@@ -192,22 +192,19 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
+        # Полная перезапись облачных смен актуальным списком с ПК (решает проблему удалений)
+        cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
             obj_name = name or s.get('object_name')
             
             cursor.execute('''
-                SELECT id FROM cloud_shifts 
-                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-            ''', (s.get('date'), s.get('employee'), obj_name, s.get('hours')))
-            if not cursor.fetchone():
-                cursor.execute('''
-                    INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    s.get('date'), s.get('employee'), s.get('company'), obj_name,
-                    s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
-                ))
+                INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                s.get('date'), s.get('employee'), s.get('company'), obj_name,
+                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+            ))
 
         conn.commit()
     except Exception as e:
