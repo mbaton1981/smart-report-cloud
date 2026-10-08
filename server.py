@@ -16,7 +16,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Таблица для смен, пришедших с телефона
+    # Таблица для смен в облаке
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,7 +32,7 @@ def init_db():
         )
     ''')
     
-    # Таблицы для справочников (чтобы выпадающие списки на сайте не были пустыми)
+    # Справочники для выпадающих списков
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
             name TEXT PRIMARY KEY
@@ -52,7 +52,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Инициализируем базу при запуске сервера
 init_db()
 
 @app.route('/')
@@ -60,7 +59,6 @@ def index():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Загружаем справочники для веб-формы
     cursor.execute("SELECT name FROM meta_employees ORDER BY name")
     employees = [row['name'] for row in cursor.fetchall()]
     
@@ -73,7 +71,7 @@ def index():
     conn.close()
     
     if not employees:
-        employees = ["Aliaksei", "Сотрудник 1"]
+        employees = ["Aliaksei Patonich"]
     if not companies:
         companies = ["Privat", "SBT", "Dvaliks", "Renatur"]
     if not objects:
@@ -147,6 +145,52 @@ def mark_synced():
     
     return jsonify({"status": "success"})
 
+@app.route('/sync-desktop-data', methods=['POST'])
+def sync_desktop_data():
+    """Принимает справочники и все смены с ПК, обновляет облако"""
+    data = request.json
+    employees = data.get("employees", [])
+    companies = data.get("companies", [])
+    objects = data.get("objects", [])
+    shifts = data.get("shifts", [])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 1. Обновляем справочники
+    cursor.execute("DELETE FROM meta_employees")
+    for emp in employees:
+        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
+        
+    cursor.execute("DELETE FROM meta_companies")
+    for comp in companies:
+        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
+        
+    cursor.execute("DELETE FROM meta_objects")
+    for obj in objects:
+        cursor.execute("INSERT OR IGNORE INTO meta_objects (name) VALUES (?)", (obj,))
+        
+    # 2. Добавляем смены с ПК в облачную базу (если их там еще нет)
+    for s in shifts:
+        cursor.execute('''
+            SELECT id FROM shifts 
+            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+        
+        if not cursor.fetchone():
+            cursor.execute('''
+                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ''', (
+                s['date'], s['employee'], s['company'], s['object_name'], 
+                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+            ))
+            
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success"})
+
 @app.route('/update-metadata', methods=['POST'])
 def update_metadata():
     data = request.json
@@ -188,23 +232,30 @@ def check_employee_shifts():
     today = datetime.now().date()
     start_date = today - timedelta(days=14)
     
-    # 1. Проверяем пропущенные смены за 2 недели
+    # Получаем историю для блока под сотрудником (последние 10 смен)
+    cursor.execute('''
+        SELECT date, object_name, hours FROM shifts 
+        WHERE employee = ? 
+        ORDER BY date DESC, id DESC 
+        LIMIT 10
+    ''', (employee_name,))
+    recent_rows = cursor.fetchall()
+    
+    recent_shifts = []
+    for r in recent_rows:
+        recent_shifts.append({
+            "date": r["date"],
+            "object_name": r["object_name"],
+            "hours": r["hours"]
+        })
+
+    # Проверка пропущенных дней за 2 недели
     cursor.execute('''
         SELECT date FROM shifts 
         WHERE employee = ? AND date >= ? AND date <= ?
     ''', (employee_name, start_date.isoformat(), today.isoformat()))
     
     worked_dates = {row[0] for row in cursor.fetchall()}
-    
-    # 2. Получаем последние заполненные смены сотрудника (до 10 штук)
-    cursor.execute('''
-        SELECT date, object_name, hours FROM shifts 
-        WHERE employee = ? 
-        ORDER BY date DESC 
-        LIMIT 10
-    ''', (employee_name,))
-    
-    recent_shifts = [{"date": row[0], "object_name": row[1], "hours": row[2]} for row in cursor.fetchall()]
     conn.close()
     
     missing_dates = []
@@ -221,13 +272,8 @@ def check_employee_shifts():
     else:
         msg = ""
         
-    return jsonify({
-        "warning": msg, 
-        "missing_count": len(missing_dates),
-        "recent_shifts": recent_shifts
-    })
+    return jsonify({"warning": msg, "missing_count": len(missing_dates), "recent_shifts": recent_shifts})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
     app.run(host='0.0.0.0', port=port)
