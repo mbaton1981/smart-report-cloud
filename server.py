@@ -207,16 +207,32 @@ def sync_desktop_data():
 
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
-                if isinstance(obj, str) and obj:
-                    clean_name = clean_obj_field(obj)
-                    if clean_name and "{" not in clean_name:
-                        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (clean_name, "Privat"))
-                elif isinstance(obj, dict) and obj.get("name"):
-                    clean_name = clean_obj_field(obj.get("name"))
-                    if clean_name and "{" not in clean_name:
-                        cursor.execute('''
-                            INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-                        ''', (clean_name, clean_obj_field(obj.get("markning", "")), clean_obj_field(obj.get("company", "Privat"))))
+                # Если десктоп присылает объект в виде словаря или строки-словаря, вытаскиваем поля корректно
+                if isinstance(obj, dict):
+                    name_val = clean_obj_field(obj.get("name"))
+                    mark_val = clean_obj_field(obj.get("markning", ""))
+                    comp_val = clean_obj_field(obj.get("company", "Privat"))
+                else:
+                    raw_str = str(obj)
+                    if "{" in raw_str and "'name'" in raw_str:
+                        try:
+                            d = ast.literal_eval(raw_str)
+                            name_val = clean_obj_field(d.get("name", ""))
+                            mark_val = clean_obj_field(d.get("markning", ""))
+                            comp_val = clean_obj_field(d.get("company", "Privat"))
+                        except Exception:
+                            name_val = clean_obj_field(raw_str)
+                            mark_val = ""
+                            comp_val = "Privat"
+                    else:
+                        name_val = clean_obj_field(raw_str)
+                        mark_val = ""
+                        comp_val = "Privat"
+
+                if name_val and "{" not in name_val:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
+                    ''', (name_val, mark_val, comp_val if comp_val else "Privat"))
 
             for s in desktop_shifts:
                 obj_cleaned = clean_obj_field(s['object_name'])
