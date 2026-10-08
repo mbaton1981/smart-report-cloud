@@ -148,7 +148,7 @@ def mark_synced():
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    """Принимает справочники и все смены с ПК, обновляет облако"""
+    """Принимает справочники и смены с ПК, обновляет облако и удаляет стертые на ПК записи"""
     data = request.json
     employees = data.get("employees", [])
     companies = data.get("companies", [])
@@ -158,7 +158,7 @@ def sync_desktop_data():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Обновляем справочники
+    # 1. Обновляем справочники (полная перезагрузка актуальных списков)
     cursor.execute("DELETE FROM meta_employees")
     for emp in employees:
         cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
@@ -171,28 +171,42 @@ def sync_desktop_data():
     for obj in objects:
         cursor.execute("INSERT OR IGNORE INTO meta_objects (name) VALUES (?)", (obj,))
         
-    # 2. Добавляем смены с ПК в облачную базу (если их там еще нет)
+    # 2. Синхронизируем смены (добавляем новые или обновляем существующие)
+    active_ids = []
     for s in shifts:
-        cursor.execute('''
-            SELECT id FROM shifts 
-            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+        shift_id = s.get('id')
         
-        if not cursor.fetchone():
+        cursor.execute("SELECT id FROM shifts WHERE id = ?", (shift_id,))
+        exists = cursor.fetchone()
+        
+        if exists:
+            cursor.execute('''
+                UPDATE shifts 
+                SET date = ?, employee = ?, company = ?, object_name = ?, hours = ?, rate = ?, transport = ?, comment = ?, synced = 1
+                WHERE id = ?
+            ''', (
+                s['date'], s['employee'], s['company'], s['object_name'], 
+                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), shift_id
+            ))
+            active_ids.append(shift_id)
+        else:
             cursor.execute('''
                 INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
             ''', (
-                s['date'], 
-                s['employee'], 
-                s['company'], 
-                s['object_name'], 
-                s['hours'], 
-                s.get('rate', 0.0), 
-                s.get('transport', 0.0), 
-                s.get('comment', '')
+                s['date'], s['employee'], s['company'], s['object_name'], 
+                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
             ))
+            # Получаем ID только что вставленной записи
+            active_ids.append(cursor.lastrowid)
             
+    # 3. Удаляем из облака смены, которых больше нет на ПК
+    if active_ids:
+        placeholders = ','.join(['?'] * len(active_ids))
+        cursor.execute(f"DELETE FROM shifts WHERE id NOT IN ({placeholders})", active_ids)
+    else:
+        cursor.execute("DELETE FROM shifts")
+
     conn.commit()
     conn.close()
     
