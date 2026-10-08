@@ -8,7 +8,7 @@ app = Flask(__name__)
 DB_FILE = "smart_report.db"
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -88,7 +88,7 @@ def submit_shift():
     company = data.get('company')
     object_name = data.get('object_name')
     hours = data.get('hours', 8.0)
-    rate = data.get('rate', 0.0)  # Явно принимаем rate со значением по умолчанию
+    rate = data.get('rate', 0.0)
     transport = data.get('transport', 0.0)
     comment = data.get('comment', '')
     
@@ -183,8 +183,14 @@ def sync_desktop_data():
                 INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
             ''', (
-                s['date'], s['employee'], s['company'], s['object_name'], 
-                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+                s['date'], 
+                s['employee'], 
+                s['company'], 
+                s['object_name'], 
+                s['hours'], 
+                s.get('rate', 0.0), 
+                s.get('transport', 0.0), 
+                s.get('comment', '')
             ))
             
     conn.commit()
@@ -233,7 +239,6 @@ def check_employee_shifts():
     today = datetime.now().date()
     start_date = today - timedelta(days=14)
     
-    # Получаем историю для блока под сотрудником (последние 10 смен)
     cursor.execute('''
         SELECT date, object_name, hours FROM shifts 
         WHERE employee = ? 
@@ -250,7 +255,6 @@ def check_employee_shifts():
             "hours": r["hours"]
         })
 
-    # Проверка пропущенных дней за 2 недели
     cursor.execute('''
         SELECT date FROM shifts 
         WHERE employee = ? AND date >= ? AND date <= ?
