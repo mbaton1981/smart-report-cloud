@@ -8,15 +8,12 @@ app = Flask(__name__)
 DB_FILE = "smart_report.db"
 
 def get_db_connection():
-    conn = sqlite3.connect('smart_report.db', timeout=30.0)
+    conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL;')
     return conn
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    # Включаем WAL режим один раз при инициализации базы данных
-    conn.execute("PRAGMA journal_mode=WAL;")
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Таблица для смен в облаке
@@ -84,221 +81,200 @@ def index():
 
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            return jsonify({"status": "error", "message": "Неверный формат данных (нет JSON)!"}), 400
-        
-        date = data.get('date')
-        employee = data.get('employee')
-        company = data.get('company')
-        object_name = data.get('object_name')
-        hours = data.get('hours', 8.0)
-        transport = data.get('transport', 0.0)
-        comment = data.get('comment', '')
-        
-        if not date or not employee or not company or not object_name:
-            return jsonify({"status": "error", "message": "Заполните все обязательные поля!"}), 400
+    data = request.json
+    
+    date = data.get('date')
+    employee = data.get('employee')
+    company = data.get('company')
+    object_name = data.get('object_name')
+    hours = data.get('hours', 8.0)
+    rate = data.get('rate', 0.0)  # Явно принимаем rate со значением по умолчанию
+    transport = data.get('transport', 0.0)
+    comment = data.get('comment', '')
+    
+    if not date or not employee or not company or not object_name:
+        return jsonify({"status": "error", "message": "Заполните все обязательные поля!"}), 400
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO shifts (date, employee, company, object_name, hours, transport, comment, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-        ''', (date, employee, company, object_name, hours, transport, comment))
-        conn.commit()
-        conn.close()
-        
-        return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
-    except Exception as e:
-        print(f"ERROR in submit_shift: {str(e)}")
-        return jsonify({"status": "error", "message": f"Ошибка сервера: {str(e)}"}), 500
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (date, employee, company, object_name, hours, rate, transport, comment))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM shifts WHERE synced = 0")
-        rows = cursor.fetchall()
-        conn.close()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM shifts WHERE synced = 0")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    shifts = []
+    for row in rows:
+        shifts.append({
+            "id": row["id"],
+            "date": row["date"],
+            "employee": row["employee"],
+            "company": row["company"],
+            "object_name": row["object_name"],
+            "hours": row["hours"],
+            "rate": row["rate"],
+            "transport": row["transport"],
+            "comment": row["comment"]
+        })
         
-        shifts = []
-        for row in rows:
-            shifts.append({
-                "id": row["id"],
-                "date": row["date"],
-                "employee": row["employee"],
-                "company": row["company"],
-                "object_name": row["object_name"],
-                "hours": row["hours"],
-                "rate": row["rate"],
-                "transport": row["transport"],
-                "comment": row["comment"]
-            })
-            
-        return jsonify({"shifts": shifts})
-    except Exception as e:
-        print(f"ERROR in get_unsynced: {str(e)}")
-        return jsonify({"shifts": [], "error": str(e)}), 500
+    return jsonify({"shifts": shifts})
 
 @app.route('/mark-synced', methods=['POST'])
 def mark_synced():
-    try:
-        data = request.get_json(silent=True) or {}
-        ids = data.get("ids", [])
+    data = request.json
+    ids = data.get("ids", [])
+    
+    if not ids:
+        return jsonify({"status": "ok"})
         
-        if not ids:
-            return jsonify({"status": "ok"})
-            
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.executemany("UPDATE shifts SET synced = 1 WHERE id = ?", [(i,) for i in ids])
-        conn.commit()
-        conn.close()
-        
-        return jsonify({"status": "success"})
-    except Exception as e:
-        print(f"ERROR in mark_synced: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.executemany("UPDATE shifts SET synced = 1 WHERE id = ?", [(i,) for i in ids])
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success"})
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    try:
-        data = request.get_json(silent=True) or {}
-        employees = data.get("employees", [])
-        companies = data.get("companies", [])
-        objects = data.get("objects", [])
-        shifts = data.get("shifts", [])
+    """Принимает справочники и все смены с ПК, обновляет облако"""
+    data = request.json
+    employees = data.get("employees", [])
+    companies = data.get("companies", [])
+    objects = data.get("objects", [])
+    shifts = data.get("shifts", [])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 1. Обновляем справочники
+    cursor.execute("DELETE FROM meta_employees")
+    for emp in employees:
+        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
+    cursor.execute("DELETE FROM meta_companies")
+    for comp in companies:
+        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
         
-        cursor.execute("DELETE FROM meta_employees")
-        for emp in employees:
-            cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
-            
-        cursor.execute("DELETE FROM meta_companies")
-        for comp in companies:
-            cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
-            
-        cursor.execute("DELETE FROM meta_objects")
-        for obj in objects:
-            cursor.execute("INSERT OR IGNORE INTO meta_objects (name) VALUES (?)", (obj,))
-            
-        for s in shifts:
+    cursor.execute("DELETE FROM meta_objects")
+    for obj in objects:
+        cursor.execute("INSERT OR IGNORE INTO meta_objects (name) VALUES (?)", (obj,))
+        
+    # 2. Добавляем смены с ПК в облачную базу (если их там еще нет)
+    for s in shifts:
+        cursor.execute('''
+            SELECT id FROM shifts 
+            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+        
+        if not cursor.fetchone():
             cursor.execute('''
-                SELECT id FROM shifts 
-                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-            ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ''', (
+                s['date'], s['employee'], s['company'], s['object_name'], 
+                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+            ))
             
-            if not cursor.fetchone():
-                cursor.execute('''
-                    INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ''', (
-                    s['date'], s['employee'], s['company'], s['object_name'], 
-                    s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
-                ))
-                
-        conn.commit()
-        conn.close()
-        
-        return jsonify({"status": "success"})
-    except Exception as e:
-        print(f"ERROR in sync_desktop_data: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success"})
 
 @app.route('/update-metadata', methods=['POST'])
 def update_metadata():
-    try:
-        data = request.get_json(silent=True) or {}
-        employees = data.get("employees", [])
-        companies = data.get("companies", [])
-        objects = data.get("objects", [])
+    data = request.json
+    employees = data.get("employees", [])
+    companies = data.get("companies", [])
+    objects = data.get("objects", [])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("DELETE FROM meta_employees")
+    for emp in employees:
+        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
+    cursor.execute("DELETE FROM meta_companies")
+    for comp in companies:
+        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
         
-        cursor.execute("DELETE FROM meta_employees")
-        for emp in employees:
-            cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
-            
-        cursor.execute("DELETE FROM meta_companies")
-        for comp in companies:
-            cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
-            
-        cursor.execute("DELETE FROM meta_objects")
-        for obj in objects:
-            cursor.execute("INSERT OR IGNORE INTO meta_objects (name) VALUES (?)", (obj,))
-            
-        conn.commit()
-        conn.close()
+    cursor.execute("DELETE FROM meta_objects")
+    for obj in objects:
+        cursor.execute("INSERT OR IGNORE INTO meta_objects (name) VALUES (?)", (obj,))
         
-        return jsonify({"status": "success"})
-    except Exception as e:
-        print(f"ERROR in update_metadata: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success"})
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
-    try:
-        data = request.get_json(silent=True) or {}
-        employee_name = data.get('employee')
+    data = request.json
+    employee_name = data.get('employee')
+    
+    if not employee_name:
+        return jsonify({"warning": "", "recent_shifts": []})
         
-        if not employee_name:
-            return jsonify({"warning": "", "recent_shifts": []})
-            
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        today = datetime.now().date()
-        start_date = today - timedelta(days=14)
-        
-        cursor.execute('''
-            SELECT date, object_name, hours FROM shifts 
-            WHERE employee = ? 
-            ORDER BY date DESC, id DESC 
-            LIMIT 10
-        ''', (employee_name,))
-        recent_rows = cursor.fetchall()
-        
-        recent_shifts = []
-        for r in recent_rows:
-            recent_shifts.append({
-                "date": r["date"],
-                "object_name": r["object_name"],
-                "hours": r["hours"]
-            })
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    today = datetime.now().date()
+    start_date = today - timedelta(days=14)
+    
+    # Получаем историю для блока под сотрудником (последние 10 смен)
+    cursor.execute('''
+        SELECT date, object_name, hours FROM shifts 
+        WHERE employee = ? 
+        ORDER BY date DESC, id DESC 
+        LIMIT 10
+    ''', (employee_name,))
+    recent_rows = cursor.fetchall()
+    
+    recent_shifts = []
+    for r in recent_rows:
+        recent_shifts.append({
+            "date": r["date"],
+            "object_name": r["object_name"],
+            "hours": r["hours"]
+        })
 
-        cursor.execute('''
-            SELECT date FROM shifts 
-            WHERE employee = ? AND date >= ? AND date <= ?
-        ''', (employee_name, start_date.isoformat(), today.isoformat()))
+    # Проверка пропущенных дней за 2 недели
+    cursor.execute('''
+        SELECT date FROM shifts 
+        WHERE employee = ? AND date >= ? AND date <= ?
+    ''', (employee_name, start_date.isoformat(), today.isoformat()))
+    
+    worked_dates = {row[0] for row in cursor.fetchall()}
+    conn.close()
+    
+    missing_dates = []
+    current = start_date
+    while current <= today:
+        if current.weekday() != 6:  # Исключая воскресенья
+            d_str = current.isoformat()
+            if d_str not in worked_dates:
+                missing_dates.append(d_str)
+        current += timedelta(days=1)
         
-        worked_dates = {row[0] for row in cursor.fetchall()}
-        conn.close()
+    if missing_dates:
+        msg = f"⚠️ Внимание, {employee_name}! У вас есть незаполненные смены за последние 2 недели (пропущено дней: {len(missing_dates)}). Пожалуйста, проверьте и внесите часы."
+    else:
+        msg = ""
         
-        missing_dates = []
-        current = start_date
-        while current <= today:
-            if current.weekday() != 6:  # Исключая воскресенья
-                d_str = current.isoformat()
-                if d_str not in worked_dates:
-                    missing_dates.append(d_str)
-            current += timedelta(days=1)
-            
-        if missing_dates:
-            msg = f"⚠️ Внимание, {employee_name}! У вас есть незаполненные смены за последние 2 недели (пропущено дней: {len(missing_dates)}). Пожалуйста, проверьте и внесите часы."
-        else:
-            msg = ""
-            
-        return jsonify({"warning": msg, "missing_count": len(missing_dates), "recent_shifts": recent_shifts})
-    except Exception as e:
-        print(f"ERROR in check_employee_shifts: {str(e)}")
-        return jsonify({"warning": "", "recent_shifts": [], "error": str(e)}), 500
+    return jsonify({"warning": msg, "missing_count": len(missing_dates), "recent_shifts": recent_shifts})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-   
