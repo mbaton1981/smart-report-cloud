@@ -5,105 +5,124 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bygger och renoverar i Sthlm</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 0 15px; color: #fff; background-color: #1a1d24; }
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 15px; color: #fff; background-color: #1a1d24; }
         h2 { text-align: center; color: #4a90e2; }
-        form { background: #222631; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid #2f3542; }
-        .form-group { margin-bottom: 18px; }
+        .main-container { display: flex; flex-wrap: wrap; gap: 20px; }
+        .form-box { flex: 1; min-width: 320px; background: #222631; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid #2f3542; }
+        .history-box { flex: 1; min-width: 320px; background: #222631; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid #2f3542; height: fit-content; }
+        .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 6px; font-weight: bold; color: #b2bec3; font-size: 14px; }
-        select, input, textarea { width: 100%; padding: 12px; box-sizing: border-box; background-color: #1e222b; border: 1px solid #3a4150; border-radius: 6px; font-size: 16px; color: #fff; }
+        select, input, textarea { width: 100%; padding: 10px; box-sizing: border-box; background-color: #1e222b; border: 1px solid #3a4150; border-radius: 6px; font-size: 15px; color: #fff; }
         select:focus, input:focus, textarea:focus { border-color: #4a90e2; outline: none; }
-        button { background-color: #3498db; color: white; padding: 14px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold; transition: background 0.2s; }
+        button { background-color: #3498db; color: white; padding: 12px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 15px; font-weight: bold; transition: background 0.2s; }
         button:hover { background-color: #2980b9; }
+        .btn-history { background-color: #27ae60; margin-top: 10px; }
+        .btn-history:hover { background-color: #219653; }
+        
+        /* Список смен */
+        #history-list { list-style-type: none; padding: 0; margin: 0; }
+        #history-list li { background: #1a2332; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #2e5b88; font-size: 13px; color: #dfe6e9; display: flex; justify-content: space-between; align-items: center; }
     </style>
 </head>
 <body>
 
-    <form id="shift-form">
-        <h2 style="margin-top: 0; margin-bottom: 20px;">Bygger och renoverar i Sthlm</h2>
+    <h2>Bygger och renoverar i Sthlm</h2>
 
-        <div class="form-group">
-            <label for="date">Дата смены:</label>
-            <input type="date" id="date" name="date" required>
+    <div class="main-container">
+        <!-- ЛЕВАЯ КОЛОНКА: Основная форма отправки смены -->
+        <div class="form-box">
+            <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">📝 Отправить смену</h3>
+            <form id="shift-form">
+                <div class="form-group">
+                    <label for="date">Дата смены:</label>
+                    <input type="date" id="date" name="date" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="employee">Сотрудник:</label>
+                    <select id="employee" name="employee" required>
+                        <option value="">-- Выберите ваше имя --</option>
+                        {% for emp in employees %}
+                        <option value="{{ emp }}">{{ emp }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="company">Фирма (Заказчик):</label>
+                    <select id="company" name="company" required>
+                        {% for comp in companies %}
+                        <option value="{{ comp }}">{{ comp }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="object_name">Объект / Адрес:</label>
+                    <select id="object_name" name="object_name" required>
+                        {% for obj in objects %}
+                        <option value="{{ obj }}">{{ obj }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="hours">Отработано часов:</label>
+                    <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
+                </div>
+
+                <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="transport_check" style="width: 20px; height: 20px; cursor: pointer;">
+                    <label for="transport_check" style="margin-bottom: 0; cursor: pointer; color: #fff;">Транспорт (учитывать поездку)</label>
+                    <input type="hidden" id="transport" name="transport" value="0.0">
+                </div>
+
+                <div class="form-group">
+                    <label for="comment">Описание выполненных работ:</label>
+                    <textarea id="comment" name="comment" rows="3" placeholder="Что было сделано за смену..."></textarea>
+                </div>
+
+                <button type="submit">Отправить смену</button>
+            </form>
         </div>
 
-        <div class="form-group">
-            <label for="employee">Сотрудник:</label>
-            <select id="employee" name="employee" required>
-                <option value="">-- Выберите ваше имя --</option>
-                {% for emp in employees %}
-                <option value="{{ emp }}">{{ emp }}</option>
-                {% endfor %}
-            </select>
-        </div>
+        <!-- ПРАВАЯ КОЛОНКА: Независимый блок просмотра последних смен работника -->
+        <div class="history-box">
+            <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">🔍 Проверка истории смен</h3>
+            
+            <div class="form-group">
+                <label for="history-employee">Выберите сотрудника:</label>
+                <select id="history-employee">
+                    <option value="">-- Выберите сотрудника --</option>
+                    {% for emp in employees %}
+                    <option value="{{ emp }}">{{ emp }}</option>
+                    {% endfor %}
+                </select>
+            </div>
 
-        <div class="form-group">
-            <label for="company">Фирма (Заказчик):</label>
-            <select id="company" name="company" required>
-                {% for comp in companies %}
-                <option value="{{ comp }}">{{ comp }}</option>
-                {% endfor %}
-            </select>
-        </div>
+            <button type="button" id="load-history-btn" class="btn-history">Показать последние смены</button>
 
-        <div class="form-group">
-            <label for="object_name">Объект / Адрес:</label>
-            <select id="object_name" name="object_name" required>
-                {% for obj in objects %}
-                <option value="{{ obj }}">{{ obj }}</option>
-                {% endfor %}
-            </select>
-        </div>
+            <div id="warning-container" style="margin-top: 15px; display: none; background: #3d2222; border: 1px solid #c0392b; padding: 10px; border-radius: 6px; font-size: 13px; color: #f5b7b1;"></div>
 
-        <div class="form-group">
-            <label for="hours">Отработано часов:</label>
-            <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
-        </div>
-
-        <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
-            <input type="checkbox" id="transport_check" style="width: 20px; height: 20px; cursor: pointer;">
-            <label for="transport_check" style="margin-bottom: 0; cursor: pointer; color: #fff;">Транспорт (учитывать поездку)</label>
-            <input type="hidden" id="transport" name="transport" value="0.0">
-        </div>
-
-        <div class="form-group">
-            <label for="comment">Описание выполненных работ:</label>
-            <textarea id="comment" name="comment" rows="3" placeholder="Что было сделано за смену..."></textarea>
-        </div>
-
-        <button type="submit">Отправить смену</button>
-    </form>
-
-    <!-- ОТДЕЛЬНЫЙ БЕЗОПАСНЫЙ БЛОК ДЛЯ ПРОВЕРКИ ИСТОРИИ -->
-    <div style="margin-top: 25px; background: #222631; padding: 20px; border-radius: 12px; border: 1px solid #2f3542; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
-        <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 12px;">🔍 История смен сотрудника</h3>
-        
-        <div style="margin-bottom: 12px;">
-            <select id="safe-employee" style="width: 100%; padding: 12px; background-color: #1e222b; border: 1px solid #3a4150; border-radius: 6px; color: #fff; font-size: 16px;">
-                <option value="">-- Выберите сотрудника --</option>
-                {% for emp in employees %}
-                <option value="{{ emp }}">{{ emp }}</option>
-                {% endfor %}
-            </select>
-        </div>
-        
-        <button type="button" id="safe-btn" style="background-color: #27ae60; color: white; padding: 12px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold;">Показать смены</button>
-        
-        <div id="safe-result" style="margin-top: 15px; display: none; background: #1a2332; padding: 12px; border-radius: 6px; border: 1px solid #2e5b88;">
-            <h4 style="margin-top: 0; margin-bottom: 8px; color: #64b5f6; font-size: 14px;">Последние смены:</h4>
-            <ul id="safe-list" style="padding-left: 20px; margin: 0; font-size: 13px; color: #dfe6e9;"></ul>
+            <div style="margin-top: 15px;">
+                <h4 style="color: #64b5f6; font-size: 14px; margin-bottom: 8px;">Последние заполненные дни:</h4>
+                <ul id="history-list">
+                    <li style="color: #7f8c8d; justify-content: center;">Выберите сотрудника и нажмите кнопку</li>
+                </ul>
+            </div>
         </div>
     </div>
 
     <script>
         // Ставим сегодняшнюю дату по умолчанию
-        document.getElementById('date').valueAsDate = new Date();
+        document.getElementById('date').value = new Date().toISOString().split('T')[0];
 
-        // Логика чекбокса транспорта
+        // Чекбокс транспорта
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
-        // Отправка данных основной смены
+        // Отправка формы смены
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -128,8 +147,11 @@
                 if (response.ok) {
                     alert(result.message);
                     document.getElementById('comment').value = '';
+                    // Автоматически подставляем отправленного сотрудника в блок проверки истории
+                    document.getElementById('history-employee').value = formData.employee;
+                    document.getElementById('load-history-btn').click();
                 } else {
-                    alert("Ошибка: " + result.message);
+                    alert("Ошибка: " + (result.message || "Неизвестная ошибка сервера"));
                 }
             } catch (err) {
                 alert("Не удалось отправить данные на сервер.");
@@ -137,40 +159,47 @@
             }
         });
 
-        // Логика отдельной кнопки проверки истории
-        document.getElementById('safe-btn').addEventListener('click', async function() {
-            const emp = document.getElementById('safe-employee').value;
-            const container = document.getElementById('safe-result');
-            const list = document.getElementById('safe-list');
+        // Загрузка истории смен в правом блоке
+        document.getElementById('load-history-btn').addEventListener('click', async function() {
+            const empName = document.getElementById('history-employee').value;
+            const listContainer = document.getElementById('history-list');
+            const warningContainer = document.getElementById('warning-container');
             
-            list.innerHTML = '';
-            if (!emp) {
-                alert('Выберите сотрудника из списка!');
+            if (!empName) {
+                alert('Пожалуйста, выберите сотрудника!');
                 return;
             }
+
+            listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">Загрузка...</li>';
+            warningContainer.style.display = 'none';
 
             try {
                 const response = await fetch('/check-employee-shifts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ employee: emp })
+                    body: JSON.stringify({ employee: empName })
                 });
-                
+
                 const data = await response.json();
-                
+                listContainer.innerHTML = '';
+
+                if (data.warning) {
+                    warningContainer.textContent = data.warning;
+                    warningContainer.style.display = 'block';
+                }
+
                 if (data.recent_shifts && data.recent_shifts.length > 0) {
                     data.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
-                        li.textContent = `${shift.date} — ${shift.object_name} (${shift.hours} ч)`;
-                        list.appendChild(li);
+                        li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #a0aec0;">${shift.object_name}</small></span>` +
+                                     `<span style="background: #2e5b88; padding: 4px 8px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
+                        listContainer.appendChild(li);
                     });
-                    container.style.display = 'block';
                 } else {
-                    list.innerHTML = '<li>У этого сотрудника пока нет сохраненных смен.</li>';
-                    container.style.display = 'block';
+                    listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">У сотрудника пока нет записей о сменах.</li>';
                 }
             } catch (err) {
-                alert("Ошибка связи с сервером.");
+                listContainer.innerHTML = '<li style="color: #e74c3c; justify-content: center;">Ошибка загрузки данных.</li>';
                 console.error(err);
             }
         });
