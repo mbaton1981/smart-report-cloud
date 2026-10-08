@@ -43,9 +43,8 @@
         <div class="form-group">
             <label for="employee">Сотрудник:</label>
             <select id="employee" name="employee" required>
-                <option value="">-- Выберите ваше имя --</option>
                 {% for emp in employees %}
-                <option value="{{ emp }}">{{ emp }}</option>
+                <option value="{{ emp }}" {% if loop.first %}selected{% endif %}>{{ emp }}</option>
                 {% endfor %}
             </select>
         </div>
