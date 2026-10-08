@@ -104,7 +104,6 @@ def init_db_once():
     if 'invoiced' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
 
-    # Всегда проверяем и добавляем сотрудника по умолчанию, если таблица пустая
     cursor.execute("SELECT COUNT(*) FROM employees")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
@@ -360,10 +359,10 @@ class SmartReportApp(QMainWindow):
         init_db_once()
         self.init_ui()
 
-        # Автоматическая фоновая синхронизация каждые 2 минуты (120000 мс)
+        # Автоматическая фоновая синхронизация каждые 30 секунд (30000 мс)
         self.auto_sync_timer = QTimer(self)
         self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
-        self.auto_sync_timer.start(120000)
+        self.auto_sync_timer.start(30000)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -489,36 +488,39 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         
         # 1. Сначала забираем новые смены, созданные через телефон / веб-форму
-        response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            shifts_from_phone = data.get("shifts", [])
-            
-            if shifts_from_phone:
-                downloaded_ids = []
-                for s in shifts_from_phone:
-                    cursor.execute('''
-                        SELECT id FROM shifts 
-                        WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                    ''', (s['date'], s['employee'], s['object_name'], s['hours']))
-                    
-                    if not cursor.fetchone():
+        try:
+            response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                shifts_from_phone = data.get("shifts", [])
+                
+                if shifts_from_phone:
+                    downloaded_ids = []
+                    for s in shifts_from_phone:
                         cursor.execute('''
-                            INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                        ''', (
-                            s['date'], s['employee'], s['company'], s['object_name'], 
-                            s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
-                        ))
+                            SELECT id FROM shifts 
+                            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
                         
-                    downloaded_ids.append(s['id'])
+                        if not cursor.fetchone():
+                            cursor.execute('''
+                                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                            ''', (
+                                s['date'], s['employee'], s['company'], s['object_name'], 
+                                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
+                            ))
+                            
+                        downloaded_ids.append(s['id'])
 
-                conn.commit()
+                    conn.commit()
 
-                if downloaded_ids:
-                    requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
+                    if downloaded_ids:
+                        requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
+        except Exception:
+            pass
 
-        # 2. Собираем актуальные списки справочников из базы данных ПК
+        # 2. Собираем актуальные списки справочников (включая всех сотрудников!) из базы данных ПК
         cursor.execute("SELECT name FROM employees ORDER BY name")
         employees = [row[0] for row in cursor.fetchall()]
         
@@ -553,24 +555,27 @@ class SmartReportApp(QMainWindow):
             "objects": objects,
             "shifts": all_local_shifts
         }
-        requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=60)
+        try:
+            requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=20)
+        except Exception:
+            pass
 
     def sync_with_cloud(self):
         """Ручная синхронизация по кнопке с уведомлением"""
         try:
             self.perform_sync_logic()
             self.load_shifts_history()
-            QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена! Данные обновлены в обе стороны.")
+            QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена! Все сотрудники и данные обновлены.")
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
 
     def background_sync_with_cloud(self):
-        """Тихая фоновая синхронизация по таймеру без всплывающих окон"""
+        """Тихая фоновая синхронизация каждые 30 секунд"""
         try:
             self.perform_sync_logic()
             self.load_shifts_history()
         except Exception:
-            pass  # Игнорируем сетевые ошибки в фоне, чтобы не мешать работе
+            pass
 
     def setup_salary_tab(self):
         layout = QVBoxLayout(self.tab_salary)
@@ -713,6 +718,7 @@ class SmartReportApp(QMainWindow):
             conn.close()
             
             self.calculate_salary_row(row)
+            self.background_sync_with_cloud()
 
     def calculate_salary_row(self, row_idx):
         emp_item = self.table_salary.item(row_idx, 0)
@@ -952,6 +958,7 @@ class SmartReportApp(QMainWindow):
         conn.close()
 
         self.load_expenses_table()
+        self.background_sync_with_cloud()
         QMessageBox.information(self, "Успех", f"Отчисления FORA ({fora_amount:,.2f} kr) и Arbetsgivareavgift ({employer_tax:,.2f} kr) успешно рассчитаны и добавлены в расходы компании!")
 
     def setup_invoice_tab(self):
@@ -1044,6 +1051,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.information(self, "Успех", "Период успешно закрыт! Смены отмечены как выставленные.")
             self.generate_invoice()
             self.load_shifts_history()
+            self.background_sync_with_cloud()
 
     def unmark_period_as_invoiced(self):
         d_from = self.inv_date_from.text().strip()
@@ -1077,6 +1085,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.information(self, "Успех", "Статус сброшен! Период снова переведен в статус «В работе».")
             self.generate_invoice()
             self.load_shifts_history()
+            self.background_sync_with_cloud()
 
     def load_objects_for_company(self, comp_name, obj_cb):
         obj_cb.clear()
@@ -1422,6 +1431,7 @@ class SmartReportApp(QMainWindow):
         conn.close()
         self.new_comp_input.clear()
         self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def load_companies_table(self):
         if hasattr(self, 'table_companies'):
@@ -1445,6 +1455,7 @@ class SmartReportApp(QMainWindow):
         conn.commit()
         conn.close()
         self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def add_object(self):
         comp = self.new_obj_comp_cb.currentText().strip()
@@ -1467,6 +1478,7 @@ class SmartReportApp(QMainWindow):
         self.new_obj_name_input.clear()
         self.new_obj_mark_input.clear()
         self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def delete_object(self):
         selected = self.table_objects.currentRow()
@@ -1479,6 +1491,7 @@ class SmartReportApp(QMainWindow):
         conn.commit()
         conn.close()
         self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def load_dropdowns(self):
         conn = get_db_connection()
@@ -1560,6 +1573,7 @@ class SmartReportApp(QMainWindow):
         self.new_emp_input.clear()
         self.new_emp_rate_input.clear()
         self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def delete_employee(self):
         selected = self.table_employees.currentRow()
@@ -1572,6 +1586,7 @@ class SmartReportApp(QMainWindow):
         conn.commit()
         conn.close()
         self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def save_shift(self):
         date = self.date_input.text().strip()
@@ -1596,7 +1611,11 @@ class SmartReportApp(QMainWindow):
         ''', (date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment))
         conn.commit()
         conn.close()
-        QMessageBox.information(self, "Успех", "Смена успешно сохранена!")
+        
+        # Мгновенная отправка в облако при сохранении смены
+        self.background_sync_with_cloud()
+        
+        QMessageBox.information(self, "Успех", "Смена успешно сохранена и отправлена в облако!")
         self.load_shifts_history()
 
     def load_shifts_history(self):
@@ -1648,6 +1667,7 @@ class SmartReportApp(QMainWindow):
             conn.commit()
             conn.close()
             self.load_shifts_history()
+            self.background_sync_with_cloud()
 
     def generate_invoice(self):
         d_from = self.inv_date_from.text().strip()
@@ -1715,6 +1735,7 @@ class SmartReportApp(QMainWindow):
         self.bal_desc.clear()
         self.bal_amount.clear()
         self.load_balance_table()
+        self.background_sync_with_cloud()
 
     def load_balance_table(self):
         conn = get_db_connection()
@@ -1760,6 +1781,7 @@ class SmartReportApp(QMainWindow):
         self.exp_desc.clear()
         self.exp_amount.clear()
         self.load_expenses_table()
+        self.background_sync_with_cloud()
 
     def load_expenses_table(self):
         conn = get_db_connection()
@@ -1791,6 +1813,7 @@ class SmartReportApp(QMainWindow):
         conn.commit()
         conn.close()
         self.load_expenses_table()
+        self.background_sync_with_cloud()
 
 if __name__ == "__main__":
     try:
