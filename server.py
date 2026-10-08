@@ -50,6 +50,7 @@ def init_cloud_db():
         )
     ''')
     
+    # Первоначальные демо-данные, если таблицы совсем пустые
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
@@ -78,10 +79,19 @@ def index():
     obj_rows = cursor.fetchall()
     objects = []
     for r in obj_rows:
+        name = r['name']
+        mark = r['markning'] or ""
+        comp = r['company'] or "Privat"
+        
+        display_str = f"{mark} | {name}" if mark else name
+        if comp and comp != 'Privat':
+            display_str += f" [{comp}]"
+            
         objects.append({
-            "name": r['name'], 
-            "markning": r['markning'] or "", 
-            "company": r['company']
+            "name": name, 
+            "markning": mark, 
+            "company": comp,
+            "display": display_str
         })
 
     conn.close()
@@ -144,7 +154,7 @@ def sync_desktop_data():
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # Синхронизация сотрудников с удалением устаревших
+            # 1. Синхронизация сотрудников с полным удалением тех, кого удалили на ПК
             if employees:
                 placeholders = ','.join(['?'] * len(employees))
                 cursor.execute(f"DELETE FROM meta_employees WHERE name NOT IN ({placeholders})", employees)
@@ -152,7 +162,7 @@ def sync_desktop_data():
                     if emp:
                         cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
 
-            # Синхронизация компаний с удалением устаревших
+            # 2. Синхронизация компаний с полным удалением устаревших
             if companies:
                 placeholders = ','.join(['?'] * len(companies))
                 cursor.execute(f"DELETE FROM meta_companies WHERE name NOT IN ({placeholders})", companies)
@@ -160,7 +170,7 @@ def sync_desktop_data():
                     if comp:
                         cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
 
-            # Синхронизация объектов
+            # 3. Синхронизация объектов (очищаем старые и записываем актуальные с ПК)
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, str) and obj:
@@ -170,7 +180,7 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
 
-            # Синхронизация смен
+            # 4. Синхронизация смен
             for s in desktop_shifts:
                 cursor.execute('''
                     SELECT id FROM cloud_shifts 
