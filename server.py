@@ -4,8 +4,15 @@ from flask import Flask, render_template, request, jsonify
 app = Flask(__name__)
 DB_FILE = "cloud_database.db"
 
+def get_db_connection():
+    # Увеличиваем timeout до 30 секунд и включаем режим WAL для предотвращения блокировок
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn.execute('PRAGMA journal_mode=WAL;')
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_cloud_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Таблица для смен из веб-формы
@@ -24,7 +31,7 @@ def init_cloud_db():
         )
     ''')
     
-    # Таблицы для хранения справочников (чтобы они не сбрасывались)
+    # Таблицы для хранения справочников
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
             name TEXT UNIQUE NOT NULL,
@@ -59,23 +66,22 @@ init_cloud_db()
 
 @app.route('/')
 def index():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Загружаем актуальные справочники из базы сервера
     cursor.execute("SELECT name FROM meta_employees ORDER BY name")
     emp_rows = cursor.fetchall()
-    employees = [row[0] for row in emp_rows] if emp_rows else ["Aliaksei Patonich"]
+    employees = [row['name'] for row in emp_rows] if emp_rows else ["Aliaksei Patonich"]
 
     cursor.execute("SELECT name FROM meta_companies ORDER BY name")
     comp_rows = cursor.fetchall()
-    companies = [row[0] for row in comp_rows] if comp_rows else ["Privat"]
+    companies = [row['name'] for row in comp_rows] if comp_rows else ["Privat"]
 
     cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
     obj_rows = cursor.fetchall()
     objects = []
     for r in obj_rows:
-        objects.append({"name": r[0], "markning": r[1] or "", "company": r[2]})
+        objects.append({"name": r['name'], "markning": r['markning'] or "", "company": r['company']})
 
     conn.close()
     return render_template('index.html', employees=employees, companies=companies, objects=objects)
@@ -83,7 +89,7 @@ def index():
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
     data = request.json
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
@@ -106,7 +112,7 @@ def submit_shift():
 def check_employee_shifts():
     data = request.json
     emp = data.get('employee')
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 5", (emp,))
     rows = cursor.fetchall()
@@ -114,32 +120,28 @@ def check_employee_shifts():
     
     shifts = []
     for r in rows:
-        shifts.append({"date": r[0], "object_name": r[1], "hours": r[2]})
+        shifts.append({"date": r['date'], "object_name": r['object_name'], "hours": r['hours']})
     return jsonify({"recent_shifts": shifts})
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    """Принимает полные справочники и смены с десктопного приложения"""
     data = request.json
     employees = data.get("employees", [])
     companies = data.get("companies", [])
     objects = data.get("objects", [])
     desktop_shifts = data.get("shifts", [])
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. Обновляем справочник сотрудников
     for emp in employees:
         if emp:
             cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
 
-    # 2. Обновляем справочник фирм
     for comp in companies:
         if comp:
             cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
 
-    # 3. Обновляем справочник объектов
     for obj in objects:
         if isinstance(obj, str) and obj:
             cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
@@ -148,7 +150,6 @@ def sync_desktop_data():
                 INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
             ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
 
-    # 4. Сохраняем смены с десктопа в историю
     for s in desktop_shifts:
         cursor.execute('''
             SELECT id FROM cloud_shifts 
@@ -169,7 +170,7 @@ def sync_desktop_data():
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
     rows = cursor.fetchall()
@@ -178,8 +179,8 @@ def get_unsynced():
     shifts = []
     for r in rows:
         shifts.append({
-            "id": r[0], "date": r[1], "employee": r[2], "company": r[3],
-            "object_name": r[4], "hours": r[5], "rate": r[6], "transport": r[7], "comment": r[8]
+            "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
+            "object_name": r['object_name'], "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
         })
     return jsonify({"shifts": shifts})
 
@@ -188,7 +189,7 @@ def mark_synced():
     data = request.json
     ids = data.get("ids", [])
     if ids:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.executemany("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", [(i,) for i in ids])
         conn.commit()
