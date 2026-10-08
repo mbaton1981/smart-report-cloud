@@ -505,14 +505,48 @@ class SmartReportApp(QMainWindow):
         self.load_shifts_history()
 
     def sync_with_cloud(self):
-        """Двусторонняя синхронизация: выгружает локальные смены/справочники в облако и забирает новые смены с телефона"""
+        """Двусторонняя синхронизация: сначала забирает новые смены с телефона, затем обновляет облако"""
         CLOUD_URL = "https://smart-report-server.onrender.com"  # Твой адрес на Render
         
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
             
-            # 1. Собираем актуальные списки из базы данных ПК
+            # 1. Сначала забираем новые смены, созданные через телефон / веб-форму
+            try:
+                response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    shifts_from_phone = data.get("shifts", [])
+                    
+                    if shifts_from_phone:
+                        downloaded_ids = []
+                        for s in shifts_from_phone:
+                            # Проверяем, нет ли уже такой смены локально
+                            cursor.execute('''
+                                SELECT id FROM shifts 
+                                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                            ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+                            
+                            if not cursor.fetchone():
+                                cursor.execute('''
+                                    INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                ''', (
+                                    s['date'], s['employee'], s['company'], s['object_name'], 
+                                    s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
+                                ))
+                                
+                            downloaded_ids.append(s['id'])
+
+                        conn.commit()
+
+                        if downloaded_ids:
+                            requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
+            except Exception as e:
+                print(f"Ошибка при скачивании смен с телефона: {e}")
+
+            # 2. Собираем актуальные списки справочников из базы данных ПК
             cursor.execute("SELECT name FROM employees ORDER BY name")
             employees = [row[0] for row in cursor.fetchall()]
             
@@ -522,7 +556,7 @@ class SmartReportApp(QMainWindow):
             cursor.execute("SELECT name FROM objects ORDER BY name")
             objects = [row[0] for row in cursor.fetchall()]
             
-            # 2. Собираем все локальные смены для отправки в облако
+            # 3. Собираем все локальные смены (уже включая скачанные с телефона) для отправки в облако
             cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
             local_shift_rows = cursor.fetchall()
             
@@ -541,7 +575,7 @@ class SmartReportApp(QMainWindow):
                     "comment": r[7]
                 })
 
-            # 3. Отправляем справочники и смены на облачный сервер
+            # 4. Отправляем итоговый полный список на облачный сервер
             metadata_payload = {
                 "employees": employees,
                 "companies": companies,
@@ -549,43 +583,6 @@ class SmartReportApp(QMainWindow):
                 "shifts": all_local_shifts
             }
             requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=60)
-
-            # 4. Забираем новые смены, созданные через телефон / веб-форму
-            response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                shifts_from_phone = data.get("shifts", [])
-                
-                if shifts_from_phone:
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    downloaded_ids = []
-                    added_count = 0
-
-                    for s in shifts_from_phone:
-                        # Проверяем, нет ли уже такой смены локально
-                        cursor.execute('''
-                            SELECT id FROM shifts 
-                            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
-                        
-                        if not cursor.fetchone():
-                            cursor.execute('''
-                                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                            ''', (
-                                s['date'], s['employee'], s['company'], s['object_name'], 
-                                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
-                            ))
-                            added_count += 1
-                            
-                        downloaded_ids.append(s['id'])
-
-                    conn.commit()
-                    conn.close()
-
-                    if downloaded_ids:
-                        requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
 
             self.load_shifts_history()
             QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена! Данные обновлены в обе стороны.")
