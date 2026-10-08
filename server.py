@@ -13,7 +13,7 @@ def get_db_connection():
     return conn
 
 def safe_parse_obj(val):
-    """Аккуратно достает имя из любой строки или словаря без падений"""
+    """Аккуратно извлекает чистое имя, маркировку и компанию из любого формата"""
     if not val:
         return "", "", "Privat"
     if isinstance(val, dict):
@@ -27,6 +27,7 @@ def safe_parse_obj(val):
                 return str(d.get('name', '')).strip(), str(d.get('markning', '')).strip(), str(d.get('company', 'Privat')).strip()
         except Exception:
             pass
+    # Если это просто строка с названием объекта
     return val_str, "", "Privat"
 
 def init_cloud_db():
@@ -66,6 +67,22 @@ def init_cloud_db():
             UNIQUE(name, company)
         )
     ''')
+    
+    # Принудительно очищаем старый мусор со словарями из базы при запуске
+    try:
+        cursor.execute("SELECT rowid, name FROM meta_objects")
+        for row in cursor.fetchall():
+            val = row['name']
+            if val and ('{' in str(val) or 'name' in str(val)):
+                name, _, _ = safe_parse_obj(val)
+                if name and "{" not in name:
+                    cursor.execute("UPDATE meta_objects SET name = ? WHERE rowid = ?", (name, row['rowid']))
+                else:
+                    cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
+        conn.commit()
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -94,13 +111,12 @@ def index():
     for r in obj_rows:
         name, mark, comp = safe_parse_obj(r['name'])
         if not name or "{" in name:
-            # Если в поле name затесался мусор, пробуем взять из колонок
-            name = str(r['name'])
-            mark = str(r['markning'] or '')
-            comp = str(r['company'] or 'Privat')
-
-        if not name or "{" in name:
             continue
+
+        if r['markning'] and not mark:
+            mark = str(r['markning']).strip()
+        if r['company'] and comp == "Privat":
+            comp = str(r['company']).strip()
 
         key = (name, comp)
         if key in seen:
@@ -169,7 +185,7 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        # 1. Сотрудники (просто добавляем новые, не ломая старые)
+        # 1. Сотрудники
         if employees:
             for emp in employees:
                 if emp:
@@ -181,17 +197,11 @@ def sync_desktop_data():
                 if comp:
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
-        # 3. Объекты (аккуратно парсим, если прилетел словарь)
+        # 3. Объекты (принимаем как чистые строки от app.py, так и словари)
         if objects:
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 name, mark, comp = safe_parse_obj(obj)
-                if isinstance(obj, dict):
-                    if obj.get('company'):
-                        comp = str(obj.get('company'))
-                    if obj.get('markning'):
-                        mark = str(obj.get('markning'))
-
                 if name and "{" not in name:
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
