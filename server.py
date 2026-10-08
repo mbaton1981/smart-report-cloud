@@ -13,14 +13,15 @@ def get_db_connection():
     return conn
 
 def clean_obj_field(val):
+    """Безупречно извлекает чистое имя из любого мусора или словаря"""
     if not val:
         return ""
     val_str = str(val).strip()
-    if val_str.startswith("{") and "'name'" in val_str:
+    if "{" in val_str and "'name'" in val_str:
         try:
             d = ast.literal_eval(val_str)
             if isinstance(d, dict):
-                return d.get('name', val_str)
+                return str(d.get('name', '')).strip()
         except Exception:
             pass
     return val_str
@@ -64,26 +65,21 @@ def init_cloud_db():
         )
     ''')
     
-    # Жесткая очистка существующих мусорных записей со словарями в базе
+    # Радикальная очистка таблицы объектов от любых застрявших словарей
     try:
-        cursor.execute("SELECT rowid, name, markning, company FROM meta_objects")
+        cursor.execute("SELECT rowid, name FROM meta_objects")
         rows = cursor.fetchall()
         for row in rows:
-            name_val = row['name']
-            if name_val and str(name_val).strip().startswith("{"):
-                try:
-                    d = ast.literal_eval(name_val)
-                    real_name = d.get('name', '')
-                    real_mark = d.get('markning', '') or row['markning'] or ''
-                    real_comp = d.get('company', 'Privat') or row['company'] or 'Privat'
-                    if real_name:
-                        cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
-                        cursor.execute("INSERT OR REPLACE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", 
-                                       (real_name, real_mark, real_comp))
-                except Exception:
-                    pass
+            val = row['name']
+            if val and ('{' in str(val) or 'name' in str(val)):
+                cleaned = clean_obj_field(val)
+                if cleaned and cleaned != val:
+                    cursor.execute("UPDATE meta_objects SET name = ? WHERE rowid = ?", (cleaned, row['rowid']))
+                else:
+                    cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
+        conn.commit()
     except Exception as e:
-        print(f"DB cleanup notice: {e}")
+        print(f"Cleanup error: {e}")
 
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
@@ -109,16 +105,16 @@ def index():
     comp_rows = cursor.fetchall()
     companies = [row['name'] for row in comp_rows] if comp_rows else ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
+    cursor.execute("SELECT name, markning, company FROM meta_objects")
     obj_rows = cursor.fetchall()
     
     objects_map = {}
     for r in obj_rows:
         raw_name = clean_obj_field(r['name'])
-        if not raw_name:
+        if not raw_name or "{" in raw_name:
             continue
-        mark = r['markning'] or ""
-        comp = r['company'] or "Privat"
+        mark = clean_obj_field(r['markning']) if r['markning'] else ""
+        comp = clean_obj_field(r['company']) if r['company'] else "Privat"
         
         display_str = f"{mark} | {raw_name}" if mark else raw_name
         if comp and comp != 'Privat':
@@ -197,28 +193,30 @@ def sync_desktop_data():
                 placeholders = ','.join(['?'] * len(employees))
                 cursor.execute(f"DELETE FROM meta_employees WHERE name NOT IN ({placeholders})", employees)
                 for emp in employees:
-                    if emp:
-                        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
+                    emp_clean = clean_obj_field(emp)
+                    if emp_clean:
+                        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp_clean,))
 
             if companies:
                 placeholders = ','.join(['?'] * len(companies))
                 cursor.execute(f"DELETE FROM meta_companies WHERE name NOT IN ({placeholders})", companies)
                 for comp in companies:
-                    if comp:
-                        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
+                    comp_clean = clean_obj_field(comp)
+                    if comp_clean:
+                        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_clean,))
 
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, str) and obj:
                     clean_name = clean_obj_field(obj)
-                    if clean_name:
+                    if clean_name and "{" not in clean_name:
                         cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (clean_name, "Privat"))
                 elif isinstance(obj, dict) and obj.get("name"):
                     clean_name = clean_obj_field(obj.get("name"))
-                    if clean_name:
+                    if clean_name and "{" not in clean_name:
                         cursor.execute('''
                             INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-                        ''', (clean_name, obj.get("markning", ""), obj.get("company", "Privat")))
+                        ''', (clean_name, clean_obj_field(obj.get("markning", "")), clean_obj_field(obj.get("company", "Privat"))))
 
             for s in desktop_shifts:
                 obj_cleaned = clean_obj_field(s['object_name'])
