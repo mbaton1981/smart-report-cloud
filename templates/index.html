@@ -15,7 +15,7 @@
         button { background-color: #3498db; color: white; padding: 14px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold; transition: background 0.2s; }
         button:hover { background-color: #2980b9; }
         
-        /* Блок для отображения последних смен под сотрудником (в стиле темной темы) */
+        /* Блок для отображения последних смен под сотрудником */
         #recent-shifts-container { 
             margin-top: 10px; 
             margin-bottom: 15px;
@@ -50,7 +50,7 @@
             </select>
         </div>
 
-        <!-- Блок истории последних смен (появляется сразу под сотрудником при выборе) -->
+        <!-- Блок истории последних смен -->
         <div id="recent-shifts-container">
             <h4>Последние заполненные смены:</h4>
             <ul id="recent-shifts-list"></ul>
@@ -102,14 +102,13 @@
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
-        // При выборе сотрудника запрашиваем историю и предупреждения
-        document.getElementById('employee').addEventListener('change', async function() {
-            const selectedEmployee = this.value;
+        // Функция загрузки смен для выбранного сотрудника
+        async function loadEmployeeShifts(employeeName) {
             const container = document.getElementById('recent-shifts-container');
             const list = document.getElementById('recent-shifts-list');
             
             list.innerHTML = '';
-            if (!selectedEmployee) {
+            if (!employeeName) {
                 container.style.display = 'none';
                 return;
             }
@@ -118,12 +117,11 @@
                 const response = await fetch('/check-employee-shifts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ employee: selectedEmployee })
+                    body: JSON.stringify({ employee: employeeName })
                 });
                 
                 const data = await response.json();
                 
-                // Отображаем последние заполненные смены (если есть)
                 if (data.recent_shifts && data.recent_shifts.length > 0) {
                     data.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
@@ -134,13 +132,21 @@
                 } else {
                     container.style.display = 'none';
                 }
-                
-                // Если есть пропущенные дни за 2 недели, показываем предупреждение
-                if (data.warning) {
-                    alert(data.warning);
-                }
             } catch (e) {
                 console.error("Не удалось загрузить историю смен", e);
+            }
+        }
+
+        // При изменении сотрудника в выпадающем списке
+        document.getElementById('employee').addEventListener('change', function() {
+            loadEmployeeShifts(this.value);
+        });
+
+        // Сразу проверяем смены для уже выбранного при загрузке сотрудника
+        window.addEventListener('DOMContentLoaded', () => {
+            const initialEmployee = document.getElementById('employee').value;
+            if (initialEmployee) {
+                loadEmployeeShifts(initialEmployee);
             }
         });
 
@@ -171,7 +177,7 @@
                     document.getElementById('comment').value = '';
                     
                     // Обновляем список последних смен после отправки новой
-                    document.getElementById('employee').dispatchEvent(new Event('change'));
+                    loadEmployeeShifts(document.getElementById('employee').value);
                 } else {
                     alert("Ошибка: " + result.message);
                 }
