@@ -19,7 +19,6 @@
         .btn-history { background-color: #27ae60; margin-top: 10px; }
         .btn-history:hover { background-color: #219653; }
         
-        /* Список смен */
         #history-list { list-style-type: none; padding: 0; margin: 0; }
         #history-list li { background: #1a2332; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #2e5b88; font-size: 13px; color: #dfe6e9; display: flex; justify-content: space-between; align-items: center; }
     </style>
@@ -61,7 +60,11 @@
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
                         {% for obj in objects %}
-                        <option value="{{ obj }}">{{ obj }}</option>
+                            {% if obj is mapping %}
+                                <option value="{{ obj.name }}">{{ obj.display }}</option>
+                            {% else %}
+                                <option value="{{ obj }}">{{ obj }}</option>
+                            {% endif %}
                         {% endfor %}
                     </select>
                 </div>
@@ -86,7 +89,7 @@
             </form>
         </div>
 
-        <!-- ПРАВАЯ КОЛОНКА: Независимый блок просмотра последних смен работника -->
+        <!-- ПРАВАЯ КОЛОНКА: Блок просмотра истории -->
         <div class="history-box">
             <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">🔍 Проверка истории смен</h3>
             
@@ -114,15 +117,12 @@
     </div>
 
     <script>
-        // Ставим сегодняшнюю дату по умолчанию
         document.getElementById('date').value = new Date().toISOString().split('T')[0];
 
-        // Чекбокс транспорта
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
-        // Отправка формы смены
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -145,13 +145,10 @@
                 
                 const result = await response.json();
                 if (response.ok) {
-                    alert(result.message);
+                    alert("Смена успешно отправлена!");
                     document.getElementById('comment').value = '';
-                    // Автоматически подставляем отправленного сотрудника в блок проверки истории
-                    document.getElementById('history-employee').value = formData.employee;
-                    document.getElementById('load-history-btn').click();
                 } else {
-                    alert("Ошибка: " + (result.message || "Неизвестная ошибка сервера"));
+                    alert("Ошибка: " + (result.message || "Не удалось отправить"));
                 }
             } catch (err) {
                 alert("Не удалось отправить данные на сервер.");
@@ -159,7 +156,6 @@
             }
         });
 
-        // Загрузка истории смен в правом блоке
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
             const listContainer = document.getElementById('history-list');
@@ -192,7 +188,7 @@
                     data.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
                         li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #a0aec0;">${shift.object_name}</small></span>` +
-                                     `<span style="background: #2e5b88; padding: 4px 8px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
+                                       `<span style="background: #2e5b88; padding: 4px 8px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
                     });
                 } else {
