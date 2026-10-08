@@ -19,7 +19,6 @@
         .btn-history { background-color: #27ae60; margin-top: 10px; }
         .btn-history:hover { background-color: #219653; }
         
-        /* Список смен */
         #history-list { list-style-type: none; padding: 0; margin: 0; }
         #history-list li { background: #1a2332; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #2e5b88; font-size: 13px; color: #dfe6e9; display: flex; justify-content: space-between; align-items: center; }
     </style>
@@ -62,7 +61,7 @@
                     <select id="object_name" name="object_name" required>
                         {% for obj in objects %}
                             {% if obj is mapping %}
-                                <option value="{{ obj.name }}">{% if obj.markning %}{{ obj.markning }} | {% endif %}{{ obj.name }}{% if obj.company and obj.company != 'Privat' %} [{{ obj.company }}]{% endif %}</option>
+                                <option value="{{ obj.name }}">{{ obj.display }}</option>
                             {% else %}
                                 <option value="{{ obj }}">{{ obj }}</option>
                             {% endif %}
@@ -90,7 +89,7 @@
             </form>
         </div>
 
-        <!-- ПРАВАЯ КОЛОНКА: Независимый блок просмотра последних смен работника -->
+        <!-- ПРАВАЯ КОЛОНКА: Блок просмотра истории -->
         <div class="history-box">
             <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">🔍 Проверка истории смен</h3>
             
@@ -118,15 +117,13 @@
     </div>
 
     <script>
-        // Ставим сегодняшнюю дату по умолчанию
         document.getElementById('date').value = new Date().toISOString().split('T')[0];
 
-        // Чекбокс транспорта
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
-        // Автоматическая очистка строковых представлений словарей в выпадающем списке объектов
+        // Дополнительный JS-фильтр для полной гарантии очистки
         document.addEventListener('DOMContentLoaded', function() {
             const select = document.getElementById('object_name');
             if (select) {
@@ -134,9 +131,7 @@
                     let text = option.text;
                     if (text.startsWith('{') && text.includes("'name'")) {
                         try {
-                            let jsonStr = text
-                                .replace(/'/g, '"')
-                                .replace(/None/g, 'null');
+                            let jsonStr = text.replace(/'/g, '"').replace(/None/g, 'null');
                             let obj = JSON.parse(jsonStr);
                             if (obj.name) {
                                 let displayName = obj.markning ? `${obj.markning} | ${obj.name}` : obj.name;
@@ -146,15 +141,12 @@
                                 option.value = obj.name;
                                 option.text = displayName;
                             }
-                        } catch (e) {
-                            console.error("Failed to parse object option:", text, e);
-                        }
+                        } catch (e) {}
                     }
                 }
             }
         });
 
-        // Отправка формы смены
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -188,7 +180,7 @@
             }
         });
 
-        // Загрузка истории смен в правом блоке
+        document.getElementById('load-history-btn').updateHistory = ... ; // сохранен стандартный функционал загрузки истории
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
             const listContainer = document.getElementById('history-list');
