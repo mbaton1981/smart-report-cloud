@@ -126,6 +126,34 @@
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
+        // Автоматическая очистка строковых представлений словарей в выпадающем списке объектов
+        document.addEventListener('DOMContentLoaded', function() {
+            const select = document.getElementById('object_name');
+            if (select) {
+                for (let option of select.options) {
+                    let text = option.text;
+                    if (text.startsWith('{') && text.includes("'name'")) {
+                        try {
+                            let jsonStr = text
+                                .replace(/'/g, '"')
+                                .replace(/None/g, 'null');
+                            let obj = JSON.parse(jsonStr);
+                            if (obj.name) {
+                                let displayName = obj.markning ? `${obj.markning} | ${obj.name}` : obj.name;
+                                if (obj.company && obj.company !== 'Privat') {
+                                    displayName += ` [${obj.company}]`;
+                                }
+                                option.value = obj.name;
+                                option.text = displayName;
+                            }
+                        } catch (e) {
+                            console.error("Failed to parse object option:", text, e);
+                        }
+                    }
+                }
+            }
+        });
+
         // Отправка формы смены
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
