@@ -548,10 +548,10 @@ class SmartReportApp(QMainWindow):
                 "objects": objects,
                 "shifts": all_local_shifts
             }
-            requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=15)
+            requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=60)
 
             # 4. Забираем новые смены, созданные через телефон / веб-форму
-            response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=10)
+            response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=30)
             if response.status_code == 200:
                 data = response.json()
                 shifts_from_phone = data.get("shifts", [])
