@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
     QFrame, QFormLayout, QDialog, QCalendarWidget
 )
-from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtGui import QIcon, QColor
 
 # Импорты для генерации PDF
@@ -103,6 +103,11 @@ def init_db_once():
     columns = [col[1] for col in cursor.fetchall()]
     if 'invoiced' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
+
+    # Всегда проверяем и добавляем сотрудника по умолчанию, если таблица пустая
+    cursor.execute("SELECT COUNT(*) FROM employees")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
 
     if is_new_db:
         initial_data = [
@@ -388,6 +393,11 @@ class SmartReportApp(QMainWindow):
         init_db_once()
         self.init_ui()
 
+        # Автоматическая фоновая синхронизация каждые 2 минуты (120000 мс)
+        self.auto_sync_timer = QTimer(self)
+        self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
+        self.auto_sync_timer.start(120000)
+
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -504,91 +514,96 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(self.table_shifts)
         self.load_shifts_history()
 
-    def sync_with_cloud(self):
-        """Двусторонняя синхронизация: сначала забирает новые смены с телефона, затем обновляет облако"""
-        CLOUD_URL = "https://smart-report-server.onrender.com"  # Твой адрес на Render
+    def perform_sync_logic(self):
+        """Общая логика двусторонней синхронизации"""
+        CLOUD_URL = "https://smart-report-server.onrender.com"
         
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. Сначала забираем новые смены, созданные через телефон / веб-форму
+        response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            shifts_from_phone = data.get("shifts", [])
             
-            # 1. Сначала забираем новые смены, созданные через телефон / веб-форму
-            try:
-                response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    shifts_from_phone = data.get("shifts", [])
+            if shifts_from_phone:
+                downloaded_ids = []
+                for s in shifts_from_phone:
+                    cursor.execute('''
+                        SELECT id FROM shifts 
+                        WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                    ''', (s['date'], s['employee'], s['object_name'], s['hours']))
                     
-                    if shifts_from_phone:
-                        downloaded_ids = []
-                        for s in shifts_from_phone:
-                            # Проверяем, нет ли уже такой смены локально
-                            cursor.execute('''
-                                SELECT id FROM shifts 
-                                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                            ''', (s['date'], s['employee'], s['object_name'], s['hours']))
-                            
-                            if not cursor.fetchone():
-                                cursor.execute('''
-                                    INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                                ''', (
-                                    s['date'], s['employee'], s['company'], s['object_name'], 
-                                    s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
-                                ))
-                                
-                            downloaded_ids.append(s['id'])
+                    if not cursor.fetchone():
+                        cursor.execute('''
+                            INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        ''', (
+                            s['date'], s['employee'], s['company'], s['object_name'], 
+                            s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
+                        ))
+                        
+                    downloaded_ids.append(s['id'])
 
-                        conn.commit()
+                conn.commit()
 
-                        if downloaded_ids:
-                            requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
-            except Exception as e:
-                print(f"Ошибка при скачивании смен с телефона: {e}")
+                if downloaded_ids:
+                    requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
 
-            # 2. Собираем актуальные списки справочников из базы данных ПК
-            cursor.execute("SELECT name FROM employees ORDER BY name")
-            employees = [row[0] for row in cursor.fetchall()]
-            
-            cursor.execute("SELECT name FROM companies ORDER BY name")
-            companies = [row[0] for row in cursor.fetchall()]
-            
-            cursor.execute("SELECT name FROM objects ORDER BY name")
-            objects = [row[0] for row in cursor.fetchall()]
-            
-            # 3. Собираем все локальные смены (уже включая скачанные с телефона) для отправки в облако
-            cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
-            local_shift_rows = cursor.fetchall()
-            
-            conn.close()
+        # 2. Собираем актуальные списки справочников из базы данных ПК
+        cursor.execute("SELECT name FROM employees ORDER BY name")
+        employees = [row[0] for row in cursor.fetchall()]
+        
+        cursor.execute("SELECT name FROM companies ORDER BY name")
+        companies = [row[0] for row in cursor.fetchall()]
+        
+        cursor.execute("SELECT name FROM objects ORDER BY name")
+        objects = [row[0] for row in cursor.fetchall()]
+        
+        # 3. Собираем все локальные смены для отправки в облако
+        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
+        local_shift_rows = cursor.fetchall()
+        
+        conn.close()
 
-            all_local_shifts = []
-            for r in local_shift_rows:
-                all_local_shifts.append({
-                    "date": r[0],
-                    "employee": r[1],
-                    "company": r[2],
-                    "object_name": r[3],
-                    "hours": r[4],
-                    "rate": r[5],
-                    "transport": r[6],
-                    "comment": r[7]
-                })
+        all_local_shifts = []
+        for r in local_shift_rows:
+            all_local_shifts.append({
+                "date": r[0],
+                "employee": r[1],
+                "company": r[2],
+                "object_name": r[3],
+                "hours": r[4],
+                "rate": r[5],
+                "transport": r[6],
+                "comment": r[7]
+            })
 
-            # 4. Отправляем итоговый полный список на облачный сервер
-            metadata_payload = {
-                "employees": employees,
-                "companies": companies,
-                "objects": objects,
-                "shifts": all_local_shifts
-            }
-            requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=60)
+        metadata_payload = {
+            "employees": employees,
+            "companies": companies,
+            "objects": objects,
+            "shifts": all_local_shifts
+        }
+        requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=60)
 
+    def sync_with_cloud(self):
+        """Ручная синхронизация по кнопке с уведомлением"""
+        try:
+            self.perform_sync_logic()
             self.load_shifts_history()
             QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена! Данные обновлены в обе стороны.")
-
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
+
+    def background_sync_with_cloud(self):
+        """Тихая фоновая синхронизация по таймеру без всплывающих окон"""
+        try:
+            self.perform_sync_logic()
+            self.load_shifts_history()
+        except Exception:
+            pass  # Игнорируем сетевые ошибки в фоне, чтобы не мешать работе
 
     def setup_salary_tab(self):
         layout = QVBoxLayout(self.tab_salary)
@@ -1505,13 +1520,15 @@ class SmartReportApp(QMainWindow):
         if hasattr(self, 'emp_cb'):
             self.emp_cb.clear()
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            for row in cursor.fetchall():
+            rows = cursor.fetchall()
+            for row in rows:
                 self.emp_cb.addItem(row[0])
 
         if hasattr(self, 'bal_emp_cb'):
             self.bal_emp_cb.clear()
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            for row in cursor.fetchall():
+            rows = cursor.fetchall()
+            for row in rows:
                 self.bal_emp_cb.addItem(row[0])
 
         for cb in [getattr(self, 'comp_cb', None), getattr(self, 'inv_comp_cb', None), getattr(self, 'dag_comp_cb', None), getattr(self, 'new_obj_comp_cb', None)]:
@@ -1762,7 +1779,7 @@ class SmartReportApp(QMainWindow):
 
     def add_company_expense(self):
         date = self.exp_date.text().strip()
-        category = self.exp_cat_cb.currentText()
+        category = self.exp_cat_cb.currentTest()
         desc = self.exp_desc.text().strip()
         amt = parse_float(self.exp_amount.text(), None)
         if amt is None:
