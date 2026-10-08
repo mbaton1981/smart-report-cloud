@@ -14,20 +14,6 @@
         select:focus, input:focus, textarea:focus { border-color: #4a90e2; outline: none; }
         button { background-color: #3498db; color: white; padding: 14px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold; transition: background 0.2s; }
         button:hover { background-color: #2980b9; }
-        
-        /* Блок для отображения последних смен под сотрудником */
-        #recent-shifts-container { 
-            margin-top: 10px; 
-            margin-bottom: 15px;
-            padding: 12px; 
-            background: #1a2332; 
-            border: 1px solid #2e5b88; 
-            border-radius: 6px; 
-            display: none; 
-        }
-        #recent-shifts-container h4 { margin-top: 0; margin-bottom: 8px; color: #64b5f6; font-size: 14px; }
-        #recent-shifts-list { padding-left: 20px; margin: 0; }
-        #recent-shifts-list li { margin-bottom: 4px; font-size: 13px; color: #dfe6e9; }
     </style>
 </head>
 <body>
@@ -43,16 +29,11 @@
         <div class="form-group">
             <label for="employee">Сотрудник:</label>
             <select id="employee" name="employee" required>
+                <option value="">-- Выберите ваше имя --</option>
                 {% for emp in employees %}
-                <option value="{{ emp }}" {% if loop.first %}selected{% endif %}>{{ emp }}</option>
+                <option value="{{ emp }}">{{ emp }}</option>
                 {% endfor %}
             </select>
-        </div>
-
-        <!-- Блок истории последних смен -->
-        <div id="recent-shifts-container">
-            <h4>Последние заполненные смены:</h4>
-            <ul id="recent-shifts-list"></ul>
         </div>
 
         <div class="form-group">
@@ -92,6 +73,27 @@
         <button type="submit">Отправить смену</button>
     </form>
 
+    <!-- ОТДЕЛЬНЫЙ БЕЗОПАСНЫЙ БЛОК ДЛЯ ПРОВЕРКИ ИСТОРИИ -->
+    <div style="margin-top: 25px; background: #222631; padding: 20px; border-radius: 12px; border: 1px solid #2f3542; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
+        <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 12px;">🔍 История смен сотрудника</h3>
+        
+        <div style="margin-bottom: 12px;">
+            <select id="safe-employee" style="width: 100%; padding: 12px; background-color: #1e222b; border: 1px solid #3a4150; border-radius: 6px; color: #fff; font-size: 16px;">
+                <option value="">-- Выберите сотрудника --</option>
+                {% for emp in employees %}
+                <option value="{{ emp }}">{{ emp }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        
+        <button type="button" id="safe-btn" style="background-color: #27ae60; color: white; padding: 12px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold;">Показать смены</button>
+        
+        <div id="safe-result" style="margin-top: 15px; display: none; background: #1a2332; padding: 12px; border-radius: 6px; border: 1px solid #2e5b88;">
+            <h4 style="margin-top: 0; margin-bottom: 8px; color: #64b5f6; font-size: 14px;">Последние смены:</h4>
+            <ul id="safe-list" style="padding-left: 20px; margin: 0; font-size: 13px; color: #dfe6e9;"></ul>
+        </div>
+    </div>
+
     <script>
         // Ставим сегодняшнюю дату по умолчанию
         document.getElementById('date').valueAsDate = new Date();
@@ -101,55 +103,7 @@
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
-        // Функция загрузки смен для выбранного сотрудника
-        async function loadEmployeeShifts(employeeName) {
-            const container = document.getElementById('recent-shifts-container');
-            const list = document.getElementById('recent-shifts-list');
-            
-            list.innerHTML = '';
-            if (!employeeName) {
-                container.style.display = 'none';
-                return;
-            }
-
-            try {
-                const response = await fetch('/check-employee-shifts', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ employee: employeeName })
-                });
-                
-                const data = await response.json();
-                
-                if (data.recent_shifts && data.recent_shifts.length > 0) {
-                    data.recent_shifts.forEach(shift => {
-                        const li = document.createElement('li');
-                        li.textContent = `${shift.date} — ${shift.object_name} (${shift.hours} ч)`;
-                        list.appendChild(li);
-                    });
-                    container.style.display = 'block';
-                } else {
-                    container.style.display = 'none';
-                }
-            } catch (e) {
-                console.error("Не удалось загрузить историю смен", e);
-            }
-        }
-
-        // При изменении сотрудника в выпадающем списке
-        document.getElementById('employee').addEventListener('change', function() {
-            loadEmployeeShifts(this.value);
-        });
-
-        // Сразу проверяем смены для уже выбранного при загрузке сотрудника
-        window.addEventListener('DOMContentLoaded', () => {
-            const initialEmployee = document.getElementById('employee').value;
-            if (initialEmployee) {
-                loadEmployeeShifts(initialEmployee);
-            }
-        });
-
-        // Отправка данных смены на сервер
+        // Отправка данных основной смены
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -174,14 +128,49 @@
                 if (response.ok) {
                     alert(result.message);
                     document.getElementById('comment').value = '';
-                    
-                    // Обновляем список последних смен после отправки новой
-                    loadEmployeeShifts(document.getElementById('employee').value);
                 } else {
                     alert("Ошибка: " + result.message);
                 }
             } catch (err) {
                 alert("Не удалось отправить данные на сервер.");
+                console.error(err);
+            }
+        });
+
+        // Логика отдельной кнопки проверки истории
+        document.getElementById('safe-btn').addEventListener('click', async function() {
+            const emp = document.getElementById('safe-employee').value;
+            const container = document.getElementById('safe-result');
+            const list = document.getElementById('safe-list');
+            
+            list.innerHTML = '';
+            if (!emp) {
+                alert('Выберите сотрудника из списка!');
+                return;
+            }
+
+            try {
+                const response = await fetch('/check-employee-shifts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ employee: emp })
+                });
+                
+                const data = await response.json();
+                
+                if (data.recent_shifts && data.recent_shifts.length > 0) {
+                    data.recent_shifts.forEach(shift => {
+                        const li = document.createElement('li');
+                        li.textContent = `${shift.date} — ${shift.object_name} (${shift.hours} ч)`;
+                        list.appendChild(li);
+                    });
+                    container.style.display = 'block';
+                } else {
+                    list.innerHTML = '<li>У этого сотрудника пока нет сохраненных смен.</li>';
+                    container.style.display = 'block';
+                }
+            } catch (err) {
+                alert("Ошибка связи с сервером.");
                 console.error(err);
             }
         });
