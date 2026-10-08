@@ -13,7 +13,6 @@ def get_db_connection():
     return conn
 
 def clean_obj_field(val):
-    """Превращает любой случайно попавший словарь-строку в нормальный текст"""
     if not val:
         return ""
     val_str = str(val).strip()
@@ -65,6 +64,33 @@ def init_cloud_db():
         )
     ''')
     
+    # Жесткая очистка существующих мусорных записей со словарями в базе
+    try:
+        cursor.execute("SELECT rowid, name, markning, company FROM meta_objects")
+        rows = cursor.fetchall()
+        for row in rows:
+            name_val = row['name']
+            if name_val and str(name_val).strip().startswith("{"):
+                try:
+                    d = ast.literal_eval(name_val)
+                    real_name = d.get('name', '')
+                    real_mark = d.get('markning', '') or row['markning'] or ''
+                    real_comp = d.get('company', 'Privat') or row['company'] or 'Privat'
+                    if real_name:
+                        cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
+                        cursor.execute("INSERT OR REPLACE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", 
+                                       (real_name, real_mark, real_comp))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"DB cleanup notice: {e}")
+
+    cursor.execute("SELECT COUNT(*) FROM meta_employees")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO meta_employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
+        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", ("Privat",))
+        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Badbacken 2", "p1010", "Privat"))
+
     conn.commit()
     conn.close()
 
@@ -83,7 +109,7 @@ def index():
     comp_rows = cursor.fetchall()
     companies = [row['name'] for row in comp_rows] if comp_rows else ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects")
+    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
     obj_rows = cursor.fetchall()
     
     objects_map = {}
