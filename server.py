@@ -12,19 +12,22 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-def clean_obj_field(val):
-    """Безупречно извлекает чистое имя из любого мусора или словаря"""
+def safe_parse_obj(val):
+    """Аккуратно достает имя из любой строки или словаря без падений"""
     if not val:
-        return ""
+        return "", "", "Privat"
+    if isinstance(val, dict):
+        return str(val.get('name', '')).strip(), str(val.get('markning', '')).strip(), str(val.get('company', 'Privat')).strip()
+    
     val_str = str(val).strip()
     if "{" in val_str and "'name'" in val_str:
         try:
             d = ast.literal_eval(val_str)
             if isinstance(d, dict):
-                return str(d.get('name', '')).strip()
+                return str(d.get('name', '')).strip(), str(d.get('markning', '')).strip(), str(d.get('company', 'Privat')).strip()
         except Exception:
             pass
-    return val_str
+    return val_str, "", "Privat"
 
 def init_cloud_db():
     conn = get_db_connection()
@@ -44,7 +47,6 @@ def init_cloud_db():
             synced INTEGER DEFAULT 0
         )
     ''')
-    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
             name TEXT UNIQUE NOT NULL,
@@ -64,29 +66,6 @@ def init_cloud_db():
             UNIQUE(name, company)
         )
     ''')
-    
-    # Радикальная очистка таблицы объектов от любых застрявших словарей
-    try:
-        cursor.execute("SELECT rowid, name FROM meta_objects")
-        rows = cursor.fetchall()
-        for row in rows:
-            val = row['name']
-            if val and ('{' in str(val) or 'name' in str(val)):
-                cleaned = clean_obj_field(val)
-                if cleaned and cleaned != val:
-                    cursor.execute("UPDATE meta_objects SET name = ? WHERE rowid = ?", (cleaned, row['rowid']))
-                else:
-                    cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
-        conn.commit()
-    except Exception as e:
-        print(f"Cleanup error: {e}")
-
-    cursor.execute("SELECT COUNT(*) FROM meta_employees")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO meta_employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
-        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", ("Privat",))
-        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Badbacken 2", "p1010", "Privat"))
-
     conn.commit()
     conn.close()
 
@@ -98,36 +77,46 @@ def index():
     cursor = conn.cursor()
     
     cursor.execute("SELECT name FROM meta_employees ORDER BY name")
-    emp_rows = cursor.fetchall()
-    employees = [row['name'] for row in emp_rows] if emp_rows else ["Aliaksei Patonich"]
+    employees = [row['name'] for row in cursor.fetchall()]
+    if not employees:
+        employees = ["Aliaksei Patonich"]
 
     cursor.execute("SELECT name FROM meta_companies ORDER BY name")
-    comp_rows = cursor.fetchall()
-    companies = [row['name'] for row in comp_rows] if comp_rows else ["Privat"]
+    companies = [row['name'] for row in cursor.fetchall()]
+    if not companies:
+        companies = ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects")
+    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
     obj_rows = cursor.fetchall()
     
-    objects_map = {}
+    objects = []
+    seen = set()
     for r in obj_rows:
-        raw_name = clean_obj_field(r['name'])
-        if not raw_name or "{" in raw_name:
+        name, mark, comp = safe_parse_obj(r['name'])
+        if not name or "{" in name:
+            # Если в поле name затесался мусор, пробуем взять из колонок
+            name = str(r['name'])
+            mark = str(r['markning'] or '')
+            comp = str(r['company'] or 'Privat')
+
+        if not name or "{" in name:
             continue
-        mark = clean_obj_field(r['markning']) if r['markning'] else ""
-        comp = clean_obj_field(r['company']) if r['company'] else "Privat"
-        
-        display_str = f"{mark} | {raw_name}" if mark else raw_name
+
+        key = (name, comp)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        display_str = f"{mark} | {name}" if mark else name
         if comp and comp != 'Privat':
             display_str += f" [{comp}]"
             
-        objects_map[raw_name] = {
-            "name": raw_name,
+        objects.append({
+            "name": name,
             "markning": mark,
             "company": comp,
             "display": display_str
-        }
-
-    objects = sorted(list(objects_map.values()), key=lambda x: (x['company'], x['name']))
+        })
 
     conn.close()
     return render_template('index.html', employees=employees, companies=companies, objects=objects)
@@ -135,31 +124,25 @@ def index():
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
     data = request.json
-    for attempt in range(5):
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-            ''', (
-                data.get('date'),
-                data.get('employee'),
-                data.get('company'),
-                clean_obj_field(data.get('object_name')),
-                data.get('hours', 0.0),
-                data.get('rate', 0.0),
-                data.get('transport', 0.0),
-                data.get('comment', ''),
-            ))
-            conn.commit()
-            conn.close()
-            return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e) and attempt < 4:
-                time.sleep(0.5)
-                continue
-            raise e
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    name, _, _ = safe_parse_obj(data.get('object_name'))
+    cursor.execute('''
+        INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (
+        data.get('date'),
+        data.get('employee'),
+        data.get('company'),
+        name or data.get('object_name'),
+        data.get('hours', 0.0),
+        data.get('rate', 0.0),
+        data.get('transport', 0.0),
+        data.get('comment', ''),
+    ))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
@@ -171,9 +154,7 @@ def check_employee_shifts():
     rows = cursor.fetchall()
     conn.close()
     
-    shifts = []
-    for r in rows:
-        shifts.append({"date": r['date'], "object_name": clean_obj_field(r['object_name']), "hours": r['hours']})
+    shifts = [{"date": r['date'], "object_name": r['object_name'], "hours": r['hours']} for r in rows]
     return jsonify({"recent_shifts": shifts})
 
 @app.route('/sync-desktop-data', methods=['POST'])
@@ -184,86 +165,64 @@ def sync_desktop_data():
     objects = data.get("objects", [])
     desktop_shifts = data.get("shifts", [])
 
-    for attempt in range(5):
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-            if employees:
-                placeholders = ','.join(['?'] * len(employees))
-                cursor.execute(f"DELETE FROM meta_employees WHERE name NOT IN ({placeholders})", employees)
-                for emp in employees:
-                    emp_clean = clean_obj_field(emp)
-                    if emp_clean:
-                        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp_clean,))
+    try:
+        # 1. Сотрудники (просто добавляем новые, не ломая старые)
+        if employees:
+            for emp in employees:
+                if emp:
+                    cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
 
-            if companies:
-                placeholders = ','.join(['?'] * len(companies))
-                cursor.execute(f"DELETE FROM meta_companies WHERE name NOT IN ({placeholders})", companies)
-                for comp in companies:
-                    comp_clean = clean_obj_field(comp)
-                    if comp_clean:
-                        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_clean,))
+        # 2. Компании
+        if companies:
+            for comp in companies:
+                if comp:
+                    cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
+        # 3. Объекты (аккуратно парсим, если прилетел словарь)
+        if objects:
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
-                # Если десктоп присылает объект в виде словаря или строки-словаря, вытаскиваем поля корректно
+                name, mark, comp = safe_parse_obj(obj)
                 if isinstance(obj, dict):
-                    name_val = clean_obj_field(obj.get("name"))
-                    mark_val = clean_obj_field(obj.get("markning", ""))
-                    comp_val = clean_obj_field(obj.get("company", "Privat"))
-                else:
-                    raw_str = str(obj)
-                    if "{" in raw_str and "'name'" in raw_str:
-                        try:
-                            d = ast.literal_eval(raw_str)
-                            name_val = clean_obj_field(d.get("name", ""))
-                            mark_val = clean_obj_field(d.get("markning", ""))
-                            comp_val = clean_obj_field(d.get("company", "Privat"))
-                        except Exception:
-                            name_val = clean_obj_field(raw_str)
-                            mark_val = ""
-                            comp_val = "Privat"
-                    else:
-                        name_val = clean_obj_field(raw_str)
-                        mark_val = ""
-                        comp_val = "Privat"
+                    if obj.get('company'):
+                        comp = str(obj.get('company'))
+                    if obj.get('markning'):
+                        mark = str(obj.get('markning'))
 
-                if name_val and "{" not in name_val:
+                if name and "{" not in name:
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-                    ''', (name_val, mark_val, comp_val if comp_val else "Privat"))
+                    ''', (name, mark, comp if comp else "Privat"))
 
-            for s in desktop_shifts:
-                obj_cleaned = clean_obj_field(s['object_name'])
+        # 4. Смены
+        for s in desktop_shifts:
+            name, _, _ = safe_parse_obj(s.get('object_name'))
+            obj_name = name or s.get('object_name')
+            
+            cursor.execute('''
+                SELECT id FROM cloud_shifts 
+                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+            ''', (s.get('date'), s.get('employee'), obj_name, s.get('hours')))
+            if not cursor.fetchone():
                 cursor.execute('''
-                    SELECT id FROM cloud_shifts 
-                    WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                ''', (s['date'], s['employee'], obj_cleaned, s['hours']))
-                if not cursor.fetchone():
-                    cursor.execute('''
-                        INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        s['date'], 
-                        s['employee'], 
-                        s['company'], 
-                        obj_cleaned,
-                        s['hours'], 
-                        s.get('rate', 0.0), 
-                        s.get('transport', 0.0), 
-                        s.get('comment', ''), 
-                        1
-                    ))
+                    INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    s.get('date'), s.get('employee'), s.get('company'), obj_name,
+                    s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+                ))
 
-            conn.commit()
-            conn.close()
-            return jsonify({"status": "synced"})
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e) and attempt < 4:
-                time.sleep(0.5)
-                continue
-            raise e
+        conn.commit()
+    except Exception as e:
+        print(f"Sync error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    return jsonify({"status": "synced"})
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
@@ -273,12 +232,10 @@ def get_unsynced():
     rows = cursor.fetchall()
     conn.close()
     
-    shifts = []
-    for r in rows:
-        shifts.append({
-            "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
-            "object_name": clean_obj_field(r['object_name']), "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
-        })
+    shifts = [{
+        "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
+        "object_name": r['object_name'], "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
+    } for r in rows]
     return jsonify({"shifts": shifts})
 
 @app.route('/mark-synced', methods=['POST'])
