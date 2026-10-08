@@ -520,15 +520,16 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
-        # 2. Собираем актуальные списки справочников (включая всех сотрудников!) из базы данных ПК
+        # 2. Собираем актуальные списки справочников из базы данных ПК
         cursor.execute("SELECT name FROM employees ORDER BY name")
         employees = [row[0] for row in cursor.fetchall()]
         
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
         
-        cursor.execute("SELECT name FROM objects ORDER BY name")
-        objects = [row[0] for row in cursor.fetchall()]
+        # Передаем объекты как словари, чтобы сервер знал их маркировку и компанию!
+        cursor.execute("SELECT name, markning, company FROM objects ORDER BY name")
+        objects = [{"name": row[0], "markning": row[1], "company": row[2]} for row in cursor.fetchall()]
         
         # 3. Собираем все локальные смены для отправки в облако
         cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
