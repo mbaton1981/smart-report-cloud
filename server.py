@@ -1,11 +1,11 @@
 import sqlite3
+import time
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 DB_FILE = "cloud_database.db"
 
 def get_db_connection():
-    # Увеличиваем timeout до 30 секунд и включаем режим WAL для предотвращения блокировок
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.execute('PRAGMA journal_mode=WAL;')
     conn.row_factory = sqlite3.Row
@@ -15,7 +15,6 @@ def init_cloud_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Таблица для смен из веб-формы
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cloud_shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +30,6 @@ def init_cloud_db():
         )
     ''')
     
-    # Таблицы для хранения справочников
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
             name TEXT UNIQUE NOT NULL,
@@ -52,7 +50,6 @@ def init_cloud_db():
         )
     ''')
     
-    # Дефолтный сотрудник на случай пустой базы
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
@@ -131,42 +128,49 @@ def sync_desktop_data():
     objects = data.get("objects", [])
     desktop_shifts = data.get("shifts", [])
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    for attempt in range(3):
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-    for emp in employees:
-        if emp:
-            cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
+            for emp in employees:
+                if emp:
+                    cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
 
-    for comp in companies:
-        if comp:
-            cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
+            for comp in companies:
+                if comp:
+                    cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
 
-    for obj in objects:
-        if isinstance(obj, str) and obj:
-            cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
-        elif isinstance(obj, dict) and obj.get("name"):
-            cursor.execute('''
-                INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-            ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
+            for obj in objects:
+                if isinstance(obj, str) and obj:
+                    cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
+                elif isinstance(obj, dict) and obj.get("name"):
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
+                    ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
 
-    for s in desktop_shifts:
-        cursor.execute('''
-            SELECT id FROM cloud_shifts 
-            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
-        if not cursor.fetchone():
-            cursor.execute('''
-                INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-            ''', (
-                s['date'], s['employee'], s['company'], s['object_name'],
-                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
-            ))
+            for s in desktop_shifts:
+                cursor.execute('''
+                    SELECT id FROM cloud_shifts 
+                    WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+                if not cursor.fetchone():
+                    cursor.execute('''
+                        INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        s['date'], s['employee'], s['company'], s['object_name'],
+                        s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+                    ))
 
-    conn.commit()
-    conn.close()
-    return jsonify({"status": "synced"})
+            conn.commit()
+            conn.close()
+            return jsonify({"status": "synced"})
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < 2:
+                time.sleep(0.5)
+                continue
+            raise e
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
