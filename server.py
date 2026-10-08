@@ -1,5 +1,6 @@
 import sqlite3
 import time
+import ast
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
@@ -50,7 +51,26 @@ def init_cloud_db():
         )
     ''')
     
-    # Первоначальные демо-данные, если таблицы совсем пустые
+    # Автоматическая очистка базы данных от случайно попавших туда строковых словарей
+    try:
+        cursor.execute("SELECT rowid, name, markning, company FROM meta_objects")
+        for row in cursor.fetchall():
+            name_val = row['name']
+            if name_val and name_val.strip().startswith("{") and "'name'" in name_val:
+                try:
+                    d = ast.literal_eval(name_val)
+                    real_name = d.get('name', '')
+                    real_mark = d.get('markning', '') or row['markning'] or ''
+                    real_comp = d.get('company', 'Privat') or row['company'] or 'Privat'
+                    # Удаляем дубликаты или обновляем текущую строку
+                    cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
+                    cursor.execute("INSERT OR REPLACE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", 
+                                   (real_name, real_mark, real_comp))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
@@ -154,7 +174,6 @@ def sync_desktop_data():
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # 1. Синхронизация сотрудников с полным удалением тех, кого удалили на ПК
             if employees:
                 placeholders = ','.join(['?'] * len(employees))
                 cursor.execute(f"DELETE FROM meta_employees WHERE name NOT IN ({placeholders})", employees)
@@ -162,7 +181,6 @@ def sync_desktop_data():
                     if emp:
                         cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
 
-            # 2. Синхронизация компаний с полным удалением устаревших
             if companies:
                 placeholders = ','.join(['?'] * len(companies))
                 cursor.execute(f"DELETE FROM meta_companies WHERE name NOT IN ({placeholders})", companies)
@@ -170,17 +188,23 @@ def sync_desktop_data():
                     if comp:
                         cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
 
-            # 3. Синхронизация объектов (очищаем старые и записываем актуальные с ПК)
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, str) and obj:
-                    cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
+                    if obj.strip().startswith("{") and "'name'" in obj:
+                        try:
+                            d = ast.literal_eval(obj)
+                            cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", 
+                                           (d.get('name'), d.get('markning', ''), d.get('company', 'Privat')))
+                        except Exception:
+                            cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
+                    else:
+                        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
                 elif isinstance(obj, dict) and obj.get("name"):
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
 
-            # 4. Синхронизация смен
             for s in desktop_shifts:
                 cursor.execute('''
                     SELECT id FROM cloud_shifts 
