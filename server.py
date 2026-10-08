@@ -8,14 +8,15 @@ app = Flask(__name__)
 DB_FILE = "smart_report.db"
 
 def get_db_connection():
+    # Убираем PRAGMA отсюда, чтобы соединения не блокировали друг друга при чтении
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    # Включаем WAL режим, чтобы избежать блокировок при одновременном чтении/записи
-    conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
 def init_db():
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_FILE)
+    # Включаем WAL режим один раз при инициализации базы данных
+    conn.execute("PRAGMA journal_mode=WAL;")
     cursor = conn.cursor()
     
     # Таблица для смен в облаке
