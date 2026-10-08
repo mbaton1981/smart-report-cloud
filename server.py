@@ -180,7 +180,13 @@ def sync_desktop_data():
         if objects:
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
-                name, mark, comp = safe_parse_obj(obj)
+                if isinstance(obj, dict):
+                    name = str(obj.get('name', '')).strip()
+                    mark = str(obj.get('markning', '')).strip()
+                    comp = str(obj.get('company', '')).strip()
+                else:
+                    name, mark, comp = safe_parse_obj(obj)
+
                 if name and "{" not in name:
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
