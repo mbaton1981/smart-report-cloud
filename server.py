@@ -8,7 +8,8 @@ app = Flask(__name__)
 DB_FILE = "smart_report.db"
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    # Добавляем timeout=10.0, чтобы соединения ждали освобождения блокировки
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     conn.row_factory = sqlite3.Row
     return conn
 
