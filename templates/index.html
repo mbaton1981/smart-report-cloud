@@ -1,0 +1,20 @@
+document.getElementById('employee').addEventListener('change', async function() {
+    const selectedEmployee = this.value;
+    if (!selectedEmployee) return;
+
+    try {
+        const response = await fetch('/check-employee-shifts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ employee: selectedEmployee })
+        });
+
+        const data = await response.json();
+
+        if (data.warning) {
+            alert(data.warning);
+        }
+    } catch (e) {
+        console.error("Не удалось проверить смены сотрудника", e);
+    }
+});
