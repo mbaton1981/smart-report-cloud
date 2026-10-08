@@ -8,9 +8,9 @@ app = Flask(__name__)
 DB_FILE = "smart_report.db"
 
 def get_db_connection():
-    # Убираем PRAGMA отсюда, чтобы соединения не блокировали друг друга при чтении
-    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn = sqlite3.connect('smart_report.db', timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL;')
     return conn
 
 def init_db():
