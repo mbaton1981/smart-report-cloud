@@ -72,7 +72,6 @@ def index():
     
     conn.close()
     
-    # Если справочники пустые (ПК еще не синхронизировался), дадим базовые заглушки
     if not employees:
         employees = ["Aliaksei", "Сотрудник 1"]
     if not companies:
@@ -181,7 +180,7 @@ def check_employee_shifts():
     employee_name = data.get('employee')
     
     if not employee_name:
-        return jsonify({"warning": ""})
+        return jsonify({"warning": "", "recent_shifts": []})
         
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -189,18 +188,29 @@ def check_employee_shifts():
     today = datetime.now().date()
     start_date = today - timedelta(days=14)
     
+    # 1. Проверяем пропущенные смены за 2 недели
     cursor.execute('''
         SELECT date FROM shifts 
         WHERE employee = ? AND date >= ? AND date <= ?
     ''', (employee_name, start_date.isoformat(), today.isoformat()))
     
     worked_dates = {row[0] for row in cursor.fetchall()}
+    
+    # 2. Получаем последние заполненные смены сотрудника (до 10 штук)
+    cursor.execute('''
+        SELECT date, object_name, hours FROM shifts 
+        WHERE employee = ? 
+        ORDER BY date DESC 
+        LIMIT 10
+    ''', (employee_name,))
+    
+    recent_shifts = [{"date": row[0], "object_name": row[1], "hours": row[2]} for row in cursor.fetchall()]
     conn.close()
     
     missing_dates = []
     current = start_date
     while current <= today:
-        if current.weekday() != 6: # Исключая воскресенья
+        if current.weekday() != 6:  # Исключая воскресенья
             d_str = current.isoformat()
             if d_str not in worked_dates:
                 missing_dates.append(d_str)
@@ -211,8 +221,13 @@ def check_employee_shifts():
     else:
         msg = ""
         
-    return jsonify({"warning": msg, "missing_count": len(missing_dates)})
+    return jsonify({
+        "warning": msg, 
+        "missing_count": len(missing_dates),
+        "recent_shifts": recent_shifts
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
     app.run(host='0.0.0.0', port=port)
