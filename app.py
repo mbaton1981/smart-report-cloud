@@ -505,10 +505,34 @@ class SmartReportApp(QMainWindow):
         self.load_shifts_history()
 
     def sync_with_cloud(self):
-        """Скачивает новые смены из облачного сервера и добавляет их в локальную базу"""
-        CLOUD_URL = "https://tvoj-server.onrender.com"  # ⚠️ Замени на свой адрес
+        """Скачивает новые смены из облачного сервера, а также выгружает актуальные справочники в облако"""
+        CLOUD_URL = "https://smart-report-server.onrender.com"  # Твой адрес на Render
         
         try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 1. Собираем актуальные списки из базы данных ПК
+            cursor.execute("SELECT name FROM employees ORDER BY name")
+            employees = [row[0] for row in cursor.fetchall()]
+            
+            cursor.execute("SELECT name FROM companies ORDER BY name")
+            companies = [row[0] for row in cursor.fetchall()]
+            
+            cursor.execute("SELECT name FROM objects ORDER BY name")
+            objects = [row[0] for row in cursor.fetchall()]
+            
+            conn.close()
+
+            # 2. Отправляем справочники на облачный сервер
+            metadata_payload = {
+                "employees": employees,
+                "companies": companies,
+                "objects": objects
+            }
+            requests.post(f"{CLOUD_URL}/update-metadata", json=metadata_payload, timeout=10)
+
+            # 3. Забираем новые смены с телефона
             response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=10)
             if response.status_code != 200:
                 QMessageBox.warning(self, "Ошибка", f"Не удалось связаться с сервером. Код: {response.status_code}")
@@ -518,7 +542,8 @@ class SmartReportApp(QMainWindow):
             shifts = data.get("shifts", [])
             
             if not shifts:
-                QMessageBox.information(self, "Синхронизация", "Новых смен с телефона пока нет.")
+                QMessageBox.information(self, "Синхронизация", "Справочники успешно обновлены в облаке! Новых смен с телефона пока нет.")
+                self.load_shifts_history()
                 return
 
             conn = get_db_connection()
@@ -537,7 +562,7 @@ class SmartReportApp(QMainWindow):
                     s['company'], 
                     s['object_name'], 
                     s['hours'], 
-                    s['rate'], 
+                    0.0, 
                     s['transport'], 
                     s['comment']
                 ))
@@ -551,7 +576,7 @@ class SmartReportApp(QMainWindow):
                 requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
 
             self.load_shifts_history()
-            QMessageBox.information(self, "Успех", f"Успешно загружено новых смен с телефона: {added_count}!")
+            QMessageBox.information(self, "Успех", f"Справочники обновлены! Загружено новых смен с телефона: {added_count}!")
 
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
