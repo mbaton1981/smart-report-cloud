@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
-    QFrame, QFormLayout, QDialog, QCalendarWidget
+    QFrame, QFormLayout, QDateEdit
 )
 from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtGui import QIcon, QColor
@@ -251,7 +251,7 @@ DARK_THEME_QSS = """
         background-color: #7a3434;
         border-color: #c53030;
     }
-    QLineEdit, QComboBox {
+    QLineEdit, QComboBox, QDateEdit {
         background-color: #28303d;
         color: #f7fafc;
         border: 1px solid #3f4c60;
@@ -259,11 +259,11 @@ DARK_THEME_QSS = """
         border-radius: 6px;
         selection-background-color: #4299e1;
     }
-    QLineEdit:focus, QComboBox:focus {
+    QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
         border: 1px solid #4299e1;
         background-color: #2d3748;
     }
-    QComboBox::drop-down {
+    QComboBox::drop-down, QDateEdit::drop-down {
         subcontrol-origin: padding;
         subcontrol-position: top right;
         width: 28px;
@@ -272,10 +272,10 @@ DARK_THEME_QSS = """
         border-bottom-right-radius: 6px;
         background-color: #313c4e;
     }
-    QComboBox::drop-down:hover {
+    QComboBox::drop-down:hover, QDateEdit::drop-down:hover {
         background-color: #3c495f;
     }
-    QComboBox::down-arrow {
+    QComboBox::down-arrow, QDateEdit::down-arrow {
         image: none;
         width: 0px;
         height: 0px;
@@ -334,53 +334,20 @@ DARK_THEME_QSS = """
     }
 """
 
-class CalendarDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Выберите дату")
-        self.setFixedSize(320, 280)
-        
-        layout = QVBoxLayout(self)
-        self.calendar = QCalendarWidget()
-        self.calendar.setGridVisible(True)
-        layout.addWidget(self.calendar)
-        
-        btn_layout = QHBoxLayout()
-        ok_btn = QPushButton("Выбрать")
-        ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Отмена")
-        cancel_btn.clicked.connect(self.reject)
-        
-        btn_layout.addWidget(ok_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-
-    def get_selected_date(self):
-        return self.calendar.selectedDate().toString("yyyy-MM-dd")
-
 def create_date_field(default_date_str=""):
-    container = QWidget()
-    h_layout = QHBoxLayout(container)
-    h_layout.setContentsMargins(0, 0, 0, 0)
-    h_layout.setSpacing(4)
-    
-    line_edit = QLineEdit(default_date_str)
-    btn = QPushButton("📅")
-    btn.setFixedWidth(40)
-    
-    def open_calendar():
-        dlg = CalendarDialog(container)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            line_edit.setText(dlg.get_selected_date())
-            
-    btn.clicked.connect(open_calendar)
-    h_layout.addWidget(line_edit)
-    h_layout.addWidget(btn)
-    
-    container.text = line_edit.text
-    container.setText = line_edit.setText
-    container.line_edit = line_edit
-    return container
+    date_edit = QDateEdit()
+    date_edit.setCalendarPopup(True)
+    date_edit.setDisplayFormat("yyyy-MM-dd")
+    if default_date_str:
+        qdate = QDate.fromString(default_date_str, "yyyy-MM-dd")
+        if qdate.isValid():
+            date_edit.setDate(qdate)
+    else:
+        date_edit.setDate(QDate.currentDate())
+        
+    date_edit.text = lambda: date_edit.date().toString("yyyy-MM-dd")
+    date_edit.setText = lambda val: date_edit.setDate(QDate.fromString(val, "yyyy-MM-dd"))
+    return date_edit
 
 
 class SmartReportApp(QMainWindow):
@@ -1779,7 +1746,7 @@ class SmartReportApp(QMainWindow):
 
     def add_company_expense(self):
         date = self.exp_date.text().strip()
-        category = self.exp_cat_cb.currentTest()
+        category = self.exp_cat_cb.currentText()
         desc = self.exp_desc.text().strip()
         amt = parse_float(self.exp_amount.text(), None)
         if amt is None:
