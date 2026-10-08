@@ -61,7 +61,11 @@
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
                         {% for obj in objects %}
-                        <option value="{{ obj.name }}">{% if obj.markning %}{{ obj.markning }} | {% endif %}{{ obj.name }}</option>
+                            {% if obj is mapping %}
+                                <option value="{{ obj.name }}">{% if obj.markning %}{{ obj.markning }} | {% endif %}{{ obj.name }}{% if obj.company and obj.company != 'Privat' %} [{{ obj.company }}]{% endif %}</option>
+                            {% else %}
+                                <option value="{{ obj }}">{{ obj }}</option>
+                            {% endif %}
                         {% endfor %}
                     </select>
                 </div>

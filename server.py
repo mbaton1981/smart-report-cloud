@@ -78,11 +78,11 @@ def index():
     obj_rows = cursor.fetchall()
     objects = []
     for r in obj_rows:
-        # Формируем аккуратное отображение для объектов, исключая «тарабарщину»
-        mark = f" ({r['markning']})" if r['markning'] else ""
-        comp = f" [{r['company']}]" if r['company'] and r['company'] != 'Privat' else ""
-        display_str = f"{r['name']}{mark}{comp}"
-        objects.append({"name": r['name'], "markning": r['markning'] or "", "company": r['company'], "display": display_str})
+        objects.append({
+            "name": r['name'], 
+            "markning": r['markning'] or "", 
+            "company": r['company']
+        })
 
     conn.close()
     return render_template('index.html', employees=employees, companies=companies, objects=objects)
@@ -144,7 +144,7 @@ def sync_desktop_data():
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # Синхронизация сотрудников (включая удаление тех, кого нет в списке с ПК)
+            # Синхронизация сотрудников с удалением устаревших
             if employees:
                 placeholders = ','.join(['?'] * len(employees))
                 cursor.execute(f"DELETE FROM meta_employees WHERE name NOT IN ({placeholders})", employees)
@@ -152,7 +152,7 @@ def sync_desktop_data():
                     if emp:
                         cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (emp,))
 
-            # Синхронизация компаний (включая удаление)
+            # Синхронизация компаний с удалением устаревших
             if companies:
                 placeholders = ','.join(['?'] * len(companies))
                 cursor.execute(f"DELETE FROM meta_companies WHERE name NOT IN ({placeholders})", companies)
