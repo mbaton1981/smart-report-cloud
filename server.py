@@ -86,24 +86,31 @@ def index():
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
     data = request.json
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-    ''', (
-        data.get('date'),
-        data.get('employee'),
-        data.get('company'),
-        data.get('object_name'),
-        data.get('hours', 0.0),
-        data.get('rate', 0.0),
-        data.get('transport', 0.0),
-        data.get('comment', ''),
-    ))
-    conn.commit()
-    conn.close()
-    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
+    for attempt in range(5):
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ''', (
+                data.get('date'),
+                data.get('employee'),
+                data.get('company'),
+                data.get('object_name'),
+                data.get('hours', 0.0),
+                data.get('rate', 0.0),
+                data.get('transport', 0.0),
+                data.get('comment', ''),
+            ))
+            conn.commit()
+            conn.close()
+            return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < 4:
+                time.sleep(0.5)
+                continue
+            raise e
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
@@ -175,7 +182,7 @@ def sync_desktop_data():
             return jsonify({"status": "synced"})
         except sqlite3.OperationalError as e:
             if "locked" in str(e) and attempt < 4:
-                time.sleep(1.0)
+                time.sleep(0.5)
                 continue
             raise e
 
