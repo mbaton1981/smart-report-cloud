@@ -3,31 +3,40 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Учет смен</title>
+    <title>Bygger och renoverar i Sthlm</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 0 15px; color: #333; background-color: #f4f7f6; }
-        h2 { text-align: center; color: #444; }
-        form { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-        select, input, textarea { width: 100%; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 16px; }
-        button { background-color: #28a745; color: white; padding: 12px; border: none; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold; }
-        button:hover { background-color: #218838; }
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 0 15px; color: #fff; background-color: #1a1d24; }
+        h2 { text-align: center; color: #4a90e2; }
+        form { background: #222631; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid #2f3542; }
+        .form-group { margin-bottom: 18px; }
+        label { display: block; margin-bottom: 6px; font-weight: bold; color: #b2bec3; font-size: 14px; }
+        select, input, textarea { width: 100%; padding: 12px; box-sizing: border-box; background-color: #1e222b; border: 1px solid #3a4150; border-radius: 6px; font-size: 16px; color: #fff; }
+        select:focus, input:focus, textarea:focus { border-color: #4a90e2; outline: none; }
+        button { background-color: #3498db; color: white; padding: 14px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold; transition: background 0.2s; }
+        button:hover { background-color: #2980b9; }
         
-        /* Блок для отображения последних смен */
-        #recent-shifts-container { margin-top: 15px; padding: 12px; background: #e8f4fd; border: 1px solid #b8daff; border-radius: 6px; display: none; }
-        #recent-shifts-container h4 { margin-top: 0; margin-bottom: 8px; color: #004085; font-size: 15px; }
+        /* Блок для отображения последних смен под сотрудником (в стиле темной темы) */
+        #recent-shifts-container { 
+            margin-top: 10px; 
+            margin-bottom: 15px;
+            padding: 12px; 
+            background: #1a2332; 
+            border: 1px solid #2e5b88; 
+            border-radius: 6px; 
+            display: none; 
+        }
+        #recent-shifts-container h4 { margin-top: 0; margin-bottom: 8px; color: #64b5f6; font-size: 14px; }
         #recent-shifts-list { padding-left: 20px; margin: 0; }
-        #recent-shifts-list li { margin-bottom: 4px; font-size: 14px; color: #222; }
+        #recent-shifts-list li { margin-bottom: 4px; font-size: 13px; color: #dfe6e9; }
     </style>
 </head>
 <body>
 
-    <h2>Учет рабочего времени</h2>
-    
     <form id="shift-form">
+        <h2 style="margin-top: 0; margin-bottom: 20px;">Bygger och renoverar i Sthlm</h2>
+
         <div class="form-group">
-            <label for="date">Дата:</label>
+            <label for="date">Дата смены:</label>
             <input type="date" id="date" name="date" required>
         </div>
 
@@ -41,14 +50,14 @@
             </select>
         </div>
 
-        <!-- Блок истории последних смен сотрудника -->
+        <!-- Блок истории последних смен (появляется сразу под сотрудником при выборе) -->
         <div id="recent-shifts-container">
-            <h4>Ваши последние заполненные смены:</h4>
+            <h4>Последние заполненные смены:</h4>
             <ul id="recent-shifts-list"></ul>
         </div>
 
-        <div class="form-group" style="margin-top: 15px;">
-            <label for="company">Компания:</label>
+        <div class="form-group">
+            <label for="company">Фирма (Заказчик):</label>
             <select id="company" name="company" required>
                 {% for comp in companies %}
                 <option value="{{ comp }}">{{ comp }}</option>
@@ -57,7 +66,7 @@
         </div>
 
         <div class="form-group">
-            <label for="object_name">Объект:</label>
+            <label for="object_name">Объект / Адрес:</label>
             <select id="object_name" name="object_name" required>
                 {% for obj in objects %}
                 <option value="{{ obj }}">{{ obj }}</option>
@@ -66,18 +75,19 @@
         </div>
 
         <div class="form-group">
-            <label for="hours">Часы:</label>
+            <label for="hours">Отработано часов:</label>
             <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
         </div>
 
-        <div class="form-group">
-            <label for="transport">Транспорт (км / доплата):</label>
-            <input type="number" step="0.5" id="transport" name="transport" value="0.0">
+        <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
+            <input type="checkbox" id="transport_check" style="width: 20px; height: 20px; cursor: pointer;">
+            <label for="transport_check" style="margin-bottom: 0; cursor: pointer; color: #fff;">Транспорт (учитывать поездку)</label>
+            <input type="hidden" id="transport" name="transport" value="0.0">
         </div>
 
         <div class="form-group">
-            <label for="comment">Комментарий:</label>
-            <textarea id="comment" name="comment" rows="2" placeholder="Необязательно"></textarea>
+            <label for="comment">Описание выполненных работ:</label>
+            <textarea id="comment" name="comment" rows="3" placeholder="Что было сделано за смену..."></textarea>
         </div>
 
         <button type="submit">Отправить смену</button>
@@ -86,6 +96,11 @@
     <script>
         // Ставим сегодняшнюю дату по умолчанию
         document.getElementById('date').valueAsDate = new Date();
+
+        // Логика чекбокса транспорта
+        document.getElementById('transport_check').addEventListener('change', function() {
+            document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
+        });
 
         // При выборе сотрудника запрашиваем историю и предупреждения
         document.getElementById('employee').addEventListener('change', async function() {
