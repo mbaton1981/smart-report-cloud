@@ -12,6 +12,20 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def clean_obj_field(val):
+    """Превращает любой случайно попавший словарь-строку в нормальный текст"""
+    if not val:
+        return ""
+    val_str = str(val).strip()
+    if val_str.startswith("{") and "'name'" in val_str:
+        try:
+            d = ast.literal_eval(val_str)
+            if isinstance(d, dict):
+                return d.get('name', val_str)
+        except Exception:
+            pass
+    return val_str
+
 def init_cloud_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -51,32 +65,6 @@ def init_cloud_db():
         )
     ''')
     
-    # Автоматическая очистка базы данных от случайно попавших туда строковых словарей
-    try:
-        cursor.execute("SELECT rowid, name, markning, company FROM meta_objects")
-        for row in cursor.fetchall():
-            name_val = row['name']
-            if name_val and name_val.strip().startswith("{") and "'name'" in name_val:
-                try:
-                    d = ast.literal_eval(name_val)
-                    real_name = d.get('name', '')
-                    real_mark = d.get('markning', '') or row['markning'] or ''
-                    real_comp = d.get('company', 'Privat') or row['company'] or 'Privat'
-                    # Удаляем дубликаты или обновляем текущую строку
-                    cursor.execute("DELETE FROM meta_objects WHERE rowid = ?", (row['rowid'],))
-                    cursor.execute("INSERT OR REPLACE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", 
-                                   (real_name, real_mark, real_comp))
-                except Exception:
-                    pass
-    except Exception as e:
-        print(f"Cleanup error: {e}")
-
-    cursor.execute("SELECT COUNT(*) FROM meta_employees")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO meta_employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
-        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", ("Privat",))
-        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Badbacken 2", "p1010", "Privat"))
-
     conn.commit()
     conn.close()
 
@@ -95,24 +83,29 @@ def index():
     comp_rows = cursor.fetchall()
     companies = [row['name'] for row in comp_rows] if comp_rows else ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
+    cursor.execute("SELECT name, markning, company FROM meta_objects")
     obj_rows = cursor.fetchall()
-    objects = []
+    
+    objects_map = {}
     for r in obj_rows:
-        name = r['name']
+        raw_name = clean_obj_field(r['name'])
+        if not raw_name:
+            continue
         mark = r['markning'] or ""
         comp = r['company'] or "Privat"
         
-        display_str = f"{mark} | {name}" if mark else name
+        display_str = f"{mark} | {raw_name}" if mark else raw_name
         if comp and comp != 'Privat':
             display_str += f" [{comp}]"
             
-        objects.append({
-            "name": name, 
-            "markning": mark, 
+        objects_map[raw_name] = {
+            "name": raw_name,
+            "markning": mark,
             "company": comp,
             "display": display_str
-        })
+        }
+
+    objects = sorted(list(objects_map.values()), key=lambda x: (x['company'], x['name']))
 
     conn.close()
     return render_template('index.html', employees=employees, companies=companies, objects=objects)
@@ -131,7 +124,7 @@ def submit_shift():
                 data.get('date'),
                 data.get('employee'),
                 data.get('company'),
-                data.get('object_name'),
+                clean_obj_field(data.get('object_name')),
                 data.get('hours', 0.0),
                 data.get('rate', 0.0),
                 data.get('transport', 0.0),
@@ -158,7 +151,7 @@ def check_employee_shifts():
     
     shifts = []
     for r in rows:
-        shifts.append({"date": r['date'], "object_name": r['object_name'], "hours": r['hours']})
+        shifts.append({"date": r['date'], "object_name": clean_obj_field(r['object_name']), "hours": r['hours']})
     return jsonify({"recent_shifts": shifts})
 
 @app.route('/sync-desktop-data', methods=['POST'])
@@ -191,25 +184,22 @@ def sync_desktop_data():
             cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, str) and obj:
-                    if obj.strip().startswith("{") and "'name'" in obj:
-                        try:
-                            d = ast.literal_eval(obj)
-                            cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", 
-                                           (d.get('name'), d.get('markning', ''), d.get('company', 'Privat')))
-                        except Exception:
-                            cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
-                    else:
-                        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
+                    clean_name = clean_obj_field(obj)
+                    if clean_name:
+                        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (clean_name, "Privat"))
                 elif isinstance(obj, dict) and obj.get("name"):
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-                    ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
+                    clean_name = clean_obj_field(obj.get("name"))
+                    if clean_name:
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
+                        ''', (clean_name, obj.get("markning", ""), obj.get("company", "Privat")))
 
             for s in desktop_shifts:
+                obj_cleaned = clean_obj_field(s['object_name'])
                 cursor.execute('''
                     SELECT id FROM cloud_shifts 
                     WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+                ''', (s['date'], s['employee'], obj_cleaned, s['hours']))
                 if not cursor.fetchone():
                     cursor.execute('''
                         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
@@ -218,7 +208,7 @@ def sync_desktop_data():
                         s['date'], 
                         s['employee'], 
                         s['company'], 
-                        s['object_name'],
+                        obj_cleaned,
                         s['hours'], 
                         s.get('rate', 0.0), 
                         s.get('transport', 0.0), 
@@ -247,7 +237,7 @@ def get_unsynced():
     for r in rows:
         shifts.append({
             "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
-            "object_name": r['object_name'], "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
+            "object_name": clean_obj_field(r['object_name']), "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
         })
     return jsonify({"shifts": shifts})
 
