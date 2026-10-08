@@ -128,7 +128,7 @@ def sync_desktop_data():
     objects = data.get("objects", [])
     desktop_shifts = data.get("shifts", [])
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
@@ -159,16 +159,23 @@ def sync_desktop_data():
                         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        s['date'], s['employee'], s['company'], s['object_name'],
-                        s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+                        s['date'], 
+                        s['employee'], 
+                        s['company'], 
+                        s['object_name'],
+                        s['hours'], 
+                        s.get('rate', 0.0), 
+                        s.get('transport', 0.0), 
+                        s.get('comment', ''), 
+                        1
                     ))
 
             conn.commit()
             conn.close()
             return jsonify({"status": "synced"})
         except sqlite3.OperationalError as e:
-            if "locked" in str(e) and attempt < 2:
-                time.sleep(0.5)
+            if "locked" in str(e) and attempt < 4:
+                time.sleep(1.0)
                 continue
             raise e
 
