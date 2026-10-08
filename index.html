@@ -147,8 +147,11 @@
                 if (response.ok) {
                     alert(result.message);
                     document.getElementById('comment').value = '';
+                    // Автоматически подставляем отправленного сотрудника в блок проверки истории
+                    document.getElementById('history-employee').value = formData.employee;
+                    document.getElementById('load-history-btn').click();
                 } else {
-                    alert("Ошибка: " + result.message);
+                    alert("Ошибка: " + (result.message || "Неизвестная ошибка сервера"));
                 }
             } catch (err) {
                 alert("Не удалось отправить данные на сервер.");
@@ -180,7 +183,6 @@
                 const data = await response.json();
                 listContainer.innerHTML = '';
 
-                // Если сервер вернул предупреждение о пропущенных днях
                 if (data.warning) {
                     warningContainer.textContent = data.warning;
                     warningContainer.style.display = 'block';
@@ -190,7 +192,7 @@
                     data.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
                         li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #a0aec0;">${shift.object_name}</small></span>` +
-                                       `<span style="background: #2e5b88; padding: 4px 8px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
+                                     `<span style="background: #2e5b88; padding: 4px 8px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
                     });
                 } else {
