@@ -10,6 +10,7 @@ DB_FILE = "smart_report.db"
 def init_cloud_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Таблица для смен
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shifts_cloud (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -18,10 +19,16 @@ def init_cloud_db():
             company TEXT NOT NULL,
             object_name TEXT NOT NULL,
             hours REAL NOT NULL,
-            rate REAL NOT NULL,
-            transport REAL DEFAULT 0.0,
+            transport INTEGER DEFAULT 0,
             comment TEXT,
             synced INTEGER DEFAULT 0
+        )
+    ''')
+    # Таблица для справочников (сотрудники, объекты, компании), прилетающих с ПК
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
     ''')
     conn.commit()
@@ -31,7 +38,32 @@ init_cloud_db()
 
 @app.get("/", response_class=HTMLResponse)
 def shift_form():
-    return """
+    # Читаем справочники из базы сервера
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Достаем списки (ожидаем JSON-строки из ПК, либо пустые списки)
+    import json
+    def get_list(key):
+        cursor.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            try: return json.loads(row[0])
+            except: return []
+        return []
+
+    employees = get_list("employees") or ["Aliaksei Patonich"]
+    companies = get_list("companies") or ["Bygger och renoverar"]
+    objects = get_list("objects") or ["Основной объект"]
+    
+    conn.close()
+
+    # Формируем HTML с выпадающими списками
+    emp_options = "".join([f'<option value="{e}">{e}</option>' for e in employees])
+    comp_options = "".join([f'<option value="{c}">{c}</option>' for c in companies])
+    obj_options = "".join([f'<option value="{o}">{o}</option>' for o in objects])
+
+    return f"""
     <!DOCTYPE html>
     <html lang="ru">
     <head>
@@ -39,14 +71,16 @@ def shift_form():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Ввод смены — Bygger och renoverar</title>
         <style>
-            body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #1e2229; color: #e2e8f0; padding: 20px; margin: 0; }
-            .container { max-width: 400px; margin: 0 auto; background: #242933; padding: 20px; border-radius: 10px; border: 1px solid #323946; }
-            h2 { color: #63b3ed; text-align: center; font-size: 18px; margin-bottom: 20px; }
-            label { display: block; margin-top: 10px; font-size: 13px; color: #a0aec0; }
-            input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; background: #28303d; border: 1px solid #3f4c60; color: #fff; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
-            button { width: 100%; margin-top: 20px; background: #4299e1; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; font-size: 15px; cursor: pointer; }
-            button:hover { background: #3182ce; }
-            .success { background: #1c4532; color: #38a169; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: bold; }
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #1e2229; color: #e2e8f0; padding: 20px; margin: 0; }}
+            .container {{ max-width: 400px; margin: 0 auto; background: #242933; padding: 20px; border-radius: 10px; border: 1px solid #323946; }}
+            h2 {{ color: #63b3ed; text-align: center; font-size: 18px; margin-bottom: 20px; }}
+            label {{ display: block; margin-top: 10px; font-size: 13px; color: #a0aec0; }}
+            input, select, textarea {{ width: 100%; padding: 10px; margin-top: 5px; background: #28303d; border: 1px solid #3f4c60; color: #fff; border-radius: 6px; box-sizing: border-box; font-size: 14px; }}
+            select {{ cursor: pointer; }}
+            button {{ width: 100%; margin-top: 20px; background: #4299e1; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; font-size: 15px; cursor: pointer; }}
+            button:hover {{ background: #3182ce; }}
+            .checkbox-group {{ display: flex; align-items: center; margin-top: 10px; }}
+            .checkbox-group input {{ width: 20px; height: 20px; margin-right: 10px; }}
         </style>
     </head>
     <body>
@@ -54,25 +88,30 @@ def shift_form():
             <h2>Bygger och renoverar i Sthlm</h2>
             <form action="/submit" method="post">
                 <label>Дата смены:</label>
-                <input type="date" name="date" required value="">
+                <input type="date" name="date" required>
                 
-                <label>Ваше имя (ФИО):</label>
-                <input type="text" name="employee" placeholder="Например: Aliaksei Patonich" required>
+                <label>Сотрудник:</label>
+                <select name="employee" required>
+                    {emp_options}
+                </select>
                 
                 <label>Фирма (Заказчик):</label>
-                <input type="text" name="company" placeholder="Например: Renatur / Privat" required>
+                <select name="company" required>
+                    {comp_options}
+                </select>
                 
                 <label>Объект / Адрес:</label>
-                <input type="text" name="object_name" placeholder="Название объекта" required>
+                <select name="object_name" required>
+                    {obj_options}
+                </select>
                 
                 <label>Отработано часов:</label>
                 <input type="number" step="0.5" name="hours" value="8.0" required>
                 
-                <label>Ставка (kr/ч):</label>
-                <input type="number" step="1" name="rate" placeholder="520" required>
-                
-                <label>Транспорт (kr):</label>
-                <input type="number" step="1" name="transport" value="0">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="transport" name="transport" value="1">
+                    <label for="transport" style="margin-top: 0; color: #fff; cursor: pointer;">Транспорт (учитывать поезду)</label>
+                </div>
                 
                 <label>Описание выполненных работ:</label>
                 <textarea name="comment" rows="3" placeholder="Что было сделано за смену..."></textarea>
@@ -91,35 +130,32 @@ def submit_shift(
     company: str = Form(...),
     object_name: str = Form(...),
     hours: float = Form(...),
-    rate: float = Form(...),
-    transport: float = Form(0.0),
+    transport: int = Form(0),
     comment: str = Form("")
 ):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO shifts_cloud (date, employee, company, object_name, hours, rate, transport, comment, synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-    ''', (date, employee, company, object_name, hours, rate, transport, comment))
+        INSERT INTO shifts_cloud (date, employee, company, object_name, hours, transport, comment, synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (date, employee, company, object_name, hours, transport, comment))
     conn.commit()
     conn.close()
 
     return """
     <!DOCTYPE html>
     <html lang="ru">
-    <head>
-        <meta charset="UTF-8"><title>Успешно</title>
-        <style>
-            body { font-family: Arial; background-color: #1e2229; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            .box { background: #242933; padding: 30px; border-radius: 10px; border: 1px solid #323946; text-align: center; }
-            h2 { color: #38a169; }
-            a { display: inline-block; margin-top: 15px; color: #4299e1; text-decoration: none; font-weight: bold; }
-        </style>
+    <head><meta charset="UTF-8"><title>Успешно</title>
+    <style>
+        body { font-family: Arial; background-color: #1e2229; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .box { background: #242933; padding: 30px; border-radius: 10px; border: 1px solid #323946; text-align: center; }
+        h2 { color: #38a169; }
+        a { display: inline-block; margin-top: 15px; color: #4299e1; text-decoration: none; font-weight: bold; }
+    </style>
     </head>
     <body>
         <div class="box">
             <h2>✅ Смена успешно отправлена!</h2>
-            <p>Данные записаны и скоро попадут в общую базу.</p>
             <a href="/">← Отправить еще одну смену</a>
         </div>
     </body>
@@ -128,7 +164,6 @@ def submit_shift(
 
 @app.get("/get-unsynced")
 def get_unsynced_shifts():
-    """Отдает на ПК все несмещенные смены"""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -140,7 +175,6 @@ def get_unsynced_shifts():
 
 @app.post("/mark-synced")
 def mark_shifts_synced(data: dict):
-    """Помечает смены как синхронизированные"""
     shift_ids = data.get("ids", [])
     if not shift_ids:
         return {"status": "ok"}
@@ -150,3 +184,15 @@ def mark_shifts_synced(data: dict):
     conn.commit()
     conn.close()
     return {"status": "success", "synced_count": len(shift_ids)}
+
+@app.post("/update-metadata")
+def update_metadata(data: dict):
+    """Принимает с ПК актуальные списки объектов, сотрудников и компаний"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    import json
+    for key, val in data.items():
+        cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, json.dumps(val)))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
