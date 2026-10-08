@@ -100,7 +100,22 @@ def submit_shift():
     ))
     conn.commit()
     conn.close()
-    return jsonify({"status": "success"})
+    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
+
+@app.route('/check-employee-shifts', methods=['POST'])
+def check_employee_shifts():
+    data = request.json
+    emp = data.get('employee')
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 5", (emp,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    shifts = []
+    for r in rows:
+        shifts.append({"date": r[0], "object_name": r[1], "hours": r[2]})
+    return jsonify({"recent_shifts": shifts})
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
@@ -108,7 +123,7 @@ def sync_desktop_data():
     data = request.json
     employees = data.get("employees", [])
     companies = data.get("companies", [])
-    objects = data.get("objects", []) # Список строк объектов или словарей
+    objects = data.get("objects", [])
     desktop_shifts = data.get("shifts", [])
 
     conn = sqlite3.connect(DB_FILE)
@@ -124,7 +139,7 @@ def sync_desktop_data():
         if comp:
             cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp,))
 
-    # 3. Обновляем справочник объектов (если передаются строками или структурой)
+    # 3. Обновляем справочник объектов
     for obj in objects:
         if isinstance(obj, str) and obj:
             cursor.execute("INSERT OR IGNORE INTO meta_objects (name, company) VALUES (?, ?)", (obj, "Privat"))
@@ -133,7 +148,7 @@ def sync_desktop_data():
                 INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
             ''', (obj.get("name"), obj.get("markning", ""), obj.get("company", "Privat")))
 
-    # 4. Сохраняем смены с десктопа в историю, если их там еще нет
+    # 4. Сохраняем смены с десктопа в историю
     for s in desktop_shifts:
         cursor.execute('''
             SELECT id FROM cloud_shifts 

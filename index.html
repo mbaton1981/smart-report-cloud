@@ -61,7 +61,7 @@
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
                         {% for obj in objects %}
-                        <option value="{{ obj }}">{{ obj }}</option>
+                        <option value="{{ obj.name }}">{% if obj.markning %}{{ obj.markning }} | {% endif %}{{ obj.name }}</option>
                         {% endfor %}
                     </select>
                 </div>
@@ -145,10 +145,10 @@
                 
                 const result = await response.json();
                 if (response.ok) {
-                    alert(result.message);
+                    alert("Смена успешно отправлена!");
                     document.getElementById('comment').value = '';
                 } else {
-                    alert("Ошибка: " + result.message);
+                    alert("Ошибка: " + (result.message || "Не удалось отправить"));
                 }
             } catch (err) {
                 alert("Не удалось отправить данные на сервер.");
@@ -180,7 +180,6 @@
                 const data = await response.json();
                 listContainer.innerHTML = '';
 
-                // Если сервер вернул предупреждение о пропущенных днях
                 if (data.warning) {
                     warningContainer.textContent = data.warning;
                     warningContainer.style.display = 'block';
