@@ -479,7 +479,7 @@ class SmartReportApp(QMainWindow):
         refresh_shifts_btn = QPushButton("🔄 Обновить данные")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
         
-        sync_cloud_btn = QPushButton("🌐 Загрузить с телефона")
+        sync_cloud_btn = QPushButton("🌐 Синхронизация с облаком")
         sync_cloud_btn.setStyleSheet("background-color: #2b6cb0; border-color: #4299e1;")
         sync_cloud_btn.clicked.connect(self.sync_with_cloud)
 
@@ -505,7 +505,7 @@ class SmartReportApp(QMainWindow):
         self.load_shifts_history()
 
     def sync_with_cloud(self):
-        """Скачивает новые смены из облачного сервера, а также выгружает актуальные справочники в облако"""
+        """Двусторонняя синхронизация: выгружает локальные смены/справочники в облако и забирает новые смены с телефона"""
         CLOUD_URL = "https://smart-report-server.onrender.com"  # Твой адрес на Render
         
         try:
@@ -522,61 +522,73 @@ class SmartReportApp(QMainWindow):
             cursor.execute("SELECT name FROM objects ORDER BY name")
             objects = [row[0] for row in cursor.fetchall()]
             
+            # 2. Собираем все локальные смены для отправки в облако
+            cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
+            local_shift_rows = cursor.fetchall()
+            
             conn.close()
 
-            # 2. Отправляем справочники на облачный сервер
+            all_local_shifts = []
+            for r in local_shift_rows:
+                all_local_shifts.append({
+                    "date": r[0],
+                    "employee": r[1],
+                    "company": r[2],
+                    "object_name": r[3],
+                    "hours": r[4],
+                    "rate": r[5],
+                    "transport": r[6],
+                    "comment": r[7]
+                })
+
+            # 3. Отправляем справочники и смены на облачный сервер
             metadata_payload = {
                 "employees": employees,
                 "companies": companies,
-                "objects": objects
+                "objects": objects,
+                "shifts": all_local_shifts
             }
-            requests.post(f"{CLOUD_URL}/update-metadata", json=metadata_payload, timeout=10)
+            requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=15)
 
-            # 3. Забираем новые смены с телефона
+            # 4. Забираем новые смены, созданные через телефон / веб-форму
             response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=10)
-            if response.status_code != 200:
-                QMessageBox.warning(self, "Ошибка", f"Не удалось связаться с сервером. Код: {response.status_code}")
-                return
+            if response.status_code == 200:
+                data = response.json()
+                shifts_from_phone = data.get("shifts", [])
                 
-            data = response.json()
-            shifts = data.get("shifts", [])
-            
-            if not shifts:
-                QMessageBox.information(self, "Синхронизация", "Справочники успешно обновлены в облаке! Новых смен с телефона пока нет.")
-                self.load_shifts_history()
-                return
+                if shifts_from_phone:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    downloaded_ids = []
+                    added_count = 0
 
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            downloaded_ids = []
-            added_count = 0
+                    for s in shifts_from_phone:
+                        # Проверяем, нет ли уже такой смены локально
+                        cursor.execute('''
+                            SELECT id FROM shifts 
+                            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+                        
+                        if not cursor.fetchone():
+                            cursor.execute('''
+                                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                            ''', (
+                                s['date'], s['employee'], s['company'], s['object_name'], 
+                                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
+                            ))
+                            added_count += 1
+                            
+                        downloaded_ids.append(s['id'])
 
-            for s in shifts:
-                cursor.execute('''
-                    INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ''', (
-                    s['date'], 
-                    s['employee'], 
-                    s['company'], 
-                    s['object_name'], 
-                    s['hours'], 
-                    0.0, 
-                    s['transport'], 
-                    s['comment']
-                ))
-                downloaded_ids.append(s['id'])
-                added_count += 1
+                    conn.commit()
+                    conn.close()
 
-            conn.commit()
-            conn.close()
-
-            if downloaded_ids:
-                requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
+                    if downloaded_ids:
+                        requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
 
             self.load_shifts_history()
-            QMessageBox.information(self, "Успех", f"Справочники обновлены! Загружено новых смен с телефона: {added_count}!")
+            QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена! Данные обновлены в обе стороны.")
 
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
