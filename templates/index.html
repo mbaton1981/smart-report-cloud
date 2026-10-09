@@ -252,26 +252,27 @@
             } else {
                 userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
                 
-                // Никаких disabled! Поля активны, без значков запрета.
-                employeeSelect.disabled = false;
-                historyEmployeeSelect.disabled = false;
-
-                // Автоматически находим и выделяем имя текущего пользователя в селектах
                 const userName = currentUser.username.trim().toLowerCase();
-                let foundIndex = -1;
-
-                for (let i = 0; i < employeeSelect.options.length; i++) {
-                    const optVal = employeeSelect.options[i].value.trim().toLowerCase();
-                    if (optVal === userName || optVal.includes(userName) || userName.includes(optVal)) {
-                        foundIndex = i;
+                const allEmployeeOptions = Array.from(employeeSelect.options).map(opt => opt.value).filter(val => val !== "");
+                
+                let matchedName = currentUser.username;
+                for (const emp of allEmployeeOptions) {
+                    const empLower = emp.trim().toLowerCase();
+                    if (empLower === userName || empLower.includes(userName) || userName.includes(empLower)) {
+                        matchedName = emp;
                         break;
                     }
                 }
 
-                if (foundIndex !== -1) {
-                    employeeSelect.selectedIndex = foundIndex;
-                    historyEmployeeSelect.selectedIndex = foundIndex;
-                }
+                // Очищаем селекты и оставляем там ТОЛЬКО имя текущего пользователя
+                [employeeSelect, historyEmployeeSelect].forEach(select => {
+                    select.innerHTML = '';
+                    const opt = document.createElement('option');
+                    opt.value = matchedName;
+                    opt.textContent = matchedName;
+                    select.appendChild(opt);
+                    select.value = matchedName;
+                });
             }
         }
 
@@ -316,16 +317,10 @@
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            // Если обычный работник, принудительно берем его имя из сессии для безопасности
-            let employeeVal = document.getElementById('employee').value;
-            if (currentUser && currentUser.role !== 'admin') {
-                employeeVal = currentUser.username;
-            }
-
             const formData = {
                 request_id: generateUUID(),
                 date: document.getElementById('date').value,
-                employee: employeeVal,
+                employee: document.getElementById('employee').value,
                 company: document.getElementById('company').value,
                 object_name: document.getElementById('object_name').value,
                 hours: parseFloat(document.getElementById('hours').value),
@@ -355,11 +350,7 @@
 
         // Проверка истории
         document.getElementById('load-history-btn').addEventListener('click', async function() {
-            let empName = document.getElementById('history-employee').value;
-            if (currentUser && currentUser.role !== 'admin') {
-                empName = currentUser.username;
-            }
-
+            const empName = document.getElementById('history-employee').value;
             const listContainer = document.getElementById('history-list');
             const warningContainer = document.getElementById('warning-container');
             
