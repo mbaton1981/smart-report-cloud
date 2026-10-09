@@ -1337,7 +1337,7 @@ class SmartReportApp(QMainWindow):
         comp_card_layout.addWidget(del_comp_btn)
         top_layout.addWidget(comp_card, stretch=1)
 
-        # Секция 2: Сотрудники
+        # Секция 2: Сотрудники (Обновлена с колонкой и кнопкой сброса ПИН-кода)
         emp_card = QFrame()
         emp_card.setObjectName("card")
         emp_card_layout = QVBoxLayout(emp_card)
@@ -1358,15 +1358,22 @@ class SmartReportApp(QMainWindow):
         emp_card_layout.addLayout(emp_add_layout)
 
         self.table_employees = QTableWidget()
-        self.table_employees.setColumnCount(2)
-        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч"])
+        self.table_employees.setColumnCount(3)
+        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус ПИН-кода"])
         self.table_employees.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         emp_card_layout.addWidget(self.table_employees, stretch=1)
 
+        emp_btn_layout = QHBoxLayout()
         del_emp_btn = QPushButton("🗑 Удалить сотрудника")
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
-        emp_card_layout.addWidget(del_emp_btn)
+        
+        reset_pin_btn = QPushButton("🔑 Сбросить ПИН")
+        reset_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
+
+        emp_btn_layout.addWidget(del_emp_btn)
+        emp_btn_layout.addWidget(reset_pin_btn)
+        emp_card_layout.addLayout(emp_btn_layout)
         top_layout.addWidget(emp_card, stretch=1)
 
         layout.addLayout(top_layout, stretch=1)
@@ -1559,11 +1566,67 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT name, salary_rate FROM employees ORDER BY name")
         rows = cursor.fetchall()
         conn.close()
+
+        # Запрашиваем статусы ПИН-кодов из облака
+        pin_statuses = {}
+        try:
+            CLOUD_URL = "https://smart-report-server.onrender.com"
+            res = requests.get(f"{CLOUD_URL}/admin/get-users-status", timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                for u in data.get("users", []):
+                    pin_statuses[u["username"].strip().lower()] = u.get("has_pin", False)
+        except Exception:
+            pass
+
         self.table_employees.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
+            name = row[0]
             rate = row[1]
-            self.table_employees.setItem(row_idx, 0, QTableWidgetItem(row[0]))
+            has_pin = pin_statuses.get(name.strip().lower(), None)
+
+            if has_pin is None:
+                pin_text = "❓ Неизвестно"
+            elif has_pin:
+                pin_text = "✅ Пин задан"
+            else:
+                pin_text = "⏳ Не задан (первый вход)"
+
+            self.table_employees.setItem(row_idx, 0, QTableWidgetItem(name))
             self.table_employees.setItem(row_idx, 1, QTableWidgetItem(f"{rate:.2f}" if rate else "0.00"))
+            
+            pin_item = QTableWidgetItem(pin_text)
+            if has_pin:
+                pin_item.setForeground(QColor("#68D391"))
+            elif has_pin is False:
+                pin_item.setForeground(QColor("#F6AD55"))
+            self.table_employees.setItem(row_idx, 2, pin_item)
+
+    def reset_employee_pin_desktop(self):
+        selected = self.table_employees.currentRow()
+        if selected < 0:
+            QMessageBox.warning(self, "Внимание", "Выберите сотрудника в таблице для сброса пин-кода!")
+            return
+        
+        emp_name = self.table_employees.item(selected, 0).text()
+        reply = QMessageBox.question(
+            self, "Подтверждение",
+            f"Сбросить пин-код для сотрудника <b>{emp_name}</b>?<br>При следующем входе система попросит задать новый пин.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                CLOUD_URL = "https://smart-report-server.onrender.com"
+                res = requests.post(f"{CLOUD_URL}/admin/reset-user-pin", json={"username": emp_name}, timeout=5)
+                if res.status_code == 200:
+                    QMessageBox.information(self, "Успех", f"Пин-код для {emp_name} успешно сброшен!")
+                    self.load_employees_table()
+                else:
+                    QMessageBox.critical(self, "Ошибка", "Сервер отклонил запрос на сброс пина.")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка сети", f"Не удалось связаться с облаком:\n{e}")
 
     def add_or_update_employee(self):
         name = self.new_emp_input.text().strip()
