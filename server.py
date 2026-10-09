@@ -352,9 +352,11 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        # ЗАЩИТА: Обновляем справочники только если пришли непустые массивы
+        # Защита от полного зануления базы: синхронизируем только если ключ передан 
+        # или если пришел хотя бы какой-то осмысленный непустой список.
+        # Полная перезапись справочников под десктопную версию:
+        cursor.execute("DELETE FROM meta_employees")
         if employees:
-            cursor.execute("DELETE FROM meta_employees")
             for emp in employees:
                 if isinstance(emp, dict):
                     emp_name = str(emp.get('name', '')).strip()
@@ -371,14 +373,16 @@ def sync_desktop_data():
                         VALUES (?, ?, ?)
                     ''', (emp_name, emp_rate, emp_active))
 
+        cursor.execute("DELETE FROM meta_companies")
         if companies:
-            cursor.execute("DELETE FROM meta_companies")
             for comp in companies:
                 if comp:
-                    cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
+                    comp_name = str(comp.get('name', '') if isinstance(comp, dict) else comp).strip()
+                    if comp_name:
+                        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
 
+        cursor.execute("DELETE FROM meta_objects")
         if objects:
-            cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, dict):
                     name = str(obj.get('name', '')).strip()
