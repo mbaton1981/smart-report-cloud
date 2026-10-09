@@ -121,7 +121,6 @@ def init_cloud_db():
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Bygg och renovering", "Sthlm", "Privat"))
 
-    # Настройка администратора и пароля 1981 по умолчанию
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
     admin_pass = os.environ.get('ADMIN_PASSWORD', '1981')
     hashed_pw = generate_password_hash(admin_pass)
@@ -362,7 +361,6 @@ def submit_shift():
     request_id = data.get('request_id')
     comment = str(data.get('comment', ''))[:2000]
 
-    # ПРОВЕРКА ПРАВ: Если пользователь не администратор, он может отправлять смену только за себя
     if session.get('role') != 'admin':
         session_username = session.get('username', '').lower()
         if session_username not in employee.lower():
@@ -442,7 +440,6 @@ def check_employee_shifts():
     data = request.json or {}
     emp = data.get('employee')
 
-    # ПРОВЕРКА ПРАВ: Обычный сотрудник может смотреть историю только за себя
     if session.get('role') != 'admin':
         session_username = session.get('username', '').lower()
         if session_username not in str(emp).lower():
@@ -452,9 +449,25 @@ def check_employee_shifts():
     cursor = conn.cursor()
     cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 5", (emp,))
     rows = cursor.fetchall()
-    conn.close()
     
-    shifts = [{"date": r['date'], "object_name": r['object_name'], "hours": r['hours']} for r in rows]
+    shifts = []
+    for r in rows:
+        obj_name = r['object_name']
+        marking = ""
+        # Ищем марркинг объекта в справочнике meta_objects
+        cursor.execute("SELECT markning FROM meta_objects WHERE name = ?", (obj_name,))
+        obj_meta = cursor.fetchone()
+        if obj_meta and obj_meta['markning']:
+            marking = obj_meta['markning']
+            
+        shifts.append({
+            "date": r['date'], 
+            "object_name": obj_name, 
+            "marking": marking,
+            "hours": r['hours']
+        })
+        
+    conn.close()
     return jsonify({"ok": True, "recent_shifts": shifts})
 
 @app.route('/sync-desktop-data', methods=['POST'])

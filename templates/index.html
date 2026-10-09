@@ -380,7 +380,10 @@
                 if (data.recent_shifts && data.recent_shifts.length > 0) {
                     data.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
-                        li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #a0aec0;">${shift.object_name}</small></span>` +
+                        // Подставляем марркинг (например, [p1029]), если он есть
+                        const markingBadge = shift.marking ? `<b style="color: #4a90e2; margin-right: 6px;">[${shift.marking}]</b>` : '';
+                        
+                        li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #a0aec0;">${markingBadge}${shift.object_name}</small></span>` +
                                        `<span style="background: #2e5b88; padding: 4px 8px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
                     });
