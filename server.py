@@ -1,14 +1,22 @@
 import sqlite3
 import time
 import ast
-from flask import Flask, render_template, request, jsonify
+import os
+from datetime import datetime, timedelta
+from flask import Flask, render_template, request, jsonify, session
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+# Секретный ключ для сессий (на Render берется из окружения)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-it-12345')
+app.permanent_session_lifetime = timedelta(hours=8)
+
 DB_FILE = "cloud_database.db"
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.execute('PRAGMA journal_mode=WAL;')
+    conn.execute('PRAGMA foreign_keys = ON;')
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -32,6 +40,20 @@ def init_cloud_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
+    # Таблица пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            employee_id INTEGER,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            last_login TEXT
+        )
+    ''')
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cloud_shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,10 +87,82 @@ def init_cloud_db():
             UNIQUE(name, company)
         )
     ''')
+
+    # Создаем администратора по умолчанию, если его нет
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+    if cursor.fetchone()[0] == 0:
+        admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
+        admin_pass = os.environ.get('ADMIN_PASSWORD', 'AdminSecure2026!')
+        hashed_pw = generate_password_hash(admin_pass)
+        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
+            VALUES (?, ?, 'admin', NULL, 1, ?)
+        ''', (admin_user, hashed_pw, now_str))
+
     conn.commit()
     conn.close()
 
 init_cloud_db()
+
+# Эндпоинты авторизации
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+
+    if not username or not password:
+        return jsonify({"ok": False, "error": "Укажите логин и пароль"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (username,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if user and check_password_hash(user['password_hash'], password):
+        session.permanent = True
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        session['role'] = user['role']
+        session['employee_id'] = user['employee_id']
+
+        # Обновляем last_login
+        conn = get_db_connection()
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), user['id']))
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "ok": True,
+            "message": "Успешный вход",
+            "user": {
+                "username": user['username'],
+                "role": user['role'],
+                "employee_id": user['employee_id']
+            }
+        })
+
+    return jsonify({"ok": False, "error": "Неверный логин или пароль"}), 401
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({"ok": True, "message": "Выход выполнен"})
+
+@app.route('/me', methods=['GET'])
+def get_current_user():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Не авторизован"}), 401
+    return jsonify({
+        "ok": True,
+        "user": {
+            "username": session.get('username'),
+            "role": session.get('role'),
+            "employee_id": session.get('employee_id')
+        }
+    })
 
 @app.route('/')
 def index():
@@ -121,30 +215,48 @@ def index():
 
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
-    data = request.json
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
+    data = request.json or {}
+    
+    # Валидация базовых полей
+    date_str = data.get('date')
+    hours = data.get('hours')
+    try:
+        hours = float(hours)
+        if not (0 <= hours <= 24):
+            raise ValueError()
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Некорректное значение часов (от 0 до 24)"}), 400
+
     conn = get_db_connection()
     cursor = conn.cursor()
     name, _, _ = safe_parse_obj(data.get('object_name'))
+    
     cursor.execute('''
         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
     ''', (
-        data.get('date'),
+        date_str,
         data.get('employee'),
         data.get('company'),
         name or data.get('object_name'),
-        data.get('hours', 0.0),
+        hours,
         data.get('rate', 0.0),
         data.get('transport', 0.0),
-        data.get('comment', ''),
+        str(data.get('comment', ''))[:2000],
     ))
     conn.commit()
     conn.close()
-    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
+    return jsonify({"ok": True, "message": "Смена успешно отправлена!"})
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
-    data = request.json
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
+    data = request.json or {}
     emp = data.get('employee')
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -153,11 +265,19 @@ def check_employee_shifts():
     conn.close()
     
     shifts = [{"date": r['date'], "object_name": r['object_name'], "hours": r['hours']} for r in rows]
-    return jsonify({"recent_shifts": shifts})
+    return jsonify({"ok": True, "recent_shifts": shifts})
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    data = request.json
+    # Проверка ключа синхронизации или прав администратора
+    sync_key = request.headers.get('X-Sync-Key')
+    expected_key = os.environ.get('SYNC_API_KEY')
+    
+    is_admin = session.get('role') == 'admin'
+    if not is_admin and (not expected_key or sync_key != expected_key):
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    data = request.json or {}
     employees = data.get("employees", [])
     companies = data.get("companies", [])
     objects = data.get("objects", [])
@@ -167,21 +287,18 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        # Полная синхронизация (перезапись) справочника сотрудников
         cursor.execute("DELETE FROM meta_employees")
         if employees:
             for emp in employees:
                 if emp:
                     cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
 
-        # Полная синхронизация (перезапись) справочника компаний
         cursor.execute("DELETE FROM meta_companies")
         if companies:
             for comp in companies:
                 if comp:
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
-        # Полная синхронизация (перезапись) справочника объектов
         cursor.execute("DELETE FROM meta_objects")
         if objects:
             for obj in objects:
@@ -197,7 +314,6 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Полная перезапись облачных смен актуальным списком с ПК
         cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
@@ -208,7 +324,7 @@ def sync_desktop_data():
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 s.get('date'), s.get('employee'), s.get('company'), obj_name,
-                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000], 1
             ))
 
         conn.commit()
@@ -218,10 +334,13 @@ def sync_desktop_data():
     finally:
         conn.close()
 
-    return jsonify({"status": "synced"})
+    return jsonify({"ok": True, "status": "synced"})
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
+    if session.get('role') != 'admin':
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
@@ -232,11 +351,14 @@ def get_unsynced():
         "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
         "object_name": r['object_name'], "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
     } for r in rows]
-    return jsonify({"shifts": shifts})
+    return jsonify({"ok": True, "shifts": shifts})
 
 @app.route('/mark-synced', methods=['POST'])
 def mark_synced():
-    data = request.json
+    if session.get('role') != 'admin':
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    data = request.json or {}
     ids = data.get("ids", [])
     if ids:
         conn = get_db_connection()
@@ -244,7 +366,7 @@ def mark_synced():
         cursor.executemany("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", [(i,) for i in ids])
         conn.commit()
         conn.close()
-    return jsonify({"status": "marked"})
+    return jsonify({"ok": True, "status": "marked"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
