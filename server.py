@@ -127,7 +127,6 @@ def submit_shift():
     cursor = conn.cursor()
     name, _, _ = safe_parse_obj(data.get('object_name'))
     
-    # Автоматический перехват и перевод комментария на шведский через безопасный вызов
     raw_comment = data.get('comment', '')
     translated_comment = raw_comment
     
@@ -138,7 +137,7 @@ def submit_shift():
                 translated_comment = raw_comment
         except Exception as e:
             print(f"Translation error: {e}")
-            translated_comment = raw_comment  # В случае сбоя или лимита сохраняем оригинал
+            translated_comment = raw_comment
 
     cursor.execute('''
         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
@@ -151,7 +150,7 @@ def submit_shift():
         data.get('hours', 0.0),
         data.get('rate', 0.0),
         data.get('transport', 0.0),
-        translated_comment,  # Сохраняем переведенный шведский вариант (или оригинал при сбое)
+        translated_comment,
     ))
     conn.commit()
     conn.close()
@@ -182,21 +181,18 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        # Полная синхронизация (перезапись) справочника сотрудников
         cursor.execute("DELETE FROM meta_employees")
         if employees:
             for emp in employees:
                 if emp:
                     cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
 
-        # Полная синхронизация (перезапись) справочника компаний
         cursor.execute("DELETE FROM meta_companies")
         if companies:
             for comp in companies:
                 if comp:
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
-        # Полная синхронизация (перезапись) справочника объектов
         cursor.execute("DELETE FROM meta_objects")
         if objects:
             for obj in objects:
@@ -212,18 +208,30 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Полная перезапись облачных смен актуальным списком с ПК
+        # Перезаписываем облачные смены с автоматическим переводом комментариев
         cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
             obj_name = name or s.get('object_name')
             
+            raw_comment = s.get('comment', '')
+            translated_comment = raw_comment
+            
+            if raw_comment and raw_comment.strip():
+                try:
+                    translated_comment = GoogleTranslator(source='auto', target='sv').translate(raw_comment)
+                    if not translated_comment:
+                        translated_comment = raw_comment
+                except Exception as e:
+                    print(f"Sync translation error: {e}")
+                    translated_comment = raw_comment
+
             cursor.execute('''
                 INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 s.get('date'), s.get('employee'), s.get('company'), obj_name,
-                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), translated_comment, 1
             ))
 
         conn.commit()
