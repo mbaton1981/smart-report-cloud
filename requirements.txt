@@ -1,7 +1,5 @@
-fastapi
-uvicorn
+flask
 gunicorn
 requests
 reportlab
 python-multipart
-flask
