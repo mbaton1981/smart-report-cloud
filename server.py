@@ -235,6 +235,50 @@ def get_current_user():
         }
     })
 
+@app.route('/admin/reset-user-pin', methods=['POST'])
+def admin_reset_user_pin():
+    """Сброс пин-кода конкретного сотрудника администратором"""
+    if session.get('role') != 'admin':
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+        
+    data = request.json or {}
+    username = str(data.get('username', '')).strip()
+    if not username:
+        return jsonify({"ok": False, "error": "Не указано имя пользователя"}), 400
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET password_hash = NULL WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"ok": True, "message": f"Пин-код для пользователя {username} успешно сброшен"})
+
+@app.route('/admin/get-users-status', methods=['GET'])
+def admin_get_users_status():
+    """Возвращает список всех пользователей и статус наличия у них пин-кода (для десктопного приложения)"""
+    sync_key = request.headers.get('X-Sync-Key')
+    expected_key = os.environ.get('SYNC_API_KEY')
+    if expected_key and sync_key and sync_key != expected_key:
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, role, is_active, created_at, last_login, (password_hash IS NOT NULL AND password_hash != '') as has_pin FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+
+    users = [{
+        "username": r['username'],
+        "role": r['role'],
+        "is_active": r['is_active'],
+        "created_at": r['created_at'],
+        "last_login": r['last_login'],
+        "has_pin": bool(r['has_pin'])
+    } for r in rows]
+
+    return jsonify({"ok": True, "users": users})
+
 @app.route('/')
 def index():
     conn = get_db_connection()
