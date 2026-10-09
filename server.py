@@ -2,13 +2,10 @@ import sqlite3
 import time
 import ast
 from flask import Flask, render_template, request, jsonify
-from deep_translator import MyMemoryTranslator
+from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 DB_FILE = "cloud_database.db"
-
-# Инициализируем стабильный переводчик на шведский язык ('sv')
-translator = MyMemoryTranslator(source='auto', target='sv')
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
@@ -130,16 +127,18 @@ def submit_shift():
     cursor = conn.cursor()
     name, _, _ = safe_parse_obj(data.get('object_name'))
     
-    # Автоматический перехват и перевод комментария на шведский
+    # Автоматический перехват и перевод комментария на шведский через безопасный вызов
     raw_comment = data.get('comment', '')
     translated_comment = raw_comment
     
     if raw_comment and raw_comment.strip():
         try:
-            translated_comment = translator.translate(raw_comment)
+            translated_comment = GoogleTranslator(source='auto', target='sv').translate(raw_comment)
+            if not translated_comment:
+                translated_comment = raw_comment
         except Exception as e:
             print(f"Translation error: {e}")
-            translated_comment = raw_comment  # В случае сбоя сохраняем оригинал
+            translated_comment = raw_comment  # В случае сбоя или лимита сохраняем оригинал
 
     cursor.execute('''
         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
@@ -152,7 +151,7 @@ def submit_shift():
         data.get('hours', 0.0),
         data.get('rate', 0.0),
         data.get('transport', 0.0),
-        translated_comment,  # Сохраняем уже переведенный шведский вариант
+        translated_comment,  # Сохраняем переведенный шведский вариант (или оригинал при сбое)
     ))
     conn.commit()
     conn.close()
