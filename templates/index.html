@@ -3,157 +3,157 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bygger och renoverar i Sthlm</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 15px; color: #fff; background-color: #1a1d24; }
-        h2 { text-align: center; color: #4a90e2; }
-        .auth-bar { display: flex; justify-content: space-between; align-items: center; background: #222631; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #2f3542; font-size: 14px; }
-        .main-container { display: flex; flex-wrap: wrap; gap: 20px; }
-        .form-box { flex: 1; min-width: 320px; background: #222631; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid #2f3542; }
-        .history-box { flex: 1; min-width: 320px; background: #222631; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid #2f3542; height: fit-content; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 6px; font-weight: bold; color: #b2bec3; font-size: 14px; }
-        select, input, textarea { width: 100%; padding: 10px; box-sizing: border-box; background-color: #1e222b; border: 1px solid #3a4150; border-radius: 6px; font-size: 15px; color: #fff; }
-        select:focus, input:focus, textarea:focus { border-color: #4a90e2; outline: none; }
-        button { background-color: #3498db; color: white; padding: 12px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 15px; font-weight: bold; transition: background 0.2s; }
-        button:hover { background-color: #2980b9; }
-        .btn-history { background-color: #27ae60; margin-top: 10px; }
-        .btn-history:hover { background-color: #219653; }
-        .btn-logout { background-color: #e74c3c; width: auto; padding: 6px 12px; font-size: 13px; }
-        .btn-logout:hover { background-color: #c0392b; }
-        
-        #history-list { list-style-type: none; padding: 0; margin: 0; }
-        #history-list li { background: #1a2332; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #2e5b88; font-size: 13px; color: #dfe6e9; display: flex; justify-content: space-between; align-items: center; }
-        
-        /* Модальное окно авторизации */
-        #auth-modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); display: flex; justify-content: center; align-items: center; z-index: 1000; }
-        .modal-content { background: #222631; padding: 30px; border-radius: 12px; width: 320px; border: 1px solid #3a4150; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
-    </style>
+    <title>Учет смен — Bygger och renoverar</title>
+    <!-- Tailwind CSS CDN для быстрой и красивой верстки -->
+    <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body>
+<body class="bg-gray-100 min-h-screen flex flex-col justify-between font-sans text-gray-800">
 
-    <!-- Модальное окно входа -->
-    <div id="auth-modal" style="display: none;">
-        <div class="modal-content">
-            <h3 style="color: #4a90e2; margin-top: 0; text-align: center;">🔐 Авторизация</h3>
-            <form id="login-form">
-                <div class="form-group">
-                    <label for="login-username">Имя пользователя:</label>
-                    <input type="text" id="login-username" required autocomplete="username">
+    <!-- Окно авторизации (скрыто, если пользователь уже вошел) -->
+    <div id="login-modal" class="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center hidden">
+        <div class="bg-white rounded-lg shadow-xl p-8 max-w-md w-full mx-4">
+            <h2 class="text-2xl font-bold text-gray-900 mb-6 text-center">Вход в систему</h2>
+            <form id="login-form" onsubmit="handleLogin(event)" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Логин</label>
+                    <input type="text" id="login-username" required 
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                           placeholder="Например: aliaksei.patonich">
                 </div>
-                <div class="form-group">
-                    <label for="login-password">Пароль:</label>
-                    <input type="password" id="login-password" required autocomplete="current-password">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Пароль</label>
+                    <input type="password" id="login-password" required 
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                           placeholder="••••••••">
                 </div>
-                <button type="submit">Войти</button>
-                <div id="login-error" style="color: #e74c3c; font-size: 13px; margin-top: 10px; text-align: center; display: none;"></div>
+                <div id="login-error" class="text-red-500 text-sm hidden"></div>
+                <button type="submit" 
+                        class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition font-medium">
+                    Войти
+                </button>
             </form>
         </div>
     </div>
 
-    <h2>Bygger och renoverar i Sthlm</h2>
+    <!-- Основной интерфейс -->
+    <div class="container mx-auto px-4 py-8 max-w-2xl flex-grow">
+        <!-- Шапка -->
+        <div class="bg-white rounded-lg shadow-md p-4 mb-6 flex justify-between items-center">
+            <div>
+                <h1 class="text-xl font-bold text-gray-800">Учет рабочего времени</h1>
+                <p id="user-info-text" class="text-sm text-gray-500">Загрузка...</p>
+            </div>
+            <button onclick="handleLogout()" class="text-sm bg-gray-200 hover:bg-gray-300 px-3 py-1.5 rounded transition text-gray-700">
+                Выйти
+            </button>
+        </div>
 
-    <!-- Шапка с информацией о пользователе -->
-    <div class="auth-bar" id="auth-bar" style="display: none;">
-        <div>👤 Пользователь: <b id="current-user-name">-</b> (<span id="current-user-role">-</span>)</div>
-        <button type="button" class="btn-logout" id="logout-btn">Выйти</button>
-    </div>
-
-    <div class="main-container">
-        <!-- ЛЕВАЯ КОЛОНКА: Основная форма отправки смены -->
-        <div class="form-box">
-            <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">📝 Отправить смену</h3>
-            <form id="shift-form">
-                <div class="form-group">
-                    <label for="date">Дата смены:</label>
-                    <input type="date" id="date" name="date" required>
+        <!-- Форма отправки смены -->
+        <div class="bg-white rounded-lg shadow-md p-6">
+            <form id="shift-form" onsubmit="submitShift(event)" class="space-y-4">
+                <!-- Дата -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Дата</label>
+                    <input type="date" id="date" required 
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                 </div>
 
-                <div class="form-group">
-                    <label for="employee">Сотрудник:</label>
-                    <select id="employee" name="employee" required>
-                        <option value="">-- Выберите ваше имя --</option>
+                <!-- Сотрудник -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Сотрудник</label>
+                    <select id="employee" required 
+                            class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
                         {% for emp in employees %}
                         <option value="{{ emp }}">{{ emp }}</option>
                         {% endfor %}
                     </select>
                 </div>
 
-                <div class="form-group">
-                    <label for="company">Фирма (Заказчик):</label>
-                    <select id="company" name="company" required>
+                <!-- Фирма -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Фирма</label>
+                    <select id="company" onchange="filterObjects()" required 
+                            class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
                         {% for comp in companies %}
                         <option value="{{ comp }}">{{ comp }}</option>
                         {% endfor %}
                     </select>
                 </div>
 
-                <div class="form-group">
-                    <label for="object_name">Объект / Адрес:</label>
-                    <select id="object_name" name="object_name" required>
-                        {% for obj in objects %}
-                            {% if obj is mapping %}
-                                <option value="{{ obj.name }}">{{ obj.display }}</option>
-                            {% else %}
-                                <option value="{{ obj }}">{{ obj }}</option>
-                            {% endif %}
-                        {% endfor %}
+                <!-- Объект -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Объект</label>
+                    <select id="object_name" required 
+                            class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                        <!-- Динамически фильтруется по выбранной фирме -->
                     </select>
                 </div>
 
-                <div class="form-group">
-                    <label for="hours">Отработано часов:</label>
-                    <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
+                <!-- Часы -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Часы (0.5 - 24)</label>
+                    <input type="number" id="hours" step="0.5" min="0.5" max="24" value="8" required 
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                 </div>
 
-                <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
-                    <input type="checkbox" id="transport_check" style="width: 20px; height: 20px; cursor: pointer;">
-                    <label for="transport_check" style="margin-bottom: 0; cursor: pointer; color: #fff;">Транспорт (учитывать поездку)</label>
-                    <input type="hidden" id="transport" name="transport" value="0.0">
+                <!-- Транспорт -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Транспорт (км / доплата)</label>
+                    <input type="number" id="transport" step="1" min="0" value="0" 
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                 </div>
 
-                <div class="form-group">
-                    <label for="comment">Описание выполненных работ:</label>
-                    <textarea id="comment" name="comment" rows="3" placeholder="Что было сделано за смену..."></textarea>
+                <!-- Комментарий -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Комментарий</label>
+                    <textarea id="comment" rows="2" 
+                              class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              placeholder="Описание выполненных работ..."></textarea>
                 </div>
 
-                <button type="submit" id="submit-btn">Отправить смену</button>
+                <!-- Статус отправки -->
+                <div id="form-message" class="text-sm font-medium hidden"></div>
+
+                <!-- Кнопка отправки -->
+                <button type="submit" 
+                        class="w-full bg-green-600 text-white py-3 px-4 rounded-md hover:bg-green-700 transition font-medium text-lg">
+                    Отправить смену
+                </button>
             </form>
-        </div>
-
-        <!-- ПРАВАЯ КОЛОНКА: Блок просмотра истории -->
-        <div class="history-box">
-            <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">🔍 Проверка истории смен</h3>
-            
-            <div class="form-group">
-                <label for="history-employee">Выберите сотрудника:</label>
-                <select id="history-employee">
-                    <option value="">-- Выберите сотрудника --</option>
-                    {% for emp in employees %}
-                    <option value="{{ emp }}">{{ emp }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-
-            <button type="button" id="load-history-btn" class="btn-history">Показать последние смены</button>
-
-            <div id="warning-container" style="margin-top: 15px; display: none; background: #3d2222; border: 1px solid #c0392b; padding: 10px; border-radius: 6px; font-size: 13px; color: #f5b7b1;"></div>
-
-            <div style="margin-top: 15px;">
-                <h4 style="color: #64b5f6; font-size: 14px; margin-bottom: 8px;">Последние заполненные дни:</h4>
-                <ul id="history-list">
-                    <li style="color: #7f8c8d; justify-content: center;">Выберите сотрудника и нажмите кнопку</li>
-                </ul>
-            </div>
         </div>
     </div>
 
+    <!-- Передаем список объектов из Flask в JS -->
     <script>
-        document.getElementById('date').value = new Date().toISOString().split('T')[0];
+        const allObjects = {{ objects | tojson }};
+        let currentUser = null;
 
-        document.getElementById('transport_check').addEventListener('change', function() {
-            document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
-        });
+        // Установка сегодняшней даты по умолчанию
+        document.getElementById('date').valueAsDate = new Date();
+
+        // Фильтрация объектов при изменении фирмы
+        function filterObjects() {
+            const selectedCompany = document.getElementById('company').value;
+            const objectSelect = document.getElementById('object_name');
+            objectSelect.innerHTML = '';
+
+            const filtered = allObjects.filter(obj => obj.company === selectedCompany);
+            
+            if (filtered.length === 0) {
+                // Если у фирмы нет объектов, показываем общие или заглушку
+                const opt = document.createElement('option');
+                opt.value = "Основной объект";
+                opt.textContent = "Основной объект";
+                objectSelect.appendChild(opt);
+            } else {
+                filtered.forEach(obj => {
+                    const opt = document.createElement('option');
+                    opt.value = obj.name;
+                    opt.textContent = obj.display;
+                    objectSelect.appendChild(opt);
+                });
+            }
+        }
 
         // Проверка авторизации при загрузке страницы
         async function checkAuth() {
@@ -161,164 +161,141 @@
                 const res = await fetch('/me');
                 const data = await res.json();
                 if (data.ok) {
-                    document.getElementById('current-user-name').textContent = data.user.username;
-                    document.getElementById('current-user-role').textContent = data.user.role;
-                    document.getElementById('auth-bar').style.display = 'flex';
-                    document.getElementById('auth-modal').style.display = 'none';
+                    currentUser = data.user;
+                    document.getElementById('login-modal').classList.add('hidden');
+                    setupUserInterface();
                 } else {
-                    document.getElementById('auth-modal').style.display = 'flex';
+                    showLoginModal();
                 }
-            } catch (err) {
-                console.error("Auth check error:", err);
-                document.getElementById('auth-modal').style.display = 'flex';
+            } catch (e) {
+                showLoginModal();
             }
         }
 
-        // Обработка формы входа
-        document.getElementById('login-form').addEventListener('submit', async function(e) {
+        function showLoginModal() {
+            document.getElementById('login-modal').classList.remove('hidden');
+        }
+
+        // Настройка интерфейса в зависимости от роли пользователя
+        function setupUserInterface() {
+            const userInfoText = document.getElementById('user-info-text');
+            const employeeSelect = document.getElementById('employee');
+
+            if (currentUser.role === 'admin') {
+                userInfoText.textContent = `Администратор: ${currentUser.username}`;
+                // Админ может выбирать любого сотрудника
+                employeeSelect.disabled = false;
+            } else {
+                userInfoText.textContent = `Работник: ${currentUser.username}`;
+                
+                // Находим ID или имя сотрудника, привязанного к юзеру
+                // Если employee_id задан, ищем в списке точное совпадение
+                // Либо блокируем селект и ставим имя текущего пользователя
+                employeeSelect.disabled = true;
+                
+                // Пробуем найти соответствие по имени (так как логин часто совпадает с именем или частью имени)
+                for (let i = 0; i < employeeSelect.options.length; i++) {
+                    const optVal = employeeSelect.options[i].value.toLowerCase();
+                    if (optVal.includes(currentUser.username.toLowerCase().replace('.', ' '))) {
+                        employeeSelect.selectedIndex = i;
+                        break;
+                    }
+                }
+            }
+            filterObjects();
+        }
+
+        // Обработка входа
+        async function handleLogin(e) {
             e.preventDefault();
             const username = document.getElementById('login-username').value.trim();
             const password = document.getElementById('login-password').value;
-            const errBox = document.getElementById('login-error');
+            const errDiv = document.getElementById('login-error');
 
-            errBox.style.display = 'none';
+            errDiv.classList.add('hidden');
 
             try {
                 const res = await fetch('/login', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({username, password})
                 });
                 const data = await res.json();
 
-                if (res.ok && data.ok) {
-                    document.getElementById('auth-modal').style.display = 'none';
-                    document.getElementById('login-password').value = '';
-                    checkAuth();
+                if (data.ok) {
+                    currentUser = data.user;
+                    document.getElementById('login-modal').classList.add('hidden');
+                    setupUserInterface();
                 } else {
-                    errBox.textContent = data.error || 'Ошибка входа';
-                    errBox.style.display = 'block';
+                    errDiv.textContent = data.error || 'Ошибка входа';
+                    errDiv.classList.remove('hidden');
                 }
             } catch (err) {
-                errBox.textContent = 'Ошибка соединения с сервером';
-                errBox.style.display = 'block';
+                errDiv.textContent = 'Ошибка соединения с сервером';
+                errDiv.classList.remove('hidden');
             }
-        });
+        }
 
         // Выход из системы
-        document.getElementById('logout-btn').addEventListener('click', async function() {
-            await fetch('/logout', { method: 'POST' });
+        async function handleLogout() {
+            await fetch('/logout', {method: 'POST'});
             window.location.reload();
-        });
+        }
+
+        // Генерация уникального request_id для защиты от дублей
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
 
         // Отправка смены
-        document.getElementById('shift-form').addEventListener('submit', async function(e) {
+        async function submitShift(e) {
             e.preventDefault();
-            const submitBtn = document.getElementById('submit-btn');
-            submitBtn.disabled = true;
-            
-            const formData = {
+            const msgDiv = document.getElementById('form-message');
+            msgDiv.classList.remove('hidden');
+            msgDiv.className = "text-sm font-medium text-blue-600";
+            msgDiv.textContent = "Отправка смены...";
+
+            const payload = {
+                request_id: generateUUID(),
                 date: document.getElementById('date').value,
                 employee: document.getElementById('employee').value,
                 company: document.getElementById('company').value,
                 object_name: document.getElementById('object_name').value,
                 hours: parseFloat(document.getElementById('hours').value),
-                transport: parseFloat(document.getElementById('transport').value || 0),
+                transport: parseFloat(document.getElementById('transport').value) || 0.0,
                 comment: document.getElementById('comment').value
             };
 
             try {
-                const response = await fetch('/submit-shift', {
+                const res = await fetch('/submit-shift', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(formData)
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
                 });
-                
-                const result = await response.json();
-                if (response.ok) {
-                    alert("Смена успешно отправлена!");
+                const data = await res.json();
+
+                if (data.ok) {
+                    msgDiv.className = "text-sm font-medium text-green-600";
+                    msgDiv.textContent = data.message || "Смена успешно сохранена!";
                     document.getElementById('comment').value = '';
                 } else {
-                    alert("Ошибка: " + (result.error || "Не удалось отправить"));
-                    if (response.status === 401) {
-                        checkAuth(); // если сессия слетела, вызовем модалку входа
-                    }
+                    msgDiv.className = "text-sm font-medium text-red-600";
+                    msgDiv.textContent = data.error || "Ошибка при отправке";
                 }
             } catch (err) {
-                alert("Не удалось отправить данные на сервер.");
-                console.error(err);
-            } finally {
-                submitBtn.disabled = false;
+                msgDiv.className = "text-sm font-medium text-red-600";
+                msgDiv.textContent = "Ошибка сети при отправке смены";
             }
-        });
+        }
 
-        // Загрузка истории
-        document.getElementById('load-history-btn').addEventListener('click', async function() {
-            const empName = document.getElementById('history-employee').value;
-            const listContainer = document.getElementById('history-list');
-            const warningContainer = document.getElementById('warning-container');
-            
-            if (!empName) {
-                alert('Пожалуйста, выберите сотрудника!');
-                return;
-            }
-
-            listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">Загрузка...</li>';
-            warningContainer.style.display = 'none';
-
-            try {
-                const response = await fetch('/check-employee-shifts', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ employee: empName })
-                });
-
-                const data = await response.json();
-                listContainer.innerHTML = '';
-
-                if (response.status === 401) {
-                    checkAuth();
-                    return;
-                }
-
-                if (data.recent_shifts && data.recent_shifts.length > 0) {
-                    data.recent_shifts.forEach(shift => {
-                        const li = document.createElement('li');
-                        
-                        // Защита от XSS через textContent
-                        const spanLeft = document.createElement('span');
-                        const bDate = document.createElement('b');
-                        bDate.textContent = shift.date;
-                        spanLeft.appendChild(bDate);
-                        spanLeft.appendChild(document.createElement('br'));
-                        
-                        const smallObj = document.createElement('small');
-                        smallObj.style.color = '#a0aec0';
-                        smallObj.textContent = shift.object_name;
-                        spanLeft.appendChild(smallObj);
-
-                        const spanRight = document.createElement('span');
-                        spanRight.style.background = '#2e5b88';
-                        spanRight.style.padding = '4px 8px';
-                        spanRight.style.borderRadius = '4px';
-                        spanRight.style.fontWeight = 'bold';
-                        spanRight.textContent = shift.hours + ' ч';
-
-                        li.appendChild(spanLeft);
-                        li.appendChild(spanRight);
-                        listContainer.appendChild(li);
-                    });
-                } else {
-                    listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">У сотрудника пока нет записей о сменах.</li>';
-                }
-            } catch (err) {
-                listContainer.innerHTML = '<li style="color: #e74c3c; justify-content: center;">Ошибка загрузки данных.</li>';
-                console.error(err);
-            }
-        });
-
-        // Первичный запуск проверки сессии
-        checkAuth();
+        // Инициализация при загрузке
+        window.onload = () => {
+            filterObjects();
+            checkAuth();
+        };
     </script>
 </body>
 </html>
