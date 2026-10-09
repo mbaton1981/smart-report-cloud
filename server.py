@@ -11,7 +11,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-it-12345')
 app.permanent_session_lifetime = timedelta(hours=8)
 
-DB_FILE = "cloud_database.db"
+DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
@@ -57,6 +57,7 @@ def init_cloud_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cloud_shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT UNIQUE,
             date TEXT NOT NULL,
             employee TEXT NOT NULL,
             company TEXT NOT NULL,
@@ -65,22 +66,39 @@ def init_cloud_db():
             rate REAL NOT NULL,
             transport REAL DEFAULT 0.0,
             comment TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             synced INTEGER DEFAULT 0
         )
     ''')
+    
+    # Авто-миграция для добавления request_id, если таблица уже существовала
+    cursor.execute("PRAGMA table_info(cloud_shifts)")
+    shift_cols = [c[1] for c in cursor.fetchall()]
+    if 'request_id' not in shift_cols:
+        try:
+            cursor.execute("ALTER TABLE cloud_shifts ADD COLUMN request_id TEXT UNIQUE")
+        except Exception:
+            pass
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
+            id INTEGER PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
-            salary_rate REAL DEFAULT 0.0
+            salary_rate REAL DEFAULT 0.0,
+            is_active INTEGER NOT NULL DEFAULT 1
         )
     ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
         )
     ''')
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_objects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             markning TEXT,
             company TEXT,
@@ -91,7 +109,7 @@ def init_cloud_db():
     # Дефолтные данные, если таблицы пустые
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", ("Aliaksei Patonich",))
+        cursor.execute("INSERT OR IGNORE INTO meta_employees (id, name, salary_rate, is_active) VALUES (?, ?, ?, ?)", (1, "Aliaksei Patonich", 0.0, 1))
 
     cursor.execute("SELECT COUNT(*) FROM meta_companies")
     if cursor.fetchone()[0] == 0:
@@ -118,15 +136,14 @@ def init_cloud_db():
 
 init_cloud_db()
 
-# Эндпоинты авторизации
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json or {}
     username = data.get('username', '').strip()
     password = data.get('password', '')
 
-    if not username or not password:
-        return jsonify({"ok": False, "error": "Укажите логин и пароль"}), 400
+    if not username or not password or len(username) > 100:
+        return jsonify({"ok": False, "error": "Неверные данные для входа"}), 400
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -141,7 +158,6 @@ def login():
         session['role'] = user['role']
         session['employee_id'] = user['employee_id']
 
-        # Обновляем last_login
         conn = get_db_connection()
         conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), user['id']))
         conn.commit()
@@ -182,7 +198,7 @@ def index():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT name FROM meta_employees ORDER BY name")
+    cursor.execute("SELECT name FROM meta_employees WHERE is_active = 1 ORDER BY name")
     employees = [row['name'] for row in cursor.fetchall()]
     if not employees:
         employees = ["Aliaksei Patonich"]
@@ -228,41 +244,100 @@ def index():
 
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
-    data = request.json or {}
-    
-    # Валидация базовых полей
-    date_str = data.get('date')
-    hours = data.get('hours')
+    # 1. Проверка авторизации
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
+
+    date_str = str(data.get('date', '')).strip()
+    employee = str(data.get('employee', '')).strip()
+    company = str(data.get('company', '')).strip()
+    object_name = str(data.get('object_name', '')).strip()
+    request_id = data.get('request_id')
+    comment = str(data.get('comment', ''))[:2000]
+
+    # 2. Валидация даты (YYYY-MM-DD)
     try:
-        hours = float(hours)
-        if not (0 <= hours <= 24):
+        datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({"ok": False, "error": "Некорректная дата (ожидается формат YYYY-MM-DD)"}), 400
+
+    # 3. Валидация часов (от 0.5 до 24, шаг 0.5)
+    try:
+        hours = float(data.get('hours'))
+        if not (0.5 <= hours <= 24) or (hours % 0.5 != 0):
             raise ValueError()
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "Некорректное значение часов (от 0 до 24)"}), 400
+        return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
+
+    # 4. Валидация транспорта и ставки
+    try:
+        rate = float(data.get('rate', 0.0))
+        transport = float(data.get('transport', 0.0))
+        if rate < 0 or transport < 0:
+            raise ValueError()
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Некорректные числовые значения ставки или транспорта"}), 400
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    name, _, _ = safe_parse_obj(data.get('object_name'))
-    
-    cursor.execute('''
-        INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-    ''', (
-        date_str,
-        data.get('employee'),
-        data.get('company'),
-        name or data.get('object_name'),
-        hours,
-        data.get('rate', 0.0),
-        data.get('transport', 0.0),
-        str(data.get('comment', ''))[:2000],
-    ))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "message": "Смена успешно отправлена!"})
+
+    try:
+        # 5. Проверка существования сотрудника и компании в базе
+        cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
+        if not cursor.fetchone():
+            return jsonify({"ok": False, "error": "Указанный сотрудник не найден или неактивен"}), 400
+
+        cursor.execute("SELECT id FROM meta_companies WHERE name = ?", (company,))
+        if not cursor.fetchone():
+            return jsonify({"ok": False, "error": "Указанная фирма не найдена"}), 400
+
+        # 6. Строгая проверка соответствия объекта выбранной фирме (object.company == company)
+        parsed_obj_name, _, _ = safe_parse_obj(object_name)
+        final_obj_name = parsed_obj_name or object_name
+
+        cursor.execute("SELECT id FROM meta_objects WHERE name = ? AND company = ?", (final_obj_name, company))
+        if not cursor.fetchone():
+            return jsonify({"ok": False, "error": "Объект не принадлежит выбранной фирме или не существует"}), 400
+
+        # 7. Защита от дублей (проверка request_id или повторной смены за последние 60 секунд)
+        if request_id:
+            cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (request_id,))
+            if cursor.fetchone():
+                return jsonify({"ok": False, "error": "Такая смена уже была отправлена ранее"}), 409
+
+        # Проверка на дубликат за последние 60 секунд (тот же сотрудник, дата, фирма, объект, часы)
+        sixty_secs_ago = (datetime.utcnow() - timedelta(seconds=60)).strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            SELECT id FROM cloud_shifts 
+            WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ? AND created_at >= ?
+        ''', (employee, date_str, company, final_obj_name, hours, sixty_secs_ago))
+        if cursor.fetchone():
+            return jsonify({"ok": False, "error": "Похожая смена уже была зарегистрирована только что. Подождите немного."}), 409
+
+        # 8. Сохранение смены
+        cursor.execute('''
+            INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ''', (request_id, date_str, employee, company, final_obj_name, hours, rate, transport, comment))
+        
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"ok": False, "error": f"Ошибка сервера при сохранении: {str(e)}"}), 500
+    finally:
+        conn.close()
+
+    return jsonify({"ok": True, "message": "Смена успешно сохранена!"}), 201
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
     data = request.json or {}
     emp = data.get('employee')
     conn = get_db_connection()
@@ -276,7 +351,6 @@ def check_employee_shifts():
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    # Разрешаем синхронизацию без жесткой блокировки 403, если ключ не задан или совпадает
     sync_key = request.headers.get('X-Sync-Key')
     expected_key = os.environ.get('SYNC_API_KEY')
     if expected_key and sync_key and sync_key != expected_key:
@@ -295,8 +369,51 @@ def sync_desktop_data():
         cursor.execute("DELETE FROM meta_employees")
         if employees:
             for emp in employees:
-                if emp:
-                    cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
+                if isinstance(emp, dict):
+                    emp_id = emp.get('id')
+                    emp_name = str(emp.get('name', '')).strip()
+                    emp_rate = float(emp.get('salary_rate', 0.0))
+                    emp_active = int(emp.get('is_active', 1))
+                else:
+                    emp_id = None
+                    emp_name = str(emp).strip()
+                    emp_rate = 0.0
+                    emp_active = 1
+
+                if emp_name:
+                    if emp_id:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO meta_employees (id, name, salary_rate, is_active) 
+                            VALUES (?, ?, ?, ?)
+                        ''', (emp_id, emp_name, emp_rate, emp_active))
+                    else:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO meta_employees (name, salary_rate, is_active) 
+                            VALUES (?, ?, ?)
+                        ''', (emp_name, emp_rate, emp_active))
+                        
+                        cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (emp_name,))
+                        row_res = cursor.fetchone()
+                        if row_res:
+                            emp_id = row_res['id']
+
+                    if emp_id:
+                        cursor.execute("SELECT id FROM users WHERE employee_id = ?", (emp_id,))
+                        user_row = cursor.fetchone()
+                        
+                        if emp_active == 1 and not user_row:
+                            username_clean = emp_name.lower().replace(" ", ".")
+                            default_pass_hash = generate_password_hash("Worker2026!")
+                            now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                            try:
+                                cursor.execute('''
+                                    INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
+                                    VALUES (?, ?, 'user', ?, 1, ?)
+                                ''', (username_clean, default_pass_hash, emp_id, now_str))
+                            except sqlite3.IntegrityError:
+                                pass
+                        elif user_row:
+                            cursor.execute("UPDATE users SET is_active = ? WHERE employee_id = ?", (emp_active, emp_id))
 
         cursor.execute("DELETE FROM meta_companies")
         if companies:

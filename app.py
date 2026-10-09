@@ -57,9 +57,16 @@ def init_db_once():
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
-            salary_rate REAL DEFAULT 0.0
+            salary_rate REAL DEFAULT 0.0,
+            is_active INTEGER NOT NULL DEFAULT 1
         )
     ''')
+
+    # Авто-миграция для существующих баз (если колонка is_active еще не создана)
+    cursor.execute("PRAGMA table_info(employees)")
+    emp_columns = [col[1] for col in cursor.fetchall()]
+    if 'is_active' not in emp_columns:
+        cursor.execute("ALTER TABLE employees ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
