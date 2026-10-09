@@ -521,7 +521,7 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Всегда полностью очищаем старые смены в облаке перед заливкой актуальных
+        # Всегда полностью очищаем старые смены в облаке перед заливкой актуальных[cite: 4]
         cursor.execute("DELETE FROM cloud_shifts")
         
         if desktop_shifts:
@@ -531,7 +531,7 @@ def sync_desktop_data():
                 
                 cursor.execute('''
                     INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     s.get('date'), s.get('employee'), s.get('company'), obj_name,
                     s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000], 1
