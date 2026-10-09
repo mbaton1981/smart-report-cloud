@@ -134,7 +134,6 @@ def init_cloud_db():
             VALUES (?, ?, 'admin', NULL, 1, ?)
         ''', (admin_user, hashed_pw, now_str))
     else:
-        # Автоматически обновляем пароль админа при старте, если он задан в окружении
         cursor.execute('''
             UPDATE users SET password_hash = ? WHERE role = 'admin'
         ''', (hashed_pw,))
@@ -146,7 +145,6 @@ init_cloud_db()
 
 @app.route('/get-active-employees', methods=['GET'])
 def get_active_employees():
-    """Возвращает список активных сотрудников для выпадающего списка при входе"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM meta_employees WHERE is_active = 1 ORDER BY name")
@@ -158,7 +156,6 @@ def get_active_employees():
 
 @app.route('/check-user-pin', methods=['POST'])
 def check_user_pin():
-    """Проверяет, задан ли пин-код/пароль для выбранного пользователя"""
     data = request.json or {}
     username = str(data.get('username', '')).strip()
     if not username:
@@ -191,7 +188,6 @@ def login():
     user = cursor.fetchone()
 
     if not user:
-        # Автоматически создаем учетную запись для сотрудника при первой попытке входа
         now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         hashed_pw = generate_password_hash(password)
         cursor.execute('''
@@ -204,7 +200,6 @@ def login():
         user = cursor.fetchone()
 
     elif not user['password_hash']:
-        # Пин-код еще не задан — сохраняем введенный как постоянный
         hashed_pw = generate_password_hash(password)
         cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed_pw, user['id']))
         conn.commit()
@@ -256,7 +251,6 @@ def get_current_user():
 
 @app.route('/admin/reset-user-pin', methods=['POST'])
 def admin_reset_user_pin():
-    """Сброс пин-кода сотрудника (поддерживает сессию админа или ключ синхронизации)"""
     sync_key = request.headers.get('X-Sync-Key')
     expected_key = os.environ.get('SYNC_API_KEY')
     
@@ -281,7 +275,6 @@ def admin_reset_user_pin():
 
 @app.route('/admin/get-users-status', methods=['GET'])
 def admin_get_users_status():
-    """Возвращает список всех пользователей и статус наличия у них пин-кода (для десктопного приложения)"""
     sync_key = request.headers.get('X-Sync-Key')
     expected_key = os.environ.get('SYNC_API_KEY')
     if expected_key and sync_key and sync_key != expected_key:
@@ -369,6 +362,12 @@ def submit_shift():
     request_id = data.get('request_id')
     comment = str(data.get('comment', ''))[:2000]
 
+    # ПРОВЕРКА ПРАВ: Если пользователь не администратор, он может отправлять смену только за себя
+    if session.get('role') != 'admin':
+        session_username = session.get('username', '').lower()
+        if session_username not in employee.lower():
+            return jsonify({"ok": False, "error": "Вы можете отправлять смены только от своего имени"}), 403
+
     try:
         datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
@@ -442,6 +441,13 @@ def check_employee_shifts():
 
     data = request.json or {}
     emp = data.get('employee')
+
+    # ПРОВЕРКА ПРАВ: Обычный сотрудник может смотреть историю только за себя
+    if session.get('role') != 'admin':
+        session_username = session.get('username', '').lower()
+        if session_username not in str(emp).lower():
+            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 5", (emp,))

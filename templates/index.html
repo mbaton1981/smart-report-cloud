@@ -193,13 +193,11 @@
                     const select = document.getElementById('login-username');
                     select.innerHTML = '<option value="">-- Выберите пользователя --</option>';
                     
-                    // Добавляем администратора
                     const adminOpt = document.createElement('option');
                     adminOpt.value = 'admin';
                     adminOpt.textContent = 'admin (Администратор)';
                     select.appendChild(adminOpt);
 
-                    // Добавляем сотрудников из базы
                     data.employees.forEach(name => {
                         const opt = document.createElement('option');
                         opt.value = name;
@@ -238,7 +236,7 @@
         }
 
         function showLoginModal() {
-            loadLoginUsers(); // Подгружаем актуальный список при открытии окна входа
+            loadLoginUsers();
             document.getElementById('login-modal').classList.remove('hidden');
         }
 
@@ -246,20 +244,24 @@
         function setupUserInterface() {
             const userInfoText = document.getElementById('user-info-text');
             const employeeSelect = document.getElementById('employee');
+            const historyEmployeeSelect = document.getElementById('history-employee');
 
             if (currentUser.role === 'admin') {
                 userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>`;
                 employeeSelect.disabled = false;
+                historyEmployeeSelect.disabled = false;
             } else {
                 userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
                 employeeSelect.disabled = true;
+                historyEmployeeSelect.disabled = true;
 
-                // Автоматически находим и выбираем сотрудника по имени
+                // Автоматически находим и выбираем сотрудника в обеих формах по имени
                 const userNameLower = currentUser.username.toLowerCase();
                 for (let i = 0; i < employeeSelect.options.length; i++) {
                     const optVal = employeeSelect.options[i].value.toLowerCase();
                     if (optVal.includes(userNameLower) || userNameLower.includes(optVal.split(' ')[0])) {
                         employeeSelect.selectedIndex = i;
+                        historyEmployeeSelect.selectedIndex = i;
                         break;
                     }
                 }
@@ -385,8 +387,8 @@
 
         // Инициализация при старте страницы
         window.onload = () => {
-            filterObjects(); // Заполняем объекты для первой выбранной фирмы
-            checkAuth();     // Проверяем авторизацию
+            filterObjects();
+            checkAuth();
         };
     </script>
 </body>
