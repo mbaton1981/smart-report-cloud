@@ -1,4 +1,5 @@
 import sqlite3
+import time
 import ast
 from flask import Flask, render_template, request, jsonify
 
@@ -124,7 +125,6 @@ def submit_shift():
     conn = get_db_connection()
     cursor = conn.cursor()
     name, _, _ = safe_parse_obj(data.get('object_name'))
-    
     cursor.execute('''
         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -167,18 +167,21 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
+        # Полная синхронизация (перезапись) справочника сотрудников
         cursor.execute("DELETE FROM meta_employees")
         if employees:
             for emp in employees:
                 if emp:
                     cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
 
+        # Полная синхронизация (перезапись) справочника компаний
         cursor.execute("DELETE FROM meta_companies")
         if companies:
             for comp in companies:
                 if comp:
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
+        # Полная синхронизация (перезапись) справочника объектов
         cursor.execute("DELETE FROM meta_objects")
         if objects:
             for obj in objects:
@@ -194,11 +197,12 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
+        # Полная перезапись облачных смен актуальным списком с ПК
         cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
             obj_name = name or s.get('object_name')
-
+            
             cursor.execute('''
                 INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
