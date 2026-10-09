@@ -7,7 +7,6 @@ from flask import Flask, render_template, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-# Секретный ключ для сессий (на Render берется из окружения)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-it-12345')
 app.permanent_session_lifetime = timedelta(hours=8)
 
@@ -40,7 +39,6 @@ def init_cloud_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +69,6 @@ def init_cloud_db():
         )
     ''')
     
-    # Авто-миграция для добавления request_id, если таблица уже существовала
     cursor.execute("PRAGMA table_info(cloud_shifts)")
     shift_cols = [c[1] for c in cursor.fetchall()]
     if 'request_id' not in shift_cols:
@@ -106,7 +103,6 @@ def init_cloud_db():
         )
     ''')
 
-    # Дефолтные данные, если таблицы пустые
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_employees (id, name, salary_rate, is_active) VALUES (?, ?, ?, ?)", (1, "Aliaksei Patonich", 0.0, 1))
@@ -119,7 +115,6 @@ def init_cloud_db():
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Bygg och renovering", "Sthlm", "Privat"))
 
-    # Создаем администратора по умолчанию, если его нет
     cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
     if cursor.fetchone()[0] == 0:
         admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
@@ -244,7 +239,6 @@ def index():
 
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
-    # 1. Проверка авторизации
     if 'user_id' not in session:
         return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
 
@@ -259,13 +253,11 @@ def submit_shift():
     request_id = data.get('request_id')
     comment = str(data.get('comment', ''))[:2000]
 
-    # 2. Валидация даты (YYYY-MM-DD)
     try:
         datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
         return jsonify({"ok": False, "error": "Некорректная дата (ожидается формат YYYY-MM-DD)"}), 400
 
-    # 3. Валидация часов (от 0.5 до 24, шаг 0.5)
     try:
         hours = float(data.get('hours'))
         if not (0.5 <= hours <= 24) or (hours % 0.5 != 0):
@@ -273,7 +265,6 @@ def submit_shift():
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
 
-    # 4. Валидация транспорта и ставки
     try:
         rate = float(data.get('rate', 0.0))
         transport = float(data.get('transport', 0.0))
@@ -286,7 +277,6 @@ def submit_shift():
     cursor = conn.cursor()
 
     try:
-        # 5. Проверка существования сотрудника и компании в базе
         cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
         if not cursor.fetchone():
             return jsonify({"ok": False, "error": "Указанный сотрудник не найден или неактивен"}), 400
@@ -295,7 +285,6 @@ def submit_shift():
         if not cursor.fetchone():
             return jsonify({"ok": False, "error": "Указанная фирма не найдена"}), 400
 
-        # 6. Строгая проверка соответствия объекта выбранной фирме (object.company == company)
         parsed_obj_name, _, _ = safe_parse_obj(object_name)
         final_obj_name = parsed_obj_name or object_name
 
@@ -303,13 +292,11 @@ def submit_shift():
         if not cursor.fetchone():
             return jsonify({"ok": False, "error": "Объект не принадлежит выбранной фирме или не существует"}), 400
 
-        # 7. Защита от дублей (проверка request_id или повторной смены за последние 60 секунд)
         if request_id:
             cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (request_id,))
             if cursor.fetchone():
                 return jsonify({"ok": False, "error": "Такая смена уже была отправлена ранее"}), 409
 
-        # Проверка на дубликат за последние 60 секунд (тот же сотрудник, дата, фирма, объект, часы)
         sixty_secs_ago = (datetime.utcnow() - timedelta(seconds=60)).strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute('''
             SELECT id FROM cloud_shifts 
@@ -318,7 +305,6 @@ def submit_shift():
         if cursor.fetchone():
             return jsonify({"ok": False, "error": "Похожая смена уже была зарегистрирована только что. Подождите немного."}), 409
 
-        # 8. Сохранение смены
         cursor.execute('''
             INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -366,63 +352,33 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        cursor.execute("DELETE FROM meta_employees")
+        # ЗАЩИТА: Обновляем справочники только если пришли непустые массивы
         if employees:
+            cursor.execute("DELETE FROM meta_employees")
             for emp in employees:
                 if isinstance(emp, dict):
-                    emp_id = emp.get('id')
                     emp_name = str(emp.get('name', '')).strip()
                     emp_rate = float(emp.get('salary_rate', 0.0))
                     emp_active = int(emp.get('is_active', 1))
                 else:
-                    emp_id = None
                     emp_name = str(emp).strip()
                     emp_rate = 0.0
                     emp_active = 1
 
                 if emp_name:
-                    if emp_id:
-                        cursor.execute('''
-                            INSERT OR REPLACE INTO meta_employees (id, name, salary_rate, is_active) 
-                            VALUES (?, ?, ?, ?)
-                        ''', (emp_id, emp_name, emp_rate, emp_active))
-                    else:
-                        cursor.execute('''
-                            INSERT OR REPLACE INTO meta_employees (name, salary_rate, is_active) 
-                            VALUES (?, ?, ?)
-                        ''', (emp_name, emp_rate, emp_active))
-                        
-                        cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (emp_name,))
-                        row_res = cursor.fetchone()
-                        if row_res:
-                            emp_id = row_res['id']
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO meta_employees (name, salary_rate, is_active) 
+                        VALUES (?, ?, ?)
+                    ''', (emp_name, emp_rate, emp_active))
 
-                    if emp_id:
-                        cursor.execute("SELECT id FROM users WHERE employee_id = ?", (emp_id,))
-                        user_row = cursor.fetchone()
-                        
-                        if emp_active == 1 and not user_row:
-                            username_clean = emp_name.lower().replace(" ", ".")
-                            default_pass_hash = generate_password_hash("Worker2026!")
-                            now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                            try:
-                                cursor.execute('''
-                                    INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
-                                    VALUES (?, ?, 'user', ?, 1, ?)
-                                ''', (username_clean, default_pass_hash, emp_id, now_str))
-                            except sqlite3.IntegrityError:
-                                pass
-                        elif user_row:
-                            cursor.execute("UPDATE users SET is_active = ? WHERE employee_id = ?", (emp_active, emp_id))
-
-        cursor.execute("DELETE FROM meta_companies")
         if companies:
+            cursor.execute("DELETE FROM meta_companies")
             for comp in companies:
                 if comp:
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
-        cursor.execute("DELETE FROM meta_objects")
         if objects:
+            cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, dict):
                     name = str(obj.get('name', '')).strip()
@@ -436,18 +392,19 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        cursor.execute("DELETE FROM cloud_shifts")
-        for s in desktop_shifts:
-            name, _, _ = safe_parse_obj(s.get('object_name'))
-            obj_name = name or s.get('object_name')
-            
-            cursor.execute('''
-                INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                s.get('date'), s.get('employee'), s.get('company'), obj_name,
-                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000], 1
-            ))
+        if desktop_shifts:
+            cursor.execute("DELETE FROM cloud_shifts")
+            for s in desktop_shifts:
+                name, _, _ = safe_parse_obj(s.get('object_name'))
+                obj_name = name or s.get('object_name')
+                
+                cursor.execute('''
+                    INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    s.get('date'), s.get('employee'), s.get('company'), obj_name,
+                    s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000], 1
+                ))
 
         conn.commit()
     except Exception as e:
