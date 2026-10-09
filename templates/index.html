@@ -139,6 +139,7 @@
 
             <button type="button" id="load-history-btn" class="btn-history">Показать последние смены</button>
 
+            <!-- Блок красного предупреждения о пропущенных сменах -->
             <div id="warning-container" style="margin-top: 15px; display: none; background: #3d2222; border: 1px solid #c0392b; padding: 10px; border-radius: 6px; font-size: 13px; color: #f5b7b1;"></div>
 
             <div style="margin-top: 15px;">
@@ -246,11 +247,11 @@
             const historyEmployeeSelect = document.getElementById('history-employee');
 
             if (currentUser.role === 'admin') {
-                userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>`;
+                userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>[cite: 5]`;
                 employeeSelect.disabled = false;
                 historyEmployeeSelect.disabled = false;
             } else {
-                userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
+                userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>[cite: 5]`;
                 
                 const userName = currentUser.username.trim().toLowerCase();
                 const allEmployeeOptions = Array.from(employeeSelect.options).map(opt => opt.value).filter(val => val !== "");
@@ -348,7 +349,7 @@
             }
         });
 
-        // Проверка истории
+        // Проверка истории и пропущенных смен
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
             const listContainer = document.getElementById('history-list');
@@ -361,26 +362,36 @@
 
             listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">Загрузка...</li>';
             warningContainer.style.display = 'none';
+            warningContainer.textContent = '';
 
             try {
-                const response = await fetch('/check-employee-shifts', {
+                // 1. Загружаем последние смены
+                const shiftsRes = await fetch('/check-employee-shifts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ employee: empName })
                 });
+                const shiftsData = await shiftsRes.json();
 
-                const data = await response.json();
-                listContainer.innerHTML = '';
+                // 2. Параллельно проверяем пропущенные рабочие дни
+                const missingRes = await fetch('/check-missing-shifts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ employee: empName })
+                });
+                const missingData = await missingRes.json();
 
-                if (data.warning) {
-                    warningContainer.textContent = data.warning;
+                // Выводим красное предупреждение, если есть пропуски
+                if (missingData.ok && missingData.has_gaps) {
+                    warningContainer.textContent = missingData.message + " Пропущенные даты: " + missingData.missing_days.join(', ');
                     warningContainer.style.display = 'block';
                 }
 
-                if (data.recent_shifts && data.recent_shifts.length > 0) {
-                    data.recent_shifts.forEach(shift => {
+                // Заполняем список смен
+                listContainer.innerHTML = '';
+                if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
+                    shiftsData.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
-                        // Подставляем марркинг (например, [p1029]), если он есть
                         const markingBadge = shift.marking ? `<b style="color: #4a90e2; margin-right: 6px;">[${shift.marking}]</b>` : '';
                         
                         li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #a0aec0;">${markingBadge}${shift.object_name}</small></span>` +
