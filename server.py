@@ -2,13 +2,13 @@ import sqlite3
 import time
 import ast
 from flask import Flask, render_template, request, jsonify
-from deep_translator import GoogleTranslator
+from deep_translator import MyMemoryTranslator
 
 app = Flask(__name__)
 DB_FILE = "cloud_database.db"
 
-# Инициализируем переводчик на шведский язык ('sv')
-translator = GoogleTranslator(source='auto', target='sv')
+# Инициализируем стабильный переводчик на шведский язык ('sv')
+translator = MyMemoryTranslator(source='auto', target='sv')
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
