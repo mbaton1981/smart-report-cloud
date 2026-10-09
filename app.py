@@ -183,6 +183,114 @@ def parse_float(val_str, default=0.0):
     except ValueError:
         return default
 
+# --- СЛОВАРЬ И ФУНКЦИЯ ДЛЯ АВТОПЕРЕВОДА КОММЕНТАРИЕВ НА ШВЕДСКИЙ ---
+CONSTRUCTION_TRANSLATIONS = {
+    "монтаж": "montering",
+    "демонтаж": "rivning",
+    "покраска": "målning",
+    "краска": "färg",
+    "утепление": "isolering",
+    "установка": "installation",
+    "гипсокартон": "gips",
+    "шпаклевка": "spackling",
+    "уборка": "städning",
+    "ремонт": "renovering",
+    "стены": "väggar",
+    "стен": "väggar",
+    "потолок": "tak",
+    "пол": "golv",
+    "полов": "golv",
+    "окна": "fönster",
+    "двери": "dörrar",
+    "плитка": "kakel",
+    "замена": "byte",
+    "проводка": "eldragning",
+    "стяжка": "avjämningsmassa",
+    "укладка": "läggning",
+    "сборка": "montering",
+    "подготовка": "förberedelse",
+    "выравнивание": "spackling",
+    "изоляция": "isolering",
+    "работа": "arbete",
+    "работы": "arbeten",
+    "комната": "rum",
+    "квартира": "lägenhet",
+    "дом": "hus"
+}
+
+def translate_to_swedish(text):
+    if not text:
+        return ""
+    
+    # Приводим весь комментарий к нижнему регистру для анализа
+    t = str(text).lower()
+    
+    # Список правил: если в тексте встречается корень/часть слова, 
+    # заменяем всю фразу или дополняем её шведским аналогом.
+    # Порядок важен: более специфичные фразы идут выше.
+    
+    # 1. Проверяем сложные составные фразы
+    replacements = {
+        "гипсокартон": "gips",
+        "гипсу": "gips",
+        "картон": "kartong",
+        "вентиляц": "ventilation",
+        "электрик": "elarbete",
+        "проводк": "eldragning",
+        "розетк": "vägguttag",
+        "демонтаж": "rivning",
+        "демонт": "rivning",
+        "монтаж": "montering",
+        "монт": "montering",
+        "покраск": "målning",
+        "красил": "målade",
+        "краск": "färg",
+        "утеплен": "isolering",
+        "изоляц": "isolering",
+        "установк": "installation",
+        "шпаклев": "spackling",
+        "шпатлев": "spackling",
+        "уборк": "städning",
+        "убирал": "städade",
+        "ремонт": "renovering",
+        "стен": "väggar",
+        "потолк": "tak",
+        "пол": "golv",
+        "окн": "fönster",
+        "двер": "dörrar",
+        "плитк": "kakel",
+        "замен": "byte",
+        "стяжк": "avjämningsmassa",
+        "работ": "arbeten",
+        "мусор": "avfall",
+        "доставк": "leverans"
+    }
+    
+    # Если точного слияния нет, проходим по словам и заменяем корни
+    words = t.split()
+    translated_words = []
+    
+    for word in words:
+        # Убираем знаки препинания для проверки
+        clean_w = word.strip(".,;:!?()[]{}\"'")
+        matched = False
+        
+        for ru_root, se_word in replacements.items():
+            if ru_root in clean_w:
+                # Сохраняем заглавную букву, если слово было с большой
+                result_word = se_word
+                if word and word[0].isupper():
+                    result_word = result_word.capitalize()
+                translated_words.append(result_word)
+                matched = True
+                break
+                
+        if not matched:
+            # Если корень не найден вообще нигде, оставляем исходное слово (или можно заменить на знак)
+            translated_words.append(word)
+            
+    return " ".join(translated_words)
+
 # --- РЕГИСТРАЦИЯ ШРИФТА С ПОДДЕРЖКОЙ КИРИЛЛИЦЫ (ARIAL) ---
 try:
     windows_font_path = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts', 'arial.ttf')
@@ -1268,7 +1376,9 @@ class SmartReportApp(QMainWindow):
             for row in rows:
                 date, emp, hrs, comment = row[0], row[1], row[2], row[3]
                 total_hours += hrs
-                table_data.append([str(date), str(emp), f"{hrs:.1f}", str(comment or "")])
+                # Автоматический перевод комментария на шведский для PDF отчета
+                translated_comment = translate_to_swedish(comment)
+                table_data.append([str(date), str(emp), f"{hrs:.1f}", str(translated_comment or "")])
 
             table_data.append(["Totalt timmar:", "", f"{total_hours:.1f}", ""])
 
