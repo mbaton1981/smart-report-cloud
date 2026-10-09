@@ -23,14 +23,20 @@ def safe_parse_obj(val):
     if not val:
         return "", "", "Privat"
     if isinstance(val, dict):
-        return str(val.get('name', '')).strip(), str(val.get('markning', '')).strip(), str(val.get('company', 'Privat')).strip()
+        name = str(val.get('name') or val.get('title') or val.get('namn') or '').strip()
+        mark = str(val.get('markning') or val.get('mark') or '').strip()
+        comp = str(val.get('company') or val.get('customer') or 'Privat').strip()
+        return name, mark, comp
     
     val_str = str(val).strip()
-    if "{" in val_str and "'name'" in val_str:
+    if "{" in val_str and ("'name'" in val_str or "'title'" in val_str):
         try:
             d = ast.literal_eval(val_str)
             if isinstance(d, dict):
-                return str(d.get('name', '')).strip(), str(d.get('markning', '')).strip(), str(d.get('company', 'Privat')).strip()
+                name = str(d.get('name') or d.get('title') or '').strip()
+                mark = str(d.get('markning') or d.get('mark') or '').strip()
+                comp = str(d.get('company') or d.get('customer') or 'Privat').strip()
+                return name, mark, comp
         except Exception:
             pass
     return val_str, "", "Privat"
@@ -43,7 +49,7 @@ def init_cloud_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
+            password_hash TEXT,
             role TEXT NOT NULL DEFAULT 'user',
             employee_id INTEGER,
             is_active INTEGER NOT NULL DEFAULT 1,
@@ -131,6 +137,26 @@ def init_cloud_db():
 
 init_cloud_db()
 
+@app.route('/check-user-pin', methods=['POST'])
+def check_user_pin():
+    """Проверяет, задан ли пин-код/пароль для выбранного пользователя"""
+    data = request.json or {}
+    username = str(data.get('username', '')).strip()
+    if not username:
+        return jsonify({"ok": False, "error": "Не указано имя"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT password_hash FROM users WHERE username = ? AND is_active = 1", (username,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        return jsonify({"ok": True, "has_pin": False, "is_new": True})
+
+    has_pin = bool(user['password_hash'])
+    return jsonify({"ok": True, "has_pin": has_pin, "is_new": not has_pin})
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json or {}
@@ -144,31 +170,52 @@ def login():
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (username,))
     user = cursor.fetchone()
+
+    if not user:
+        # Автоматически создаем учетную запись для сотрудника при первой попытке входа
+        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        hashed_pw = generate_password_hash(password)
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, role, is_active, created_at)
+            VALUES (?, ?, 'user', 1, ?)
+        ''', (username, hashed_pw, now_str))
+        conn.commit()
+        
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+
+    elif not user['password_hash']:
+        # Пин-код еще не задан — сохраняем введенный как постоянный
+        hashed_pw = generate_password_hash(password)
+        cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed_pw, user['id']))
+        conn.commit()
+        
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user['id'],))
+        user = cursor.fetchone()
+
+    elif not check_password_hash(user['password_hash'], password):
+        conn.close()
+        return jsonify({"ok": False, "error": "Неверный пин-код или пароль"}), 401
+
+    conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), user['id']))
+    conn.commit()
     conn.close()
 
-    if user and check_password_hash(user['password_hash'], password):
-        session.permanent = True
-        session['user_id'] = user['id']
-        session['username'] = user['username']
-        session['role'] = user['role']
-        session['employee_id'] = user['employee_id']
+    session.permanent = True
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['role'] = user['role']
+    session['employee_id'] = user['employee_id']
 
-        conn = get_db_connection()
-        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), user['id']))
-        conn.commit()
-        conn.close()
-
-        return jsonify({
-            "ok": True,
-            "message": "Успешный вход",
-            "user": {
-                "username": user['username'],
-                "role": user['role'],
-                "employee_id": user['employee_id']
-            }
-        })
-
-    return jsonify({"ok": False, "error": "Неверный логин или пароль"}), 401
+    return jsonify({
+        "ok": True,
+        "message": "Успешный вход",
+        "user": {
+            "username": user['username'],
+            "role": user['role'],
+            "employee_id": user['employee_id']
+        }
+    })
 
 @app.route('/logout', methods=['POST'])
 def logout():
@@ -352,9 +399,6 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        # Защита от полного зануления базы: синхронизируем только если ключ передан 
-        # или если пришел хотя бы какой-то осмысленный непустой список.
-        # Полная перезапись справочников под десктопную версию:
         cursor.execute("DELETE FROM meta_employees")
         if employees:
             for emp in employees:
@@ -384,13 +428,7 @@ def sync_desktop_data():
         cursor.execute("DELETE FROM meta_objects")
         if objects:
             for obj in objects:
-                if isinstance(obj, dict):
-                    name = str(obj.get('name', '')).strip()
-                    mark = str(obj.get('markning', '')).strip()
-                    comp = str(obj.get('company', '')).strip()
-                else:
-                    name, mark, comp = safe_parse_obj(obj)
-
+                name, mark, comp = safe_parse_obj(obj)
                 if name and "{" not in name:
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
