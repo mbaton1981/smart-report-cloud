@@ -144,6 +144,18 @@ def init_cloud_db():
 
 init_cloud_db()
 
+@app.route('/get-active-employees', methods=['GET'])
+def get_active_employees():
+    """Возвращает список активных сотрудников для выпадающего списка при входе"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM meta_employees WHERE is_active = 1 ORDER BY name")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    employees = [r['name'] for r in rows]
+    return jsonify({"ok": True, "employees": employees})
+
 @app.route('/check-user-pin', methods=['POST'])
 def check_user_pin():
     """Проверяет, задан ли пин-код/пароль для выбранного пользователя"""
