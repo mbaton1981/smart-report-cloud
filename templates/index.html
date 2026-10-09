@@ -252,19 +252,30 @@
                 historyEmployeeSelect.disabled = false;
             } else {
                 userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
-                employeeSelect.disabled = true;
-                historyEmployeeSelect.disabled = true;
+                
+                // Гибкий поиск и автоматический выбор сотрудника по имени/логину
+                const userName = currentUser.username.trim().toLowerCase();
+                let foundIndex = -1;
 
-                // Автоматически находим и выбираем сотрудника в обеих формах по имени
-                const userNameLower = currentUser.username.toLowerCase();
                 for (let i = 0; i < employeeSelect.options.length; i++) {
-                    const optVal = employeeSelect.options[i].value.toLowerCase();
-                    if (optVal.includes(userNameLower) || userNameLower.includes(optVal.split(' ')[0])) {
-                        employeeSelect.selectedIndex = i;
-                        historyEmployeeSelect.selectedIndex = i;
+                    const optVal = employeeSelect.options[i].value.trim().toLowerCase();
+                    if (optVal === userName || optVal.includes(userName) || userName.includes(optVal)) {
+                        foundIndex = i;
                         break;
                     }
                 }
+
+                if (foundIndex !== -1) {
+                    employeeSelect.selectedIndex = foundIndex;
+                    historyEmployeeSelect.selectedIndex = foundIndex;
+                } else if (employeeSelect.options.length > 1) {
+                    employeeSelect.selectedIndex = 1;
+                    historyEmployeeSelect.selectedIndex = 1;
+                }
+
+                // Оставляем поля доступными, но имя уже выбрано и закреплено за пользователем бэкендом
+                employeeSelect.disabled = false;
+                historyEmployeeSelect.disabled = false;
             }
         }
 
