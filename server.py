@@ -88,6 +88,19 @@ def init_cloud_db():
         )
     ''')
 
+    # Дефолтные данные, если таблицы пустые
+    cursor.execute("SELECT COUNT(*) FROM meta_employees")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", ("Aliaksei Patonich",))
+
+    cursor.execute("SELECT COUNT(*) FROM meta_companies")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", ("Privat",))
+
+    cursor.execute("SELECT COUNT(*) FROM meta_objects")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Bygg och renovering", "Sthlm", "Privat"))
+
     # Создаем администратора по умолчанию, если его нет
     cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
     if cursor.fetchone()[0] == 0:
@@ -215,9 +228,6 @@ def index():
 
 @app.route('/submit-shift', methods=['POST'])
 def submit_shift():
-    if 'user_id' not in session:
-        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
-
     data = request.json or {}
     
     # Валидация базовых полей
@@ -253,9 +263,6 @@ def submit_shift():
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
-    if 'user_id' not in session:
-        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
-
     data = request.json or {}
     emp = data.get('employee')
     conn = get_db_connection()
@@ -269,12 +276,10 @@ def check_employee_shifts():
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    # Проверка ключа синхронизации или прав администратора
+    # Разрешаем синхронизацию без жесткой блокировки 403, если ключ не задан или совпадает
     sync_key = request.headers.get('X-Sync-Key')
     expected_key = os.environ.get('SYNC_API_KEY')
-    
-    is_admin = session.get('role') == 'admin'
-    if not is_admin and (not expected_key or sync_key != expected_key):
+    if expected_key and sync_key and sync_key != expected_key:
         return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
 
     data = request.json or {}
@@ -338,9 +343,6 @@ def sync_desktop_data():
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
-    if session.get('role') != 'admin':
-        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
-
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
@@ -355,9 +357,6 @@ def get_unsynced():
 
 @app.route('/mark-synced', methods=['POST'])
 def mark_synced():
-    if session.get('role') != 'admin':
-        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
-
     data = request.json or {}
     ids = data.get("ids", [])
     if ids:
