@@ -273,9 +273,9 @@
                     historyEmployeeSelect.selectedIndex = 1;
                 }
 
-                // Оставляем поля доступными, но имя уже выбрано и закреплено за пользователем бэкендом
-                employeeSelect.disabled = false;
-                historyEmployeeSelect.disabled = false;
+                // Блокируем поля для обычного работника, чтобы он не мог выбрать другого человека
+                employeeSelect.disabled = true;
+                historyEmployeeSelect.disabled = true;
             }
         }
 
