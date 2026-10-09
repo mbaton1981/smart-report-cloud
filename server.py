@@ -167,18 +167,23 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
+        # Полная синхронизация (перезапись) справочника сотрудников
+        cursor.execute("DELETE FROM meta_employees")
         if employees:
             for emp in employees:
                 if emp:
                     cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
 
+        # Полная синхронизация (перезапись) справочника компаний
+        cursor.execute("DELETE FROM meta_companies")
         if companies:
             for comp in companies:
                 if comp:
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
 
+        # Полная синхронизация (перезапись) справочника объектов
+        cursor.execute("DELETE FROM meta_objects")
         if objects:
-            cursor.execute("DELETE FROM meta_objects")
             for obj in objects:
                 if isinstance(obj, dict):
                     name = str(obj.get('name', '')).strip()
@@ -192,7 +197,7 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Полная перезапись облачных смен актуальным списком с ПК (решает проблему удалений)
+        # Полная перезапись облачных смен актуальным списком с ПК
         cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
