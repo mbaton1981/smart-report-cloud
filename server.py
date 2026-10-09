@@ -469,6 +469,51 @@ def check_employee_shifts():
     conn.close()
     return jsonify({"ok": True, "recent_shifts": shifts})
 
+@app.route('/check-missing-shifts', methods=['POST'])
+def check_missing_shifts():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
+    data = request.json or {}
+    emp = data.get('employee')
+
+    if session.get('role') != 'admin':
+        session_username = session.get('username', '').lower()
+        if session_username not in str(emp).lower():
+            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    today = datetime.utcnow().date()
+    start_check = today - timedelta(days=10)
+    
+    cursor.execute("""
+        SELECT date FROM cloud_shifts 
+        WHERE employee = ? AND date >= ? AND date <= ?
+    """, (emp, start_check.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')))
+    
+    existing_dates = {row['date'] for row in cursor.fetchall()}
+    conn.close()
+
+    missing_days = []
+    current = start_check
+    while current < today:
+        # Пропускаем субботу (5) и воскресенье (6)
+        if current.weekday() < 5:
+            date_str = current.strftime('%Y-%m-%d')
+            if date_str not in existing_dates:
+                missing_days.append(date_str)
+        current += timedelta(days=1)
+
+    has_gaps = len(missing_days) > 0
+    return jsonify({
+        "ok": True, 
+        "has_gaps": has_gaps, 
+        "missing_days": missing_days,
+        "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
+    })
+
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     sync_key = request.headers.get('X-Sync-Key')
@@ -521,7 +566,7 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Всегда полностью очищаем старые смены в облаке перед заливкой актуальных[cite: 4]
+        # Всегда полностью очищаем старые смены в облаке перед заливкой актуальных[cite: 3]
         cursor.execute("DELETE FROM cloud_shifts")
         
         if desktop_shifts:
@@ -530,10 +575,10 @@ def sync_desktop_data():
                 obj_name = name or s.get('object_name')
                 
                 cursor.execute('''
-                    INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                    INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    s.get('date'), s.get('employee'), s.get('company'), obj_name,
+                    s.get('request_id'), s.get('date'), s.get('employee'), s.get('company'), obj_name,
                     s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000], 1
                 ))
 
