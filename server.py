@@ -244,8 +244,14 @@ def get_current_user():
 
 @app.route('/admin/reset-user-pin', methods=['POST'])
 def admin_reset_user_pin():
-    """Сброс пин-кода конкретного сотрудника администратором"""
-    if session.get('role') != 'admin':
+    """Сброс пин-кода сотрудника (поддерживает сессию админа или ключ синхронизации)"""
+    sync_key = request.headers.get('X-Sync-Key')
+    expected_key = os.environ.get('SYNC_API_KEY')
+    
+    is_admin_session = session.get('role') == 'admin'
+    is_valid_sync = expected_key and sync_key and sync_key == expected_key
+    
+    if not is_admin_session and not is_valid_sync and expected_key:
         return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
         
     data = request.json or {}
