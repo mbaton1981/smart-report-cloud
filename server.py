@@ -121,16 +121,23 @@ def init_cloud_db():
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Bygg och renovering", "Sthlm", "Privat"))
 
+    # Настройка администратора и пароля 1981 по умолчанию
+    admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
+    admin_pass = os.environ.get('ADMIN_PASSWORD', '1981')
+    hashed_pw = generate_password_hash(admin_pass)
+    now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
     cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
     if cursor.fetchone()[0] == 0:
-        admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
-        admin_pass = os.environ.get('ADMIN_PASSWORD', 'AdminSecure2026!')
-        hashed_pw = generate_password_hash(admin_pass)
-        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute('''
             INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
             VALUES (?, ?, 'admin', NULL, 1, ?)
         ''', (admin_user, hashed_pw, now_str))
+    else:
+        # Автоматически обновляем пароль админа при старте, если он задан в окружении
+        cursor.execute('''
+            UPDATE users SET password_hash = ? WHERE role = 'admin'
+        ''', (hashed_pw,))
 
     conn.commit()
     conn.close()
