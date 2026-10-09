@@ -87,7 +87,7 @@
 
                 <div class="form-group">
                     <label for="company">Фирма (Заказчик):</label>
-                    <select id="company" name="company" required>
+                    <select id="company" name="company" required onchange="filterObjects()">
                         {% for comp in companies %}
                         <option value="{{ comp }}">{{ comp }}</option>
                         {% endfor %}
@@ -97,13 +97,7 @@
                 <div class="form-group">
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
-                        {% for obj in objects %}
-                            {% if obj is mapping %}
-                                <option value="{{ obj.name }}">{{ obj.display }}</option>
-                            {% else %}
-                                <option value="{{ obj }}">{{ obj }}</option>
-                            {% endif %}
-                        {% endfor %}
+                        <!-- Заполняется динамически через JS в зависимости от выбранной фирмы -->
                     </select>
                 </div>
 
@@ -154,13 +148,38 @@
         </div>
     </div>
 
+    <!-- Передаем список объектов из Flask в JS -->
     <script>
+        const allObjects = {{ objects | tojson }};
         let currentUser = null;
         document.getElementById('date').value = new Date().toISOString().split('T')[0];
 
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
+
+        // Функция динамической фильтрации объектов по выбранной фирме
+        function filterObjects() {
+            const selectedCompany = document.getElementById('company').value;
+            const objectSelect = document.getElementById('object_name');
+            objectSelect.innerHTML = '';
+
+            const filtered = allObjects.filter(obj => obj.company === selectedCompany);
+
+            if (filtered.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = "";
+                opt.textContent = "-- Нет объектов для этой фирмы --";
+                objectSelect.appendChild(opt);
+            } else {
+                filtered.forEach(obj => {
+                    const opt = document.createElement('option');
+                    opt.value = obj.name;
+                    opt.textContent = obj.display;
+                    objectSelect.appendChild(opt);
+                });
+            }
+        }
 
         // Генерация уникального request_id для защиты от дублей
         function generateUUID() {
@@ -332,9 +351,10 @@
             }
         });
 
-        // Проверяем авторизацию при старте страницы
+        // Инициализация при старте страницы
         window.onload = () => {
-            checkAuth();
+            filterObjects(); // Заполняем объекты для первой выбранной фирмы
+            checkAuth();     // Проверяем авторизацию
         };
     </script>
 </body>
