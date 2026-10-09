@@ -1,8 +1,6 @@
 import sqlite3
-import time
 import ast
 from flask import Flask, render_template, request, jsonify
-from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 DB_FILE = "cloud_database.db"
@@ -127,18 +125,6 @@ def submit_shift():
     cursor = conn.cursor()
     name, _, _ = safe_parse_obj(data.get('object_name'))
     
-    raw_comment = data.get('comment', '')
-    translated_comment = raw_comment
-    
-    if raw_comment and raw_comment.strip():
-        try:
-            translated_comment = GoogleTranslator(source='auto', target='sv').translate(raw_comment)
-            if not translated_comment:
-                translated_comment = raw_comment
-        except Exception as e:
-            print(f"Translation error: {e}")
-            translated_comment = raw_comment
-
     cursor.execute('''
         INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -150,11 +136,11 @@ def submit_shift():
         data.get('hours', 0.0),
         data.get('rate', 0.0),
         data.get('transport', 0.0),
-        translated_comment,
+        data.get('comment', ''),
     ))
     conn.commit()
     conn.close()
-    return jsonify({"status": "success", "message": "Смена успешно отправлена и переведена!"})
+    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
@@ -208,31 +194,17 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Перезаписываем облачные смены с безопасным переводом и паузой против лимитов Google
         cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
             obj_name = name or s.get('object_name')
-            
-            raw_comment = s.get('comment', '')
-            translated_comment = raw_comment
-            
-            if raw_comment and raw_comment.strip():
-                try:
-                    translated_comment = GoogleTranslator(source='auto', target='sv').translate(raw_comment)
-                    if not translated_comment:
-                        translated_comment = raw_comment
-                    time.sleep(0.3)  # Пауза между запросами к переводчику
-                except Exception as e:
-                    print(f"Sync translation error: {e}")
-                    translated_comment = raw_comment
 
             cursor.execute('''
                 INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 s.get('date'), s.get('employee'), s.get('company'), obj_name,
-                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), translated_comment, 1
+                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
             ))
 
         conn.commit()
