@@ -4,3 +4,4 @@ gunicorn
 requests
 reportlab
 python-multipart
+flask
