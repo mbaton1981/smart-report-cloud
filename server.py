@@ -1,17 +1,39 @@
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
 import sqlite3
-import os
+import time
+import ast
+from flask import Flask, render_template, request, jsonify
 
-app = FastAPI()
+app = Flask(__name__)
+DB_FILE = "cloud_database.db"
 
-DB_FILE = "smart_report.db"
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn.execute('PRAGMA journal_mode=WAL;')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def safe_parse_obj(val):
+    if not val:
+        return "", "", "Privat"
+    if isinstance(val, dict):
+        return str(val.get('name', '')).strip(), str(val.get('markning', '')).strip(), str(val.get('company', 'Privat')).strip()
+    
+    val_str = str(val).strip()
+    if "{" in val_str and "'name'" in val_str:
+        try:
+            d = ast.literal_eval(val_str)
+            if isinstance(d, dict):
+                return str(d.get('name', '')).strip(), str(d.get('markning', '')).strip(), str(d.get('company', 'Privat')).strip()
+        except Exception:
+            pass
+    return val_str, "", "Privat"
 
 def init_cloud_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
+    
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS shifts_cloud (
+        CREATE TABLE IF NOT EXISTS cloud_shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
             employee TEXT NOT NULL,
@@ -27,8 +49,20 @@ def init_cloud_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
             name TEXT UNIQUE NOT NULL,
-            salary_rate REAL DEFAULT 0.0,
-            pin TEXT DEFAULT '0000'
+            salary_rate REAL DEFAULT 0.0
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS meta_companies (
+            name TEXT UNIQUE NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS meta_objects (
+            name TEXT NOT NULL,
+            markning TEXT,
+            company TEXT,
+            UNIQUE(name, company)
         )
     ''')
     conn.commit()
@@ -36,255 +70,176 @@ def init_cloud_db():
 
 init_cloud_db()
 
-@app.get("/", response_class=HTMLResponse)
-def shift_form():
-    return """
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Ввод смены — Bygger och renoverar</title>
-        <style>
-            body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #1e2229; color: #e2e8f0; padding: 20px; margin: 0; }
-            .container { max-width: 400px; margin: 0 auto; background: #242933; padding: 20px; border-radius: 10px; border: 1px solid #323946; }
-            h2 { color: #63b3ed; text-align: center; font-size: 18px; margin-bottom: 20px; }
-            label { display: block; margin-top: 10px; font-size: 13px; color: #a0aec0; }
-            input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; background: #28303d; border: 1px solid #3f4c60; color: #fff; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
-            button { width: 100%; margin-top: 20px; background: #4299e1; color: white; border: none; padding: 12px; border-radius: 6px; font-weight: bold; font-size: 15px; cursor: pointer; }
-            button:hover { background: #3182ce; }
-            button:disabled { background: #4a5568; cursor: not-allowed; }
-            .pin-container { background: #1a1f26; padding: 10px; border-radius: 6px; margin-top: 5px; border: 1px solid #4a5568; display: none; }
-            .error-msg { color: #e53e3e; font-size: 12px; margin-top: 5px; display: none; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Bygger och renoverar i Sthlm</h2>
-            <form action="/submit" method="post" id="shiftForm">
-                <label>Дата смены:</label>
-                <input type="date" name="date" required id="dateInput">
-                
-                <label>Сотрудник:</label>
-                <select name="employee" id="empSelect" required onchange="onEmployeeChanged()">
-                    <option value="">Загрузка списка...</option>
-                </select>
-
-                <div id="pinBlock" class="pin-container">
-                    <label style="margin-top:0;">Введите PIN-код сотрудника:</label>
-                    <input type="password" id="pinInput" maxlength="4" placeholder="••••" oninput="checkPin()">
-                    <div id="pinError" class="error-msg">Неверный PIN-код</div>
-                </div>
-                
-                <label>Фирма (Заказчик):</label>
-                <input type="text" name="company" placeholder="Например: Renatur / Privat" required>
-                
-                <label>Объект / Адрес:</label>
-                <input type="text" name="object_name" placeholder="Название объекта" required>
-                
-                <label>Отработано часов:</label>
-                <input type="number" step="0.5" name="hours" value="8.0" required>
-                
-                <label>Ставка (kr/ч):</label>
-                <input type="number" step="1" name="rate" placeholder="520" required>
-                
-                <label>Транспорт (kr):</label>
-                <input type="number" step="1" name="transport" value="0">
-                
-                <label>Описание выполненных работ:</label>
-                <textarea name="comment" rows="3" placeholder="Что было сделано за смену..."></textarea>
-                
-                <button type="submit" id="submitBtn" disabled>Введите PIN-код</button>
-            </form>
-        </div>
-
-        <script>
-            let employeesData = [];
-
-            // Установка текущей даты по умолчанию
-            document.getElementById('dateInput').valueAsDate = new Date();
-
-            // Загружаем список сотрудников с сервера при открытии страницы
-            fetch('/get-meta')
-                .then(res => res.json())
-                .then(data => {
-                    employeesData = data.employees || [];
-                    const select = document.getElementById('empSelect');
-                    select.innerHTML = '<option value="">-- Выберите сотрудника --</option>';
-                    employeesData.forEach(emp => {
-                        const opt = document.createElement('option');
-                        // На всякий случай обрабатываем, если имя пришло объектом или строкой
-                        let empName = (typeof emp === 'object' && emp !== null) ? (emp.name || '') : String(emp);
-                        if (empName.startsWith('{')) {
-                            try {
-                                let parsed = eval('(' + empName + ')');
-                                empName = parsed.name || empName;
-                            } catch(e) {}
-                        }
-                        opt.value = empName;
-                        opt.textContent = empName;
-                        select.appendChild(opt);
-                    });
-                })
-                .catch(err => {
-                    console.error('Ошибка загрузки сотрудников:', err);
-                });
-
-            function onEmployeeChanged() {
-                const empName = document.getElementById('empSelect').value;
-                const pinBlock = document.getElementById('pinBlock');
-                const submitBtn = document.getElementById('submitBtn');
-                
-                if (!empName) {
-                    pinBlock.style.display = 'none';
-                    submitBtn.disabled = true;
-                    submitBtn.textContent = 'Выберите сотрудника';
-                    return;
-                }
-
-                pinBlock.style.display = 'block';
-                document.getElementById('pinInput').value = '';
-                document.getElementById('pinError').style.display = 'none';
-                submitBtn.disabled = true;
-                submitBtn.textContent = 'Введите PIN-код';
-            }
-
-            function checkPin() {
-                const empName = document.getElementById('empSelect').value;
-                const enteredPin = document.getElementById('pinInput').value;
-                const submitBtn = document.getElementById('submitBtn');
-                const pinError = document.getElementById('pinError');
-
-                const currentEmp = employeesData.find(e => {
-                    let name = (typeof e === 'object' && e !== null) ? e.name : String(e);
-                    return name === empName;
-                });
-                
-                if (!currentEmp) return;
-
-                const correctPin = (typeof currentEmp === 'object' && currentEmp.pin) ? currentEmp.pin : '0000';
-
-                if (enteredPin === correctPin) {
-                    pinError.style.display = 'none';
-                    submitBtn.disabled = false;
-                    submitBtn.textContent = 'Отправить смену';
-                } else {
-                    if (enteredPin.length >= 4) {
-                        pinError.style.display = 'block';
-                    } else {
-                        pinError.style.display = 'none';
-                    }
-                    submitBtn.disabled = true;
-                    submitBtn.textContent = 'Неверный PIN-код';
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
-
-@app.post("/sync-desktop-data")
-def sync_desktop_data(data: dict):
-    """Принимает актуальные справочники и смены с десктопного приложения"""
-    conn = sqlite3.connect(DB_FILE)
+@app.route('/')
+def index():
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    employees = data.get("employees", [])
-    for emp in employees:
-        if isinstance(emp, dict):
-            name = emp.get("name")
-            rate = emp.get("salary_rate", 0.0)
-            pin = emp.get("pin", "0000")
-        else:
-            name = str(emp)
-            rate = 0.0
-            pin = "0000"
+    cursor.execute("SELECT name FROM meta_employees ORDER BY name")
+    employees = [row['name'] for row in cursor.fetchall()]
+    if not employees:
+        employees = ["Aliaksei Patonich"]
+
+    cursor.execute("SELECT name FROM meta_companies ORDER BY name")
+    companies = [row['name'] for row in cursor.fetchall()]
+    if not companies:
+        companies = ["Privat"]
+
+    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
+    obj_rows = cursor.fetchall()
+    
+    objects = []
+    seen = set()
+    for r in obj_rows:
+        name, mark, comp = safe_parse_obj(r['name'])
+        if not name or "{" in name:
+            continue
+
+        if r['markning'] and not mark:
+            mark = str(r['markning']).strip()
+        if r['company'] and comp == "Privat":
+            comp = str(r['company']).strip()
+
+        key = (name, comp)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        display_str = f"{mark} | {name}" if mark else name
+        if comp and comp != 'Privat':
+            display_str += f" [{comp}]"
             
-        if name:
-            cursor.execute('''
-                INSERT INTO meta_employees (name, salary_rate, pin) VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET salary_rate = ?, pin = ?
-            ''', (name, rate, pin, rate, pin))
-        
-    conn.commit()
-    conn.close()
-    return {"status": "success"}
+        objects.append({
+            "name": name,
+            "markning": mark,
+            "company": comp,
+            "display": display_str
+        })
 
-@app.get("/get-meta")
-def get_meta():
-    """Отдает список сотрудников с пин-кодами для веб-формы"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, salary_rate, pin FROM meta_employees ORDER BY name")
-    rows = cursor.fetchall()
-    employees = [dict(r) for r in rows]
     conn.close()
-    return {"employees": employees}
+    return render_template('index.html', employees=employees, companies=companies, objects=objects)
 
-@app.post("/submit", response_class=HTMLResponse)
-def submit_shift(
-    date: str = Form(...),
-    employee: str = Form(...),
-    company: str = Form(...),
-    object_name: str = Form(...),
-    hours: float = Form(...),
-    rate: float = Form(...),
-    transport: float = Form(0.0),
-    comment: str = Form("")
-):
-    conn = sqlite3.connect(DB_FILE)
+@app.route('/submit-shift', methods=['POST'])
+def submit_shift():
+    data = request.json
+    conn = get_db_connection()
     cursor = conn.cursor()
+    name, _, _ = safe_parse_obj(data.get('object_name'))
     cursor.execute('''
-        INSERT INTO shifts_cloud (date, employee, company, object_name, hours, rate, transport, comment, synced)
+        INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-    ''', (date, employee, company, object_name, hours, rate, transport, comment))
+    ''', (
+        data.get('date'),
+        data.get('employee'),
+        data.get('company'),
+        name or data.get('object_name'),
+        data.get('hours', 0.0),
+        data.get('rate', 0.0),
+        data.get('transport', 0.0),
+        data.get('comment', ''),
+    ))
     conn.commit()
     conn.close()
+    return jsonify({"status": "success", "message": "Смена успешно отправлена!"})
 
-    return """
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8"><title>Успешно</title>
-        <style>
-            body { font-family: Arial; background-color: #1e2229; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            .box { background: #242933; padding: 30px; border-radius: 10px; border: 1px solid #323946; text-align: center; }
-            h2 { color: #38a169; }
-            a { display: inline-block; margin-top: 15px; color: #4299e1; text-decoration: none; font-weight: bold; }
-        </style>
-    </head>
-    <body>
-        <div class="box">
-            <h2>✅ Смена успешно отправлена!</h2>
-            <p>Данные записаны и скоро попадут в общую базу.</p>
-            <a href="/">← Отправить еще одну смену</a>
-        </div>
-    </body>
-    </html>
-    """
-
-@app.get("/get-unsynced")
-def get_unsynced_shifts():
-    """Отдает на ПК все несмещенные смены"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+@app.route('/check-employee-shifts', methods=['POST'])
+def check_employee_shifts():
+    data = request.json
+    emp = data.get('employee')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM shifts_cloud WHERE synced = 0")
+    cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 5", (emp,))
     rows = cursor.fetchall()
-    shifts_list = [dict(row) for row in rows]
     conn.close()
-    return JSONResponse(content={"shifts": shifts_list})
+    
+    shifts = [{"date": r['date'], "object_name": r['object_name'], "hours": r['hours']} for r in rows]
+    return jsonify({"recent_shifts": shifts})
 
-@app.post("/mark-synced")
-def mark_shifts_synced(data: dict):
-    """Помечает смены как синхронизированные"""
-    shift_ids = data.get("ids", [])
-    if not shift_ids:
-        return {"status": "ok"}
-    conn = sqlite3.connect(DB_FILE)
+@app.route('/sync-desktop-data', methods=['POST'])
+def sync_desktop_data():
+    data = request.json
+    employees = data.get("employees", [])
+    companies = data.get("companies", [])
+    objects = data.get("objects", [])
+    desktop_shifts = data.get("shifts", [])
+
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.executemany("UPDATE shifts_cloud SET synced = 1 WHERE id = ?", [(sid,) for sid in shift_ids])
-    conn.commit()
+
+    try:
+        if employees:
+            for emp in employees:
+                if emp:
+                    cursor.execute("INSERT OR IGNORE INTO meta_employees (name) VALUES (?)", (str(emp),))
+
+        if companies:
+            for comp in companies:
+                if comp:
+                    cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (str(comp),))
+
+        if objects:
+            cursor.execute("DELETE FROM meta_objects")
+            for obj in objects:
+                if isinstance(obj, dict):
+                    name = str(obj.get('name', '')).strip()
+                    mark = str(obj.get('markning', '')).strip()
+                    comp = str(obj.get('company', '')).strip()
+                else:
+                    name, mark, comp = safe_parse_obj(obj)
+
+                if name and "{" not in name:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
+                    ''', (name, mark, comp if comp else "Privat"))
+
+        # Полная перезапись облачных смен актуальным списком с ПК (решает проблему удалений)
+        cursor.execute("DELETE FROM cloud_shifts")
+        for s in desktop_shifts:
+            name, _, _ = safe_parse_obj(s.get('object_name'))
+            obj_name = name or s.get('object_name')
+            
+            cursor.execute('''
+                INSERT INTO cloud_shifts (date, employee, company, object_name, hours, rate, transport, comment, synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                s.get('date'), s.get('employee'), s.get('company'), obj_name,
+                s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', ''), 1
+            ))
+
+        conn.commit()
+    except Exception as e:
+        print(f"Sync error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    return jsonify({"status": "synced"})
+
+@app.route('/get-unsynced', methods=['GET'])
+def get_unsynced():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
+    rows = cursor.fetchall()
     conn.close()
-    return {"status": "success", "synced_count": len(shift_ids)}
+    
+    shifts = [{
+        "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
+        "object_name": r['object_name'], "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
+    } for r in rows]
+    return jsonify({"shifts": shifts})
+
+@app.route('/mark-synced', methods=['POST'])
+def mark_synced():
+    data = request.json
+    ids = data.get("ids", [])
+    if ids:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.executemany("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", [(i,) for i in ids])
+        conn.commit()
+        conn.close()
+    return jsonify({"status": "marked"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)

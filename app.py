@@ -57,8 +57,7 @@ def init_db_once():
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
-            salary_rate REAL DEFAULT 0.0,
-            pin TEXT DEFAULT '0000'
+            salary_rate REAL DEFAULT 0.0
         )
     ''')
     cursor.execute('''
@@ -100,20 +99,14 @@ def init_db_once():
         )
     ''')
 
-    # Безопасное добавление колонок, если база уже существовала
     cursor.execute("PRAGMA table_info(shifts)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'invoiced' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
 
-    cursor.execute("PRAGMA table_info(employees)")
-    emp_columns = [col[1] for col in cursor.fetchall()]
-    if 'pin' not in emp_columns:
-        cursor.execute("ALTER TABLE employees ADD COLUMN pin TEXT DEFAULT '0000'")
-
     cursor.execute("SELECT COUNT(*) FROM employees")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO employees (name, salary_rate, pin) VALUES (?, ?, ?)", ("Aliaksei Patonich", 0.0, "0000"))
+        cursor.execute("INSERT OR IGNORE INTO employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
 
     if is_new_db:
         initial_data = [
@@ -527,13 +520,14 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
-        # 2. Собираем актуальные списки справочников из базы данных ПК (включая PIN-коды сотрудников)
-        cursor.execute("SELECT name, salary_rate, pin FROM employees ORDER BY name")
-        employees = [{"name": row[0], "salary_rate": row[1], "pin": row[2] if row[2] else "0000"} for row in cursor.fetchall()]
+        # 2. Собираем актуальные списки справочников из базы данных ПК
+        cursor.execute("SELECT name FROM employees ORDER BY name")
+        employees = [row[0] for row in cursor.fetchall()]
         
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
         
+        # Передаем объекты как словари, чтобы сервер знал их маркировку и компанию!
         cursor.execute("SELECT name, markning, company FROM objects ORDER BY name")
         objects = [{"name": row[0], "markning": row[1], "company": row[2]} for row in cursor.fetchall()]
         
@@ -1336,7 +1330,7 @@ class SmartReportApp(QMainWindow):
         comp_card_layout.addWidget(del_comp_btn)
         top_layout.addWidget(comp_card, stretch=1)
 
-        # Секция 2: Сотрудники (ФИО, Ставка, PIN)
+        # Секция 2: Сотрудники
         emp_card = QFrame()
         emp_card.setObjectName("card")
         emp_card_layout = QVBoxLayout(emp_card)
@@ -1346,27 +1340,19 @@ class SmartReportApp(QMainWindow):
         emp_add_layout = QHBoxLayout()
         self.new_emp_input = QLineEdit()
         self.new_emp_input.setPlaceholderText("ФИО...")
-        
         self.new_emp_rate_input = QLineEdit()
         self.new_emp_rate_input.setPlaceholderText("kr/ч...")
-        self.new_emp_rate_input.setFixedWidth(75)
-
-        self.new_emp_pin_input = QLineEdit()
-        self.new_emp_pin_input.setPlaceholderText("PIN...")
-        self.new_emp_pin_input.setFixedWidth(75)
-
+        self.new_emp_rate_input.setFixedWidth(80)
         add_emp_btn = QPushButton("➕ Добавить")
         add_emp_btn.clicked.connect(self.add_or_update_employee)
-        
         emp_add_layout.addWidget(self.new_emp_input, stretch=2)
         emp_add_layout.addWidget(self.new_emp_rate_input, stretch=1)
-        emp_add_layout.addWidget(self.new_emp_pin_input, stretch=1)
         emp_add_layout.addWidget(add_emp_btn)
         emp_card_layout.addLayout(emp_add_layout)
 
         self.table_employees = QTableWidget()
-        self.table_employees.setColumnCount(3)
-        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "PIN"])
+        self.table_employees.setColumnCount(2)
+        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч"])
         self.table_employees.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         emp_card_layout.addWidget(self.table_employees, stretch=1)
 
@@ -1563,38 +1549,30 @@ class SmartReportApp(QMainWindow):
     def load_employees_table(self):
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, salary_rate, pin FROM employees ORDER BY name")
+        cursor.execute("SELECT name, salary_rate FROM employees ORDER BY name")
         rows = cursor.fetchall()
         conn.close()
         self.table_employees.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             rate = row[1]
-            pin = row[2]
             self.table_employees.setItem(row_idx, 0, QTableWidgetItem(row[0]))
             self.table_employees.setItem(row_idx, 1, QTableWidgetItem(f"{rate:.2f}" if rate else "0.00"))
-            self.table_employees.setItem(row_idx, 2, QTableWidgetItem(str(pin) if pin else "0000"))
 
     def add_or_update_employee(self):
         name = self.new_emp_input.text().strip()
         rate_val = parse_float(self.new_emp_rate_input.text(), 0.0)
-        pin_val = self.new_emp_pin_input.text().strip()
-        if not pin_val:
-            pin_val = "0000"
-            
         if not name:
             return
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO employees (name, salary_rate, pin) VALUES (?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET salary_rate = ?, pin = ?
-        ''', (name, rate_val, pin_val, rate_val, pin_val))
+            INSERT INTO employees (name, salary_rate) VALUES (?, ?)
+            ON CONFLICT(name) DO UPDATE SET salary_rate = ?
+        ''', (name, rate_val, rate_val))
         conn.commit()
         conn.close()
-        
         self.new_emp_input.clear()
         self.new_emp_rate_input.clear()
-        self.new_emp_pin_input.clear()
         self.load_dropdowns()
         self.background_sync_with_cloud()
 
