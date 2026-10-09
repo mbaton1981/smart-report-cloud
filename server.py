@@ -208,7 +208,7 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Перезаписываем облачные смены с автоматическим переводом комментариев
+        # Перезаписываем облачные смены с безопасным переводом и паузой против лимитов Google
         cursor.execute("DELETE FROM cloud_shifts")
         for s in desktop_shifts:
             name, _, _ = safe_parse_obj(s.get('object_name'))
@@ -222,6 +222,7 @@ def sync_desktop_data():
                     translated_comment = GoogleTranslator(source='auto', target='sv').translate(raw_comment)
                     if not translated_comment:
                         translated_comment = raw_comment
+                    time.sleep(0.3)  # Пауза между запросами к переводчику
                 except Exception as e:
                     print(f"Sync translation error: {e}")
                     translated_comment = raw_comment
