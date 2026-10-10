@@ -107,7 +107,7 @@ def init_cloud_db():
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
             salary_rate REAL DEFAULT 0.0,
             is_active INTEGER NOT NULL DEFAULT 1
@@ -179,11 +179,11 @@ def verify_sync_key():
 def get_active_employees():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM meta_employees WHERE is_active = 1 ORDER BY name")
+    cursor.execute("SELECT id, name FROM meta_employees WHERE is_active = 1 ORDER BY name")
     rows = cursor.fetchall()
     conn.close()
     
-    employees = [r['name'] for r in rows]
+    employees = [{"id": r['id'], "name": r['name']} for r in rows]
     return jsonify({"ok": True, "employees": employees})
 
 @app.route('/check-user-pin', methods=['POST'])
@@ -235,6 +235,16 @@ def login():
         conn.close()
         return jsonify({"ok": False, "error": "Неверный пин-код или пароль"}), 401
 
+    # Автоматически находим employee_id по имени пользователя, если он еще не прописан в users
+    emp_id = user['employee_id']
+    if not emp_id and user['role'] != 'admin':
+        cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (user['username'],))
+        emp_row = cursor.fetchone()
+        if emp_row:
+            emp_id = emp_row['id']
+            cursor.execute("UPDATE users SET employee_id = ? WHERE id = ?", (emp_id, user['id']))
+            conn.commit()
+
     conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), user['id']))
     conn.commit()
     conn.close()
@@ -243,7 +253,7 @@ def login():
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
-    session['employee_id'] = user['employee_id']
+    session['employee_id'] = emp_id
 
     return jsonify({
         "ok": True,
@@ -251,7 +261,7 @@ def login():
         "user": {
             "username": user['username'],
             "role": user['role'],
-            "employee_id": user['employee_id']
+            "employee_id": emp_id
         }
     })
 
@@ -292,14 +302,19 @@ def admin_set_user_pin():
     
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hashed_pw, username))
+    
+    cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (username,))
+    emp_row = cursor.fetchone()
+    emp_id = emp_row['id'] if emp_row else None
+
+    cursor.execute("UPDATE users SET password_hash = ?, employee_id = COALESCE(employee_id, ?) WHERE username = ?", (hashed_pw, emp_id, username))
     
     if cursor.rowcount == 0:
         now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute('''
-            INSERT INTO users (username, password_hash, role, is_active, created_at)
-            VALUES (?, ?, 'user', 1, ?)
-        ''', (username, hashed_pw, now_str))
+            INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
+            VALUES (?, ?, 'user', ?, 1, ?)
+        ''', (username, hashed_pw, emp_id, now_str))
         
     conn.commit()
     conn.close()
@@ -390,20 +405,37 @@ def submit_shift():
         return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
 
     date_str = str(data.get('date', '')).strip()
-    employee = str(data.get('employee', '')).strip()
     company = str(data.get('company', '')).strip()
     object_name = str(data.get('object_name', '')).strip()
     request_id = data.get('request_id')
     comment = str(data.get('comment', ''))[:2000]
 
-    if session.get('role') != 'admin':
-        session_username = session.get('username', '').lower()
-        if session_username not in employee.lower():
-            return jsonify({"ok": False, "error": "Вы можете отправлять смены только от своего имени"}), 403
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # 🛡 СТРОГАЯ ИДЕНТИФИКАЦИЯ ПО EMPLOYEE_ID ИЗ СЕССИИ
+    if session.get('role') == 'admin':
+        employee = str(data.get('employee', '')).strip()
+        if not employee:
+            conn.close()
+            return jsonify({"ok": False, "error": "Администратор должен указать сотрудника"}), 400
+    else:
+        emp_id = session.get('employee_id')
+        if not emp_id:
+            conn.close()
+            return jsonify({"ok": False, "error": "Ошибка сессии: не найден ID сотрудника"}), 403
+        
+        cursor.execute("SELECT name FROM meta_employees WHERE id = ? AND is_active = 1", (emp_id,))
+        emp_row = cursor.fetchone()
+        if not emp_row:
+            conn.close()
+            return jsonify({"ok": False, "error": "Сотрудник не найден в базе или деактивирован"}), 403
+        employee = emp_row['name']
 
     try:
         datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
+        conn.close()
         return jsonify({"ok": False, "error": "Некорректная дата (ожидается формат YYYY-MM-DD)"}), 400
 
     try:
@@ -411,6 +443,7 @@ def submit_shift():
         if not (0.5 <= hours <= 24) or (hours % 0.5 != 0):
             raise ValueError()
     except (TypeError, ValueError):
+        conn.close()
         return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
 
     try:
@@ -419,18 +452,18 @@ def submit_shift():
         if rate < 0 or transport < 0:
             raise ValueError()
     except (TypeError, ValueError):
+        conn.close()
         return jsonify({"ok": False, "error": "Некорректные числовые значения ставки или транспорта"}), 400
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
 
     try:
         cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
         if not cursor.fetchone():
+            conn.close()
             return jsonify({"ok": False, "error": "Указанный сотрудник не найден или неактивен"}), 400
 
         cursor.execute("SELECT id FROM meta_companies WHERE name = ?", (company,))
         if not cursor.fetchone():
+            conn.close()
             return jsonify({"ok": False, "error": "Указанная фирма не найдена"}), 400
 
         parsed_obj_name, _, _ = safe_parse_obj(object_name)
@@ -438,11 +471,13 @@ def submit_shift():
 
         cursor.execute("SELECT id FROM meta_objects WHERE name = ? AND company = ?", (final_obj_name, company))
         if not cursor.fetchone():
+            conn.close()
             return jsonify({"ok": False, "error": "Объект не принадлежит выбранной фирме или не существует"}), 400
 
         if request_id:
             cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (request_id,))
             if cursor.fetchone():
+                conn.close()
                 return jsonify({"ok": False, "error": "Такая смена уже была отправлена ранее"}), 409
 
         sixty_secs_ago = (datetime.utcnow() - timedelta(seconds=60)).strftime('%Y-%m-%d %H:%M:%S')
@@ -451,6 +486,7 @@ def submit_shift():
             WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ? AND created_at >= ?
         ''', (employee, date_str, company, final_obj_name, hours, sixty_secs_ago))
         if cursor.fetchone():
+            conn.close()
             return jsonify({"ok": False, "error": "Похожая смена уже была зарегистрирована только что. Подождите немного."}), 409
 
         cursor.execute('''
@@ -474,16 +510,29 @@ def check_employee_shifts():
         return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
 
     data = request.json or {}
-    emp = data.get('employee')
     selected_month = data.get('month')
-
-    if session.get('role') != 'admin':
-        session_username = session.get('username', '').lower()
-        if session_username not in str(emp).lower():
-            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
 
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # 🛡 СТРОГАЯ ПРОВЕРКА ПРАВ ДЛЯ ИСТОРИИ
+    if session.get('role') == 'admin':
+        emp = data.get('employee')
+        if not emp:
+            conn.close()
+            return jsonify({"ok": False, "error": "Не указан сотрудник"}), 400
+    else:
+        emp_id = session.get('employee_id')
+        if not emp_id:
+            conn.close()
+            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+        
+        cursor.execute("SELECT name FROM meta_employees WHERE id = ?", (emp_id,))
+        emp_row = cursor.fetchone()
+        if not emp_row:
+            conn.close()
+            return jsonify({"ok": False, "error": "Сотрудник не найден"}), 403
+        emp = emp_row['name']
 
     if selected_month:
         try:
@@ -530,16 +579,26 @@ def check_missing_shifts():
     if 'user_id' not in session:
         return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
 
-    data = request.json or {}
-    emp = data.get('employee')
-
-    if session.get('role') != 'admin':
-        session_username = session.get('username', '').lower()
-        if session_username not in str(emp).lower():
-            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
-
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    if session.get('role') == 'admin':
+        data = request.json or {}
+        emp = data.get('employee')
+        if not emp:
+            conn.close()
+            return jsonify({"ok": False, "error": "Не указан сотрудник"}), 400
+    else:
+        emp_id = session.get('employee_id')
+        if not emp_id:
+            conn.close()
+            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+        cursor.execute("SELECT name FROM meta_employees WHERE id = ?", (emp_id,))
+        emp_row = cursor.fetchone()
+        if not emp_row:
+            conn.close()
+            return jsonify({"ok": False, "error": "Сотрудник не найден"}), 403
+        emp = emp_row['name']
     
     today = datetime.utcnow().date()
     start_check = today - timedelta(days=10)
@@ -569,7 +628,6 @@ def check_missing_shifts():
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
 
-# 🛡 БЕЗОПАСНАЯ СИНХРОНИЗАЦИЯ БЕЗ УДАЛЕНИЯ ДАННЫХ (UPSERT)
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -585,7 +643,6 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        # 1. Синхронизация сотрудников (добавление или обновление)
         if employees:
             for emp in employees:
                 if isinstance(emp, dict):
@@ -606,7 +663,6 @@ def sync_desktop_data():
                             is_active = excluded.is_active
                     ''', (emp_name, emp_rate, emp_active))
 
-        # 2. Синхронизация компаний
         if companies:
             for comp in companies:
                 if comp:
@@ -614,7 +670,6 @@ def sync_desktop_data():
                     if comp_name:
                         cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
 
-        # 3. Синхронизация объектов
         if objects:
             for obj in objects:
                 name, mark, comp = safe_parse_obj(obj)
@@ -624,7 +679,6 @@ def sync_desktop_data():
                         ON CONFLICT(name, company) DO UPDATE SET markning = excluded.markning
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # 4. Безопасное добавление смен без удаления старых
         if desktop_shifts:
             for s in desktop_shifts:
                 name, _, _ = safe_parse_obj(s.get('object_name'))

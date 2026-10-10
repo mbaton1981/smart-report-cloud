@@ -174,7 +174,7 @@
 
             <div id="form-alert"></div>
             
-            <!-- Кастомный красивый блок подтверждения -->
+            <!-- Кастомный блок подтверждения -->
             <div id="confirm-box">
                 <span id="confirm-text">⚠️ За этот день уже записаны часы. Добавить еще?</span>
                 <div class="confirm-btns">
@@ -333,10 +333,10 @@
                     adminOpt.textContent = 'admin (Администратор)';
                     select.appendChild(adminOpt);
 
-                    data.employees.forEach(name => {
+                    data.employees.forEach(emp => {
                         const opt = document.createElement('option');
-                        opt.value = name;
-                        opt.textContent = name;
+                        opt.value = emp.name;
+                        opt.textContent = emp.name;
                         select.appendChild(opt);
                     });
                 }
@@ -373,7 +373,7 @@
             document.getElementById('login-modal').classList.remove('hidden');
         }
 
-        function setupUserInterface() {
+        async function setupUserInterface() {
             const userInfoText = document.getElementById('user-info-text');
             const employeeSelect = document.getElementById('employee');
             const historyEmployeeSelect = document.getElementById('history-employee');
@@ -385,26 +385,30 @@
             } else {
                 userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
                 
-                const userName = currentUser.username.trim().toLowerCase();
-                const allEmployeeOptions = Array.from(employeeSelect.options).map(opt => opt.value).filter(val => val !== "");
-                
-                let matchedName = currentUser.username;
-                for (const emp of allEmployeeOptions) {
-                    const empLower = emp.trim().toLowerCase();
-                    if (empLower === userName || empLower.includes(userName) || userName.includes(empLower)) {
-                        matchedName = emp;
-                        break;
+                try {
+                    const res = await fetch('/get-active-employees');
+                    const data = await res.json();
+                    let matchedName = currentUser.username;
+                    
+                    if (data.ok && data.employees) {
+                        const found = data.employees.find(e => e.id === currentUser.employee_id);
+                        if (found) {
+                            matchedName = found.name;
+                        }
                     }
-                }
 
-                [employeeSelect, historyEmployeeSelect].forEach(select => {
-                    select.innerHTML = '';
-                    const opt = document.createElement('option');
-                    opt.value = matchedName;
-                    opt.textContent = matchedName;
-                    select.appendChild(opt);
-                    select.value = matchedName;
-                });
+                    [employeeSelect, historyEmployeeSelect].forEach(select => {
+                        select.innerHTML = '';
+                        const opt = document.createElement('option');
+                        opt.value = matchedName;
+                        opt.textContent = matchedName;
+                        select.appendChild(opt);
+                        select.value = matchedName;
+                        select.disabled = true; // Обычный пользователь не может менять свое имя
+                    });
+                } catch (e) {
+                    console.error("Ошибка привязки сотрудника:", e);
+                }
             }
         }
 
@@ -443,7 +447,6 @@
             window.location.reload();
         }
 
-        // Основная логика отправки смены с кастомным красивым предупреждением
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -579,7 +582,6 @@
                     let printRowsData = [];
 
                     for (const shift of shiftsData.recent_shifts) {
-                        // 🛡 БЕЗОПАСНОЕ СОЗДАНИЕ ЭЛЕМЕНТОВ ЧЕРЕЗ DOM API (ЗАЩИТА ОТ XSS)
                         const li = document.createElement('li');
 
                         const spanInfo = document.createElement('span');
