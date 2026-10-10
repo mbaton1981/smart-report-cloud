@@ -2,13 +2,37 @@ import sqlite3
 import time
 import ast
 import os
+import logging
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Настройка системного логирования для безопасного перехвата ошибок
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-it-12345')
 app.permanent_session_lifetime = timedelta(hours=8)
+
+# --- Безопасная инициализация секретов (Fail-Fast) ---
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения SECRET_KEY не задана!")
+    raise RuntimeError("SECRET_KEY environment variable is required.")
+app.secret_key = SECRET_KEY
+
+SYNC_API_KEY = os.environ.get('SYNC_API_KEY')
+if not SYNC_API_KEY:
+    logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения SYNC_API_KEY не задана!")
+    raise RuntimeError("SYNC_API_KEY environment variable is required.")
+
+# Настройка безопасности Cookie (Secure включается только если явно разрешено для HTTPS в окружении)
+use_secure = os.environ.get('USE_SECURE_COOKIES', 'false').lower() == 'true'
+app.config.update(
+    SESSION_COOKIE_SECURE=use_secure,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax'
+)
 
 DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
 
@@ -122,7 +146,11 @@ def init_cloud_db():
         cursor.execute("INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)", ("Bygg och renovering", "Sthlm", "Privat"))
 
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
-    admin_pass = os.environ.get('ADMIN_PASSWORD', '1981')
+    admin_pass = os.environ.get('ADMIN_PASSWORD')
+    if not admin_pass:
+        logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения ADMIN_PASSWORD обязательна!")
+        raise RuntimeError("ADMIN_PASSWORD environment variable is required.")
+        
     hashed_pw = generate_password_hash(admin_pass)
     now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -141,6 +169,13 @@ def init_cloud_db():
     conn.close()
 
 init_cloud_db()
+
+def verify_sync_key():
+    sync_key = request.headers.get('X-Sync-Key') or request.headers.get('X-API-Key')
+    if not sync_key or sync_key != SYNC_API_KEY:
+        logger.warning(f"Несанкционированная попытка доступа к защищенному маршруту с IP: {request.remote_addr}")
+        return False
+    return True
 
 @app.route('/get-active-employees', methods=['GET'])
 def get_active_employees():
@@ -187,16 +222,8 @@ def login():
     user = cursor.fetchone()
 
     if not user:
-        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        hashed_pw = generate_password_hash(password)
-        cursor.execute('''
-            INSERT INTO users (username, password_hash, role, is_active, created_at)
-            VALUES (?, ?, 'user', 1, ?)
-        ''', (username, hashed_pw, now_str))
-        conn.commit()
-        
-        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
-        user = cursor.fetchone()
+        conn.close()
+        return jsonify({"ok": False, "error": "Пользователь не найден в системе"}), 401
 
     elif not user['password_hash']:
         hashed_pw = generate_password_hash(password)
@@ -250,13 +277,10 @@ def get_current_user():
 
 @app.route('/admin/reset-user-pin', methods=['POST'])
 def admin_reset_user_pin():
-    sync_key = request.headers.get('X-Sync-Key')
-    expected_key = os.environ.get('SYNC_API_KEY')
-    
     is_admin_session = session.get('role') == 'admin'
-    is_valid_sync = expected_key and sync_key and sync_key == expected_key
+    is_valid_sync = verify_sync_key()
     
-    if not is_admin_session and not is_valid_sync and expected_key:
+    if not is_admin_session and not is_valid_sync:
         return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
         
     data = request.json or {}
@@ -274,9 +298,10 @@ def admin_reset_user_pin():
 
 @app.route('/admin/get-users-status', methods=['GET'])
 def admin_get_users_status():
-    sync_key = request.headers.get('X-Sync-Key')
-    expected_key = os.environ.get('SYNC_API_KEY')
-    if expected_key and sync_key and sync_key != expected_key:
+    is_admin_session = session.get('role') == 'admin'
+    is_valid_sync = verify_sync_key()
+
+    if not is_admin_session and not is_valid_sync:
         return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
 
     conn = get_db_connection()
@@ -426,7 +451,8 @@ def submit_shift():
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return jsonify({"ok": False, "error": f"Ошибка сервера при сохранении: {str(e)}"}), 500
+        logger.error(f"Ошибка при сохранении смены: {str(e)}")
+        return jsonify({"ok": False, "error": "Внутренняя ошибка сервера при сохранении смены."}), 500
     finally:
         conn.close()
 
@@ -439,7 +465,7 @@ def check_employee_shifts():
 
     data = request.json or {}
     emp = data.get('employee')
-    selected_month = data.get('month') # Формат 'YYYY-MM'
+    selected_month = data.get('month')
 
     if session.get('role') != 'admin':
         session_username = session.get('username', '').lower()
@@ -519,7 +545,6 @@ def check_missing_shifts():
     missing_days = []
     current = start_check
     while current < today:
-        # Пропускаем субботу (5) и воскресенье (6)
         if current.weekday() < 5:
             date_str = current.strftime('%Y-%m-%d')
             if date_str not in existing_dates:
@@ -536,10 +561,8 @@ def check_missing_shifts():
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
-    sync_key = request.headers.get('X-Sync-Key')
-    expected_key = os.environ.get('SYNC_API_KEY')
-    if expected_key and sync_key and sync_key != expected_key:
-        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен. Требуется валидный ключ синхронизации."}), 403
 
     data = request.json or {}
     employees = data.get("employees", [])
@@ -603,8 +626,9 @@ def sync_desktop_data():
 
         conn.commit()
     except Exception as e:
-        print(f"Sync error: {e}")
+        logger.error(f"Sync error: {e}")
         conn.rollback()
+        return jsonify({"ok": False, "error": "Ошибка синхронизации на сервере"}), 500
     finally:
         conn.close()
 
@@ -612,6 +636,9 @@ def sync_desktop_data():
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
@@ -626,6 +653,9 @@ def get_unsynced():
 
 @app.route('/mark-synced', methods=['POST'])
 def mark_synced():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
     data = request.json or {}
     ids = data.get("ids", [])
     if ids:

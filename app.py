@@ -30,6 +30,10 @@ BACKUP_DIR = "backups"
 REPORTS_DIR = "reports"
 SALARIES_DIR = "salaries"
 
+# 🌐 Адрес облачного сервера на Render и ваш новый надежный ключ синхронизации
+CLOUD_URL = "https://smart-report-server.onrender.com"
+SYNC_API_KEY = "ЗДЕСЬ_ВСТАВЬТЕ_ТОТ_ЖЕ_КЛЮЧ_ЧТО_И_НА_RENDER"
+
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -596,12 +600,14 @@ class SmartReportApp(QMainWindow):
             self.table_shifts.setRowHidden(row, not match)
 
     def perform_sync_logic(self):
-        CLOUD_URL = "https://smart-report-server.onrender.com"
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # 🛡 Добавлен заголовок X-Sync-Key с вашим секретным ключом
+        headers = {"X-Sync-Key": SYNC_API_KEY}
+        
         try:
-            response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=15)
+            response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=15)
             if response.status_code == 200:
                 data = response.json()
                 shifts_from_phone = data.get("shifts", [])
@@ -634,7 +640,7 @@ class SmartReportApp(QMainWindow):
 
                     conn.commit()
                     if downloaded_ids:
-                        requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
+                        requests.post(f"{CLOUD_URL}/mark-synced", headers=headers, json={"ids": downloaded_ids}, timeout=10)
         except Exception:
             pass
 
@@ -665,7 +671,7 @@ class SmartReportApp(QMainWindow):
             "shifts": all_local_shifts
         }
         try:
-            requests.post(f"{CLOUD_URL}/sync-desktop-data", json=metadata_payload, timeout=20)
+            requests.post(f"{CLOUD_URL}/sync-desktop-data", headers=headers, json=metadata_payload, timeout=20)
         except Exception:
             pass
 
@@ -673,7 +679,7 @@ class SmartReportApp(QMainWindow):
         try:
             self.perform_sync_logic()
             self.load_shifts_history()
-            QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена!")
+            QMessageBox.information(self, "Успех", "Синхронизация с защищенным облаком успешно завершена!")
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
 
@@ -2034,8 +2040,8 @@ class SmartReportApp(QMainWindow):
 
         pin_statuses = {}
         try:
-            CLOUD_URL = "https://smart-report-server.onrender.com"
-            res = requests.get(f"{CLOUD_URL}/admin/get-users-status", timeout=5)
+            headers = {"X-Sync-Key": SYNC_API_KEY}
+            res = requests.get(f"{CLOUD_URL}/admin/get-users-status", headers=headers, timeout=5)
             if res.status_code == 200:
                 data = res.json()
                 for u in data.get("users", []):
@@ -2074,8 +2080,8 @@ class SmartReportApp(QMainWindow):
         reply = QMessageBox.question(self, "Подтверждение", f"Сбросить пин-код для {emp_name}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                CLOUD_URL = "https://smart-report-server.onrender.com"
-                requests.post(f"{CLOUD_URL}/admin/reset-user-pin", json={"username": emp_name}, timeout=5)
+                headers = {"X-Sync-Key": SYNC_API_KEY}
+                requests.post(f"{CLOUD_URL}/admin/reset-user-pin", headers=headers, json={"username": emp_name}, timeout=5)
                 QMessageBox.information(self, "Успех", f"Пин-код для {emp_name} сброшен!")
                 self.load_employees_table()
             except Exception as e:
