@@ -613,7 +613,7 @@ def check_employee_shifts():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    if session.get('role'] == 'admin':
+    if session.get('role') == 'admin':
         emp = data.get('employee')
         if not emp:
             conn.close()
@@ -679,7 +679,7 @@ def check_missing_shifts():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if session.get('role'] == 'admin':
+    if session.get('role') == 'admin':
         data = request.json or {}
         emp = data.get('employee')
         if not emp:
