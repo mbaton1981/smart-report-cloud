@@ -129,6 +129,7 @@
                 <div class="form-group">
                     <label for="company">Фирма (Заказчик):</label>
                     <select id="company" name="company" required onchange="filterObjects()">
+                        <option value="">-- Выберите фирму --</option>
                         {% for comp in companies %}
                         <option value="{{ comp }}">{{ comp }}</option>
                         {% endfor %}
@@ -138,7 +139,7 @@
                 <div class="form-group">
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
-                        <!-- Заполняется динамически через JS -->
+                        <option value="">-- Сначала выберите фирму --</option>
                     </select>
                 </div>
 
@@ -271,6 +272,14 @@
             const objectSelect = document.getElementById('object_name');
             objectSelect.innerHTML = '';
 
+            if (!selectedCompany) {
+                const opt = document.createElement('option');
+                opt.value = "";
+                opt.textContent = "-- Сначала выберите фирму --";
+                objectSelect.appendChild(opt);
+                return;
+            }
+
             const filtered = allObjects.filter(obj => obj.company === selectedCompany);
 
             if (filtered.length === 0) {
@@ -279,6 +288,11 @@
                 opt.textContent = "-- Нет объектов для этой фирмы --";
                 objectSelect.appendChild(opt);
             } else {
+                const defaultOpt = document.createElement('option');
+                defaultOpt.value = "";
+                defaultOpt.textContent = "-- Выберите объект --";
+                objectSelect.appendChild(defaultOpt);
+
                 filtered.forEach(obj => {
                     const opt = document.createElement('option');
                     opt.value = obj.name;
@@ -435,7 +449,18 @@
                 const result = await response.json();
                 if (response.ok) {
                     showFormAlert("Смена успешно отправлена!", "success");
+                    
+                    // Очищаем комментарий
                     document.getElementById('comment').value = '';
+                    
+                    // Сбрасываем транспорт
+                    document.getElementById('transport_check').checked = false;
+                    document.getElementById('transport').value = '0.0';
+
+                    // Сбрасываем фирму и объекты в исходное пустое состояние для безопасности
+                    document.getElementById('company').value = "";
+                    filterObjects();
+
                 } else {
                     showFormAlert("Ошибка: " + (result.error || result.message || "Не удалось отправить"), "error");
                 }
@@ -491,7 +516,6 @@
                 let totalsByObject = {};
 
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
-                    // Массив для хранения строк отчета (чтобы дождаться асинхронного перевода)
                     let printRowsData = [];
 
                     for (const shift of shiftsData.recent_shifts) {
@@ -509,7 +533,6 @@
                                        `<span style="${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
 
-                        // Суммируем часы по объектам для сводки
                         let objKey = shift.object_name;
                         if (shift.marking) {
                             objKey = `[${shift.marking}] ${objKey}`;
@@ -517,7 +540,6 @@
                         totalsByObject[objKey] = (totalsByObject[objKey] || 0) + shift.hours;
                         totalHours += shift.hours;
 
-                        // Автоматически переводим описание/комментарий на шведский для печатного отчета
                         let rawComment = shift.comment || "";
                         let translatedComment = rawComment;
                         if (rawComment.trim() !== "") {
@@ -539,7 +561,6 @@
                         });
                     }
 
-                    // Формируем HTML таблицы для печати из переведенных данных
                     let printTableHtml = '';
                     printRowsData.forEach(row => {
                         printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
@@ -549,14 +570,12 @@
                         </tr>`;
                     });
 
-                    // Формируем блок сводки по объектам на шведском
                     let summaryHtml = '<b>Totalt per objekt / typ:</b><ul style="margin: 5px 0 0 20px; padding: 0; font-size: 13px;">';
                     for (let [obj, hrs] of Object.entries(totalsByObject)) {
                         summaryHtml += `<li>${obj}: <b>${hrs} tim</b></li>`;
                     }
                     summaryHtml += '</ul>';
 
-                    // Показываем кнопку печати/PDF и заполняем данные
                     printBtn.style.display = 'block';
                     document.getElementById('print-title').textContent = `Arbetsdagbok: ${empName} (${selectedMonth})`;
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
@@ -573,7 +592,11 @@
         });
 
         window.onload = () => {
-            filterObjects();
+            // Устанавливаем пустой выбор при загрузке страницы
+            const compSelect = document.getElementById('company');
+            if (compSelect.options.length > 0 && compSelect.value === "") {
+                filterObjects();
+            }
             checkAuth();
         };
     </script>
