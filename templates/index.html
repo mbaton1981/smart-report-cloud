@@ -19,7 +19,13 @@
         .btn-history { background-color: #27ae60; margin-top: 10px; }
         .btn-history:hover { background-color: #219653; }
         
-        #history-list { list-style-type: none; padding: 0; margin: 0; }
+        #history-list { 
+            list-style-type: none; 
+            padding: 0; 
+            margin: 0; 
+            max-height: 250px; 
+            overflow-y: auto; 
+        }
         #history-list li { background: #1a2332; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #2e5b88; font-size: 13px; color: #dfe6e9; display: flex; justify-content: space-between; align-items: center; }
 
         /* Модальное окно авторизации */
@@ -128,6 +134,11 @@
             <h3 style="color: #4a90e2; margin-top: 0; font-size: 16px; margin-bottom: 15px;">🔍 Проверка истории смен</h3>
             
             <div class="form-group">
+                <label for="history-month">Выберите месяц:</label>
+                <input type="month" id="history-month" class="form-control">
+            </div>
+
+            <div class="form-group">
                 <label for="history-employee">Выберите сотрудника:</label>
                 <select id="history-employee">
                     <option value="">-- Выберите сотрудника --</option>
@@ -137,15 +148,15 @@
                 </select>
             </div>
 
-            <button type="button" id="load-history-btn" class="btn-history">Показать последние смены</button>
+            <button type="button" id="load-history-btn" class="btn-history">Показать смены за месяц</button>
 
             <!-- Блок красного предупреждения о пропущенных сменах -->
             <div id="warning-container" style="margin-top: 15px; display: none; background: #3d2222; border: 1px solid #c0392b; padding: 10px; border-radius: 6px; font-size: 13px; color: #f5b7b1;"></div>
 
             <div style="margin-top: 15px;">
-                <h4 style="color: #64b5f6; font-size: 14px; margin-bottom: 8px;">Последние заполненные дни:</h4>
+                <h4 style="color: #64b5f6; font-size: 14px; margin-bottom: 8px;">Заполненные дни за месяц:</h4>
                 <ul id="history-list">
-                    <li style="color: #7f8c8d; justify-content: center;">Выберите сотрудника и нажмите кнопку</li>
+                    <li style="color: #7f8c8d; justify-content: center;">Выберите месяц, сотрудника и нажмите кнопку</li>
                 </ul>
             </div>
         </div>
@@ -156,6 +167,12 @@
         const allObjects = {{ objects | tojson }};
         let currentUser = null;
         document.getElementById('date').value = new Date().toISOString().split('T')[0];
+        
+        // Устанавливаем текущий месяц по умолчанию в поле выбора месяца
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        document.getElementById('history-month').value = `${year}-${month}`;
 
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
@@ -349,14 +366,19 @@
             }
         });
 
-        // Проверка истории и пропущенных смен
+        // Проверка истории за месяц и пропущенных смен
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
+            const selectedMonth = document.getElementById('history-month').value;
             const listContainer = document.getElementById('history-list');
             const warningContainer = document.getElementById('warning-container');
             
             if (!empName) {
                 alert('Пожалуйста, выберите сотрудника!');
+                return;
+            }
+            if (!selectedMonth) {
+                alert('Пожалуйста, выберите месяц!');
                 return;
             }
 
@@ -365,11 +387,11 @@
             warningContainer.textContent = '';
 
             try {
-                // 1. Загружаем последние смены
+                // 1. Загружаем смены за выбранный месяц
                 const shiftsRes = await fetch('/check-employee-shifts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ employee: empName })
+                    body: JSON.stringify({ employee: empName, month: selectedMonth })
                 });
                 const shiftsData = await shiftsRes.json();
 
@@ -399,7 +421,7 @@
                         listContainer.appendChild(li);
                     });
                 } else {
-                    listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">У сотрудника пока нет записей о сменах.</li>';
+                    listContainer.innerHTML = '<li style="color: #7f8c8d; justify-content: center;">За этот месяц нет записей о сменах.</li>';
                 }
             } catch (err) {
                 listContainer.innerHTML = '<li style="color: #e74c3c; justify-content: center;">Ошибка загрузки данных.</li>';

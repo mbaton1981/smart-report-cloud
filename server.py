@@ -439,6 +439,7 @@ def check_employee_shifts():
 
     data = request.json or {}
     emp = data.get('employee')
+    selected_month = data.get('month') # Формат 'YYYY-MM'
 
     if session.get('role') != 'admin':
         session_username = session.get('username', '').lower()
@@ -447,7 +448,26 @@ def check_employee_shifts():
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 5", (emp,))
+
+    if selected_month:
+        try:
+            year, month = map(int, selected_month.split('-'))
+            start_date = datetime(year, month, 1).strftime('%Y-%m-%d')
+            if month == 12:
+                end_date = datetime(year + 1, 1, 1).strftime('%Y-%m-%d')
+            else:
+                end_date = datetime(year, month + 1, 1).strftime('%Y-%m-%d')
+            
+            cursor.execute("""
+                SELECT date, object_name, hours FROM cloud_shifts 
+                WHERE employee = ? AND date >= ? AND date < ? 
+                ORDER BY date ASC
+            """, (emp, start_date, end_date))
+        except Exception:
+            cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 31", (emp,))
+    else:
+        cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 31", (emp,))
+
     rows = cursor.fetchall()
     
     shifts = []
@@ -566,7 +586,6 @@ def sync_desktop_data():
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                     ''', (name, mark, comp if comp else "Privat"))
 
-        # Всегда полностью очищаем старые смены в облаке перед заливкой актуальных[cite: 3]
         cursor.execute("DELETE FROM cloud_shifts")
         
         if desktop_shifts:
