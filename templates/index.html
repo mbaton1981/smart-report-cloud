@@ -425,21 +425,48 @@
             window.location.reload();
         }
 
+        // Обработка отправки смены с проверкой на уже существующие часы за этот день
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
-            const formData = {
-                request_id: generateUUID(),
-                date: document.getElementById('date').value,
-                employee: document.getElementById('employee').value,
-                company: document.getElementById('company').value,
-                object_name: document.getElementById('object_name').value,
-                hours: parseFloat(document.getElementById('hours').value),
-                transport: parseFloat(document.getElementById('transport').value || 0),
-                comment: document.getElementById('comment').value
-            };
+            const selectedDate = document.getElementById('date').value;
+            const empName = document.getElementById('employee').value;
+            const hoursVal = parseFloat(document.getElementById('hours').value);
 
             try {
+                // Проверяем, есть ли уже смены у этого сотрудника в текущем месяце
+                const checkRes = await fetch('/check-employee-shifts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        employee: empName, 
+                        month: selectedDate.substring(0, 7) // формат ГГГГ-ММ
+                    })
+                });
+                const checkData = await checkRes.json();
+                
+                if (checkData.recent_shifts) {
+                    const existingForDate = checkData.recent_shifts.filter(s => s.date === selectedDate);
+                    if (existingForDate.length > 0) {
+                        let totalExistingHours = existingForDate.reduce((sum, s) => sum + s.hours, 0);
+                        let confirmed = confirm(`⚠️ Внимание!\n\nУ вас за ${selectedDate} уже записано смен на ${totalExistingHours} ч.\nВы уверены, что хотите добавить еще ${hoursVal} ч?`);
+                        if (!confirmed) {
+                            return; // Отменяем отправку, если пользователь нажал «Отмена»
+                        }
+                    }
+                }
+
+                const formData = {
+                    request_id: generateUUID(),
+                    date: selectedDate,
+                    employee: empName,
+                    company: document.getElementById('company').value,
+                    object_name: document.getElementById('object_name').value,
+                    hours: hoursVal,
+                    transport: parseFloat(document.getElementById('transport').value || 0),
+                    comment: document.getElementById('comment').value
+                };
+
                 const response = await fetch('/submit-shift', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -592,7 +619,6 @@
         });
 
         window.onload = () => {
-            // Устанавливаем пустой выбор при загрузке страницы
             const compSelect = document.getElementById('company');
             if (compSelect.options.length > 0 && compSelect.value === "") {
                 filterObjects();
