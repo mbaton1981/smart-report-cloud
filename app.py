@@ -199,7 +199,6 @@ def translate_to_swedish(text):
     
     raw_text = str(text).strip()
     
-    # Онлайн-переводчик через MyMemory API
     try:
         url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(raw_text)}&langpair=ru|sv"
         response = requests.get(url, timeout=5)
@@ -212,7 +211,6 @@ def translate_to_swedish(text):
     except Exception:
         pass
     
-    # Резервный словарь на случай отсутствия интернета
     t = raw_text.lower()
     replacements = {
         "гипсокартон": "gips", "гипсу": "gips", "картон": "kartong",
@@ -319,7 +317,7 @@ DARK_THEME_QSS = """
         background-color: #28303d;
         color: #f7fafc;
         border: 1px solid #3f4c60;
-        padding: 6px 10px;
+        padding: 6px 12px;
         border-radius: 6px;
         selection-background-color: #4299e1;
     }
@@ -329,12 +327,24 @@ DARK_THEME_QSS = """
     }
     QComboBox::drop-down, QDateEdit::drop-down {
         subcontrol-origin: padding;
-        subcontrol-position: top right;
-        width: 28px;
+        subcontrol-position: center right;
+        width: 32px;
         border-left: 1px solid #3f4c60;
         border-top-right-radius: 6px;
         border-bottom-right-radius: 6px;
         background-color: #313c4e;
+    }
+    QComboBox::down-arrow, QDateEdit::down-arrow {
+        image: none;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-top: 6px solid #e2e8f0;
+        width: 0px;
+        height: 0px;
+        margin-right: 10px;
+    }
+    QComboBox::down-arrow:hover, QDateEdit::down-arrow:hover {
+        border-top: 6px solid #63b3ed;
     }
     QTableWidget, QTableView {
         background-color: #1a1f26;
@@ -479,7 +489,15 @@ class SmartReportApp(QMainWindow):
 
         layout.addWidget(card)
         
-        shifts_ctrl_layout = QHBoxLayout()
+        # 🟢 ЯРКАЯ ПАНЕЛЬ ФИЛЬТРОВ И УПРАВЛЕНИЯ СМЕНАМИ
+        control_card = QFrame()
+        control_card.setObjectName("card")
+        control_card.setStyleSheet("background-color: #242933; border: 2px solid #3182ce; border-radius: 8px; margin-top: 5px;")
+        c_layout = QVBoxLayout(control_card)
+        c_layout.setSpacing(8)
+
+        # Строка кнопок
+        btn_row = QHBoxLayout()
         refresh_shifts_btn = QPushButton("🔄 Обновить данные")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
         
@@ -491,11 +509,43 @@ class SmartReportApp(QMainWindow):
         del_shift_btn.setObjectName("danger")
         del_shift_btn.clicked.connect(self.delete_shift)
 
-        shifts_ctrl_layout.addWidget(refresh_shifts_btn)
-        shifts_ctrl_layout.addWidget(sync_cloud_btn)
-        shifts_ctrl_layout.addStretch()
-        shifts_ctrl_layout.addWidget(del_shift_btn)
-        layout.addLayout(shifts_ctrl_layout)
+        btn_row.addWidget(refresh_shifts_btn)
+        btn_row.addWidget(sync_cloud_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(del_shift_btn)
+        c_layout.addLayout(btn_row)
+
+        # Строка фильтров
+        filter_row = QHBoxLayout()
+        self.filter_date = QLineEdit()
+        self.filter_date.setPlaceholderText("🔍 Дата...")
+        self.filter_date.textChanged.connect(self.apply_shifts_filters)
+
+        self.filter_emp = QComboBox()
+        self.filter_emp.addItem("-- Все сотрудники --")
+        self.filter_emp.currentIndexChanged.connect(self.apply_shifts_filters)
+
+        self.filter_comp = QComboBox()
+        self.filter_comp.addItem("-- Все фирмы --")
+        self.filter_comp.currentIndexChanged.connect(self.apply_shifts_filters)
+
+        self.filter_obj = QLineEdit()
+        self.filter_obj.setPlaceholderText("🔍 Объект...")
+        self.filter_obj.textChanged.connect(self.apply_shifts_filters)
+
+        self.filter_status = QComboBox()
+        self.filter_status.addItems(["-- Все статусы --", "В работе", "Выставлен в счёт"])
+        self.filter_status.currentIndexChanged.connect(self.apply_shifts_filters)
+
+        filter_row.addWidget(QLabel("<b>Фильтры таблицы:</b>"))
+        filter_row.addWidget(self.filter_date)
+        filter_row.addWidget(self.filter_emp)
+        filter_row.addWidget(self.filter_comp)
+        filter_row.addWidget(self.filter_obj)
+        filter_row.addWidget(self.filter_status)
+        c_layout.addLayout(filter_row)
+
+        layout.addWidget(control_card)
 
         layout.addWidget(QLabel("<b>История смен в базе данных (зеленые — уже выставлены в счёт):</b>"))
         
@@ -507,6 +557,36 @@ class SmartReportApp(QMainWindow):
         self.table_shifts.setAlternatingRowColors(True)
         layout.addWidget(self.table_shifts)
         self.load_shifts_history()
+
+    def apply_shifts_filters(self):
+        d_val = self.filter_date.text().strip().lower()
+        emp_val = self.filter_emp.currentText()
+        comp_val = self.filter_comp.currentText()
+        obj_val = self.filter_obj.text().strip().lower()
+        status_val = self.filter_status.currentText()
+
+        for row in range(self.table_shifts.rowCount()):
+            match = True
+            date_cell = self.table_shifts.item(row, 1).text().lower()
+            emp_cell = self.table_shifts.item(row, 2).text()
+            comp_cell = self.table_shifts.item(row, 3).text()
+            obj_cell = self.table_shifts.item(row, 4).text().lower()
+            status_cell = self.table_shifts.item(row, 9).text()
+
+            if d_val and d_val not in date_cell:
+                match = False
+            if emp_val != "-- Все сотрудники --" and emp_cell != emp_val:
+                match = False
+            if comp_val != "-- Все фирмы --" and comp_cell != comp_val:
+                match = False
+            if obj_val and obj_val not in obj_cell:
+                match = False
+            if status_val == "В работе" and "В работе" not in status_cell:
+                match = False
+            elif status_val == "Выставлен в счёт" and "Выставлен" not in status_cell:
+                match = False
+
+            self.table_shifts.setRowHidden(row, not match)
 
     def perform_sync_logic(self):
         CLOUD_URL = "https://smart-report-server.onrender.com"
@@ -1855,6 +1935,28 @@ class SmartReportApp(QMainWindow):
             for row in cursor.fetchall():
                 self.bal_emp_cb.addItem(row[0])
 
+        if hasattr(self, 'filter_emp'):
+            curr_emp = self.filter_emp.currentText()
+            self.filter_emp.clear()
+            self.filter_emp.addItem("-- Все сотрудники --")
+            cursor.execute("SELECT name FROM employees ORDER BY name")
+            for row in cursor.fetchall():
+                self.filter_emp.addItem(row[0])
+            idx = self.filter_emp.findText(curr_emp)
+            if idx >= 0:
+                self.filter_emp.setCurrentIndex(idx)
+
+        if hasattr(self, 'filter_comp'):
+            curr_comp = self.filter_comp.currentText()
+            self.filter_comp.clear()
+            self.filter_comp.addItem("-- Все фирмы --")
+            cursor.execute("SELECT name FROM companies ORDER BY name")
+            for row in cursor.fetchall():
+                self.filter_comp.addItem(row[0])
+            idx = self.filter_comp.findText(curr_comp)
+            if idx >= 0:
+                self.filter_comp.setCurrentIndex(idx)
+
         for cb in [getattr(self, 'comp_cb', None), getattr(self, 'inv_comp_cb', None), getattr(self, 'dag_comp_cb', None), getattr(self, 'new_obj_comp_cb', None)]:
             if cb:
                 self.load_companies_into_combobox(cb)
@@ -2035,7 +2137,7 @@ class SmartReportApp(QMainWindow):
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 50")
+            cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 100")
             rows = cursor.fetchall()
             conn.close()
 
@@ -2050,6 +2152,7 @@ class SmartReportApp(QMainWindow):
                         it.setBackground(QColor("#1c4532"))
                     self.table_shifts.setItem(row_idx, col_idx, it)
             self.load_dropdowns()
+            self.apply_shifts_filters()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
 
