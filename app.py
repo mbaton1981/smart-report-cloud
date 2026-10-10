@@ -325,7 +325,6 @@ DARK_THEME_QSS = """
         border-radius: 6px;
         selection-background-color: #3182ce;
         selection-color: #ffffff;
-         /* Делает курсор ввода (палочку) ярко-голубым и заметным */
     }
     QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
         border: 1px solid #63b3ed;
@@ -359,11 +358,9 @@ DARK_THEME_QSS = """
         gridline-color: #2d3748;
         border: 1px solid #323946;
         border-radius: 6px;
-        /* Делаем выбранную строку или ячейку ярко-синей с белым текстом */
         selection-background-color: #2b6cb0;
         selection-color: #ffffff;
     }
-    /* Добавляем четкую подсветку активной строки под курсором */
     QTableWidget::item:selected {
         background-color: #3182ce;
         color: #ffffff;
@@ -383,6 +380,7 @@ DARK_THEME_QSS = """
         padding: 12px;
     }
 """
+
 def create_date_field(default_date_str=""):
     date_edit = QDateEdit()
     date_edit.setCalendarPopup(True)
@@ -1746,7 +1744,6 @@ class SmartReportApp(QMainWindow):
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
         
-        # Кнопка установки/задания ПИН-кода
         set_pin_btn = QPushButton("🔑 Задать ПИН")
         set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
@@ -2083,7 +2080,6 @@ class SmartReportApp(QMainWindow):
             return
         emp_name = self.table_employees.item(selected, 0).text()
         
-        # Открываем диалоговое окно для ввода ПИН-кода
         new_pin, ok = QInputDialog.getText(
             self, 
             "Установка ПИН-кода", 
@@ -2206,14 +2202,35 @@ class SmartReportApp(QMainWindow):
         if selected < 0:
             QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
             return
+        
         shift_id = self.table_shifts.item(selected, 0).text()
+        date_val = self.table_shifts.item(selected, 1).text()
+        emp_val = self.table_shifts.item(selected, 2).text()
+        obj_val = self.table_shifts.item(selected, 4).text()
+        hrs_val = parse_float(self.table_shifts.item(selected, 5).text(), 0.0)
+
         reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
+            # 1. Удаляем локально в SQLite
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
             conn.commit()
             conn.close()
+
+            # 2. Отправляем запрос на удаление в облако для обеспечения двусторонней синхронизации
+            try:
+                headers = {"X-Sync-Key": SYNC_API_KEY}
+                payload = {
+                    "date": date_val,
+                    "employee": emp_val,
+                    "object_name": obj_val,
+                    "hours": hrs_val
+                }
+                requests.post(f"{CLOUD_URL}/delete-cloud-shift", headers=headers, json=payload, timeout=5)
+            except Exception as e:
+                print(f"Не удалось удалить смену в облаке: {e}")
+
             self.load_shifts_history()
             self.background_sync_with_cloud()
 

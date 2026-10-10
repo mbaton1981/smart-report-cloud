@@ -570,6 +570,38 @@ def submit_shift():
 
     return jsonify({"ok": True, "message": "Смена успешно сохранена!"}), 201
 
+@app.route('/delete-cloud-shift', methods=['POST'])
+def delete_cloud_shift():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    data = request.json or {}
+    shift_id = data.get('id')
+    date = data.get('date')
+    employee = data.get('employee')
+    object_name = data.get('object_name')
+    hours = data.get('hours')
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        if shift_id:
+            cursor.execute("DELETE FROM cloud_shifts WHERE id = ?", (shift_id,))
+        elif date and employee and object_name and hours is not None:
+            cursor.execute("""
+                DELETE FROM cloud_shifts 
+                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+            """, (date, employee, object_name, hours))
+        
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "message": "Смена успешно удалена на сервере"})
+    except Exception as e:
+        conn.close()
+        logger.error(f"Ошибка удаления смены на сервере: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
     if 'user_id' not in session:
