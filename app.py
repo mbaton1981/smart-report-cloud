@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
-    QFrame, QFormLayout, QDateEdit
+    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog
 )
 from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtGui import QIcon, QColor
@@ -50,9 +50,19 @@ def init_db_once():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
             markning TEXT,
-            company TEXT
+            company TEXT,
+            rate REAL DEFAULT 0.0,
+            transport_rate REAL DEFAULT 0.0
         )
     ''')
+    
+    cursor.execute("PRAGMA table_info(objects)")
+    obj_columns = [col[1] for col in cursor.fetchall()]
+    if 'rate' not in obj_columns:
+        cursor.execute("ALTER TABLE objects ADD COLUMN rate REAL DEFAULT 0.0")
+    if 'transport_rate' not in obj_columns:
+        cursor.execute("ALTER TABLE objects ADD COLUMN transport_rate REAL DEFAULT 0.0")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,11 +72,11 @@ def init_db_once():
         )
     ''')
 
-    # Авто-миграция для существующих баз (если колонка is_active еще не создана)
     cursor.execute("PRAGMA table_info(employees)")
     emp_columns = [col[1] for col in cursor.fetchall()]
     if 'is_active' not in emp_columns:
         cursor.execute("ALTER TABLE employees ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,59 +127,59 @@ def init_db_once():
 
     if is_new_db:
         initial_data = [
-            ("Privat", "Badbacken 2", "p1010"),
-            ("Privat", "Koksgaatan 40", "p1011"),
-            ("Privat", "Tallvagen 12", "p1001"),
-            ("Dvaliks", "Klockargardsstigen 3", "***"),
-            ("Privat", "Norra vagen 7", "p1013"),
-            ("Privat", "Punchvagen 5", "p1012"),
-            ("Privat", "Storholmsvagen 24", "p1014"),
-            ("Privat", "Östra vägen 13", "p1017"),
-            ("Privat", "Punchvagen 5 Ext", "p1016"),
-            ("SBT", "Teknologgatan 7", "p2086"),
-            ("SBT", "Bisittargatan 20A", "p2083"),
-            ("Dvaliks", "Kronstigen 12", "***"),
-            ("Dvaliks", "Gustav 3 boulevard 167", "Gustav 3"),
-            ("SBT", "Krogtappan 97", "***"),
-            ("Privat", "Badbacken 2 Altan", "p1018"),
-            ("Privat", "Punchvagen 5 roof altan", "p1019"),
-            ("SBT", "Hamarby Alle 3b", "***"),
-            ("Privat", "Norra vagen 18 Niklas", "p1020"),
-            ("Privat", "Tallvagen 12 Fasad Mal", "p1021"),
-            ("Privat", "Badbacken 5 ext", "p1022"),
-            ("Privat", "Östra vägen 7B", "p1023"),
-            ("Privat", "Johan Hammarstrom", "p1024"),
-            ("Privat", "Norra vagen 26 Katarina", "p1025"),
-            ("Privat", "Tallvagen 14 Egil", "p1026"),
-            ("SBT", "Kraftriket 21", "p2152"),
-            ("SBT", "Teknikringen 35 Hogdel", "p2154"),
-            ("Dvaliks", "Drottning vag 123", "***"),
-            ("Pareto Properties AB", "Sonnebovagen 16 Sollentuna", "p1027"),
-            ("Dvaliks", "Soderproken 16 Lidingo", "p1028"),
-            ("SBT", "Alvsjoborgatan 1-3", "p2166"),
-            ("Dvaliks", "Nyneshamn", "p1029"),
-            ("SBT", "Vikingshillsvägen 15", "***"),
-            ("Pareto Properties AB", "Alfred Nobels Alle 109", "p1030"),
-            ("Renatur", "Tomteboda glass", "p1031"),
-            ("Renatur", "Tomteboda doors", "p1032"),
-            ("Privat", "Uddens vag 12 Tomas", "p1033"),
-            ("SBT", "Karlsviksgatan 15", "p2128"),
-            ("Renatur", "Tomteboda arbetsledning", "***"),
-            ("Renatur", "Tomteboda ÄTA", "p1034"),
-            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill", "p1035"),
-            ("Privat", "Kolarbacken 52 136 48 Handen/Vega Daniel", "p1036"),
-            ("Renatur", "Tomteboda ÄTA Hotel", "****"),
-            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill ÄTA", "p1037")
+            ("Privat", "Badbacken 2", "p1010", 520.0, 0.0),
+            ("Privat", "Koksgaatan 40", "p1011", 520.0, 0.0),
+            ("Privat", "Tallvagen 12", "p1001", 520.0, 0.0),
+            ("Dvaliks", "Klockargardsstigen 3", "***", 550.0, 0.0),
+            ("Privat", "Norra vagen 7", "p1013", 520.0, 0.0),
+            ("Privat", "Punchvagen 5", "p1012", 520.0, 0.0),
+            ("Privat", "Storholmsvagen 24", "p1014", 520.0, 0.0),
+            ("Privat", "Östra vägen 13", "p1017", 520.0, 0.0),
+            ("Privat", "Punchvagen 5 Ext", "p1016", 520.0, 0.0),
+            ("SBT", "Teknologgatan 7", "p2086", 580.0, 0.0),
+            ("SBT", "Bisittargatan 20A", "p2083", 580.0, 0.0),
+            ("Dvaliks", "Kronstigen 12", "***", 550.0, 0.0),
+            ("Dvaliks", "Gustav 3 boulevard 167", "Gustav 3", 550.0, 0.0),
+            ("SBT", "Krogtappan 97", "***", 580.0, 0.0),
+            ("Privat", "Badbacken 2 Altan", "p1018", 520.0, 0.0),
+            ("Privat", "Punchvagen 5 roof altan", "p1019", 520.0, 0.0),
+            ("SBT", "Hamarby Alle 3b", "***", 580.0, 0.0),
+            ("Privat", "Norra vagen 18 Niklas", "p1020", 520.0, 0.0),
+            ("Privat", "Tallvagen 12 Fasad Mal", "p1021", 520.0, 0.0),
+            ("Privat", "Badbacken 5 ext", "p1022", 520.0, 0.0),
+            ("Privat", "Östra vägen 7B", "p1023", 520.0, 0.0),
+            ("Privat", "Johan Hammarstrom", "p1024", 520.0, 0.0),
+            ("Privat", "Norra vagen 26 Katarina", "p1025", 520.0, 0.0),
+            ("Privat", "Tallvagen 14 Egil", "p1026", 520.0, 0.0),
+            ("SBT", "Kraftriket 21", "p2152", 580.0, 0.0),
+            ("SBT", "Teknikringen 35 Hogdel", "p2154", 580.0, 0.0),
+            ("Dvaliks", "Drottning vag 123", "***", 550.0, 0.0),
+            ("Pareto Properties AB", "Sonnebovagen 16 Sollentuna", "p1027", 600.0, 0.0),
+            ("Dvaliks", "Soderproken 16 Lidingo", "p1028", 550.0, 0.0),
+            ("SBT", "Alvsjoborgatan 1-3", "p2166", 580.0, 0.0),
+            ("Dvaliks", "Nyneshamn", "p1029", 550.0, 0.0),
+            ("SBT", "Vikingshillsvägen 15", "***", 580.0, 0.0),
+            ("Pareto Properties AB", "Alfred Nobels Alle 109", "p1030", 600.0, 0.0),
+            ("Renatur", "Tomteboda glass", "p1031", 550.0, 0.0),
+            ("Renatur", "Tomteboda doors", "p1032", 550.0, 0.0),
+            ("Privat", "Uddens vag 12 Tomas", "p1033", 520.0, 0.0),
+            ("SBT", "Karlsviksgatan 15", "p2128", 580.0, 0.0),
+            ("Renatur", "Tomteboda arbetsledning", "***", 550.0, 0.0),
+            ("Renatur", "Tomteboda ÄTA", "p1034", 550.0, 0.0),
+            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill", "p1035", 520.0, 0.0),
+            ("Privat", "Kolarbacken 52 136 48 Handen/Vega Daniel", "p1036", 520.0, 0.0),
+            ("Renatur", "Tomteboda ÄTA Hotel", "****", 550.0, 0.0),
+            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill ÄTA", "p1037", 520.0, 0.0)
         ]
 
         unique_companies = sorted(list(set(item[0] for item in initial_data)))
         for comp in unique_companies:
             cursor.execute("INSERT OR IGNORE INTO companies (name) VALUES (?)", (comp,))
 
-        for comp, name, mark in initial_data:
+        for comp, name, mark, rate, tr in initial_data:
             cursor.execute('''
-                INSERT OR IGNORE INTO objects (name, markning, company) VALUES (?, ?, ?)
-            ''', (name, mark, comp))
+                INSERT OR IGNORE INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
+            ''', (name, mark, comp, rate, tr))
 
     conn.commit()
     conn.close()
@@ -183,115 +193,40 @@ def parse_float(val_str, default=0.0):
     except ValueError:
         return default
 
-# --- СЛОВАРЬ И ФУНКЦИЯ ДЛЯ АВТОПЕРЕВОДА КОММЕНТАРИЕВ НА ШВЕДСКИЙ ---
-CONSTRUCTION_TRANSLATIONS = {
-    "монтаж": "montering",
-    "демонтаж": "rivning",
-    "покраска": "målning",
-    "краска": "färg",
-    "утепление": "isolering",
-    "установка": "installation",
-    "гипсокартон": "gips",
-    "шпаклевка": "spackling",
-    "уборка": "städning",
-    "ремонт": "renovering",
-    "стены": "väggar",
-    "стен": "väggar",
-    "потолок": "tak",
-    "пол": "golv",
-    "полов": "golv",
-    "окна": "fönster",
-    "двери": "dörrar",
-    "плитка": "kakel",
-    "замена": "byte",
-    "проводка": "eldragning",
-    "стяжка": "avjämningsmassa",
-    "укладка": "läggning",
-    "сборка": "montering",
-    "подготовка": "förberedelse",
-    "выравнивание": "spackling",
-    "изоляция": "isolering",
-    "работа": "arbete",
-    "работы": "arbeten",
-    "комната": "rum",
-    "квартира": "lägenhet",
-    "дом": "hus"
-}
-
 def translate_to_swedish(text):
     if not text:
         return ""
-    
-    # Приводим весь комментарий к нижнему регистру для анализа
     t = str(text).lower()
-    
-    # Список правил: если в тексте встречается корень/часть слова, 
-    # заменяем всю фразу или дополняем её шведским аналогом.
-    # Порядок важен: более специфичные фразы идут выше.
-    
-    # 1. Проверяем сложные составные фразы
     replacements = {
-        "гипсокартон": "gips",
-        "гипсу": "gips",
-        "картон": "kartong",
-        "вентиляц": "ventilation",
-        "электрик": "elarbete",
-        "проводк": "eldragning",
-        "розетк": "vägguttag",
-        "демонтаж": "rivning",
-        "демонт": "rivning",
-        "монтаж": "montering",
-        "монт": "montering",
-        "покраск": "målning",
-        "красил": "målade",
-        "краск": "färg",
-        "утеплен": "isolering",
-        "изоляц": "isolering",
-        "установк": "installation",
-        "шпаклев": "spackling",
-        "шпатлев": "spackling",
-        "уборк": "städning",
-        "убирал": "städade",
-        "ремонт": "renovering",
-        "стен": "väggar",
-        "потолк": "tak",
-        "пол": "golv",
-        "окн": "fönster",
-        "двер": "dörrar",
-        "плитк": "kakel",
-        "замен": "byte",
-        "стяжк": "avjämningsmassa",
-        "работ": "arbeten",
-        "мусор": "avfall",
-        "доставк": "leverans"
+        "гипсокартон": "gips", "гипсу": "gips", "картон": "kartong",
+        "вентиляц": "ventilation", "электрик": "elarbete", "проводк": "eldragning",
+        "розетк": "vägguttag", "демонтаж": "rivning", "демонт": "rivning",
+        "монтаж": "montering", "монт": "montering", "покраск": "målning",
+        "красил": "målade", "краск": "färg", "утеплен": "isolering",
+        "изоляц": "isolering", "установк": "installation", "шпаклев": "spackling",
+        "шпатлев": "spackling", "уборк": "städning", "убирал": "städade",
+        "ремонт": "renovering", "стен": "väggar", "потолк": "tak",
+        "пол": "golv", "окн": "fönster", "двер": "dörrar", "плитк": "kakel",
+        "замен": "byte", "стяжк": "avjämningsmassa", "работ": "arbeten",
+        "мусор": "avfall", "доставк": "leverans"
     }
-    
-    # Если точного слияния нет, проходим по словам и заменяем корни
     words = t.split()
     translated_words = []
-    
     for word in words:
-        # Убираем знаки препинания для проверки
         clean_w = word.strip(".,;:!?()[]{}\"'")
         matched = False
-        
         for ru_root, se_word in replacements.items():
             if ru_root in clean_w:
-                # Сохраняем заглавную букву, если слово было с большой
                 result_word = se_word
                 if word and word[0].isupper():
                     result_word = result_word.capitalize()
                 translated_words.append(result_word)
                 matched = True
                 break
-                
         if not matched:
-            # Если корень не найден вообще нигде, оставляем исходное слово (или можно заменить на знак)
             translated_words.append(word)
-            
     return " ".join(translated_words)
 
-# --- РЕГИСТРАЦИЯ ШРИФТА С ПОДДЕРЖКОЙ КИРИЛЛИЦЫ (ARIAL) ---
 try:
     windows_font_path = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts', 'arial.ttf')
     if os.path.exists(windows_font_path):
@@ -306,8 +241,6 @@ except Exception:
     DEFAULT_FONT = 'Helvetica'
     DEFAULT_FONT_BOLD = 'Helvetica-Bold'
 
-
-# --- КОМФОРТНАЯ МЯГКАЯ ТЕМА ОФОРМЛЕНИЯ (SOFT GRAPHITE & BLUE ACCENT) ---
 DARK_THEME_QSS = """
     QMainWindow, QWidget {
         background-color: #1e2229;
@@ -386,25 +319,6 @@ DARK_THEME_QSS = """
         border-bottom-right-radius: 6px;
         background-color: #313c4e;
     }
-    QComboBox::drop-down:hover, QDateEdit::drop-down:hover {
-        background-color: #3c495f;
-    }
-    QComboBox::down-arrow, QDateEdit::down-arrow {
-        image: none;
-        width: 0px;
-        height: 0px;
-        border-left: 5px solid transparent;
-        border-right: 5px solid transparent;
-        border-top: 7px solid #4299e1;
-        margin-right: 2px;
-    }
-    QComboBox QAbstractItemView {
-        background-color: #28303d;
-        color: #f7fafc;
-        selection-background-color: #4299e1;
-        border: 1px solid #3f4c60;
-        outline: none;
-    }
     QTableWidget, QTableView {
         background-color: #1a1f26;
         alternate-background-color: #212832;
@@ -429,23 +343,6 @@ DARK_THEME_QSS = """
         border-radius: 8px;
         padding: 12px;
     }
-    QScrollBar:vertical {
-        background: #1e2229;
-        width: 10px;
-        margin: 0px;
-        border-radius: 5px;
-    }
-    QScrollBar::handle:vertical {
-        background: #4a5568;
-        min-height: 20px;
-        border-radius: 5px;
-    }
-    QScrollBar::handle:vertical:hover {
-        background: #4299e1;
-    }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-        height: 0px;
-    }
 """
 
 def create_date_field(default_date_str=""):
@@ -458,7 +355,6 @@ def create_date_field(default_date_str=""):
             date_edit.setDate(qdate)
     else:
         date_edit.setDate(QDate.currentDate())
-        
     date_edit.text = lambda: date_edit.date().toString("yyyy-MM-dd")
     date_edit.setText = lambda val: date_edit.setDate(QDate.fromString(val, "yyyy-MM-dd"))
     return date_edit
@@ -474,7 +370,6 @@ class SmartReportApp(QMainWindow):
         init_db_once()
         self.init_ui()
 
-        # Автоматическая фоновая синхронизация каждые 30 секунд (30000 мс)
         self.auto_sync_timer = QTimer(self)
         self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
         self.auto_sync_timer.start(30000)
@@ -546,8 +441,9 @@ class SmartReportApp(QMainWindow):
 
         self.hours_input = QLineEdit("8.0")
         self.rate_input = QLineEdit()
-        self.rate_input.setPlaceholderText("Например: 520")
+        self.rate_input.setPlaceholderText("Например: 520 (или берется из объекта)")
         self.trans_input = QLineEdit("0")
+        self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Описание выполненных работ...")
 
@@ -557,7 +453,7 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Объект:", self.obj_cb)
         card_layout.addRow("Часы:", self.hours_input)
         card_layout.addRow("Фактурная ставка (крон/час):", self.rate_input)
-        card_layout.addRow("Транспорт (kr):", self.trans_input)
+        card_layout.addRow("Транспорт (0 или 1):", self.trans_input)
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
 
         save_btn = QPushButton("💾 Сохранить смену")
@@ -596,13 +492,10 @@ class SmartReportApp(QMainWindow):
         self.load_shifts_history()
 
     def perform_sync_logic(self):
-        """Общая логика двусторонней синхронизации"""
         CLOUD_URL = "https://smart-report-server.onrender.com"
-        
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. Сначала забираем новые смены, созданные через телефон / веб-форму
         try:
             response = requests.get(f"{CLOUD_URL}/get-unsynced", timeout=15)
             if response.status_code == 200:
@@ -618,51 +511,47 @@ class SmartReportApp(QMainWindow):
                         ''', (s['date'], s['employee'], s['object_name'], s['hours']))
                         
                         if not cursor.fetchone():
+                            obj_rate_val = s.get('rate', 0.0)
+                            if not obj_rate_val or obj_rate_val == 0.0:
+                                cursor.execute("SELECT rate FROM objects WHERE name = ?", (s['object_name'],))
+                                obj_r_row = cursor.fetchone()
+                                if obj_r_row and obj_r_row[0]:
+                                    obj_rate_val = obj_r_row[0]
+
                             cursor.execute('''
                                 INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
                             ''', (
                                 s['date'], s['employee'], s['company'], s['object_name'], 
-                                s['hours'], s.get('rate', 0.0), s.get('transport', 0.0), s.get('comment', '')
+                                s['hours'], obj_rate_val, s.get('transport', 0.0), s.get('comment', '')
                             ))
                             
                         downloaded_ids.append(s['id'])
 
                     conn.commit()
-
                     if downloaded_ids:
                         requests.post(f"{CLOUD_URL}/mark-synced", json={"ids": downloaded_ids}, timeout=10)
         except Exception:
             pass
 
-        # 2. Собираем актуальные списки справочников из базы данных ПК
         cursor.execute("SELECT name FROM employees ORDER BY name")
         employees = [row[0] for row in cursor.fetchall()]
         
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
         
-        # Передаем объекты как словари, чтобы сервер знал их маркировку и компанию!
-        cursor.execute("SELECT name, markning, company FROM objects ORDER BY name")
-        objects = [{"name": row[0], "markning": row[1], "company": row[2]} for row in cursor.fetchall()]
+        cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
+        objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
         
-        # 3. Собираем все локальные смены для отправки в облако
         cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
         local_shift_rows = cursor.fetchall()
-        
         conn.close()
 
         all_local_shifts = []
         for r in local_shift_rows:
             all_local_shifts.append({
-                "date": r[0],
-                "employee": r[1],
-                "company": r[2],
-                "object_name": r[3],
-                "hours": r[4],
-                "rate": r[5],
-                "transport": r[6],
-                "comment": r[7]
+                "date": r[0], "employee": r[1], "company": r[2], "object_name": r[3],
+                "hours": r[4], "rate": r[5], "transport": r[6], "comment": r[7]
             })
 
         metadata_payload = {
@@ -677,16 +566,14 @@ class SmartReportApp(QMainWindow):
             pass
 
     def sync_with_cloud(self):
-        """Ручная синхронизация по кнопке с уведомлением"""
         try:
             self.perform_sync_logic()
             self.load_shifts_history()
-            QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена! Все сотрудники и данные обновлены.")
+            QMessageBox.information(self, "Успех", "Синхронизация с облаком успешно завершена!")
         except requests.exceptions.RequestException as e:
             QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
 
     def background_sync_with_cloud(self):
-        """Тихая фоновая синхронизация каждые 30 секунд"""
         try:
             self.perform_sync_logic()
             self.load_shifts_history()
@@ -695,7 +582,6 @@ class SmartReportApp(QMainWindow):
 
     def setup_salary_tab(self):
         layout = QVBoxLayout(self.tab_salary)
-        
         total_card = QFrame()
         total_card.setObjectName("card")
         total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 8px; margin-bottom: 5px;")
@@ -751,7 +637,6 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        
         cursor.execute("SELECT name, COALESCE(salary_rate, 0.0) FROM employees ORDER BY name")
         emp_rows = cursor.fetchall()
         
@@ -771,7 +656,6 @@ class SmartReportApp(QMainWindow):
         hours_map = {str(row[0]).strip().lower(): row[1] for row in shift_rows}
 
         self.table_salary.setRowCount(len(sorted_keys))
-        
         sum_hrs_all = 0.0
         sum_net_all = 0.0
 
@@ -779,18 +663,15 @@ class SmartReportApp(QMainWindow):
             emp_display_name = orig_names.get(key, key.title())
             hrs = hours_map.get(key, 0.0)
             salary_rate = rates_map.get(key, 0.0)
-            
             sum_hrs_all += hrs
 
             work_sum = hrs * salary_rate
             vacation_pay = work_sum * 0.13
             tax = (work_sum + vacation_pay) * 0.3006
             net_total = (work_sum + vacation_pay) - tax
-            
             sum_net_all += net_total
 
             item_emp = QTableWidgetItem(str(emp_display_name))
-            item_emp.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             item_emp.setFlags(item_emp.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_salary.setItem(row_idx, 0, item_emp)
 
@@ -811,7 +692,6 @@ class SmartReportApp(QMainWindow):
 
         self.sal_summary_hours_lbl.setText(f"<b>Всего часов: {sum_hrs_all:.1f}</b>")
         self.sal_summary_total_lbl.setText(f"<b>Итого к выплате: {sum_net_all:,.2f} kr</b>")
-
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
 
     def on_salary_cell_changed(self, row, col):
@@ -820,7 +700,6 @@ class SmartReportApp(QMainWindow):
             rate_item = self.table_salary.item(row, 2)
             if not emp_item or not rate_item:
                 return
-
             emp_name = emp_item.text().strip()
             new_rate = parse_float(rate_item.text(), 0.0)
 
@@ -837,13 +716,10 @@ class SmartReportApp(QMainWindow):
             self.background_sync_with_cloud()
 
     def calculate_salary_row(self, row_idx):
-        emp_item = self.table_salary.item(row_idx, 0)
         hrs_item = self.table_salary.item(row_idx, 1)
         rate_item = self.table_salary.item(row_idx, 2)
-        
-        if not emp_item or not hrs_item or not rate_item:
+        if not hrs_item or not rate_item:
             return
-        
         hrs = parse_float(hrs_item.text(), 0.0)
         salary_rate = parse_float(rate_item.text(), 0.0)
 
@@ -865,8 +741,7 @@ class SmartReportApp(QMainWindow):
 
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
         
-        sum_hrs = 0.0
-        sum_net = 0.0
+        sum_hrs, sum_net = 0.0, 0.0
         for r in range(self.table_salary.rowCount()):
             h_it = self.table_salary.item(r, 1)
             n_it = self.table_salary.item(r, 5)
@@ -881,9 +756,11 @@ class SmartReportApp(QMainWindow):
 
     def setup_balance_tab(self):
         layout = QVBoxLayout(self.tab_balance)
+        layout.setSpacing(10)
+
         total_card = QFrame()
         total_card.setObjectName("card")
-        total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 10px; margin-bottom: 5px;")
+        total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 10px;")
         
         total_layout = QVBoxLayout(total_card)
         total_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -908,8 +785,8 @@ class SmartReportApp(QMainWindow):
         self.table_bal_summary.setColumnCount(2)
         self.table_bal_summary.setHorizontalHeaderLabels(["Сотрудник", "Баланс / Долг (SEK)"])
         self.table_bal_summary.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table_bal_summary.setFixedHeight(140)
         self.table_bal_summary.setAlternatingRowColors(True)
+        self.table_bal_summary.setMinimumHeight(180)
         summary_layout.addWidget(self.table_bal_summary)
         layout.addWidget(summary_card)
 
@@ -943,9 +820,53 @@ class SmartReportApp(QMainWindow):
         self.table_balance.setAlternatingRowColors(True)
         layout.addWidget(self.table_balance)
 
+    def add_balance_entry(self):
+        date = self.bal_date.text().strip()
+        emp = self.bal_emp_cb.currentText()
+        desc = self.bal_desc.text().strip()
+        amt = parse_float(self.bal_amount.text(), None)
+        if amt is None:
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO balance (date, employee, description, change_amount) VALUES (?, ?, ?, ?)', (date, emp, desc, amt))
+        conn.commit()
+        conn.close()
+        self.bal_desc.clear()
+        self.bal_amount.clear()
+        self.load_balance_table()
+        self.background_sync_with_cloud()
+
+    def load_balance_table(self):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT employee, SUM(change_amount) as total_bal
+            FROM balance
+            GROUP BY employee
+            HAVING SUM(change_amount) != 0
+            ORDER BY SUM(change_amount) DESC
+        ''')
+        summary_rows = cursor.fetchall()
+        self.table_bal_summary.setRowCount(len(summary_rows))
+        grand_total = 0.0
+        for r_idx, row in enumerate(summary_rows):
+            emp, total = row[0], row[1]
+            grand_total += total
+            self.table_bal_summary.setItem(r_idx, 0, QTableWidgetItem(str(emp)))
+            self.table_bal_summary.setItem(r_idx, 1, QTableWidgetItem(f"{total:,.2f} kr"))
+
+        self.total_sum_label.setText(f"{grand_total:,.2f} kr")
+        cursor.execute("SELECT date, employee, description, change_amount FROM balance ORDER BY id DESC")
+        rows = cursor.fetchall()
+        conn.close()
+        self.table_balance.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            for col_idx, val in enumerate(row):
+                self.table_balance.setItem(row_idx, col_idx, QTableWidgetItem(str(val)))
+
     def setup_expenses_tab(self):
         layout = QVBoxLayout(self.tab_expenses)
-        
         exp_total_card = QFrame()
         exp_total_card.setObjectName("card")
         exp_total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 8px; margin-bottom: 5px;")
@@ -973,7 +894,6 @@ class SmartReportApp(QMainWindow):
         auto_calc_btn.clicked.connect(self.auto_calculate_taxes_and_fora)
         f_layout.addWidget(auto_calc_btn)
         f_layout.addStretch()
-        
         layout.addWidget(filter_card)
 
         card = QFrame()
@@ -993,7 +913,6 @@ class SmartReportApp(QMainWindow):
         
         self.exp_desc = QLineEdit()
         self.exp_desc.setPlaceholderText("Описание расхода (например, покупка дисков Makita)...")
-        
         self.exp_amount = QLineEdit()
         self.exp_amount.setPlaceholderText("Сумма в SEK")
 
@@ -1018,7 +937,6 @@ class SmartReportApp(QMainWindow):
 
         exp_summary_box = QHBoxLayout()
         exp_summary_box.addStretch()
-        
         del_exp_btn = QPushButton("🗑 Удалить выбранную запись")
         del_exp_btn.setObjectName("danger")
         del_exp_btn.clicked.connect(self.delete_company_expense)
@@ -1032,7 +950,6 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         cursor = conn.cursor()
-
         cursor.execute("SELECT name, COALESCE(salary_rate, 0.0) FROM employees")
         rates = {str(row[0]).strip().lower(): row[1] for row in cursor.fetchall()}
 
@@ -1061,8 +978,8 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Фонд оплаты труда за период равен нулю. Проверьте ставки сотрудников!")
             return
 
-        fora_amount = total_payroll * 0.052          # FORA (~5.2%)
-        employer_tax = total_payroll * 0.3142        # Arbetsgivareavgift (~31.42%)
+        fora_amount = total_payroll * 0.052          
+        employer_tax = total_payroll * 0.3142        
 
         cursor.execute("INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)",
                        (record_date, "FORA и страхование рабочих (Kollektivavtal)", f"Авторасчет FORA за период {d_from} - {d_to}", fora_amount))
@@ -1075,7 +992,55 @@ class SmartReportApp(QMainWindow):
 
         self.load_expenses_table()
         self.background_sync_with_cloud()
-        QMessageBox.information(self, "Успех", f"Отчисления FORA ({fora_amount:,.2f} kr) и Arbetsgivareavgift ({employer_tax:,.2f} kr) успешно рассчитаны и добавлены в расходы компании!")
+        QMessageBox.information(self, "Успех", f"Отчисления FORA ({fora_amount:,.2f} kr) и Arbetsgivareavgift ({employer_tax:,.2f} kr) успешно рассчитаны!")
+
+    def add_company_expense(self):
+        date = self.exp_date.text().strip()
+        category = self.exp_cat_cb.currentText()
+        desc = self.exp_desc.text().strip()
+        amt = parse_float(self.exp_amount.text(), None)
+        if amt is None:
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)', (date, category, desc, amt))
+        conn.commit()
+        conn.close()
+        self.exp_desc.clear()
+        self.exp_amount.clear()
+        self.load_expenses_table()
+        self.background_sync_with_cloud()
+
+    def load_expenses_table(self):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, category, description, amount FROM company_expenses ORDER BY id DESC")
+        rows = cursor.fetchall()
+        conn.close()
+        self.table_expenses.setRowCount(len(rows))
+        total_exp = 0.0
+        for row_idx, row in enumerate(rows):
+            date, cat, desc, amt = row[0], row[1], row[2], row[3]
+            total_exp += amt
+            self.table_expenses.setItem(row_idx, 0, QTableWidgetItem(str(date)))
+            self.table_expenses.setItem(row_idx, 1, QTableWidgetItem(str(cat)))
+            self.table_expenses.setItem(row_idx, 2, QTableWidgetItem(str(desc)))
+            self.table_expenses.setItem(row_idx, 3, QTableWidgetItem(f"{amt:,.2f} kr"))
+        self.exp_summary_total_lbl.setText(f"<b>ОБЩАЯ СУММА РАСХОДОВ И НАЛОГОВ: {total_exp:,.2f} kr</b>")
+
+    def delete_company_expense(self, index=None):
+        selected = self.table_expenses.currentRow()
+        if selected < 0:
+            return
+        date_val = self.table_expenses.item(selected, 0).text()
+        cat_val = self.table_expenses.item(selected, 1).text()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM company_expenses WHERE date = ? AND category = ?', (date_val, cat_val))
+        conn.commit()
+        conn.close()
+        self.load_expenses_table()
+        self.background_sync_with_cloud()
 
     def setup_invoice_tab(self):
         layout = QVBoxLayout(self.tab_invoice)
@@ -1092,7 +1057,6 @@ class SmartReportApp(QMainWindow):
         
         self.inv_obj_cb = QComboBox()
         self.load_objects_for_company(self.inv_comp_cb.currentText(), self.inv_obj_cb)
-
         self.inv_comp_cb.currentTextChanged.connect(lambda comp: self.load_objects_for_company(comp, self.inv_obj_cb))
 
         card_layout.addRow("Период с:", self.inv_date_from)
@@ -1100,25 +1064,42 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Фирма:", self.inv_comp_cb)
         card_layout.addRow("Объект:", self.inv_obj_cb)
 
+        fast_pris_box = QHBoxLayout()
+        self.fast_pris_check = QCheckBox("📌 Фиксированная цена за объект (Fast pris)")
+        self.fast_pris_check.setStyleSheet("color: #63b3ed; font-weight: bold;")
+        self.fast_pris_input = QLineEdit()
+        self.fast_pris_input.setPlaceholderText("Сумма без НДС (SEK)")
+        self.fast_pris_input.setEnabled(False)
+        self.fast_pris_check.toggled.connect(self.fast_pris_input.setEnabled)
+
+        fast_pris_box.addWidget(self.fast_pris_check)
+        fast_pris_box.addWidget(self.fast_pris_input)
+        card_layout.addRow(fast_pris_box)
+
         btn_layout = QHBoxLayout()
         gen_btn = QPushButton("📊 Сформировать отчёт для счёта")
         gen_btn.clicked.connect(self.generate_invoice)
         
-        mark_invoiced_btn = QPushButton("✅ Закрыть период (Отметить как выставленный)")
+        export_pdf_inv_btn = QPushButton("📄 Экспорт отчета в PDF (SV)")
+        export_pdf_inv_btn.setStyleSheet("background-color: #2b6cb0; border-color: #4299e1;")
+        export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
+        
+        mark_invoiced_btn = QPushButton("✅ Закрыть период")
         mark_invoiced_btn.setStyleSheet("background-color: #276749; border-color: #38a169;")
         mark_invoiced_btn.clicked.connect(self.mark_period_as_invoiced)
 
-        unmark_invoiced_btn = QPushButton("❌ Отменить закрытие (Вернуть в работу)")
+        unmark_invoiced_btn = QPushButton("❌ Вернуть в работу")
         unmark_invoiced_btn.setObjectName("danger")
         unmark_invoiced_btn.clicked.connect(self.unmark_period_as_invoiced)
 
         btn_layout.addWidget(gen_btn)
+        btn_layout.addWidget(export_pdf_inv_btn)
         btn_layout.addWidget(mark_invoiced_btn)
         btn_layout.addWidget(unmark_invoiced_btn)
         card_layout.addRow(btn_layout)
 
         layout.addWidget(card)
-        layout.addWidget(QLabel("<b>Результат по объекту за период (зеленые строки уже закрыты и выставлены в счет):</b>"))
+        layout.addWidget(QLabel("<b>Результат по объекту за период (зеленые строки уже закрыты):</b>"))
         
         self.table_invoice = QTableWidget()
         self.table_invoice.setColumnCount(7)
@@ -1135,6 +1116,190 @@ class SmartReportApp(QMainWindow):
         summary_box.addWidget(self.inv_total_sum_lbl)
         layout.addLayout(summary_box)
 
+    def generate_invoice(self):
+        d_from = self.inv_date_from.text().strip()
+        d_to = self.inv_date_to.text().strip()
+        comp = self.inv_comp_cb.currentText()
+        obj_data = self.inv_obj_cb.currentData()
+        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
+
+        if not comp or not obj:
+            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
+            return
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ?", (obj,))
+        obj_row = cursor.fetchone()
+        object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
+        object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
+
+        is_fast_pris = self.fast_pris_check.isChecked()
+        fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
+
+        cursor.execute('''
+            SELECT employee, SUM(hours) as total_hours, SUM(transport) as total_trans_count, MAX(invoiced) as invoiced_status
+            FROM shifts
+            WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+            GROUP BY employee
+            ORDER BY employee
+        ''', (comp, obj, d_from, d_to))
+        rows = cursor.fetchall()
+        conn.close()
+
+        self.table_invoice.setRowCount(len(rows))
+        total_hours_all = 0.0
+        total_sum_all = 0.0
+
+        for row_idx, row in enumerate(rows):
+            emp = row[0]
+            hrs = row[1]
+            trans_count = row[2] or 0.0
+            is_inv = row[3] == 1
+            status_str = "✅ Выставлен" * is_inv or "⏳ В работе"
+            
+            total_hours_all += hrs
+            transport_total_sum = trans_count * object_transport_rate
+            
+            if is_fast_pris:
+                rate = 0.0
+                work_sum = 0.0
+                row_total = transport_total_sum
+            else:
+                rate = object_default_rate
+                work_sum = hrs * rate
+                row_total = work_sum + transport_total_sum
+
+            total_sum_all += row_total
+
+            for col_idx, val in enumerate([emp, hrs, f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str]):
+                it = QTableWidgetItem(str(val))
+                if is_inv:
+                    it.setBackground(QColor("#1c4532"))
+                self.table_invoice.setItem(row_idx, col_idx, it)
+
+        if is_fast_pris:
+            total_sum_all = fast_pris_amount
+            self.inv_total_hours_lbl.setText(f"<b>Всего часов: {total_hours_all:.1f} (Fast pris)</b>")
+            self.inv_total_sum_lbl.setText(f"<b>Общая сумма по договору: {fast_pris_amount:,.2f} kr</b>")
+        else:
+            self.inv_total_hours_lbl.setText(f"<b>Всего часов: {total_hours_all:.1f}</b>")
+            self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
+
+    def export_invoice_to_pdf(self):
+        d_from = self.inv_date_from.text().strip()
+        d_to = self.inv_date_to.text().strip()
+        comp = self.inv_comp_cb.currentText()
+        obj_data = self.inv_obj_cb.currentData()
+        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
+
+        if not comp or not obj:
+            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для формирования PDF-счета!")
+            return
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ?", (obj,))
+        obj_row = cursor.fetchone()
+        object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
+        object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
+
+        is_fast_pris = self.fast_pris_check.isChecked()
+        fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
+
+        cursor.execute('''
+            SELECT employee, SUM(hours) as total_hours, SUM(transport) as total_trans_count
+            FROM shifts
+            WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+            GROUP BY employee
+            ORDER BY employee
+        ''', (comp, obj, d_from, d_to))
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows and not is_fast_pris:
+            QMessageBox.warning(self, "Внимание", "За выбранный период нет данных для отчета!")
+            return
+
+        if not os.path.exists(REPORTS_DIR):
+            os.makedirs(REPORTS_DIR)
+
+        base_filename = f"Fakturaunderlag_{comp.replace(' ', '_')}_{obj.replace(' ', '_')}_{d_from}_till_{d_to}.pdf"
+        filepath = os.path.join(REPORTS_DIR, base_filename)
+
+        try:
+            doc = SimpleDocTemplate(filepath, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+            story = []
+            styles = getSampleStyleSheet()
+            
+            title_style = ParagraphStyle('TitleSV', parent=styles['Heading1'], fontName=DEFAULT_FONT_BOLD, fontSize=15, spaceAfter=4)
+            subtitle_style = ParagraphStyle('SubTitleSV', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=10, spaceAfter=14)
+
+            story.append(Paragraph("<b>Bygger och renoverar i Sthlm AB</b>", title_style))
+            story.append(Paragraph(f"<b>Fakturaunderlag (Underlag för faktura)</b><br/>Beställare (Firma): <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
+            story.append(Spacer(1, 5))
+
+            table_data = [["Anställd", "Timmar", "Pris/tim (SEK)", "Arbete (SEK)", "Resa/Trans (SEK)", "Totalt (SEK)"]]
+            total_hours_all = 0.0
+            total_sum_all = 0.0
+
+            for row in rows:
+                emp = row[0]
+                hrs = row[1]
+                trans_count = row[2] or 0.0
+                total_hours_all += hrs
+
+                transport_total_sum = trans_count * object_transport_rate
+
+                if is_fast_pris:
+                    rate = 0.0
+                    work_sum = 0.0
+                    row_total = transport_total_sum
+                else:
+                    rate = object_default_rate
+                    work_sum = hrs * rate
+                    row_total = work_sum + transport_total_sum
+
+                total_sum_all += row_total
+                table_data.append([str(emp), f"{hrs:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}"])
+
+            if is_fast_pris:
+                total_sum_all = fast_pris_amount
+                table_data.append(["Fast pris (Enligt avtal)", "", "", "", "", f"{fast_pris_amount:.2f}"])
+
+            table_data.append(["Totalt:", f"{total_hours_all:.1f}", "", "", "", f"{total_sum_all:,.2f}"])
+
+            t = Table(table_data, colWidths=[130, 55, 75, 80, 85, 80])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+                ('TOPPADDING', (0, 0), (-1, 0), 6),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#f9f9f9'), colors.white]),
+                ('GRID', (0, 0), (-1, -2), 0.5, colors.HexColor('#dddddd')),
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#eeeeee')),
+                ('FONTNAME', (0, -1), (-1, -1), DEFAULT_FONT_BOLD),
+            ]))
+
+            story.append(t)
+            doc.build(story)
+            QMessageBox.information(self, "Успех", f"PDF-отчет для счета сохранен:\n{base_filename}")
+            
+            if sys.platform == 'win32':
+                os.startfile(filepath)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', filepath])
+            else:
+                subprocess.run(['xdg-open', filepath])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF счета: {e}")
+
     def mark_period_as_invoiced(self):
         d_from = self.inv_date_from.text().strip()
         d_to = self.inv_date_to.text().strip()
@@ -1148,7 +1313,7 @@ class SmartReportApp(QMainWindow):
 
         reply = QMessageBox.question(
             self, "Подтверждение",
-            f"Отметить все смены по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b> как выставленные в счет (закрыть период)?",
+            f"Отметить все смены по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b> как выставленные в счет?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -1164,7 +1329,7 @@ class SmartReportApp(QMainWindow):
             conn.commit()
             conn.close()
 
-            QMessageBox.information(self, "Успех", "Период успешно закрыт! Смены отмечены как выставленные.")
+            QMessageBox.information(self, "Успех", "Период успешно закрыт!")
             self.generate_invoice()
             self.load_shifts_history()
             self.background_sync_with_cloud()
@@ -1182,7 +1347,7 @@ class SmartReportApp(QMainWindow):
 
         reply = QMessageBox.question(
             self, "Подтверждение",
-            f"Вернуть в работу (снять отметку счета) все смены по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b>?",
+            f"Вернуть в работу все смены по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b>?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -1198,7 +1363,7 @@ class SmartReportApp(QMainWindow):
             conn.commit()
             conn.close()
 
-            QMessageBox.information(self, "Успех", "Статус сброшен! Период снова переведен в статус «В работе».")
+            QMessageBox.information(self, "Успех", "Статус сброшен!")
             self.generate_invoice()
             self.load_shifts_history()
             self.background_sync_with_cloud()
@@ -1209,13 +1374,12 @@ class SmartReportApp(QMainWindow):
             return
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, COALESCE(markning, '') FROM objects WHERE company = ? ORDER BY name", (comp_name,))
+        cursor.execute("SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects WHERE company = ? ORDER BY name", (comp_name,))
         rows = cursor.fetchall()
         conn.close()
         for row in rows:
-            name = row[0]
-            mark = row[1]
-            display = f"{mark} | {name}" if mark else name
+            name, mark, rate, tr_rate = row[0], row[1], row[2], row[3]
+            display = f"{mark} | {name} ({rate} kr/ч, тр: {tr_rate})" if mark else f"{name} ({rate} kr/ч)"
             obj_cb.addItem(display, userData=name)
 
     def setup_dagbok_tab(self):
@@ -1233,7 +1397,6 @@ class SmartReportApp(QMainWindow):
         
         self.dag_obj_cb = QComboBox()
         self.load_objects_for_company(self.dag_comp_cb.currentText(), self.dag_obj_cb)
-
         self.dag_comp_cb.currentTextChanged.connect(lambda comp: self.load_objects_for_company(comp, self.dag_obj_cb))
 
         card_layout.addRow("Период с:", self.dag_date_from)
@@ -1268,7 +1431,6 @@ class SmartReportApp(QMainWindow):
         self.table_dagbok.setColumnWidth(0, 130)
         self.table_dagbok.setColumnWidth(1, 200)
         self.table_dagbok.setColumnWidth(2, 160)
-
         self.table_dagbok.setAlternatingRowColors(True)
         layout.addWidget(self.table_dagbok)
 
@@ -1286,7 +1448,7 @@ class SmartReportApp(QMainWindow):
         obj = obj_data if obj_data else self.dag_obj_cb.currentText()
 
         if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для формирования журнала!")
+            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
             return
 
         conn = get_db_connection()
@@ -1309,15 +1471,10 @@ class SmartReportApp(QMainWindow):
             
             it_date = QTableWidgetItem(str(date))
             it_date.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            
             it_emp = QTableWidgetItem(str(emp))
-            it_emp.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            
             it_hrs = QTableWidgetItem(str(hrs))
             it_hrs.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            
             it_comm = QTableWidgetItem(str(comment or ""))
-            it_comm.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
             self.table_dagbok.setItem(row_idx, 0, it_date)
             self.table_dagbok.setItem(row_idx, 1, it_emp)
@@ -1334,7 +1491,7 @@ class SmartReportApp(QMainWindow):
         obj = obj_data if obj_data else self.dag_obj_cb.currentText()
 
         if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для формирования отчета!")
+            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
             return
 
         conn = get_db_connection()
@@ -1349,7 +1506,7 @@ class SmartReportApp(QMainWindow):
         conn.close()
 
         if not rows:
-            QMessageBox.warning(self, "Внимание", "За выбранный период по этому объекту нет записей!")
+            QMessageBox.warning(self, "Внимание", "За выбранный период нет записей!")
             return
 
         if not os.path.exists(REPORTS_DIR):
@@ -1367,7 +1524,7 @@ class SmartReportApp(QMainWindow):
             subtitle_style = ParagraphStyle('SubTitleSV', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=10, spaceAfter=14)
 
             story.append(Paragraph("<b>Bygger och renoverar i Sthlm AB</b>", title_style))
-            story.append(Paragraph(f"<b>Arbetsdagbok (Dagbok)</b><br/>Beställare (Firma): <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
+            story.append(Paragraph(f"<b>Arbetsdagbok (Dagbok)</b><br/>Beställare: <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
             story.append(Spacer(1, 5))
 
             table_data = [["Datum", "Anställd", "Timmar", "Arbetsbeskrivning"]]
@@ -1376,7 +1533,6 @@ class SmartReportApp(QMainWindow):
             for row in rows:
                 date, emp, hrs, comment = row[0], row[1], row[2], row[3]
                 total_hours += hrs
-                # Автоматический перевод комментария на шведский для PDF отчета
                 translated_comment = translate_to_swedish(comment)
                 table_data.append([str(date), str(emp), f"{hrs:.1f}", str(translated_comment or "")])
 
@@ -1399,7 +1555,7 @@ class SmartReportApp(QMainWindow):
 
             story.append(t)
             doc.build(story)
-            QMessageBox.information(self, "Успех", f"PDF-отчет сохранен в папку reports:\n{base_filename}")
+            QMessageBox.information(self, "Успех", f"PDF-отчет сохранен:\n{base_filename}")
             
             if sys.platform == 'win32':
                 os.startfile(filepath)
@@ -1407,7 +1563,6 @@ class SmartReportApp(QMainWindow):
                 subprocess.run(['open', filepath])
             else:
                 subprocess.run(['xdg-open', filepath])
-
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF: {e}")
 
@@ -1447,7 +1602,7 @@ class SmartReportApp(QMainWindow):
         comp_card_layout.addWidget(del_comp_btn)
         top_layout.addWidget(comp_card, stretch=1)
 
-        # Секция 2: Сотрудники (Обновлена с колонкой и кнопкой сброса ПИН-кода)
+        # Секция 2: Сотрудники
         emp_card = QFrame()
         emp_card.setObjectName("card")
         emp_card_layout = QVBoxLayout(emp_card)
@@ -1477,7 +1632,6 @@ class SmartReportApp(QMainWindow):
         del_emp_btn = QPushButton("🗑 Удалить сотрудника")
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
-        
         reset_pin_btn = QPushButton("🔑 Сбросить ПИН")
         reset_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
@@ -1488,36 +1642,60 @@ class SmartReportApp(QMainWindow):
 
         layout.addLayout(top_layout, stretch=1)
 
-        # Нижняя панель (Управление объектами)
+        # Нижняя панель (Управление объектами со ставками и транспортом)
         obj_card = QFrame()
         obj_card.setObjectName("card")
         obj_card_layout = QVBoxLayout(obj_card)
         obj_card_layout.setSpacing(6)
-        obj_card_layout.addWidget(QLabel("<b>🏗 Управление объектами:</b>"))
+        obj_card_layout.addWidget(QLabel("<b>🏗 Управление объектами (Ставки и транспорт):</b>"))
 
         obj_add_layout = QHBoxLayout()
-        
         self.new_obj_comp_cb = QComboBox()
         self.load_companies_into_combobox(self.new_obj_comp_cb)
 
         self.new_obj_name_input = QLineEdit()
         self.new_obj_name_input.setPlaceholderText("Адрес / Название объекта...")
+        
         self.new_obj_mark_input = QLineEdit()
-        self.new_obj_mark_input.setPlaceholderText("Markning...")
-        self.new_obj_mark_input.setFixedWidth(130)
-        add_obj_btn = QPushButton("➕ Добавить объект")
+        self.new_obj_mark_input.setPlaceholderText("Markning")
+        self.new_obj_mark_input.setFixedWidth(90)
+        
+        self.new_obj_rate_input = QLineEdit()
+        self.new_obj_rate_input.setPlaceholderText("kr/ч")
+        self.new_obj_rate_input.setFixedWidth(70)
+
+        self.new_obj_trans_input = QLineEdit()
+        self.new_obj_trans_input.setPlaceholderText("Транс.kr")
+        self.new_obj_trans_input.setFixedWidth(75)
+
+        add_obj_btn = QPushButton("➕ Добавить")
         add_obj_btn.clicked.connect(self.add_object)
 
         obj_add_layout.addWidget(self.new_obj_comp_cb, stretch=2)
         obj_add_layout.addWidget(self.new_obj_name_input, stretch=3)
         obj_add_layout.addWidget(self.new_obj_mark_input, stretch=1)
+        obj_add_layout.addWidget(self.new_obj_rate_input, stretch=1)
+        obj_add_layout.addWidget(self.new_obj_trans_input, stretch=1)
         obj_add_layout.addWidget(add_obj_btn)
         obj_card_layout.addLayout(obj_add_layout)
         
         self.table_objects = QTableWidget()
-        self.table_objects.setColumnCount(3)
-        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning"])
-        self.table_objects.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table_objects.setColumnCount(5)
+        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Факт. ставка (kr/ч)", "Транспорт (kr/выезд)"])
+        
+        obj_header = self.table_objects.horizontalHeader()
+        obj_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        obj_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        obj_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        obj_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        obj_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        
+        self.table_objects.setColumnWidth(0, 150)
+        self.table_objects.setColumnWidth(2, 110)
+        self.table_objects.setColumnWidth(3, 140)
+        self.table_objects.setColumnWidth(4, 150)
+
+        self.table_objects.cellChanged.connect(self.on_object_cell_changed)
         obj_card_layout.addWidget(self.table_objects, stretch=1)
 
         del_obj_btn = QPushButton("🗑 Удалить выбранный объект")
@@ -1586,24 +1764,50 @@ class SmartReportApp(QMainWindow):
         comp = self.new_obj_comp_cb.currentText().strip()
         name = self.new_obj_name_input.text().strip()
         mark = self.new_obj_mark_input.text().strip()
+        rate_val = parse_float(self.new_obj_rate_input.text(), 0.0)
+        trans_rate_val = parse_float(self.new_obj_trans_input.text(), 0.0)
+        
         if not name or not comp:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму из списка и укажите название объекта!")
+            QMessageBox.warning(self, "Ошибка", "Выберите фирму и укажите название объекта!")
             return
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
             cursor.execute('''
-                INSERT INTO objects (name, markning, company) VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET markning = ?, company = ?
-            ''', (name, mark, comp, mark, comp))
+                INSERT INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET markning = ?, company = ?, rate = ?, transport_rate = ?
+            ''', (name, mark, comp, rate_val, trans_rate_val, mark, comp, rate_val, trans_rate_val))
             conn.commit()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось добавить объект: {e}")
         conn.close()
         self.new_obj_name_input.clear()
         self.new_obj_mark_input.clear()
+        self.new_obj_rate_input.clear()
+        self.new_obj_trans_input.clear()
         self.load_dropdowns()
         self.background_sync_with_cloud()
+
+    def on_object_cell_changed(self, row, col):
+        if col in [3, 4]:
+            try:
+                name_item = self.table_objects.item(row, 1)
+                rate_item = self.table_objects.item(row, 3)
+                trans_item = self.table_objects.item(row, 4)
+                if not name_item or not rate_item or not trans_item:
+                    return
+                obj_name = name_item.text().strip()
+                new_rate = parse_float(rate_item.text(), 0.0)
+                new_trans = parse_float(trans_item.text(), 0.0)
+
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("UPDATE objects SET rate = ?, transport_rate = ? WHERE name = ?", (new_rate, new_trans, obj_name))
+                conn.commit()
+                conn.close()
+                self.background_sync_with_cloud()
+            except Exception:
+                pass
 
     def delete_object(self):
         selected = self.table_objects.currentRow()
@@ -1625,15 +1829,13 @@ class SmartReportApp(QMainWindow):
         if hasattr(self, 'emp_cb'):
             self.emp_cb.clear()
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            rows = cursor.fetchall()
-            for row in rows:
+            for row in cursor.fetchall():
                 self.emp_cb.addItem(row[0])
 
         if hasattr(self, 'bal_emp_cb'):
             self.bal_emp_cb.clear()
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            rows = cursor.fetchall()
-            for row in rows:
+            for row in cursor.fetchall():
                 self.bal_emp_cb.addItem(row[0])
 
         for cb in [getattr(self, 'comp_cb', None), getattr(self, 'inv_comp_cb', None), getattr(self, 'dag_comp_cb', None), getattr(self, 'new_obj_comp_cb', None)]:
@@ -1659,16 +1861,32 @@ class SmartReportApp(QMainWindow):
             self.load_companies_table()
 
     def load_objects_table(self):
+        try:
+            self.table_objects.cellChanged.disconnect(self.on_object_cell_changed)
+        except TypeError:
+            pass
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT company, name, markning FROM objects ORDER BY company, name")
+        cursor.execute("SELECT company, name, markning, COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects ORDER BY company, name")
         rows = cursor.fetchall()
         conn.close()
+
         self.table_objects.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             self.table_objects.setItem(row_idx, 0, QTableWidgetItem(row[0] or ""))
             self.table_objects.setItem(row_idx, 1, QTableWidgetItem(row[1]))
             self.table_objects.setItem(row_idx, 2, QTableWidgetItem(row[2] or ""))
+            
+            rate_item = QTableWidgetItem(f"{row[3]:.2f}")
+            rate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table_objects.setItem(row_idx, 3, rate_item)
+
+            trans_item = QTableWidgetItem(f"{row[4]:.2f}")
+            trans_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table_objects.setItem(row_idx, 4, trans_item)
+
+        self.table_objects.cellChanged.connect(self.on_object_cell_changed)
 
     def load_employees_table(self):
         conn = get_db_connection()
@@ -1677,7 +1895,6 @@ class SmartReportApp(QMainWindow):
         rows = cursor.fetchall()
         conn.close()
 
-        # Запрашиваем статусы ПИН-кодов из облака
         pin_statuses = {}
         try:
             CLOUD_URL = "https://smart-report-server.onrender.com"
@@ -1691,8 +1908,7 @@ class SmartReportApp(QMainWindow):
 
         self.table_employees.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
-            name = row[0]
-            rate = row[1]
+            name, rate = row[0], row[1]
             has_pin = pin_statuses.get(name.strip().lower(), None)
 
             if has_pin is None:
@@ -1700,7 +1916,7 @@ class SmartReportApp(QMainWindow):
             elif has_pin:
                 pin_text = "✅ Пин задан"
             else:
-                pin_text = "⏳ Не задан (первый вход)"
+                pin_text = "⏳ Не задан"
 
             self.table_employees.setItem(row_idx, 0, QTableWidgetItem(name))
             self.table_employees.setItem(row_idx, 1, QTableWidgetItem(f"{rate:.2f}" if rate else "0.00"))
@@ -1715,28 +1931,18 @@ class SmartReportApp(QMainWindow):
     def reset_employee_pin_desktop(self):
         selected = self.table_employees.currentRow()
         if selected < 0:
-            QMessageBox.warning(self, "Внимание", "Выберите сотрудника в таблице для сброса пин-кода!")
+            QMessageBox.warning(self, "Внимание", "Выберите сотрудника!")
             return
-        
         emp_name = self.table_employees.item(selected, 0).text()
-        reply = QMessageBox.question(
-            self, "Подтверждение",
-            f"Сбросить пин-код для сотрудника <b>{emp_name}</b>?<br>При следующем входе система попросит задать новый пин.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
+        reply = QMessageBox.question(self, "Подтверждение", f"Сбросить пин-код для {emp_name}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             try:
                 CLOUD_URL = "https://smart-report-server.onrender.com"
-                res = requests.post(f"{CLOUD_URL}/admin/reset-user-pin", json={"username": emp_name}, timeout=5)
-                if res.status_code == 200:
-                    QMessageBox.information(self, "Успех", f"Пин-код для {emp_name} успешно сброшен!")
-                    self.load_employees_table()
-                else:
-                    QMessageBox.critical(self, "Ошибка", "Сервер отклонил запрос на сброс пина.")
+                requests.post(f"{CLOUD_URL}/admin/reset-user-pin", json={"username": emp_name}, timeout=5)
+                QMessageBox.information(self, "Успех", f"Пин-код для {emp_name} сброшен!")
+                self.load_employees_table()
             except Exception as e:
-                QMessageBox.critical(self, "Ошибка сети", f"Не удалось связаться с облаком:\n{e}")
+                QMessageBox.critical(self, "Ошибка", f"Не удалось связаться с облаком:\n{e}")
 
     def add_or_update_employee(self):
         name = self.new_emp_input.text().strip()
@@ -1776,12 +1982,23 @@ class SmartReportApp(QMainWindow):
         obj_name = self.obj_cb.currentData() or self.obj_cb.currentText()
         
         hours_val = parse_float(self.hours_input.text(), -1)
-        rate_val = parse_float(self.rate_input.text(), -1)
+        
+        rate_input_str = self.rate_input.text().strip()
+        if rate_input_str:
+            rate_val = parse_float(rate_input_str, -1)
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT rate FROM objects WHERE name = ?", (obj_name,))
+            obj_row = cursor.fetchone()
+            conn.close()
+            rate_val = obj_row[0] if obj_row and obj_row[0] else 0.0
+
         trans_val = parse_float(self.trans_input.text(), 0.0)
         comment = self.comment_input.text().strip()
 
         if hours_val < 0 or rate_val < 0:
-            QMessageBox.warning(self, "Ошибка", "Проверьте правильность числовых полей (часы и ставка)!")
+            QMessageBox.warning(self, "Ошибка", "Проверьте правильность часов и ставки!")
             return
 
         conn = get_db_connection()
@@ -1793,10 +2010,8 @@ class SmartReportApp(QMainWindow):
         conn.commit()
         conn.close()
         
-        # Мгновенная отправка в облако при сохранении смены
         self.background_sync_with_cloud()
-        
-        QMessageBox.information(self, "Успех", "Смена успешно сохранена и отправлена в облако!")
+        QMessageBox.information(self, "Успех", "Смена успешно сохранена!")
         self.load_shifts_history()
 
     def load_shifts_history(self):
@@ -1817,30 +2032,17 @@ class SmartReportApp(QMainWindow):
                     if is_inv:
                         it.setBackground(QColor("#1c4532"))
                     self.table_shifts.setItem(row_idx, col_idx, it)
-            
             self.load_dropdowns()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
 
-    def delete_shift(self):
+    def delete_shift(self, index=None):
         selected = self.table_shifts.currentRow()
         if selected < 0:
-            QMessageBox.warning(self, "Внимание", "Выберите строку смены в таблице для удаления!")
+            QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
             return
-        
-        shift_id_item = self.table_shifts.item(selected, 0)
-        if not shift_id_item:
-            return
-        
-        shift_id = shift_id_item.text()
-        
-        reply = QMessageBox.question(
-            self, "Подтверждение", 
-            "Вы действительно хотите удалить выбранную смену из базы данных?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
+        shift_id = self.table_shifts.item(selected, 0).text()
+        reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             conn = get_db_connection()
             cursor = conn.cursor()
@@ -1849,152 +2051,6 @@ class SmartReportApp(QMainWindow):
             conn.close()
             self.load_shifts_history()
             self.background_sync_with_cloud()
-
-    def generate_invoice(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для формирования отчёта!")
-            return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT employee, SUM(hours) as total_hours, AVG(rate) as avg_rate, SUM(hours * rate) as work_sum, SUM(transport) as total_trans, MAX(invoiced) as invoiced_status
-            FROM shifts
-            WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-            GROUP BY employee
-            ORDER BY employee
-        ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        conn.close()
-
-        self.table_invoice.setRowCount(len(rows))
-        total_hours_all = 0.0
-        total_sum_all = 0.0
-
-        for row_idx, row in enumerate(rows):
-            emp = row[0]
-            hrs = row[1]
-            rate = row[2]
-            work_sum = row[3]
-            transport = row[4]
-            row_total = work_sum + transport
-            is_inv = row[5] == 1
-            status_str = "✅ Выставлен" * is_inv or "⏳ В работе"
-            
-            total_hours_all += hrs
-            total_sum_all += row_total
-
-            for col_idx, val in enumerate([emp, hrs, f"{rate:.2f}", f"{work_sum:.2f}", f"{transport:.2f}", f"{row_total:.2f}", status_str]):
-                it = QTableWidgetItem(str(val))
-                if is_inv:
-                    it.setBackground(QColor("#1c4532"))
-                self.table_invoice.setItem(row_idx, col_idx, it)
-
-        self.inv_total_hours_lbl.setText(f"<b>Всего часов: {total_hours_all:.1f}</b>")
-        self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
-
-    def add_balance_entry(self):
-        date = self.bal_date.text().strip()
-        emp = self.bal_emp_cb.currentText()
-        desc = self.bal_desc.text().strip()
-        amt = parse_float(self.bal_amount.text(), None)
-        if amt is None:
-            return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO balance (date, employee, description, change_amount) VALUES (?, ?, ?, ?)',
-                       (date, emp, desc, amt))
-        conn.commit()
-        conn.close()
-        self.bal_desc.clear()
-        self.bal_amount.clear()
-        self.load_balance_table()
-        self.background_sync_with_cloud()
-
-    def load_balance_table(self):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT employee, SUM(change_amount) as total_bal
-            FROM balance
-            GROUP BY employee
-            HAVING SUM(change_amount) != 0
-            ORDER BY SUM(change_amount) DESC
-        ''')
-        summary_rows = cursor.fetchall()
-        self.table_bal_summary.setRowCount(len(summary_rows))
-        grand_total = 0.0
-        for r_idx, row in enumerate(summary_rows):
-            emp, total = row[0], row[1]
-            grand_total += total
-            self.table_bal_summary.setItem(r_idx, 0, QTableWidgetItem(str(emp)))
-            self.table_bal_summary.setItem(r_idx, 1, QTableWidgetItem(f"{total:,.2f} kr"))
-
-        self.total_sum_label.setText(f"{grand_total:,.2f} kr")
-        cursor.execute("SELECT date, employee, description, change_amount FROM balance ORDER BY id DESC")
-        rows = cursor.fetchall()
-        conn.close()
-        self.table_balance.setRowCount(len(rows))
-        for row_idx, row in enumerate(rows):
-            for col_idx, val in enumerate(row):
-                self.table_balance.setItem(row_idx, col_idx, QTableWidgetItem(str(val)))
-
-    def add_company_expense(self):
-        date = self.exp_date.text().strip()
-        category = self.exp_cat_cb.currentText()
-        desc = self.exp_desc.text().strip()
-        amt = parse_float(self.exp_amount.text(), None)
-        if amt is None:
-            return
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)',
-                       (date, category, desc, amt))
-        conn.commit()
-        conn.close()
-        self.exp_desc.clear()
-        self.exp_amount.clear()
-        self.load_expenses_table()
-        self.background_sync_with_cloud()
-
-    def load_expenses_table(self):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT date, category, description, amount FROM company_expenses ORDER BY id DESC")
-        rows = cursor.fetchall()
-        conn.close()
-        self.table_expenses.setRowCount(len(rows))
-        total_exp = 0.0
-        for row_idx, row in enumerate(rows):
-            date, cat, desc, amt = row[0], row[1], row[2], row[3]
-            total_exp += amt
-            self.table_expenses.setItem(row_idx, 0, QTableWidgetItem(str(date)))
-            self.table_expenses.setItem(row_idx, 1, QTableWidgetItem(str(cat)))
-            self.table_expenses.setItem(row_idx, 2, QTableWidgetItem(str(desc)))
-            self.table_expenses.setItem(row_idx, 3, QTableWidgetItem(f"{amt:,.2f} kr"))
-        
-        self.exp_summary_total_lbl.setText(f"<b>ОБЩАЯ СУММА РАСХОДОВ И НАЛОГОВ: {total_exp:,.2f} kr</b>")
-
-    def delete_company_expense(self, index=None):
-        selected = self.table_expenses.currentRow()
-        if selected < 0:
-            return
-        date_val = self.table_expenses.item(selected, 0).text()
-        cat_val = self.table_expenses.item(selected, 1).text()
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM company_expenses WHERE date = ? AND category = ?', (date_val, cat_val))
-        conn.commit()
-        conn.close()
-        self.load_expenses_table()
-        self.background_sync_with_cloud()
 
 if __name__ == "__main__":
     try:
