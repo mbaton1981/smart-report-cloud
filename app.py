@@ -323,10 +323,12 @@ DARK_THEME_QSS = """
         border: 1px solid #3f4c60;
         padding: 6px 12px;
         border-radius: 6px;
-        selection-background-color: #4299e1;
+        selection-background-color: #3182ce;
+        selection-color: #ffffff;
+         /* Делает курсор ввода (палочку) ярко-голубым и заметным */
     }
     QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
-        border: 1px solid #4299e1;
+        border: 1px solid #63b3ed;
         background-color: #2d3748;
     }
     QComboBox::drop-down, QDateEdit::drop-down {
@@ -357,8 +359,14 @@ DARK_THEME_QSS = """
         gridline-color: #2d3748;
         border: 1px solid #323946;
         border-radius: 6px;
+        /* Делаем выбранную строку или ячейку ярко-синей с белым текстом */
         selection-background-color: #2b6cb0;
         selection-color: #ffffff;
+    }
+    /* Добавляем четкую подсветку активной строки под курсором */
+    QTableWidget::item:selected {
+        background-color: #3182ce;
+        color: #ffffff;
     }
     QHeaderView::section {
         background-color: #28303d;
@@ -375,7 +383,6 @@ DARK_THEME_QSS = """
         padding: 12px;
     }
 """
-
 def create_date_field(default_date_str=""):
     date_edit = QDateEdit()
     date_edit.setCalendarPopup(True)
