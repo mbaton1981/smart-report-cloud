@@ -273,7 +273,6 @@ def get_current_user():
         }
     })
 
-# 🔑 Новый маршрут для задания ПИН-кода из настольного приложения или веб-панели
 @app.route('/admin/set-user-pin', methods=['POST'])
 def admin_set_user_pin():
     is_admin_session = session.get('role') == 'admin'
@@ -570,6 +569,7 @@ def check_missing_shifts():
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
 
+# 🛡 БЕЗОПАСНАЯ СИНХРОНИЗАЦИЯ БЕЗ УДАЛЕНИЯ ДАННЫХ (UPSERT)
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -585,7 +585,7 @@ def sync_desktop_data():
     cursor = conn.cursor()
 
     try:
-        cursor.execute("DELETE FROM meta_employees")
+        # 1. Синхронизация сотрудников (добавление или обновление)
         if employees:
             for emp in employees:
                 if isinstance(emp, dict):
@@ -593,17 +593,20 @@ def sync_desktop_data():
                     emp_rate = float(emp.get('salary_rate', 0.0))
                     emp_active = int(emp.get('is_active', 1))
                 else:
-                    emp_name = str(emp).strip()
+                    emp_name = str(emp).strip() if emp else ""
                     emp_rate = 0.0
                     emp_active = 1
 
                 if emp_name:
                     cursor.execute('''
-                        INSERT OR REPLACE INTO meta_employees (name, salary_rate, is_active) 
+                        INSERT INTO meta_employees (name, salary_rate, is_active) 
                         VALUES (?, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET 
+                            salary_rate = excluded.salary_rate,
+                            is_active = excluded.is_active
                     ''', (emp_name, emp_rate, emp_active))
 
-        cursor.execute("DELETE FROM meta_companies")
+        # 2. Синхронизация компаний
         if companies:
             for comp in companies:
                 if comp:
@@ -611,39 +614,48 @@ def sync_desktop_data():
                     if comp_name:
                         cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
 
-        cursor.execute("DELETE FROM meta_objects")
+        # 3. Синхронизация объектов
         if objects:
             for obj in objects:
                 name, mark, comp = safe_parse_obj(obj)
                 if name and "{" not in name:
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
+                        ON CONFLICT(name, company) DO UPDATE SET markning = excluded.markning
                     ''', (name, mark, comp if comp else "Privat"))
 
-        cursor.execute("DELETE FROM cloud_shifts")
-        
+        # 4. Безопасное добавление смен без удаления старых
         if desktop_shifts:
             for s in desktop_shifts:
                 name, _, _ = safe_parse_obj(s.get('object_name'))
                 obj_name = name or s.get('object_name')
+                date_val = s.get('date')
+                emp_val = s.get('employee')
+                hrs_val = s.get('hours', 0.0)
                 
                 cursor.execute('''
-                    INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    s.get('request_id'), s.get('date'), s.get('employee'), s.get('company'), obj_name,
-                    s.get('hours', 0.0), s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000], 1
-                ))
+                    SELECT id FROM cloud_shifts 
+                    WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                ''', (date_val, emp_val, obj_name, hrs_val))
+                
+                if not cursor.fetchone():
+                    cursor.execute('''
+                        INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    ''', (
+                        s.get('request_id'), date_val, emp_val, s.get('company'), obj_name,
+                        hrs_val, s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000]
+                    ))
 
         conn.commit()
     except Exception as e:
-        logger.error(f"Sync error: {e}")
+        logger.error(f"Safe sync error: {e}")
         conn.rollback()
-        return jsonify({"ok": False, "error": "Ошибка синхронизации на сервере"}), 500
+        return jsonify({"ok": False, "error": "Ошибка безопасной синхронизации на сервере"}), 500
     finally:
         conn.close()
 
-    return jsonify({"ok": True, "status": "synced"})
+    return jsonify({"ok": True, "status": "safe_merged"})
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
