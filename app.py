@@ -489,14 +489,14 @@ class SmartReportApp(QMainWindow):
 
         layout.addWidget(card)
         
-        # 🟢 ЯРКАЯ ПАНЕЛЬ ФИЛЬТРОВ И УПРАВЛЕНИЯ СМЕНАМИ
+        # 🟢 ПАНЕЛЬ ФИЛЬТРОВ С УДОБНЫМИ ВЫПАДАЮЩИМИ СПИСКАМИ И КАЛЕНДАРЕМ ДАТЫ
         control_card = QFrame()
         control_card.setObjectName("card")
         control_card.setStyleSheet("background-color: #242933; border: 2px solid #3182ce; border-radius: 8px; margin-top: 5px;")
         c_layout = QVBoxLayout(control_card)
         c_layout.setSpacing(8)
 
-        # Строка кнопок
+        # Строка кнопок управления
         btn_row = QHBoxLayout()
         refresh_shifts_btn = QPushButton("🔄 Обновить данные")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
@@ -515,11 +515,13 @@ class SmartReportApp(QMainWindow):
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
 
-        # Строка фильтров
+        # Строка фильтров (дата через QDateEdit, объект через QComboBox)
         filter_row = QHBoxLayout()
-        self.filter_date = QLineEdit()
-        self.filter_date.setPlaceholderText("🔍 Дата...")
-        self.filter_date.textChanged.connect(self.apply_shifts_filters)
+        
+        self.filter_date = create_date_field("")
+        self.filter_date.setSpecialValueText("-- Все даты --")
+        self.filter_date.setDate(QDate()) # Сброс по умолчанию на пустую/все
+        self.filter_date.dateChanged.connect(self.apply_shifts_filters)
 
         self.filter_emp = QComboBox()
         self.filter_emp.addItem("-- Все сотрудники --")
@@ -529,15 +531,15 @@ class SmartReportApp(QMainWindow):
         self.filter_comp.addItem("-- Все фирмы --")
         self.filter_comp.currentIndexChanged.connect(self.apply_shifts_filters)
 
-        self.filter_obj = QLineEdit()
-        self.filter_obj.setPlaceholderText("🔍 Объект...")
-        self.filter_obj.textChanged.connect(self.apply_shifts_filters)
+        self.filter_obj = QComboBox()
+        self.filter_obj.addItem("-- Все объекты --")
+        self.filter_obj.currentIndexChanged.connect(self.apply_shifts_filters)
 
         self.filter_status = QComboBox()
         self.filter_status.addItems(["-- Все статусы --", "В работе", "Выставлен в счёт"])
         self.filter_status.currentIndexChanged.connect(self.apply_shifts_filters)
 
-        filter_row.addWidget(QLabel("<b>Фильтры таблицы:</b>"))
+        filter_row.addWidget(QLabel("<b>Фильтры:</b>"))
         filter_row.addWidget(self.filter_date)
         filter_row.addWidget(self.filter_emp)
         filter_row.addWidget(self.filter_comp)
@@ -559,18 +561,21 @@ class SmartReportApp(QMainWindow):
         self.load_shifts_history()
 
     def apply_shifts_filters(self):
-        d_val = self.filter_date.text().strip().lower()
+        d_val = self.filter_date.text().strip()
+        if d_val == "-- Все даты --" or not self.filter_date.date().isValid():
+            d_val = ""
+            
         emp_val = self.filter_emp.currentText()
         comp_val = self.filter_comp.currentText()
-        obj_val = self.filter_obj.text().strip().lower()
+        obj_val = self.filter_obj.currentText()
         status_val = self.filter_status.currentText()
 
         for row in range(self.table_shifts.rowCount()):
             match = True
-            date_cell = self.table_shifts.item(row, 1).text().lower()
+            date_cell = self.table_shifts.item(row, 1).text()
             emp_cell = self.table_shifts.item(row, 2).text()
             comp_cell = self.table_shifts.item(row, 3).text()
-            obj_cell = self.table_shifts.item(row, 4).text().lower()
+            obj_cell = self.table_shifts.item(row, 4).text()
             status_cell = self.table_shifts.item(row, 9).text()
 
             if d_val and d_val not in date_cell:
@@ -579,7 +584,7 @@ class SmartReportApp(QMainWindow):
                 match = False
             if comp_val != "-- Все фирмы --" and comp_cell != comp_val:
                 match = False
-            if obj_val and obj_val not in obj_cell:
+            if obj_val != "-- Все объекты --" and obj_cell != obj_val:
                 match = False
             if status_val == "В работе" and "В работе" not in status_cell:
                 match = False
@@ -1956,6 +1961,17 @@ class SmartReportApp(QMainWindow):
             idx = self.filter_comp.findText(curr_comp)
             if idx >= 0:
                 self.filter_comp.setCurrentIndex(idx)
+
+        if hasattr(self, 'filter_obj'):
+            curr_obj = self.filter_obj.currentText()
+            self.filter_obj.clear()
+            self.filter_obj.addItem("-- Все объекты --")
+            cursor.execute("SELECT name FROM objects ORDER BY name")
+            for row in cursor.fetchall():
+                self.filter_obj.addItem(row[0])
+            idx = self.filter_obj.findText(curr_obj)
+            if idx >= 0:
+                self.filter_obj.setCurrentIndex(idx)
 
         for cb in [getattr(self, 'comp_cb', None), getattr(self, 'inv_comp_cb', None), getattr(self, 'dag_comp_cb', None), getattr(self, 'new_obj_comp_cb', None)]:
             if cb:
