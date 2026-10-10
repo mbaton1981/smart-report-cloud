@@ -36,7 +36,14 @@ app.config.update(
 DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
 
 def get_db_connection():
-    # 🛡 Автоматическое создание родительской папки (например, /data/) перед подключением
+    # 🛡 Если по пути базы данных случайно образовалась директория — удаляем её
+    if os.path.exists(DB_FILE) and os.path.isdir(DB_FILE):
+        try:
+            os.rmdir(DB_FILE)
+        except Exception:
+            pass
+
+    # Автоматическое создание родительской папки (например, /data/) перед подключением
     db_dir = os.path.dirname(os.path.abspath(DB_FILE))
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
