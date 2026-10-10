@@ -200,13 +200,13 @@
     <!-- СКРЫТАЯ ОБЛАСТЬ ДЛЯ ПЕЧАТИ И PDF -->
     <div id="print-area">
         <h2 style="text-align: center; color: #000;">Bygger och renoverar i Sthlm</h2>
-        <h3 id="print-title" style="text-align: center; margin-bottom: 20px; color: #333;">Отчет по сменам</h3>
+        <h3 id="print-title" style="text-align: center; margin-bottom: 20px; color: #333;">Arbetsdagbok (Rapport)</h3>
         <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px;">
             <thead>
                 <tr style="border-bottom: 2px solid #000; text-align: left;">
-                    <th style="padding: 8px;">Дата</th>
-                    <th style="padding: 8px;">Объект / Описание</th>
-                    <th style="padding: 8px; text-align: right;">Часы</th>
+                    <th style="padding: 8px;">Datum</th>
+                    <th style="padding: 8px;">Objekt / Arbetsbeskrivning</th>
+                    <th style="padding: 8px; text-align: right;">Timmar</th>
                 </tr>
             </thead>
             <tbody id="print-table-body">
@@ -235,6 +235,25 @@
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
+
+        // Функция автоматического перевода комментариев на шведский язык через публичный API
+        async function translateToSwedish(text) {
+            if (!text || text.trim() === "") return "";
+            try {
+                const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=ru|sv`;
+                const res = await fetch(url);
+                const data = await res.json();
+                if (data && data.responseData && data.responseData.translatedText) {
+                    let translated = data.responseData.translatedText;
+                    if (!translated.includes("MYMEMORY WARNING")) {
+                        return translated;
+                    }
+                }
+            } catch (e) {
+                console.error("Ошибка перевода:", e);
+            }
+            return text; // Возвращаем оригинал в случае ошибки сети
+        }
 
         function showFormAlert(message, type) {
             const alertBox = document.getElementById('form-alert');
@@ -468,12 +487,14 @@
                 }
 
                 listContainer.innerHTML = '';
-                let printTableHtml = '';
                 let totalHours = 0;
                 let totalsByObject = {};
 
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
-                    shiftsData.recent_shifts.forEach(shift => {
+                    // Массив для хранения строк отчета (чтобы дождаться асинхронного перевода)
+                    let printRowsData = [];
+
+                    for (const shift of shiftsData.recent_shifts) {
                         const li = document.createElement('li');
                         const markingBadge = shift.marking ? `<b style="margin-right: 6px;">[${shift.marking}]</b>` : '';
                         
@@ -494,29 +515,53 @@
                             objKey = `[${shift.marking}] ${objKey}`;
                         }
                         totalsByObject[objKey] = (totalsByObject[objKey] || 0) + shift.hours;
-
-                        // Строка для таблицы печати
-                        printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
-                            <td style="padding: 8px;">${shift.date}</td>
-                            <td style="padding: 8px;">${markingBadge.replace(/<[^>]*>?/gm, '')} ${shift.object_name}</td>
-                            <td style="padding: 8px; text-align: right; font-weight: bold;">${shift.hours} ч</td>
-                        </tr>`;
                         totalHours += shift.hours;
+
+                        // Автоматически переводим описание/комментарий на шведский для печатного отчета
+                        let rawComment = shift.comment || "";
+                        let translatedComment = rawComment;
+                        if (rawComment.trim() !== "") {
+                            translatedComment = await translateToSwedish(rawComment);
+                        }
+
+                        let objDisplay = shift.object_name;
+                        if (shift.marking) {
+                            objDisplay = `[${shift.marking}] ${objDisplay}`;
+                        }
+                        if (translatedComment) {
+                            objDisplay += ` — ${translatedComment}`;
+                        }
+
+                        printRowsData.push({
+                            date: shift.date,
+                            description: objDisplay,
+                            hours: shift.hours
+                        });
+                    }
+
+                    // Формируем HTML таблицы для печати из переведенных данных
+                    let printTableHtml = '';
+                    printRowsData.forEach(row => {
+                        printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
+                            <td style="padding: 8px;">${row.date}</td>
+                            <td style="padding: 8px;">${row.description}</td>
+                            <td style="padding: 8px; text-align: right; font-weight: bold;">${row.hours} tim</td>
+                        </tr>`;
                     });
 
-                    // Формируем блок сводки по объектам
-                    let summaryHtml = '<b>Итого по объектам / типам:</b><ul style="margin: 5px 0 0 20px; padding: 0; font-size: 13px;">';
+                    // Формируем блок сводки по объектам на шведском
+                    let summaryHtml = '<b>Totalt per objekt / typ:</b><ul style="margin: 5px 0 0 20px; padding: 0; font-size: 13px;">';
                     for (let [obj, hrs] of Object.entries(totalsByObject)) {
-                        summaryHtml += `<li>${obj}: <b>${hrs} ч</b></li>`;
+                        summaryHtml += `<li>${obj}: <b>${hrs} tim</b></li>`;
                     }
                     summaryHtml += '</ul>';
 
                     // Показываем кнопку печати/PDF и заполняем данные
                     printBtn.style.display = 'block';
-                    document.getElementById('print-title').textContent = `Отчет по сменам: ${empName} (${selectedMonth})`;
+                    document.getElementById('print-title').textContent = `Arbetsdagbok: ${empName} (${selectedMonth})`;
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
-                    document.getElementById('print-total-hours').textContent = `Общий итог часов за месяц: ${totalHours} ч`;
+                    document.getElementById('print-total-hours').textContent = `Totalt antal timmar: ${totalHours} tim`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
