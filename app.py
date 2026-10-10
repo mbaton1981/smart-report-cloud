@@ -5,7 +5,6 @@ import traceback
 import subprocess
 import sqlite3
 import requests
-import uuid
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -41,6 +40,8 @@ def get_db_connection():
     return conn
 
 def init_db_once():
+    is_new_db = not os.path.exists(DB_FILE)
+    
     for d in [REPORTS_DIR, SALARIES_DIR, BACKUP_DIR]:
         if not os.path.exists(d):
             os.makedirs(d)
@@ -59,6 +60,13 @@ def init_db_once():
         )
     ''')
     
+    cursor.execute("PRAGMA table_info(objects)")
+    obj_columns = [col[1] for col in cursor.fetchall()]
+    if 'rate' not in obj_columns:
+        cursor.execute("ALTER TABLE objects ADD COLUMN rate REAL DEFAULT 0.0")
+    if 'transport_rate' not in obj_columns:
+        cursor.execute("ALTER TABLE objects ADD COLUMN transport_rate REAL DEFAULT 0.0")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,17 +76,20 @@ def init_db_once():
         )
     ''')
 
+    cursor.execute("PRAGMA table_info(employees)")
+    emp_columns = [col[1] for col in cursor.fetchall()]
+    if 'is_active' not in emp_columns:
+        cursor.execute("ALTER TABLE employees ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
         )
     ''')
-    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id TEXT UNIQUE,
             date TEXT NOT NULL,
             employee TEXT NOT NULL,
             company TEXT NOT NULL,
@@ -90,21 +101,6 @@ def init_db_once():
             invoiced INTEGER DEFAULT 0
         )
     ''')
-
-    # ГАРАНТИРОВАННОЕ ДОБАВЛЕНИЕ КОЛОНОК ДЛЯ СТАРОЙ БАЗЫ
-    cursor.execute("PRAGMA table_info(shifts)")
-    shift_cols = [col[1] for col in cursor.fetchall()]
-    if 'request_id' not in shift_cols:
-        try:
-            cursor.execute("ALTER TABLE shifts ADD COLUMN request_id TEXT UNIQUE")
-        except Exception:
-            pass
-    if 'invoiced' not in shift_cols:
-        try:
-            cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS balance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +119,71 @@ def init_db_once():
             amount REAL NOT NULL
         )
     ''')
+
+    cursor.execute("PRAGMA table_info(shifts)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'invoiced' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
+
+    cursor.execute("SELECT COUNT(*) FROM employees")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT OR IGNORE INTO employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
+
+    if is_new_db:
+        initial_data = [
+            ("Privat", "Badbacken 2", "p1010", 520.0, 0.0),
+            ("Privat", "Koksgaatan 40", "p1011", 520.0, 0.0),
+            ("Privat", "Tallvagen 12", "p1001", 520.0, 0.0),
+            ("Dvaliks", "Klockargardsstigen 3", "***", 550.0, 0.0),
+            ("Privat", "Norra vagen 7", "p1013", 520.0, 0.0),
+            ("Privat", "Punchvagen 5", "p1012", 520.0, 0.0),
+            ("Privat", "Storholmsvagen 24", "p1014", 520.0, 0.0),
+            ("Privat", "Östra vägen 13", "p1017", 520.0, 0.0),
+            ("Privat", "Punchvagen 5 Ext", "p1016", 520.0, 0.0),
+            ("SBT", "Teknologgatan 7", "p2086", 580.0, 0.0),
+            ("SBT", "Bisittargatan 20A", "p2083", 580.0, 0.0),
+            ("Dvaliks", "Kronstigen 12", "***", 550.0, 0.0),
+            ("Dvaliks", "Gustav 3 boulevard 167", "Gustav 3", 550.0, 0.0),
+            ("SBT", "Krogtappan 97", "***", 580.0, 0.0),
+            ("Privat", "Badbacken 2 Altan", "p1018", 520.0, 0.0),
+            ("Privat", "Punchvagen 5 roof altan", "p1019", 520.0, 0.0),
+            ("SBT", "Hamarby Alle 3b", "***", 580.0, 0.0),
+            ("Privat", "Norra vagen 18 Niklas", "p1020", 520.0, 0.0),
+            ("Privat", "Tallvagen 12 Fasad Mal", "p1021", 520.0, 0.0),
+            ("Privat", "Badbacken 5 ext", "p1022", 520.0, 0.0),
+            ("Privat", "Östra vägen 7B", "p1023", 520.0, 0.0),
+            ("Privat", "Johan Hammarstrom", "p1024", 520.0, 0.0),
+            ("Privat", "Norra vagen 26 Katarina", "p1025", 520.0, 0.0),
+            ("Privat", "Tallvagen 14 Egil", "p1026", 520.0, 0.0),
+            ("SBT", "Kraftriket 21", "p2152", 580.0, 0.0),
+            ("SBT", "Teknikringen 35 Hogdel", "p2154", 580.0, 0.0),
+            ("Dvaliks", "Drottning vag 123", "***", 550.0, 0.0),
+            ("Pareto Properties AB", "Sonnebovagen 16 Sollentuna", "p1027", 600.0, 0.0),
+            ("Dvaliks", "Soderproken 16 Lidingo", "p1028", 550.0, 0.0),
+            ("SBT", "Alvsjoborgatan 1-3", "p2166", 580.0, 0.0),
+            ("Dvaliks", "Nyneshamn", "p1029", 550.0, 0.0),
+            ("SBT", "Vikingshillsvägen 15", "***", 580.0, 0.0),
+            ("Pareto Properties AB", "Alfred Nobels Alle 109", "p1030", 600.0, 0.0),
+            ("Renatur", "Tomteboda glass", "p1031", 550.0, 0.0),
+            ("Renatur", "Tomteboda doors", "p1032", 550.0, 0.0),
+            ("Privat", "Uddens vag 12 Tomas", "p1033", 520.0, 0.0),
+            ("SBT", "Karlsviksgatan 15", "p2128", 580.0, 0.0),
+            ("Renatur", "Tomteboda arbetsledning", "***", 550.0, 0.0),
+            ("Renatur", "Tomteboda ÄTA", "p1034", 550.0, 0.0),
+            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill", "p1035", 520.0, 0.0),
+            ("Privat", "Kolarbacken 52 136 48 Handen/Vega Daniel", "p1036", 520.0, 0.0),
+            ("Renatur", "Tomteboda ÄTA Hotel", "****", 550.0, 0.0),
+            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill ÄTA", "p1037", 520.0, 0.0)
+        ]
+
+        unique_companies = sorted(list(set(item[0] for item in initial_data)))
+        for comp in unique_companies:
+            cursor.execute("INSERT OR IGNORE INTO companies (name) VALUES (?)", (comp,))
+
+        for comp, name, mark, rate, tr in initial_data:
+            cursor.execute('''
+                INSERT OR IGNORE INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
+            ''', (name, mark, comp, rate, tr))
 
     conn.commit()
     conn.close()
@@ -264,6 +325,7 @@ DARK_THEME_QSS = """
         border-radius: 6px;
         selection-background-color: #3182ce;
         selection-color: #ffffff;
+         /* Делает курсор ввода (палочку) ярко-голубым и заметным */
     }
     QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
         border: 1px solid #63b3ed;
@@ -297,9 +359,11 @@ DARK_THEME_QSS = """
         gridline-color: #2d3748;
         border: 1px solid #323946;
         border-radius: 6px;
+        /* Делаем выбранную строку или ячейку ярко-синей с белым текстом */
         selection-background-color: #2b6cb0;
         selection-color: #ffffff;
     }
+    /* Добавляем четкую подсветку активной строки под курсором */
     QTableWidget::item:selected {
         background-color: #3182ce;
         color: #ffffff;
@@ -319,7 +383,6 @@ DARK_THEME_QSS = """
         padding: 12px;
     }
 """
-
 def create_date_field(default_date_str=""):
     date_edit = QDateEdit()
     date_edit.setCalendarPopup(True)
@@ -550,28 +613,17 @@ class SmartReportApp(QMainWindow):
             response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=15)
             if response.status_code == 200:
                 data = response.json()
-                shifts_from_cloud = data.get("shifts", [])
+                shifts_from_phone = data.get("shifts", [])
                 
-                if shifts_from_cloud:
+                if shifts_from_phone:
                     downloaded_ids = []
-                    for s in shifts_from_cloud:
-                        req_id = s.get('request_id')
+                    for s in shifts_from_phone:
+                        cursor.execute('''
+                            SELECT id FROM shifts 
+                            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
+                        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
                         
-                        exists = False
-                        if req_id:
-                            cursor.execute("SELECT id FROM shifts WHERE request_id = ?", (req_id,))
-                            if cursor.fetchone():
-                                exists = True
-                        
-                        if not exists:
-                            cursor.execute('''
-                                SELECT id FROM shifts 
-                                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ? AND rate = ?
-                            ''', (s['date'], s['employee'], s['object_name'], s['hours'], s.get('rate', 0.0)))
-                            if cursor.fetchone():
-                                exists = True
-
-                        if not exists:
+                        if not cursor.fetchone():
                             obj_rate_val = s.get('rate', 0.0)
                             if not obj_rate_val or obj_rate_val == 0.0:
                                 cursor.execute("SELECT rate FROM objects WHERE name = ?", (s['object_name'],))
@@ -580,29 +632,18 @@ class SmartReportApp(QMainWindow):
                                     obj_rate_val = obj_r_row[0]
 
                             cursor.execute('''
-                                INSERT INTO shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
                             ''', (
-                                req_id if req_id else str(uuid.uuid4()),
                                 s['date'], s['employee'], s['company'], s['object_name'], 
                                 s['hours'], obj_rate_val, s.get('transport', 0.0), s.get('comment', '')
                             ))
                             
-                        if 'id' in s:
-                            downloaded_ids.append(s['id'])
+                        downloaded_ids.append(s['id'])
 
                     conn.commit()
                     if downloaded_ids:
                         requests.post(f"{CLOUD_URL}/mark-synced", headers=headers, json={"ids": downloaded_ids}, timeout=10)
-        except Exception:
-            pass
-
-        try:
-            cursor.execute("SELECT id FROM shifts WHERE request_id IS NULL OR request_id = ''")
-            no_req_shifts = cursor.fetchall()
-            for r in no_req_shifts:
-                cursor.execute("UPDATE shifts SET request_id = ? WHERE id = ?", (str(uuid.uuid4()), r[0]))
-            conn.commit()
         except Exception:
             pass
 
@@ -615,15 +656,15 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
         objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
         
-        cursor.execute("SELECT request_id, date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
+        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
         local_shift_rows = cursor.fetchall()
         conn.close()
 
         all_local_shifts = []
         for r in local_shift_rows:
             all_local_shifts.append({
-                "request_id": r[0], "date": r[1], "employee": r[2], "company": r[3], "object_name": r[4],
-                "hours": r[5], "rate": r[6], "transport": r[7], "comment": r[8]
+                "date": r[0], "employee": r[1], "company": r[2], "object_name": r[3],
+                "hours": r[4], "rate": r[5], "transport": r[6], "comment": r[7]
             })
 
         metadata_payload = {
@@ -1705,6 +1746,7 @@ class SmartReportApp(QMainWindow):
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
         
+        # Кнопка установки/задания ПИН-кода
         set_pin_btn = QPushButton("🔑 Задать ПИН")
         set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
@@ -2041,6 +2083,7 @@ class SmartReportApp(QMainWindow):
             return
         emp_name = self.table_employees.item(selected, 0).text()
         
+        # Открываем диалоговое окно для ввода ПИН-кода
         new_pin, ok = QInputDialog.getText(
             self, 
             "Установка ПИН-кода", 
@@ -2122,14 +2165,12 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Проверьте правильность часов и ставки!")
             return
 
-        req_id = str(uuid.uuid4())
-
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        ''', (req_id, date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment))
+            INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ''', (date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment))
         conn.commit()
         conn.close()
         
@@ -2160,21 +2201,21 @@ class SmartReportApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
 
-    def delete_shift(self, index=None, shift_id=None):
-        if shift_id is None:
-            selected = self.table_shifts.currentRow()
-            if selected < 0:
-                QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
-                return
-            shift_id = self.table_shifts.item(selected, 0).text()
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
-        conn.commit()
-        conn.close()
-        self.load_shifts_history()
-        self.background_sync_with_cloud()
+    def delete_shift(self, index=None):
+        selected = self.table_shifts.currentRow()
+        if selected < 0:
+            QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
+            return
+        shift_id = self.table_shifts.item(selected, 0).text()
+        reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
+            conn.commit()
+            conn.close()
+            self.load_shifts_history()
+            self.background_sync_with_cloud()
 
 if __name__ == "__main__":
     try:
