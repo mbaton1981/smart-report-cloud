@@ -247,11 +247,11 @@
             const historyEmployeeSelect = document.getElementById('history-employee');
 
             if (currentUser.role === 'admin') {
-                userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>[cite: 5]`;
+                userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>`;
                 employeeSelect.disabled = false;
                 historyEmployeeSelect.disabled = false;
             } else {
-                userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>[cite: 5]`;
+                userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
                 
                 const userName = currentUser.username.trim().toLowerCase();
                 const allEmployeeOptions = Array.from(employeeSelect.options).map(opt => opt.value).filter(val => val !== "");
