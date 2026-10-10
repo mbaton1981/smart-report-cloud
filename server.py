@@ -2,6 +2,7 @@ import sqlite3
 import time
 import ast
 import os
+import shutil
 import logging
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session
@@ -41,6 +42,33 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def create_database_backup():
+    """Создание резервной копии базы данных при запуске сервера"""
+    try:
+        if not os.path.exists(DB_FILE):
+            return
+        
+        backup_dir = "backups"
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_path = os.path.join(backup_dir, f"backup_{timestamp}.db")
+        
+        # Безопасное копирование файла базы данных
+        shutil.copy2(DB_FILE, backup_path)
+        logger.info(f"Резервная копия базы данных успешно создана: {backup_path}")
+        
+        # Очистка старых бэкапов (оставляем последние 10 штук, чтобы не забивать диск)
+        backups = sorted([os.path.join(backup_dir, f) for f in os.listdir(backup_dir) if f.endswith('.db')])
+        if len(backups) > 10:
+            for old_backup in backups[:-10]:
+                try:
+                    os.remove(old_backup)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Не удалось создать резервную копию базы данных: {e}")
+
 def safe_parse_obj(val):
     if not val:
         return "", "", "Privat"
@@ -64,6 +92,9 @@ def safe_parse_obj(val):
     return val_str, "", "Privat"
 
 def init_cloud_db():
+    # Создаем бэкап существующей базы перед инициализацией
+    create_database_backup()
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -457,10 +488,9 @@ def submit_shift():
         conn.close()
         return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
 
-    # 🛡 Защита числовых параметров от NaN и бесконечности
     try:
-        rate = float(data.get('rate', 0.0))
-        transport = float(data.get('transport', 0.0))
+        rate = round(float(data.get('rate', 0.0)), 2)
+        transport = round(float(data.get('transport', 0.0)), 2)
         if rate < 0 or transport < 0 or rate > 100000 or transport > 10000:
             raise ValueError()
         if str(rate).lower() in ['nan', 'inf', '-inf'] or str(transport).lower() in ['nan', 'inf', '-inf']:
@@ -641,7 +671,6 @@ def check_missing_shifts():
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
 
-# 🛡 СТРОГАЯ ВАЛИДАЦИЯ ПАКЕТА СИНХРОНИЗАЦИИ НА ВХОДЕ
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -671,7 +700,7 @@ def sync_desktop_data():
                     if not emp_name or len(emp_name) > 150:
                         raise ValueError("Недопустимое имя сотрудника")
                     try:
-                        emp_rate = float(emp.get('salary_rate', 0.0))
+                        emp_rate = round(float(emp.get('salary_rate', 0.0)), 2)
                         if not (0 <= emp_rate <= 100000) or str(emp_rate).lower() in ['nan', 'inf', '-inf']:
                             raise ValueError()
                     except (TypeError, ValueError):
@@ -728,8 +757,8 @@ def sync_desktop_data():
 
                 try:
                     hrs_val = float(s.get('hours', 0.0))
-                    rate_val = float(s.get('rate', 0.0))
-                    transport_val = float(s.get('transport', 0.0))
+                    rate_val = round(float(s.get('rate', 0.0)), 2)
+                    transport_val = round(float(s.get('transport', 0.0)), 2)
                     
                     if not (0.5 <= hrs_val <= 24) or str(hrs_val).lower() in ['nan', 'inf', '-inf']:
                         raise ValueError("Часы вне диапазона")
@@ -746,20 +775,21 @@ def sync_desktop_data():
                     return jsonify({"ok": False, "error": "Некорректное имя объекта"}), 400
 
                 comment_val = str(s.get('comment', ''))[:2000]
+                req_id = str(s.get('request_id', ''))[:100]
+
+                # 🛡 Мягкая обработка дубликатов по request_id без падения пакета
+                if req_id:
+                    cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (req_id,))
+                    if cursor.fetchone():
+                        continue  # Уже существует — тихо пропускаем
 
                 cursor.execute('''
-                    SELECT id FROM cloud_shifts 
-                    WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                ''', (date_val, emp_val, obj_name, hrs_val))
-                
-                if not cursor.fetchone():
-                    cursor.execute('''
-                        INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                    ''', (
-                        str(s.get('request_id', ''))[:100], date_val, emp_val, str(s.get('company', 'Privat')), obj_name,
-                        hrs_val, rate_val, transport_val, comment_val
-                    ))
+                    INSERT OR IGNORE INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ''', (
+                    req_id if req_id else None, date_val, emp_val, str(s.get('company', 'Privat')), obj_name,
+                    hrs_val, rate_val, transport_val, comment_val
+                ))
 
         conn.commit()
     except Exception as e:
