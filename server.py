@@ -613,7 +613,7 @@ def check_employee_shifts():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    if session.get('role') == 'admin':
+    if session.get('role'] == 'admin':
         emp = data.get('employee')
         if not emp:
             conn.close()
@@ -679,7 +679,7 @@ def check_missing_shifts():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    if session.get('role') == 'admin':
+    if session.get('role'] == 'admin':
         data = request.json or {}
         emp = data.get('employee')
         if not emp:
@@ -795,6 +795,10 @@ def sync_desktop_data():
                     ''', (name, mark, comp if comp else "Privat"))
 
         if desktop_shifts:
+            desktop_keys = set()
+            min_date = None
+            max_date = None
+
             for s in desktop_shifts:
                 if not isinstance(s, dict):
                     return jsonify({"ok": False, "error": "Неверный формат смены"}), 400
@@ -804,6 +808,11 @@ def sync_desktop_data():
                     datetime.strptime(date_val, '%Y-%m-%d')
                 except ValueError:
                     return jsonify({"ok": False, "error": f"Некорректный формат даты: {date_val}"}), 400
+
+                if min_date is None or date_val < min_date:
+                    min_date = date_val
+                if max_date is None or date_val > max_date:
+                    max_date = date_val
 
                 emp_val = str(s.get('employee', '')).strip()
                 if not emp_val or len(emp_val) > 150:
@@ -832,6 +841,8 @@ def sync_desktop_data():
                 req_id = str(s.get('request_id', ''))[:100]
                 company_val = str(s.get('company', 'Privat'))
 
+                desktop_keys.add((date_val, emp_val, obj_name, hrs_val, company_val))
+
                 exists = False
                 if req_id:
                     cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (req_id,))
@@ -856,6 +867,16 @@ def sync_desktop_data():
                     req_id if req_id else None, date_val, emp_val, company_val, obj_name,
                     hrs_val, rate_val, transport_val, comment_val
                 ))
+
+            # 🔄 Зеркалирование: удаляем из облака смены за диапазон дат, которых больше нет на компьютере
+            if min_date and max_date:
+                cursor.execute("SELECT id, date, employee, object_name, hours, company FROM cloud_shifts WHERE date >= ? AND date <= ?", (min_date, max_date))
+                cloud_rows = cursor.fetchall()
+
+                for cr in cloud_rows:
+                    c_key = (cr['date'], cr['employee'], cr['object_name'], cr['hours'], cr['company'])
+                    if c_key not in desktop_keys:
+                        cursor.execute("DELETE FROM cloud_shifts WHERE id = ?", (cr['id'],))
 
         conn.commit()
     except Exception as e:
