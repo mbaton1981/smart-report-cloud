@@ -49,9 +49,19 @@
         #history-list li { background: #f1f2f6; margin-bottom: 8px; padding: 12px; border-radius: 6px; border: 1px solid #dcdde1; font-size: 14px; color: #2d3436; display: flex; justify-content: space-between; align-items: center; }
 
         /* Уведомления формы */
-        #form-alert { display: none; margin-top: 15px; padding: 12px; border-radius: 6px; text-align: center; font-weight: bold; font-size: 15px; }
+        #form-alert { display: none; margin-top: 15px; padding: 14px; border-radius: 6px; text-align: center; font-weight: bold; font-size: 15px; }
         #form-alert.success { background: #00b894; color: #fff; }
         #form-alert.error { background: #d63031; color: #fff; }
+        #form-alert.warning { background: #e67e22; color: #fff; }
+
+        /* Кастомный блок подтверждения */
+        #confirm-box { display: none; margin-top: 15px; padding: 14px; border-radius: 6px; background: #fff3cd; border: 1px solid #ffeeba; color: #856404; text-align: center; font-size: 14px; font-weight: bold; }
+        .confirm-btns { display: flex; gap: 10px; margin-top: 10px; }
+        .confirm-btns button { padding: 8px; font-size: 14px; }
+        .btn-yes { background-color: #d63031; }
+        .btn-yes:hover { background-color: #c0392b; }
+        .btn-no { background-color: #636e72; }
+        .btn-no:hover { background-color: #2d3436; }
 
         /* Модальное окно авторизации */
         #login-modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); z-index: 100; display: flex; align-items: center; justify-content: center; }
@@ -163,6 +173,15 @@
             </form>
 
             <div id="form-alert"></div>
+            
+            <!-- Кастомный красивый блок подтверждения -->
+            <div id="confirm-box">
+                <span id="confirm-text">⚠️ За этот день уже записаны часы. Добавить еще?</span>
+                <div class="confirm-btns">
+                    <button type="button" class="btn-yes" onclick="submitShiftForce(true)">Да, добавить</button>
+                    <button type="button" class="btn-no" onclick="submitShiftForce(false)">Отмена</button>
+                </div>
+            </div>
         </div>
 
         <!-- ПРАВАЯ КОЛОНКА: Блок просмотра истории -->
@@ -237,7 +256,6 @@
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
 
-        // Функция автоматического перевода комментариев на шведский язык через публичный API
         async function translateToSwedish(text) {
             if (!text || text.trim() === "") return "";
             try {
@@ -253,7 +271,7 @@
             } catch (e) {
                 console.error("Ошибка перевода:", e);
             }
-            return text; // Возвращаем оригинал в случае ошибки сети
+            return text;
         }
 
         function showFormAlert(message, type) {
@@ -425,7 +443,7 @@
             window.location.reload();
         }
 
-        // Обработка отправки смены с проверкой на уже существующие часы за этот день
+        // Основная логика отправки смены с кастомным красивым предупреждением
         document.getElementById('shift-form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -434,13 +452,12 @@
             const hoursVal = parseFloat(document.getElementById('hours').value);
 
             try {
-                // Проверяем, есть ли уже смены у этого сотрудника в текущем месяце
                 const checkRes = await fetch('/check-employee-shifts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
                         employee: empName, 
-                        month: selectedDate.substring(0, 7) // формат ГГГГ-ММ
+                        month: selectedDate.substring(0, 7) 
                     })
                 });
                 const checkData = await checkRes.json();
@@ -449,24 +466,47 @@
                     const existingForDate = checkData.recent_shifts.filter(s => s.date === selectedDate);
                     if (existingForDate.length > 0) {
                         let totalExistingHours = existingForDate.reduce((sum, s) => sum + s.hours, 0);
-                        let confirmed = confirm(`⚠️ Внимание!\n\nУ вас за ${selectedDate} уже записано смен на ${totalExistingHours} ч.\nВы уверены, что хотите добавить еще ${hoursVal} ч?`);
-                        if (!confirmed) {
-                            return; // Отменяем отправку, если пользователь нажал «Отмена»
-                        }
+                        
+                        // Показываем красивый блок вместо системного confirm
+                        document.getElementById('confirm-text').innerHTML = `⚠️ У вас за <b>${selectedDate}</b> уже записано смен на <b>${totalExistingHours} ч</b>.<br>Вы уверены, что хотите добавить еще ${hoursVal} ч?`;
+                        document.getElementById('confirm-box').style.display = 'block';
+                        return; // Останавливаем отправку, ждем нажатия кнопок в блоке
                     }
                 }
 
-                const formData = {
-                    request_id: generateUUID(),
-                    date: selectedDate,
-                    employee: empName,
-                    company: document.getElementById('company').value,
-                    object_name: document.getElementById('object_name').value,
-                    hours: hoursVal,
-                    transport: parseFloat(document.getElementById('transport').value || 0),
-                    comment: document.getElementById('comment').value
-                };
+                executeShiftSubmission();
 
+            } catch (err) {
+                showFormAlert("Не удалось проверить историю смен.", "error");
+                console.error(err);
+            }
+        });
+
+        // Функция отправки при подтверждении в кастомном блоке
+        function submitShiftForce(allowed) {
+            document.getElementById('confirm-box').style.display = 'none';
+            if (allowed) {
+                executeShiftSubmission();
+            }
+        }
+
+        async function executeShiftSubmission() {
+            const selectedDate = document.getElementById('date').value;
+            const empName = document.getElementById('employee').value;
+            const hoursVal = parseFloat(document.getElementById('hours').value);
+
+            const formData = {
+                request_id: generateUUID() + "_" + Date.now(), // Уникальный ID для исключения ошибок дублирования
+                date: selectedDate,
+                employee: empName,
+                company: document.getElementById('company').value,
+                object_name: document.getElementById('object_name').value,
+                hours: hoursVal,
+                transport: parseFloat(document.getElementById('transport').value || 0),
+                comment: document.getElementById('comment').value
+            };
+
+            try {
                 const response = await fetch('/submit-shift', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -477,14 +517,9 @@
                 if (response.ok) {
                     showFormAlert("Смена успешно отправлена!", "success");
                     
-                    // Очищаем комментарий
                     document.getElementById('comment').value = '';
-                    
-                    // Сбрасываем транспорт
                     document.getElementById('transport_check').checked = false;
                     document.getElementById('transport').value = '0.0';
-
-                    // Сбрасываем фирму и объекты в исходное пустое состояние для безопасности
                     document.getElementById('company').value = "";
                     filterObjects();
 
@@ -495,7 +530,7 @@
                 showFormAlert("Не удалось отправить данные на сервер.", "error");
                 console.error(err);
             }
-        });
+        }
 
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
