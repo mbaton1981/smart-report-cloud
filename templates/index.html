@@ -467,10 +467,9 @@
                     if (existingForDate.length > 0) {
                         let totalExistingHours = existingForDate.reduce((sum, s) => sum + s.hours, 0);
                         
-                        // Показываем красивый блок вместо системного confirm
                         document.getElementById('confirm-text').innerHTML = `⚠️ У вас за <b>${selectedDate}</b> уже записано смен на <b>${totalExistingHours} ч</b>.<br>Вы уверены, что хотите добавить еще ${hoursVal} ч?`;
                         document.getElementById('confirm-box').style.display = 'block';
-                        return; // Останавливаем отправку, ждем нажатия кнопок в блоке
+                        return;
                     }
                 }
 
@@ -482,7 +481,6 @@
             }
         });
 
-        // Функция отправки при подтверждении в кастомном блоке
         function submitShiftForce(allowed) {
             document.getElementById('confirm-box').style.display = 'none';
             if (allowed) {
@@ -496,7 +494,7 @@
             const hoursVal = parseFloat(document.getElementById('hours').value);
 
             const formData = {
-                request_id: generateUUID() + "_" + Date.now(), // Уникальный ID для исключения ошибок дублирования
+                request_id: generateUUID() + "_" + Date.now(),
                 date: selectedDate,
                 employee: empName,
                 company: document.getElementById('company').value,
@@ -581,18 +579,43 @@
                     let printRowsData = [];
 
                     for (const shift of shiftsData.recent_shifts) {
+                        // 🛡 БЕЗОПАСНОЕ СОЗДАНИЕ ЭЛЕМЕНТОВ ЧЕРЕЗ DOM API (ЗАЩИТА ОТ XSS)
                         const li = document.createElement('li');
-                        const markingBadge = shift.marking ? `<b style="margin-right: 6px;">[${shift.marking}]</b>` : '';
-                        
+
+                        const spanInfo = document.createElement('span');
+                        const boldDate = document.createElement('b');
+                        boldDate.textContent = shift.date;
+
+                        const br = document.createElement('br');
+                        const small = document.createElement('small');
+                        small.style.color = '#636e72';
+
+                        if (shift.marking) {
+                            const markingB = document.createElement('b');
+                            markingB.style.marginRight = '6px';
+                            markingB.textContent = `[${shift.marking}]`;
+                            small.appendChild(markingB);
+                        }
+
+                        small.appendChild(document.createTextNode(shift.object_name));
+
+                        spanInfo.appendChild(boldDate);
+                        spanInfo.appendChild(br);
+                        spanInfo.appendChild(small);
+
                         let badgeStyle = "background: #e1f5fe; color: #0277bd;";
                         if (shift.marking === 'p1000') {
                             badgeStyle = "background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9;";
                         } else if (shift.marking === 'p1001') {
                             badgeStyle = "background: #ffebee; color: #c62828; border: 1px solid #ffcdd2;";
                         }
-                        
-                        li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #636e72;">${markingBadge}${shift.object_name}</small></span>` +
-                                       `<span style="${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
+
+                        const spanHours = document.createElement('span');
+                        spanHours.style.cssText = `${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;`;
+                        spanHours.textContent = `${shift.hours} ч`;
+
+                        li.appendChild(spanInfo);
+                        li.appendChild(spanHours);
                         listContainer.appendChild(li);
 
                         let objKey = shift.object_name;
