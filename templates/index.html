@@ -213,8 +213,11 @@
                 <!-- Заполняется динамически -->
             </tbody>
         </table>
-        <div style="font-size: 16px; font-weight: bold; text-align: right; border-top: 2px solid #000; padding-top: 10px;" id="print-total-hours">
-            Итого часов: 0
+        <div style="margin-top: 15px; border-top: 1px dashed #666; padding-top: 10px;" id="print-summary">
+            <!-- Сводка по объектам -->
+        </div>
+        <div style="font-size: 16px; font-weight: bold; text-align: right; border-top: 2px solid #000; padding-top: 10px; margin-top: 10px;" id="print-total-hours">
+            <!-- Общий итог -->
         </div>
     </div>
 
@@ -467,6 +470,7 @@
                 listContainer.innerHTML = '';
                 let printTableHtml = '';
                 let totalHours = 0;
+                let totalsByObject = {};
 
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
                     shiftsData.recent_shifts.forEach(shift => {
@@ -484,7 +488,14 @@
                                        `<span style="${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
 
-                        // Формируем строчки для печати / PDF
+                        // Суммируем часы по объектам для сводки
+                        let objKey = shift.object_name;
+                        if (shift.marking) {
+                            objKey = `[${shift.marking}] ${objKey}`;
+                        }
+                        totalsByObject[objKey] = (totalsByObject[objKey] || 0) + shift.hours;
+
+                        // Строка для таблицы печати
                         printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
                             <td style="padding: 8px;">${shift.date}</td>
                             <td style="padding: 8px;">${markingBadge.replace(/<[^>]*>?/gm, '')} ${shift.object_name}</td>
@@ -493,11 +504,19 @@
                         totalHours += shift.hours;
                     });
 
-                    // Показываем кнопку печати/PDF
+                    // Формируем блок сводки по объектам
+                    let summaryHtml = '<b>Итого по объектам / типам:</b><ul style="margin: 5px 0 0 20px; padding: 0; font-size: 13px;">';
+                    for (let [obj, hrs] of Object.entries(totalsByObject)) {
+                        summaryHtml += `<li>${obj}: <b>${hrs} ч</b></li>`;
+                    }
+                    summaryHtml += '</ul>';
+
+                    // Показываем кнопку печати/PDF и заполняем данные
                     printBtn.style.display = 'block';
                     document.getElementById('print-title').textContent = `Отчет по сменам: ${empName} (${selectedMonth})`;
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
-                    document.getElementById('print-total-hours').textContent = `Итого часов за месяц: ${totalHours}`;
+                    document.getElementById('print-summary').innerHTML = summaryHtml;
+                    document.getElementById('print-total-hours').textContent = `Общий итог часов за месяц: ${totalHours} ч`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
