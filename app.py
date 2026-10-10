@@ -194,9 +194,26 @@ def parse_float(val_str, default=0.0):
         return default
 
 def translate_to_swedish(text):
-    if not text:
+    if not text or not str(text).strip():
         return ""
-    t = str(text).lower()
+    
+    raw_text = str(text).strip()
+    
+    # Онлайн-переводчик через MyMemory API
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(raw_text)}&langpair=ru|sv"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data and "responseData" in data and data["responseData"].get("translatedText"):
+                translated = data["responseData"]["translatedText"]
+                if "MYMEMORY WARNING" not in translated:
+                    return translated
+    except Exception:
+        pass
+    
+    # Резервный словарь на случай отсутствия интернета
+    t = raw_text.lower()
     replacements = {
         "гипсокартон": "gips", "гипсу": "gips", "картон": "kartong",
         "вентиляц": "ventilation", "электрик": "elarbete", "проводк": "eldragning",
