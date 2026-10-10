@@ -41,8 +41,6 @@ def get_db_connection():
     return conn
 
 def init_db_once():
-    is_new_db = not os.path.exists(DB_FILE)
-    
     for d in [REPORTS_DIR, SALARIES_DIR, BACKUP_DIR]:
         if not os.path.exists(d):
             os.makedirs(d)
@@ -61,13 +59,6 @@ def init_db_once():
         )
     ''')
     
-    cursor.execute("PRAGMA table_info(objects)")
-    obj_columns = [col[1] for col in cursor.fetchall()]
-    if 'rate' not in obj_columns:
-        cursor.execute("ALTER TABLE objects ADD COLUMN rate REAL DEFAULT 0.0")
-    if 'transport_rate' not in obj_columns:
-        cursor.execute("ALTER TABLE objects ADD COLUMN transport_rate REAL DEFAULT 0.0")
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,17 +68,13 @@ def init_db_once():
         )
     ''')
 
-    cursor.execute("PRAGMA table_info(employees)")
-    emp_columns = [col[1] for col in cursor.fetchall()]
-    if 'is_active' not in emp_columns:
-        cursor.execute("ALTER TABLE employees ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
         )
     ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +91,7 @@ def init_db_once():
         )
     ''')
 
+    # Принудительная проверка и добавление колонки request_id, если таблица уже существовала
     cursor.execute("PRAGMA table_info(shifts)")
     shift_cols = [col[1] for col in cursor.fetchall()]
     if 'request_id' not in shift_cols:
@@ -135,66 +123,6 @@ def init_db_once():
             amount REAL NOT NULL
         )
     ''')
-
-    cursor.execute("SELECT COUNT(*) FROM employees")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO employees (name, salary_rate) VALUES (?, ?)", ("Aliaksei Patonich", 0.0))
-
-    if is_new_db:
-        initial_data = [
-            ("Privat", "Badbacken 2", "p1010", 520.0, 0.0),
-            ("Privat", "Koksgaatan 40", "p1011", 520.0, 0.0),
-            ("Privat", "Tallvagen 12", "p1001", 520.0, 0.0),
-            ("Dvaliks", "Klockargardsstigen 3", "***", 550.0, 0.0),
-            ("Privat", "Norra vagen 7", "p1013", 520.0, 0.0),
-            ("Privat", "Punchvagen 5", "p1012", 520.0, 0.0),
-            ("Privat", "Storholmsvagen 24", "p1014", 520.0, 0.0),
-            ("Privat", "Östra vägen 13", "p1017", 520.0, 0.0),
-            ("Privat", "Punchvagen 5 Ext", "p1016", 520.0, 0.0),
-            ("SBT", "Teknologgatan 7", "p2086", 580.0, 0.0),
-            ("SBT", "Bisittargatan 20A", "p2083", 580.0, 0.0),
-            ("Dvaliks", "Kronstigen 12", "***", 550.0, 0.0),
-            ("Dvaliks", "Gustav 3 boulevard 167", "Gustav 3", 550.0, 0.0),
-            ("SBT", "Krogtappan 97", "***", 580.0, 0.0),
-            ("Privat", "Badbacken 2 Altan", "p1018", 520.0, 0.0),
-            ("Privat", "Punchvagen 5 roof altan", "p1019", 520.0, 0.0),
-            ("SBT", "Hamarby Alle 3b", "***", 580.0, 0.0),
-            ("Privat", "Norra vagen 18 Niklas", "p1020", 520.0, 0.0),
-            ("Privat", "Tallvagen 12 Fasad Mal", "p1021", 520.0, 0.0),
-            ("Privat", "Badbacken 5 ext", "p1022", 520.0, 0.0),
-            ("Privat", "Östra vägen 7B", "p1023", 520.0, 0.0),
-            ("Privat", "Johan Hammarstrom", "p1024", 520.0, 0.0),
-            ("Privat", "Norra vagen 26 Katarina", "p1025", 520.0, 0.0),
-            ("Privat", "Tallvagen 14 Egil", "p1026", 520.0, 0.0),
-            ("SBT", "Kraftriket 21", "p2152", 580.0, 0.0),
-            ("SBT", "Teknikringen 35 Hogdel", "p2154", 580.0, 0.0),
-            ("Dvaliks", "Drottning vag 123", "***", 550.0, 0.0),
-            ("Pareto Properties AB", "Sonnebovagen 16 Sollentuna", "p1027", 600.0, 0.0),
-            ("Dvaliks", "Soderproken 16 Lidingo", "p1028", 550.0, 0.0),
-            ("SBT", "Alvsjoborgatan 1-3", "p2166", 580.0, 0.0),
-            ("Dvaliks", "Nyneshamn", "p1029", 550.0, 0.0),
-            ("SBT", "Vikingshillsvägen 15", "***", 580.0, 0.0),
-            ("Pareto Properties AB", "Alfred Nobels Alle 109", "p1030", 600.0, 0.0),
-            ("Renatur", "Tomteboda glass", "p1031", 550.0, 0.0),
-            ("Renatur", "Tomteboda doors", "p1032", 550.0, 0.0),
-            ("Privat", "Uddens vag 12 Tomas", "p1033", 520.0, 0.0),
-            ("SBT", "Karlsviksgatan 15", "p2128", 580.0, 0.0),
-            ("Renatur", "Tomteboda arbetsledning", "***", 550.0, 0.0),
-            ("Renatur", "Tomteboda ÄTA", "p1034", 550.0, 0.0),
-            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill", "p1035", 520.0, 0.0),
-            ("Privat", "Kolarbacken 52 136 48 Handen/Vega Daniel", "p1036", 520.0, 0.0),
-            ("Renatur", "Tomteboda ÄTA Hotel", "****", 550.0, 0.0),
-            ("Privat", "Tallvagen 11 1:116, Lidingö Kejill ÄTA", "p1037", 520.0, 0.0)
-        ]
-
-        unique_companies = sorted(list(set(item[0] for item in initial_data)))
-        for comp in unique_companies:
-            cursor.execute("INSERT OR IGNORE INTO companies (name) VALUES (?)", (comp,))
-
-        for comp, name, mark, rate, tr in initial_data:
-            cursor.execute('''
-                INSERT OR IGNORE INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
-            ''', (name, mark, comp, rate, tr))
 
     conn.commit()
     conn.close()
@@ -629,7 +557,6 @@ class SmartReportApp(QMainWindow):
                     for s in shifts_from_cloud:
                         req_id = s.get('request_id')
                         
-                        # 🛡 Надежная проверка по уникальному request_id или по набору параметров
                         exists = False
                         if req_id:
                             cursor.execute("SELECT id FROM shifts WHERE request_id = ?", (req_id,))
@@ -670,12 +597,15 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
-        # Убедимся, что у всех существующих локальных смен есть request_id
-        cursor.execute("SELECT id FROM shifts WHERE request_id IS NULL OR request_id = ''")
-        no_req_shifts = cursor.fetchall()
-        for r in no_req_shifts:
-            cursor.execute("UPDATE shifts SET request_id = ? WHERE id = ?", (str(uuid.uuid4()), r[0]))
-        conn.commit()
+        # Безопасная проверка и заполнение request_id для старых локальных записей
+        try:
+            cursor.execute("SELECT id FROM shifts WHERE request_id IS NULL OR request_id = ''")
+            no_req_shifts = cursor.fetchall()
+            for r in no_req_shifts:
+                cursor.execute("UPDATE shifts SET request_id = ? WHERE id = ?", (str(uuid.uuid4()), r[0]))
+            conn.commit()
+        except Exception:
+            pass
 
         cursor.execute("SELECT name FROM employees ORDER BY name")
         employees = [row[0] for row in cursor.fetchall()]
