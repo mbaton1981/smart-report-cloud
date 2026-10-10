@@ -32,7 +32,7 @@ SALARIES_DIR = "salaries"
 
 # 🌐 Адрес облачного сервера на Render и ваш новый надежный ключ синхронизации
 CLOUD_URL = "https://smart-report-server.onrender.com"
-SYNC_API_KEY = "ЗДЕСЬ_ВСТАВЬТЕ_ТОТ_ЖЕ_КЛЮЧ_ЧТО_И_НА_RENDER"
+SYNC_API_KEY = "Alina1981!"
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
