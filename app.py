@@ -91,7 +91,7 @@ def init_db_once():
         )
     ''')
 
-    # Принудительная проверка и добавление колонки request_id, если таблица уже существовала
+    # ГАРАНТИРОВАННОЕ ДОБАВЛЕНИЕ КОЛОНОК ДЛЯ СТАРОЙ БАЗЫ
     cursor.execute("PRAGMA table_info(shifts)")
     shift_cols = [col[1] for col in cursor.fetchall()]
     if 'request_id' not in shift_cols:
@@ -597,7 +597,6 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
-        # Безопасная проверка и заполнение request_id для старых локальных записей
         try:
             cursor.execute("SELECT id FROM shifts WHERE request_id IS NULL OR request_id = ''")
             no_req_shifts = cursor.fetchall()
@@ -2161,21 +2160,21 @@ class SmartReportApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
 
-    def delete_shift(self, index=None):
-        selected = self.table_shifts.currentRow()
-        if selected < 0:
-            QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
-            return
-        shift_id = self.table_shifts.item(selected, 0).text()
-        reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
-            conn.commit()
-            conn.close()
-            self.load_shifts_history()
-            self.background_sync_with_cloud()
+    def delete_shift(self, index=None, shift_id=None):
+        if shift_id is None:
+            selected = self.table_shifts.currentRow()
+            if selected < 0:
+                QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
+                return
+            shift_id = self.table_shifts.item(selected, 0).text()
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
+        conn.commit()
+        conn.close()
+        self.load_shifts_history()
+        self.background_sync_with_cloud()
 
 if __name__ == "__main__":
     try:

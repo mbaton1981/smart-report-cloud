@@ -36,14 +36,12 @@ app.config.update(
 DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
 
 def get_db_connection():
-    # 🛡 Если по пути базы данных случайно образовалась директория — удаляем её
     if os.path.exists(DB_FILE) and os.path.isdir(DB_FILE):
         try:
             os.rmdir(DB_FILE)
         except Exception:
             pass
 
-    # Автоматическое создание родительской папки (например, /data/) перед подключением
     db_dir = os.path.dirname(os.path.abspath(DB_FILE))
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -66,11 +64,9 @@ def create_database_backup():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         backup_path = os.path.join(backup_dir, f"backup_{timestamp}.db")
         
-        # Безопасное копирование файла базы данных
         shutil.copy2(DB_FILE, backup_path)
         logger.info(f"Резервная копия базы данных успешно создана: {backup_path}")
         
-        # Очистка старых бэкапов (оставляем последние 10 штук, чтобы не забивать диск)
         backups = sorted([os.path.join(backup_dir, f) for f in os.listdir(backup_dir) if f.endswith('.db')])
         if len(backups) > 10:
             for old_backup in backups[:-10]:
@@ -104,7 +100,6 @@ def safe_parse_obj(val):
     return val_str, "", "Privat"
 
 def init_cloud_db():
-    # Создаем бэкап существующей базы перед инициализацией
     create_database_backup()
 
     conn = get_db_connection()
@@ -788,18 +783,31 @@ def sync_desktop_data():
 
                 comment_val = str(s.get('comment', ''))[:2000]
                 req_id = str(s.get('request_id', ''))[:100]
+                company_val = str(s.get('company', 'Privat'))
 
-                # 🛡 Мягкая обработка дубликатов по request_id без падения пакета
+                # 🛡 Жесткая защита от задвоения: проверяем и по request_id, и по уникальному набору параметров смены
+                exists = False
                 if req_id:
                     cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (req_id,))
                     if cursor.fetchone():
-                        continue  # Уже существует — тихо пропускаем
+                        exists = True
+
+                if not exists:
+                    cursor.execute('''
+                        SELECT id FROM cloud_shifts 
+                        WHERE date = ? AND employee = ? AND object_name = ? AND hours = ? AND company = ?
+                    ''', (date_val, emp_val, obj_name, hrs_val, company_val))
+                    if cursor.fetchone():
+                        exists = True
+
+                if exists:
+                    continue  # Пропускаем дубликат, предотвращая лавинообразный рост часов
 
                 cursor.execute('''
                     INSERT OR IGNORE INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ''', (
-                    req_id if req_id else None, date_val, emp_val, str(s.get('company', 'Privat')), obj_name,
+                    req_id if req_id else None, date_val, emp_val, company_val, obj_name,
                     hrs_val, rate_val, transport_val, comment_val
                 ))
 
