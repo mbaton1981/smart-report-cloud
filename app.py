@@ -489,7 +489,7 @@ class SmartReportApp(QMainWindow):
 
         layout.addWidget(card)
         
-        # 🟢 ПАНЕЛЬ ФИЛЬТРОВ С УДОБНЫМИ ВЫПАДАЮЩИМИ СПИСКАМИ И КАЛЕНДАРЕМ ДАТЫ
+        # 🟢 ПАНЕЛЬ ФИЛЬТРОВ С ДИАПАЗОНОМ ДАТ (С ... ПО ...)
         control_card = QFrame()
         control_card.setObjectName("card")
         control_card.setStyleSheet("background-color: #242933; border: 2px solid #3182ce; border-radius: 8px; margin-top: 5px;")
@@ -515,13 +515,14 @@ class SmartReportApp(QMainWindow):
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
 
-        # Строка фильтров (дата через QDateEdit, объект через QComboBox)
+        # Строка фильтров по периоду с-по и остальным параметрам
         filter_row = QHBoxLayout()
         
-        self.filter_date = create_date_field("")
-        self.filter_date.setSpecialValueText("-- Все даты --")
-        self.filter_date.setDate(QDate()) # Сброс по умолчанию на пустую/все
-        self.filter_date.dateChanged.connect(self.apply_shifts_filters)
+        self.filter_date_from = create_date_field("2026-10-01")
+        self.filter_date_from.dateChanged.connect(self.apply_shifts_filters)
+
+        self.filter_date_to = create_date_field("2026-10-31")
+        self.filter_date_to.dateChanged.connect(self.apply_shifts_filters)
 
         self.filter_emp = QComboBox()
         self.filter_emp.addItem("-- Все сотрудники --")
@@ -539,8 +540,10 @@ class SmartReportApp(QMainWindow):
         self.filter_status.addItems(["-- Все статусы --", "В работе", "Выставлен в счёт"])
         self.filter_status.currentIndexChanged.connect(self.apply_shifts_filters)
 
-        filter_row.addWidget(QLabel("<b>Фильтры:</b>"))
-        filter_row.addWidget(self.filter_date)
+        filter_row.addWidget(QLabel("<b>Период с:</b>"))
+        filter_row.addWidget(self.filter_date_from)
+        filter_row.addWidget(QLabel("<b>по:</b>"))
+        filter_row.addWidget(self.filter_date_to)
         filter_row.addWidget(self.filter_emp)
         filter_row.addWidget(self.filter_comp)
         filter_row.addWidget(self.filter_obj)
@@ -561,10 +564,9 @@ class SmartReportApp(QMainWindow):
         self.load_shifts_history()
 
     def apply_shifts_filters(self):
-        d_val = self.filter_date.text().strip()
-        if d_val == "-- Все даты --" or not self.filter_date.date().isValid():
-            d_val = ""
-            
+        d_from = self.filter_date_from.text().strip()
+        d_to = self.filter_date_to.text().strip()
+        
         emp_val = self.filter_emp.currentText()
         comp_val = self.filter_comp.currentText()
         obj_val = self.filter_obj.currentText()
@@ -578,7 +580,7 @@ class SmartReportApp(QMainWindow):
             obj_cell = self.table_shifts.item(row, 4).text()
             status_cell = self.table_shifts.item(row, 9).text()
 
-            if d_val and d_val not in date_cell:
+            if d_from and d_to and not (d_from <= date_cell <= d_to):
                 match = False
             if emp_val != "-- Все сотрудники --" and emp_cell != emp_val:
                 match = False
@@ -2153,7 +2155,7 @@ class SmartReportApp(QMainWindow):
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 100")
+            cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 200")
             rows = cursor.fetchall()
             conn.close()
 
