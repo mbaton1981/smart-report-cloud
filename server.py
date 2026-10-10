@@ -797,7 +797,7 @@ def sync_desktop_data():
         if desktop_shifts:
             desktop_keys = set()
             min_date = None
-            max_date = None
+            synced_employees = set()
 
             for s in desktop_shifts:
                 if not isinstance(s, dict):
@@ -811,12 +811,12 @@ def sync_desktop_data():
 
                 if min_date is None or date_val < min_date:
                     min_date = date_val
-                if max_date is None or date_val > max_date:
-                    max_date = date_val
 
                 emp_val = str(s.get('employee', '')).strip()
                 if not emp_val or len(emp_val) > 150:
                     return jsonify({"ok": False, "error": "Некорректное имя сотрудника в смене"}), 400
+
+                synced_employees.add(emp_val)
 
                 try:
                     hrs_val = float(s.get('hours', 0.0))
@@ -868,9 +868,13 @@ def sync_desktop_data():
                     hrs_val, rate_val, transport_val, comment_val
                 ))
 
-            # 🔄 Зеркалирование: удаляем из облака смены за диапазон дат, которых больше нет на компьютере
-            if min_date and max_date:
-                cursor.execute("SELECT id, date, employee, object_name, hours, company FROM cloud_shifts WHERE date >= ? AND date <= ?", (min_date, max_date))
+            # 🔄 Исправленное зеркалирование: проверяем все смены начиная с min_date для синхронизируемых сотрудников
+            if min_date and synced_employees:
+                placeholders = ','.join(['?'] * len(synced_employees))
+                query = f"SELECT id, date, employee, object_name, hours, company FROM cloud_shifts WHERE date >= ? AND employee IN ({placeholders})"
+                params = [min_date] + list(synced_employees)
+                
+                cursor.execute(query, params)
                 cloud_rows = cursor.fetchall()
 
                 for cr in cloud_rows:
