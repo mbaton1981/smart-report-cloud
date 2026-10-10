@@ -163,6 +163,21 @@ def init_cloud_db():
             UPDATE users SET password_hash = ? WHERE role = 'admin'
         ''', (hashed_pw,))
 
+    # 🛡 АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ СОТРУДНИКОВ С ТАБЛИЦЕЙ USERS (БЕЗ СБРОСА ПИН-КОДОВ)
+    cursor.execute("SELECT id, name FROM meta_employees WHERE is_active = 1")
+    active_emps = cursor.fetchall()
+    for emp in active_emps:
+        cursor.execute("SELECT id FROM users WHERE username = ?", (emp['name'],))
+        existing_user = cursor.fetchone()
+        if not existing_user:
+            cursor.execute('''
+                INSERT INTO users (username, role, employee_id, is_active, created_at)
+                VALUES (?, 'user', ?, 1, ?)
+            ''', (emp['name'], emp['id'], now_str))
+        else:
+            # Обновляем employee_id на всякий случай, если он не был заполнен
+            cursor.execute("UPDATE users SET employee_id = COALESCE(employee_id, ?) WHERE username = ?", (emp['id'], emp['name']))
+
     conn.commit()
     conn.close()
 
@@ -235,7 +250,6 @@ def login():
         conn.close()
         return jsonify({"ok": False, "error": "Неверный пин-код или пароль"}), 401
 
-    # Автоматически находим employee_id по имени пользователя, если он еще не прописан в users
     emp_id = user['employee_id']
     if not emp_id and user['role'] != 'admin':
         cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (user['username'],))
@@ -413,7 +427,6 @@ def submit_shift():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 🛡 СТРОГАЯ ИДЕНТИФИКАЦИЯ ПО EMPLOYEE_ID ИЗ СЕССИИ
     if session.get('role') == 'admin':
         employee = str(data.get('employee', '')).strip()
         if not employee:
@@ -515,7 +528,6 @@ def check_employee_shifts():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 🛡 СТРОГАЯ ПРОВЕРКА ПРАВ ДЛЯ ИСТОРИИ
     if session.get('role') == 'admin':
         emp = data.get('employee')
         if not emp:
