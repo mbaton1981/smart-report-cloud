@@ -163,7 +163,6 @@ def init_cloud_db():
             UPDATE users SET password_hash = ? WHERE role = 'admin'
         ''', (hashed_pw,))
 
-    # 🛡 АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ СОТРУДНИКОВ С ТАБЛИЦЕЙ USERS (БЕЗ СБРОСА ПИН-КОДОВ)
     cursor.execute("SELECT id, name FROM meta_employees WHERE is_active = 1")
     active_emps = cursor.fetchall()
     for emp in active_emps:
@@ -175,7 +174,6 @@ def init_cloud_db():
                 VALUES (?, 'user', ?, 1, ?)
             ''', (emp['name'], emp['id'], now_str))
         else:
-            # Обновляем employee_id на всякий случай, если он не был заполнен
             cursor.execute("UPDATE users SET employee_id = COALESCE(employee_id, ?) WHERE username = ?", (emp['id'], emp['name']))
 
     conn.commit()
@@ -453,16 +451,19 @@ def submit_shift():
 
     try:
         hours = float(data.get('hours'))
-        if not (0.5 <= hours <= 24) or (hours % 0.5 != 0):
+        if not (0.5 <= hours <= 24) or (hours % 0.5 != 0) or str(hours).lower() in ['nan', 'inf', '-inf']:
             raise ValueError()
     except (TypeError, ValueError):
         conn.close()
         return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
 
+    # 🛡 Защита числовых параметров от NaN и бесконечности
     try:
         rate = float(data.get('rate', 0.0))
         transport = float(data.get('transport', 0.0))
-        if rate < 0 or transport < 0:
+        if rate < 0 or transport < 0 or rate > 100000 or transport > 10000:
+            raise ValueError()
+        if str(rate).lower() in ['nan', 'inf', '-inf'] or str(transport).lower() in ['nan', 'inf', '-inf']:
             raise ValueError()
     except (TypeError, ValueError):
         conn.close()
@@ -640,6 +641,7 @@ def check_missing_shifts():
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
 
+# 🛡 СТРОГАЯ ВАЛИДАЦИЯ ПАКЕТА СИНХРОНИЗАЦИИ НА ВХОДЕ
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -651,6 +653,13 @@ def sync_desktop_data():
     objects = data.get("objects", [])
     desktop_shifts = data.get("shifts", [])
 
+    if not isinstance(employees, list) or not isinstance(companies, list) or \
+       not isinstance(objects, list) or not isinstance(desktop_shifts, list):
+        return jsonify({"ok": False, "error": "Неверный формат данных: ожидаются списки"}), 400
+
+    if len(employees) > 500 or len(companies) > 500 or len(objects) > 2000 or len(desktop_shifts) > 5000:
+        return jsonify({"ok": False, "error": "Превышен лимит записей в пакете синхронизации"}), 400
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -659,33 +668,44 @@ def sync_desktop_data():
             for emp in employees:
                 if isinstance(emp, dict):
                     emp_name = str(emp.get('name', '')).strip()
-                    emp_rate = float(emp.get('salary_rate', 0.0))
+                    if not emp_name or len(emp_name) > 150:
+                        raise ValueError("Недопустимое имя сотрудника")
+                    try:
+                        emp_rate = float(emp.get('salary_rate', 0.0))
+                        if not (0 <= emp_rate <= 100000) or str(emp_rate).lower() in ['nan', 'inf', '-inf']:
+                            raise ValueError()
+                    except (TypeError, ValueError):
+                        return jsonify({"ok": False, "error": "Некорректная ставка сотрудника"}), 400
                     emp_active = int(emp.get('is_active', 1))
                 else:
                     emp_name = str(emp).strip() if emp else ""
+                    if not emp_name or len(emp_name) > 150:
+                        raise ValueError("Недопустимое имя сотрудника")
                     emp_rate = 0.0
                     emp_active = 1
 
-                if emp_name:
-                    cursor.execute('''
-                        INSERT INTO meta_employees (name, salary_rate, is_active) 
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(name) DO UPDATE SET 
-                            salary_rate = excluded.salary_rate,
-                            is_active = excluded.is_active
-                    ''', (emp_name, emp_rate, emp_active))
+                cursor.execute('''
+                    INSERT INTO meta_employees (name, salary_rate, is_active) 
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET 
+                        salary_rate = excluded.salary_rate,
+                        is_active = excluded.is_active
+                ''', (emp_name, emp_rate, emp_active))
 
         if companies:
             for comp in companies:
-                if comp:
-                    comp_name = str(comp.get('name', '') if isinstance(comp, dict) else comp).strip()
-                    if comp_name:
-                        cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
+                comp_name = str(comp.get('name', '') if isinstance(comp, dict) else comp).strip()
+                if comp_name:
+                    if len(comp_name) > 150:
+                        return jsonify({"ok": False, "error": "Слишком длинное имя компании"}), 400
+                    cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
 
         if objects:
             for obj in objects:
                 name, mark, comp = safe_parse_obj(obj)
                 if name and "{" not in name:
+                    if len(name) > 200 or len(mark) > 50 or len(comp) > 150:
+                        return jsonify({"ok": False, "error": "Превышена длина полей объекта"}), 400
                     cursor.execute('''
                         INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
                         ON CONFLICT(name, company) DO UPDATE SET markning = excluded.markning
@@ -693,12 +713,40 @@ def sync_desktop_data():
 
         if desktop_shifts:
             for s in desktop_shifts:
+                if not isinstance(s, dict):
+                    return jsonify({"ok": False, "error": "Неверный формат смены"}), 400
+
+                date_val = str(s.get('date', '')).strip()
+                try:
+                    datetime.strptime(date_val, '%Y-%m-%d')
+                except ValueError:
+                    return jsonify({"ok": False, "error": f"Некорректный формат даты: {date_val}"}), 400
+
+                emp_val = str(s.get('employee', '')).strip()
+                if not emp_val or len(emp_val) > 150:
+                    return jsonify({"ok": False, "error": "Некорректное имя сотрудника в смене"}), 400
+
+                try:
+                    hrs_val = float(s.get('hours', 0.0))
+                    rate_val = float(s.get('rate', 0.0))
+                    transport_val = float(s.get('transport', 0.0))
+                    
+                    if not (0.5 <= hrs_val <= 24) or str(hrs_val).lower() in ['nan', 'inf', '-inf']:
+                        raise ValueError("Часы вне диапазона")
+                    if not (0 <= rate_val <= 100000) or str(rate_val).lower() in ['nan', 'inf', '-inf']:
+                        raise ValueError("Некорректная ставка")
+                    if not (0 <= transport_val <= 10000) or str(transport_val).lower() in ['nan', 'inf', '-inf']:
+                        raise ValueError("Некорректный транспорт")
+                except (TypeError, ValueError) as err:
+                    return jsonify({"ok": False, "error": f"Ошибка параметров смены: {err}"}), 400
+
                 name, _, _ = safe_parse_obj(s.get('object_name'))
-                obj_name = name or s.get('object_name')
-                date_val = s.get('date')
-                emp_val = s.get('employee')
-                hrs_val = s.get('hours', 0.0)
-                
+                obj_name = name or str(s.get('object_name', '')).strip()
+                if not obj_name or len(obj_name) > 200:
+                    return jsonify({"ok": False, "error": "Некорректное имя объекта"}), 400
+
+                comment_val = str(s.get('comment', ''))[:2000]
+
                 cursor.execute('''
                     SELECT id FROM cloud_shifts 
                     WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
@@ -709,19 +757,19 @@ def sync_desktop_data():
                         INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     ''', (
-                        s.get('request_id'), date_val, emp_val, s.get('company'), obj_name,
-                        hrs_val, s.get('rate', 0.0), s.get('transport', 0.0), str(s.get('comment', ''))[:2000]
+                        str(s.get('request_id', ''))[:100], date_val, emp_val, str(s.get('company', 'Privat')), obj_name,
+                        hrs_val, rate_val, transport_val, comment_val
                     ))
 
         conn.commit()
     except Exception as e:
-        logger.error(f"Safe sync error: {e}")
+        logger.error(f"Safe sync validation error: {e}")
         conn.rollback()
-        return jsonify({"ok": False, "error": "Ошибка безопасной синхронизации на сервере"}), 500
+        return jsonify({"ok": False, "error": f"Ошибка валидации и синхронизации: {str(e)}"}), 400
     finally:
         conn.close()
 
-    return jsonify({"ok": True, "status": "safe_merged"})
+    return jsonify({"ok": True, "status": "safe_merged_and_validated"})
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
