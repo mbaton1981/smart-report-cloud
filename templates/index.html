@@ -9,16 +9,16 @@
         h2 { text-align: center; color: #1b6ca8; font-size: 24px; margin-bottom: 20px; }
         .main-container { display: flex; flex-wrap: wrap; gap: 20px; }
         
-        /* Карточки сделали посветлее и контрастнее */
+        /* Карточки посветлее и контрастнее */
         .form-box { flex: 1; min-width: 320px; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; }
         .history-box { flex: 1; min-width: 320px; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; height: fit-content; }
         
         .form-group { margin-bottom: 18px; }
         
-        /* Увеличили шрифт и контраст подписей */
+        /* Крупный шрифт и контраст подписей */
         label { display: block; margin-bottom: 7px; font-weight: bold; color: #2f3640; font-size: 15px; }
         
-        /* Светлые, контрастные поля ввода и календари с крупным текстом */
+        /* Светлые, контрастные поля ввода и календари */
         select, input, textarea { 
             width: 100%; 
             padding: 12px; 
@@ -31,7 +31,7 @@
         }
         select:focus, input:focus, textarea:focus { border-color: #0984e3; background-color: #fff; outline: none; box-shadow: 0 0 0 3px rgba(9, 132, 227, 0.15); }
         
-        /* Настройка видимости иконок календаря на мобильных */
+        /* Четкие иконки и стрелочки календаря на мобильных */
         input[type="date"], input[type="month"] {
             color-scheme: light;
         }
@@ -440,10 +440,18 @@
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
                     shiftsData.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
-                        const markingBadge = shift.marking ? `<b style="color: #0984e3; margin-right: 6px;">[${shift.marking}]</b>` : '';
+                        const markingBadge = shift.marking ? `<b style="margin-right: 6px;">[${shift.marking}]</b>` : '';
+                        
+                        // Цветная подсветка для p1000 (ATF - зеленый) и p1001 (Sjuk - красный)
+                        let badgeStyle = "background: #e1f5fe; color: #0277bd;"; // Синий по умолчанию
+                        if (shift.marking === 'p1000') {
+                            badgeStyle = "background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9;"; // Зеленый для ATF
+                        } else if (shift.marking === 'p1001') {
+                            badgeStyle = "background: #ffebee; color: #c62828; border: 1px solid #ffcdd2;"; // Красный для Больничного
+                        }
                         
                         li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #636e72;">${markingBadge}${shift.object_name}</small></span>` +
-                                       `<span style="background: #e1f5fe; color: #0277bd; padding: 5px 10px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
+                                       `<span style="${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
                     });
                 } else {
