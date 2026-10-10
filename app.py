@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
-    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog
+    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog
 )
 from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtGui import QIcon, QColor
@@ -30,7 +30,7 @@ BACKUP_DIR = "backups"
 REPORTS_DIR = "reports"
 SALARIES_DIR = "salaries"
 
-# 🌐 Адрес облачного сервера на Render и ваш новый надежный ключ синхронизации
+# 🌐 Адрес облачного сервера на Render и ваш секретный ключ синхронизации
 CLOUD_URL = "https://smart-report-server.onrender.com"
 SYNC_API_KEY = "Alina1981!"
 
@@ -493,14 +493,12 @@ class SmartReportApp(QMainWindow):
 
         layout.addWidget(card)
         
-        # 🟢 ПАНЕЛЬ ФИЛЬТРОВ С ДИАПАЗОНОМ ДАТ (С ... ПО ...)
         control_card = QFrame()
         control_card.setObjectName("card")
         control_card.setStyleSheet("background-color: #242933; border: 2px solid #3182ce; border-radius: 8px; margin-top: 5px;")
         c_layout = QVBoxLayout(control_card)
         c_layout.setSpacing(8)
 
-        # Строка кнопок управления
         btn_row = QHBoxLayout()
         refresh_shifts_btn = QPushButton("🔄 Обновить данные")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
@@ -519,7 +517,6 @@ class SmartReportApp(QMainWindow):
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
 
-        # Строка фильтров по периоду с-по и остальным параметрам
         filter_row = QHBoxLayout()
         
         self.filter_date_from = create_date_field("2026-10-01")
@@ -603,7 +600,6 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 🛡 Добавлен заголовок X-Sync-Key с вашим секретным ключом
         headers = {"X-Sync-Key": SYNC_API_KEY}
         
         try:
@@ -1742,11 +1738,13 @@ class SmartReportApp(QMainWindow):
         del_emp_btn = QPushButton("🗑 Удалить сотрудника")
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
-        reset_pin_btn = QPushButton("🔑 Сбросить ПИН")
-        reset_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
+        
+        # Кнопка установки/задания ПИН-кода
+        set_pin_btn = QPushButton("🔑 Задать ПИН")
+        set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
         emp_btn_layout.addWidget(del_emp_btn)
-        emp_btn_layout.addWidget(reset_pin_btn)
+        emp_btn_layout.addWidget(set_pin_btn)
         emp_card_layout.addLayout(emp_btn_layout)
         top_layout.addWidget(emp_card, stretch=1)
 
@@ -2077,13 +2075,29 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Выберите сотрудника!")
             return
         emp_name = self.table_employees.item(selected, 0).text()
-        reply = QMessageBox.question(self, "Подтверждение", f"Сбросить пин-код для {emp_name}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        
+        # Открываем диалоговое окно для ввода ПИН-кода
+        new_pin, ok = QInputDialog.getText(
+            self, 
+            "Установка ПИН-кода", 
+            f"Введите новый ПИН-код для сотрудника:\n{emp_name}", 
+            QLineEdit.EchoMode.Normal
+        )
+        
+        if ok and new_pin.strip():
             try:
                 headers = {"X-Sync-Key": SYNC_API_KEY}
-                requests.post(f"{CLOUD_URL}/admin/reset-user-pin", headers=headers, json={"username": emp_name}, timeout=5)
-                QMessageBox.information(self, "Успех", f"Пин-код для {emp_name} сброшен!")
-                self.load_employees_table()
+                response = requests.post(
+                    f"{CLOUD_URL}/admin/set-user-pin", 
+                    headers=headers, 
+                    json={"username": emp_name, "pin": new_pin.strip()}, 
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    QMessageBox.information(self, "Успех", f"ПИН-код для {emp_name} успешно установлен!")
+                    self.load_employees_table()
+                else:
+                    QMessageBox.critical(self, "Ошибка", f"Сервер отклонил запрос:\n{response.text}")
             except Exception as e:
                 QMessageBox.critical(self, "Ошибка", f"Не удалось связаться с облаком:\n{e}")
 

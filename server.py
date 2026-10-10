@@ -7,14 +7,13 @@ from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Настройка системного логирования для безопасного перехвата ошибок
+# Настройка системного логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.permanent_session_lifetime = timedelta(hours=8)
 
-# --- Безопасная инициализация секретов (Fail-Fast) ---
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
     logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения SECRET_KEY не задана!")
@@ -26,7 +25,6 @@ if not SYNC_API_KEY:
     logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения SYNC_API_KEY не задана!")
     raise RuntimeError("SYNC_API_KEY environment variable is required.")
 
-# Настройка безопасности Cookie (Secure включается только если явно разрешено для HTTPS в окружении)
 use_secure = os.environ.get('USE_SECURE_COOKIES', 'false').lower() == 'true'
 app.config.update(
     SESSION_COOKIE_SECURE=use_secure,
@@ -173,7 +171,7 @@ init_cloud_db()
 def verify_sync_key():
     sync_key = request.headers.get('X-Sync-Key') or request.headers.get('X-API-Key')
     if not sync_key or sync_key != SYNC_API_KEY:
-        logger.warning(f"Несанкционированная попытка доступа к защищенному маршруту с IP: {request.remote_addr}")
+        logger.warning(f"Несанкционированная попытка доступа с IP: {request.remote_addr}")
         return False
     return True
 
@@ -275,8 +273,9 @@ def get_current_user():
         }
     })
 
-@app.route('/admin/reset-user-pin', methods=['POST'])
-def admin_reset_user_pin():
+# 🔑 Новый маршрут для задания ПИН-кода из настольного приложения или веб-панели
+@app.route('/admin/set-user-pin', methods=['POST'])
+def admin_set_user_pin():
     is_admin_session = session.get('role') == 'admin'
     is_valid_sync = verify_sync_key()
     
@@ -285,16 +284,28 @@ def admin_reset_user_pin():
         
     data = request.json or {}
     username = str(data.get('username', '')).strip()
-    if not username:
-        return jsonify({"ok": False, "error": "Не указано имя пользователя"}), 400
+    pin = str(data.get('pin', '')).strip()
+    
+    if not username or not pin:
+        return jsonify({"ok": False, "error": "Не указано имя пользователя или ПИН"}), 400
         
+    hashed_pw = generate_password_hash(pin)
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET password_hash = NULL WHERE username = ?", (username,))
+    cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hashed_pw, username))
+    
+    if cursor.rowcount == 0:
+        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, role, is_active, created_at)
+            VALUES (?, ?, 'user', 1, ?)
+        ''', (username, hashed_pw, now_str))
+        
     conn.commit()
     conn.close()
     
-    return jsonify({"ok": True, "message": f"Пин-код для пользователя {username} успешно сброшен"})
+    return jsonify({"ok": True, "message": f"Пин-код для пользователя {username} успешно установлен"})
 
 @app.route('/admin/get-users-status', methods=['GET'])
 def admin_get_users_status():
