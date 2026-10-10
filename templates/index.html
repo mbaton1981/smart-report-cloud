@@ -9,16 +9,13 @@
         h2 { text-align: center; color: #1b6ca8; font-size: 24px; margin-bottom: 20px; }
         .main-container { display: flex; flex-wrap: wrap; gap: 20px; }
         
-        /* Карточки посветлее и контрастнее */
         .form-box { flex: 1; min-width: 320px; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; }
         .history-box { flex: 1; min-width: 320px; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; height: fit-content; }
         
         .form-group { margin-bottom: 18px; }
         
-        /* Крупный шрифт и контраст подписей */
         label { display: block; margin-bottom: 7px; font-weight: bold; color: #2f3640; font-size: 15px; }
         
-        /* Светлые, контрастные поля ввода и календари */
         select, input, textarea { 
             width: 100%; 
             padding: 12px; 
@@ -31,7 +28,6 @@
         }
         select:focus, input:focus, textarea:focus { border-color: #0984e3; background-color: #fff; outline: none; box-shadow: 0 0 0 3px rgba(9, 132, 227, 0.15); }
         
-        /* Четкие иконки и стрелочки календаря на мобильных */
         input[type="date"], input[type="month"] {
             color-scheme: light;
         }
@@ -40,6 +36,8 @@
         button:hover { background-color: #0765b7; }
         .btn-history { background-color: #00b894; margin-top: 10px; }
         .btn-history:hover { background-color: #00a884; }
+        .btn-print { background-color: #e67e22; margin-top: 10px; display: none; }
+        .btn-print:hover { background-color: #d35400; }
         
         #history-list { 
             list-style-type: none; 
@@ -64,6 +62,15 @@
         .user-header { background: #ffffff; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #dcdde1; display: flex; justify-content: space-between; align-items: center; font-size: 15px; color: #2d3436; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
         .btn-logout { background: #d63031; width: auto; padding: 8px 14px; font-size: 14px; }
         .btn-logout:hover { background: #c0392b; }
+
+        /* Скрытая область для печати/PDF */
+        #print-area { display: none; }
+
+        @media print {
+            body * { visibility: hidden; }
+            #print-area, #print-area * { visibility: visible; }
+            #print-area { position: absolute; left: 0; top: 0; width: 100%; display: block !important; background: #fff; color: #000; padding: 20px; }
+        }
     </style>
 </head>
 <body>
@@ -93,7 +100,6 @@
     <h2>Bygger och renoverar i Sthlm</h2>
 
     <div class="container" style="max-width: 800px; margin: 0 auto;">
-        <!-- Шапка с инфо о пользователе -->
         <div class="user-header">
             <span id="user-info-text">Загрузка сессии...</span>
             <button type="button" class="btn-logout" onclick="handleLogout()">Выйти</button>
@@ -132,7 +138,7 @@
                 <div class="form-group">
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
-                        <!-- Заполняется динамически через JS в зависимости от выбранной фирмы -->
+                        <!-- Заполняется динамически через JS -->
                     </select>
                 </div>
 
@@ -155,7 +161,6 @@
                 <button type="submit">Отправить смену</button>
             </form>
 
-            <!-- Блок плавающего уведомления -->
             <div id="form-alert"></div>
         </div>
 
@@ -179,8 +184,8 @@
             </div>
 
             <button type="button" id="load-history-btn" class="btn-history">Показать смены за месяц</button>
+            <button type="button" id="print-report-btn" class="btn-print" onclick="window.print()">🖨️ Печать / Сохранить в PDF</button>
 
-            <!-- Блок предупреждения о пропущенных сменах -->
             <div id="warning-container" style="margin-top: 15px; display: none; background: #ffeaa7; border: 1px solid #fdcb6e; padding: 12px; border-radius: 6px; font-size: 14px; color: #d63031; font-weight: bold;"></div>
 
             <div style="margin-top: 18px;">
@@ -189,6 +194,27 @@
                     <li style="color: #636e72; justify-content: center;">Выберите месяц, сотрудника и нажмите кнопку</li>
                 </ul>
             </div>
+        </div>
+    </div>
+
+    <!-- СКРЫТАЯ ОБЛАСТЬ ДЛЯ ПЕЧАТИ И PDF -->
+    <div id="print-area">
+        <h2 style="text-align: center; color: #000;">Bygger och renoverar i Sthlm</h2>
+        <h3 id="print-title" style="text-align: center; margin-bottom: 20px; color: #333;">Отчет по сменам</h3>
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px;">
+            <thead>
+                <tr style="border-bottom: 2px solid #000; text-align: left;">
+                    <th style="padding: 8px;">Дата</th>
+                    <th style="padding: 8px;">Объект / Описание</th>
+                    <th style="padding: 8px; text-align: right;">Часы</th>
+                </tr>
+            </thead>
+            <tbody id="print-table-body">
+                <!-- Заполняется динамически -->
+            </tbody>
+        </table>
+        <div style="font-size: 16px; font-weight: bold; text-align: right; border-top: 2px solid #000; padding-top: 10px;" id="print-total-hours">
+            Итого часов: 0
         </div>
     </div>
 
@@ -261,7 +287,7 @@
                     });
                 }
             } catch (err) {
-                console.error("Ошибка загрузки пользователей для входа:", err);
+                console.error("Ошибка загрузки пользователей:", err);
             }
         }
 
@@ -402,6 +428,7 @@
             const selectedMonth = document.getElementById('history-month').value;
             const listContainer = document.getElementById('history-list');
             const warningContainer = document.getElementById('warning-container');
+            const printBtn = document.getElementById('print-report-btn');
             
             if (!empName) {
                 alert('Пожалуйста, выберите сотрудника!');
@@ -415,6 +442,7 @@
             listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">Загрузка...</li>';
             warningContainer.style.display = 'none';
             warningContainer.textContent = '';
+            printBtn.style.display = 'none';
 
             try {
                 const shiftsRes = await fetch('/check-employee-shifts', {
@@ -437,23 +465,40 @@
                 }
 
                 listContainer.innerHTML = '';
+                let printTableHtml = '';
+                let totalHours = 0;
+
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
                     shiftsData.recent_shifts.forEach(shift => {
                         const li = document.createElement('li');
                         const markingBadge = shift.marking ? `<b style="margin-right: 6px;">[${shift.marking}]</b>` : '';
                         
-                        // Цветная подсветка для p1000 (ATF - зеленый) и p1001 (Sjuk - красный)
-                        let badgeStyle = "background: #e1f5fe; color: #0277bd;"; // Синий по умолчанию
+                        let badgeStyle = "background: #e1f5fe; color: #0277bd;";
                         if (shift.marking === 'p1000') {
-                            badgeStyle = "background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9;"; // Зеленый для ATF
+                            badgeStyle = "background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9;";
                         } else if (shift.marking === 'p1001') {
-                            badgeStyle = "background: #ffebee; color: #c62828; border: 1px solid #ffcdd2;"; // Красный для Больничного
+                            badgeStyle = "background: #ffebee; color: #c62828; border: 1px solid #ffcdd2;";
                         }
                         
                         li.innerHTML = `<span><b>${shift.date}</b><br><small style="color: #636e72;">${markingBadge}${shift.object_name}</small></span>` +
                                        `<span style="${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;">${shift.hours} ч</span>`;
                         listContainer.appendChild(li);
+
+                        // Формируем строчки для печати / PDF
+                        printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
+                            <td style="padding: 8px;">${shift.date}</td>
+                            <td style="padding: 8px;">${markingBadge.replace(/<[^>]*>?/gm, '')} ${shift.object_name}</td>
+                            <td style="padding: 8px; text-align: right; font-weight: bold;">${shift.hours} ч</td>
+                        </tr>`;
+                        totalHours += shift.hours;
                     });
+
+                    // Показываем кнопку печати/PDF
+                    printBtn.style.display = 'block';
+                    document.getElementById('print-title').textContent = `Отчет по сменам: ${empName} (${selectedMonth})`;
+                    document.getElementById('print-table-body').innerHTML = printTableHtml;
+                    document.getElementById('print-total-hours').textContent = `Итого часов за месяц: ${totalHours}`;
+
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
                 }
