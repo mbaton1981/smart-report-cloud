@@ -4,8 +4,10 @@ import ast
 import os
 import shutil
 import logging
+import csv
+import io
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, render_template, request, jsonify, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Настройка системного логирования
@@ -725,6 +727,64 @@ def check_missing_shifts():
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
 
+@app.route('/export-shifts-csv', methods=['POST'])
+def export_shifts_csv():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
+    data = request.json or {}
+    selected_month = data.get('month')
+    empName = data.get('employee')
+
+    if not selected_month or not empName:
+        return jsonify({"ok": False, "error": "Не указан месяц или сотрудник"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        year, month = map(int, selected_month.split('-'))
+        start_date = datetime(year, month, 1).strftime('%Y-%m-%d')
+        if month == 12:
+            end_date = datetime(year + 1, 1, 1).strftime('%Y-%m-%d')
+        else:
+            end_date = datetime(year, month + 1, 1).strftime('%Y-%m-%d')
+        
+        cursor.execute("""
+            SELECT date, company, object_name, hours, rate, transport, comment 
+            FROM cloud_shifts 
+            WHERE employee = ? AND date >= ? AND date < ? 
+            ORDER BY date ASC
+        """, (empName, start_date, end_date))
+        rows = cursor.fetchall()
+    except Exception as e:
+        conn.close()
+        return jsonify({"ok": False, "error": str(e)}), 400
+    
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(['Дата', 'Сотрудник', 'Фирма', 'Объект', 'Часы', 'Ставка', 'Транспорт', 'Комментарий'])
+    
+    for r in rows:
+        writer.writerow([
+            r['date'], 
+            empName, 
+            r['company'], 
+            r['object_name'], 
+            r['hours'], 
+            r['rate'], 
+            r['transport'], 
+            r['comment'] or ''
+        ])
+
+    csv_data = output.getvalue().encode('utf-8-sig')
+    response = make_response(csv_data)
+    response.headers["Content-Disposition"] = f"attachment; filename=report_{empName}_{selected_month}.csv"
+    response.headers["Content-type"] = "text/csv; charset=utf-8-sig"
+    return response
+
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -868,7 +928,6 @@ def sync_desktop_data():
                     hrs_val, rate_val, transport_val, comment_val
                 ))
 
-            # 🔄 Исправленное зеркалирование: проверяем все смены начиная с min_date для синхронизируемых сотрудников
             if min_date and synced_employees:
                 placeholders = ','.join(['?'] * len(synced_employees))
                 query = f"SELECT id, date, employee, object_name, hours, company FROM cloud_shifts WHERE date >= ? AND employee IN ({placeholders})"
