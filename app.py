@@ -5,6 +5,7 @@ import traceback
 import subprocess
 import sqlite3
 import requests
+import uuid
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -90,6 +91,7 @@ def init_db_once():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT UNIQUE,
             date TEXT NOT NULL,
             employee TEXT NOT NULL,
             company TEXT NOT NULL,
@@ -101,6 +103,20 @@ def init_db_once():
             invoiced INTEGER DEFAULT 0
         )
     ''')
+
+    cursor.execute("PRAGMA table_info(shifts)")
+    shift_cols = [col[1] for col in cursor.fetchall()]
+    if 'request_id' not in shift_cols:
+        try:
+            cursor.execute("ALTER TABLE shifts ADD COLUMN request_id TEXT UNIQUE")
+        except Exception:
+            pass
+    if 'invoiced' not in shift_cols:
+        try:
+            cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS balance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,11 +135,6 @@ def init_db_once():
             amount REAL NOT NULL
         )
     ''')
-
-    cursor.execute("PRAGMA table_info(shifts)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'invoiced' not in columns:
-        cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
 
     cursor.execute("SELECT COUNT(*) FROM employees")
     if cursor.fetchone()[0] == 0:
@@ -325,7 +336,6 @@ DARK_THEME_QSS = """
         border-radius: 6px;
         selection-background-color: #3182ce;
         selection-color: #ffffff;
-         /* Делает курсор ввода (палочку) ярко-голубым и заметным */
     }
     QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
         border: 1px solid #63b3ed;
@@ -359,11 +369,9 @@ DARK_THEME_QSS = """
         gridline-color: #2d3748;
         border: 1px solid #323946;
         border-radius: 6px;
-        /* Делаем выбранную строку или ячейку ярко-синей с белым текстом */
         selection-background-color: #2b6cb0;
         selection-color: #ffffff;
     }
-    /* Добавляем четкую подсветку активной строки под курсором */
     QTableWidget::item:selected {
         background-color: #3182ce;
         color: #ffffff;
@@ -383,6 +391,7 @@ DARK_THEME_QSS = """
         padding: 12px;
     }
 """
+
 def create_date_field(default_date_str=""):
     date_edit = QDateEdit()
     date_edit.setCalendarPopup(True)
@@ -613,17 +622,29 @@ class SmartReportApp(QMainWindow):
             response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=15)
             if response.status_code == 200:
                 data = response.json()
-                shifts_from_phone = data.get("shifts", [])
+                shifts_from_cloud = data.get("shifts", [])
                 
-                if shifts_from_phone:
+                if shifts_from_cloud:
                     downloaded_ids = []
-                    for s in shifts_from_phone:
-                        cursor.execute('''
-                            SELECT id FROM shifts 
-                            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
+                    for s in shifts_from_cloud:
+                        req_id = s.get('request_id')
                         
-                        if not cursor.fetchone():
+                        # 🛡 Надежная проверка по уникальному request_id или по набору параметров
+                        exists = False
+                        if req_id:
+                            cursor.execute("SELECT id FROM shifts WHERE request_id = ?", (req_id,))
+                            if cursor.fetchone():
+                                exists = True
+                        
+                        if not exists:
+                            cursor.execute('''
+                                SELECT id FROM shifts 
+                                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ? AND rate = ?
+                            ''', (s['date'], s['employee'], s['object_name'], s['hours'], s.get('rate', 0.0)))
+                            if cursor.fetchone():
+                                exists = True
+
+                        if not exists:
                             obj_rate_val = s.get('rate', 0.0)
                             if not obj_rate_val or obj_rate_val == 0.0:
                                 cursor.execute("SELECT rate FROM objects WHERE name = ?", (s['object_name'],))
@@ -632,20 +653,29 @@ class SmartReportApp(QMainWindow):
                                     obj_rate_val = obj_r_row[0]
 
                             cursor.execute('''
-                                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                INSERT INTO shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                             ''', (
+                                req_id if req_id else str(uuid.uuid4()),
                                 s['date'], s['employee'], s['company'], s['object_name'], 
                                 s['hours'], obj_rate_val, s.get('transport', 0.0), s.get('comment', '')
                             ))
                             
-                        downloaded_ids.append(s['id'])
+                        if 'id' in s:
+                            downloaded_ids.append(s['id'])
 
                     conn.commit()
                     if downloaded_ids:
                         requests.post(f"{CLOUD_URL}/mark-synced", headers=headers, json={"ids": downloaded_ids}, timeout=10)
         except Exception:
             pass
+
+        # Убедимся, что у всех существующих локальных смен есть request_id
+        cursor.execute("SELECT id FROM shifts WHERE request_id IS NULL OR request_id = ''")
+        no_req_shifts = cursor.fetchall()
+        for r in no_req_shifts:
+            cursor.execute("UPDATE shifts SET request_id = ? WHERE id = ?", (str(uuid.uuid4()), r[0]))
+        conn.commit()
 
         cursor.execute("SELECT name FROM employees ORDER BY name")
         employees = [row[0] for row in cursor.fetchall()]
@@ -656,15 +686,15 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
         objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
         
-        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
+        cursor.execute("SELECT request_id, date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
         local_shift_rows = cursor.fetchall()
         conn.close()
 
         all_local_shifts = []
         for r in local_shift_rows:
             all_local_shifts.append({
-                "date": r[0], "employee": r[1], "company": r[2], "object_name": r[3],
-                "hours": r[4], "rate": r[5], "transport": r[6], "comment": r[7]
+                "request_id": r[0], "date": r[1], "employee": r[2], "company": r[3], "object_name": r[4],
+                "hours": r[5], "rate": r[6], "transport": r[7], "comment": r[8]
             })
 
         metadata_payload = {
@@ -1746,7 +1776,6 @@ class SmartReportApp(QMainWindow):
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
         
-        # Кнопка установки/задания ПИН-кода
         set_pin_btn = QPushButton("🔑 Задать ПИН")
         set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
@@ -2083,7 +2112,6 @@ class SmartReportApp(QMainWindow):
             return
         emp_name = self.table_employees.item(selected, 0).text()
         
-        # Открываем диалоговое окно для ввода ПИН-кода
         new_pin, ok = QInputDialog.getText(
             self, 
             "Установка ПИН-кода", 
@@ -2165,12 +2193,14 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Проверьте правильность часов и ставки!")
             return
 
+        req_id = str(uuid.uuid4())
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-        ''', (date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment))
+            INSERT INTO shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, invoiced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ''', (req_id, date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment))
         conn.commit()
         conn.close()
         
