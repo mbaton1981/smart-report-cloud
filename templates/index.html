@@ -28,6 +28,11 @@
         }
         #history-list li { background: #1a2332; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #2e5b88; font-size: 13px; color: #dfe6e9; display: flex; justify-content: space-between; align-items: center; }
 
+        /* Уведомления формы */
+        #form-alert { display: none; margin-top: 15px; padding: 12px; border-radius: 6px; text-align: center; font-weight: bold; font-size: 14px; }
+        #form-alert.success { background: #27ae60; color: #fff; }
+        #form-alert.error { background: #c0392b; color: #fff; }
+
         /* Модальное окно авторизации */
         #login-modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.75); z-index: 100; display: flex; align-items: center; justify-content: center; }
         #login-modal.hidden { display: none; }
@@ -127,6 +132,9 @@
 
                 <button type="submit">Отправить смену</button>
             </form>
+
+            <!-- Блок плавающего уведомления прямо в форме -->
+            <div id="form-alert"></div>
         </div>
 
         <!-- ПРАВАЯ КОЛОНКА: Блок просмотра истории -->
@@ -177,6 +185,18 @@
         document.getElementById('transport_check').addEventListener('change', function() {
             document.getElementById('transport').value = this.checked ? 1.0 : 0.0;
         });
+
+        // Функция показа уведомлений вместо alert
+        function showFormAlert(message, type) {
+            const alertBox = document.getElementById('form-alert');
+            alertBox.textContent = message;
+            alertBox.className = type; // 'success' или 'error'
+            alertBox.style.display = 'block';
+
+            setTimeout(() => {
+                alertBox.style.display = 'none';
+            }, 3500);
+        }
 
         // Функция динамической фильтрации объектов по выбранной фирме
         function filterObjects() {
@@ -355,13 +375,13 @@
                 
                 const result = await response.json();
                 if (response.ok) {
-                    alert("Смена успешно отправлена!");
+                    showFormAlert("Смена успешно отправлена!", "success");
                     document.getElementById('comment').value = '';
                 } else {
-                    alert("Ошибка: " + (result.error || result.message || "Не удалось отправить"));
+                    showFormAlert("Ошибка: " + (result.error || result.message || "Не удалось отправить"), "error");
                 }
             } catch (err) {
-                alert("Не удалось отправить данные на сервер.");
+                showFormAlert("Не удалось отправить данные на сервер.", "error");
                 console.error(err);
             }
         });
