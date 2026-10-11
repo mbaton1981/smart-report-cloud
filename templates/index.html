@@ -5,12 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bygger och renoverar i Sthlm</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 15px; color: #2d3436; background-color: #f0f2f5; }
+        *, *::before, *::after { box-sizing: border-box; }
+        body { width: 100%; max-width: 800px; margin: 20px auto; padding: 0 15px; color: #2d3436; background-color: #f0f2f5; }
         h2 { text-align: center; color: #1b6ca8; font-size: 24px; margin-bottom: 20px; }
         .main-container { display: flex; flex-wrap: wrap; gap: 20px; }
         
-        .form-box { flex: 1; min-width: 320px; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; }
-        .history-box { flex: 1; min-width: 320px; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; height: fit-content; }
+        .form-box, .history-box { flex: 1 1 320px; min-width: 0; max-width: 100%; box-sizing: border-box; background: #ffffff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); border: 1px solid #dcdde1; }
+        .history-box { height: fit-content; }
         
         .form-group { margin-bottom: 18px; }
         
@@ -34,6 +35,9 @@
 
         button { background-color: #0984e3; color: white; padding: 14px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; font-weight: bold; transition: background 0.2s; }
         button:hover { background-color: #0765b7; }
+        button:focus-visible { outline: 3px solid #74b9ff; outline-offset: 2px; }
+        button:active { transform: translateY(1px); }
+        button:disabled { background-color: #a0a7ad; color: #fff; cursor: not-allowed; }
         .btn-history { background-color: #00b894; margin-top: 10px; }
         .btn-history:hover { background-color: #00a884; }
         .btn-print { background-color: #e67e22; margin-top: 10px; display: none; }
@@ -54,10 +58,16 @@
         .history-actions button { width: auto; max-width: 100%; flex: 0 0 auto; padding: 6px 9px; font-size: 13px; line-height: 1.2; white-space: nowrap; min-height: 36px; }
 
         @media (max-width: 768px) {
-            .main-container, .form-box, .history-box { min-width: 0; max-width: 100%; box-sizing: border-box; }
+            body { margin: 12px auto; padding: 0 12px; }
+            h2 { font-size: 21px; margin-bottom: 16px; }
+            .main-container { gap: 12px; min-width: 0; max-width: 100%; }
+            .form-box, .history-box { flex-basis: 100%; padding: 16px; }
+            .user-header { gap: 8px; padding: 10px 12px; }
+            #user-info-text { min-width: 0; overflow-wrap: anywhere; }
             #history-list li { padding: 8px; gap: 6px; align-items: flex-start; }
             .history-actions { gap: 4px; }
             .history-actions button { padding: 5px 7px; font-size: 12px; min-height: 40px; }
+            button { padding: 11px 12px; font-size: 15px; }
         }
 
         /* Уведомления формы */

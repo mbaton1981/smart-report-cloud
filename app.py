@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
     QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
-    QDialog, QDialogButtonBox, QDoubleSpinBox
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QColor
@@ -494,6 +494,45 @@ DARK_THEME_QSS = """
     QPushButton:pressed {
         background-color: #4299e1;
         border-color: #3182ce;
+        padding-top: 8px;
+        padding-bottom: 6px;
+    }
+    QPushButton:disabled {
+        background-color: #252b35;
+        color: #718096;
+        border-color: #323946;
+    }
+    QPushButton:focus {
+        border: 2px solid #90cdf4;
+    }
+    QPushButton#primaryAction {
+        background-color: #2b6cb0;
+        border-color: #4299e1;
+    }
+    QPushButton#primaryAction:hover {
+        background-color: #3182ce;
+        border-color: #63b3ed;
+    }
+    QPushButton#secondaryAction, QPushButton#editShiftButton {
+        background-color: #2a313d;
+        border-color: #4a5568;
+    }
+    QPushButton#secondaryAction:hover, QPushButton#editShiftButton:hover {
+        background-color: #3c495f;
+        border-color: #90cdf4;
+    }
+    QPushButton#deleteShiftButton {
+        background-color: #632c2c;
+        border-color: #9b3c3c;
+    }
+    QPushButton#deleteShiftButton:hover {
+        background-color: #7a3434;
+        border-color: #c53030;
+    }
+    QPushButton#editShiftButton, QPushButton#deleteShiftButton {
+        padding: 5px 9px;
+        font-size: 12px;
+        min-height: 28px;
     }
     QPushButton#danger {
         background-color: #632c2c;
@@ -634,6 +673,24 @@ class SmartReportApp(QMainWindow):
         
         self.load_dropdowns()
 
+        current_tab = self.tabs.currentIndex()
+        blocked = self.tabs.blockSignals(True)
+        for index in range(self.tabs.count()):
+            title = self.tabs.tabText(index)
+            page = self.tabs.widget(index)
+            self.tabs.removeTab(index)
+            page.setMinimumWidth(0)
+            page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+            scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll_area.setWidget(page)
+            self.tabs.insertTab(index, scroll_area, title)
+        self.tabs.blockSignals(blocked)
+        self.tabs.setCurrentIndex(current_tab)
+
     def on_tab_changed(self, index):
         self.load_dropdowns()
         if index == 1:
@@ -690,6 +747,7 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
 
         save_btn = QPushButton("💾 Сохранить смену")
+        save_btn.setObjectName("primaryAction")
         save_btn.clicked.connect(self.save_shift)
         card_layout.addRow(save_btn)
 
@@ -703,16 +761,20 @@ class SmartReportApp(QMainWindow):
 
         btn_row = QHBoxLayout()
         refresh_shifts_btn = QPushButton("🔄 Обновить данные")
+        refresh_shifts_btn.setObjectName("secondaryAction")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
         
         sync_cloud_btn = QPushButton("🌐 Синхронизация с облаком")
-        sync_cloud_btn.setStyleSheet("background-color: #2b6cb0; border-color: #4299e1;")
+        sync_cloud_btn.setObjectName("primaryAction")
         sync_cloud_btn.clicked.connect(self.sync_with_cloud)
 
-        del_shift_btn = QPushButton("🗑 Удалить выбранную смену")
-        del_shift_btn.setObjectName("danger")
+        del_shift_btn = QPushButton("🗑 Удалить")
+        del_shift_btn.setObjectName("deleteShiftButton")
+        del_shift_btn.setToolTip("Удалить выбранную смену")
         del_shift_btn.clicked.connect(self.delete_shift)
-        edit_shift_btn = QPushButton("✏ Изменить смену")
+        edit_shift_btn = QPushButton("✏ Изменить")
+        edit_shift_btn.setObjectName("editShiftButton")
+        edit_shift_btn.setToolTip("Изменить выбранную смену")
         edit_shift_btn.clicked.connect(self.edit_shift)
 
         btn_row.addWidget(refresh_shifts_btn)
@@ -722,7 +784,9 @@ class SmartReportApp(QMainWindow):
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
 
-        filter_row = QHBoxLayout()
+        filter_layout = QVBoxLayout()
+        filter_date_row = QHBoxLayout()
+        filter_select_row = QHBoxLayout()
         
         self.filter_date_from = create_date_field("2026-10-01")
         self.filter_date_from.dateChanged.connect(self.apply_shifts_filters)
@@ -746,15 +810,19 @@ class SmartReportApp(QMainWindow):
         self.filter_status.addItems(["-- Все статусы --", "В работе", "Выставлен в счёт"])
         self.filter_status.currentIndexChanged.connect(self.apply_shifts_filters)
 
-        filter_row.addWidget(QLabel("<b>Период с:</b>"))
-        filter_row.addWidget(self.filter_date_from)
-        filter_row.addWidget(QLabel("<b>по:</b>"))
-        filter_row.addWidget(self.filter_date_to)
-        filter_row.addWidget(self.filter_emp)
-        filter_row.addWidget(self.filter_comp)
-        filter_row.addWidget(self.filter_obj)
-        filter_row.addWidget(self.filter_status)
-        c_layout.addLayout(filter_row)
+        filter_date_row.addWidget(QLabel("<b>Период с:</b>"))
+        filter_date_row.addWidget(self.filter_date_from, 1)
+        filter_date_row.addWidget(QLabel("<b>по:</b>"))
+        filter_date_row.addWidget(self.filter_date_to, 1)
+
+        for filter_combo in (self.filter_emp, self.filter_comp, self.filter_obj, self.filter_status):
+            filter_combo.setMinimumContentsLength(9)
+            filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            filter_select_row.addWidget(filter_combo, 1)
+
+        filter_layout.addLayout(filter_date_row)
+        filter_layout.addLayout(filter_select_row)
+        c_layout.addLayout(filter_layout)
 
         layout.addWidget(control_card)
 
@@ -764,7 +832,14 @@ class SmartReportApp(QMainWindow):
         self.table_shifts.setColumnCount(11)
         self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры"])
         self.table_shifts.setColumnHidden(0, True)
-        self.table_shifts.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        shifts_header = self.table_shifts.horizontalHeader()
+        shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column, width in {1: 95, 2: 130, 3: 110, 4: 170, 5: 85, 6: 65, 7: 90, 8: 85, 10: 125}.items():
+            self.table_shifts.setColumnWidth(column, width)
+        shifts_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        self.table_shifts.setColumnWidth(9, 210)
+        self.table_shifts.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table_shifts.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_shifts.setAlternatingRowColors(True)
         self.table_shifts.cellDoubleClicked.connect(lambda *_: self.edit_shift())
         layout.addWidget(self.table_shifts)
@@ -2685,6 +2760,8 @@ class SmartReportApp(QMainWindow):
                 values = [row[0], row[1], row[2], row[3], row[4], record_type_label(row[5]), row[6], row[7], row[8], row[9] or "", status_text]
                 for col_idx, val in enumerate(values):
                     it = QTableWidgetItem(str(val))
+                    if col_idx in (2, 3, 4, 9) and val:
+                        it.setToolTip(str(val))
                     if is_inv:
                         it.setBackground(QColor("#1c4532"))
                     self.table_shifts.setItem(row_idx, col_idx, it)
