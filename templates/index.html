@@ -39,14 +39,26 @@
         .btn-print { background-color: #e67e22; margin-top: 10px; display: none; }
         .btn-print:hover { background-color: #d35400; }
         
-        #history-list { 
-            list-style-type: none; 
-            padding: 0; 
-            margin: 0; 
-            max-height: 280px; 
-            overflow-y: auto; 
+        #history-list {
+            list-style-type: none;
+            padding: 0;
+            margin: 0;
+            max-height: 280px;
+            max-width: 100%;
+            box-sizing: border-box;
+            overflow-y: auto;
         }
-        #history-list li { background: #f1f2f6; margin-bottom: 8px; padding: 12px; border-radius: 6px; border: 1px solid #dcdde1; font-size: 14px; color: #2d3436; display: flex; justify-content: space-between; align-items: center; }
+        #history-list li { background: #f1f2f6; margin-bottom: 8px; padding: 12px; border-radius: 6px; border: 1px solid #dcdde1; font-size: 14px; color: #2d3436; display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; align-items: center; max-width: 100%; box-sizing: border-box; }
+        #history-list li > span:first-child { flex: 1 1 140px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+        .history-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 4px; align-items: center; margin-left: auto; max-width: 100%; }
+        .history-actions button { width: auto; max-width: 100%; flex: 0 0 auto; padding: 6px 9px; font-size: 13px; line-height: 1.2; white-space: nowrap; min-height: 36px; }
+
+        @media (max-width: 768px) {
+            .main-container, .form-box, .history-box { min-width: 0; max-width: 100%; box-sizing: border-box; }
+            #history-list li { padding: 8px; gap: 6px; align-items: flex-start; }
+            .history-actions { gap: 4px; }
+            .history-actions button { padding: 5px 7px; font-size: 12px; min-height: 40px; }
+        }
 
         /* Уведомления формы */
         #form-alert { display: none; margin-top: 15px; padding: 14px; border-radius: 6px; text-align: center; font-weight: bold; font-size: 15px; }
@@ -891,7 +903,7 @@
                         spanHours.textContent = `${shift.hours} ч`;
 
                         const actions = document.createElement('span');
-                        actions.style.cssText = 'display:flex;gap:6px;align-items:center;';
+                        actions.className = 'history-actions';
                         const editButton = document.createElement('button');
                         editButton.type = 'button';
                         editButton.textContent = 'Изменить';
