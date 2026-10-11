@@ -5,15 +5,18 @@ import traceback
 import subprocess
 import sqlite3
 import requests
+import json
+import uuid
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
-    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog
+    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
+    QDialog, QDialogButtonBox, QDoubleSpinBox
 )
-from PyQt6.QtCore import Qt, QDate, QTimer
+from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QColor
 
 # Импорты для генерации PDF
@@ -25,14 +28,29 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # Локальная база данных SQLite и папки
-DB_FILE = "smart_report.db"
+DB_FILE = os.environ.get("SMARTREPORT_DB_FILE", "smart_report.db")
 BACKUP_DIR = "backups"
 REPORTS_DIR = "reports"
 SALARIES_DIR = "salaries"
 
 # 🌐 Адрес облачного сервера на Render и ваш секретный ключ синхронизации
-CLOUD_URL = "https://smart-report-server.onrender.com"
-SYNC_API_KEY = "Alina1981!"
+CLOUD_URL = os.environ.get("SMARTREPORT_CLOUD_URL", "https://smart-report-server.onrender.com")
+SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
+
+RECORD_TYPE_WORK = "work"
+RECORD_TYPE_ATF = "atf"
+RECORD_TYPE_SICK = "sick"
+RECORD_TYPE_REVIEW = "review"
+RECORD_TYPE_LABELS = {
+    RECORD_TYPE_WORK: "Работа",
+    RECORD_TYPE_ATF: "АТФ",
+    RECORD_TYPE_SICK: "Больничный",
+    RECORD_TYPE_REVIEW: "Требует проверки",
+}
+SPECIAL_OBJECTS = {
+    RECORD_TYPE_ATF: ("Arbetstidsförkortning", "p1000"),
+    RECORD_TYPE_SICK: ("Sjuk", "p1001"),
+}
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
@@ -124,6 +142,77 @@ def init_db_once():
     columns = [col[1] for col in cursor.fetchall()]
     if 'invoiced' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
+    if 'sync_id' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN sync_id TEXT")
+    if 'sync_version' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 0")
+    entry_type_added = 'entry_type' not in columns
+    if entry_type_added:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'work'")
+        cursor.execute("SELECT id, company, object_name FROM shifts WHERE object_name IN (?, ?)", tuple(item[0] for item in SPECIAL_OBJECTS.values()))
+        for old_shift in cursor.fetchall():
+            matching_types = []
+            for record_type, (object_name, marking) in SPECIAL_OBJECTS.items():
+                if old_shift['object_name'] != object_name:
+                    continue
+                cursor.execute(
+                    "SELECT id FROM objects WHERE company = ? AND name = ? AND COALESCE(markning, '') = ?",
+                    (old_shift['company'], object_name, marking)
+                )
+                if len(cursor.fetchall()) == 1:
+                    matching_types.append(record_type)
+            migrated_type = matching_types[0] if len(matching_types) == 1 else RECORD_TYPE_REVIEW
+            cursor.execute("UPDATE shifts SET entry_type = ? WHERE id = ?", (migrated_type, old_shift['id']))
+    cursor.execute("PRAGMA table_info(shifts)")
+    columns = {col[1] for col in cursor.fetchall()}
+    if 'work_rate_cache' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN work_rate_cache REAL NOT NULL DEFAULT 0.0")
+    if 'work_transport_cache' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN work_transport_cache REAL NOT NULL DEFAULT 0.0")
+    cursor.execute("UPDATE shifts SET work_rate_cache = COALESCE(rate, 0.0), work_transport_cache = COALESCE(transport, 0.0) WHERE entry_type = 'work'")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shift_sync_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL UNIQUE,
+            sync_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            base_version INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_shift_sync_outbox_pending ON shift_sync_outbox(state, sync_id, id)")
+    cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE state = 'pending' AND sync_id IN (SELECT sync_id FROM shifts WHERE entry_type <> ?)", (RECORD_TYPE_WORK,))
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shift_sync_state (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    cursor.execute("INSERT OR IGNORE INTO shift_sync_state (name, value) VALUES ('cursor', 0)")
+
+    cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, entry_type FROM shifts")
+    existing_shifts = cursor.fetchall()
+    for shift in existing_shifts:
+        sync_id = shift['sync_id'] or str(uuid.uuid4())
+        if not shift['sync_id']:
+            cursor.execute("UPDATE shifts SET sync_id = ? WHERE id = ?", (sync_id, shift['id']))
+            payload = {
+                "date": shift['date'], "employee": shift['employee'], "company": shift['company'],
+                "object_name": shift['object_name'], "hours": shift['hours'], "rate": shift['rate'],
+                "transport": shift['transport'] or 0.0, "comment": shift['comment'] or "",
+                "record_type": shift['entry_type'],
+                "invoiced": shift['invoiced'] or 0
+            }
+            cursor.execute('''
+                INSERT OR IGNORE INTO shift_sync_outbox
+                    (operation_id, sync_id, operation, base_version, payload_json, created_at)
+                VALUES (?, ?, 'upsert', 0, ?, ?)
+            ''', (str(uuid.uuid4()), sync_id, json.dumps(payload), datetime.utcnow().isoformat()))
+    cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE state = 'pending' AND sync_id IN (SELECT sync_id FROM shifts WHERE entry_type <> ?)", (RECORD_TYPE_WORK,))
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shifts_sync_id ON shifts(sync_id) WHERE sync_id IS NOT NULL")
 
     cursor.execute("SELECT COUNT(*) FROM employees")
     if cursor.fetchone()[0] == 0:
@@ -187,6 +276,103 @@ def init_db_once():
 
     conn.commit()
     conn.close()
+
+def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, state=None):
+    record_type = payload.get('record_type', RECORD_TYPE_WORK)
+    if record_type != RECORD_TYPE_WORK:
+        cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
+        if operation == 'delete' and int(base_version) == 0:
+            return
+    state = state or ('pending' if record_type == RECORD_TYPE_WORK else 'blocked')
+    cursor.execute('''
+        INSERT INTO shift_sync_outbox
+            (operation_id, sync_id, operation, base_version, payload_json, state, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        str(uuid.uuid4()), sync_id, operation, int(base_version),
+        json.dumps(payload, ensure_ascii=False), state, datetime.utcnow().isoformat()
+    ))
+
+
+def compact_blocked_shift_operations(cursor):
+    cursor.execute("SELECT DISTINCT sync_id FROM shift_sync_outbox WHERE state = 'blocked'")
+    sync_ids = [row['sync_id'] for row in cursor.fetchall()]
+    released = 0
+    for sync_id in sync_ids:
+        cursor.execute("SELECT * FROM shifts WHERE sync_id = ?", (sync_id,))
+        local = cursor.fetchone()
+        if local:
+            if local['entry_type'] not in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+                continue
+            payload = shift_payload(local)
+            cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
+            enqueue_shift_operation(cursor, sync_id, 'upsert', local['sync_version'], payload, state='pending')
+            released += 1
+            continue
+
+        cursor.execute("SELECT * FROM shift_sync_outbox WHERE sync_id = ? AND state = 'blocked' ORDER BY id DESC", (sync_id,))
+        blocked = cursor.fetchall()
+        tombstone = next((row for row in blocked if row['operation'] == 'delete'), None)
+        if tombstone and int(tombstone['base_version']) > 0:
+            payload = json.loads(tombstone['payload_json'])
+            if payload.get('record_type') in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+                cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
+                enqueue_shift_operation(cursor, sync_id, 'delete', tombstone['base_version'], payload, state='pending')
+                released += 1
+        else:
+            cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
+    return released
+
+def shift_payload(row):
+    return {
+        "date": row['date'], "employee": row['employee'], "company": row['company'],
+        "object_name": row['object_name'], "hours": row['hours'], "rate": row['rate'],
+        "transport": row['transport'] or 0.0, "comment": row['comment'] or "",
+        "record_type": row['entry_type'] if 'entry_type' in row.keys() else RECORD_TYPE_WORK,
+        "invoiced": row['invoiced'] or 0
+    }
+
+
+def record_type_label(record_type):
+    return RECORD_TYPE_LABELS.get(record_type, RECORD_TYPE_LABELS[RECORD_TYPE_REVIEW])
+
+
+def resolve_special_object(cursor, company, record_type):
+    reference = SPECIAL_OBJECTS.get(record_type)
+    if not reference:
+        return None, "Неизвестный тип записи."
+    cursor.execute(
+        "SELECT id, name, markning, company FROM objects WHERE company = ? AND name = ? AND COALESCE(markning, '') = ?",
+        (company, reference[0], reference[1])
+    )
+    matches = cursor.fetchall()
+    if len(matches) != 1:
+        if not matches:
+            return None, f"В справочнике фирмы «{company}» не найдена запись «{reference[0]} / {reference[1]}»."
+        return None, f"В справочнике фирмы «{company}» неоднозначна запись «{reference[0]} / {reference[1]}»."
+    return matches[0], None
+
+def enqueue_matching_shifts(cursor, where_clause, params):
+    cursor.execute(f"SELECT * FROM shifts WHERE {where_clause}", params)
+    for row in cursor.fetchall():
+        sync_id = row['sync_id'] or str(uuid.uuid4())
+        if not row['sync_id']:
+            cursor.execute("UPDATE shifts SET sync_id = ? WHERE id = ?", (sync_id, row['id']))
+        enqueue_shift_operation(cursor, sync_id, 'upsert', row['sync_version'], shift_payload(row))
+
+class SyncWorker(QThread):
+    completed = pyqtSignal(bool, int, str)
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+
+    def run(self):
+        try:
+            conflicts = self.window.perform_sync_logic()
+            self.completed.emit(True, conflicts, "")
+        except Exception as error:
+            self.completed.emit(False, 0, str(error))
 
 def parse_float(val_str, default=0.0):
     if not val_str:
@@ -408,7 +594,9 @@ class SmartReportApp(QMainWindow):
 
         self.auto_sync_timer = QTimer(self)
         self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
-        self.auto_sync_timer.start(30000)
+        self._sync_worker = None
+        self._manual_sync_requested = False
+        self.auto_sync_timer.start(2000)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -470,10 +658,15 @@ class SmartReportApp(QMainWindow):
         self.emp_cb = QComboBox()
         self.comp_cb = QComboBox()
         self.load_companies_into_combobox(self.comp_cb)
+
+        self.record_type_cb = QComboBox()
+        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+            self.record_type_cb.addItem(record_type_label(record_type), record_type)
         
         self.obj_cb = QComboBox()
-        self.load_objects_for_company(self.comp_cb.currentText(), self.obj_cb)
-        self.comp_cb.currentTextChanged.connect(lambda comp: self.load_objects_for_company(comp, self.obj_cb))
+        self.load_objects_for_company(self.comp_cb.currentText(), self.obj_cb, RECORD_TYPE_WORK)
+        self.comp_cb.currentTextChanged.connect(self.reload_input_objects)
+        self.record_type_cb.currentIndexChanged.connect(self.reload_input_objects)
 
         self.hours_input = QLineEdit("8.0")
         self.rate_input = QLineEdit()
@@ -486,7 +679,11 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Дата (ГГГГ-ММ-ДД):", self.date_input)
         card_layout.addRow("Сотрудник:", self.emp_cb)
         card_layout.addRow("Фирма:", self.comp_cb)
+        card_layout.addRow("Тип записи:", self.record_type_cb)
         card_layout.addRow("Объект:", self.obj_cb)
+        self.record_type_status_lbl = QLabel("")
+        self.record_type_status_lbl.setWordWrap(True)
+        card_layout.addRow(self.record_type_status_lbl)
         card_layout.addRow("Часы:", self.hours_input)
         card_layout.addRow("Фактурная ставка (крон/час):", self.rate_input)
         card_layout.addRow("Транспорт (0 или 1):", self.trans_input)
@@ -515,9 +712,12 @@ class SmartReportApp(QMainWindow):
         del_shift_btn = QPushButton("🗑 Удалить выбранную смену")
         del_shift_btn.setObjectName("danger")
         del_shift_btn.clicked.connect(self.delete_shift)
+        edit_shift_btn = QPushButton("✏ Изменить смену")
+        edit_shift_btn.clicked.connect(self.edit_shift)
 
         btn_row.addWidget(refresh_shifts_btn)
         btn_row.addWidget(sync_cloud_btn)
+        btn_row.addWidget(edit_shift_btn)
         btn_row.addStretch()
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
@@ -561,11 +761,12 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>История смен в базе данных (зеленые — уже выставлены в счёт):</b>"))
         
         self.table_shifts = QTableWidget()
-        self.table_shifts.setColumnCount(10)
-        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Часы", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры"])
+        self.table_shifts.setColumnCount(11)
+        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры"])
         self.table_shifts.setColumnHidden(0, True)
         self.table_shifts.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_shifts.setAlternatingRowColors(True)
+        self.table_shifts.cellDoubleClicked.connect(lambda *_: self.edit_shift())
         layout.addWidget(self.table_shifts)
         self.load_shifts_history()
 
@@ -584,7 +785,7 @@ class SmartReportApp(QMainWindow):
             emp_cell = self.table_shifts.item(row, 2).text()
             comp_cell = self.table_shifts.item(row, 3).text()
             obj_cell = self.table_shifts.item(row, 4).text()
-            status_cell = self.table_shifts.item(row, 9).text()
+            status_cell = self.table_shifts.item(row, 10).text()
 
             if d_from and d_to and not (d_from <= date_cell <= d_to):
                 match = False
@@ -601,95 +802,272 @@ class SmartReportApp(QMainWindow):
 
             self.table_shifts.setRowHidden(row, not match)
 
+    def reload_input_objects(self, *_):
+        record_type = self.record_type_cb.currentData()
+        if record_type in SPECIAL_OBJECTS:
+            self.record_type_status_lbl.setText("Тип хранится отдельно и не входит в оплату. Сервер пока не поддерживает синхронизацию АТФ/больничного.")
+        else:
+            self.record_type_status_lbl.clear()
+        company = self.comp_cb.currentText()
+        if not company:
+            self.load_objects_for_company(company, self.obj_cb, record_type)
+            return
+        if self.load_objects_for_company(company, self.obj_cb, record_type):
+            return
+        if record_type in SPECIAL_OBJECTS:
+            conn = get_db_connection()
+            _, error = resolve_special_object(conn.cursor(), company, record_type)
+            conn.close()
+            QMessageBox.warning(self, "Справочник объекта", error or "Не удалось выбрать справочную запись.")
+
+    def apply_remote_shift(self, cursor, shift):
+        sync_id = str(shift.get('sync_id') or shift.get('request_id') or '').strip()
+        if not sync_id:
+            return
+
+        cursor.execute("SELECT * FROM shifts WHERE sync_id = ?", (sync_id,))
+        local = cursor.fetchone()
+        if shift.get('deleted'):
+            cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
+            if local:
+                cursor.execute("DELETE FROM shifts WHERE sync_id = ?", (sync_id,))
+            return
+        cursor.execute("SELECT operation, payload_json FROM shift_sync_outbox WHERE sync_id = ? AND state = 'blocked' ORDER BY id DESC LIMIT 1", (sync_id,))
+        blocked_change = cursor.fetchone()
+        if blocked_change:
+            blocked_payload = json.loads(blocked_change['payload_json'])
+            if blocked_change['operation'] == 'delete' or blocked_payload.get('record_type') != RECORD_TYPE_WORK:
+                return
+        if not local and shift.get('source') == 'legacy':
+            cursor.execute('''
+                SELECT * FROM shifts
+                WHERE date = ? AND employee = ? AND company = ? AND object_name = ? AND hours = ?
+            ''', (shift['date'], shift['employee'], shift['company'], shift['object_name'], shift['hours']))
+            candidates = cursor.fetchall()
+            if len(candidates) == 1:
+                local = candidates[0]
+                previous_sync_id = local['sync_id']
+                cursor.execute("UPDATE shifts SET sync_id = ?, sync_version = ? WHERE id = ?", (sync_id, shift['version'], local['id']))
+                cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state = 'pending'", (previous_sync_id,))
+                cursor.execute("SELECT * FROM shifts WHERE id = ?", (local['id'],))
+                local = cursor.fetchone()
+
+        if local and local['entry_type'] != RECORD_TYPE_WORK:
+            cursor.execute("SELECT 1 FROM shift_sync_outbox WHERE sync_id = ? AND state = 'blocked' LIMIT 1", (sync_id,))
+            if cursor.fetchone():
+                return
+
+        cursor.execute("SELECT 1 FROM shift_sync_outbox WHERE sync_id = ? AND state = 'pending' LIMIT 1", (sync_id,))
+        has_pending = cursor.fetchone() is not None
+        remote_version = int(shift.get('version', 1))
+        if local and has_pending:
+            if remote_version > local['sync_version']:
+                cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE sync_id = ? AND state = 'pending'", (sync_id,))
+            else:
+                return
+
+        record_type = shift.get('record_type', shift.get('submission_type', RECORD_TYPE_WORK))
+        if record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+            record_type = RECORD_TYPE_REVIEW
+        if record_type == RECORD_TYPE_WORK:
+            work_rate_cache = float(shift.get('rate', 0.0) or 0.0)
+            work_transport_cache = float(shift.get('transport', 0.0) or 0.0)
+        elif local:
+            if local['entry_type'] == RECORD_TYPE_WORK:
+                work_rate_cache = float(local['rate'] or 0.0)
+                work_transport_cache = float(local['transport'] or 0.0)
+            else:
+                work_rate_cache = float(local['work_rate_cache'] or 0.0)
+                work_transport_cache = float(local['work_transport_cache'] or 0.0)
+        else:
+            work_rate_cache = float(shift.get('rate', 0.0) or 0.0)
+            work_transport_cache = float(shift.get('transport', 0.0) or 0.0)
+        stored_rate = float(shift.get('rate', 0.0) or 0.0) if record_type == RECORD_TYPE_WORK else 0.0
+        stored_transport = float(shift.get('transport', 0.0) or 0.0) if record_type == RECORD_TYPE_WORK else 0.0
+        values = (
+            shift['date'], shift['employee'], shift['company'], shift['object_name'], shift['hours'],
+            stored_rate, stored_transport, shift.get('comment', ''),
+            int(bool(shift.get('invoiced', 0))) if record_type == RECORD_TYPE_WORK else 0,
+            remote_version, record_type, work_rate_cache, work_transport_cache
+        )
+        if local:
+            if remote_version <= local['sync_version']:
+                return
+            cursor.execute('''
+                UPDATE shifts SET date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
+                    rate = ?, transport = ?, comment = ?, invoiced = ?, sync_version = ?, entry_type = ?,
+                    work_rate_cache = ?, work_transport_cache = ?
+                WHERE sync_id = ?
+            ''', values + (sync_id,))
+        else:
+            cursor.execute('''
+                INSERT INTO shifts
+                    (date, employee, company, object_name, hours, rate, transport, comment, invoiced,
+                     sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache))
+
     def perform_sync_logic(self):
+        headers = {"X-Sync-Key": SYNC_API_KEY}
+        downloaded_ids = []
+        typed_sync_supported = False
+        try:
+            capabilities = requests.get(f"{CLOUD_URL}/sync/capabilities", headers=headers, timeout=4)
+            if capabilities.status_code == 200:
+                capability_data = capabilities.json()
+                typed_sync_supported = (
+                    {RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK}.issubset(
+                        set(capability_data.get('submission_types', []))
+                    ) and capability_data.get('typed_tombstones') is True
+                )
+        except requests.RequestException:
+            typed_sync_supported = False
+
+        response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=4)
+        response.raise_for_status()
+        downloaded = response.json().get('shifts', [])
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        headers = {"X-Sync-Key": SYNC_API_KEY}
-        
         try:
-            response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                shifts_from_phone = data.get("shifts", [])
-                
-                if shifts_from_phone:
-                    downloaded_ids = []
-                    for s in shifts_from_phone:
-                        cursor.execute('''
-                            SELECT id FROM shifts 
-                            WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-                        ''', (s['date'], s['employee'], s['object_name'], s['hours']))
-                        
-                        if not cursor.fetchone():
-                            obj_rate_val = s.get('rate', 0.0)
-                            if not obj_rate_val or obj_rate_val == 0.0:
-                                cursor.execute("SELECT rate FROM objects WHERE name = ?", (s['object_name'],))
-                                obj_r_row = cursor.fetchone()
-                                if obj_r_row and obj_r_row[0]:
-                                    obj_rate_val = obj_r_row[0]
-
-                            cursor.execute('''
-                                INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-                            ''', (
-                                s['date'], s['employee'], s['company'], s['object_name'], 
-                                s['hours'], obj_rate_val, s.get('transport', 0.0), s.get('comment', '')
-                            ))
-                            
-                        downloaded_ids.append(s['id'])
-
-                    conn.commit()
-                    if downloaded_ids:
-                        requests.post(f"{CLOUD_URL}/mark-synced", headers=headers, json={"ids": downloaded_ids}, timeout=10)
+            cursor.execute("BEGIN IMMEDIATE")
+            for shift in downloaded:
+                self.apply_remote_shift(cursor, shift)
+                downloaded_ids.append(shift['id'])
+            conn.commit()
         except Exception:
-            pass
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
-        cursor.execute("SELECT name FROM employees ORDER BY name")
-        employees = [row[0] for row in cursor.fetchall()]
-        
-        cursor.execute("SELECT name FROM companies ORDER BY name")
-        companies = [row[0] for row in cursor.fetchall()]
-        
-        cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
-        objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
-        
-        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment FROM shifts")
-        local_shift_rows = cursor.fetchall()
+        if downloaded_ids:
+            acknowledged = requests.post(
+                f"{CLOUD_URL}/mark-synced", headers=headers, json={"ids": downloaded_ids}, timeout=4
+            )
+            acknowledged.raise_for_status()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM shift_sync_state WHERE name = 'cursor'")
+        current_cursor = cursor.fetchone()[0]
         conn.close()
 
-        all_local_shifts = []
-        for r in local_shift_rows:
-            all_local_shifts.append({
-                "date": r[0], "employee": r[1], "company": r[2], "object_name": r[3],
-                "hours": r[4], "rate": r[5], "transport": r[6], "comment": r[7]
+        response = requests.get(
+            f"{CLOUD_URL}/sync/pull", headers=headers, params={"since": current_cursor}, timeout=4
+        )
+        response.raise_for_status()
+        pulled = response.json()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            for shift in pulled.get('changes', []):
+                self.apply_remote_shift(cursor, shift)
+            cursor.execute("UPDATE shift_sync_state SET value = ? WHERE name = 'cursor'", (pulled.get('cursor', current_cursor),))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        if typed_sync_supported:
+            compact_blocked_shift_operations(cursor)
+        cursor.execute('''
+            SELECT o.operation_id, o.sync_id, o.operation, o.base_version, o.payload_json
+            FROM shift_sync_outbox o
+            WHERE o.state = 'pending'
+            ORDER BY o.id
+        ''')
+        pending_rows = cursor.fetchall()
+        conn.commit()
+        conn.close()
+        changes = []
+        seen_sync_ids = set()
+        for row in pending_rows:
+            if row['sync_id'] in seen_sync_ids:
+                continue
+            seen_sync_ids.add(row['sync_id'])
+            changes.append({
+                "operation_id": row['operation_id'], "sync_id": row['sync_id'],
+                "operation": row['operation'], "base_version": row['base_version'],
+                "shift": json.loads(row['payload_json'])
             })
 
-        metadata_payload = {
-            "employees": employees,
-            "companies": companies,
-            "objects": objects,
-            "shifts": all_local_shifts
-        }
-        try:
-            requests.post(f"{CLOUD_URL}/sync-desktop-data", headers=headers, json=metadata_payload, timeout=20)
-        except Exception:
-            pass
+        conflicts = 0
+        if changes:
+            pushed = requests.post(
+                f"{CLOUD_URL}/sync/push", headers=headers, json={"changes": changes}, timeout=4
+            )
+            pushed.raise_for_status()
+            results = {result['operation_id']: result for result in pushed.json().get('results', [])}
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                for change in changes:
+                    result = results.get(change['operation_id'], {})
+                    if result.get('ok'):
+                        version = int(result.get('version', change['base_version'] + 1))
+                        cursor.execute("UPDATE shifts SET sync_version = ? WHERE sync_id = ?", (version, change['sync_id']))
+                        cursor.execute("DELETE FROM shift_sync_outbox WHERE operation_id = ?", (change['operation_id'],))
+                        cursor.execute('''
+                            UPDATE shift_sync_outbox SET base_version = ?
+                            WHERE sync_id = ? AND state = 'pending'
+                            AND id = (SELECT MIN(id) FROM shift_sync_outbox WHERE sync_id = ? AND state = 'pending')
+                        ''', (version, change['sync_id'], change['sync_id']))
+                    elif result.get('conflict'):
+                        conflicts += 1
+                        cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE operation_id = ?", (change['operation_id'],))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM employees ORDER BY name")
+        employees = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name FROM companies ORDER BY name")
+        companies = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
+        objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
+        conn.close()
+        metadata_response = requests.post(
+            f"{CLOUD_URL}/sync-desktop-data", headers=headers,
+            json={"employees": employees, "companies": companies, "objects": objects, "shifts": []}, timeout=4
+        )
+        metadata_response.raise_for_status()
+        return conflicts
+
+    def _on_sync_completed(self, success, conflicts, error):
+        self._sync_worker = None
+        if success:
+            self.load_shifts_history()
+        if self._manual_sync_requested:
+            self._manual_sync_requested = False
+            if success and not conflicts:
+                QMessageBox.information(self, "Синхронизация", "Синхронизация завершена.")
+            elif success:
+                QMessageBox.warning(self, "Конфликт синхронизации", f"Есть конфликтующих изменений: {conflicts}. Несохранённые данные оставлены в локальной очереди.")
+            else:
+                QMessageBox.warning(self, "Нет связи", f"Изменения сохранены локально и будут отправлены после восстановления связи.\n{error}")
 
     def sync_with_cloud(self):
-        try:
-            self.perform_sync_logic()
-            self.load_shifts_history()
-            QMessageBox.information(self, "Успех", "Синхронизация с защищенным облаком успешно завершена!")
-        except requests.exceptions.RequestException as e:
-            QMessageBox.critical(self, "Ошибка сети", f"Не удалось подключиться к облаку:\n{e}")
+        self._manual_sync_requested = True
+        self.background_sync_with_cloud()
 
     def background_sync_with_cloud(self):
-        try:
-            self.perform_sync_logic()
-            self.load_shifts_history()
-        except Exception:
-            pass
+        if self._sync_worker and self._sync_worker.isRunning():
+            return
+        self._sync_worker = SyncWorker(self)
+        self._sync_worker.completed.connect(self._on_sync_completed)
+        self._sync_worker.start()
 
     def setup_salary_tab(self):
         layout = QVBoxLayout(self.tab_salary)
@@ -699,12 +1077,16 @@ class SmartReportApp(QMainWindow):
         t_layout = QHBoxLayout(total_card)
         t_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        self.sal_summary_hours_lbl = QLabel("<b>Всего часов: 0.0</b>")
+        self.sal_summary_hours_lbl = QLabel("<b>Рабочие часы: 0.0</b>")
         self.sal_summary_hours_lbl.setStyleSheet("font-size: 14px; color: #63b3ed; border: none;")
+        self.sal_summary_atf_lbl = QLabel("<b>АТФ: 0.0 ч</b>")
+        self.sal_summary_sick_lbl = QLabel("<b>Больничный: 0.0 ч</b>")
         self.sal_summary_total_lbl = QLabel("<b>Итого к выплате: 0.00 kr</b>")
         self.sal_summary_total_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #ffffff; border: none;")
         
         t_layout.addWidget(self.sal_summary_hours_lbl)
+        t_layout.addWidget(self.sal_summary_atf_lbl)
+        t_layout.addWidget(self.sal_summary_sick_lbl)
         t_layout.addSpacing(30)
         t_layout.addWidget(self.sal_summary_total_lbl)
         layout.addWidget(total_card)
@@ -728,9 +1110,9 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(card)
         
         self.table_salary = QTableWidget()
-        self.table_salary.setColumnCount(6)
+        self.table_salary.setColumnCount(8)
         self.table_salary.setHorizontalHeaderLabels([
-            "Сотрудник", "Часы", "Зарп. ставка", "Отпускные (13%)", "Налог (Skatt ~30%)", "Итого к выплате"
+            "Сотрудник", "Рабочие часы", "АТФ, ч", "Больничный, ч", "Зарп. ставка", "Отпускные (13%)", "Налог (Skatt ~30%)", "Итого к выплате"
         ])
         self.table_salary.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_salary.setAlternatingRowColors(True)
@@ -755,7 +1137,10 @@ class SmartReportApp(QMainWindow):
         orig_names = {str(row[0]).strip().lower(): row[0] for row in emp_rows}
 
         cursor.execute("""
-            SELECT employee, SUM(hours) 
+                 SELECT employee,
+                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END),
+                     SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END),
+                     SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END)
             FROM shifts 
             WHERE date >= ? AND date <= ? 
             GROUP BY employee
@@ -764,17 +1149,21 @@ class SmartReportApp(QMainWindow):
         conn.close()
 
         sorted_keys = sorted(list(rates_map.keys()))
-        hours_map = {str(row[0]).strip().lower(): row[1] for row in shift_rows}
+        hours_map = {str(row[0]).strip().lower(): (row[1], row[2], row[3]) for row in shift_rows}
 
         self.table_salary.setRowCount(len(sorted_keys))
         sum_hrs_all = 0.0
+        sum_atf_all = 0.0
+        sum_sick_all = 0.0
         sum_net_all = 0.0
 
         for row_idx, key in enumerate(sorted_keys):
             emp_display_name = orig_names.get(key, key.title())
-            hrs = hours_map.get(key, 0.0)
+            hrs, atf_hours, sick_hours = hours_map.get(key, (0.0, 0.0, 0.0))
             salary_rate = rates_map.get(key, 0.0)
             sum_hrs_all += hrs
+            sum_atf_all += atf_hours
+            sum_sick_all += sick_hours
 
             work_sum = hrs * salary_rate
             vacation_pay = work_sum * 0.13
@@ -791,24 +1180,32 @@ class SmartReportApp(QMainWindow):
             item_hrs.setFlags(item_hrs.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_salary.setItem(row_idx, 1, item_hrs)
 
+            for column, hours_value in ((2, atf_hours), (3, sick_hours)):
+                item = QTableWidgetItem(f"{hours_value:.1f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table_salary.setItem(row_idx, column, item)
+
             item_rate = QTableWidgetItem(f"{salary_rate:.2f}")
             item_rate.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.table_salary.setItem(row_idx, 2, item_rate)
+            self.table_salary.setItem(row_idx, 4, item_rate)
 
-            for col_i, val in enumerate([vacation_pay, tax, net_total], start=3):
+            for col_i, val in enumerate([vacation_pay, tax, net_total], start=5):
                 item_res = QTableWidgetItem(f"{val:.2f}")
                 item_res.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 item_res.setFlags(item_res.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table_salary.setItem(row_idx, col_i, item_res)
 
-        self.sal_summary_hours_lbl.setText(f"<b>Всего часов: {sum_hrs_all:.1f}</b>")
+        self.sal_summary_hours_lbl.setText(f"<b>Рабочие часы: {sum_hrs_all:.1f}</b>")
+        self.sal_summary_atf_lbl.setText(f"<b>АТФ: {sum_atf_all:.1f} ч</b>")
+        self.sal_summary_sick_lbl.setText(f"<b>Больничный: {sum_sick_all:.1f} ч</b>")
         self.sal_summary_total_lbl.setText(f"<b>Итого к выплате: {sum_net_all:,.2f} kr</b>")
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
 
     def on_salary_cell_changed(self, row, col):
-        if col == 2:
+        if col == 4:
             emp_item = self.table_salary.item(row, 0)
-            rate_item = self.table_salary.item(row, 2)
+            rate_item = self.table_salary.item(row, 4)
             if not emp_item or not rate_item:
                 return
             emp_name = emp_item.text().strip()
@@ -828,7 +1225,7 @@ class SmartReportApp(QMainWindow):
 
     def calculate_salary_row(self, row_idx):
         hrs_item = self.table_salary.item(row_idx, 1)
-        rate_item = self.table_salary.item(row_idx, 2)
+        rate_item = self.table_salary.item(row_idx, 4)
         if not hrs_item or not rate_item:
             return
         hrs = parse_float(hrs_item.text(), 0.0)
@@ -844,7 +1241,7 @@ class SmartReportApp(QMainWindow):
         except TypeError:
             pass
 
-        for c_idx, val in enumerate([vacation_pay, tax, net_total], start=3):
+        for c_idx, val in enumerate([vacation_pay, tax, net_total], start=5):
             it = QTableWidgetItem(f"{val:.2f}")
             it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -852,14 +1249,20 @@ class SmartReportApp(QMainWindow):
 
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
         
-        sum_hrs, sum_net = 0.0, 0.0
+        sum_hrs, sum_atf, sum_sick, sum_net = 0.0, 0.0, 0.0, 0.0
         for r in range(self.table_salary.rowCount()):
             h_it = self.table_salary.item(r, 1)
-            n_it = self.table_salary.item(r, 5)
+            atf_it = self.table_salary.item(r, 2)
+            sick_it = self.table_salary.item(r, 3)
+            n_it = self.table_salary.item(r, 7)
             if h_it: sum_hrs += parse_float(h_it.text(), 0.0)
+            if atf_it: sum_atf += parse_float(atf_it.text(), 0.0)
+            if sick_it: sum_sick += parse_float(sick_it.text(), 0.0)
             if n_it: sum_net += parse_float(n_it.text(), 0.0)
             
-        self.sal_summary_hours_lbl.setText(f"<b>Всего часов: {sum_hrs:.1f}</b>")
+        self.sal_summary_hours_lbl.setText(f"<b>Рабочие часы: {sum_hrs:.1f}</b>")
+        self.sal_summary_atf_lbl.setText(f"<b>АТФ: {sum_atf:.1f} ч</b>")
+        self.sal_summary_sick_lbl.setText(f"<b>Больничный: {sum_sick:.1f} ч</b>")
         self.sal_summary_total_lbl.setText(f"<b>Итого к выплате: {sum_net:,.2f} kr</b>")
 
     def calculate_salary(self):
@@ -1065,7 +1468,7 @@ class SmartReportApp(QMainWindow):
         rates = {str(row[0]).strip().lower(): row[1] for row in cursor.fetchall()}
 
         cursor.execute("""
-            SELECT employee, SUM(hours) as total_hours 
+            SELECT employee, SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as total_hours
             FROM shifts 
             WHERE date >= ? AND date <= ? 
             GROUP BY employee
@@ -1213,16 +1616,20 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>Результат по объекту за период (зеленые строки уже закрыты):</b>"))
         
         self.table_invoice = QTableWidget()
-        self.table_invoice.setColumnCount(7)
-        self.table_invoice.setHorizontalHeaderLabels(["Сотрудник", "Часы", "Ставка", "Сумма (работа)", "Транспорт", "Итого", "Статус"])
+        self.table_invoice.setColumnCount(9)
+        self.table_invoice.setHorizontalHeaderLabels(["Сотрудник", "Рабочие часы", "АТФ, ч", "Больничный, ч", "Ставка", "Сумма (работа)", "Транспорт", "Итого", "Статус"])
         self.table_invoice.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_invoice.setAlternatingRowColors(True)
         layout.addWidget(self.table_invoice)
 
         summary_box = QHBoxLayout()
         self.inv_total_hours_lbl = QLabel("<b>Всего часов: 0</b>")
+        self.inv_total_atf_lbl = QLabel("<b>АТФ: 0 ч</b>")
+        self.inv_total_sick_lbl = QLabel("<b>Больничный: 0 ч</b>")
         self.inv_total_sum_lbl = QLabel("<b>Общая сумма: 0.00 kr</b>")
         summary_box.addWidget(self.inv_total_hours_lbl)
+        summary_box.addWidget(self.inv_total_atf_lbl)
+        summary_box.addWidget(self.inv_total_sick_lbl)
         summary_box.addStretch()
         summary_box.addWidget(self.inv_total_sum_lbl)
         layout.addLayout(summary_box)
@@ -1250,7 +1657,12 @@ class SmartReportApp(QMainWindow):
         fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
 
         cursor.execute('''
-            SELECT employee, SUM(hours) as total_hours, SUM(transport) as total_trans_count, MAX(invoiced) as invoiced_status
+                 SELECT employee,
+                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
+                     SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END) as atf_hours,
+                     SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END) as sick_hours,
+                     SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
+                     MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status
             FROM shifts
             WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
             GROUP BY employee
@@ -1261,16 +1673,20 @@ class SmartReportApp(QMainWindow):
 
         self.table_invoice.setRowCount(len(rows))
         total_hours_all = 0.0
+        total_atf_all = 0.0
+        total_sick_all = 0.0
         total_sum_all = 0.0
 
         for row_idx, row in enumerate(rows):
             emp = row[0]
-            hrs = row[1]
-            trans_count = row[2] or 0.0
-            is_inv = row[3] == 1
+            hrs, atf_hours, sick_hours = row[1], row[2], row[3]
+            trans_count = row[4] or 0.0
+            is_inv = row[5] == 1
             status_str = "✅ Выставлен" * is_inv or "⏳ В работе"
             
             total_hours_all += hrs
+            total_atf_all += atf_hours
+            total_sick_all += sick_hours
             transport_total_sum = trans_count * object_transport_rate
             
             if is_fast_pris:
@@ -1284,7 +1700,8 @@ class SmartReportApp(QMainWindow):
 
             total_sum_all += row_total
 
-            for col_idx, val in enumerate([emp, hrs, f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str]):
+            row_values = [emp, f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str]
+            for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
                 if is_inv:
                     it.setBackground(QColor("#1c4532"))
@@ -1292,11 +1709,13 @@ class SmartReportApp(QMainWindow):
 
         if is_fast_pris:
             total_sum_all = fast_pris_amount
-            self.inv_total_hours_lbl.setText(f"<b>Всего часов: {total_hours_all:.1f} (Fast pris)</b>")
+            self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f} (Fast pris)</b>")
             self.inv_total_sum_lbl.setText(f"<b>Общая сумма по договору: {fast_pris_amount:,.2f} kr</b>")
         else:
-            self.inv_total_hours_lbl.setText(f"<b>Всего часов: {total_hours_all:.1f}</b>")
+            self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f}</b>")
             self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
+        self.inv_total_atf_lbl.setText(f"<b>АТФ: {total_atf_all:.1f} ч</b>")
+        self.inv_total_sick_lbl.setText(f"<b>Больничный: {total_sick_all:.1f} ч</b>")
 
     def export_invoice_to_pdf(self):
         d_from = self.inv_date_from.text().strip()
@@ -1321,7 +1740,11 @@ class SmartReportApp(QMainWindow):
         fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
 
         cursor.execute('''
-            SELECT employee, SUM(hours) as total_hours, SUM(transport) as total_trans_count
+                 SELECT employee,
+                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
+                     SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END) as atf_hours,
+                     SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END) as sick_hours,
+                     SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport
             FROM shifts
             WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
             GROUP BY employee
@@ -1352,15 +1775,19 @@ class SmartReportApp(QMainWindow):
             story.append(Paragraph(f"<b>Fakturaunderlag (Underlag för faktura)</b><br/>Beställare (Firma): <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
             story.append(Spacer(1, 5))
 
-            table_data = [["Anställd", "Timmar", "Pris/tim (SEK)", "Arbete (SEK)", "Resa/Trans (SEK)", "Totalt (SEK)"]]
+            table_data = [["Anställd", "Arbete h", "ATF h", "Sjuk h", "Pris/tim", "Arbete (SEK)", "Resa (SEK)", "Totalt (SEK)"]]
             total_hours_all = 0.0
+            total_atf_all = 0.0
+            total_sick_all = 0.0
             total_sum_all = 0.0
 
             for row in rows:
                 emp = row[0]
-                hrs = row[1]
-                trans_count = row[2] or 0.0
+                hrs, atf_hours, sick_hours = row[1], row[2], row[3]
+                trans_count = row[4] or 0.0
                 total_hours_all += hrs
+                total_atf_all += atf_hours
+                total_sick_all += sick_hours
 
                 transport_total_sum = trans_count * object_transport_rate
 
@@ -1374,15 +1801,15 @@ class SmartReportApp(QMainWindow):
                     row_total = work_sum + transport_total_sum
 
                 total_sum_all += row_total
-                table_data.append([str(emp), f"{hrs:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}"])
+                table_data.append([str(emp), f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}"])
 
             if is_fast_pris:
                 total_sum_all = fast_pris_amount
-                table_data.append(["Fast pris (Enligt avtal)", "", "", "", "", f"{fast_pris_amount:.2f}"])
+                table_data.append(["Fast pris (Enligt avtal)", "", "", "", "", "", "", f"{fast_pris_amount:.2f}"])
 
-            table_data.append(["Totalt:", f"{total_hours_all:.1f}", "", "", "", f"{total_sum_all:,.2f}"])
+            table_data.append(["Totalt:", f"{total_hours_all:.1f}", f"{total_atf_all:.1f}", f"{total_sick_all:.1f}", "", "", "", f"{total_sum_all:,.2f}"])
 
-            t = Table(table_data, colWidths=[130, 55, 75, 80, 85, 80])
+            t = Table(table_data, colWidths=[105, 45, 40, 50, 55, 75, 65, 100])
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -1435,8 +1862,9 @@ class SmartReportApp(QMainWindow):
             cursor.execute('''
                 UPDATE shifts 
                 SET invoiced = 1 
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'
             ''', (comp, obj, d_from, d_to))
+            enqueue_matching_shifts(cursor, "company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'", (comp, obj, d_from, d_to))
             conn.commit()
             conn.close()
 
@@ -1469,8 +1897,9 @@ class SmartReportApp(QMainWindow):
             cursor.execute('''
                 UPDATE shifts 
                 SET invoiced = 0 
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'
             ''', (comp, obj, d_from, d_to))
+            enqueue_matching_shifts(cursor, "company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'", (comp, obj, d_from, d_to))
             conn.commit()
             conn.close()
 
@@ -1479,19 +1908,33 @@ class SmartReportApp(QMainWindow):
             self.load_shifts_history()
             self.background_sync_with_cloud()
 
-    def load_objects_for_company(self, comp_name, obj_cb):
+    def load_objects_for_company(self, comp_name, obj_cb, record_type=None):
+        selected_name = obj_cb.currentData()
         obj_cb.clear()
         if not comp_name:
-            return
+            return False
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects WHERE company = ? ORDER BY name", (comp_name,))
         rows = cursor.fetchall()
         conn.close()
+        if record_type in SPECIAL_OBJECTS:
+            ref_name, ref_mark = SPECIAL_OBJECTS[record_type]
+            rows = [row for row in rows if row[0] == ref_name and row[1] == ref_mark]
+            if len(rows) != 1:
+                return False
+        elif record_type == RECORD_TYPE_WORK:
+            special_refs = set(SPECIAL_OBJECTS.values())
+            rows = [row for row in rows if (row[0], row[1]) not in special_refs]
         for row in rows:
             name, mark, rate, tr_rate = row[0], row[1], row[2], row[3]
             display = f"{mark} | {name} ({rate} kr/ч, тр: {tr_rate})" if mark else f"{name} ({rate} kr/ч)"
             obj_cb.addItem(display, userData=name)
+        if selected_name:
+            selected_index = obj_cb.findData(selected_name)
+            if selected_index >= 0:
+                obj_cb.setCurrentIndex(selected_index)
+        return bool(rows)
 
     def setup_dagbok_tab(self):
         layout = QVBoxLayout(self.tab_dagbok)
@@ -1530,24 +1973,30 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>Журнал выполненных работ (Dagbok):</b>"))
         
         self.table_dagbok = QTableWidget()
-        self.table_dagbok.setColumnCount(4)
-        self.table_dagbok.setHorizontalHeaderLabels(["Дата", "Сотрудник", "Отработано часов", "Описание выполненных работ"])
+        self.table_dagbok.setColumnCount(5)
+        self.table_dagbok.setHorizontalHeaderLabels(["Дата", "Сотрудник", "Тип записи", "Часы", "Описание"])
         
         header = self.table_dagbok.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         
         self.table_dagbok.setColumnWidth(0, 130)
         self.table_dagbok.setColumnWidth(1, 200)
-        self.table_dagbok.setColumnWidth(2, 160)
+        self.table_dagbok.setColumnWidth(2, 130)
+        self.table_dagbok.setColumnWidth(3, 90)
         self.table_dagbok.setAlternatingRowColors(True)
         layout.addWidget(self.table_dagbok)
 
         dag_summary_box = QHBoxLayout()
-        self.dag_total_hours_lbl = QLabel("<b>Итого часов по журналу: 0.0</b>")
+        self.dag_total_hours_lbl = QLabel("<b>Работа: 0.0 ч</b>")
+        self.dag_total_atf_lbl = QLabel("<b>АТФ: 0.0 ч</b>")
+        self.dag_total_sick_lbl = QLabel("<b>Больничный: 0.0 ч</b>")
         dag_summary_box.addWidget(self.dag_total_hours_lbl)
+        dag_summary_box.addWidget(self.dag_total_atf_lbl)
+        dag_summary_box.addWidget(self.dag_total_sick_lbl)
         dag_summary_box.addStretch()
         layout.addLayout(dag_summary_box)
 
@@ -1565,7 +2014,7 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT date, employee, hours, comment 
+            SELECT date, employee, entry_type, hours, comment 
             FROM shifts
             WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
             ORDER BY date ASC, employee ASC
@@ -1574,25 +2023,30 @@ class SmartReportApp(QMainWindow):
         conn.close()
 
         self.table_dagbok.setRowCount(len(rows))
-        total_hours = 0.0
+        totals = {RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0}
 
         for row_idx, row in enumerate(rows):
-            date, emp, hrs, comment = row[0], row[1], row[2], row[3]
-            total_hours += hrs
+            date, emp, record_type, hrs, comment = row[0], row[1], row[2], row[3], row[4]
+            if record_type in totals:
+                totals[record_type] += hrs
             
             it_date = QTableWidgetItem(str(date))
             it_date.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             it_emp = QTableWidgetItem(str(emp))
+            it_type = QTableWidgetItem(record_type_label(record_type))
             it_hrs = QTableWidgetItem(str(hrs))
             it_hrs.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             it_comm = QTableWidgetItem(str(comment or ""))
 
             self.table_dagbok.setItem(row_idx, 0, it_date)
             self.table_dagbok.setItem(row_idx, 1, it_emp)
-            self.table_dagbok.setItem(row_idx, 2, it_hrs)
-            self.table_dagbok.setItem(row_idx, 3, it_comm)
+            self.table_dagbok.setItem(row_idx, 2, it_type)
+            self.table_dagbok.setItem(row_idx, 3, it_hrs)
+            self.table_dagbok.setItem(row_idx, 4, it_comm)
 
-        self.dag_total_hours_lbl.setText(f"<b>Итого часов по журналу: {total_hours:.1f}</b>")
+        self.dag_total_hours_lbl.setText(f"<b>Работа: {totals[RECORD_TYPE_WORK]:.1f} ч</b>")
+        self.dag_total_atf_lbl.setText(f"<b>АТФ: {totals[RECORD_TYPE_ATF]:.1f} ч</b>")
+        self.dag_total_sick_lbl.setText(f"<b>Больничный: {totals[RECORD_TYPE_SICK]:.1f} ч</b>")
 
     def export_dagbok_to_pdf(self):
         d_from = self.dag_date_from.text().strip()
@@ -1608,7 +2062,7 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT date, employee, hours, comment 
+            SELECT date, employee, entry_type, hours, comment 
             FROM shifts
             WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
             ORDER BY date ASC, employee ASC
@@ -1638,18 +2092,23 @@ class SmartReportApp(QMainWindow):
             story.append(Paragraph(f"<b>Arbetsdagbok (Dagbok)</b><br/>Beställare: <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
             story.append(Spacer(1, 5))
 
-            table_data = [["Datum", "Anställd", "Timmar", "Arbetsbeskrivning"]]
-            total_hours = 0.0
+            table_data = [["Datum", "Anställd", "Typ", "Timmar", "Arbetsbeskrivning"]]
+            totals = {RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0}
 
             for row in rows:
-                date, emp, hrs, comment = row[0], row[1], row[2], row[3]
-                total_hours += hrs
+                date, emp, record_type, hrs, comment = row[0], row[1], row[2], row[3], row[4]
+                if record_type in totals:
+                    totals[record_type] += hrs
                 translated_comment = translate_to_swedish(comment)
-                table_data.append([str(date), str(emp), f"{hrs:.1f}", str(translated_comment or "")])
+                table_data.append([str(date), str(emp), record_type_label(record_type), f"{hrs:.1f}", str(translated_comment or "")])
 
-            table_data.append(["Totalt timmar:", "", f"{total_hours:.1f}", ""])
+            table_data.extend([
+                ["Totalt arbete:", "", "", f"{totals[RECORD_TYPE_WORK]:.1f}", ""],
+                ["Totalt ATF:", "", "", f"{totals[RECORD_TYPE_ATF]:.1f}", ""],
+                ["Totalt sjuk:", "", "", f"{totals[RECORD_TYPE_SICK]:.1f}", ""],
+            ])
 
-            t = Table(table_data, colWidths=[75, 110, 50, 300])
+            t = Table(table_data, colWidths=[70, 100, 75, 55, 235])
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4299e1')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
@@ -1988,7 +2447,8 @@ class SmartReportApp(QMainWindow):
                 self.load_companies_into_combobox(cb)
 
         if hasattr(self, 'obj_cb') and hasattr(self, 'comp_cb'):
-            self.load_objects_for_company(self.comp_cb.currentText(), self.obj_cb)
+            record_type = self.record_type_cb.currentData() if hasattr(self, 'record_type_cb') else RECORD_TYPE_WORK
+            self.load_objects_for_company(self.comp_cb.currentText(), self.obj_cb, record_type)
 
         if hasattr(self, 'inv_obj_cb') and hasattr(self, 'inv_comp_cb'):
             self.load_objects_for_company(self.inv_comp_cb.currentText(), self.inv_obj_cb)
@@ -2140,6 +2600,26 @@ class SmartReportApp(QMainWindow):
         emp = self.emp_cb.currentText()
         comp = self.comp_cb.currentText()
         obj_name = self.obj_cb.currentData() or self.obj_cb.currentText()
+        record_type = self.record_type_cb.currentData() or RECORD_TYPE_WORK
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        if record_type in SPECIAL_OBJECTS:
+            special_row, error = resolve_special_object(cursor, comp, record_type)
+            if error or not special_row or obj_name != special_row['name']:
+                conn.close()
+                QMessageBox.warning(self, "Справочник объекта", error or "Выберите существующую справочную запись для выбранного типа.")
+                return
+        elif record_type != RECORD_TYPE_WORK:
+            conn.close()
+            QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
+            return
+        else:
+            cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ?", (comp, obj_name))
+            object_row = cursor.fetchone()
+            if object_row and (obj_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
+                conn.close()
+                QMessageBox.warning(self, "Тип записи", "Справочные объекты АТФ и больничного нельзя сохранить как обычную работу.")
+                return
         
         hours_val = parse_float(self.hours_input.text(), -1)
         
@@ -2147,47 +2627,63 @@ class SmartReportApp(QMainWindow):
         if rate_input_str:
             rate_val = parse_float(rate_input_str, -1)
         else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
             cursor.execute("SELECT rate FROM objects WHERE name = ?", (obj_name,))
             obj_row = cursor.fetchone()
-            conn.close()
             rate_val = obj_row[0] if obj_row and obj_row[0] else 0.0
 
         trans_val = parse_float(self.trans_input.text(), 0.0)
         comment = self.comment_input.text().strip()
+        if record_type != RECORD_TYPE_WORK:
+            rate_val = 0.0
+            trans_val = 0.0
 
         if hours_val < 0 or rate_val < 0:
+            conn.close()
             QMessageBox.warning(self, "Ошибка", "Проверьте правильность часов и ставки!")
             return
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        sync_id = str(uuid.uuid4())
         cursor.execute('''
-            INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-        ''', (date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment))
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)
+        ''', (
+            date, emp, comp, obj_name, hours_val, rate_val, trans_val, comment,
+            sync_id, record_type,
+            rate_val if record_type == RECORD_TYPE_WORK else 0.0,
+            trans_val if record_type == RECORD_TYPE_WORK else 0.0
+        ))
+        enqueue_shift_operation(cursor, sync_id, 'upsert', 0, {
+            "date": date, "employee": emp, "company": comp, "object_name": obj_name,
+            "hours": hours_val, "rate": rate_val, "transport": trans_val,
+            "comment": comment, "invoiced": 0, "record_type": record_type
+        })
         conn.commit()
         conn.close()
         
-        self.background_sync_with_cloud()
-        QMessageBox.information(self, "Успех", "Смена успешно сохранена!")
+        if record_type == RECORD_TYPE_WORK:
+            self.background_sync_with_cloud()
+            QMessageBox.information(self, "Успех", "Смена успешно сохранена!")
+        else:
+            QMessageBox.information(self, "Сохранено локально", "Запись сохранена отдельно от рабочих часов. Сервер не поддерживает этот тип, поэтому запись остаётся в локальной очереди.")
         self.load_shifts_history()
 
     def load_shifts_history(self):
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 200")
+            cursor.execute("SELECT id, date, employee, company, object_name, entry_type, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 200")
             rows = cursor.fetchall()
             conn.close()
 
             self.table_shifts.setRowCount(len(rows))
             for row_idx, row in enumerate(rows):
-                is_inv = row[9] == 1
+                is_inv = row[10] == 1
                 status_text = "✅ Выставлен" * is_inv or "⏳ В работе"
 
-                for col_idx, val in enumerate([row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8] or "", status_text]):
+                values = [row[0], row[1], row[2], row[3], row[4], record_type_label(row[5]), row[6], row[7], row[8], row[9] or "", status_text]
+                for col_idx, val in enumerate(values):
                     it = QTableWidgetItem(str(val))
                     if is_inv:
                         it.setBackground(QColor("#1c4532"))
@@ -2197,42 +2693,211 @@ class SmartReportApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
 
+    def edit_shift(self):
+        selected = self.table_shifts.currentRow()
+        if selected < 0:
+            QMessageBox.warning(self, "Внимание", "Выберите смену для изменения!")
+            return
+
+        local_id = self.table_shifts.item(selected, 0).text()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM shifts WHERE id = ?", (local_id,))
+        shift = cursor.fetchone()
+        cursor.execute("SELECT name FROM employees ORDER BY name")
+        employees = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name FROM companies ORDER BY name")
+        companies = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        if not shift:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Изменить смену")
+        form = QFormLayout(dialog)
+        date_field = create_date_field(shift['date'])
+        employee_field = QComboBox()
+        employee_field.setEditable(True)
+        employee_field.addItems(employees)
+        employee_field.setCurrentText(shift['employee'])
+        company_field = QComboBox()
+        company_field.setEditable(True)
+        company_field.addItems(companies)
+        company_field.setCurrentText(shift['company'])
+        record_type_field = QComboBox()
+        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+            record_type_field.addItem(record_type_label(record_type), record_type)
+        current_type = shift['entry_type'] or RECORD_TYPE_REVIEW
+        work_values = [
+            float(shift['work_rate_cache'] or (shift['rate'] if current_type == RECORD_TYPE_WORK else 0.0)),
+            float(shift['work_transport_cache'] or (shift['transport'] if current_type == RECORD_TYPE_WORK else 0.0)),
+        ]
+        previous_type = [current_type]
+        type_index = record_type_field.findData(current_type)
+        if type_index < 0:
+            record_type_field.insertItem(0, record_type_label(RECORD_TYPE_REVIEW), RECORD_TYPE_REVIEW)
+            type_index = 0
+        record_type_field.setCurrentIndex(type_index)
+        object_field = QComboBox()
+        self.load_objects_for_company(shift['company'], object_field, current_type)
+        object_index = object_field.findData(shift['object_name'])
+        if object_index >= 0:
+            object_field.setCurrentIndex(object_index)
+        company_field.currentTextChanged.connect(lambda company: self.load_objects_for_company(company, object_field, record_type_field.currentData()))
+        record_type_field.currentIndexChanged.connect(lambda *_: self.load_objects_for_company(company_field.currentText(), object_field, record_type_field.currentData()))
+        hours_field = QDoubleSpinBox()
+        hours_field.setRange(0.5, 24)
+        hours_field.setSingleStep(0.5)
+        hours_field.setDecimals(1)
+        hours_field.setValue(shift['hours'])
+        rate_field = QDoubleSpinBox()
+        rate_field.setRange(0, 100000)
+        rate_field.setDecimals(2)
+        rate_field.setValue(shift['rate'])
+        transport_field = QDoubleSpinBox()
+        transport_field.setRange(0, 10000)
+        transport_field.setDecimals(2)
+        transport_field.setValue(shift['transport'] or 0)
+        comment_field = QLineEdit(shift['comment'] or '')
+
+        def update_type_values():
+            new_type = record_type_field.currentData()
+            if previous_type[0] == RECORD_TYPE_WORK and new_type != RECORD_TYPE_WORK:
+                work_values[0] = rate_field.value()
+                work_values[1] = transport_field.value()
+                rate_field.setValue(0.0)
+                transport_field.setValue(0.0)
+            elif previous_type[0] != RECORD_TYPE_WORK and new_type == RECORD_TYPE_WORK:
+                rate_field.setValue(work_values[0])
+                transport_field.setValue(work_values[1])
+            elif new_type != RECORD_TYPE_WORK:
+                rate_field.setValue(0.0)
+                transport_field.setValue(0.0)
+            previous_type[0] = new_type
+
+        record_type_field.currentIndexChanged.connect(update_type_values)
+
+        form.addRow("Дата:", date_field)
+        form.addRow("Сотрудник:", employee_field)
+        form.addRow("Фирма:", company_field)
+        form.addRow("Тип записи:", record_type_field)
+        form.addRow("Объект:", object_field)
+        form.addRow("Часы:", hours_field)
+        form.addRow("Ставка:", rate_field)
+        form.addRow("Транспорт:", transport_field)
+        form.addRow("Комментарий:", comment_field)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        record_type = record_type_field.currentData()
+        object_name = object_field.currentData() or object_field.currentText().strip()
+        check_conn = get_db_connection()
+        check_cursor = check_conn.cursor()
+        if record_type in SPECIAL_OBJECTS:
+            special_row, error = resolve_special_object(check_cursor, company_field.currentText().strip(), record_type)
+            if error or not special_row or special_row['name'] != object_name:
+                check_conn.close()
+                QMessageBox.warning(self, "Справочник объекта", error or "Выберите существующую справочную запись для выбранного типа.")
+                return
+        elif record_type != RECORD_TYPE_WORK:
+            check_conn.close()
+            QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
+            return
+        else:
+            check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ?", (company_field.currentText().strip(), object_name))
+            object_row = check_cursor.fetchone()
+            if object_row and (object_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
+                check_conn.close()
+                QMessageBox.warning(self, "Тип записи", "Справочные объекты АТФ и больничного нельзя сохранить как обычную работу.")
+                return
+        check_conn.close()
+
+        payload = {
+            "date": date_field.text(), "employee": employee_field.currentText().strip(),
+            "company": company_field.currentText().strip(), "object_name": object_name,
+            "hours": hours_field.value(),
+            "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,
+            "transport": transport_field.value() if record_type == RECORD_TYPE_WORK else 0.0,
+            "comment": comment_field.text().strip(),
+            "invoiced": shift['invoiced'] or 0, "record_type": record_type
+        }
+        if not payload['employee'] or not payload['company'] or not payload['object_name']:
+            QMessageBox.warning(self, "Ошибка", "Заполните сотрудника, фирму и объект.")
+            return
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            sync_id = shift['sync_id'] or str(uuid.uuid4())
+            if record_type != shift['entry_type']:
+                cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE sync_id = ? AND state = 'pending'", (sync_id,))
+                if record_type == RECORD_TYPE_WORK:
+                    cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state = 'blocked'", (sync_id,))
+            cursor.execute('''
+                UPDATE shifts SET date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
+                    rate = ?, transport = ?, comment = ?, sync_id = ?, entry_type = ?,
+                    work_rate_cache = ?, work_transport_cache = ?
+                WHERE id = ?
+            ''', (
+                payload['date'], payload['employee'], payload['company'], payload['object_name'],
+                payload['hours'], payload['rate'], payload['transport'], payload['comment'], sync_id, record_type,
+                rate_field.value() if record_type == RECORD_TYPE_WORK else work_values[0],
+                transport_field.value() if record_type == RECORD_TYPE_WORK else work_values[1],
+                local_id
+            ))
+            enqueue_shift_operation(cursor, sync_id, 'upsert', shift['sync_version'], payload)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self.load_shifts_history()
+        if record_type == RECORD_TYPE_WORK:
+            self.background_sync_with_cloud()
+            QMessageBox.information(self, "Изменение сохранено", "Запись сохранена.")
+        else:
+            self.record_type_status_lbl.setText("Изменение сохранено локально. Сервер не поддерживает типы АТФ/больничного; ранее отправленная версия работы на сервере автоматически не изменена.")
+            QMessageBox.information(self, "Сохранено локально", "Запись изменена локально. Для согласования её типа на сервере потребуется отдельное обновление серверного кода.")
+
     def delete_shift(self, index=None):
         selected = self.table_shifts.currentRow()
         if selected < 0:
             QMessageBox.warning(self, "Внимание", "Выберите смену для удаления!")
             return
-        
-        shift_id = self.table_shifts.item(selected, 0).text()
-        date_val = self.table_shifts.item(selected, 1).text()
-        emp_val = self.table_shifts.item(selected, 2).text()
-        obj_val = self.table_shifts.item(selected, 4).text()
-        hrs_val = parse_float(self.table_shifts.item(selected, 5).text(), 0.0)
 
+        shift_id = self.table_shifts.item(selected, 0).text()
         reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            # 1. Удаляем локально в SQLite
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,))
+            shift = cursor.fetchone()
+            if shift:
+                sync_id = shift['sync_id'] or str(uuid.uuid4())
+                enqueue_shift_operation(cursor, sync_id, 'delete', shift['sync_version'], shift_payload(shift))
+                cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
             conn.close()
 
-            # 2. Отправляем запрос на удаление в облако для обеспечения двусторонней синхронизации
-            try:
-                headers = {"X-Sync-Key": SYNC_API_KEY}
-                payload = {
-                    "date": date_val,
-                    "employee": emp_val,
-                    "object_name": obj_val,
-                    "hours": hrs_val
-                }
-                requests.post(f"{CLOUD_URL}/delete-cloud-shift", headers=headers, json=payload, timeout=5)
-            except Exception as e:
-                print(f"Не удалось удалить смену в облаке: {e}")
-
-            self.load_shifts_history()
+        self.load_shifts_history()
+        if shift and shift['entry_type'] == RECORD_TYPE_WORK:
             self.background_sync_with_cloud()
+        elif shift:
+            QMessageBox.information(self, "Удалено локально", "Запись удалена из десктопной базы. Сервер не поддерживает синхронизацию удаления АТФ/больничного.")
 
 if __name__ == "__main__":
     try:

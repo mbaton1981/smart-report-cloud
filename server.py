@@ -2,10 +2,12 @@ import sqlite3
 import time
 import ast
 import os
-import shutil
+import json
+import hashlib
 import logging
 import csv
 import io
+import uuid
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,6 +15,83 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # Настройка системного логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
+
+SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick"}
+SPECIAL_SUBMISSION_OBJECTS = {
+    "atf": ("Arbetstidsförkortning", "p1000"),
+    "sick": ("Sjuk", "p1001"),
+}
+
+
+def resolve_submission_type(data, default="work"):
+    provided = [data[key] for key in ("submission_type", "record_type") if key in data]
+    if len(provided) == 2 and provided[0] != provided[1]:
+        raise ValueError("Поля submission_type и record_type не совпадают.")
+    submission_type = str(provided[0] if provided else default).strip()
+    if submission_type not in SUPPORTED_SUBMISSION_TYPES:
+        raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick.")
+    return submission_type
+
+
+def validate_submission_object(cursor, submission_type, company, object_name):
+    reference = SPECIAL_SUBMISSION_OBJECTS.get(submission_type)
+    if not reference:
+        cursor.execute("SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ?", (object_name, company))
+    else:
+        cursor.execute(
+            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ?",
+            (reference[0], company, reference[1])
+        )
+    matches = cursor.fetchall()
+    if len(matches) != 1:
+        if reference and not matches:
+            raise ValueError(f"Для типа {submission_type} не найдена точная запись справочника {reference[0]} / {reference[1]}.")
+        if len(matches) > 1:
+            raise ValueError("Запись объекта неоднозначна в справочнике.")
+        raise ValueError("Объект не принадлежит выбранной фирме или не существует.")
+    if reference and object_name != reference[0]:
+        raise ValueError(f"Для типа {submission_type} нужно выбрать объект {reference[0]}.")
+    if not reference and (matches[0]['name'], matches[0]['markning']) in SPECIAL_SUBMISSION_OBJECTS.values():
+        raise ValueError("Справочная запись АТФ/больничного требует соответствующий тип.")
+    return matches[0]['id']
+
+
+def infer_submission_type_from_object(cursor, company, object_name):
+    cursor.execute(
+        "SELECT name, markning FROM meta_objects WHERE company = ? AND name = ?",
+        (company, object_name)
+    )
+    matches = cursor.fetchall()
+    if len(matches) > 1:
+        raise ValueError("Объект неоднозначен; требуется проверить название и отметку справочника.")
+    if matches:
+        object_key = (matches[0]['name'], matches[0]['markning'])
+        for submission_type, reference in SPECIAL_SUBMISSION_OBJECTS.items():
+            if object_key == reference:
+                return submission_type
+    return "work"
+
+
+def resolve_session_employee(cursor, requested_employee=None):
+    if session.get('role') == 'admin':
+        employee = str(requested_employee or '').strip()
+        if not employee:
+            raise ValueError("Не указан сотрудник.")
+    else:
+        employee_id = session.get('employee_id')
+        if not employee_id:
+            raise PermissionError("Доступ запрещен.")
+        cursor.execute("SELECT name FROM meta_employees WHERE id = ? AND is_active = 1", (employee_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise PermissionError("Сотрудник не найден или деактивирован.")
+        employee = row['name']
+        if requested_employee and str(requested_employee).strip() != employee:
+            raise PermissionError("Нельзя изменять записи другого сотрудника.")
+    cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
+    if not cursor.fetchone():
+        raise ValueError("Указанный сотрудник не найден или неактивен.")
+    return employee
 
 app = Flask(__name__)
 app.permanent_session_lifetime = timedelta(hours=8)
@@ -59,17 +138,30 @@ def create_database_backup():
     try:
         if not os.path.exists(DB_FILE):
             return
-        
-        backup_dir = "backups"
+
+        backup_dir = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), "backups")
         os.makedirs(backup_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         backup_path = os.path.join(backup_dir, f"backup_{timestamp}.db")
-        
-        shutil.copy2(DB_FILE, backup_path)
+
+        source = sqlite3.connect(f"file:{os.path.abspath(DB_FILE)}?mode=ro", uri=True, timeout=30.0)
+        destination = sqlite3.connect(backup_path, timeout=30.0)
+        try:
+            source.backup(destination)
+            integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise sqlite3.DatabaseError(f"Backup integrity check failed: {integrity}")
+        finally:
+            destination.close()
+            source.close()
+
         logger.info(f"Резервная копия базы данных успешно создана: {backup_path}")
-        
-        backups = sorted([os.path.join(backup_dir, f) for f in os.listdir(backup_dir) if f.endswith('.db')])
+
+        backups = sorted([
+            os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+            if f.startswith('backup_') and f.endswith('.db')
+        ])
         if len(backups) > 10:
             for old_backup in backups[:-10]:
                 try:
@@ -78,6 +170,12 @@ def create_database_backup():
                     pass
     except Exception as e:
         logger.error(f"Не удалось создать резервную копию базы данных: {e}")
+        raise
+
+def next_change_sequence(cursor):
+    cursor.execute("UPDATE sync_metadata SET value = value + 1 WHERE name = 'change_sequence'")
+    cursor.execute("SELECT value FROM sync_metadata WHERE name = 'change_sequence'")
+    return cursor.fetchone()[0]
 
 def safe_parse_obj(val):
     if not val:
@@ -136,29 +234,88 @@ def init_cloud_db():
             synced INTEGER DEFAULT 0
         )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sync_metadata (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    cursor.execute("INSERT OR IGNORE INTO sync_metadata (name, value) VALUES ('change_sequence', 0)")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS incoming_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL UNIQUE,
+            sync_id TEXT NOT NULL UNIQUE,
+            submission_type TEXT NOT NULL DEFAULT 'work',
+            date TEXT NOT NULL,
+            employee TEXT NOT NULL,
+            company TEXT NOT NULL,
+            object_name TEXT NOT NULL,
+            hours REAL NOT NULL,
+            rate REAL NOT NULL DEFAULT 0,
+            transport REAL NOT NULL DEFAULT 0,
+            comment TEXT,
+            invoiced INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1,
+            change_seq INTEGER NOT NULL DEFAULT 0,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            desktop_acked INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'web',
+            legacy_cloud_id INTEGER UNIQUE,
+            last_operation_id TEXT,
+            payload_hash TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_employee_date ON incoming_submissions(employee, date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_change_seq ON incoming_submissions(change_seq)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_pending ON incoming_submissions(desktop_acked, source, is_deleted)")
+    cursor.execute("PRAGMA table_info(incoming_submissions)")
+    submission_columns = {column[1] for column in cursor.fetchall()}
+    if 'submission_type' not in submission_columns:
+        cursor.execute("ALTER TABLE incoming_submissions ADD COLUMN submission_type TEXT NOT NULL DEFAULT 'work'")
+    if 'invoiced' not in submission_columns:
+        cursor.execute("ALTER TABLE incoming_submissions ADD COLUMN invoiced INTEGER NOT NULL DEFAULT 0")
     
     cursor.execute("PRAGMA table_info(cloud_shifts)")
     shift_cols = [c[1] for c in cursor.fetchall()]
     if 'request_id' not in shift_cols:
-        try:
-            cursor.execute("ALTER TABLE cloud_shifts ADD COLUMN request_id TEXT UNIQUE")
-        except Exception:
-            pass
-
-    # 🛡 Автоматическая дедупликация базы данных при запуске сервера
+        cursor.execute("ALTER TABLE cloud_shifts ADD COLUMN request_id TEXT")
     try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cloud_shifts_request_id ON cloud_shifts(request_id) WHERE request_id IS NOT NULL")
+    except sqlite3.IntegrityError:
+        logger.warning("В legacy cloud_shifts найдены повторяющиеся request_id; старые строки сохранены без уникального индекса.")
+
+    cursor.execute("SELECT id, request_id, date, employee, company, object_name, hours, rate, transport, comment, synced, created_at FROM cloud_shifts")
+    legacy_rows = cursor.fetchall()
+    for legacy in legacy_rows:
+        legacy_request_id = legacy['request_id'] or f"legacy-cloud:{legacy['id']}"
+        cursor.execute("SELECT id FROM incoming_submissions WHERE legacy_cloud_id = ? OR request_id = ?", (legacy['id'], legacy_request_id))
+        if cursor.fetchone():
+            continue
+        sequence = next_change_sequence(cursor)
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        payload = {
+            "date": legacy['date'], "employee": legacy['employee'], "company": legacy['company'],
+            "object_name": legacy['object_name'], "hours": legacy['hours'], "rate": legacy['rate'],
+            "transport": legacy['transport'], "comment": legacy['comment'] or ""
+        }
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
         cursor.execute('''
-            DELETE FROM cloud_shifts 
-            WHERE id NOT IN (
-                SELECT MIN(id) 
-                FROM cloud_shifts 
-                GROUP BY date, employee, company, object_name, hours
-            )
-        ''')
-        conn.commit()
-        logger.info("Автоматическая дедупликация базы данных успешно выполнена.")
-    except Exception as e:
-        logger.warning(f"Ошибка при автоочистке дубликатов: {e}")
+            INSERT INTO incoming_submissions (
+                request_id, sync_id, submission_type, date, employee, company, object_name,
+                hours, rate, transport, comment, version, change_seq, desktop_acked,
+                source, legacy_cloud_id, payload_hash, created_at, updated_at
+            ) VALUES (?, ?, 'work', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'legacy', ?, ?, ?, ?)
+        ''', (
+            legacy_request_id, legacy_request_id, legacy['date'], legacy['employee'], legacy['company'],
+            legacy['object_name'], legacy['hours'], legacy['rate'], legacy['transport'], legacy['comment'],
+            sequence, int(bool(legacy['synced'])), legacy['id'], payload_hash,
+            legacy['created_at'] or now, now
+        ))
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_employees (
@@ -471,10 +628,17 @@ def submit_shift():
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
 
+    try:
+        submission_type = resolve_submission_type(data)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
     date_str = str(data.get('date', '')).strip()
     company = str(data.get('company', '')).strip()
     object_name = str(data.get('object_name', '')).strip()
-    request_id = data.get('request_id')
+    request_id = str(data.get('request_id') or uuid.uuid4().hex).strip()
+    if not request_id or len(request_id) > 120:
+        return jsonify({"ok": False, "error": "Некорректный идентификатор запроса"}), 400
     comment = str(data.get('comment', ''))[:2000]
 
     conn = get_db_connection()
@@ -523,6 +687,10 @@ def submit_shift():
         conn.close()
         return jsonify({"ok": False, "error": "Некорректные числовые значения ставки или транспорта"}), 400
 
+    if submission_type != "work":
+        rate = 0.0
+        transport = 0.0
+
     try:
         cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
         if not cursor.fetchone():
@@ -537,32 +705,60 @@ def submit_shift():
         parsed_obj_name, _, _ = safe_parse_obj(object_name)
         final_obj_name = parsed_obj_name or object_name
 
-        cursor.execute("SELECT id FROM meta_objects WHERE name = ? AND company = ?", (final_obj_name, company))
-        if not cursor.fetchone():
+        try:
+            validate_submission_object(cursor, submission_type, company, final_obj_name)
+        except ValueError as e:
             conn.close()
-            return jsonify({"ok": False, "error": "Объект не принадлежит выбранной фирме или не существует"}), 400
+            return jsonify({"ok": False, "error": str(e)}), 400
 
-        if request_id:
-            cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (request_id,))
-            if cursor.fetchone():
-                conn.close()
-                return jsonify({"ok": False, "error": "Такая смена уже была отправлена ранее"}), 409
+        cursor.execute("BEGIN IMMEDIATE")
+        payload = {
+            "date": date_str, "employee": employee, "company": company, "object_name": final_obj_name,
+            "hours": hours, "rate": rate, "transport": transport, "comment": comment,
+            "submission_type": submission_type
+        }
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+        cursor.execute("SELECT id, payload_hash, submission_type FROM incoming_submissions WHERE request_id = ?", (request_id,))
+        existing = cursor.fetchone()
+        if existing:
+            conn.rollback()
+            legacy_payload = dict(payload)
+            legacy_payload.pop('submission_type', None)
+            legacy_payload_hash = hashlib.sha256(json.dumps(legacy_payload, sort_keys=True).encode('utf-8')).hexdigest()
+            if existing['payload_hash'] == payload_hash or (
+                'submission_type' not in data and (existing['submission_type'] or 'work') == submission_type
+                and existing['payload_hash'] == legacy_payload_hash
+            ):
+                return jsonify({"ok": True, "idempotent": True, "request_id": request_id}), 200
+            return jsonify({"ok": False, "error": "request_id уже использован для другой смены"}), 409
 
         sixty_secs_ago = (datetime.utcnow() - timedelta(seconds=60)).strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute('''
-            SELECT id FROM cloud_shifts 
-            WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ? AND created_at >= ?
-        ''', (employee, date_str, company, final_obj_name, hours, sixty_secs_ago))
+            SELECT id FROM incoming_submissions
+            WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ?
+              AND submission_type = ? AND created_at >= ? AND is_deleted = 0
+          ''', (employee, date_str, company, final_obj_name, hours, submission_type, sixty_secs_ago))
         if cursor.fetchone():
-            conn.close()
+            conn.rollback()
             return jsonify({"ok": False, "error": "Похожая смена уже была зарегистрирована только что. Подождите немного."}), 409
 
+        change_seq = next_change_sequence(cursor)
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute('''
-            INSERT INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        ''', (request_id, date_str, employee, company, final_obj_name, hours, rate, transport, comment))
+            INSERT INTO incoming_submissions (
+                request_id, sync_id, submission_type, date, employee, company, object_name,
+                hours, rate, transport, comment, version, change_seq, is_deleted,
+                desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, 0, 'web', NULL, ?, ?, ?)
+        ''', (
+            request_id, request_id, submission_type, date_str, employee, company, final_obj_name,
+            hours, rate, transport, comment, change_seq, payload_hash, now, now
+        ))
         
         conn.commit()
+    except ValueError as e:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         conn.rollback()
         logger.error(f"Ошибка при сохранении смены: {str(e)}")
@@ -570,7 +766,178 @@ def submit_shift():
     finally:
         conn.close()
 
-    return jsonify({"ok": True, "message": "Смена успешно сохранена!"}), 201
+    return jsonify({"ok": True, "message": "Смена успешно сохранена!", "request_id": request_id}), 201
+
+@app.route('/edit-shift', methods=['POST'])
+def edit_shift():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
+    sync_id = str(data.get('sync_id') or '').strip()
+    operation_id = str(data.get('operation_id') or uuid.uuid4().hex).strip()
+    if not sync_id or len(sync_id) > 120 or not operation_id or len(operation_id) > 120:
+        return jsonify({"ok": False, "error": "Отсутствует корректный sync_id или operation_id"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ?", (sync_id,))
+        existing = cursor.fetchone()
+        if not existing:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Смена не найдена"}), 404
+        if existing['is_deleted']:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Удалённую смену нельзя редактировать", "reason": "deleted"}), 409
+
+        employee = resolve_session_employee(cursor, data.get('employee', existing['employee']))
+        if employee != existing['employee'] and session.get('role') != 'admin':
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Нельзя изменять записи другого сотрудника"}), 403
+        try:
+            expected_version = int(data.get('version', existing['version']))
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная версия смены.")
+        submission_type = resolve_submission_type(data, existing['submission_type'] or 'work')
+        date_val = str(data.get('date', existing['date'])).strip()
+        datetime.strptime(date_val, '%Y-%m-%d')
+        company = str(data.get('company', existing['company'])).strip()
+        object_name = str(data.get('object_name', existing['object_name'])).strip()
+        validate_submission_object(cursor, submission_type, company, object_name)
+        hours = float(data.get('hours', existing['hours']))
+        transport = round(float(data.get('transport', existing['transport'])), 2)
+        if not (0.5 <= hours <= 24) or hours % 0.5 != 0 or not (0 <= transport <= 10000):
+            raise ValueError("Часы или транспорт вне допустимого диапазона.")
+        if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, transport)):
+            raise ValueError("Числовое поле должно быть конечным.")
+        comment = str(data.get('comment', existing['comment'] or ''))[:2000]
+        invoiced = int(existing['invoiced']) if submission_type == 'work' else 0
+        normalized = {
+            "date": date_val, "employee": employee, "company": company,
+            "object_name": object_name, "hours": hours, "rate": existing['rate'],
+            "transport": transport, "comment": comment, "invoiced": invoiced,
+            "submission_type": submission_type
+        }
+        operation_hash = hashlib.sha256(json.dumps(
+            {"operation": "upsert", "shift": normalized}, sort_keys=True
+        ).encode('utf-8')).hexdigest()
+        if existing['last_operation_id'] == operation_id:
+            if existing['payload_hash'] == operation_hash:
+                conn.rollback()
+                return jsonify({"ok": True, "idempotent": True, "sync_id": sync_id, "version": existing['version']}), 200
+            conn.rollback()
+            return jsonify({"ok": False, "error": "operation_id уже использован для другого изменения"}), 409
+        if expected_version != existing['version']:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Смена уже изменена; обновите историю", "conflict": True, "current": serialize_submission(existing)}), 409
+
+        change_seq = next_change_sequence(cursor)
+        new_version = existing['version'] + 1
+        cursor.execute('''
+            UPDATE incoming_submissions SET
+                date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
+                transport = ?, comment = ?, invoiced = ?, submission_type = ?,
+                version = ?, change_seq = ?, desktop_acked = 0,
+                last_operation_id = ?, payload_hash = ?, updated_at = ?
+            WHERE id = ? AND is_deleted = 0
+        ''', (
+            date_val, employee, company, object_name, hours, transport, comment,
+            invoiced, submission_type, new_version, change_seq, operation_id,
+            operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
+        ))
+        conn.commit()
+        return jsonify({"ok": True, "sync_id": sync_id, "version": new_version, "change_seq": change_seq}), 200
+    except PermissionError as e:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 403
+    except (ValueError, TypeError, sqlite3.IntegrityError) as e:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        conn.rollback()
+        logger.exception("Ошибка редактирования смены в браузере")
+        return jsonify({"ok": False, "error": "Не удалось изменить смену"}), 500
+    finally:
+        conn.close()
+
+@app.route('/delete-shift', methods=['POST'])
+def delete_shift():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
+    sync_id = str(data.get('sync_id') or '').strip()
+    operation_id = str(data.get('operation_id') or uuid.uuid4().hex).strip()
+    if not sync_id or len(sync_id) > 120 or not operation_id or len(operation_id) > 120:
+        return jsonify({"ok": False, "error": "Отсутствует корректный sync_id или operation_id"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ?", (sync_id,))
+        existing = cursor.fetchone()
+        if not existing:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Смена не найдена"}), 404
+        employee = resolve_session_employee(cursor, data.get('employee', existing['employee']))
+        if employee != existing['employee'] and session.get('role') != 'admin':
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Нельзя удалять записи другого сотрудника"}), 403
+        try:
+            expected_version = int(data.get('version', existing['version']))
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная версия смены.")
+        submission_type = resolve_submission_type(data, existing['submission_type'] or 'work')
+        if submission_type != (existing['submission_type'] or 'work'):
+            raise ValueError("Тип удаления не совпадает с текущим типом записи.")
+        operation_hash = hashlib.sha256(json.dumps(
+            {"operation": "delete", "submission_type": submission_type}, sort_keys=True
+        ).encode('utf-8')).hexdigest()
+        if existing['last_operation_id'] == operation_id:
+            if existing['payload_hash'] == operation_hash and existing['is_deleted']:
+                conn.rollback()
+                return jsonify({"ok": True, "idempotent": True, "sync_id": sync_id, "version": existing['version']}), 200
+            conn.rollback()
+            return jsonify({"ok": False, "error": "operation_id уже использован для другого изменения"}), 409
+        if existing['is_deleted']:
+            conn.rollback()
+            return jsonify({"ok": True, "idempotent": True, "sync_id": sync_id, "version": existing['version']}), 200
+        if expected_version != existing['version']:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Смена уже изменена; обновите историю", "conflict": True, "current": serialize_submission(existing)}), 409
+
+        change_seq = next_change_sequence(cursor)
+        new_version = existing['version'] + 1
+        cursor.execute('''
+            UPDATE incoming_submissions SET
+                submission_type = ?, is_deleted = 1, version = ?, change_seq = ?,
+                desktop_acked = 0, last_operation_id = ?, payload_hash = ?, updated_at = ?
+            WHERE id = ? AND is_deleted = 0
+        ''', (
+            submission_type, new_version, change_seq, operation_id, operation_hash,
+            datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
+        ))
+        if existing['legacy_cloud_id'] is not None:
+            cursor.execute("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", (existing['legacy_cloud_id'],))
+        conn.commit()
+        return jsonify({"ok": True, "sync_id": sync_id, "version": new_version, "change_seq": change_seq, "submission_type": submission_type}), 200
+    except PermissionError as e:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 403
+    except (ValueError, TypeError, sqlite3.IntegrityError) as e:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        conn.rollback()
+        logger.exception("Ошибка удаления смены в браузере")
+        return jsonify({"ok": False, "error": "Не удалось удалить смену"}), 500
+    finally:
+        conn.close()
 
 @app.route('/delete-cloud-shift', methods=['POST'])
 def delete_cloud_shift():
@@ -579,6 +946,7 @@ def delete_cloud_shift():
 
     data = request.json or {}
     shift_id = data.get('id')
+    sync_id = str(data.get('sync_id') or '').strip()
     date = data.get('date')
     employee = data.get('employee')
     object_name = data.get('object_name')
@@ -588,14 +956,59 @@ def delete_cloud_shift():
     cursor = conn.cursor()
 
     try:
-        if shift_id:
-            cursor.execute("DELETE FROM cloud_shifts WHERE id = ?", (shift_id,))
+        if isinstance(shift_id, str) and shift_id.startswith('submission:'):
+            try:
+                submission_id = int(shift_id.split(':', 1)[1])
+            except ValueError:
+                return jsonify({"ok": False, "error": "Некорректный ID заявки"}), 400
+            cursor.execute("SELECT * FROM incoming_submissions WHERE id = ?", (submission_id,))
+            submission = cursor.fetchone()
+        elif sync_id:
+            cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ?", (sync_id,))
+            submission = cursor.fetchone()
+        elif shift_id is not None:
+            try:
+                legacy_id = int(shift_id)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "Некорректный ID смены"}), 400
+            cursor.execute("SELECT * FROM incoming_submissions WHERE legacy_cloud_id = ?", (legacy_id,))
+            submission = cursor.fetchone()
+        else:
+            submission = None
+
+        if submission:
+            if not submission['is_deleted']:
+                change_seq = next_change_sequence(cursor)
+                cursor.execute('''
+                    UPDATE incoming_submissions
+                    SET is_deleted = 1, version = version + 1, change_seq = ?, updated_at = ?
+                    WHERE id = ?
+                ''', (change_seq, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), submission['id']))
+            if submission['legacy_cloud_id'] is not None:
+                cursor.execute("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", (submission['legacy_cloud_id'],))
         elif date and employee and object_name and hours is not None:
-            cursor.execute("""
-                DELETE FROM cloud_shifts 
-                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ?
-            """, (date, employee, object_name, hours))
+            cursor.execute('''
+                SELECT * FROM incoming_submissions
+                WHERE date = ? AND employee = ? AND object_name = ? AND hours = ? AND is_deleted = 0
+            ''', (date, employee, object_name, hours))
+            matches = cursor.fetchall()
+            if len(matches) != 1:
+                conn.close()
+                return jsonify({"ok": False, "error": "Удаление по полям неоднозначно; требуется стабильный ID"}), 409
+            submission = matches[0]
+            change_seq = next_change_sequence(cursor)
+            cursor.execute('''
+                UPDATE incoming_submissions
+                SET is_deleted = 1, version = version + 1, change_seq = ?, updated_at = ?
+                WHERE id = ?
+            ''', (change_seq, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), submission['id']))
+            if submission['legacy_cloud_id'] is not None:
+                cursor.execute("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", (submission['legacy_cloud_id'],))
         
+        elif not submission:
+            conn.close()
+            return jsonify({"ok": False, "error": "Смена не найдена"}), 404
+
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "message": "Смена успешно удалена на сервере"})
@@ -643,14 +1056,14 @@ def check_employee_shifts():
                 end_date = datetime(year, month + 1, 1).strftime('%Y-%m-%d')
             
             cursor.execute("""
-                SELECT date, object_name, hours FROM cloud_shifts 
-                WHERE employee = ? AND date >= ? AND date < ? 
-                ORDER BY date ASC
+                SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, version, change_seq, submission_type FROM incoming_submissions
+                WHERE employee = ? AND date >= ? AND date < ? AND is_deleted = 0
+                ORDER BY date ASC, id ASC
             """, (emp, start_date, end_date))
         except Exception:
-            cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 31", (emp,))
+            cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, version, change_seq, submission_type FROM incoming_submissions WHERE employee = ? AND is_deleted = 0 ORDER BY date DESC LIMIT 31", (emp,))
     else:
-        cursor.execute("SELECT date, object_name, hours FROM cloud_shifts WHERE employee = ? ORDER BY date DESC LIMIT 31", (emp,))
+        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, version, change_seq, submission_type FROM incoming_submissions WHERE employee = ? AND is_deleted = 0 ORDER BY date DESC LIMIT 31", (emp,))
 
     rows = cursor.fetchall()
     
@@ -658,16 +1071,26 @@ def check_employee_shifts():
     for r in rows:
         obj_name = r['object_name']
         marking = ""
-        cursor.execute("SELECT markning FROM meta_objects WHERE name = ?", (obj_name,))
+        cursor.execute("SELECT markning FROM meta_objects WHERE name = ? AND company = ?", (obj_name, r['company']))
         obj_meta = cursor.fetchone()
         if obj_meta and obj_meta['markning']:
             marking = obj_meta['markning']
             
         shifts.append({
             "date": r['date'], 
+            "employee": r['employee'],
             "object_name": obj_name, 
             "marking": marking,
-            "hours": r['hours']
+            "hours": r['hours'],
+            "company": r['company'],
+            "rate": r['rate'],
+            "transport": r['transport'],
+            "comment": r['comment'] or "",
+            "invoiced": r['invoiced'],
+            "sync_id": r['sync_id'],
+            "version": r['version'],
+            "change_seq": r['change_seq'],
+            "submission_type": r['submission_type'] or "work"
         })
         
     conn.close()
@@ -703,8 +1126,8 @@ def check_missing_shifts():
     start_check = today - timedelta(days=10)
     
     cursor.execute("""
-        SELECT date FROM cloud_shifts 
-        WHERE employee = ? AND date >= ? AND date <= ?
+        SELECT date FROM incoming_submissions
+        WHERE employee = ? AND date >= ? AND date <= ? AND is_deleted = 0 AND submission_type = 'work'
     """, (emp, start_check.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')))
     
     existing_dates = {row['date'] for row in cursor.fetchall()}
@@ -742,6 +1165,15 @@ def export_shifts_csv():
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    if session.get('role') != 'admin':
+        emp_id = session.get('employee_id')
+        cursor.execute("SELECT name FROM meta_employees WHERE id = ? AND is_active = 1", (emp_id,))
+        employee_row = cursor.fetchone()
+        if not employee_row:
+            conn.close()
+            return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+        empName = employee_row['name']
+
     try:
         year, month = map(int, selected_month.split('-'))
         start_date = datetime(year, month, 1).strftime('%Y-%m-%d')
@@ -751,9 +1183,9 @@ def export_shifts_csv():
             end_date = datetime(year, month + 1, 1).strftime('%Y-%m-%d')
         
         cursor.execute("""
-            SELECT date, company, object_name, hours, rate, transport, comment 
-            FROM cloud_shifts 
-            WHERE employee = ? AND date >= ? AND date < ? 
+            SELECT date, company, object_name, hours, rate, transport, comment, submission_type
+            FROM incoming_submissions
+            WHERE employee = ? AND date >= ? AND date < ? AND is_deleted = 0
             ORDER BY date ASC
         """, (empName, start_date, end_date))
         rows = cursor.fetchall()
@@ -765,7 +1197,7 @@ def export_shifts_csv():
 
     output = io.StringIO()
     writer = csv.writer(output, delimiter=';')
-    writer.writerow(['Дата', 'Сотрудник', 'Фирма', 'Объект', 'Часы', 'Ставка', 'Транспорт', 'Комментарий'])
+    writer.writerow(['Дата', 'Сотрудник', 'Фирма', 'Объект', 'Тип записи', 'Часы', 'Ставка', 'Транспорт', 'Комментарий'])
     
     for r in rows:
         writer.writerow([
@@ -773,6 +1205,7 @@ def export_shifts_csv():
             empName, 
             r['company'], 
             r['object_name'], 
+            r['submission_type'] or 'work',
             r['hours'], 
             r['rate'], 
             r['transport'], 
@@ -854,93 +1287,6 @@ def sync_desktop_data():
                         ON CONFLICT(name, company) DO UPDATE SET markning = excluded.markning
                     ''', (name, mark, comp if comp else "Privat"))
 
-        if desktop_shifts:
-            desktop_keys = set()
-            min_date = None
-            synced_employees = set()
-
-            for s in desktop_shifts:
-                if not isinstance(s, dict):
-                    return jsonify({"ok": False, "error": "Неверный формат смены"}), 400
-
-                date_val = str(s.get('date', '')).strip()
-                try:
-                    datetime.strptime(date_val, '%Y-%m-%d')
-                except ValueError:
-                    return jsonify({"ok": False, "error": f"Некорректный формат даты: {date_val}"}), 400
-
-                if min_date is None or date_val < min_date:
-                    min_date = date_val
-
-                emp_val = str(s.get('employee', '')).strip()
-                if not emp_val or len(emp_val) > 150:
-                    return jsonify({"ok": False, "error": "Некорректное имя сотрудника в смене"}), 400
-
-                synced_employees.add(emp_val)
-
-                try:
-                    hrs_val = float(s.get('hours', 0.0))
-                    rate_val = round(float(s.get('rate', 0.0)), 2)
-                    transport_val = round(float(s.get('transport', 0.0)), 2)
-                    
-                    if not (0.5 <= hrs_val <= 24) or str(hrs_val).lower() in ['nan', 'inf', '-inf']:
-                        raise ValueError("Часы вне диапазона")
-                    if not (0 <= rate_val <= 100000) or str(rate_val).lower() in ['nan', 'inf', '-inf']:
-                        raise ValueError("Некорректная ставка")
-                    if not (0 <= transport_val <= 10000) or str(transport_val).lower() in ['nan', 'inf', '-inf']:
-                        raise ValueError("Некорректный транспорт")
-                except (TypeError, ValueError) as err:
-                    return jsonify({"ok": False, "error": f"Ошибка параметров смены: {err}"}), 400
-
-                name, _, _ = safe_parse_obj(s.get('object_name'))
-                obj_name = name or str(s.get('object_name', '')).strip()
-                if not obj_name or len(obj_name) > 200:
-                    return jsonify({"ok": False, "error": "Некорректное имя объекта"}), 400
-
-                comment_val = str(s.get('comment', ''))[:2000]
-                req_id = str(s.get('request_id', ''))[:100]
-                company_val = str(s.get('company', 'Privat'))
-
-                desktop_keys.add((date_val, emp_val, obj_name, hrs_val, company_val))
-
-                exists = False
-                if req_id:
-                    cursor.execute("SELECT id FROM cloud_shifts WHERE request_id = ?", (req_id,))
-                    if cursor.fetchone():
-                        exists = True
-
-                if not exists:
-                    cursor.execute('''
-                        SELECT id FROM cloud_shifts 
-                        WHERE date = ? AND employee = ? AND object_name = ? AND hours = ? AND company = ?
-                    ''', (date_val, emp_val, obj_name, hrs_val, company_val))
-                    if cursor.fetchone():
-                        exists = True
-
-                if exists:
-                    continue
-
-                cursor.execute('''
-                    INSERT OR IGNORE INTO cloud_shifts (request_id, date, employee, company, object_name, hours, rate, transport, comment, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ''', (
-                    req_id if req_id else None, date_val, emp_val, company_val, obj_name,
-                    hrs_val, rate_val, transport_val, comment_val
-                ))
-
-            if min_date and synced_employees:
-                placeholders = ','.join(['?'] * len(synced_employees))
-                query = f"SELECT id, date, employee, object_name, hours, company FROM cloud_shifts WHERE date >= ? AND employee IN ({placeholders})"
-                params = [min_date] + list(synced_employees)
-                
-                cursor.execute(query, params)
-                cloud_rows = cursor.fetchall()
-
-                for cr in cloud_rows:
-                    c_key = (cr['date'], cr['employee'], cr['object_name'], cr['hours'], cr['company'])
-                    if c_key not in desktop_keys:
-                        cursor.execute("DELETE FROM cloud_shifts WHERE id = ?", (cr['id'],))
-
         conn.commit()
     except Exception as e:
         logger.error(f"Safe sync validation error: {e}")
@@ -949,7 +1295,238 @@ def sync_desktop_data():
     finally:
         conn.close()
 
-    return jsonify({"ok": True, "status": "safe_merged_and_validated"})
+    return jsonify({"ok": True, "status": "metadata_synced", "shift_sync": "versioned_api_required"})
+
+def serialize_submission(row):
+    return {
+        "id": f"submission:{row['id']}",
+        "request_id": row['request_id'],
+        "sync_id": row['sync_id'],
+        "version": row['version'],
+        "change_seq": row['change_seq'],
+        "deleted": bool(row['is_deleted']),
+        "source": row['source'],
+        "date": row['date'],
+        "employee": row['employee'],
+        "company": row['company'],
+        "object_name": row['object_name'],
+        "hours": row['hours'],
+        "rate": row['rate'],
+        "transport": row['transport'],
+        "comment": row['comment'] or "",
+        "submission_type": row['submission_type'] or "work",
+        "invoiced": row['invoiced']
+    }
+
+@app.route('/sync/pull', methods=['GET'])
+def sync_pull():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    try:
+        since = max(0, int(request.args.get('since', '0')))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Некорректный курсор синхронизации"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("BEGIN")
+    cursor.execute("SELECT * FROM incoming_submissions WHERE change_seq > ? ORDER BY change_seq, id", (since,))
+    rows = cursor.fetchall()
+    cursor.execute("SELECT value FROM sync_metadata WHERE name = 'change_sequence'")
+    current_sequence = cursor.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return jsonify({
+        "ok": True,
+        "changes": [serialize_submission(row) for row in rows],
+        "cursor": current_sequence
+    })
+
+@app.route('/sync/capabilities', methods=['GET'])
+def sync_capabilities():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+    return jsonify({
+        "ok": True,
+        "submission_types": sorted(SUPPORTED_SUBMISSION_TYPES),
+        "typed_tombstones": True
+    })
+
+@app.route('/sync/push', methods=['POST'])
+def sync_push():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
+    data = request.json or {}
+    changes = data.get('changes', [])
+    if not isinstance(changes, list) or len(changes) > 500:
+        return jsonify({"ok": False, "error": "Ожидается список изменений (не более 500)"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    results = []
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        for change in changes:
+            if not isinstance(change, dict):
+                raise ValueError("Некорректный элемент синхронизации")
+            sync_id = str(change.get('sync_id', '')).strip()
+            operation_id = str(change.get('operation_id', '')).strip()
+            operation = change.get('operation')
+            if not sync_id or len(sync_id) > 120 or not operation_id or len(operation_id) > 120:
+                raise ValueError("Отсутствует стабильный ID или operation_id")
+            if operation not in ('upsert', 'delete'):
+                raise ValueError("Неизвестный тип изменения")
+            try:
+                base_version = int(change.get('base_version', 0))
+            except (TypeError, ValueError):
+                raise ValueError("Некорректная версия изменения")
+            if base_version < 0:
+                raise ValueError("Некорректная версия изменения")
+
+            payload = change.get('shift') or {}
+            if not isinstance(payload, dict):
+                raise ValueError("Некорректные данные смены.")
+            cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ? OR request_id = ?", (sync_id, sync_id))
+            existing = cursor.fetchone()
+
+            if operation == 'upsert':
+                date_val = str(payload.get('date', '')).strip()
+                datetime.strptime(date_val, '%Y-%m-%d')
+                employee = str(payload.get('employee', '')).strip()
+                company = str(payload.get('company', '')).strip()
+                object_name = str(payload.get('object_name', '')).strip()
+                if not employee or len(employee) > 150 or not company or not object_name or len(object_name) > 200:
+                    raise ValueError("Некорректные поля смены")
+                hours = float(payload.get('hours'))
+                rate = round(float(payload.get('rate', 0)), 2)
+                transport = round(float(payload.get('transport', 0)), 2)
+                if not (0.5 <= hours <= 24) or hours % 0.5 != 0 or not (0 <= rate <= 100000) or not (0 <= transport <= 10000):
+                    raise ValueError("Часы, ставка или транспорт вне допустимого диапазона")
+                if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, rate, transport)):
+                    raise ValueError("Числовое поле должно быть конечным")
+                comment = str(payload.get('comment', ''))[:2000]
+                has_type = 'submission_type' in payload or 'record_type' in payload
+                if has_type:
+                    submission_type = resolve_submission_type(payload)
+                elif existing and not existing['is_deleted']:
+                    submission_type = existing['submission_type'] or infer_submission_type_from_object(cursor, company, object_name)
+                else:
+                    submission_type = infer_submission_type_from_object(cursor, company, object_name)
+                validate_submission_object(cursor, submission_type, company, object_name)
+                invoiced = int(bool(payload.get('invoiced', 0))) if submission_type == 'work' else 0
+                if submission_type != 'work':
+                    rate = float(existing['rate']) if existing else 0.0
+                    transport = float(existing['transport']) if existing else 0.0
+                normalized = {
+                    "date": date_val, "employee": employee, "company": company,
+                    "object_name": object_name, "hours": hours, "rate": rate,
+                    "transport": transport, "comment": comment, "invoiced": invoiced,
+                    "submission_type": submission_type
+                }
+            else:
+                has_type = 'submission_type' in payload or 'record_type' in payload
+                if has_type:
+                    submission_type = resolve_submission_type(payload)
+                elif existing:
+                    submission_type = existing['submission_type'] or "work"
+                elif all(payload.get(key) for key in ('company', 'object_name')):
+                    submission_type = infer_submission_type_from_object(
+                        cursor, str(payload['company']).strip(), str(payload['object_name']).strip()
+                    )
+                else:
+                    submission_type = "work"
+                if has_type:
+                    tombstone_company = str(payload.get('company') or (existing['company'] if existing else '')).strip()
+                    tombstone_object = str(payload.get('object_name') or (existing['object_name'] if existing else '')).strip()
+                    if tombstone_company and tombstone_object:
+                        validate_submission_object(cursor, submission_type, tombstone_company, tombstone_object)
+                normalized = {"submission_type": submission_type}
+
+            operation_hash = hashlib.sha256(json.dumps(
+                {"operation": operation, "shift": normalized}, sort_keys=True
+            ).encode('utf-8')).hexdigest()
+
+            if existing and existing['last_operation_id'] == operation_id:
+                legacy_normalized = dict(normalized)
+                legacy_normalized.pop('submission_type', None)
+                legacy_operation_hash = hashlib.sha256(json.dumps(
+                    {"operation": operation, "shift": legacy_normalized}, sort_keys=True
+                ).encode('utf-8')).hexdigest()
+                if existing['payload_hash'] == operation_hash or (
+                    not has_type and (existing['submission_type'] or 'work') == submission_type
+                    and existing['payload_hash'] == legacy_operation_hash
+                ):
+                    results.append({"operation_id": operation_id, "ok": True, "version": existing['version'], "idempotent": True})
+                else:
+                    results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "operation_id_reused"})
+                continue
+
+            if existing and existing['is_deleted'] and operation != 'delete':
+                results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "deleted"})
+                continue
+            if existing and (existing['version'] != base_version or existing['sync_id'] != sync_id):
+                results.append({
+                    "operation_id": operation_id, "ok": False, "conflict": True,
+                    "reason": "stale_version", "current": serialize_submission(existing)
+                })
+                continue
+            if not existing and base_version != 0:
+                results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
+                continue
+
+            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            change_seq = next_change_sequence(cursor)
+            version = existing['version'] + 1 if existing else 1
+            if existing:
+                cursor.execute('''
+                    UPDATE incoming_submissions SET
+                        date = COALESCE(?, date), employee = COALESCE(?, employee),
+                        company = COALESCE(?, company), object_name = COALESCE(?, object_name),
+                        hours = COALESCE(?, hours), rate = COALESCE(?, rate),
+                        transport = COALESCE(?, transport), comment = COALESCE(?, comment),
+                        invoiced = COALESCE(?, invoiced),
+                        submission_type = COALESCE(?, submission_type),
+                        version = ?, change_seq = ?, is_deleted = ?, desktop_acked = 1,
+                        last_operation_id = ?, payload_hash = ?, updated_at = ?
+                    WHERE id = ?
+                ''', (
+                    normalized.get('date'), normalized.get('employee'), normalized.get('company'),
+                    normalized.get('object_name'), normalized.get('hours'), normalized.get('rate'),
+                    normalized.get('transport'), normalized.get('comment'), normalized.get('invoiced'),
+                    normalized.get('submission_type'), version, change_seq,
+                    int(operation == 'delete'), operation_id, operation_hash, now, existing['id']
+                ))
+            else:
+                if operation == 'delete':
+                    results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
+                    continue
+                cursor.execute('''
+                    INSERT INTO incoming_submissions (
+                        request_id, sync_id, submission_type, date, employee, company, object_name,
+                        hours, rate, transport, comment, invoiced, version, change_seq, is_deleted,
+                        desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?)
+                ''', (
+                    sync_id, sync_id, normalized['submission_type'], normalized['date'], normalized['employee'], normalized['company'],
+                    normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
+                    normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now
+                ))
+            results.append({"operation_id": operation_id, "ok": True, "version": version, "change_seq": change_seq})
+
+        conn.commit()
+    except (ValueError, TypeError, sqlite3.IntegrityError) as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        conn.rollback()
+        conn.close()
+        logger.exception("Ошибка применения синхронизации смен")
+        return jsonify({"ok": False, "error": "Не удалось применить изменения синхронизации"}), 500
+    conn.close()
+    return jsonify({"ok": True, "results": results})
 
 @app.route('/get-unsynced', methods=['GET'])
 def get_unsynced():
@@ -958,14 +1535,23 @@ def get_unsynced():
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
-    rows = cursor.fetchall()
+    cursor.execute("SELECT id, request_id, date, employee, company, object_name, hours, rate, transport, comment FROM cloud_shifts WHERE synced = 0")
+    legacy_rows = cursor.fetchall()
+    cursor.execute("SELECT * FROM incoming_submissions WHERE source = 'web' AND desktop_acked = 0 AND is_deleted = 0 ORDER BY id")
+    submission_rows = cursor.fetchall()
     conn.close()
-    
-    shifts = [{
-        "id": r['id'], "date": r['date'], "employee": r['employee'], "company": r['company'],
-        "object_name": r['object_name'], "hours": r['hours'], "rate": r['rate'], "transport": r['transport'], "comment": r['comment']
-    } for r in rows]
+
+    shifts = []
+    for row in legacy_rows:
+        shifts.append({
+            "id": row['id'], "request_id": row['request_id'] or f"legacy-cloud:{row['id']}",
+            "sync_id": row['request_id'] or f"legacy-cloud:{row['id']}", "version": 1,
+            "source": "legacy",
+            "date": row['date'], "employee": row['employee'], "company": row['company'],
+            "object_name": row['object_name'], "hours": row['hours'], "rate": row['rate'],
+            "transport": row['transport'], "comment": row['comment'] or ""
+        })
+    shifts.extend(serialize_submission(row) for row in submission_rows)
     return jsonify({"ok": True, "shifts": shifts})
 
 @app.route('/mark-synced', methods=['POST'])
@@ -975,10 +1561,27 @@ def mark_synced():
 
     data = request.json or {}
     ids = data.get("ids", [])
+    if not isinstance(ids, list):
+        return jsonify({"ok": False, "error": "Ожидается список идентификаторов"}), 400
     if ids:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.executemany("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", [(i,) for i in ids])
+        for shift_id in ids:
+            if isinstance(shift_id, str) and shift_id.startswith('submission:'):
+                try:
+                    submission_id = int(shift_id.split(':', 1)[1])
+                except ValueError:
+                    conn.close()
+                    return jsonify({"ok": False, "error": "Некорректный ID заявки"}), 400
+                cursor.execute("UPDATE incoming_submissions SET desktop_acked = 1 WHERE id = ? AND source = 'web'", (submission_id,))
+            else:
+                try:
+                    legacy_id = int(shift_id)
+                except (TypeError, ValueError):
+                    conn.close()
+                    return jsonify({"ok": False, "error": "Некорректный ID смены"}), 400
+                cursor.execute("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", (legacy_id,))
+                cursor.execute("UPDATE incoming_submissions SET desktop_acked = 1 WHERE legacy_cloud_id = ?", (legacy_id,))
         conn.commit()
         conn.close()
     return jsonify({"ok": True, "status": "marked"})

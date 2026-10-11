@@ -147,6 +147,15 @@
                 </div>
 
                 <div class="form-group">
+                    <label for="submission_type">Тип записи:</label>
+                    <select id="submission_type" name="submission_type" required onchange="updateSubmissionTypeForm()">
+                        <option value="work">Работа</option>
+                        <option value="atf">АТФ</option>
+                        <option value="sick">Больничный</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
                     <label for="object_name">Объект / Адрес:</label>
                     <select id="object_name" name="object_name" required>
                         <option value="">-- Сначала выберите фирму --</option>
@@ -154,7 +163,7 @@
                 </div>
 
                 <div class="form-group">
-                    <label for="hours">Отработано часов:</label>
+                    <label id="hours-label" for="hours">Отработано часов:</label>
                     <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
                 </div>
 
@@ -207,6 +216,7 @@
             <button type="button" id="print-report-btn" class="btn-print" onclick="window.print()">🖨️ Печать / Сохранить в PDF</button>
 
             <div id="warning-container" style="margin-top: 15px; display: none; background: #ffeaa7; border: 1px solid #fdcb6e; padding: 12px; border-radius: 6px; font-size: 14px; color: #d63031; font-weight: bold;"></div>
+            <div id="history-period-totals" style="margin-top: 12px; font-weight: bold;"></div>
 
             <div style="margin-top: 18px;">
                 <h4 style="color: #0984e3; font-size: 15px; margin-bottom: 10px;">Заполненные дни за месяц:</h4>
@@ -217,6 +227,34 @@
         </div>
     </div>
 
+    <dialog id="shift-edit-dialog" style="width: min(480px, 92vw); border: 1px solid #dfe6e9; border-radius: 8px;">
+        <form id="shift-edit-form">
+            <h3>Изменить запись</h3>
+            <label for="edit-date">Дата</label>
+            <input id="edit-date" type="date" required>
+            <label for="edit-company">Фирма</label>
+            <select id="edit-company" required></select>
+            <label for="edit-type">Тип записи</label>
+            <select id="edit-type" required>
+                <option value="work">Работа</option>
+                <option value="atf">АТФ</option>
+                <option value="sick">Больничный</option>
+            </select>
+            <label for="edit-object">Объект</label>
+            <select id="edit-object" required></select>
+            <label for="edit-hours">Часы</label>
+            <input id="edit-hours" type="number" min="0.5" max="24" step="0.5" required>
+            <label for="edit-transport-check">Транспорт (только для работы)</label>
+            <input id="edit-transport-check" type="checkbox">
+            <label for="edit-comment">Комментарий</label>
+            <textarea id="edit-comment" rows="3"></textarea>
+            <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:16px;">
+                <button type="button" id="edit-cancel">Отмена</button>
+                <button type="submit">Сохранить</button>
+            </div>
+        </form>
+    </dialog>
+
     <!-- СКРЫТАЯ ОБЛАСТЬ ДЛЯ ПЕЧАТИ И PDF -->
     <div id="print-area">
         <h2 style="text-align: center; color: #000;">Bygger och renoverar i Sthlm</h2>
@@ -226,6 +264,7 @@
                 <tr style="border-bottom: 2px solid #000; text-align: left;">
                     <th style="padding: 8px;">Datum</th>
                     <th style="padding: 8px;">Objekt / Arbetsbeskrivning</th>
+                    <th style="padding: 8px;">Typ</th>
                     <th style="padding: 8px; text-align: right;">Timmar</th>
                 </tr>
             </thead>
@@ -239,12 +278,21 @@
         <div style="font-size: 16px; font-weight: bold; text-align: right; border-top: 2px solid #000; padding-top: 10px; margin-top: 10px;" id="print-total-hours">
             <!-- Общий итог -->
         </div>
+        <div style="font-size: 14px; font-weight: bold; text-align: right; margin-top: 6px;" id="print-special-hours"></div>
     </div>
 
     <!-- Скрипты -->
     <script>
         const allObjects = {{ objects | tojson }};
         let currentUser = null;
+        let pendingShiftRequestId = null;
+        let historySnapshot = null;
+        let historyPollTimer = null;
+        let historyPollInFlight = false;
+        let historyLoadInFlight = false;
+        let activeEditShift = null;
+        let activeEditOperationId = null;
+        let editOriginalTransport = 0;
         document.getElementById('date').value = new Date().toISOString().split('T')[0];
         
         const now = new Date();
@@ -258,6 +306,7 @@
 
         async function translateToSwedish(text) {
             if (!text || text.trim() === "") return "";
+            if (location.hostname === '127.0.0.1' || location.hostname === 'localhost') return text;
             try {
                 const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=ru|sv`;
                 const res = await fetch(url);
@@ -287,6 +336,7 @@
 
         function filterObjects() {
             const selectedCompany = document.getElementById('company').value;
+            const submissionType = document.getElementById('submission_type').value;
             const objectSelect = document.getElementById('object_name');
             objectSelect.innerHTML = '';
 
@@ -298,12 +348,21 @@
                 return;
             }
 
-            const filtered = allObjects.filter(obj => obj.company === selectedCompany);
+            const specialRefs = {
+                atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
+                sick: { name: 'Sjuk', marking: 'p1001' }
+            };
+            const reference = specialRefs[submissionType];
+            const filtered = allObjects.filter(obj => obj.company === selectedCompany && (
+                reference
+                    ? obj.name === reference.name && obj.markning === reference.marking
+                    : !Object.values(specialRefs).some(item => obj.name === item.name && obj.markning === item.marking)
+            ));
 
             if (filtered.length === 0) {
                 const opt = document.createElement('option');
                 opt.value = "";
-                opt.textContent = "-- Нет объектов для этой фирмы --";
+                opt.textContent = reference ? "-- Специальная запись не найдена в справочнике --" : "-- Нет рабочих объектов для этой фирмы --";
                 objectSelect.appendChild(opt);
             } else {
                 const defaultOpt = document.createElement('option');
@@ -317,6 +376,148 @@
                     opt.textContent = obj.display;
                     objectSelect.appendChild(opt);
                 });
+            }
+        }
+
+        function updateSubmissionTypeForm() {
+            const submissionType = document.getElementById('submission_type').value;
+            const special = submissionType !== 'work';
+            document.getElementById('hours-label').textContent = submissionType === 'atf'
+                ? 'Часы АТФ:'
+                : (submissionType === 'sick' ? 'Больничные часы:' : 'Отработано часов:');
+            const transportCheck = document.getElementById('transport_check');
+            transportCheck.checked = false;
+            transportCheck.disabled = special;
+            document.getElementById('transport').value = '0.0';
+            filterObjects();
+        }
+
+        function filterEditObjects(selectedName = '') {
+            const type = document.getElementById('edit-type').value;
+            const company = document.getElementById('edit-company').value;
+            const reference = {
+                atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
+                sick: { name: 'Sjuk', marking: 'p1001' }
+            }[type];
+            const select = document.getElementById('edit-object');
+            const options = allObjects.filter(obj => obj.company === company && (
+                reference
+                    ? obj.name === reference.name && obj.markning === reference.marking
+                    : !Object.values({
+                        atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
+                        sick: { name: 'Sjuk', marking: 'p1001' }
+                    }).some(item => obj.name === item.name && obj.markning === item.marking)
+            ));
+            select.replaceChildren();
+            for (const object of options) {
+                const option = document.createElement('option');
+                option.value = object.name;
+                option.textContent = object.display;
+                select.appendChild(option);
+            }
+            if (options.length === 0) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = reference ? 'Специальная запись не найдена' : 'Нет рабочих объектов';
+                select.appendChild(option);
+            } else if (options.some(object => object.name === selectedName)) {
+                select.value = selectedName;
+            }
+        }
+
+        function updateEditTypeForm() {
+            const special = document.getElementById('edit-type').value !== 'work';
+            const transport = document.getElementById('edit-transport-check');
+            transport.disabled = special;
+            transport.checked = special ? false : editOriginalTransport > 0;
+            filterEditObjects(document.getElementById('edit-object').value);
+        }
+
+        function openEditShift(shift) {
+            activeEditShift = shift;
+            activeEditOperationId = generateUUID();
+            editOriginalTransport = Number(shift.transport || 0);
+            document.getElementById('edit-date').value = shift.date;
+            const companySelect = document.getElementById('edit-company');
+            const companies = [...new Set(allObjects.map(object => object.company))].sort();
+            companySelect.replaceChildren();
+            for (const company of companies) {
+                const option = document.createElement('option');
+                option.value = company;
+                option.textContent = company;
+                companySelect.appendChild(option);
+            }
+            companySelect.value = shift.company;
+            document.getElementById('edit-type').value = shift.submission_type || 'work';
+            document.getElementById('edit-hours').value = shift.hours;
+            document.getElementById('edit-comment').value = shift.comment || '';
+            filterEditObjects(shift.object_name);
+            document.getElementById('edit-transport-check').checked = editOriginalTransport > 0;
+            updateEditTypeForm();
+            document.getElementById('shift-edit-dialog').showModal();
+        }
+
+        document.getElementById('edit-type').addEventListener('change', updateEditTypeForm);
+        document.getElementById('edit-company').addEventListener('change', () => filterEditObjects());
+        document.getElementById('edit-cancel').addEventListener('click', () => {
+            document.getElementById('shift-edit-dialog').close();
+        });
+
+        document.getElementById('shift-edit-form').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            if (!activeEditShift) return;
+            const submissionType = document.getElementById('edit-type').value;
+            const payload = {
+                sync_id: activeEditShift.sync_id,
+                operation_id: activeEditOperationId,
+                version: activeEditShift.version,
+                employee: activeEditShift.employee,
+                date: document.getElementById('edit-date').value,
+                company: document.getElementById('edit-company').value,
+                object_name: document.getElementById('edit-object').value,
+                hours: parseFloat(document.getElementById('edit-hours').value),
+                comment: document.getElementById('edit-comment').value,
+                submission_type: submissionType
+            };
+            if (submissionType === 'work') {
+                payload.transport = document.getElementById('edit-transport-check').checked ? 1 : 0;
+            }
+            try {
+                const response = await fetch('/edit-shift', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Не удалось изменить запись.');
+                document.getElementById('shift-edit-dialog').close();
+                showFormAlert('Запись изменена.', 'success');
+                document.getElementById('load-history-btn').click();
+            } catch (error) {
+                showFormAlert('Ошибка: ' + error.message, 'error');
+            }
+        });
+
+        async function deleteBrowserShift(shift) {
+            if (!confirm('Удалить эту запись?')) return;
+            try {
+                const response = await fetch('/delete-shift', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sync_id: shift.sync_id,
+                        operation_id: generateUUID(),
+                        version: shift.version,
+                        employee: shift.employee,
+                        submission_type: shift.submission_type || 'work'
+                    })
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Не удалось удалить запись.');
+                showFormAlert('Запись удалена.', 'success');
+                document.getElementById('load-history-btn').click();
+            } catch (error) {
+                showFormAlert('Ошибка: ' + error.message, 'error');
             }
         }
 
@@ -346,10 +547,41 @@
         }
 
         function generateUUID() {
-            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
                 return v.toString(16);
             });
+        }
+
+        async function pollShiftHistory() {
+            if (!currentUser || document.hidden || historyPollInFlight) return;
+            const employee = document.getElementById('history-employee').value;
+            const month = document.getElementById('history-month').value;
+            if (!employee || !month) return;
+
+            historyPollInFlight = true;
+            try {
+                const response = await fetch('/check-employee-shifts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ employee, month })
+                });
+                if (!response.ok) return;
+                const data = await response.json();
+                const snapshot = JSON.stringify((data.recent_shifts || []).map(shift => [
+                    shift.sync_id, shift.version, shift.change_seq, shift.submission_type
+                ]));
+                if (historySnapshot !== null && snapshot !== historySnapshot) {
+                    historySnapshot = snapshot;
+                    document.getElementById('load-history-btn').click();
+                } else if (historySnapshot === null) {
+                    historySnapshot = snapshot;
+                }
+            } catch (error) {
+                console.error('Не удалось обновить историю смен:', error);
+            } finally {
+                historyPollInFlight = false;
+            }
         }
 
         async function checkAuth() {
@@ -410,6 +642,12 @@
                     console.error("Ошибка привязки сотрудника:", e);
                 }
             }
+
+            if (historyEmployeeSelect.value) {
+                document.getElementById('load-history-btn').click();
+            }
+            if (historyPollTimer) clearInterval(historyPollTimer);
+            historyPollTimer = setInterval(pollShiftHistory, 2000);
         }
 
         async function handleLogin(e) {
@@ -453,6 +691,7 @@
             const selectedDate = document.getElementById('date').value;
             const empName = document.getElementById('employee').value;
             const hoursVal = parseFloat(document.getElementById('hours').value);
+            const submissionType = document.getElementById('submission_type').value;
 
             try {
                 const checkRes = await fetch('/check-employee-shifts', {
@@ -466,7 +705,7 @@
                 const checkData = await checkRes.json();
                 
                 if (checkData.recent_shifts) {
-                    const existingForDate = checkData.recent_shifts.filter(s => s.date === selectedDate);
+                    const existingForDate = checkData.recent_shifts.filter(s => s.date === selectedDate && (s.submission_type || 'work') === submissionType);
                     if (existingForDate.length > 0) {
                         let totalExistingHours = existingForDate.reduce((sum, s) => sum + s.hours, 0);
                         
@@ -497,14 +736,15 @@
             const hoursVal = parseFloat(document.getElementById('hours').value);
 
             const formData = {
-                request_id: generateUUID() + "_" + Date.now(),
+                request_id: pendingShiftRequestId || (pendingShiftRequestId = generateUUID()),
                 date: selectedDate,
                 employee: empName,
                 company: document.getElementById('company').value,
                 object_name: document.getElementById('object_name').value,
                 hours: hoursVal,
                 transport: parseFloat(document.getElementById('transport').value || 0),
-                comment: document.getElementById('comment').value
+                comment: document.getElementById('comment').value,
+                submission_type: document.getElementById('submission_type').value
             };
 
             try {
@@ -516,6 +756,7 @@
                 
                 const result = await response.json();
                 if (response.ok) {
+                    pendingShiftRequestId = null;
                     showFormAlert("Смена успешно отправлена!", "success");
                     
                     document.getElementById('comment').value = '';
@@ -533,6 +774,10 @@
             }
         }
 
+        document.getElementById('shift-form').addEventListener('input', function() {
+            pendingShiftRequestId = null;
+        });
+
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
             const selectedMonth = document.getElementById('history-month').value;
@@ -548,6 +793,8 @@
                 alert('Пожалуйста, выберите месяц!');
                 return;
             }
+            if (historyLoadInFlight) return;
+            historyLoadInFlight = true;
 
             listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">Загрузка...</li>';
             warningContainer.style.display = 'none';
@@ -561,6 +808,9 @@
                     body: JSON.stringify({ employee: empName, month: selectedMonth })
                 });
                 const shiftsData = await shiftsRes.json();
+                historySnapshot = JSON.stringify((shiftsData.recent_shifts || []).map(shift => [
+                    shift.sync_id, shift.version, shift.change_seq, shift.submission_type
+                ]));
 
                 const missingRes = await fetch('/check-missing-shifts', {
                     method: 'POST',
@@ -575,7 +825,9 @@
                 }
 
                 listContainer.innerHTML = '';
-                let totalHours = 0;
+                let totalWorkHours = 0;
+                let totalAtfHours = 0;
+                let totalSickHours = 0;
                 let totalsByObject = {};
 
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
@@ -583,6 +835,9 @@
 
                     for (const shift of shiftsData.recent_shifts) {
                         const li = document.createElement('li');
+                        const submissionType = shift.submission_type || 'work';
+                        const typeLabels = { work: 'Работа', atf: 'АТФ', sick: 'Больничный' };
+                        const typeLabel = typeLabels[submissionType] || 'Неизвестный тип';
 
                         const spanInfo = document.createElement('span');
                         const boldDate = document.createElement('b');
@@ -603,7 +858,19 @@
 
                         spanInfo.appendChild(boldDate);
                         spanInfo.appendChild(br);
+                        const typeLine = document.createElement('small');
+                        typeLine.style.fontWeight = 'bold';
+                        typeLine.textContent = typeLabel;
+                        spanInfo.appendChild(typeLine);
+                        spanInfo.appendChild(document.createElement('br'));
                         spanInfo.appendChild(small);
+                        if (shift.company || shift.comment) {
+                            const details = document.createElement('small');
+                            details.style.color = '#636e72';
+                            details.textContent = [shift.company, shift.comment].filter(Boolean).join(' | ');
+                            spanInfo.appendChild(document.createElement('br'));
+                            spanInfo.appendChild(details);
+                        }
 
                         let badgeStyle = "background: #e1f5fe; color: #0277bd;";
                         if (shift.marking === 'p1000') {
@@ -616,16 +883,31 @@
                         spanHours.style.cssText = `${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;`;
                         spanHours.textContent = `${shift.hours} ч`;
 
+                        const actions = document.createElement('span');
+                        actions.style.cssText = 'display:flex;gap:6px;align-items:center;';
+                        const editButton = document.createElement('button');
+                        editButton.type = 'button';
+                        editButton.textContent = 'Изменить';
+                        editButton.addEventListener('click', () => openEditShift(shift));
+                        const deleteButton = document.createElement('button');
+                        deleteButton.type = 'button';
+                        deleteButton.textContent = 'Удалить';
+                        deleteButton.addEventListener('click', () => deleteBrowserShift(shift));
+                        actions.append(editButton, deleteButton);
+
                         li.appendChild(spanInfo);
                         li.appendChild(spanHours);
+                        li.appendChild(actions);
                         listContainer.appendChild(li);
 
                         let objKey = shift.object_name;
                         if (shift.marking) {
                             objKey = `[${shift.marking}] ${objKey}`;
                         }
-                        totalsByObject[objKey] = (totalsByObject[objKey] || 0) + shift.hours;
-                        totalHours += shift.hours;
+                        totalsByObject[`${typeLabel}: ${objKey}`] = (totalsByObject[`${typeLabel}: ${objKey}`] || 0) + shift.hours;
+                        if (submissionType === 'work') totalWorkHours += shift.hours;
+                        else if (submissionType === 'atf') totalAtfHours += shift.hours;
+                        else if (submissionType === 'sick') totalSickHours += shift.hours;
 
                         let rawComment = shift.comment || "";
                         let translatedComment = rawComment;
@@ -644,6 +926,7 @@
                         printRowsData.push({
                             date: shift.date,
                             description: objDisplay,
+                            type: typeLabel,
                             hours: shift.hours
                         });
                     }
@@ -653,6 +936,7 @@
                         printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
                             <td style="padding: 8px;">${row.date}</td>
                             <td style="padding: 8px;">${row.description}</td>
+                            <td style="padding: 8px;">${row.type}</td>
                             <td style="padding: 8px; text-align: right; font-weight: bold;">${row.hours} tim</td>
                         </tr>`;
                     });
@@ -667,14 +951,19 @@
                     document.getElementById('print-title').textContent = `Arbetsdagbok: ${empName} (${selectedMonth})`;
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
-                    document.getElementById('print-total-hours').textContent = `Totalt antal timmar: ${totalHours} tim`;
+                    document.getElementById('print-total-hours').textContent = `Рабочие часы: ${totalWorkHours} ч`;
+                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч`;
+                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
+                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч';
                 }
             } catch (err) {
                 listContainer.innerHTML = '<li style="color: #d63031; justify-content: center;">Ошибка загрузки данных.</li>';
                 console.error(err);
+            } finally {
+                historyLoadInFlight = false;
             }
         });
 
