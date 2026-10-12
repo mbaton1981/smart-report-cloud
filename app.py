@@ -1319,9 +1319,16 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
         objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
         conn.close()
+        metadata_payload = {"employees": employees, "companies": companies, "objects": objects, "shifts": []}
+        if self.__dict__.get("_manual_sync_requested", False):
+            print(
+                f"[SYNC] POST {CLOUD_URL}/sync-desktop-data employees="
+                f"{json.dumps(employees, ensure_ascii=False)}",
+                flush=True,
+            )
         metadata_response = requests.post(
             f"{CLOUD_URL}/sync-desktop-data", headers=headers,
-            json={"employees": employees, "companies": companies, "objects": objects, "shifts": []}, timeout=4
+            json=metadata_payload, timeout=4
         )
         metadata_response.raise_for_status()
         return conflicts

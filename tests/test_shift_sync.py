@@ -218,6 +218,8 @@ class ShiftSyncTests(unittest.TestCase):
         self.assertEqual(history['recent_shifts'], [])
 
     def test_desktop_outbox_survives_offline_and_syncs_tombstone(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
         import app as desktop
         import requests
 
@@ -278,7 +280,11 @@ class ShiftSyncTests(unittest.TestCase):
             conn.close()
 
             window = desktop.SmartReportApp.__new__(desktop.SmartReportApp)
-            window.perform_sync_logic()
+            window._manual_sync_requested = True
+            sync_log = StringIO()
+            with redirect_stdout(sync_log):
+                window.perform_sync_logic()
+            self.assertIn('"salary_rate": 245.8', sync_log.getvalue())
             remote = self.database()
             self.assertEqual(
                 remote.execute("SELECT salary_rate FROM meta_employees WHERE name = ?", (payload['employee'],)).fetchone()[0],
