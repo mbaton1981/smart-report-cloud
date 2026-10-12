@@ -22,6 +22,20 @@ SPECIAL_SUBMISSION_OBJECTS = {
     "atf": ("Arbetstidsförkortning", "p1000"),
     "sick": ("Sjuk", "p1001"),
 }
+OB_BASE_RATE_FALLBACKS = {
+    "aliaksei patonich": 245.80,
+    "andrii mudrii": 220.00,
+    "andrii piskun": 245.80,
+    "ivan kovpak": 220.00,
+    "mykhailo berdnyk": 220.00,
+    "oleg ievdokimov": 220.00,
+    "oleh strun": 220.00,
+    "roman bashchuk": 245.80,
+    "roman palamar": 220.00,
+    "taras oleksii": 220.00,
+    "taras roman": 220.00,
+    "vitalii stankovskyi": 220.00,
+}
 
 
 def resolve_submission_type(data, default="work"):
@@ -86,6 +100,14 @@ def get_employee_ob_base_rate(cursor, employee):
         )
         raise ValueError("Для OB не найден активный профиль сотрудника")
     salary_rate = float(profile["salary_rate"] or 0.0)
+    if salary_rate <= 0:
+        fallback_rate = OB_BASE_RATE_FALLBACKS.get(normalize_employee_name(employee))
+        if fallback_rate is not None:
+            logger.warning(
+                "OB salary fallback used employee_name=%r profile_id=%s database_rate=%s fallback_rate=%s",
+                employee, profile["id"], salary_rate, fallback_rate,
+            )
+            salary_rate = fallback_rate
     logger.info(
         "OB salary lookup result employee_name=%r profile_id=%s matched_name=%r salary_rate=%s",
         employee, profile["id"], profile["name"], salary_rate,
@@ -485,6 +507,19 @@ def init_cloud_db():
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT OR IGNORE INTO meta_employees (id, name, salary_rate, is_active) VALUES (?, ?, ?, ?)", (1, "Aliaksei Patonich", 0.0, 1))
+
+    cursor.execute("SELECT id, name, salary_rate FROM meta_employees")
+    seeded_ob_rates = []
+    for employee_row in cursor.fetchall():
+        fallback_rate = OB_BASE_RATE_FALLBACKS.get(normalize_employee_name(employee_row["name"]))
+        if fallback_rate is not None and float(employee_row["salary_rate"] or 0.0) <= 0:
+            cursor.execute(
+                "UPDATE meta_employees SET salary_rate = ? WHERE id = ?",
+                (fallback_rate, employee_row["id"]),
+            )
+            seeded_ob_rates.append((employee_row["name"], fallback_rate))
+    if seeded_ob_rates:
+        logger.warning("Seeded missing OB base rates from configured fallback list: %s", seeded_ob_rates)
 
     cursor.execute("SELECT COUNT(*) FROM meta_companies")
     if cursor.fetchone()[0] == 0:

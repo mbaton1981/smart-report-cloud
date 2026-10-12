@@ -237,6 +237,35 @@ class ObApiTests(unittest.TestCase):
         with self.client.session_transaction() as session:
             self.assertEqual(session["employee_id"], 2)
 
+    def test_ob_preview_uses_known_fallback_when_profile_rate_is_zero(self):
+        conn = self.database()
+        conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        preview = self.client.post("/calculate-ob", json={
+            "date": "2026-10-12",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "employee": "Aliaksei Patonich",
+        })
+        self.assertEqual(preview.status_code, 200, preview.json)
+        self.assertTrue(preview.json["base_rate_configured"])
+        self.assertAlmostEqual(preview.json["total_amount"], 1401.06, places=2)
+
+    def test_startup_seeds_known_base_rate_only_when_database_rate_is_zero(self):
+        conn = self.database()
+        conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        server.init_cloud_db()
+
+        conn = self.database()
+        profile = conn.execute("SELECT salary_rate FROM meta_employees WHERE id = 1").fetchone()
+        conn.close()
+        self.assertEqual(profile["salary_rate"], 245.80)
+
     def test_server_rejects_invalid_ob_and_does_not_trust_client_amount(self):
         invalid = dict(self.payload, request_id="invalid-ob", start_time="10:00", end_time="10:00")
         response = self.client.post("/submit-shift", json=invalid)
