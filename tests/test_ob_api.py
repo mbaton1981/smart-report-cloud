@@ -67,9 +67,12 @@ class ObApiTests(unittest.TestCase):
         response = self.client.post("/submit-shift", json=self.payload)
         self.assertEqual(response.status_code, 201, response.json)
         self.assertEqual(response.json["hours"], 4.0)
-        self.assertEqual(response.json["total_amount"], 570.0)
+        self.assertNotIn("total_amount", response.json)
         self.assertNotIn("ob_base_rate", response.json)
-        self.assertEqual([segment["amount"] for segment in response.json["segments"]], [100.0, 300.0, 170.0])
+        self.assertEqual(
+            [set(segment) for segment in response.json["segments"]],
+            [{"start_time", "end_time", "hours"}] * 3,
+        )
 
         conn = self.database()
         original = conn.execute(
@@ -85,10 +88,12 @@ class ObApiTests(unittest.TestCase):
             json={"employee": "Aliaksei Patonich", "month": "2026-10"},
         ).json["recent_shifts"][0]
         self.assertEqual(history["submission_type"], "ob")
-        self.assertEqual(history["ob_total_amount"], 570.0)
+        self.assertNotIn("ob_total_amount", history)
+        self.assertNotIn("rate", history)
+        self.assertNotIn("transport", history)
         self.assertEqual(len(history["ob_segments"]), 3)
         self.assertNotIn("ob_base_rate", history)
-        self.assertNotIn("base_rate", history["ob_segments"][0])
+        self.assertEqual(set(history["ob_segments"][0]), {"start_time", "end_time", "hours"})
         exported = self.client.post("/export-shifts-csv", json={
             "employee": "Aliaksei Patonich", "month": "2026-10"
         })
@@ -114,6 +119,9 @@ class ObApiTests(unittest.TestCase):
         }
         edited = self.client.post("/edit-shift", json=edit_payload)
         self.assertEqual(edited.status_code, 200, edited.json)
+        self.assertNotIn("total_amount", edited.json)
+        self.assertNotIn("ob_base_rate", edited.json)
+        self.assertEqual(set(edited.json["segments"][0]), {"start_time", "end_time", "hours"})
         conn = self.database()
         rows = conn.execute("SELECT id, sync_id, hours, start_time, end_time, ob_base_rate FROM incoming_submissions").fetchall()
         segments = conn.execute("SELECT hours, multiplier, amount FROM ob_segments WHERE shift_id = ?", (original["sync_id"],)).fetchall()
@@ -147,6 +155,12 @@ class ObApiTests(unittest.TestCase):
         self.assertIn("obIntervals: submissionType === 'ob'", page_text)
         self.assertIn("row.obIntervals.map", page_text)
         self.assertIn("OB-интервалы:", page_text)
+        self.assertNotIn("premium_percent", page_text)
+        self.assertNotIn("segment.multiplier", page_text)
+        self.assertNotIn("segment.amount", page_text)
+        self.assertNotIn("ob_total_amount", page_text)
+        self.assertNotIn("base_rate_configured", page_text)
+        self.assertNotRegex(page_text, r"\d+(?:\.\d+)?\s*kr\b")
         self.assertNotIn('type="time"', page_text)
         self.assertNotIn("ob-base-rate", page_text)
 
@@ -157,10 +171,16 @@ class ObApiTests(unittest.TestCase):
             "employee": "Aliaksei Patonich",
         })
         self.assertEqual(response.status_code, 200, response.json)
-        self.assertEqual(response.json["total_amount"], 570.0)
-        self.assertEqual([segment["amount"] for segment in response.json["segments"]], [100.0, 300.0, 170.0])
-        self.assertNotIn("base_rate", response.json["segments"][0])
+        self.assertEqual(response.json["total_hours"], 4.0)
+        self.assertEqual(len(response.json["segments"]), 3)
+        self.assertEqual(set(response.json["segments"][0]), {"start_time", "end_time", "hours"})
+        self.assertNotIn("total_amount", response.json)
+        self.assertNotIn("base_rate_configured", response.json)
+        self.assertNotIn("premium_percent", response.json["segments"][0])
         self.assertNotIn("ob_base_rate", response.json)
+        self.assertNotIn("segment.amount", page_text)
+        self.assertNotIn("segment.multiplier", page_text)
+        self.assertNotIn("OB сумма:", page_text)
 
     def test_desktop_sync_matches_employee_name_case_insensitively(self):
         conn = self.database()
@@ -202,7 +222,7 @@ class ObApiTests(unittest.TestCase):
             "employee": "  aLiAkSeI   PaToNiCh  ",
         })
         self.assertEqual(preview.status_code, 200, preview.json)
-        self.assertTrue(preview.json["base_rate_configured"])
+        self.assertEqual(preview.json["total_hours"], 4.0)
 
     def test_legacy_name_only_sync_preserves_existing_salary_rate(self):
         conn = self.database()
@@ -254,8 +274,9 @@ class ObApiTests(unittest.TestCase):
             "employee": "Taras Hlynskyi",
         })
         self.assertEqual(preview.status_code, 200, preview.json)
-        self.assertTrue(preview.json["base_rate_configured"])
-        self.assertAlmostEqual(preview.json["total_amount"], 1254.00, places=2)
+        self.assertEqual(preview.json["total_hours"], 4.0)
+        self.assertNotIn("total_amount", preview.json)
+        self.assertNotIn("base_rate_configured", preview.json)
 
     def test_ob_preview_repairs_stale_session_employee_id_by_username(self):
         conn = self.database()
@@ -283,8 +304,9 @@ class ObApiTests(unittest.TestCase):
                 "employee": "Aliaksei Patonich",
             })
         self.assertEqual(preview.status_code, 200, preview.json)
-        self.assertTrue(preview.json["base_rate_configured"])
-        self.assertAlmostEqual(preview.json["total_amount"], 1401.06, places=2)
+        self.assertEqual(preview.json["total_hours"], 4.0)
+        self.assertNotIn("total_amount", preview.json)
+        self.assertNotIn("base_rate_configured", preview.json)
         log_output = "\n".join(preview_logs.output)
         self.assertIn("employee_name='Aliaksei Patonich'", log_output)
         self.assertIn("normalize_employee_name(name) = ?", log_output)
@@ -316,7 +338,7 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.json)
         self.assertEqual((response.json["start_time"], response.json["end_time"]), ("17:00", "21:30"))
         self.assertEqual(response.json["hours"], 4.5)
-        self.assertEqual(response.json["total_amount"], 655.0)
+        self.assertNotIn("total_amount", response.json)
         conn = self.database()
         saved = conn.execute(
             "SELECT start_time, end_time, hours FROM incoming_submissions WHERE request_id = ?",

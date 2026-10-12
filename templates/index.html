@@ -35,9 +35,6 @@
         .ob-preview-panel { display: grid; gap: 6px; margin: 8px 0 14px; padding: 10px; border: 1px solid #d7e2ec; border-radius: 6px; background: #f5f9fc; font-size: 13px; overflow-wrap: anywhere; }
         .ob-segment-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding-bottom: 6px; border-bottom: 1px solid #dfe6e9; }
         .ob-segment-row strong { grid-column: 1 / -1; }
-        .ob-segment-row .ob-segment-amount { font-weight: bold; text-align: right; }
-        .ob-preview-note { color: #805b10; font-size: 12px; }
-        .ob-preview-warning { padding: 8px; border-radius: 4px; background: #fff3cd; color: #7a5a00; font-weight: bold; }
         
         input[type="date"], input[type="month"] {
             color-scheme: light;
@@ -520,47 +517,27 @@
 
         initializeHalfHourTimeFields();
 
+        function formatObHours(value) {
+            const hours = Number(value || 0);
+            if (!Number.isFinite(hours)) return '0';
+            return hours.toFixed(2).replace(/\.?0+$/, '');
+        }
+
         function renderObPreview(container, result) {
             container.replaceChildren();
-            const formatNumber = (value, digits = 2) => {
-                const number = Number(value);
-                return Number.isFinite(number) ? number.toFixed(digits) : (0).toFixed(digits);
-            };
-            const labels = {
-                weekday_early_morning_unpaid_pending_confirmation: '00:00–07:00 без оплаты до подтверждения договора',
-                weekday_day: 'Дневное время',
-                weekday_early_evening: 'Ранний вечер',
-                weekday_late_evening_night: 'Поздний вечер/ночь',
-                saturday: 'Суббота',
-                sunday: 'Воскресенье'
-            };
             (Array.isArray(result.segments) ? result.segments : []).forEach(segment => {
                 const row = document.createElement('div');
                 row.className = 'ob-segment-row';
                 const heading = document.createElement('strong');
-                heading.textContent = `${segment.start_time || ''}–${segment.end_time || ''} · ${labels[segment.category] || segment.category || 'OB'}`;
-                const details = document.createElement('span');
-                details.textContent = `${formatNumber(segment.hours)} ч · +${formatNumber(segment.premium_percent, 0)}% · ×${formatNumber(segment.multiplier)}`;
-                const amount = document.createElement('span');
-                amount.className = 'ob-segment-amount';
-                amount.textContent = `${formatNumber(segment.amount)} kr`;
-                row.append(heading, details, amount);
+                heading.textContent = `${segment.start_time || ''}–${segment.end_time || ''}`;
+                const hours = document.createElement('span');
+                hours.textContent = `${formatObHours(segment.hours)} ч`;
+                row.append(heading, hours);
                 container.appendChild(row);
             });
             const total = document.createElement('b');
-            total.textContent = `Всего: ${formatNumber(result.total_hours)} ч; OB сумма: ${formatNumber(result.total_amount)} kr`;
+            total.textContent = `Всего: ${formatObHours(result.total_hours)} ч`;
             container.appendChild(total);
-            if (result.base_rate_configured === false) {
-                const warning = document.createElement('div');
-                warning.className = 'ob-preview-warning';
-                warning.textContent = 'В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.';
-                container.appendChild(warning);
-            }
-            const note = document.createElement('small');
-            note.className = 'ob-preview-note';
-            note.style.display = 'block';
-            note.textContent = 'Начальные тарифы требуют подтверждения по применяемому kollektivavtal.';
-            container.appendChild(note);
         }
 
         async function refreshObPreview(edit = false) {
@@ -701,10 +678,6 @@
                 const preview = await refreshObPreview(true);
                 if (!preview) return;
                 payload.hours = preview.total_hours;
-                if (!preview.base_rate_configured) {
-                    showFormAlert('В профиле сотрудника не настроена базовая ставка.', 'error');
-                    return;
-                }
                 payload.start_time = getHalfHourTime('edit-ob-start');
                 payload.end_time = getHalfHourTime('edit-ob-end');
             }
@@ -1074,7 +1047,6 @@
                 let totalAtfHours = 0;
                 let totalSickHours = 0;
                 let totalObHours = 0;
-                let totalObAmount = 0;
                 let totalsByObject = {};
 
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
@@ -1112,17 +1084,10 @@
                         spanInfo.appendChild(document.createElement('br'));
                         spanInfo.appendChild(small);
                         if (submissionType === 'ob') {
-                            const obInfo = document.createElement('small');
-                            obInfo.style.display = 'block';
-                            obInfo.textContent = `${shift.start_time || ''}–${shift.end_time || ''}`;
-                            spanInfo.appendChild(document.createElement('br'));
-                            spanInfo.appendChild(obInfo);
                             for (const segment of (shift.ob_segments || [])) {
                                 const segmentLine = document.createElement('small');
                                 segmentLine.style.display = 'block';
-                                segmentLine.textContent = `${segment.segment_date || ''} ${segment.start_time || ''}–${segment.end_time || ''}: ` +
-                                    `${Number(segment.hours || 0).toFixed(2)} ч, +${Number(segment.premium_percent || 0)}%, ` +
-                                    `×${Number(segment.multiplier || 0).toFixed(2)}, ${Number(segment.amount || 0).toFixed(2)} kr`;
+                                segmentLine.textContent = `${segment.start_time || ''}–${segment.end_time || ''} — ${formatObHours(segment.hours)} ч`;
                                 spanInfo.appendChild(segmentLine);
                             }
                         }
@@ -1143,9 +1108,7 @@
 
                         const spanHours = document.createElement('span');
                         spanHours.style.cssText = `${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;`;
-                        spanHours.textContent = submissionType === 'ob'
-                            ? `${shift.hours} ч · ${Number(shift.ob_total_amount || 0).toFixed(2)} kr`
-                            : `${shift.hours} ч`;
+                        spanHours.textContent = `${formatObHours(shift.hours)} ч`;
 
                         const actions = document.createElement('span');
                         actions.className = 'history-actions';
@@ -1172,10 +1135,7 @@
                         if (submissionType === 'work') totalWorkHours += shift.hours;
                         else if (submissionType === 'atf') totalAtfHours += shift.hours;
                         else if (submissionType === 'sick') totalSickHours += shift.hours;
-                        else if (submissionType === 'ob') {
-                            totalObHours += shift.hours;
-                            totalObAmount += Number(shift.ob_total_amount || 0);
-                        }
+                        else if (submissionType === 'ob') totalObHours += shift.hours;
 
                         let rawComment = shift.comment || "";
                         let translatedComment = rawComment;
@@ -1215,8 +1175,8 @@
                         };
                         const obIntervalsHtml = row.obIntervals.length
                             ? `<div class="print-ob-intervals"><b>OB-интервалы:</b><br>${row.obIntervals.map(segment =>
-                                `${escapePrintText(segment.startTime)}–${escapePrintText(segment.endTime)} (${segment.hours.toFixed(2)} ч)`
-                            ).join('<br>')}</div>`
+                                `${escapePrintText(segment.startTime)}–${escapePrintText(segment.endTime)} (${formatObHours(segment.hours)} ч)`
+                            ).join('<br>')}<br><b>Всего: ${formatObHours(row.hours)} ч</b></div>`
                             : '';
                         printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
                             <td style="padding: 8px;">${escapePrintText(row.date)}</td>
@@ -1237,12 +1197,12 @@
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
                     document.getElementById('print-total-hours').textContent = `Рабочие часы: ${totalWorkHours} ч`;
-                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${totalObHours.toFixed(2)} ч / ${totalObAmount.toFixed(2)} kr`;
-                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${totalObHours.toFixed(2)} ч / ${totalObAmount.toFixed(2)} kr`;
+                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${formatObHours(totalObHours)} ч`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
-                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · OB: 0 ч / 0 kr';
+                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · OB: 0 ч';
                 }
             } catch (err) {
                 listContainer.innerHTML = '<li style="color: #d63031; justify-content: center;">Ошибка загрузки данных.</li>';

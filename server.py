@@ -110,10 +110,7 @@ def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
 
 def public_ob_result(result):
     public_segments = [
-        {key: segment[key] for key in (
-            "segment_date", "start_time", "end_time", "hours", "category",
-            "premium_percent", "multiplier", "amount",
-        )}
+        {key: segment[key] for key in ("start_time", "end_time", "hours")}
         for segment in result["segments"]
     ]
     return {
@@ -122,10 +119,7 @@ def public_ob_result(result):
         "end_time": result["end_time"],
         "hours": result["hours"],
         "total_hours": result["hours"],
-        "total_amount": result["total_amount"],
         "segments": public_segments,
-        "rules_version": result["rules_version"],
-        "base_rate_configured": result["base_rate_configured"],
     }
 
 
@@ -824,7 +818,7 @@ def submit_shift():
             )
             if not ob_result["base_rate_configured"]:
                 conn.close()
-                return jsonify({"ok": False, "error": "В профиле сотрудника не настроена базовая ставка. Обратитесь к администратору."}), 400
+                return jsonify({"ok": False, "error": "Не удалось рассчитать OB-смену. Обратитесь к администратору."}), 400
             date_str = ob_result["date"]
             hours = ob_result["hours"]
             rate = 0.0
@@ -1048,7 +1042,7 @@ def edit_shift():
                 employee,
             )
             if not ob_result["base_rate_configured"]:
-                raise ValueError("В профиле сотрудника не настроена базовая ставка. Обратитесь к администратору.")
+                raise ValueError("Не удалось пересчитать OB-смену. Обратитесь к администратору.")
             date_val = ob_result["date"]
             hours = ob_result["hours"]
             transport = 0.0
@@ -1125,7 +1119,7 @@ def edit_shift():
         conn.commit()
         response = {"ok": True, "sync_id": sync_id, "version": new_version, "change_seq": change_seq}
         if ob_result:
-            response.update({"hours": ob_result["hours"], "segments": ob_result["segments"], "total_amount": ob_result["total_amount"]})
+            response.update(public_ob_result(ob_result))
         return jsonify(response), 200
     except PermissionError as e:
         conn.rollback()
@@ -1362,8 +1356,6 @@ def check_employee_shifts():
             "marking": marking,
             "hours": r['hours'],
             "company": r['company'],
-            "rate": r['rate'],
-            "transport": r['transport'],
             "comment": r['comment'] or "",
             "invoiced": r['invoiced'],
             "sync_id": r['sync_id'],
@@ -1380,17 +1372,13 @@ def check_employee_shifts():
             if ob_record:
                 segments = get_ob_segments(cursor, r['sync_id'])
                 public_segments = [
-                    {key: segment[key] for key in (
-                        "segment_date", "start_time", "end_time", "hours", "category",
-                        "premium_percent", "multiplier", "amount",
-                    )}
+                    {key: segment[key] for key in ("start_time", "end_time", "hours")}
                     for segment in segments
                 ]
                 shifts[-1].update({
                     "start_time": ob_record["start_time"],
                     "end_time": ob_record["end_time"],
                     "ob_segments": public_segments,
-                    "ob_total_amount": round(sum(segment["amount"] for segment in segments), 2),
                 })
         
     conn.close()
