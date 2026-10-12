@@ -9,9 +9,19 @@ import csv
 import io
 import uuid
 from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template, request, jsonify, session, make_response
+from xml.sax.saxutils import escape
+from flask import Flask, render_template, request, jsonify, session, make_response, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from ob_calculator import calculate_work_interval
+import reportlab
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import LongTable, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 
 # Настройка системного логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -1437,6 +1447,199 @@ def check_missing_shifts():
         "missing_days": missing_days,
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
+
+@app.route('/download-arbetsdagbok.pdf', methods=['GET'])
+def download_arbetsdagbok_pdf():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+
+    selected_month = str(request.args.get('month') or '').strip()
+    try:
+        month_start = datetime.strptime(selected_month, '%Y-%m')
+    except ValueError:
+        return jsonify({"ok": False, "error": "Укажите месяц в формате YYYY-MM"}), 400
+    if month_start.strftime('%Y-%m') != selected_month:
+        return jsonify({"ok": False, "error": "Укажите месяц в формате YYYY-MM"}), 400
+    if month_start.month == 12:
+        month_end = datetime(month_start.year + 1, 1, 1)
+    else:
+        month_end = datetime(month_start.year, month_start.month + 1, 1)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if session.get('role') == 'admin':
+            requested_employee = str(request.args.get('employee') or '').strip()
+            profiles = find_employee_profiles(cursor, requested_employee, active_only=True)
+            profile = select_employee_profile(profiles, preferred_name=requested_employee)
+            if not profile:
+                return jsonify({"ok": False, "error": "Укажите активного сотрудника"}), 400
+            employee = profile['name']
+        else:
+            employee = resolve_session_employee(cursor)
+
+        cursor.execute('''
+            SELECT date, company, object_name, hours, comment, submission_type, sync_id
+            FROM incoming_submissions
+            WHERE normalize_employee_name(employee) = ?
+              AND date >= ? AND date < ? AND is_deleted = 0
+            ORDER BY date ASC, id ASC
+        ''', (
+            normalize_employee_name(employee),
+            month_start.strftime('%Y-%m-%d'),
+            month_end.strftime('%Y-%m-%d'),
+        ))
+        shifts = cursor.fetchall()
+
+        styles = getSampleStyleSheet()
+        font_path_candidates = [
+            os.environ.get('ARBETSDAGBOK_FONT_PATH'),
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
+            os.path.join(os.path.dirname(reportlab.__file__), 'fonts', 'Vera.ttf'),
+        ]
+        bold_font_candidates = [
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+            '/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf',
+            os.path.join(os.path.dirname(reportlab.__file__), 'fonts', 'VeraBd.ttf'),
+        ]
+        font_path = next((path for path in font_path_candidates if path and os.path.isfile(path)), None)
+        bold_font_path = next((path for path in bold_font_candidates if os.path.isfile(path)), None)
+        if font_path:
+            if 'Arbetsdagbok' not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont('Arbetsdagbok', font_path))
+            if bold_font_path and 'Arbetsdagbok-Bold' not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont('Arbetsdagbok-Bold', bold_font_path))
+            body_font = 'Arbetsdagbok'
+            bold_font = 'Arbetsdagbok-Bold' if bold_font_path else body_font
+        else:
+            body_font = 'Helvetica'
+            bold_font = 'Helvetica-Bold'
+
+        title_style = ParagraphStyle(
+            'ArbetsdagbokTitle', parent=styles['Title'], fontName=bold_font,
+            fontSize=15, leading=19, alignment=TA_CENTER, spaceAfter=8,
+        )
+        meta_style = ParagraphStyle(
+            'ArbetsdagbokMeta', parent=styles['BodyText'], fontName=body_font,
+            fontSize=9, leading=12, spaceAfter=4,
+        )
+        cell_style = ParagraphStyle(
+            'ArbetsdagbokCell', parent=styles['BodyText'], fontName=body_font,
+            fontSize=8.5, leading=11,
+        )
+        interval_style = ParagraphStyle(
+            'ArbetsdagbokInterval', parent=cell_style, fontSize=8, leading=10,
+            leftIndent=4, spaceBefore=3,
+        )
+        hours_style = ParagraphStyle(
+            'ArbetsdagbokHours', parent=cell_style, fontName=bold_font,
+            alignment=TA_RIGHT,
+        )
+
+        type_labels = {
+            'work': 'Arbete',
+            'atf': 'ATF',
+            'sick': 'Sjukfrånvaro',
+            'ob': 'OB/övertid',
+        }
+        totals_by_type = {'work': 0.0, 'atf': 0.0, 'sick': 0.0, 'ob': 0.0}
+        table_data = [[
+            Paragraph('Datum', cell_style),
+            Paragraph('Objekt / Arbetsbeskrivning', cell_style),
+            Paragraph('Typ', cell_style),
+            Paragraph('Timmar', hours_style),
+        ]]
+
+        for shift in shifts:
+            submission_type = shift['submission_type'] or 'work'
+            hours = float(shift['hours'] or 0.0)
+            totals_by_type[submission_type if submission_type in totals_by_type else 'work'] += hours
+            description_parts = []
+            cursor.execute(
+                "SELECT markning FROM meta_objects WHERE name = ? AND company = ?",
+                (shift['object_name'], shift['company']),
+            )
+            object_meta = cursor.fetchone()
+            object_name = shift['object_name'] or ''
+            if object_meta and object_meta['markning']:
+                object_name = f"[{object_meta['markning']}] {object_name}"
+            description_parts.append(escape(object_name))
+            if shift['company']:
+                description_parts.append(f"Firma: {escape(shift['company'])}")
+            if shift['comment']:
+                comment = escape(str(shift['comment'])).replace('\n', '<br/>')
+                description_parts.append(f"Arbetsbeskrivning: {comment}")
+
+            if submission_type == 'ob' and ob_schema_ready(cursor):
+                segments = get_ob_segments(cursor, shift['sync_id'])
+                interval_lines = [
+                    f"{escape(segment['start_time'])}–{escape(segment['end_time'])} "
+                    f"({float(segment['hours']):.2f} h)"
+                    for segment in segments
+                ]
+                interval_lines.append(f"<b>Totalt: {hours:.2f} h</b>")
+                description_parts.append(
+                    '<font size="8">OB intervals:<br/>' + '<br/>'.join(interval_lines) + '</font>'
+                )
+
+            table_data.append([
+                Paragraph(escape(shift['date'] or ''), cell_style),
+                Paragraph('<br/>'.join(description_parts), cell_style),
+                Paragraph(type_labels.get(submission_type, 'Arbete'), cell_style),
+                Paragraph(f"{hours:.2f} h", hours_style),
+            ])
+
+        output = io.BytesIO()
+        document = SimpleDocTemplate(
+            output, pagesize=A4, rightMargin=15 * mm, leftMargin=15 * mm,
+            topMargin=15 * mm, bottomMargin=15 * mm,
+            title=f"Arbetsdagbok {selected_month}", author="SmartReport",
+        )
+        story = [
+            Paragraph('Arbetsdagbok', title_style),
+            Paragraph(f"Medarbetare: {escape(employee)}", meta_style),
+            Paragraph(f"Period: {escape(selected_month)}", meta_style),
+            Spacer(1, 6 * mm),
+        ]
+        table = LongTable(table_data, colWidths=[20 * mm, 93 * mm, 35 * mm, 22 * mm], repeatRows=1)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e8edf2')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('FONTNAME', (0, 0), (-1, 0), bold_font),
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor('#b8c2cc')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('ALIGN', (-1, 0), (-1, -1), 'RIGHT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 5),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 8 * mm))
+        total_hours = sum(totals_by_type.values())
+        summary = ' · '.join(
+            f"{type_labels[key]}: {value:.2f} h"
+            for key, value in totals_by_type.items() if value
+        ) or 'Inga timmar registrerade'
+        story.append(Paragraph(f"<b>Totalt: {total_hours:.2f} h</b>", meta_style))
+        story.append(Paragraph(escape(summary), meta_style))
+        document.build(story)
+        output.seek(0)
+    except Exception:
+        logger.exception("Не удалось сформировать Arbetsdagbok PDF")
+        return jsonify({"ok": False, "error": "Не удалось сформировать PDF-отчёт"}), 500
+    finally:
+        conn.close()
+
+    return send_file(
+        output,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f"Arbetsdagbok_{selected_month}.pdf",
+        max_age=0,
+    )
+
 
 @app.route('/export-shifts-csv', methods=['POST'])
 def export_shifts_csv():

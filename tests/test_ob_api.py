@@ -163,6 +163,17 @@ class ObApiTests(unittest.TestCase):
         self.assertNotRegex(page_text, r"\d+(?:\.\d+)?\s*kr\b")
         self.assertNotIn('type="time"', page_text)
         self.assertNotIn("ob-base-rate", page_text)
+        self.assertIn('id="download-report-btn"', page_text)
+        self.assertIn('id="share-report-btn"', page_text)
+        self.assertIn("navigator.share", page_text)
+        self.assertIn("navigator.canShare", page_text)
+        self.assertIn("navigator.clipboard.writeText", page_text)
+        self.assertIn("Ссылка на отчёт скопирована в буфер обмена", page_text)
+        self.assertIn("download-arbetsdagbok.pdf", page_text)
+        self.assertNotIn("onclick=\"window.print()\"", page_text)
+        self.assertNotIn("segment.amount", page_text)
+        self.assertNotIn("segment.multiplier", page_text)
+        self.assertNotIn("OB сумма:", page_text)
 
         response = self.client.post("/calculate-ob", json={
             "date": "2026-10-12",
@@ -178,9 +189,18 @@ class ObApiTests(unittest.TestCase):
         self.assertNotIn("base_rate_configured", response.json)
         self.assertNotIn("premium_percent", response.json["segments"][0])
         self.assertNotIn("ob_base_rate", response.json)
-        self.assertNotIn("segment.amount", page_text)
-        self.assertNotIn("segment.multiplier", page_text)
-        self.assertNotIn("OB сумма:", page_text)
+
+    def test_arbetsdagbok_pdf_download_is_authenticated_and_named(self):
+        anonymous = server.app.test_client().get("/download-arbetsdagbok.pdf?month=2026-10")
+        self.assertEqual(anonymous.status_code, 401)
+
+        submitted = self.client.post("/submit-shift", json=self.payload)
+        self.assertEqual(submitted.status_code, 201, submitted.json)
+        response = self.client.get("/download-arbetsdagbok.pdf?month=2026-10")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "application/pdf")
+        self.assertTrue(response.data.startswith(b"%PDF-"))
+        self.assertIn("Arbetsdagbok_2026-10.pdf", response.headers["Content-Disposition"])
 
     def test_desktop_sync_matches_employee_name_case_insensitively(self):
         conn = self.database()
