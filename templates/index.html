@@ -271,7 +271,7 @@
             </div>
 
             <button type="button" id="load-history-btn" class="btn-history">Показать смены за месяц</button>
-            <button type="button" id="print-report-btn" class="btn-print" onclick="window.print()" style="display:none;">🖨️ Печать / Сохранить в PDF</button>
+            <button type="button" id="preview-report-btn" class="btn-print" style="display:none;">📄 Просмотр отчёта</button>
 
             <div id="warning-container" style="margin-top: 15px; display: none; background: #ffeaa7; border: 1px solid #fdcb6e; padding: 12px; border-radius: 6px; font-size: 14px; color: #d63031; font-weight: bold;"></div>
             <div id="history-period-totals" style="margin-top: 12px; font-weight: bold;"></div>
@@ -998,17 +998,31 @@
             pendingShiftRequestId = null;
         });
 
-        function setReportPdfTarget(employee, month) {
+        function setReportTargets(employee, month) {
             const params = new URLSearchParams({ employee, month });
+            reportPreviewUrl = `/report-preview?${params.toString()}`;
             reportPdfUrl = `/download-arbetsdagbok.pdf?${params.toString()}`;
         }
+
+        document.getElementById('preview-report-btn').addEventListener('click', () => {
+            if (!reportPreviewUrl) {
+                alert('Сначала загрузите отчёт за месяц.');
+                return;
+            }
+            const previewWin = window.open(reportPreviewUrl, '_blank');
+            if (previewWin) {
+                previewWin.opener = null;
+            } else {
+                window.location.href = reportPreviewUrl;
+            }
+        });
 
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
             const selectedMonth = document.getElementById('history-month').value;
             const listContainer = document.getElementById('history-list');
             const warningContainer = document.getElementById('warning-container');
-            const printBtn = document.getElementById('print-report-btn');
+            const previewBtn = document.getElementById('preview-report-btn');
             
             if (!empName) {
                 alert('Пожалуйста, выберите сотрудника!');
@@ -1024,7 +1038,8 @@
             listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">Загрузка...</li>';
             warningContainer.style.display = 'none';
             warningContainer.textContent = '';
-            printBtn.style.display = 'none';
+            previewBtn.style.display = 'none';
+            reportPreviewUrl = '';
             reportPdfUrl = '';
 
             try {
@@ -1200,8 +1215,8 @@
                     }
                     summaryHtml += '</ul>';
 
-                    setReportPdfTarget(empName, selectedMonth);
-                    printBtn.style.display = 'block';
+                    setReportTargets(empName, selectedMonth);
+                    previewBtn.style.display = 'block';
                     document.getElementById('print-title').textContent = `Arbetsdagbok: ${empName} (${selectedMonth})`;
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;

@@ -1448,23 +1448,127 @@ def check_missing_shifts():
         "message": f"Внимание! За прошлые рабочие дни не заполнено смен: {len(missing_days)}." if has_gaps else ""
     })
 
+
+def fetch_arbetsdagbok_records(cursor, employee, selected_month):
+    try:
+        month_start = datetime.strptime(selected_month, '%Y-%m')
+    except ValueError:
+        return None, "Укажите месяц в формате YYYY-MM"
+    if month_start.strftime('%Y-%m') != selected_month:
+        return None, "Укажите месяц в формате YYYY-MM"
+    if month_start.month == 12:
+        month_end = datetime(month_start.year + 1, 1, 1)
+    else:
+        month_end = datetime(month_start.year, month_start.month + 1, 1)
+
+    cursor.execute('''
+        SELECT date, company, object_name, hours, comment, submission_type, sync_id
+        FROM incoming_submissions
+        WHERE normalize_employee_name(employee) = ?
+          AND date >= ? AND date < ? AND is_deleted = 0
+        ORDER BY date ASC, id ASC
+    ''', (
+        normalize_employee_name(employee),
+        month_start.strftime('%Y-%m-%d'),
+        month_end.strftime('%Y-%m-%d'),
+    ))
+    raw_shifts = cursor.fetchall()
+
+    type_labels = {
+        'work': 'Arbete',
+        'atf': 'ATF',
+        'sick': 'Sjukfrånvaro',
+        'ob': 'OB/övertid',
+    }
+    totals_by_type = {'work': 0.0, 'atf': 0.0, 'sick': 0.0, 'ob': 0.0}
+    totals_by_object = {}
+    formatted_shifts = []
+
+    for shift in raw_shifts:
+        sub_type = shift['submission_type'] or 'work'
+        hours = float(shift['hours'] or 0.0)
+        totals_by_type[sub_type if sub_type in totals_by_type else 'work'] += hours
+
+        cursor.execute(
+            "SELECT markning FROM meta_objects WHERE name = ? AND company = ?",
+            (shift['object_name'], shift['company']),
+        )
+        object_meta = cursor.fetchone()
+        raw_obj_name = shift['object_name'] or ''
+        if object_meta and object_meta['markning']:
+            obj_display = f"[{object_meta['markning']}] {raw_obj_name}"
+        else:
+            obj_display = raw_obj_name
+
+        totals_by_object[obj_display] = round(totals_by_object.get(obj_display, 0.0) + hours, 2)
+
+        ob_segments = []
+        if sub_type == 'ob' and ob_schema_ready(cursor):
+            segments = get_ob_segments(cursor, shift['sync_id'])
+            for seg in segments:
+                ob_segments.append({
+                    'start_time': seg['start_time'],
+                    'end_time': seg['end_time'],
+                    'hours': float(seg['hours']),
+                })
+
+        formatted_shifts.append({
+            'date': shift['date'] or '',
+            'company': shift['company'] or '',
+            'object_name': obj_display,
+            'comment': shift['comment'] or '',
+            'hours': hours,
+            'type_key': sub_type,
+            'type_label': type_labels.get(sub_type, 'Arbete'),
+            'ob_segments': ob_segments,
+        })
+
+    total_hours = sum(totals_by_type.values())
+    return {
+        'employee': employee,
+        'selected_month': selected_month,
+        'shifts': formatted_shifts,
+        'totals_by_type': totals_by_type,
+        'totals_by_object': totals_by_object,
+        'total_hours': total_hours,
+        'type_labels': type_labels,
+    }, None
+
+
+@app.route('/report-preview', methods=['GET'])
+def report_preview():
+    if 'user_id' not in session:
+        return redirect('/?login_required=1')
+
+    selected_month = str(request.args.get('month') or '').strip()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if session.get('role') == 'admin':
+            requested_employee = str(request.args.get('employee') or '').strip()
+            profiles = find_employee_profiles(cursor, requested_employee, active_only=True)
+            profile = select_employee_profile(profiles, preferred_name=requested_employee)
+            if not profile:
+                return "Сотрудник не найден или не активен", 400
+            employee = profile['name']
+        else:
+            employee = resolve_session_employee(cursor)
+
+        report_data, err = fetch_arbetsdagbok_records(cursor, employee, selected_month)
+        if err:
+            return err, 400
+
+        return render_template('report_preview.html', **report_data)
+    finally:
+        conn.close()
+
+
 @app.route('/download-arbetsdagbok.pdf', methods=['GET'])
 def download_arbetsdagbok_pdf():
     if 'user_id' not in session:
         return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
 
     selected_month = str(request.args.get('month') or '').strip()
-    try:
-        month_start = datetime.strptime(selected_month, '%Y-%m')
-    except ValueError:
-        return jsonify({"ok": False, "error": "Укажите месяц в формате YYYY-MM"}), 400
-    if month_start.strftime('%Y-%m') != selected_month:
-        return jsonify({"ok": False, "error": "Укажите месяц в формате YYYY-MM"}), 400
-    if month_start.month == 12:
-        month_end = datetime(month_start.year + 1, 1, 1)
-    else:
-        month_end = datetime(month_start.year, month_start.month + 1, 1)
-
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -1478,18 +1582,9 @@ def download_arbetsdagbok_pdf():
         else:
             employee = resolve_session_employee(cursor)
 
-        cursor.execute('''
-            SELECT date, company, object_name, hours, comment, submission_type, sync_id
-            FROM incoming_submissions
-            WHERE normalize_employee_name(employee) = ?
-              AND date >= ? AND date < ? AND is_deleted = 0
-            ORDER BY date ASC, id ASC
-        ''', (
-            normalize_employee_name(employee),
-            month_start.strftime('%Y-%m-%d'),
-            month_end.strftime('%Y-%m-%d'),
-        ))
-        shifts = cursor.fetchall()
+        report_data, err = fetch_arbetsdagbok_records(cursor, employee, selected_month)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
 
         styles = getSampleStyleSheet()
         font_path_candidates = [
@@ -1537,13 +1632,8 @@ def download_arbetsdagbok_pdf():
             alignment=TA_RIGHT,
         )
 
-        type_labels = {
-            'work': 'Arbete',
-            'atf': 'ATF',
-            'sick': 'Sjukfrånvaro',
-            'ob': 'OB/övertid',
-        }
-        totals_by_type = {'work': 0.0, 'atf': 0.0, 'sick': 0.0, 'ob': 0.0}
+        type_labels = report_data['type_labels']
+        totals_by_type = report_data['totals_by_type']
         table_data = [[
             Paragraph('Datum', cell_style),
             Paragraph('Objekt / Arbetsbeskrivning', cell_style),
@@ -1551,34 +1641,21 @@ def download_arbetsdagbok_pdf():
             Paragraph('Timmar', hours_style),
         ]]
 
-        for shift in shifts:
-            submission_type = shift['submission_type'] or 'work'
-            hours = float(shift['hours'] or 0.0)
-            totals_by_type[submission_type if submission_type in totals_by_type else 'work'] += hours
-            description_parts = []
-            cursor.execute(
-                "SELECT markning FROM meta_objects WHERE name = ? AND company = ?",
-                (shift['object_name'], shift['company']),
-            )
-            object_meta = cursor.fetchone()
-            object_name = shift['object_name'] or ''
-            if object_meta and object_meta['markning']:
-                object_name = f"[{object_meta['markning']}] {object_name}"
-            description_parts.append(escape(object_name))
+        for shift in report_data['shifts']:
+            description_parts = [escape(shift['object_name'])]
             if shift['company']:
                 description_parts.append(f"Firma: {escape(shift['company'])}")
             if shift['comment']:
                 comment = escape(str(shift['comment'])).replace('\n', '<br/>')
                 description_parts.append(f"Arbetsbeskrivning: {comment}")
 
-            if submission_type == 'ob' and ob_schema_ready(cursor):
-                segments = get_ob_segments(cursor, shift['sync_id'])
+            if shift['ob_segments']:
                 interval_lines = [
                     f"{escape(segment['start_time'])}–{escape(segment['end_time'])} "
                     f"({float(segment['hours']):.2f} h)"
-                    for segment in segments
+                    for segment in shift['ob_segments']
                 ]
-                interval_lines.append(f"<b>Totalt: {hours:.2f} h</b>")
+                interval_lines.append(f"<b>Totalt: {float(shift['hours']):.2f} h</b>")
                 description_parts.append(
                     '<font size="8">OB intervals:<br/>' + '<br/>'.join(interval_lines) + '</font>'
                 )
@@ -1586,8 +1663,8 @@ def download_arbetsdagbok_pdf():
             table_data.append([
                 Paragraph(escape(shift['date'] or ''), cell_style),
                 Paragraph('<br/>'.join(description_parts), cell_style),
-                Paragraph(type_labels.get(submission_type, 'Arbete'), cell_style),
-                Paragraph(f"{hours:.2f} h", hours_style),
+                Paragraph(shift['type_label'], cell_style),
+                Paragraph(f"{float(shift['hours']):.2f} h", hours_style),
             ])
 
         output = io.BytesIO()

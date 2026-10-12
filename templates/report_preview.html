@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arbetsdagbok: {{ employee }} ({{ selected_month }})</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f1f2f6;
+            margin: 0;
+            padding: 20px;
+            color: #2d3436;
+        }
+
+        .preview-toolbar {
+            position: sticky;
+            top: 10px;
+            background: #2d3436;
+            color: #fff;
+            padding: 12px 20px;
+            border-radius: 8px;
+            max-width: 900px;
+            margin: 0 auto 20px auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+            z-index: 1000;
+        }
+        .toolbar-title {
+            font-size: 15px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .toolbar-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            border: none;
+            border-radius: 6px;
+            padding: 9px 16px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .btn:hover { opacity: 0.92; }
+        .btn:active { transform: scale(0.98); }
+        .btn-print { background: #0984e3; color: #fff; }
+        .btn-pdf { background: #00b894; color: #fff; }
+        .btn-close { background: #636e72; color: #fff; }
+
+        .sheet {
+            background: #fff;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px 45px;
+            border-radius: 8px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            border: 1px solid #dfe6e9;
+        }
+        .sheet-header {
+            text-align: center;
+            margin-bottom: 24px;
+            border-bottom: 2px solid #2d3436;
+            padding-bottom: 16px;
+        }
+        .sheet-header h1 {
+            margin: 0 0 4px 0;
+            font-size: 22px;
+            color: #2d3436;
+            letter-spacing: 0.5px;
+        }
+        .sheet-header h2 {
+            margin: 0 0 12px 0;
+            font-size: 17px;
+            color: #636e72;
+            font-weight: 500;
+        }
+        .meta-info {
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+            color: #2d3436;
+            font-weight: 600;
+            margin-top: 10px;
+        }
+
+        table.report-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            font-size: 13.5px;
+        }
+        table.report-table th {
+            background: #f4f6f8;
+            border-bottom: 2px solid #2d3436;
+            padding: 9px 8px;
+            text-align: left;
+            font-weight: 600;
+            color: #2d3436;
+        }
+        table.report-table td {
+            border-bottom: 1px solid #e9ecef;
+            padding: 9px 8px;
+            vertical-align: top;
+        }
+        .hours-col {
+            text-align: right;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .shift-desc-line {
+            margin-top: 3px;
+            font-size: 12.5px;
+            color: #636e72;
+        }
+        .ob-intervals {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #2d3436;
+            background: #f8f9fa;
+            padding: 6px 10px;
+            border-radius: 4px;
+            border-left: 3px solid #0984e3;
+        }
+
+        .summary-box {
+            margin-top: 25px;
+            padding-top: 15px;
+            border-top: 1px dashed #b2bec3;
+            font-size: 13.5px;
+        }
+        .summary-box ul {
+            margin: 6px 0 0 20px;
+            padding: 0;
+            font-size: 13px;
+        }
+        .summary-box li {
+            margin-bottom: 3px;
+        }
+
+        .totals-bar {
+            margin-top: 18px;
+            padding-top: 12px;
+            border-top: 2px solid #2d3436;
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .special-hours {
+            margin-top: 6px;
+            text-align: right;
+            font-size: 13.5px;
+            color: #636e72;
+            font-weight: 600;
+        }
+
+        .signature-block {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #e9ecef;
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            color: #636e72;
+        }
+        .sig-line {
+            width: 42%;
+            border-top: 1px solid #2d3436;
+            padding-top: 6px;
+            text-align: center;
+        }
+
+        @page {
+            size: A4;
+            margin: 15mm;
+        }
+
+        @media print {
+            body {
+                background: #fff;
+                padding: 0;
+                margin: 0;
+                color: #000;
+            }
+            .no-print, .preview-toolbar {
+                display: none !important;
+            }
+            .sheet {
+                box-shadow: none;
+                border: none;
+                padding: 0;
+                max-width: none;
+                margin: 0;
+            }
+            table.report-table th {
+                background: #f0f0f0 !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            table.report-table tr {
+                page-break-inside: avoid;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="preview-toolbar no-print">
+        <div class="toolbar-title">
+            📄 Предпросмотр отчёта: {{ employee }} ({{ selected_month }})
+        </div>
+        <div class="toolbar-actions">
+            <button type="button" class="btn btn-print" onclick="window.print()">🖨️ Печать / Сохранить в PDF</button>
+            <a class="btn btn-pdf" href="/download-arbetsdagbok.pdf?employee={{ employee|urlencode }}&month={{ selected_month|urlencode }}">📥 Скачать бланк PDF</a>
+            <button type="button" class="btn btn-close" onclick="window.close()">✕ Закрыть</button>
+        </div>
+    </div>
+
+    <div class="sheet">
+        <div class="sheet-header">
+            <h1>Bygger och renoverar i Sthlm</h1>
+            <h2>Arbetsdagbok (Rapport)</h2>
+            <div class="meta-info">
+                <span>Medarbetare: {{ employee }}</span>
+                <span>Period: {{ selected_month }}</span>
+            </div>
+        </div>
+
+        <table class="report-table">
+            <thead>
+                <tr>
+                    <th style="width: 15%;">Datum</th>
+                    <th style="width: 53%;">Objekt / Arbetsbeskrivning</th>
+                    <th style="width: 18%;">Typ</th>
+                    <th style="width: 14%;" class="hours-col">Timmar</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if shifts %}
+                    {% for shift in shifts %}
+                    <tr>
+                        <td>{{ shift.date }}</td>
+                        <td>
+                            <b>{{ shift.object_name }}</b>
+                            {% if shift.company %}
+                            <div class="shift-desc-line">Firma: {{ shift.company }}</div>
+                            {% endif %}
+                            {% if shift.comment %}
+                            <div class="shift-desc-line">Arbetsbeskrivning: {{ shift.comment }}</div>
+                            {% endif %}
+                            {% if shift.ob_segments %}
+                            <div class="ob-intervals">
+                                <b>OB-intervaller:</b><br>
+                                {% for seg in shift.ob_segments %}
+                                {{ seg.start_time }}–{{ seg.end_time }} ({{ "%.2f"|format(seg.hours) }} tim)<br>
+                                {% endfor %}
+                                <b>Totalt: {{ "%.2f"|format(shift.hours) }} tim</b>
+                            </div>
+                            {% endif %}
+                        </td>
+                        <td>{{ shift.type_label }}</td>
+                        <td class="hours-col">{{ "%.2f"|format(shift.hours) }} tim</td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: #636e72; padding: 20px;">
+                            Inga arbetspass registrerade för denna period.
+                        </td>
+                    </tr>
+                {% endif %}
+            </tbody>
+        </table>
+
+        {% if totals_by_object %}
+        <div class="summary-box">
+            <b>Totalt per objekt / typ:</b>
+            <ul>
+                {% for obj, hrs in totals_by_object.items() %}
+                <li>{{ obj }}: <b>{{ "%.2f"|format(hrs) }} tim</b></li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <div class="totals-bar">
+            <span>Totalt antal timmar:</span>
+            <span>{{ "%.2f"|format(total_hours) }} tim</span>
+        </div>
+        <div class="special-hours">
+            Arbete: {{ "%.2f"|format(totals_by_type.work) }} tim · ATF: {{ "%.2f"|format(totals_by_type.atf) }} tim · Sjukfrånvaro: {{ "%.2f"|format(totals_by_type.sick) }} tim · OB: {{ "%.2f"|format(totals_by_type.ob) }} tim
+        </div>
+
+        <div class="signature-block">
+            <div class="sig-line">Underskrift medarbetare</div>
+            <div class="sig-line">Godkänd av arbetsledare / Datum</div>
+        </div>
+    </div>
+</body>
+</html>
