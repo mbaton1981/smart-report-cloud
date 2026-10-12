@@ -1635,7 +1635,7 @@ def download_arbetsdagbok_pdf():
     return send_file(
         output,
         mimetype='application/pdf',
-        as_attachment=True,
+        as_attachment=False,
         download_name=f"Arbetsdagbok_{selected_month}.pdf",
         max_age=0,
     )
