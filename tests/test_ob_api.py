@@ -214,6 +214,30 @@ class ObApiTests(unittest.TestCase):
         self.assertIn("inline", response.headers["Content-Disposition"])
         self.assertIn("Arbetsdagbok_2026-10.pdf", response.headers["Content-Disposition"])
 
+    def test_sync_endpoints_return_ob_details_and_segments(self):
+        submitted = self.client.post("/submit-shift", json=self.payload)
+        self.assertEqual(submitted.status_code, 201)
+
+        unsynced_res = self.client.get("/get-unsynced", headers={"X-Sync-Key": "unit-test-sync-key"})
+        self.assertEqual(unsynced_res.status_code, 200)
+        shifts = unsynced_res.json["shifts"]
+        ob_shift = next((s for s in shifts if s["submission_type"] == "ob"), None)
+        self.assertIsNotNone(ob_shift)
+        self.assertEqual(ob_shift["record_type"], "ob")
+        self.assertEqual(ob_shift["start_time"], "17:00")
+        self.assertEqual(ob_shift["end_time"], "21:00")
+        self.assertGreater(len(ob_shift.get("ob_segments", [])), 0)
+
+        pull_res = self.client.get("/sync/pull?since=0", headers={"X-Sync-Key": "unit-test-sync-key"})
+        self.assertEqual(pull_res.status_code, 200)
+        changes = pull_res.json["changes"]
+        pulled_ob = next((c for c in changes if c["submission_type"] == "ob"), None)
+        self.assertIsNotNone(pulled_ob)
+        self.assertEqual(pulled_ob["record_type"], "ob")
+        self.assertEqual(pulled_ob["start_time"], "17:00")
+        self.assertEqual(pulled_ob["end_time"], "21:00")
+        self.assertGreater(len(pulled_ob.get("ob_segments", [])), 0)
+
     def test_desktop_sync_matches_employee_name_case_insensitively(self):
         conn = self.database()
         conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")

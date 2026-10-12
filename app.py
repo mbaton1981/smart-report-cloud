@@ -62,6 +62,9 @@ def record_type_short_label(record_type):
     return mapping.get(record_type, "Работа")
 
 def format_ob_detail(start_time, end_time, total_hours, segments=None):
+    if segments and (not start_time or not end_time):
+        start_time = segments[0].get("start_time")
+        end_time = segments[-1].get("end_time")
     if not start_time or not end_time:
         return ""
     cat_short = {
@@ -356,7 +359,45 @@ def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, s
     ))
 
 
+def ensure_ob_schema(cursor):
+    cursor.execute("PRAGMA table_info(shifts)")
+    columns = {col[1] for col in cursor.fetchall()}
+    if 'entry_type' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'work'")
+    if 'work_rate_cache' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN work_rate_cache REAL NOT NULL DEFAULT 0.0")
+    if 'work_transport_cache' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN work_transport_cache REAL NOT NULL DEFAULT 0.0")
+    if 'start_time' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN start_time TEXT")
+    if 'end_time' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN end_time TEXT")
+    if 'ob_base_rate' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN ob_base_rate REAL")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ob_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shift_id TEXT NOT NULL,
+            segment_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            hours REAL NOT NULL,
+            category TEXT NOT NULL,
+            premium_percent REAL NOT NULL,
+            multiplier REAL NOT NULL,
+            base_rate REAL NOT NULL,
+            calculated_rate REAL NOT NULL,
+            amount REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (shift_id, segment_date, start_time, end_time, category)
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ob_segments_shift_id ON ob_segments(shift_id, segment_date)")
+
+
 def ob_schema_ready(cursor):
+    ensure_ob_schema(cursor)
     cursor.execute("PRAGMA table_info(shifts)")
     columns = {row[1] for row in cursor.fetchall()}
     required = {"start_time", "end_time", "ob_base_rate"}
@@ -1153,7 +1194,7 @@ class SmartReportApp(QMainWindow):
             else:
                 return
 
-        record_type = shift.get('record_type', shift.get('submission_type', RECORD_TYPE_WORK))
+        record_type = shift.get('record_type') or shift.get('submission_type') or RECORD_TYPE_WORK
         if record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK, RECORD_TYPE_OB):
             record_type = RECORD_TYPE_REVIEW
         if record_type == RECORD_TYPE_WORK:
@@ -1177,14 +1218,17 @@ class SmartReportApp(QMainWindow):
             int(bool(shift.get('invoiced', 0))) if record_type == RECORD_TYPE_WORK else 0,
             remote_version, record_type, work_rate_cache, work_transport_cache
         )
-        if local and remote_version <= local['sync_version']:
+        needs_type_repair = local and (
+            local['entry_type'] != record_type or
+            (record_type == RECORD_TYPE_OB and (not local['start_time'] or not local['end_time']))
+        )
+        if local and remote_version <= local['sync_version'] and not needs_type_repair:
             return
         if ob_schema_ready(cursor):
-            ob_values = (
-                shift.get("start_time") if record_type == RECORD_TYPE_OB else None,
-                shift.get("end_time") if record_type == RECORD_TYPE_OB else None,
-                shift.get("ob_base_rate") if record_type == RECORD_TYPE_OB else None,
-            )
+            start_t = shift.get("start_time") if record_type == RECORD_TYPE_OB else None
+            end_t = shift.get("end_time") if record_type == RECORD_TYPE_OB else None
+            base_r = shift.get("ob_base_rate") if record_type == RECORD_TYPE_OB else None
+            ob_values = (start_t, end_t, base_r)
             if local:
                 cursor.execute('''
                     UPDATE shifts SET date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
@@ -1215,10 +1259,23 @@ class SmartReportApp(QMainWindow):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache))
         if record_type == RECORD_TYPE_OB:
-            ob_result = calculate_work_interval(
-                shift["date"], shift["start_time"], shift["end_time"], shift["ob_base_rate"]
-            )
-            replace_ob_segments(cursor, sync_id, ob_result["segments"])
+            segments = shift.get("ob_segments")
+            if segments:
+                replace_ob_segments(cursor, sync_id, segments)
+            elif shift.get("start_time") and shift.get("end_time"):
+                base_rate = float(shift.get("ob_base_rate") or 0.0)
+                if base_rate <= 0:
+                    try:
+                        base_rate = get_local_employee_ob_base_rate(cursor, shift["employee"])
+                    except Exception:
+                        base_rate = 0.0
+                try:
+                    ob_result = calculate_work_interval(
+                        shift["date"], shift["start_time"], shift["end_time"], base_rate
+                    )
+                    replace_ob_segments(cursor, sync_id, ob_result["segments"])
+                except Exception as ex:
+                    logger.warning(f"Не удалось рассчитать OB сегменты для смены {sync_id}: {ex}")
         elif ob_schema_ready(cursor):
             cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
 
@@ -1277,10 +1334,14 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM shift_sync_state WHERE name = 'cursor'")
         current_cursor = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM shifts WHERE (entry_type = 'ob' AND (start_time IS NULL OR end_time IS NULL)) OR (entry_type = 'work' AND (rate = 0 OR rate IS NULL) AND (transport = 0 OR transport IS NULL))")
+        has_suspicious_or_incomplete = cursor.fetchone()[0] > 0
         conn.close()
 
+        manual_requested = bool(getattr(self, '__dict__', {}).get('_manual_sync_requested', False))
+        pull_since = 0 if (manual_requested or has_suspicious_or_incomplete) else current_cursor
         response = requests.get(
-            f"{CLOUD_URL}/sync/pull", headers=headers, params={"since": current_cursor}, timeout=4
+            f"{CLOUD_URL}/sync/pull", headers=headers, params={"since": pull_since}, timeout=4
         )
         response.raise_for_status()
         pulled = response.json()
@@ -3240,6 +3301,10 @@ class SmartReportApp(QMainWindow):
                 status_text = "✅ Выставлен" if is_inv else "⏳ В работе"
 
                 entry_type = row["entry_type"] or RECORD_TYPE_WORK
+                has_start = bool("start_time" in row.keys() and row["start_time"])
+                has_end = bool("end_time" in row.keys() and row["end_time"])
+                if entry_type == RECORD_TYPE_WORK and has_start and has_end:
+                    entry_type = RECORD_TYPE_OB
                 short_type = record_type_short_label(entry_type)
 
                 detalization = ""
@@ -3247,6 +3312,19 @@ class SmartReportApp(QMainWindow):
                 detail_tooltip = ""
                 if has_ob_schema and entry_type == RECORD_TYPE_OB:
                     segments = ob_segments_by_id.get(row["sync_id"], [])
+                    if not segments and has_start and has_end:
+                        try:
+                            calc_conn = get_db_connection()
+                            base_rate = float(row['ob_base_rate'] or 0.0) if "ob_base_rate" in row.keys() else 0.0
+                            if base_rate <= 0:
+                                base_rate = get_local_employee_ob_base_rate(calc_conn.cursor(), row['employee'])
+                            calc_res = calculate_work_interval(row['date'], row['start_time'], row['end_time'], base_rate)
+                            replace_ob_segments(calc_conn.cursor(), row['sync_id'], calc_res["segments"])
+                            calc_conn.commit()
+                            calc_conn.close()
+                            segments = calc_res["segments"]
+                        except Exception:
+                            pass
                     ob_amount = sum(segment["amount"] for segment in segments)
                     ob_amount_str = f"{ob_amount:.2f}"
                     detalization = format_ob_detail(row['start_time'], row['end_time'], row['hours'], segments)

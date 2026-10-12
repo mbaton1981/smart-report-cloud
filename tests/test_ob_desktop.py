@@ -28,6 +28,10 @@ class ObDesktopHarness(QWidget):
     delete_shift = desktop.SmartReportApp.delete_shift
     sync_with_cloud = desktop.SmartReportApp.sync_with_cloud
     load_objects_for_company = desktop.SmartReportApp.load_objects_for_company
+    apply_remote_shift = desktop.SmartReportApp.apply_remote_shift
+    load_shifts_history = desktop.SmartReportApp.load_shifts_history
+    apply_shifts_filters = desktop.SmartReportApp.apply_shifts_filters
+    load_dropdowns = desktop.SmartReportApp.load_dropdowns
 
 
 class ObDesktopTests(unittest.TestCase):
@@ -304,6 +308,69 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM ob_segments").fetchone()[0], 0)
         self.assertEqual(conn.execute("SELECT name FROM employees").fetchone()[0], "Alice")
         conn.close()
+
+    def test_apply_remote_shift_imports_and_repairs_ob_record(self):
+        conn = self.database()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1, 'work', 0, 0)
+        ''', ("2026-10-12", "Alice", "Privat", "Bygg och renovering", 4.0, "stale work", "remote-ob-sync-1"))
+        conn.commit()
+
+        remote_payload = {
+            "sync_id": "remote-ob-sync-1",
+            "version": 1,
+            "submission_type": "ob",
+            "record_type": "ob",
+            "date": "2026-10-12",
+            "employee": "Alice",
+            "company": "Privat",
+            "object_name": "Bygg och renovering",
+            "hours": 4.0,
+            "rate": 0.0,
+            "transport": 0.0,
+            "comment": "cloud OB shift",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "ob_base_rate": 100.0,
+            "ob_segments": [
+                {"segment_date": "2026-10-12", "start_time": "17:00", "end_time": "18:00", "hours": 1.0, "category": "weekday_day", "premium_percent": 0.0, "multiplier": 1.0, "base_rate": 100.0, "calculated_rate": 100.0, "amount": 100.0},
+                {"segment_date": "2026-10-12", "start_time": "18:00", "end_time": "20:00", "hours": 2.0, "category": "weekday_early_evening", "premium_percent": 50.0, "multiplier": 1.5, "base_rate": 100.0, "calculated_rate": 150.0, "amount": 300.0},
+                {"segment_date": "2026-10-12", "start_time": "20:00", "end_time": "21:00", "hours": 1.0, "category": "weekday_late_evening_night", "premium_percent": 70.0, "multiplier": 1.7, "base_rate": 100.0, "calculated_rate": 170.0, "amount": 170.0},
+            ]
+        }
+        self.window.apply_remote_shift(cursor, remote_payload)
+        conn.commit()
+
+        row = cursor.execute("SELECT entry_type, start_time, end_time, ob_base_rate FROM shifts WHERE sync_id = 'remote-ob-sync-1'").fetchone()
+        self.assertEqual(tuple(row), ("ob", "17:00", "21:00", 100.0))
+        segments = cursor.execute("SELECT COUNT(*) FROM ob_segments WHERE shift_id = 'remote-ob-sync-1'").fetchone()[0]
+        self.assertEqual(segments, 3)
+        conn.close()
+
+        self.window.table_shifts = QTableWidget()
+        self.window.table_shifts.setColumnCount(13)
+        self.window.filter_date_from = desktop.create_date_field("2026-10-01")
+        self.window.filter_date_to = desktop.create_date_field("2026-10-31")
+        self.window.filter_emp = QComboBox()
+        self.window.filter_emp.addItem("-- Все сотрудники --")
+        self.window.filter_comp = QComboBox()
+        self.window.filter_comp.addItem("-- Все фирмы --")
+        self.window.filter_obj = QComboBox()
+        self.window.filter_obj.addItem("-- Все объекты --")
+        self.window.filter_status = QComboBox()
+        self.window.filter_status.addItem("-- Все статусы --")
+        self.window.load_dropdowns = Mock()
+        self.window.load_shifts_history = desktop.SmartReportApp.load_shifts_history.__get__(self.window, ObDesktopHarness)
+        self.window.load_shifts_history()
+
+        self.assertEqual(self.window.table_shifts.rowCount(), 1)
+        self.assertEqual(self.window.table_shifts.item(0, 5).text(), "OB")
+        self.assertIn("17:00–21:00 (4 ч)", self.window.table_shifts.item(0, 7).text())
+        self.assertEqual(self.window.table_shifts.item(0, 12).text(), "570.00")
 
 
 if __name__ == "__main__":

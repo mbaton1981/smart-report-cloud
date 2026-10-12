@@ -1923,7 +1923,8 @@ def sync_desktop_data():
         "employee_sync": employee_sync_results,
     })
 
-def serialize_submission(row):
+def serialize_submission(row, cursor=None):
+    sub_type = row['submission_type'] or "work"
     payload = {
         "id": f"submission:{row['id']}",
         "request_id": row['request_id'],
@@ -1940,14 +1941,22 @@ def serialize_submission(row):
         "rate": row['rate'],
         "transport": row['transport'],
         "comment": row['comment'] or "",
-        "submission_type": row['submission_type'] or "work",
+        "submission_type": sub_type,
+        "record_type": sub_type,
         "invoiced": row['invoiced']
     }
-    if "start_time" in row.keys() and (row["submission_type"] or "work") == "ob":
+    if sub_type == "ob":
+        start_time = row["start_time"] if "start_time" in row.keys() else None
+        end_time = row["end_time"] if "end_time" in row.keys() else None
+        ob_base_rate = row["ob_base_rate"] if "ob_base_rate" in row.keys() else None
+        segments = []
+        if cursor and ob_schema_ready(cursor):
+            segments = get_ob_segments(cursor, row["sync_id"])
         payload.update({
-            "start_time": row["start_time"],
-            "end_time": row["end_time"],
-            "ob_base_rate": row["ob_base_rate"],
+            "start_time": start_time,
+            "end_time": end_time,
+            "ob_base_rate": ob_base_rate,
+            "ob_segments": segments,
         })
     return payload
 
@@ -1968,11 +1977,12 @@ def sync_pull():
     rows = cursor.fetchall()
     cursor.execute("SELECT value FROM sync_metadata WHERE name = 'change_sequence'")
     current_sequence = cursor.fetchone()[0]
+    changes = [serialize_submission(row, cursor=cursor) for row in rows]
     conn.commit()
     conn.close()
     return jsonify({
         "ok": True,
-        "changes": [serialize_submission(row) for row in rows],
+        "changes": changes,
         "cursor": current_sequence
     })
 
@@ -2240,7 +2250,6 @@ def get_unsynced():
     legacy_rows = cursor.fetchall()
     cursor.execute("SELECT * FROM incoming_submissions WHERE source = 'web' AND desktop_acked = 0 AND is_deleted = 0 ORDER BY id")
     submission_rows = cursor.fetchall()
-    conn.close()
 
     shifts = []
     for row in legacy_rows:
@@ -2250,9 +2259,12 @@ def get_unsynced():
             "source": "legacy",
             "date": row['date'], "employee": row['employee'], "company": row['company'],
             "object_name": row['object_name'], "hours": row['hours'], "rate": row['rate'],
-            "transport": row['transport'], "comment": row['comment'] or ""
+            "transport": row['transport'], "comment": row['comment'] or "",
+            "submission_type": "work",
+            "record_type": "work",
         })
-    shifts.extend(serialize_submission(row) for row in submission_rows)
+    shifts.extend(serialize_submission(row, cursor=cursor) for row in submission_rows)
+    conn.close()
     return jsonify({"ok": True, "shifts": shifts})
 
 @app.route('/mark-synced', methods=['POST'])
