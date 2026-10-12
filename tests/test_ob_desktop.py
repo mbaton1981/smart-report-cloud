@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from PyQt6.QtCore import QDate, QTime, Qt
-from PyQt6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QTimeEdit, QWidget
+from PyQt6.QtCore import QDate, Qt
+from PyQt6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QWidget
 
 import app as desktop
 from migrate_ob import migrate_database
@@ -85,10 +85,8 @@ class ObDesktopTests(unittest.TestCase):
         self.window.rate_input = QLineEdit("99999")
         self.window.trans_input = QLineEdit("1")
         self.window.comment_input = QLineEdit("OB test")
-        self.window.ob_start_time = QTimeEdit()
-        self.window.ob_start_time.setTime(QTime(17, 0))
-        self.window.ob_end_time = QTimeEdit()
-        self.window.ob_end_time.setTime(QTime(21, 0))
+        self.window.ob_start_time = desktop.create_half_hour_time_field("17:00")
+        self.window.ob_end_time = desktop.create_half_hour_time_field("21:00")
         self.window.record_type_status_lbl = QLabel()
         self.window.background_sync_with_cloud = Mock()
         self.window.load_shifts_history = Mock()
@@ -120,8 +118,10 @@ class ObDesktopTests(unittest.TestCase):
         window.setup_hours_tab()
         window.emp_cb.addItem("Alice")
         window.emp_cb.setCurrentText("Alice")
-        window.ob_start_time.setTime(QTime(17, 0))
-        window.ob_end_time.setTime(QTime(21, 0))
+        self.assertEqual(window.ob_start_time.count(), 48)
+        self.assertEqual(window.ob_start_time.itemText(1), "00:30")
+        window.ob_start_time.setCurrentText("17:00")
+        window.ob_end_time.setCurrentText("21:00")
         window.record_type_cb.setCurrentIndex(window.record_type_cb.findData(desktop.RECORD_TYPE_OB))
 
         self.assertFalse(window.ob_start_time.isHidden())
@@ -183,8 +183,8 @@ class ObDesktopTests(unittest.TestCase):
                 if label_item and field_item and label_item.widget():
                     fields[label_item.widget().text()] = field_item.widget()
             fields["Тип записи:"].setCurrentIndex(fields["Тип записи:"].findData(desktop.RECORD_TYPE_OB))
-            fields["Время начала:"].setTime(QTime(18, 0))
-            fields["Время окончания:"].setTime(QTime(20, 0))
+            fields["Время начала:"].setCurrentText("18:00")
+            fields["Время окончания:"].setCurrentText("20:00")
             fields["Комментарий:"].setText("updated OB")
             return int(desktop.QDialog.DialogCode.Accepted)
 

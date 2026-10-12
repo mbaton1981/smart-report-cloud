@@ -142,6 +142,8 @@ class ObApiTests(unittest.TestCase):
         self.assertIn('<option value="ob">OB/сверхурочные</option>', page_text)
         self.assertIn('id="ob-start-time"', page_text)
         self.assertIn('id="edit-ob-start-time"', page_text)
+        self.assertIn('id="ob-start-time" step="1800"', page_text)
+        self.assertIn('id="edit-ob-start-time" type="time" step="1800"', page_text)
         self.assertNotIn("ob-base-rate", page_text)
 
         response = self.client.post("/calculate-ob", json={
@@ -167,6 +169,26 @@ class ObApiTests(unittest.TestCase):
         stored = conn.execute("SELECT hours, rate, transport FROM incoming_submissions WHERE request_id = ?", ("ob-request-1",)).fetchone()
         self.assertEqual(tuple(stored), (4.0, 0.0, 0.0))
         conn.close()
+
+    def test_server_rounds_arbitrary_ob_times_to_nearest_half_hour(self):
+        payload = dict(
+            self.payload,
+            request_id="rounded-ob",
+            start_time="17:14",
+            end_time="21:16",
+        )
+        response = self.client.post("/submit-shift", json=payload)
+        self.assertEqual(response.status_code, 201, response.json)
+        self.assertEqual((response.json["start_time"], response.json["end_time"]), ("17:00", "21:30"))
+        self.assertEqual(response.json["hours"], 4.5)
+        self.assertEqual(response.json["total_amount"], 655.0)
+        conn = self.database()
+        saved = conn.execute(
+            "SELECT start_time, end_time, hours FROM incoming_submissions WHERE request_id = ?",
+            ("rounded-ob",),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(tuple(saved), ("17:00", "21:30", 4.5))
 
     def test_old_submission_payload_remains_work(self):
         legacy = dict(self.payload)

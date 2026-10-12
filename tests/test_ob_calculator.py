@@ -1,7 +1,7 @@
 import unittest
 from datetime import date
 
-from ob_calculator import calculate_work_interval, load_ob_rules
+from ob_calculator import calculate_work_interval, load_ob_rules, round_time_to_half_hour
 
 
 class ObCalculatorTests(unittest.TestCase):
@@ -85,6 +85,16 @@ class ObCalculatorTests(unittest.TestCase):
             with self.subTest(day=day, start=start, end=end, rate=rate):
                 with self.assertRaises(ValueError):
                     self.calculate(day, start, end, rate)
+
+    def test_rounds_to_nearest_half_hour_half_up_and_handles_midnight_rollover(self):
+        self.assertEqual(round_time_to_half_hour("07:14"), "07:00")
+        self.assertEqual(round_time_to_half_hour("07:15"), "07:30")
+        self.assertEqual(round_time_to_half_hour("07:46"), "08:00")
+        rounded = self.calculate("2026-10-12", "23:50", "02:10")
+        self.assertEqual(rounded["start_date"], "2026-10-13")
+        self.assertEqual(rounded["start_time"], "00:00")
+        self.assertEqual(rounded["end_time"], "02:00")
+        self.assertEqual(rounded["total_hours"], 2.0)
 
     def test_holiday_rule_can_override_weekday_configuration(self):
         rules = dict(self.rules)

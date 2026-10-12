@@ -36,6 +36,16 @@ def _parse_time(value, allow_end_of_day=False):
     return hour * 60 + minute
 
 
+def _round_minute_to_half_hour(minute):
+    return ((minute + 15) // 30) * 30
+
+
+def round_time_to_half_hour(value):
+    """Normalize a local clock time to the nearest HH:00 or HH:30 (half-up)."""
+    rounded = _round_minute_to_half_hour(_parse_time(value)) % (24 * 60)
+    return f"{rounded // 60:02d}:{rounded % 60:02d}"
+
+
 def _decimal_rate(value):
     if isinstance(value, bool):
         raise ValueError("Базовая ставка должна быть числом")
@@ -122,12 +132,21 @@ def calculate_work_interval(work_date, start_time, end_time, base_rate, rules=No
         raise ValueError("Некорректная политика неоднозначного местного времени")
 
     start_day = _parse_date(work_date)
-    start_minute = _parse_time(start_time)
-    end_minute = _parse_time(end_time)
-    if start_minute == end_minute:
+    raw_start_minute = _parse_time(start_time)
+    raw_end_minute = _parse_time(end_time, allow_end_of_day=True)
+    if raw_start_minute == raw_end_minute:
         raise ValueError("Время начала и окончания не может совпадать")
     rate = _decimal_rate(base_rate)
-    end_day = start_day + timedelta(days=1) if end_minute < start_minute else start_day
+    end_absolute_minute = raw_end_minute if raw_end_minute > raw_start_minute else raw_end_minute + 24 * 60
+    start_absolute_minute = _round_minute_to_half_hour(raw_start_minute)
+    end_absolute_minute = _round_minute_to_half_hour(end_absolute_minute)
+    if end_absolute_minute <= start_absolute_minute:
+        raise ValueError("После округления продолжительность интервала должна быть положительной")
+    start_day_offset, start_minute = divmod(start_absolute_minute, 24 * 60)
+    end_day_offset, end_minute = divmod(end_absolute_minute, 24 * 60)
+    original_start_day = start_day
+    start_day = original_start_day + timedelta(days=start_day_offset)
+    end_day = original_start_day + timedelta(days=end_day_offset)
     interval_start = _localize(start_day, start_minute, zone, ambiguous_policy)
     interval_end = _localize(end_day, end_minute, zone, ambiguous_policy)
     if interval_end.astimezone(timezone.utc) <= interval_start.astimezone(timezone.utc):
@@ -177,8 +196,10 @@ def calculate_work_interval(work_date, start_time, end_time, base_rate, rules=No
     return {
         "timezone": config["timezone"],
         "rules_version": str(config.get("version", "unversioned")),
-        "start_time": str(start_time),
-        "end_time": str(end_time),
+        "start_date": start_day.isoformat(),
+        "end_date": end_day.isoformat(),
+        "start_time": f"{start_minute // 60:02d}:{start_minute % 60:02d}",
+        "end_time": f"{end_minute // 60:02d}:{end_minute % 60:02d}",
         "total_hours": float(total_hours),
         "total_amount": float(total_amount),
         "segments": segments,

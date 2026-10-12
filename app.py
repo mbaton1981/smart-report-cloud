@@ -13,10 +13,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
-    QFrame, QFormLayout, QDateEdit, QTimeEdit, QCheckBox, QFileDialog, QInputDialog,
+    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QDate, QTime, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QColor
 
 # Импорты для генерации PDF
@@ -26,7 +26,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from ob_calculator import calculate_work_interval
+from ob_calculator import calculate_work_interval, round_time_to_half_hour
 
 # Локальная база данных SQLite и папки
 DB_FILE = os.environ.get("SMARTREPORT_DB_FILE", "smart_report.db")
@@ -673,6 +673,15 @@ def create_date_field(default_date_str=""):
     return date_edit
 
 
+def create_half_hour_time_field(default_time):
+    field = QComboBox()
+    for minutes in range(0, 24 * 60, 30):
+        value = f"{minutes // 60:02d}:{minutes % 60:02d}"
+        field.addItem(value, value)
+    field.setCurrentText(round_time_to_half_hour(default_time))
+    return field
+
+
 class SmartReportApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -785,12 +794,8 @@ class SmartReportApp(QMainWindow):
         self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Описание выполненных работ...")
-        self.ob_start_time = QTimeEdit()
-        self.ob_start_time.setDisplayFormat("HH:mm")
-        self.ob_start_time.setTime(QTime(7, 0))
-        self.ob_end_time = QTimeEdit()
-        self.ob_end_time.setDisplayFormat("HH:mm")
-        self.ob_end_time.setTime(QTime(18, 0))
+        self.ob_start_time = create_half_hour_time_field("07:00")
+        self.ob_end_time = create_half_hour_time_field("18:00")
         self.ob_preview_lbl = QLabel("Введите интервал для расчёта сегментов.")
         self.ob_preview_lbl.setWordWrap(True)
 
@@ -816,8 +821,8 @@ class SmartReportApp(QMainWindow):
         self._standard_hour_widgets = (self.hours_input, self.rate_input, self.trans_input)
         self.record_type_cb.currentIndexChanged.connect(self.update_ob_form_visibility)
         self.date_input.dateChanged.connect(self.refresh_ob_preview)
-        self.ob_start_time.timeChanged.connect(self.refresh_ob_preview)
-        self.ob_end_time.timeChanged.connect(self.refresh_ob_preview)
+        self.ob_start_time.currentTextChanged.connect(self.refresh_ob_preview)
+        self.ob_end_time.currentTextChanged.connect(self.refresh_ob_preview)
         self.emp_cb.currentTextChanged.connect(self.refresh_ob_preview)
         self.update_ob_form_visibility()
 
@@ -943,8 +948,8 @@ class SmartReportApp(QMainWindow):
             base_rate = get_local_employee_ob_base_rate(cursor, self.emp_cb.currentText().strip())
             result = calculate_work_interval(
                 self.date_input.text(),
-                self.ob_start_time.time().toString("HH:mm"),
-                self.ob_end_time.time().toString("HH:mm"),
+                self.ob_start_time.currentText(),
+                self.ob_end_time.currentText(),
                 base_rate,
             )
         except (TypeError, ValueError) as error:
@@ -2998,10 +3003,11 @@ class SmartReportApp(QMainWindow):
                 return
             try:
                 ob_result = calculate_work_interval(
-                    date, self.ob_start_time.time().toString("HH:mm"),
-                    self.ob_end_time.time().toString("HH:mm"),
+                    date, self.ob_start_time.currentText(),
+                    self.ob_end_time.currentText(),
                     get_local_employee_ob_base_rate(cursor, emp),
                 )
+                date = ob_result["start_date"]
             except (TypeError, ValueError) as error:
                 conn.close()
                 QMessageBox.warning(self, "Некорректный интервал OB", str(error))
@@ -3191,12 +3197,8 @@ class SmartReportApp(QMainWindow):
         transport_field.setDecimals(2)
         transport_field.setValue(shift['transport'] or 0)
         comment_field = QLineEdit(shift['comment'] or '')
-        ob_start_field = QTimeEdit()
-        ob_start_field.setDisplayFormat("HH:mm")
-        ob_start_field.setTime(QTime.fromString((shift["start_time"] if has_ob_schema else None) or "07:00", "HH:mm"))
-        ob_end_field = QTimeEdit()
-        ob_end_field.setDisplayFormat("HH:mm")
-        ob_end_field.setTime(QTime.fromString((shift["end_time"] if has_ob_schema else None) or "18:00", "HH:mm"))
+        ob_start_field = create_half_hour_time_field((shift["start_time"] if has_ob_schema else None) or "07:00")
+        ob_end_field = create_half_hour_time_field((shift["end_time"] if has_ob_schema else None) or "18:00")
         ob_preview_field = QLabel("")
         ob_preview_field.setWordWrap(True)
 
@@ -3225,8 +3227,8 @@ class SmartReportApp(QMainWindow):
                     preview_conn.cursor(), employee_field.currentText().strip()
                 )
                 result = calculate_work_interval(
-                    date_field.text(), ob_start_field.time().toString("HH:mm"),
-                    ob_end_field.time().toString("HH:mm"), base_rate,
+                    date_field.text(), ob_start_field.currentText(),
+                    ob_end_field.currentText(), base_rate,
                 )
             except (TypeError, ValueError) as error:
                 ob_preview_field.setText(f"Ошибка интервала: {error}")
@@ -3261,10 +3263,7 @@ class SmartReportApp(QMainWindow):
         record_type_field.currentIndexChanged.connect(update_dialog_ob_visibility)
         employee_field.currentTextChanged.connect(refresh_dialog_ob_preview)
         for ob_widget in (ob_start_field, ob_end_field):
-            if isinstance(ob_widget, QTimeEdit):
-                ob_widget.timeChanged.connect(refresh_dialog_ob_preview)
-            else:
-                ob_widget.valueChanged.connect(refresh_dialog_ob_preview)
+            ob_widget.currentTextChanged.connect(refresh_dialog_ob_preview)
         date_field.dateChanged.connect(refresh_dialog_ob_preview)
 
         form.addRow("Дата:", date_field)
@@ -3329,15 +3328,18 @@ class SmartReportApp(QMainWindow):
                 return
             try:
                 ob_result = calculate_work_interval(
-                    date_field.text(), ob_start_field.time().toString("HH:mm"),
-                    ob_end_field.time().toString("HH:mm"), employee_base_rate,
+                    date_field.text(), ob_start_field.currentText(),
+                    ob_end_field.currentText(), employee_base_rate,
                 )
+                payload_date = ob_result["start_date"]
             except (TypeError, ValueError) as error:
                 QMessageBox.warning(self, "Некорректный интервал OB", str(error))
                 return
+        else:
+            payload_date = date_field.text()
 
         payload = {
-            "date": date_field.text(), "employee": employee_field.currentText().strip(),
+            "date": payload_date, "employee": employee_field.currentText().strip(),
             "company": company_field.currentText().strip(), "object_name": object_name,
             "hours": ob_result["total_hours"] if ob_result else hours_field.value(),
             "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,

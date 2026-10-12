@@ -200,11 +200,11 @@
                 <div id="ob-fields" style="display:none;">
                     <div class="form-group">
                         <label for="ob-start-time">Время начала (Europe/Stockholm):</label>
-                        <input type="time" id="ob-start-time" step="60">
+                        <input type="time" id="ob-start-time" step="1800">
                     </div>
                     <div class="form-group">
                         <label for="ob-end-time">Время окончания:</label>
-                        <input type="time" id="ob-end-time" step="60">
+                        <input type="time" id="ob-end-time" step="1800">
                     </div>
                     <div id="ob-preview" role="status" aria-live="polite"></div>
                 </div>
@@ -289,9 +289,9 @@
             <input id="edit-hours" type="number" min="0.5" max="24" step="0.5" required>
             <div id="edit-ob-fields" style="display:none;">
                 <label for="edit-ob-start-time">Время начала (Europe/Stockholm)</label>
-                <input id="edit-ob-start-time" type="time" step="60">
+                <input id="edit-ob-start-time" type="time" step="1800">
                 <label for="edit-ob-end-time">Время окончания</label>
-                <input id="edit-ob-end-time" type="time" step="60">
+                <input id="edit-ob-end-time" type="time" step="1800">
                 <div id="edit-ob-preview" role="status" aria-live="polite"></div>
             </div>
             <label for="edit-transport-check">Транспорт (только для работы)</label>
@@ -503,6 +503,9 @@
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.error || 'Не удалось рассчитать OB-интервал.');
                 renderObPreview(preview, result);
+                document.getElementById(edit ? 'edit-date' : 'date').value = result.date;
+                document.getElementById(`${prefix}ob-start-time`).value = result.start_time;
+                document.getElementById(`${prefix}ob-end-time`).value = result.end_time;
                 document.getElementById(edit ? 'edit-hours' : 'hours').value = result.total_hours;
                 return result;
             } catch (error) {

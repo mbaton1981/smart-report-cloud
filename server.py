@@ -57,8 +57,9 @@ def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
     base_rate = get_employee_ob_base_rate(cursor, employee)
     result = calculate_work_interval(work_date, start_time, end_time, base_rate)
     return {
-        "start_time": str(start_time),
-        "end_time": str(end_time),
+        "date": result["start_date"],
+        "start_time": result["start_time"],
+        "end_time": result["end_time"],
         "ob_base_rate": float(base_rate),
         "hours": result["total_hours"],
         "rate": 0.0,
@@ -77,6 +78,7 @@ def public_ob_result(result):
         for segment in result["segments"]
     ]
     return {
+        "date": result["date"],
         "start_time": result["start_time"],
         "end_time": result["end_time"],
         "hours": result["hours"],
@@ -757,6 +759,7 @@ def submit_shift():
             ob_result = calculate_ob_payload(
                 cursor, date_str, data.get("start_time"), data.get("end_time"), employee
             )
+            date_str = ob_result["date"]
             hours = ob_result["hours"]
             rate = 0.0
             transport = 0.0
@@ -969,6 +972,7 @@ def edit_shift():
                 data.get("end_time", existing["end_time"]),
                 employee,
             )
+            date_val = ob_result["date"]
             hours = ob_result["hours"]
             transport = 0.0
         else:
@@ -1683,6 +1687,7 @@ def sync_push():
                     ob_result = calculate_ob_payload(
                         cursor, date_val, payload.get("start_time"), payload.get("end_time"), employee
                     )
+                    date_val = ob_result["date"]
                     hours = ob_result["hours"]
                     rate = 0.0
                     transport = 0.0
