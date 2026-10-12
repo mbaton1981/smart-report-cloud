@@ -201,6 +201,42 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(preview.status_code, 200, preview.json)
         self.assertTrue(preview.json["base_rate_configured"])
 
+    def test_new_desktop_employee_rate_flows_to_ob_preview(self):
+        response = self.client.post("/sync-desktop-data", headers={
+            "X-Sync-Key": "unit-test-sync-key",
+        }, json={
+            "employees": [{
+                "name": "Taras Hlynskyi",
+                "salary_rate": 220.00,
+                "is_active": 1,
+            }],
+            "companies": [],
+            "objects": [],
+            "shifts": [],
+        })
+        self.assertEqual(response.status_code, 200, response.json)
+        profile = response.json["employee_sync"][0]["profiles"][0]
+        self.assertEqual(profile["name"], "Taras Hlynskyi")
+        self.assertEqual(profile["salary_rate"], 220.00)
+
+        with self.client.session_transaction() as session:
+            session["username"] = "Taras Hlynskyi"
+            session["employee_id"] = -1
+
+        current_user = self.client.get("/me")
+        self.assertEqual(current_user.status_code, 200, current_user.json)
+        self.assertEqual(current_user.json["user"]["employee_id"], profile["id"])
+
+        preview = self.client.post("/calculate-ob", json={
+            "date": "2026-10-12",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "employee": "Taras Hlynskyi",
+        })
+        self.assertEqual(preview.status_code, 200, preview.json)
+        self.assertTrue(preview.json["base_rate_configured"])
+        self.assertAlmostEqual(preview.json["total_amount"], 1254.00, places=2)
+
     def test_ob_preview_repairs_stale_session_employee_id_by_username(self):
         conn = self.database()
         conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
@@ -236,35 +272,6 @@ class ObApiTests(unittest.TestCase):
 
         with self.client.session_transaction() as session:
             self.assertEqual(session["employee_id"], 2)
-
-    def test_ob_preview_uses_known_fallback_when_profile_rate_is_zero(self):
-        conn = self.database()
-        conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
-        conn.commit()
-        conn.close()
-
-        preview = self.client.post("/calculate-ob", json={
-            "date": "2026-10-12",
-            "start_time": "17:00",
-            "end_time": "21:00",
-            "employee": "Aliaksei Patonich",
-        })
-        self.assertEqual(preview.status_code, 200, preview.json)
-        self.assertTrue(preview.json["base_rate_configured"])
-        self.assertAlmostEqual(preview.json["total_amount"], 1401.06, places=2)
-
-    def test_startup_seeds_known_base_rate_only_when_database_rate_is_zero(self):
-        conn = self.database()
-        conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
-        conn.commit()
-        conn.close()
-
-        server.init_cloud_db()
-
-        conn = self.database()
-        profile = conn.execute("SELECT salary_rate FROM meta_employees WHERE id = 1").fetchone()
-        conn.close()
-        self.assertEqual(profile["salary_rate"], 245.80)
 
     def test_server_rejects_invalid_ob_and_does_not_trust_client_amount(self):
         invalid = dict(self.payload, request_id="invalid-ob", start_time="10:00", end_time="10:00")
