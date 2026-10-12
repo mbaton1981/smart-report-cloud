@@ -44,12 +44,44 @@ RECORD_TYPE_SICK = "sick"
 RECORD_TYPE_OB = "ob"
 RECORD_TYPE_REVIEW = "review"
 RECORD_TYPE_LABELS = {
-    RECORD_TYPE_WORK: "Работа",
+    RECORD_TYPE_WORK: "Обычная работа",
+    RECORD_TYPE_OB: "OB / Сверхурочные",
     RECORD_TYPE_ATF: "АТФ",
     RECORD_TYPE_SICK: "Больничный",
-    RECORD_TYPE_OB: "OB/сверхурочные",
     RECORD_TYPE_REVIEW: "Требует проверки",
 }
+
+def record_type_short_label(record_type):
+    mapping = {
+        RECORD_TYPE_WORK: "Работа",
+        RECORD_TYPE_OB: "OB",
+        RECORD_TYPE_ATF: "АТФ",
+        RECORD_TYPE_SICK: "Больничный",
+        RECORD_TYPE_REVIEW: "Проверка",
+    }
+    return mapping.get(record_type, "Работа")
+
+def format_ob_detail(start_time, end_time, total_hours, segments=None):
+    if not start_time or not end_time:
+        return ""
+    cat_short = {
+        "weekday_day": "День",
+        "weekday_early_evening": "OB1",
+        "weekday_late_evening_night": "OB2",
+        "saturday": "Сб",
+        "sunday": "Вс",
+        "weekday_early_morning_unpaid_pending_confirmation": "Утро",
+    }
+    interval_str = f"{start_time}–{end_time} ({float(total_hours):g} ч)"
+    if not segments:
+        return interval_str
+    parts = []
+    for s in segments:
+        short_cat = cat_short.get(s.get("category"), s.get("category", "OB"))
+        hrs = float(s.get("hours", 0.0))
+        parts.append(f"{hrs:g} ч {short_cat}")
+    breakdown_str = " / ".join(parts)
+    return f"{interval_str}: {breakdown_str}" if breakdown_str else interval_str
 SPECIAL_OBJECTS = {
     RECORD_TYPE_ATF: ("Arbetstidsförkortning", "p1000"),
     RECORD_TYPE_SICK: ("Sjuk", "p1001"),
@@ -172,7 +204,34 @@ def init_db_once():
         cursor.execute("ALTER TABLE shifts ADD COLUMN work_rate_cache REAL NOT NULL DEFAULT 0.0")
     if 'work_transport_cache' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN work_transport_cache REAL NOT NULL DEFAULT 0.0")
+    if 'start_time' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN start_time TEXT")
+    if 'end_time' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN end_time TEXT")
+    if 'ob_base_rate' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN ob_base_rate REAL")
     cursor.execute("UPDATE shifts SET work_rate_cache = COALESCE(rate, 0.0), work_transport_cache = COALESCE(transport, 0.0) WHERE entry_type = 'work'")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ob_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shift_id TEXT NOT NULL,
+            segment_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            hours REAL NOT NULL,
+            category TEXT NOT NULL,
+            premium_percent REAL NOT NULL,
+            multiplier REAL NOT NULL,
+            base_rate REAL NOT NULL,
+            calculated_rate REAL NOT NULL,
+            amount REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (shift_id, segment_date, start_time, end_time, category)
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ob_segments_shift_id ON ob_segments(shift_id, segment_date)")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shift_sync_outbox (
@@ -779,7 +838,7 @@ class SmartReportApp(QMainWindow):
         self.load_companies_into_combobox(self.comp_cb)
 
         self.record_type_cb = QComboBox()
-        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK, RECORD_TYPE_OB):
+        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
             self.record_type_cb.addItem(record_type_label(record_type), record_type)
         
         self.obj_cb = QComboBox()
@@ -794,8 +853,8 @@ class SmartReportApp(QMainWindow):
         self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Описание выполненных работ...")
-        self.ob_start_time = create_half_hour_time_field("07:00")
-        self.ob_end_time = create_half_hour_time_field("18:00")
+        self.ob_start_time = create_half_hour_time_field("16:00")
+        self.ob_end_time = create_half_hour_time_field("23:00")
         self.ob_preview_lbl = QLabel("Введите интервал для расчёта сегментов.")
         self.ob_preview_lbl.setWordWrap(True)
 
@@ -811,8 +870,8 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Фактурная ставка (крон/час):", self.rate_input)
         card_layout.addRow("Транспорт (0 или 1):", self.trans_input)
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
-        card_layout.addRow("Начало (Europe/Stockholm):", self.ob_start_time)
-        card_layout.addRow("Окончание:", self.ob_end_time)
+        card_layout.addRow("Время начала:", self.ob_start_time)
+        card_layout.addRow("Время окончания:", self.ob_end_time)
         card_layout.addRow("Рассчитанные сегменты:", self.ob_preview_lbl)
 
         self._ob_form_widgets = (
@@ -910,14 +969,25 @@ class SmartReportApp(QMainWindow):
         
         self.table_shifts = QTableWidget()
         self.table_shifts.setColumnCount(13)
-        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры", "OB интервал", "OB сумма (SEK)"])
+        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры", "OB сумма (SEK)"])
         self.table_shifts.setColumnHidden(0, True)
         shifts_header = self.table_shifts.horizontalHeader()
         shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for column, width in {1: 95, 2: 130, 3: 110, 4: 170, 5: 85, 6: 65, 7: 90, 8: 85, 10: 125, 11: 125, 12: 105}.items():
+        for column, width in {
+            1: 95,   # Дата: узкая ровно под YYYY-MM-DD
+            2: 125,  # Сотрудник: ровно под ФИО
+            3: 105,  # Фирма
+            4: 135,  # Объект
+            5: 75,   # Тип: узкая (Работа / OB / АТФ / Больничный)
+            6: 60,   # Часы: узкая под 2-3 цифры (напр. 8.0)
+            7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
+            8: 80,   # Факт. ставка: максимально узкая
+            9: 70,   # Транспорт: узкая под 0.0 / 1.0
+            11: 110, # Статус фактуры: узкая под статус (⌛ В работе / ✅ Выставлен)
+            12: 95,  # OB сумма (SEK)
+        }.items():
             self.table_shifts.setColumnWidth(column, width)
-        shifts_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
-        self.table_shifts.setColumnWidth(9, 210)
+        shifts_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)  # Комментарий: забирает всё свободное место
         self.table_shifts.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.table_shifts.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_shifts.setAlternatingRowColors(True)
@@ -996,7 +1066,7 @@ class SmartReportApp(QMainWindow):
             emp_cell = self.table_shifts.item(row, 2).text()
             comp_cell = self.table_shifts.item(row, 3).text()
             obj_cell = self.table_shifts.item(row, 4).text()
-            status_cell = self.table_shifts.item(row, 10).text()
+            status_cell = self.table_shifts.item(row, 11).text()
 
             if d_from and d_to and not (d_from <= date_cell <= d_to):
                 match = False
@@ -1162,7 +1232,7 @@ class SmartReportApp(QMainWindow):
         schema_conn.close()
         try:
             capabilities = requests.get(f"{CLOUD_URL}/sync/capabilities", headers=headers, timeout=4)
-            if capabilities.status_code == 200:
+            if getattr(capabilities, 'status_code', None) == 200:
                 capability_data = capabilities.json()
                 typed_sync_supported = (
                     {RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK}.issubset(
@@ -1173,8 +1243,9 @@ class SmartReportApp(QMainWindow):
                     "ob" in set(capability_data.get('submission_types', []))
                     and capability_data.get('typed_tombstones') is True
                 )
-        except requests.RequestException:
+        except Exception:
             typed_sync_supported = False
+            ob_sync_supported = False
 
         response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=4)
         response.raise_for_status()
@@ -2346,20 +2417,22 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>Журнал выполненных работ (Dagbok):</b>"))
         
         self.table_dagbok = QTableWidget()
-        self.table_dagbok.setColumnCount(5)
-        self.table_dagbok.setHorizontalHeaderLabels(["Дата", "Сотрудник", "Тип записи", "Часы", "Описание"])
+        self.table_dagbok.setColumnCount(6)
+        self.table_dagbok.setHorizontalHeaderLabels(["Дата", "Сотрудник", "Тип", "Часы", "Детализация / OB", "Описание"])
         
         header = self.table_dagbok.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         
-        self.table_dagbok.setColumnWidth(0, 130)
-        self.table_dagbok.setColumnWidth(1, 200)
-        self.table_dagbok.setColumnWidth(2, 130)
-        self.table_dagbok.setColumnWidth(3, 90)
+        self.table_dagbok.setColumnWidth(0, 100)
+        self.table_dagbok.setColumnWidth(1, 150)
+        self.table_dagbok.setColumnWidth(2, 75)
+        self.table_dagbok.setColumnWidth(3, 70)
+        self.table_dagbok.setColumnWidth(4, 185)
         self.table_dagbok.setAlternatingRowColors(True)
         layout.addWidget(self.table_dagbok)
 
@@ -2389,12 +2462,20 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         has_ob_schema = ob_schema_ready(cursor)
-        cursor.execute('''
-            SELECT date, employee, entry_type, hours, comment, sync_id
-            FROM shifts
-            WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-            ORDER BY date ASC, employee ASC
-        ''', (comp, obj, d_from, d_to))
+        if has_ob_schema:
+            cursor.execute('''
+                SELECT date, employee, entry_type, hours, comment, sync_id, start_time, end_time
+                FROM shifts
+                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+                ORDER BY date ASC, employee ASC
+            ''', (comp, obj, d_from, d_to))
+        else:
+            cursor.execute('''
+                SELECT date, employee, entry_type, hours, comment, sync_id
+                FROM shifts
+                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+                ORDER BY date ASC, employee ASC
+            ''', (comp, obj, d_from, d_to))
         rows = cursor.fetchall()
         ob_segments_by_id = {
             row["sync_id"]: get_ob_segments(cursor, row["sync_id"])
@@ -2407,33 +2488,55 @@ class SmartReportApp(QMainWindow):
         ob_amount_total = 0.0
 
         for row_idx, row in enumerate(rows):
-            date, emp, record_type, hrs, comment = row[0], row[1], row[2], row[3], row[4]
+            date = row["date"]
+            emp = row["employee"]
+            record_type = row["entry_type"]
+            hrs = float(row["hours"] or 0.0)
+            comment = row["comment"] or ""
             if record_type in totals:
                 totals[record_type] += hrs
+            
+            detalization = ""
+            detail_tooltip = ""
             if record_type == RECORD_TYPE_OB:
                 segments = ob_segments_by_id.get(row["sync_id"], [])
-                ob_amount_total += sum(segment["amount"] for segment in segments)
-                segment_text = "; ".join(
+                ob_amount = sum(segment["amount"] for segment in segments)
+                ob_amount_total += ob_amount
+                start_t = row["start_time"] if "start_time" in row.keys() else None
+                end_t = row["end_time"] if "end_time" in row.keys() else None
+                detalization = format_ob_detail(start_t, end_t, hrs, segments)
+                if not detalization and segments:
+                    detalization = f"{segments[0]['start_time']}–{segments[-1]['end_time']} ({hrs:.1f} ч)"
+                detail_tooltip = "; ".join(
                     f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']} "
                     f"{segment['hours']:.2f} ч, +{segment['premium_percent']:.0f}%, "
                     f"×{segment['multiplier']:.2f}, {segment['amount']:.2f} kr"
                     for segment in segments
                 )
-                comment = f"{comment or ''} | OB: {segment_text}".strip(" |")
+            elif record_type == RECORD_TYPE_ATF:
+                detalization = "АТФ (p1000)"
+            elif record_type == RECORD_TYPE_SICK:
+                detalization = "Больничный (p1001)"
             
             it_date = QTableWidgetItem(str(date))
             it_date.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             it_emp = QTableWidgetItem(str(emp))
-            it_type = QTableWidgetItem(record_type_label(record_type))
-            it_hrs = QTableWidgetItem(str(hrs))
+            it_type = QTableWidgetItem(record_type_short_label(record_type))
+            it_type.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+            it_hrs = QTableWidgetItem(f"{hrs:.1f} ч")
             it_hrs.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            it_comm = QTableWidgetItem(str(comment or ""))
+            it_det = QTableWidgetItem(str(detalization))
+            if detail_tooltip:
+                it_det.setToolTip(detail_tooltip)
+            it_comm = QTableWidgetItem(str(comment))
+            it_comm.setToolTip(str(comment))
 
             self.table_dagbok.setItem(row_idx, 0, it_date)
             self.table_dagbok.setItem(row_idx, 1, it_emp)
             self.table_dagbok.setItem(row_idx, 2, it_type)
             self.table_dagbok.setItem(row_idx, 3, it_hrs)
-            self.table_dagbok.setItem(row_idx, 4, it_comm)
+            self.table_dagbok.setItem(row_idx, 4, it_det)
+            self.table_dagbok.setItem(row_idx, 5, it_comm)
 
         self.dag_total_hours_lbl.setText(f"<b>Работа: {totals[RECORD_TYPE_WORK]:.1f} ч</b>")
         self.dag_total_atf_lbl.setText(f"<b>АТФ: {totals[RECORD_TYPE_ATF]:.1f} ч</b>")
@@ -3124,27 +3227,66 @@ class SmartReportApp(QMainWindow):
                 cursor.execute("SELECT id, date, employee, company, object_name, entry_type, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 200")
             rows = cursor.fetchall()
 
+            ob_segments_by_id = {}
+            if has_ob_schema:
+                sync_ids = [row["sync_id"] for row in rows if row["entry_type"] == RECORD_TYPE_OB and row["sync_id"]]
+                for sid in sync_ids:
+                    ob_segments_by_id[sid] = get_ob_segments(cursor, sid)
+            conn.close()
+
             self.table_shifts.setRowCount(len(rows))
             for row_idx, row in enumerate(rows):
-                is_inv = row[10] == 1
-                status_text = "✅ Выставлен" * is_inv or "⏳ В работе"
+                is_inv = row["invoiced"] == 1
+                status_text = "✅ Выставлен" if is_inv else "⏳ В работе"
 
-                values = [row[0], row[1], row[2], row[3], row[4], record_type_label(row[5]), row[6], row[7], row[8], row[9] or "", status_text]
-                if has_ob_schema:
-                    interval = f"{row['start_time']}–{row['end_time']}" if row[5] == RECORD_TYPE_OB else ""
-                    cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM ob_segments WHERE shift_id = ?", (row["sync_id"],))
-                    ob_amount = cursor.fetchone()[0] if row[5] == RECORD_TYPE_OB else 0.0
-                    values.extend([interval, f"{ob_amount:.2f}" if row[5] == RECORD_TYPE_OB else ""])
-                else:
-                    values.extend(["", ""])
+                entry_type = row["entry_type"] or RECORD_TYPE_WORK
+                short_type = record_type_short_label(entry_type)
+
+                detalization = ""
+                ob_amount_str = ""
+                detail_tooltip = ""
+                if has_ob_schema and entry_type == RECORD_TYPE_OB:
+                    segments = ob_segments_by_id.get(row["sync_id"], [])
+                    ob_amount = sum(segment["amount"] for segment in segments)
+                    ob_amount_str = f"{ob_amount:.2f}"
+                    detalization = format_ob_detail(row['start_time'], row['end_time'], row['hours'], segments)
+                    if segments:
+                        detail_tooltip = ";\n".join(
+                            f"{s['segment_date']} {s['start_time']}–{s['end_time']}: {s['hours']:.2f} ч (×{s['multiplier']:.2f}, {s['amount']:.2f} kr)"
+                            for s in segments
+                        ) + f"\nИтого OB: {ob_amount:.2f} kr"
+                elif entry_type == RECORD_TYPE_ATF:
+                    detalization = "АТФ (p1000)"
+                elif entry_type == RECORD_TYPE_SICK:
+                    detalization = "Больничный (p1001)"
+
+                values = [
+                    row["id"],                                       # 0: ID
+                    row["date"],                                     # 1: Дата
+                    row["employee"],                                 # 2: Сотрудник
+                    row["company"],                                  # 3: Фирма
+                    row["object_name"],                              # 4: Объект
+                    short_type,                                      # 5: Тип
+                    f"{float(row['hours'] or 0.0):.1f}",             # 6: Часы
+                    detalization,                                    # 7: Детализация / OB
+                    f"{float(row['rate'] or 0.0):.2f}" if row['rate'] else "0.00", # 8: Факт. ставка
+                    f"{float(row['transport'] or 0.0):.1f}" if row['transport'] else "0.0", # 9: Транспорт
+                    row["comment"] or "",                            # 10: Комментарий
+                    status_text,                                     # 11: Статус фактуры
+                    ob_amount_str,                                   # 12: OB сумма (SEK)
+                ]
+
                 for col_idx, val in enumerate(values):
                     it = QTableWidgetItem(str(val))
-                    if col_idx in (2, 3, 4, 9) and val:
+                    if col_idx in (1, 5, 6, 8, 9, 11, 12):
+                        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                    if col_idx == 7 and detail_tooltip:
+                        it.setToolTip(detail_tooltip)
+                    elif col_idx in (2, 3, 4, 7, 10) and val:
                         it.setToolTip(str(val))
                     if is_inv:
                         it.setBackground(QColor("#1c4532"))
                     self.table_shifts.setItem(row_idx, col_idx, it)
-                    conn.close()
             self.load_dropdowns()
             self.apply_shifts_filters()
         except Exception as e:
@@ -3183,7 +3325,7 @@ class SmartReportApp(QMainWindow):
         company_field.addItems(companies)
         company_field.setCurrentText(shift['company'])
         record_type_field = QComboBox()
-        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK, RECORD_TYPE_OB):
+        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
             record_type_field.addItem(record_type_label(record_type), record_type)
         current_type = shift['entry_type'] or RECORD_TYPE_REVIEW
         work_values = [
