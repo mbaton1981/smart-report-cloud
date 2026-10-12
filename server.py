@@ -1466,6 +1466,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         FROM incoming_submissions
         WHERE normalize_employee_name(employee) = ?
           AND date >= ? AND date < ? AND is_deleted = 0
+          AND submission_type IN ('work', 'ob')
         ORDER BY date ASC, id ASC
     ''', (
         normalize_employee_name(employee),
@@ -1476,11 +1477,9 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
 
     type_labels = {
         'work': 'Arbete',
-        'atf': 'ATF',
-        'sick': 'Sjukfrånvaro',
-        'ob': 'OB/övertid',
+        'ob': 'OB / Övertid',
     }
-    totals_by_type = {'work': 0.0, 'atf': 0.0, 'sick': 0.0, 'ob': 0.0}
+    totals_by_type = {'work': 0.0, 'ob': 0.0}
     totals_by_object = {}
     formatted_shifts = []
 
@@ -1694,13 +1693,10 @@ def download_arbetsdagbok_pdf():
         ]))
         story.append(table)
         story.append(Spacer(1, 8 * mm))
-        total_hours = sum(totals_by_type.values())
-        summary = ' · '.join(
-            f"{type_labels[key]}: {value:.2f} h"
-            for key, value in totals_by_type.items() if value
-        ) or 'Inga timmar registrerade'
-        story.append(Paragraph(f"<b>Totalt: {total_hours:.2f} h</b>", meta_style))
-        story.append(Paragraph(escape(summary), meta_style))
+        total_work = totals_by_type.get('work', 0.0)
+        total_ob = totals_by_type.get('ob', 0.0)
+        story.append(Paragraph(f"<b>Totalt arbete: {total_work:.2f} tim</b>", meta_style))
+        story.append(Paragraph(f"<b>Totalt OB: {total_ob:.2f} tim</b>", meta_style))
         document.build(story)
         output.seek(0)
     except Exception:

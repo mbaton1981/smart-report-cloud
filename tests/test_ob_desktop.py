@@ -32,6 +32,7 @@ class ObDesktopHarness(QWidget):
     load_shifts_history = desktop.SmartReportApp.load_shifts_history
     apply_shifts_filters = desktop.SmartReportApp.apply_shifts_filters
     load_dropdowns = desktop.SmartReportApp.load_dropdowns
+    export_dagbok_to_pdf = desktop.SmartReportApp.export_dagbok_to_pdf
 
 
 class ObDesktopTests(unittest.TestCase):
@@ -371,6 +372,58 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(self.window.table_shifts.item(0, 5).text(), "OB")
         self.assertIn("17:00–21:00 (4 ч)", self.window.table_shifts.item(0, 7).text())
         self.assertEqual(self.window.table_shifts.item(0, 12).text(), "570.00")
+
+    def test_export_dagbok_to_pdf_excludes_atf_sick_and_shows_only_work_and_ob_hours(self):
+        conn = self.database()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1, 'work', 0, 0)
+        ''', ("2026-10-10", "Alice", "Privat", "Bygg och renovering", 8.0, "normal work", "work-1"))
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1, 'atf', 0, 0)
+        ''', ("2026-10-11", "Alice", "Privat", "Bygg och renovering", 8.0, "internal atf", "atf-1"))
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1, 'sick', 0, 0)
+        ''', ("2026-10-12", "Alice", "Privat", "Bygg och renovering", 8.0, "internal sick", "sick-1"))
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache,
+                start_time, end_time, ob_base_rate
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1, 'ob', 0, 0, '18:00', '21:00', 100.0)
+        ''', ("2026-10-13", "Alice", "Privat", "Bygg och renovering", 3.0, "overtime work", "ob-1"))
+        conn.commit()
+        conn.close()
+
+        self.window.dag_date_from = desktop.create_date_field("2026-10-01")
+        self.window.dag_date_to = desktop.create_date_field("2026-10-31")
+        self.window.dag_comp_cb = QComboBox()
+        self.window.dag_comp_cb.addItem("Privat")
+        self.window.dag_obj_cb = QComboBox()
+        self.window.dag_obj_cb.addItem("Bygg och renovering", userData="Bygg och renovering")
+
+        reports_path = Path(self.temp_dir.name) / "reports"
+        with patch.object(desktop, "REPORTS_DIR", str(reports_path)), \
+             patch("os.startfile", create=True) as mock_startfile, \
+             patch("subprocess.run") as mock_subproc:
+            self.window.export_dagbok_to_pdf()
+
+        pdf_files = list(reports_path.glob("Arbetsdagbok_*.pdf"))
+        self.assertEqual(len(pdf_files), 1)
+        pdf_content = pdf_files[0].read_bytes()
+        self.assertTrue(pdf_content.startswith(b"%PDF-"))
+        self.assertNotIn(b"6609", pdf_content)
+        self.assertNotIn(b"kr", pdf_content)
+        self.assertNotIn(b"SEK", pdf_content)
 
 
 if __name__ == "__main__":

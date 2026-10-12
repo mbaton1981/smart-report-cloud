@@ -103,6 +103,7 @@
             border-collapse: collapse;
             margin-top: 15px;
             font-size: 13.5px;
+            table-layout: fixed;
         }
         table.report-table th {
             background: #f4f6f8;
@@ -116,6 +117,9 @@
             border-bottom: 1px solid #e9ecef;
             padding: 9px 8px;
             vertical-align: top;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            hyphens: auto;
         }
         .hours-col {
             text-align: right;
@@ -299,11 +303,12 @@
         {% endif %}
 
         <div class="totals-bar">
-            <span>Totalt antal timmar:</span>
-            <span>{{ "%.2f"|format(total_hours) }} tim</span>
+            <span>Totalt arbete:</span>
+            <span>{{ "%.2f"|format(totals_by_type.work) }} tim</span>
         </div>
-        <div class="special-hours">
-            Arbete: {{ "%.2f"|format(totals_by_type.work) }} tim · ATF: {{ "%.2f"|format(totals_by_type.atf) }} tim · Sjukfrånvaro: {{ "%.2f"|format(totals_by_type.sick) }} tim · OB: {{ "%.2f"|format(totals_by_type.ob) }} tim
+        <div class="totals-bar" style="margin-top: 8px; border-top: 1px dashed #b2bec3; font-size: 15px;">
+            <span>Totalt OB:</span>
+            <span>{{ "%.2f"|format(totals_by_type.ob) }} tim</span>
         </div>
 
         <div class="signature-block">

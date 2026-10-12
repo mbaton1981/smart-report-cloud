@@ -2622,6 +2622,7 @@ class SmartReportApp(QMainWindow):
             SELECT date, employee, entry_type, hours, comment, sync_id
             FROM shifts
             WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+              AND entry_type IN ('work', 'ob')
             ORDER BY date ASC, employee ASC
         ''', (comp, obj, d_from, d_to))
         rows = cursor.fetchall()
@@ -2648,14 +2649,25 @@ class SmartReportApp(QMainWindow):
             
             title_style = ParagraphStyle('TitleSV', parent=styles['Heading1'], fontName=DEFAULT_FONT_BOLD, fontSize=15, spaceAfter=4)
             subtitle_style = ParagraphStyle('SubTitleSV', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=10, spaceAfter=14)
+            cell_text_style = ParagraphStyle(
+                'CellTextSV', parent=styles['Normal'], fontName=DEFAULT_FONT,
+                fontSize=9, leading=12, wordWrap='CJK'
+            )
+            cell_bold_style = ParagraphStyle(
+                'CellBoldSV', parent=cell_text_style, fontName=DEFAULT_FONT_BOLD
+            )
 
             story.append(Paragraph("<b>Bygger och renoverar i Sthlm AB</b>", title_style))
             story.append(Paragraph(f"<b>Arbetsdagbok (Dagbok)</b><br/>Beställare: <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
             story.append(Spacer(1, 5))
 
             table_data = [["Datum", "Anställd", "Typ", "Timmar", "Arbetsbeskrivning"]]
-            totals = {RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0, RECORD_TYPE_OB: 0.0}
-            total_ob_amount = 0.0
+            totals = {RECORD_TYPE_WORK: 0.0, RECORD_TYPE_OB: 0.0}
+
+            swedish_type_labels = {
+                RECORD_TYPE_WORK: "Arbete",
+                RECORD_TYPE_OB: "OB / Övertid",
+            }
 
             for row in rows:
                 date, emp, record_type, hrs, comment = row[0], row[1], row[2], row[3], row[4]
@@ -2663,37 +2675,45 @@ class SmartReportApp(QMainWindow):
                     totals[record_type] += hrs
                 if record_type == RECORD_TYPE_OB:
                     segments = ob_segments_by_id.get(row["sync_id"], [])
-                    total_ob_amount += sum(segment["amount"] for segment in segments)
                     segment_text = "; ".join(
-                        f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']} "
-                        f"{segment['hours']:.2f} ч, +{segment['premium_percent']:.0f}%, "
-                        f"×{segment['multiplier']:.2f}, {segment['amount']:.2f} kr"
+                        f"{segment['start_time']}–{segment['end_time']} ({segment['hours']:.2f} tim)"
                         for segment in segments
                     )
-                    comment = f"{comment or ''} | OB: {segment_text}".strip(" |")
+                    comment = f"{comment or ''} | OB-intervaller: {segment_text}".strip(" |")
                 translated_comment = translate_to_swedish(comment)
-                table_data.append([str(date), str(emp), record_type_label(record_type), f"{hrs:.1f}", str(translated_comment or "")])
+                type_display = swedish_type_labels.get(record_type, "Arbete")
+                
+                comment_p = Paragraph(str(translated_comment or ""), cell_text_style)
+                emp_p = Paragraph(str(emp), cell_text_style)
+                
+                table_data.append([
+                    str(date),
+                    emp_p,
+                    type_display,
+                    f"{hrs:.2f} tim",
+                    comment_p
+                ])
 
             table_data.extend([
-                ["Totalt arbete:", "", "", f"{totals[RECORD_TYPE_WORK]:.1f}", ""],
-                ["Totalt ATF:", "", "", f"{totals[RECORD_TYPE_ATF]:.1f}", ""],
-                ["Totalt sjuk:", "", "", f"{totals[RECORD_TYPE_SICK]:.1f}", ""],
-                ["Totalt OB (отдельно):", "", "", f"{totals[RECORD_TYPE_OB]:.2f}", f"{total_ob_amount:,.2f} kr"],
+                ["Totalt arbete:", "", "", f"{totals[RECORD_TYPE_WORK]:.2f} tim", ""],
+                ["Totalt OB:", "", "", f"{totals[RECORD_TYPE_OB]:.2f} tim", ""],
             ])
 
-            t = Table(table_data, colWidths=[70, 100, 75, 55, 235])
+            t = Table(table_data, colWidths=[70, 95, 80, 65, 225])
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4299e1')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                 ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
                 ('TOPPADDING', (0, 0), (-1, 0), 6),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#f9f9f9'), colors.white]),
-                ('GRID', (0, 0), (-1, -2), 0.5, colors.HexColor('#dddddd')),
-                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#eeeeee')),
-                ('FONTNAME', (0, -1), (-1, -1), DEFAULT_FONT_BOLD),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -3), [colors.HexColor('#f9f9f9'), colors.white]),
+                ('GRID', (0, 0), (-1, -3), 0.5, colors.HexColor('#dddddd')),
+                ('BACKGROUND', (0, -2), (-1, -1), colors.HexColor('#eeeeee')),
+                ('FONTNAME', (0, -2), (-1, -1), DEFAULT_FONT_BOLD),
+                ('LINEABOVE', (0, -2), (-1, -2), 1.5, colors.HexColor('#2b6cb0')),
             ]))
 
             story.append(t)

@@ -196,6 +196,26 @@ class ObApiTests(unittest.TestCase):
         submitted = self.client.post("/submit-shift", json=self.payload)
         self.assertEqual(submitted.status_code, 201, submitted.json)
 
+        # Also add atf and sick shifts to ensure they are excluded from Arbetsdagbok
+        conn = self.database()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO incoming_submissions (
+                request_id, sync_id, submission_type, date, employee, company, object_name,
+                hours, rate, transport, comment, version, change_seq, is_deleted, desktop_acked,
+                source, payload_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 1, 999, 0, 0, 'web', 'hash', '2026-10-12 10:00:00', '2026-10-12 10:00:00')
+        ''', ("atf-sub-1", "atf-sub-1", "atf", "2026-10-15", "Aliaksei Patonich", "Privat", "Arbetstidsförkortning", 8.0, "atf comment"))
+        cursor.execute('''
+            INSERT INTO incoming_submissions (
+                request_id, sync_id, submission_type, date, employee, company, object_name,
+                hours, rate, transport, comment, version, change_seq, is_deleted, desktop_acked,
+                source, payload_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 1, 1000, 0, 0, 'web', 'hash', '2026-10-16 10:00:00', '2026-10-16 10:00:00')
+        ''', ("sick-sub-1", "sick-sub-1", "sick", "2026-10-16", "Aliaksei Patonich", "Privat", "Sjuk", 8.0, "sick comment"))
+        conn.commit()
+        conn.close()
+
         preview_res = self.client.get("/report-preview?month=2026-10")
         self.assertEqual(preview_res.status_code, 200)
         preview_html = preview_res.get_data(as_text=True)
@@ -204,6 +224,10 @@ class ObApiTests(unittest.TestCase):
         self.assertIn("2026-10", preview_html)
         self.assertIn("window.print()", preview_html)
         self.assertIn("download-arbetsdagbok.pdf", preview_html)
+        self.assertIn("Totalt arbete:", preview_html)
+        self.assertIn("Totalt OB:", preview_html)
+        self.assertNotIn("Arbetstidsförkortning", preview_html)
+        self.assertNotIn("Sjukfrånvaro", preview_html)
         self.assertNotRegex(preview_html, r"\d+(?:\.\d+)?\s*kr\b")
         self.assertNotIn("SEK", preview_html)
 
