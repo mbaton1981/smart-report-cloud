@@ -271,8 +271,7 @@
             </div>
 
             <button type="button" id="load-history-btn" class="btn-history">Показать смены за месяц</button>
-            <button type="button" id="open-report-pdf-btn" class="btn-print" style="display:none;">📄 Сформировать и открыть PDF</button>
-            <div id="report-action-status" role="status" aria-live="polite"></div>
+            <button type="button" id="print-report-btn" class="btn-print" onclick="window.print()" style="display:none;">🖨️ Печать / Сохранить в PDF</button>
 
             <div id="warning-container" style="margin-top: 15px; display: none; background: #ffeaa7; border: 1px solid #fdcb6e; padding: 12px; border-radius: 6px; font-size: 14px; color: #d63031; font-weight: bold;"></div>
             <div id="history-period-totals" style="margin-top: 12px; font-weight: bold;"></div>
@@ -1004,28 +1003,12 @@
             reportPdfUrl = `/download-arbetsdagbok.pdf?${params.toString()}`;
         }
 
-        document.getElementById('open-report-pdf-btn').addEventListener('click', () => {
-            const status = document.getElementById('report-action-status');
-            if (!reportPdfUrl) {
-                status.textContent = 'Сначала загрузите отчёт за месяц.';
-                return;
-            }
-            const pdfWindow = window.open(reportPdfUrl, '_blank');
-            if (pdfWindow) {
-                pdfWindow.opener = null;
-                status.textContent = '';
-            } else {
-                status.textContent = 'Разрешите открытие новой вкладки для просмотра PDF.';
-            }
-        });
-
         document.getElementById('load-history-btn').addEventListener('click', async function() {
             const empName = document.getElementById('history-employee').value;
             const selectedMonth = document.getElementById('history-month').value;
             const listContainer = document.getElementById('history-list');
             const warningContainer = document.getElementById('warning-container');
-            const openPdfBtn = document.getElementById('open-report-pdf-btn');
-            const reportStatus = document.getElementById('report-action-status');
+            const printBtn = document.getElementById('print-report-btn');
             
             if (!empName) {
                 alert('Пожалуйста, выберите сотрудника!');
@@ -1041,8 +1024,7 @@
             listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">Загрузка...</li>';
             warningContainer.style.display = 'none';
             warningContainer.textContent = '';
-            openPdfBtn.style.display = 'none';
-            reportStatus.textContent = '';
+            printBtn.style.display = 'none';
             reportPdfUrl = '';
 
             try {
@@ -1219,7 +1201,7 @@
                     summaryHtml += '</ul>';
 
                     setReportPdfTarget(empName, selectedMonth);
-                    openPdfBtn.style.display = 'block';
+                    printBtn.style.display = 'block';
                     document.getElementById('print-title').textContent = `Arbetsdagbok: ${empName} (${selectedMonth})`;
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
