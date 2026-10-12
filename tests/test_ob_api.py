@@ -224,7 +224,7 @@ class ObApiTests(unittest.TestCase):
         })
         self.assertEqual(preview.status_code, 200, preview.json)
         self.assertTrue(preview.json["base_rate_configured"])
-        self.assertGreater(preview.json["total_amount"], 0)
+        self.assertAlmostEqual(preview.json["total_amount"], 1401.06, places=2)
 
         with self.client.session_transaction() as session:
             self.assertEqual(session["employee_id"], 2)
