@@ -216,15 +216,20 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(current_user.status_code, 200, current_user.json)
         self.assertEqual(current_user.json["user"]["employee_id"], 2)
 
-        preview = self.client.post("/calculate-ob", json={
-            "date": "2026-10-12",
-            "start_time": "17:00",
-            "end_time": "21:00",
-            "employee": "Aliaksei Patonich",
-        })
+        with self.assertLogs("server", level="INFO") as preview_logs:
+            preview = self.client.post("/calculate-ob", json={
+                "date": "2026-10-12",
+                "start_time": "17:00",
+                "end_time": "21:00",
+                "employee": "Aliaksei Patonich",
+            })
         self.assertEqual(preview.status_code, 200, preview.json)
         self.assertTrue(preview.json["base_rate_configured"])
         self.assertAlmostEqual(preview.json["total_amount"], 1401.06, places=2)
+        log_output = "\n".join(preview_logs.output)
+        self.assertIn("employee_name='Aliaksei Patonich'", log_output)
+        self.assertIn("normalize_employee_name(name) = ?", log_output)
+        self.assertIn("salary_rate=245.8", log_output)
 
         with self.client.session_transaction() as session:
             self.assertEqual(session["employee_id"], 2)

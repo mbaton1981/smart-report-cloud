@@ -47,15 +47,12 @@ def normalize_employee_name(name):
 
 
 def find_employee_profiles(cursor, name, active_only=False):
-    query = "SELECT id, name, salary_rate, is_active FROM meta_employees"
+    query = "SELECT id, name, salary_rate, is_active FROM meta_employees WHERE normalize_employee_name(name) = ?"
+    params = [normalize_employee_name(name)]
     if active_only:
-        query += " WHERE is_active = 1"
-    cursor.execute(query)
-    normalized_name = normalize_employee_name(name)
-    return [
-        row for row in cursor.fetchall()
-        if normalize_employee_name(row["name"]) == normalized_name
-    ]
+        query += " AND is_active = 1"
+    cursor.execute(query, params)
+    return cursor.fetchall()
 
 
 def select_employee_profile(profiles, preferred_id=None, preferred_name=None):
@@ -71,11 +68,29 @@ def select_employee_profile(profiles, preferred_id=None, preferred_name=None):
 
 
 def get_employee_ob_base_rate(cursor, employee):
-    profiles = find_employee_profiles(cursor, employee, active_only=True)
+    sql = """SELECT id, name, salary_rate, is_active
+             FROM meta_employees
+             WHERE normalize_employee_name(name) = ? AND is_active = 1"""
+    normalized_name = normalize_employee_name(employee)
+    logger.info(
+        "OB salary lookup employee_name=%r normalized_name=%r SQL=%s params=%r",
+        employee, normalized_name, sql, (normalized_name,),
+    )
+    cursor.execute(sql, (normalized_name,))
+    profiles = cursor.fetchall()
     profile = select_employee_profile(profiles, preferred_name=employee)
     if not profile:
+        logger.warning(
+            "OB salary lookup found no active meta_employees row for employee_name=%r",
+            employee,
+        )
         raise ValueError("Для OB не найден активный профиль сотрудника")
-    return float(profile["salary_rate"] or 0.0)
+    salary_rate = float(profile["salary_rate"] or 0.0)
+    logger.info(
+        "OB salary lookup result employee_name=%r profile_id=%s matched_name=%r salary_rate=%s",
+        employee, profile["id"], profile["name"], salary_rate,
+    )
+    return salary_rate
 
 
 def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
@@ -253,6 +268,7 @@ def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.execute('PRAGMA journal_mode=WAL;')
     conn.execute('PRAGMA foreign_keys = ON;')
+    conn.create_function("normalize_employee_name", 1, normalize_employee_name, deterministic=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -961,7 +977,16 @@ def calculate_ob_preview():
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        employee = resolve_session_employee(cursor, data.get("employee"))
+        requested_employee = data.get("employee")
+        logger.info(
+            "OB preview request employee_name=%r role=%r session_username=%r session_employee_id=%r",
+            requested_employee, session.get("role"), session.get("username"), session.get("employee_id"),
+        )
+        employee = resolve_session_employee(cursor, requested_employee)
+        logger.info(
+            "OB preview resolved employee_name=%r session_employee_id=%r",
+            employee, session.get("employee_id"),
+        )
         result = calculate_ob_payload(
             cursor, data.get("date"), data.get("start_time"), data.get("end_time"), employee
         )
