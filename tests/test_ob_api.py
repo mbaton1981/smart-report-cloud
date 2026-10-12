@@ -140,10 +140,11 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         page_text = page.get_data(as_text=True)
         self.assertIn('<option value="ob">OB/сверхурочные</option>', page_text)
-        self.assertIn('id="ob-start-time"', page_text)
-        self.assertIn('id="edit-ob-start-time"', page_text)
-        self.assertIn('id="ob-start-time" step="1800"', page_text)
-        self.assertIn('id="edit-ob-start-time" type="time" step="1800"', page_text)
+        self.assertIn('id="ob-start-hour"', page_text)
+        self.assertIn('id="ob-start-minute"', page_text)
+        self.assertIn('id="edit-ob-start-hour"', page_text)
+        self.assertIn('id="edit-ob-start-minute"', page_text)
+        self.assertNotIn('type="time"', page_text)
         self.assertNotIn("ob-base-rate", page_text)
 
         response = self.client.post("/calculate-ob", json={

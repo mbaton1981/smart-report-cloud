@@ -946,6 +946,9 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         try:
             base_rate = get_local_employee_ob_base_rate(cursor, self.emp_cb.currentText().strip())
+            if base_rate <= 0:
+                self.ob_preview_lbl.setText("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
+                return
             result = calculate_work_interval(
                 self.date_input.text(),
                 self.ob_start_time.currentText(),
@@ -3002,10 +3005,13 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(self, "Требуется миграция", "Сначала выполните migrate_ob.py с резервной копией desktop-базы.")
                 return
             try:
+                base_rate = get_local_employee_ob_base_rate(cursor, emp)
+                if base_rate <= 0:
+                    raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
                 ob_result = calculate_work_interval(
                     date, self.ob_start_time.currentText(),
                     self.ob_end_time.currentText(),
-                    get_local_employee_ob_base_rate(cursor, emp),
+                    base_rate,
                 )
                 date = ob_result["start_date"]
             except (TypeError, ValueError) as error:
@@ -3226,6 +3232,8 @@ class SmartReportApp(QMainWindow):
                 base_rate = get_local_employee_ob_base_rate(
                     preview_conn.cursor(), employee_field.currentText().strip()
                 )
+                if base_rate <= 0:
+                    raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
                 result = calculate_work_interval(
                     date_field.text(), ob_start_field.currentText(),
                     ob_end_field.currentText(), base_rate,
@@ -3318,6 +3326,8 @@ class SmartReportApp(QMainWindow):
                 employee_base_rate = get_local_employee_ob_base_rate(
                     rate_cursor, employee_field.currentText().strip()
                 ) if schema_ready else None
+                if employee_base_rate is not None and employee_base_rate <= 0:
+                    raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
             except ValueError as error:
                 schema_conn.close()
                 QMessageBox.warning(self, "Профиль сотрудника", str(error))

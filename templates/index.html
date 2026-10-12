@@ -28,6 +28,16 @@
             color: #2d3436; 
         }
         select:focus, input:focus, textarea:focus { border-color: #0984e3; background-color: #fff; outline: none; box-shadow: 0 0 0 3px rgba(9, 132, 227, 0.15); }
+
+        .ob-time-control { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; align-items: center; max-width: 100%; }
+        .ob-time-control select { min-width: 0; min-height: 44px; padding: 9px 10px; }
+        .ob-time-separator { text-align: center; font-weight: bold; }
+        .ob-preview-panel { display: grid; gap: 6px; margin: 8px 0 14px; padding: 10px; border: 1px solid #d7e2ec; border-radius: 6px; background: #f5f9fc; font-size: 13px; overflow-wrap: anywhere; }
+        .ob-segment-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding-bottom: 6px; border-bottom: 1px solid #dfe6e9; }
+        .ob-segment-row strong { grid-column: 1 / -1; }
+        .ob-segment-row .ob-segment-amount { font-weight: bold; text-align: right; }
+        .ob-preview-note { color: #805b10; font-size: 12px; }
+        .ob-preview-warning { padding: 8px; border-radius: 4px; background: #fff3cd; color: #7a5a00; font-weight: bold; }
         
         input[type="date"], input[type="month"] {
             color-scheme: light;
@@ -199,14 +209,22 @@
 
                 <div id="ob-fields" style="display:none;">
                     <div class="form-group">
-                        <label for="ob-start-time">Время начала (Europe/Stockholm):</label>
-                        <input type="time" id="ob-start-time" step="1800">
+                        <label>Время начала (Europe/Stockholm):</label>
+                        <div class="ob-time-control">
+                            <select id="ob-start-hour" aria-label="Час начала"></select>
+                            <span class="ob-time-separator">:</span>
+                            <select id="ob-start-minute" aria-label="Минуты начала"></select>
+                        </div>
                     </div>
                     <div class="form-group">
-                        <label for="ob-end-time">Время окончания:</label>
-                        <input type="time" id="ob-end-time" step="1800">
+                        <label>Время окончания:</label>
+                        <div class="ob-time-control">
+                            <select id="ob-end-hour" aria-label="Час окончания"></select>
+                            <span class="ob-time-separator">:</span>
+                            <select id="ob-end-minute" aria-label="Минуты окончания"></select>
+                        </div>
                     </div>
-                    <div id="ob-preview" role="status" aria-live="polite"></div>
+                    <div id="ob-preview" class="ob-preview-panel" role="status" aria-live="polite"></div>
                 </div>
 
                 <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
@@ -288,11 +306,19 @@
             <label for="edit-hours">Часы</label>
             <input id="edit-hours" type="number" min="0.5" max="24" step="0.5" required>
             <div id="edit-ob-fields" style="display:none;">
-                <label for="edit-ob-start-time">Время начала (Europe/Stockholm)</label>
-                <input id="edit-ob-start-time" type="time" step="1800">
-                <label for="edit-ob-end-time">Время окончания</label>
-                <input id="edit-ob-end-time" type="time" step="1800">
-                <div id="edit-ob-preview" role="status" aria-live="polite"></div>
+                <label>Время начала (Europe/Stockholm)</label>
+                <div class="ob-time-control">
+                    <select id="edit-ob-start-hour" aria-label="Час начала"></select>
+                    <span class="ob-time-separator">:</span>
+                    <select id="edit-ob-start-minute" aria-label="Минуты начала"></select>
+                </div>
+                <label>Время окончания</label>
+                <div class="ob-time-control">
+                    <select id="edit-ob-end-hour" aria-label="Час окончания"></select>
+                    <span class="ob-time-separator">:</span>
+                    <select id="edit-ob-end-minute" aria-label="Минуты окончания"></select>
+                </div>
+                <div id="edit-ob-preview" class="ob-preview-panel" role="status" aria-live="polite"></div>
             </div>
             <label for="edit-transport-check">Транспорт (только для работы)</label>
             <input id="edit-transport-check" type="checkbox">
@@ -448,6 +474,52 @@
             if (isOb) refreshObPreview(false);
         }
 
+        function normalizeHalfHour(value) {
+            const match = /^(\d{2}):(\d{2})$/.exec(String(value || ''));
+            if (!match) return '07:00';
+            const totalMinutes = Number(match[1]) * 60 + Number(match[2]);
+            const rounded = Math.floor((totalMinutes + 15) / 30) * 30 % 1440;
+            return `${String(Math.floor(rounded / 60)).padStart(2, '0')}:${String(rounded % 60).padStart(2, '0')}`;
+        }
+
+        function initializeHalfHourTimeFields() {
+            for (const prefix of ['ob-start', 'ob-end', 'edit-ob-start', 'edit-ob-end']) {
+                const hourSelect = document.getElementById(`${prefix}-hour`);
+                const minuteSelect = document.getElementById(`${prefix}-minute`);
+                if (!hourSelect || !minuteSelect) continue;
+                hourSelect.replaceChildren();
+                minuteSelect.replaceChildren();
+                for (let hour = 0; hour < 24; hour++) {
+                    const option = document.createElement('option');
+                    option.value = String(hour).padStart(2, '0');
+                    option.textContent = option.value;
+                    hourSelect.appendChild(option);
+                }
+                for (const minute of ['00', '30']) {
+                    const option = document.createElement('option');
+                    option.value = minute;
+                    option.textContent = minute;
+                    minuteSelect.appendChild(option);
+                }
+                setHalfHourTime(prefix, prefix.endsWith('end') ? '18:00' : '07:00');
+            }
+        }
+
+        function getHalfHourTime(prefix) {
+            const hour = document.getElementById(`${prefix}-hour`).value;
+            const minute = document.getElementById(`${prefix}-minute`).value;
+            return normalizeHalfHour(`${hour}:${minute}`);
+        }
+
+        function setHalfHourTime(prefix, value) {
+            const normalized = normalizeHalfHour(value);
+            const [hour, minute] = normalized.split(':');
+            document.getElementById(`${prefix}-hour`).value = hour;
+            document.getElementById(`${prefix}-minute`).value = minute;
+        }
+
+        initializeHalfHourTimeFields();
+
         function renderObPreview(container, result) {
             container.replaceChildren();
             const formatNumber = (value, digits = 2) => {
@@ -463,17 +535,29 @@
                 sunday: 'Воскресенье'
             };
             (Array.isArray(result.segments) ? result.segments : []).forEach(segment => {
-                const line = document.createElement('div');
-                line.textContent = `${segment.segment_date || ''} ${segment.start_time || ''}–${segment.end_time || ''}: ` +
-                    `${labels[segment.category] || segment.category || 'OB'}, ${formatNumber(segment.hours)} ч, ` +
-                    `+${formatNumber(segment.premium_percent, 0)}%, ×${formatNumber(segment.multiplier)}, ` +
-                    `${formatNumber(segment.amount)} kr`;
-                container.appendChild(line);
+                const row = document.createElement('div');
+                row.className = 'ob-segment-row';
+                const heading = document.createElement('strong');
+                heading.textContent = `${segment.start_time || ''}–${segment.end_time || ''} · ${labels[segment.category] || segment.category || 'OB'}`;
+                const details = document.createElement('span');
+                details.textContent = `${formatNumber(segment.hours)} ч · +${formatNumber(segment.premium_percent, 0)}% · ×${formatNumber(segment.multiplier)}`;
+                const amount = document.createElement('span');
+                amount.className = 'ob-segment-amount';
+                amount.textContent = `${formatNumber(segment.amount)} kr`;
+                row.append(heading, details, amount);
+                container.appendChild(row);
             });
             const total = document.createElement('b');
             total.textContent = `Всего: ${formatNumber(result.total_hours)} ч; OB сумма: ${formatNumber(result.total_amount)} kr`;
             container.appendChild(total);
+            if (result.base_rate_configured === false) {
+                const warning = document.createElement('div');
+                warning.className = 'ob-preview-warning';
+                warning.textContent = 'В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.';
+                container.appendChild(warning);
+            }
             const note = document.createElement('small');
+            note.className = 'ob-preview-note';
             note.style.display = 'block';
             note.textContent = 'Начальные тарифы требуют подтверждения по применяемому kollektivavtal.';
             container.appendChild(note);
@@ -484,8 +568,8 @@
             const type = document.getElementById(edit ? 'edit-type' : 'submission_type').value;
             if (type !== 'ob') return null;
             const date = document.getElementById(edit ? 'edit-date' : 'date').value;
-            const start = document.getElementById(`${prefix}ob-start-time`).value;
-            const end = document.getElementById(`${prefix}ob-end-time`).value;
+            const start = getHalfHourTime(`${prefix}ob-start`);
+            const end = getHalfHourTime(`${prefix}ob-end`);
             const preview = document.getElementById(edit ? 'edit-ob-preview' : 'ob-preview');
             if (!date || !start || !end) {
                 preview.textContent = 'Укажите дату, время начала и окончания.';
@@ -504,8 +588,8 @@
                 if (!response.ok) throw new Error(result.error || 'Не удалось рассчитать OB-интервал.');
                 renderObPreview(preview, result);
                 document.getElementById(edit ? 'edit-date' : 'date').value = result.date;
-                document.getElementById(`${prefix}ob-start-time`).value = result.start_time;
-                document.getElementById(`${prefix}ob-end-time`).value = result.end_time;
+                setHalfHourTime(`${prefix}ob-start`, result.start_time);
+                setHalfHourTime(`${prefix}ob-end`, result.end_time);
                 document.getElementById(edit ? 'edit-hours' : 'hours').value = result.total_hours;
                 return result;
             } catch (error) {
@@ -576,8 +660,8 @@
             companySelect.value = shift.company;
             document.getElementById('edit-type').value = shift.submission_type || 'work';
             document.getElementById('edit-hours').value = shift.hours;
-            document.getElementById('edit-ob-start-time').value = shift.start_time || '';
-            document.getElementById('edit-ob-end-time').value = shift.end_time || '';
+            setHalfHourTime('edit-ob-start', shift.start_time || '07:00');
+            setHalfHourTime('edit-ob-end', shift.end_time || '18:00');
             document.getElementById('edit-comment').value = shift.comment || '';
             filterEditObjects(shift.object_name);
             document.getElementById('edit-transport-check').checked = editOriginalTransport > 0;
@@ -587,10 +671,10 @@
 
         document.getElementById('edit-type').addEventListener('change', updateEditTypeForm);
         document.getElementById('edit-company').addEventListener('change', () => filterEditObjects());
-        for (const id of ['edit-date', 'edit-ob-start-time', 'edit-ob-end-time']) {
+        for (const id of ['edit-date', 'edit-ob-start-hour', 'edit-ob-start-minute', 'edit-ob-end-hour', 'edit-ob-end-minute']) {
             document.getElementById(id).addEventListener('change', () => refreshObPreview(true));
         }
-        for (const id of ['date', 'employee', 'ob-start-time', 'ob-end-time']) {
+        for (const id of ['date', 'employee', 'ob-start-hour', 'ob-start-minute', 'ob-end-hour', 'ob-end-minute']) {
             document.getElementById(id).addEventListener('change', () => refreshObPreview(false));
         }
         document.getElementById('edit-cancel').addEventListener('click', () => {
@@ -617,8 +701,12 @@
                 const preview = await refreshObPreview(true);
                 if (!preview) return;
                 payload.hours = preview.total_hours;
-                payload.start_time = document.getElementById('edit-ob-start-time').value;
-                payload.end_time = document.getElementById('edit-ob-end-time').value;
+                if (!preview.base_rate_configured) {
+                    showFormAlert('В профиле сотрудника не настроена базовая ставка.', 'error');
+                    return;
+                }
+                payload.start_time = getHalfHourTime('edit-ob-start');
+                payload.end_time = getHalfHourTime('edit-ob-end');
             }
             if (submissionType === 'work') {
                 payload.transport = document.getElementById('edit-transport-check').checked ? 1 : 0;
@@ -897,8 +985,8 @@
                 submission_type: submissionType
             };
             if (obPreview) {
-                formData.start_time = document.getElementById('ob-start-time').value;
-                formData.end_time = document.getElementById('ob-end-time').value;
+                formData.start_time = getHalfHourTime('ob-start');
+                formData.end_time = getHalfHourTime('ob-end');
             } else {
                 formData.hours = hoursVal;
                 formData.transport = parseFloat(document.getElementById('transport').value || 0);

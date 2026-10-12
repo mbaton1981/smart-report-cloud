@@ -67,6 +67,7 @@ def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
         "segments": result["segments"],
         "total_amount": result["total_amount"],
         "rules_version": result["rules_version"],
+        "base_rate_configured": base_rate > 0,
     }
 
 def public_ob_result(result):
@@ -86,6 +87,7 @@ def public_ob_result(result):
         "total_amount": result["total_amount"],
         "segments": public_segments,
         "rules_version": result["rules_version"],
+        "base_rate_configured": result["base_rate_configured"],
     }
 
 
@@ -759,6 +761,9 @@ def submit_shift():
             ob_result = calculate_ob_payload(
                 cursor, date_str, data.get("start_time"), data.get("end_time"), employee
             )
+            if not ob_result["base_rate_configured"]:
+                conn.close()
+                return jsonify({"ok": False, "error": "В профиле сотрудника не настроена базовая ставка. Обратитесь к администратору."}), 400
             date_str = ob_result["date"]
             hours = ob_result["hours"]
             rate = 0.0
@@ -972,6 +977,8 @@ def edit_shift():
                 data.get("end_time", existing["end_time"]),
                 employee,
             )
+            if not ob_result["base_rate_configured"]:
+                raise ValueError("В профиле сотрудника не настроена базовая ставка. Обратитесь к администратору.")
             date_val = ob_result["date"]
             hours = ob_result["hours"]
             transport = 0.0
@@ -1687,6 +1694,8 @@ def sync_push():
                     ob_result = calculate_ob_payload(
                         cursor, date_val, payload.get("start_time"), payload.get("end_time"), employee
                     )
+                    if not ob_result["base_rate_configured"]:
+                        raise ValueError("В профиле сотрудника не настроена базовая ставка.")
                     date_val = ob_result["date"]
                     hours = ob_result["hours"]
                     rate = 0.0
