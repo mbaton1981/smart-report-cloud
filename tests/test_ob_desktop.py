@@ -72,7 +72,7 @@ class ObDesktopTests(unittest.TestCase):
         self.window.emp_cb = QComboBox()
         self.window.emp_cb.setEditable(True)
         self.window.emp_cb.addItem("Alice")
-        self.window.emp_cb.setCurrentText("Private person")
+        self.window.emp_cb.setCurrentText("Alice")
         self.window.comp_cb = QComboBox()
         self.window.comp_cb.addItem("Privat")
         self.window.obj_cb = QComboBox()
@@ -89,7 +89,6 @@ class ObDesktopTests(unittest.TestCase):
         self.window.ob_start_time.setTime(QTime(17, 0))
         self.window.ob_end_time = QTimeEdit()
         self.window.ob_end_time.setTime(QTime(21, 0))
-        self.window.ob_base_rate_input = QLineEdit("100")
         self.window.record_type_status_lbl = QLabel()
         self.window.background_sync_with_cloud = Mock()
         self.window.load_shifts_history = Mock()
@@ -119,10 +118,11 @@ class ObDesktopTests(unittest.TestCase):
         window.apply_shifts_filters = Mock()
         window.background_sync_with_cloud = Mock()
         window.setup_hours_tab()
+        window.emp_cb.addItem("Alice")
+        window.emp_cb.setCurrentText("Alice")
         window.ob_start_time.setTime(QTime(17, 0))
         window.ob_end_time.setTime(QTime(21, 0))
         window.record_type_cb.setCurrentIndex(window.record_type_cb.findData(desktop.RECORD_TYPE_OB))
-        window.ob_base_rate_input.setText("100")
 
         self.assertFalse(window.ob_start_time.isHidden())
         self.assertTrue(window.hours_input.isHidden())
@@ -130,7 +130,7 @@ class ObDesktopTests(unittest.TestCase):
         self.assertIn("570.00 kr", window.ob_preview_lbl.text())
         window.background_sync_with_cloud.assert_not_called()
 
-    def test_preview_is_local_and_save_stores_manual_person_and_segments(self):
+    def test_preview_is_local_and_save_uses_employee_profile_rate(self):
         result = desktop.calculate_work_interval("2026-10-12", "17:00", "21:00", 100)
         self.assertEqual(result["total_amount"], 570.0)
         self.window.background_sync_with_cloud.assert_not_called()
@@ -141,7 +141,7 @@ class ObDesktopTests(unittest.TestCase):
         employees = [entry[0] for entry in conn.execute("SELECT name FROM employees ORDER BY name")]
         segments = conn.execute("SELECT start_time, end_time, multiplier, amount FROM ob_segments ORDER BY start_time").fetchall()
         conn.close()
-        self.assertEqual(row["employee"], "Private person")
+        self.assertEqual(row["employee"], "Alice")
         self.assertEqual(row["hours"], 4.0)
         self.assertEqual(row["rate"], 0.0)
         self.assertEqual(row["transport"], 0.0)
@@ -185,7 +185,6 @@ class ObDesktopTests(unittest.TestCase):
             fields["Тип записи:"].setCurrentIndex(fields["Тип записи:"].findData(desktop.RECORD_TYPE_OB))
             fields["Время начала:"].setTime(QTime(18, 0))
             fields["Время окончания:"].setTime(QTime(20, 0))
-            fields["Базовая ставка (SEK/ч):"].setValue(200)
             fields["Комментарий:"].setText("updated OB")
             return int(desktop.QDialog.DialogCode.Accepted)
 
@@ -197,9 +196,9 @@ class ObDesktopTests(unittest.TestCase):
         segment_rows = conn.execute("SELECT hours, multiplier, amount FROM ob_segments WHERE shift_id = ?", (existing["sync_id"],)).fetchall()
         conn.close()
         self.assertEqual(len(rows), 2)
-        self.assertEqual(tuple(rows[0]), (existing["id"], existing["sync_id"], 2.0, "updated OB", "ob", "18:00", "20:00", 200.0))
+        self.assertEqual(tuple(rows[0]), (existing["id"], existing["sync_id"], 2.0, "updated OB", "ob", "18:00", "20:00", 100.0))
         self.assertEqual(tuple(rows[1]), (neighbor_id, "work-neighbor", 8.0, "neighbor", "work", None, None, None))
-        self.assertEqual([tuple(row) for row in segment_rows], [(2.0, 1.5, 600.0)])
+        self.assertEqual([tuple(row) for row in segment_rows], [(2.0, 1.5, 300.0)])
 
     def test_cancel_desktop_edit_keeps_existing_record_and_segments(self):
         self.window.save_shift()

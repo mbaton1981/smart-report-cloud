@@ -42,7 +42,19 @@ def ob_schema_ready(cursor):
     return required.issubset(columns) and cursor.fetchone() is not None
 
 
-def calculate_ob_payload(work_date, start_time, end_time, base_rate):
+def get_employee_ob_base_rate(cursor, employee):
+    cursor.execute(
+        "SELECT COALESCE(salary_rate, 0.0) FROM meta_employees WHERE name = ? AND is_active = 1",
+        (employee,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Для OB не найден активный профиль сотрудника")
+    return float(row[0])
+
+
+def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
+    base_rate = get_employee_ob_base_rate(cursor, employee)
     result = calculate_work_interval(work_date, start_time, end_time, base_rate)
     return {
         "start_time": str(start_time),
@@ -53,6 +65,24 @@ def calculate_ob_payload(work_date, start_time, end_time, base_rate):
         "transport": 0.0,
         "segments": result["segments"],
         "total_amount": result["total_amount"],
+        "rules_version": result["rules_version"],
+    }
+
+def public_ob_result(result):
+    public_segments = [
+        {key: segment[key] for key in (
+            "segment_date", "start_time", "end_time", "hours", "category",
+            "premium_percent", "multiplier", "amount",
+        )}
+        for segment in result["segments"]
+    ]
+    return {
+        "start_time": result["start_time"],
+        "end_time": result["end_time"],
+        "hours": result["hours"],
+        "total_hours": result["hours"],
+        "total_amount": result["total_amount"],
+        "segments": public_segments,
         "rules_version": result["rules_version"],
     }
 
@@ -725,7 +755,7 @@ def submit_shift():
             return jsonify({"ok": False, "error": "OB-схема не подготовлена. Выполните migrate_ob.py с backup."}), 503
         try:
             ob_result = calculate_ob_payload(
-                date_str, data.get("start_time"), data.get("end_time"), data.get("ob_base_rate")
+                cursor, date_str, data.get("start_time"), data.get("end_time"), employee
             )
             hours = ob_result["hours"]
             rate = 0.0
@@ -862,7 +892,7 @@ def submit_shift():
 
     response = {"ok": True, "message": "Смена успешно сохранена!", "request_id": request_id}
     if ob_result:
-        response.update({"hours": ob_result["hours"], "segments": ob_result["segments"], "total_amount": ob_result["total_amount"]})
+        response.update(public_ob_result(ob_result))
     return jsonify(response), 201
 
 
@@ -873,13 +903,20 @@ def calculate_ob_preview():
     data = request.json
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
+        employee = resolve_session_employee(cursor, data.get("employee"))
         result = calculate_ob_payload(
-            data.get("date"), data.get("start_time"), data.get("end_time"), data.get("ob_base_rate")
+            cursor, data.get("date"), data.get("start_time"), data.get("end_time"), employee
         )
+    except PermissionError as error:
+        return jsonify({"ok": False, "error": str(error)}), 403
     except (TypeError, ValueError) as error:
         return jsonify({"ok": False, "error": str(error)}), 400
-    return jsonify({"ok": True, **result})
+    finally:
+        conn.close()
+    return jsonify({"ok": True, **public_ob_result(result)})
 
 @app.route('/edit-shift', methods=['POST'])
 def edit_shift():
@@ -926,10 +963,11 @@ def edit_shift():
                 conn.rollback()
                 return jsonify({"ok": False, "error": "OB-схема не подготовлена. Выполните migrate_ob.py с backup."}), 503
             ob_result = calculate_ob_payload(
+                cursor,
                 date_val,
                 data.get("start_time", existing["start_time"]),
                 data.get("end_time", existing["end_time"]),
-                data.get("ob_base_rate", existing["ob_base_rate"]),
+                employee,
             )
             hours = ob_result["hours"]
             transport = 0.0
@@ -1260,11 +1298,17 @@ def check_employee_shifts():
             ob_record = cursor.fetchone()
             if ob_record:
                 segments = get_ob_segments(cursor, r['sync_id'])
+                public_segments = [
+                    {key: segment[key] for key in (
+                        "segment_date", "start_time", "end_time", "hours", "category",
+                        "premium_percent", "multiplier", "amount",
+                    )}
+                    for segment in segments
+                ]
                 shifts[-1].update({
                     "start_time": ob_record["start_time"],
                     "end_time": ob_record["end_time"],
-                    "ob_base_rate": ob_record["ob_base_rate"],
-                    "ob_segments": segments,
+                    "ob_segments": public_segments,
                     "ob_total_amount": round(sum(segment["amount"] for segment in segments), 2),
                 })
         
@@ -1382,17 +1426,23 @@ def export_shifts_csv():
     writer = csv.writer(output, delimiter=';')
     writer.writerow([
         'Дата', 'Сотрудник', 'Фирма', 'Объект', 'Тип записи', 'Часы', 'Ставка',
-        'Транспорт', 'Комментарий', 'Время начала', 'Время окончания', 'Базовая ставка OB',
-        'OB сегменты', 'OB сумма'
+        'Транспорт', 'Комментарий', 'Время начала', 'Время окончания', 'OB сегменты', 'OB сумма'
     ])
     
     for r in rows:
-        ob_values = ["", "", "", "", ""]
+        ob_values = ["", "", "", ""]
         if ob_export_enabled and (r['submission_type'] or 'work') == 'ob':
             ob_segments = get_ob_segments(cursor, r['sync_id'])
+            public_segments = [
+                {key: segment[key] for key in (
+                    "segment_date", "start_time", "end_time", "hours", "category",
+                    "premium_percent", "multiplier", "amount",
+                )}
+                for segment in ob_segments
+            ]
             ob_values = [
-                r['start_time'] or '', r['end_time'] or '', r['ob_base_rate'] or 0,
-                json.dumps(ob_segments, ensure_ascii=False),
+                r['start_time'] or '', r['end_time'] or '',
+                json.dumps(public_segments, ensure_ascii=False),
                 round(sum(segment['amount'] for segment in ob_segments), 2),
             ]
         writer.writerow([
@@ -1631,7 +1681,7 @@ def sync_push():
                     if not ob_schema_ready(cursor):
                         raise ValueError("OB-схема не подготовлена; выполните миграцию с backup")
                     ob_result = calculate_ob_payload(
-                        date_val, payload.get("start_time"), payload.get("end_time"), payload.get("ob_base_rate")
+                        cursor, date_val, payload.get("start_time"), payload.get("end_time"), employee
                     )
                     hours = ob_result["hours"]
                     rate = 0.0

@@ -21,6 +21,10 @@ class ObApiTests(unittest.TestCase):
         server.DB_FILE = str(Path(self.temp_dir.name) / "ob_server.db")
         server.app.config["TESTING"] = True
         server.init_cloud_db()
+        conn = server.get_db_connection()
+        conn.execute("UPDATE meta_employees SET salary_rate = 100 WHERE name = ?", ("Aliaksei Patonich",))
+        conn.commit()
+        conn.close()
         migrate_database(
             server.DB_FILE,
             Path(self.temp_dir.name) / "ob_server.pre-migration.db",
@@ -46,7 +50,7 @@ class ObApiTests(unittest.TestCase):
             "submission_type": "ob",
             "start_time": "17:00",
             "end_time": "21:00",
-            "ob_base_rate": 100,
+            "ob_base_rate": 999999,
             "total_amount": 1,
         }
 
@@ -64,6 +68,7 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.json)
         self.assertEqual(response.json["hours"], 4.0)
         self.assertEqual(response.json["total_amount"], 570.0)
+        self.assertNotIn("ob_base_rate", response.json)
         self.assertEqual([segment["amount"] for segment in response.json["segments"]], [100.0, 300.0, 170.0])
 
         conn = self.database()
@@ -82,12 +87,15 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(history["submission_type"], "ob")
         self.assertEqual(history["ob_total_amount"], 570.0)
         self.assertEqual(len(history["ob_segments"]), 3)
+        self.assertNotIn("ob_base_rate", history)
+        self.assertNotIn("base_rate", history["ob_segments"][0])
         exported = self.client.post("/export-shifts-csv", json={
             "employee": "Aliaksei Patonich", "month": "2026-10"
         })
         self.assertEqual(exported.status_code, 200, exported.get_data(as_text=True))
         self.assertIn("OB сегменты", exported.get_data(as_text=True))
         self.assertIn("570.0", exported.get_data(as_text=True))
+        self.assertNotIn("Базовая ставка OB", exported.get_data(as_text=True))
 
         edit_payload = {
             "sync_id": original["sync_id"],
@@ -111,8 +119,8 @@ class ObApiTests(unittest.TestCase):
         segments = conn.execute("SELECT hours, multiplier, amount FROM ob_segments WHERE shift_id = ?", (original["sync_id"],)).fetchall()
         conn.close()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(tuple(rows[0]), (original["id"], original["sync_id"], 2.0, "18:00", "20:00", 200.0))
-        self.assertEqual([tuple(row) for row in segments], [(2.0, 1.5, 600.0)])
+        self.assertEqual(tuple(rows[0]), (original["id"], original["sync_id"], 2.0, "18:00", "20:00", 100.0))
+        self.assertEqual([tuple(row) for row in segments], [(2.0, 1.5, 300.0)])
 
         deleted = self.client.post("/delete-shift", json={
             "sync_id": original["sync_id"],
@@ -134,16 +142,19 @@ class ObApiTests(unittest.TestCase):
         self.assertIn('<option value="ob">OB/сверхурочные</option>', page_text)
         self.assertIn('id="ob-start-time"', page_text)
         self.assertIn('id="edit-ob-start-time"', page_text)
+        self.assertNotIn("ob-base-rate", page_text)
 
         response = self.client.post("/calculate-ob", json={
             "date": "2026-10-12",
             "start_time": "17:00",
             "end_time": "21:00",
-            "ob_base_rate": 100,
+            "employee": "Aliaksei Patonich",
         })
         self.assertEqual(response.status_code, 200, response.json)
         self.assertEqual(response.json["total_amount"], 570.0)
-        self.assertEqual([segment["calculated_rate"] for segment in response.json["segments"]], [100.0, 150.0, 170.0])
+        self.assertEqual([segment["amount"] for segment in response.json["segments"]], [100.0, 300.0, 170.0])
+        self.assertNotIn("base_rate", response.json["segments"][0])
+        self.assertNotIn("ob_base_rate", response.json)
 
     def test_server_rejects_invalid_ob_and_does_not_trust_client_amount(self):
         invalid = dict(self.payload, request_id="invalid-ob", start_time="10:00", end_time="10:00")
@@ -233,8 +244,8 @@ class ObApiTests(unittest.TestCase):
         row = conn.execute("SELECT hours, rate, transport, submission_type, ob_base_rate FROM incoming_submissions WHERE sync_id = ?", ("stable-ob-sync-id",)).fetchone()
         segments = conn.execute("SELECT amount FROM ob_segments WHERE shift_id = ? ORDER BY start_time", ("stable-ob-sync-id",)).fetchall()
         conn.close()
-        self.assertEqual(tuple(row), (4.0, 0.0, 0.0, "ob", 80.0))
-        self.assertEqual([segment[0] for segment in segments], [80.0, 240.0, 136.0])
+        self.assertEqual(tuple(row), (4.0, 0.0, 0.0, "ob", 100.0))
+        self.assertEqual([segment[0] for segment in segments], [100.0, 300.0, 170.0])
 
     def test_unmigrated_server_refuses_ob_but_accepts_legacy_work(self):
         previous_db = server.DB_FILE
