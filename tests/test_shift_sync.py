@@ -267,6 +267,7 @@ class ShiftSyncTests(unittest.TestCase):
             }
             conn = desktop.get_db_connection()
             cursor = conn.cursor()
+            cursor.execute("UPDATE employees SET salary_rate = ? WHERE name = ?", (245.80, 'Aliaksei Patonich'))
             cursor.execute('''
                 INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, sync_version)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
@@ -278,6 +279,12 @@ class ShiftSyncTests(unittest.TestCase):
 
             window = desktop.SmartReportApp.__new__(desktop.SmartReportApp)
             window.perform_sync_logic()
+            remote = self.database()
+            self.assertEqual(
+                remote.execute("SELECT salary_rate FROM meta_employees WHERE name = ?", (payload['employee'],)).fetchone()[0],
+                245.80,
+            )
+            remote.close()
             conn = desktop.get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM shifts WHERE sync_id = ?", (sync_id,))

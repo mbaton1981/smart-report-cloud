@@ -1305,8 +1305,15 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM employees ORDER BY name")
-        employees = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name, COALESCE(salary_rate, 0.0) AS salary_rate, is_active FROM employees ORDER BY name")
+        employees = [
+            {
+                "name": row["name"],
+                "salary_rate": float(row["salary_rate"]),
+                "is_active": int(row["is_active"]),
+            }
+            for row in cursor.fetchall()
+        ]
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
         cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
