@@ -1,0 +1,261 @@
+import os
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+_IMPORT_ROOT = tempfile.TemporaryDirectory()
+os.environ["SECRET_KEY"] = "unit-test-secret"
+os.environ["SYNC_API_KEY"] = "unit-test-sync-key"
+os.environ["ADMIN_PASSWORD"] = "unit-test-admin-password"
+os.environ["DATABASE_PATH"] = str(Path(_IMPORT_ROOT.name) / "server_import.db")
+
+import server
+from migrate_ob import migrate_database
+
+
+class ObApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.previous_db_file = server.DB_FILE
+        server.DB_FILE = str(Path(self.temp_dir.name) / "ob_server.db")
+        server.app.config["TESTING"] = True
+        server.init_cloud_db()
+        migrate_database(
+            server.DB_FILE,
+            Path(self.temp_dir.name) / "ob_server.pre-migration.db",
+        )
+        self.client = server.app.test_client()
+        with self.client.session_transaction() as session:
+            session.update({
+                "user_id": 1,
+                "username": "Aliaksei Patonich",
+                "role": "user",
+                "employee_id": 1,
+            })
+        self.payload = {
+            "request_id": "ob-request-1",
+            "date": "2026-10-12",
+            "employee": "Aliaksei Patonich",
+            "company": "Privat",
+            "object_name": "Bygg och renovering",
+            "hours": 23,
+            "rate": 99999,
+            "transport": 9999,
+            "comment": "evening interval",
+            "submission_type": "ob",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "ob_base_rate": 100,
+            "total_amount": 1,
+        }
+
+    def tearDown(self):
+        server.DB_FILE = self.previous_db_file
+        self.temp_dir.cleanup()
+
+    def database(self):
+        conn = server.get_db_connection()
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def test_server_recalculates_submit_edit_history_and_delete_segments(self):
+        response = self.client.post("/submit-shift", json=self.payload)
+        self.assertEqual(response.status_code, 201, response.json)
+        self.assertEqual(response.json["hours"], 4.0)
+        self.assertEqual(response.json["total_amount"], 570.0)
+        self.assertEqual([segment["amount"] for segment in response.json["segments"]], [100.0, 300.0, 170.0])
+
+        conn = self.database()
+        original = conn.execute(
+            "SELECT id, sync_id, hours, rate, transport, submission_type FROM incoming_submissions"
+        ).fetchone()
+        self.assertEqual(tuple(original), (1, "ob-request-1", 4.0, 0.0, 0.0, "ob"))
+        stored_segments = conn.execute("SELECT COUNT(*) FROM ob_segments WHERE shift_id = ?", (original["sync_id"],)).fetchone()[0]
+        conn.close()
+
+        self.assertEqual(stored_segments, 3)
+        history = self.client.post(
+            "/check-employee-shifts",
+            json={"employee": "Aliaksei Patonich", "month": "2026-10"},
+        ).json["recent_shifts"][0]
+        self.assertEqual(history["submission_type"], "ob")
+        self.assertEqual(history["ob_total_amount"], 570.0)
+        self.assertEqual(len(history["ob_segments"]), 3)
+        exported = self.client.post("/export-shifts-csv", json={
+            "employee": "Aliaksei Patonich", "month": "2026-10"
+        })
+        self.assertEqual(exported.status_code, 200, exported.get_data(as_text=True))
+        self.assertIn("OB сегменты", exported.get_data(as_text=True))
+        self.assertIn("570.0", exported.get_data(as_text=True))
+
+        edit_payload = {
+            "sync_id": original["sync_id"],
+            "operation_id": "ob-edit-1",
+            "version": 1,
+            "employee": "Aliaksei Patonich",
+            "date": "2026-10-12",
+            "company": "Privat",
+            "object_name": "Bygg och renovering",
+            "submission_type": "ob",
+            "start_time": "18:00",
+            "end_time": "20:00",
+            "ob_base_rate": 200,
+            "hours": 1,
+            "total_amount": 999999,
+        }
+        edited = self.client.post("/edit-shift", json=edit_payload)
+        self.assertEqual(edited.status_code, 200, edited.json)
+        conn = self.database()
+        rows = conn.execute("SELECT id, sync_id, hours, start_time, end_time, ob_base_rate FROM incoming_submissions").fetchall()
+        segments = conn.execute("SELECT hours, multiplier, amount FROM ob_segments WHERE shift_id = ?", (original["sync_id"],)).fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tuple(rows[0]), (original["id"], original["sync_id"], 2.0, "18:00", "20:00", 200.0))
+        self.assertEqual([tuple(row) for row in segments], [(2.0, 1.5, 600.0)])
+
+        deleted = self.client.post("/delete-shift", json={
+            "sync_id": original["sync_id"],
+            "operation_id": "ob-delete-1",
+            "version": 2,
+            "employee": "Aliaksei Patonich",
+            "submission_type": "ob",
+        })
+        self.assertEqual(deleted.status_code, 200, deleted.json)
+        conn = self.database()
+        self.assertEqual(conn.execute("SELECT is_deleted FROM incoming_submissions WHERE sync_id = ?", (original["sync_id"],)).fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM ob_segments WHERE shift_id = ?", (original["sync_id"],)).fetchone()[0], 0)
+        conn.close()
+
+    def test_calculate_ob_preview_uses_internal_rules_endpoint(self):
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200)
+        page_text = page.get_data(as_text=True)
+        self.assertIn('<option value="ob">OB/сверхурочные</option>', page_text)
+        self.assertIn('id="ob-start-time"', page_text)
+        self.assertIn('id="edit-ob-start-time"', page_text)
+
+        response = self.client.post("/calculate-ob", json={
+            "date": "2026-10-12",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "ob_base_rate": 100,
+        })
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json["total_amount"], 570.0)
+        self.assertEqual([segment["calculated_rate"] for segment in response.json["segments"]], [100.0, 150.0, 170.0])
+
+    def test_server_rejects_invalid_ob_and_does_not_trust_client_amount(self):
+        invalid = dict(self.payload, request_id="invalid-ob", start_time="10:00", end_time="10:00")
+        response = self.client.post("/submit-shift", json=invalid)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("не может совпадать", response.json["error"])
+
+        self.assertEqual(self.client.post("/submit-shift", json=self.payload).status_code, 201)
+        conn = self.database()
+        stored = conn.execute("SELECT hours, rate, transport FROM incoming_submissions WHERE request_id = ?", ("ob-request-1",)).fetchone()
+        self.assertEqual(tuple(stored), (4.0, 0.0, 0.0))
+        conn.close()
+
+    def test_old_submission_payload_remains_work(self):
+        legacy = dict(self.payload)
+        legacy.pop("submission_type")
+        legacy.pop("start_time")
+        legacy.pop("end_time")
+        legacy.pop("ob_base_rate")
+        legacy.pop("total_amount")
+        legacy.update({"request_id": "legacy-work", "hours": 8, "rate": 100, "transport": 0})
+        response = self.client.post("/submit-shift", json=legacy)
+        self.assertEqual(response.status_code, 201, response.json)
+        conn = self.database()
+        row = conn.execute("SELECT submission_type, hours, rate FROM incoming_submissions WHERE request_id = ?", ("legacy-work",)).fetchone()
+        self.assertEqual(tuple(row), ("work", 8.0, 100.0))
+        conn.close()
+
+    def test_atf_and_sick_submission_types_remain_unchanged(self):
+        conn = self.database()
+        conn.execute(
+            "INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)",
+            ("Arbetstidsförkortning", "p1000", "Privat"),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)",
+            ("Sjuk", "p1001", "Privat"),
+        )
+        conn.commit()
+        conn.close()
+
+        for record_type, object_name in (("atf", "Arbetstidsförkortning"), ("sick", "Sjuk")):
+            payload = {
+                "request_id": f"legacy-{record_type}", "date": "2026-10-12",
+                "employee": "Aliaksei Patonich", "company": "Privat", "object_name": object_name,
+                "hours": 4, "rate": 50, "transport": 1, "comment": "old type",
+                "submission_type": record_type,
+            }
+            response = self.client.post("/submit-shift", json=payload)
+            self.assertEqual(response.status_code, 201, response.json)
+
+        conn = self.database()
+        rows = conn.execute(
+            "SELECT submission_type, rate, transport FROM incoming_submissions ORDER BY request_id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("atf", 0.0, 0.0), ("sick", 0.0, 0.0)])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM ob_segments").fetchone()[0], 0)
+        conn.close()
+
+    def test_sync_push_recalculates_ob_segments_instead_of_trusting_client(self):
+        response = self.client.post("/sync/push", headers={"X-Sync-Key": "unit-test-sync-key"}, json={
+            "changes": [{
+                "operation_id": "ob-sync-1",
+                "sync_id": "stable-ob-sync-id",
+                "operation": "upsert",
+                "base_version": 0,
+                "shift": {
+                    "record_type": "ob",
+                    "date": "2026-10-12",
+                    "employee": "Aliaksei Patonich",
+                    "company": "Privat",
+                    "object_name": "Bygg och renovering",
+                    "hours": 1,
+                    "rate": 99999,
+                    "transport": 9999,
+                    "start_time": "17:00",
+                    "end_time": "21:00",
+                    "ob_base_rate": 80,
+                    "total_amount": 0.01,
+                    "comment": "synced OB",
+                },
+            }]
+        })
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertTrue(response.json["results"][0]["ok"])
+        conn = self.database()
+        row = conn.execute("SELECT hours, rate, transport, submission_type, ob_base_rate FROM incoming_submissions WHERE sync_id = ?", ("stable-ob-sync-id",)).fetchone()
+        segments = conn.execute("SELECT amount FROM ob_segments WHERE shift_id = ? ORDER BY start_time", ("stable-ob-sync-id",)).fetchall()
+        conn.close()
+        self.assertEqual(tuple(row), (4.0, 0.0, 0.0, "ob", 80.0))
+        self.assertEqual([segment[0] for segment in segments], [80.0, 240.0, 136.0])
+
+    def test_unmigrated_server_refuses_ob_but_accepts_legacy_work(self):
+        previous_db = server.DB_FILE
+        server.DB_FILE = str(Path(self.temp_dir.name) / "unmigrated.db")
+        try:
+            server.init_cloud_db()
+            rejected = self.client.post("/submit-shift", json=self.payload)
+            self.assertEqual(rejected.status_code, 503)
+            self.assertIn("migrate_ob.py", rejected.json["error"])
+            legacy = dict(self.payload, request_id="old-work-payload", hours=8, rate=100, transport=0)
+            for key in ("submission_type", "start_time", "end_time", "ob_base_rate", "total_amount"):
+                legacy.pop(key, None)
+            accepted = self.client.post("/submit-shift", json=legacy)
+            self.assertEqual(accepted.status_code, 201, accepted.json)
+            conn = self.database()
+            self.assertEqual(conn.execute("SELECT submission_type FROM incoming_submissions").fetchone()[0], "work")
+            self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE name = 'ob_segments'").fetchone())
+            conn.close()
+        finally:
+            server.DB_FILE = previous_db
+
+
+if __name__ == "__main__":
+    unittest.main()

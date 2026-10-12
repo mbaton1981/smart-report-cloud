@@ -181,6 +181,7 @@
                         <option value="work">Работа</option>
                         <option value="atf">АТФ</option>
                         <option value="sick">Больничный</option>
+                        <option value="ob">OB/сверхурочные</option>
                     </select>
                 </div>
 
@@ -194,6 +195,22 @@
                 <div class="form-group">
                     <label id="hours-label" for="hours">Отработано часов:</label>
                     <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
+                </div>
+
+                <div id="ob-fields" style="display:none;">
+                    <div class="form-group">
+                        <label for="ob-start-time">Время начала (Europe/Stockholm):</label>
+                        <input type="time" id="ob-start-time" step="60">
+                    </div>
+                    <div class="form-group">
+                        <label for="ob-end-time">Время окончания:</label>
+                        <input type="time" id="ob-end-time" step="60">
+                    </div>
+                    <div class="form-group">
+                        <label for="ob-base-rate">Базовая ставка (SEK/ч):</label>
+                        <input type="number" id="ob-base-rate" min="0" step="0.01">
+                    </div>
+                    <div id="ob-preview" role="status" aria-live="polite"></div>
                 </div>
 
                 <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
@@ -268,11 +285,21 @@
                 <option value="work">Работа</option>
                 <option value="atf">АТФ</option>
                 <option value="sick">Больничный</option>
+                <option value="ob">OB/сверхурочные</option>
             </select>
             <label for="edit-object">Объект</label>
             <select id="edit-object" required></select>
             <label for="edit-hours">Часы</label>
             <input id="edit-hours" type="number" min="0.5" max="24" step="0.5" required>
+            <div id="edit-ob-fields" style="display:none;">
+                <label for="edit-ob-start-time">Время начала (Europe/Stockholm)</label>
+                <input id="edit-ob-start-time" type="time" step="60">
+                <label for="edit-ob-end-time">Время окончания</label>
+                <input id="edit-ob-end-time" type="time" step="60">
+                <label for="edit-ob-base-rate">Базовая ставка (SEK/ч)</label>
+                <input id="edit-ob-base-rate" type="number" min="0" step="0.01">
+                <div id="edit-ob-preview" role="status" aria-live="polite"></div>
+            </div>
             <label for="edit-transport-check">Транспорт (только для работы)</label>
             <input id="edit-transport-check" type="checkbox">
             <label for="edit-comment">Комментарий</label>
@@ -411,14 +438,77 @@
         function updateSubmissionTypeForm() {
             const submissionType = document.getElementById('submission_type').value;
             const special = submissionType !== 'work';
-            document.getElementById('hours-label').textContent = submissionType === 'atf'
-                ? 'Часы АТФ:'
-                : (submissionType === 'sick' ? 'Больничные часы:' : 'Отработано часов:');
+            const isOb = submissionType === 'ob';
+            document.getElementById('hours-label').textContent = isOb
+                ? 'Рассчитано часов:'
+                : (submissionType === 'atf'
+                    ? 'Часы АТФ:'
+                    : (submissionType === 'sick' ? 'Больничные часы:' : 'Отработано часов:'));
+            document.getElementById('hours').readOnly = isOb;
+            document.getElementById('ob-fields').style.display = isOb ? 'block' : 'none';
             const transportCheck = document.getElementById('transport_check');
             transportCheck.checked = false;
             transportCheck.disabled = special;
             document.getElementById('transport').value = '0.0';
             filterObjects();
+            if (isOb) refreshObPreview(false);
+        }
+
+        function renderObPreview(container, result) {
+            container.replaceChildren();
+            const labels = {
+                weekday_early_morning_unconfirmed: 'Раннее утро (правило требует подтверждения)',
+                weekday_day: 'Дневное время',
+                weekday_early_evening: 'Ранний вечер',
+                weekday_late_evening_night: 'Поздний вечер/ночь',
+                saturday: 'Суббота',
+                sunday: 'Воскресенье'
+            };
+            result.segments.forEach(segment => {
+                const line = document.createElement('div');
+                line.textContent = `${segment.segment_date} ${segment.start_time}–${segment.end_time}: ` +
+                    `${labels[segment.category] || segment.category}, ${segment.hours.toFixed(2)} ч, ` +
+                    `+${segment.premium_percent}%, ${segment.base_rate.toFixed(2)} × ${segment.multiplier}, ` +
+                    `${segment.calculated_rate.toFixed(2)} kr/ч, ${segment.amount.toFixed(2)} kr`;
+                container.appendChild(line);
+            });
+            const total = document.createElement('b');
+            total.textContent = `Всего: ${result.total_hours.toFixed(2)} ч; OB сумма: ${result.total_amount.toFixed(2)} kr`;
+            container.appendChild(total);
+            const note = document.createElement('small');
+            note.style.display = 'block';
+            note.textContent = 'Начальные тарифы требуют подтверждения по применяемому kollektivavtal.';
+            container.appendChild(note);
+        }
+
+        async function refreshObPreview(edit = false) {
+            const prefix = edit ? 'edit-' : '';
+            const type = document.getElementById(edit ? 'edit-type' : 'submission_type').value;
+            if (type !== 'ob') return null;
+            const date = document.getElementById(edit ? 'edit-date' : 'date').value;
+            const start = document.getElementById(`${prefix}ob-start-time`).value;
+            const end = document.getElementById(`${prefix}ob-end-time`).value;
+            const baseRate = document.getElementById(`${prefix}ob-base-rate`).value;
+            const preview = document.getElementById(edit ? 'edit-ob-preview' : 'ob-preview');
+            if (!date || !start || !end || baseRate === '') {
+                preview.textContent = 'Укажите дату, время начала/окончания и базовую ставку.';
+                return null;
+            }
+            try {
+                const response = await fetch('/calculate-ob', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ date, start_time: start, end_time: end, ob_base_rate: Number(baseRate) })
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Не удалось рассчитать OB-интервал.');
+                renderObPreview(preview, result);
+                document.getElementById(edit ? 'edit-hours' : 'hours').value = result.total_hours;
+                return result;
+            } catch (error) {
+                preview.textContent = `Ошибка расчёта: ${error.message}`;
+                return null;
+            }
         }
 
         function filterEditObjects(selectedName = '') {
@@ -456,10 +546,14 @@
 
         function updateEditTypeForm() {
             const special = document.getElementById('edit-type').value !== 'work';
+            const isOb = document.getElementById('edit-type').value === 'ob';
             const transport = document.getElementById('edit-transport-check');
             transport.disabled = special;
             transport.checked = special ? false : editOriginalTransport > 0;
+            document.getElementById('edit-hours').readOnly = isOb;
+            document.getElementById('edit-ob-fields').style.display = isOb ? 'block' : 'none';
             filterEditObjects(document.getElementById('edit-object').value);
+            if (isOb) refreshObPreview(true);
         }
 
         function openEditShift(shift) {
@@ -479,6 +573,9 @@
             companySelect.value = shift.company;
             document.getElementById('edit-type').value = shift.submission_type || 'work';
             document.getElementById('edit-hours').value = shift.hours;
+            document.getElementById('edit-ob-start-time').value = shift.start_time || '';
+            document.getElementById('edit-ob-end-time').value = shift.end_time || '';
+            document.getElementById('edit-ob-base-rate').value = shift.ob_base_rate ?? '';
             document.getElementById('edit-comment').value = shift.comment || '';
             filterEditObjects(shift.object_name);
             document.getElementById('edit-transport-check').checked = editOriginalTransport > 0;
@@ -488,6 +585,12 @@
 
         document.getElementById('edit-type').addEventListener('change', updateEditTypeForm);
         document.getElementById('edit-company').addEventListener('change', () => filterEditObjects());
+        for (const id of ['edit-date', 'edit-ob-start-time', 'edit-ob-end-time', 'edit-ob-base-rate']) {
+            document.getElementById(id).addEventListener('change', () => refreshObPreview(true));
+        }
+        for (const id of ['date', 'ob-start-time', 'ob-end-time', 'ob-base-rate']) {
+            document.getElementById(id).addEventListener('change', () => refreshObPreview(false));
+        }
         document.getElementById('edit-cancel').addEventListener('click', () => {
             document.getElementById('shift-edit-dialog').close();
         });
@@ -508,6 +611,14 @@
                 comment: document.getElementById('edit-comment').value,
                 submission_type: submissionType
             };
+            if (submissionType === 'ob') {
+                const preview = await refreshObPreview(true);
+                if (!preview) return;
+                payload.hours = preview.total_hours;
+                payload.start_time = document.getElementById('edit-ob-start-time').value;
+                payload.end_time = document.getElementById('edit-ob-end-time').value;
+                payload.ob_base_rate = Number(document.getElementById('edit-ob-base-rate').value);
+            }
             if (submissionType === 'work') {
                 payload.transport = document.getElementById('edit-transport-check').checked ? 1 : 0;
             }
@@ -719,8 +830,12 @@
             
             const selectedDate = document.getElementById('date').value;
             const empName = document.getElementById('employee').value;
-            const hoursVal = parseFloat(document.getElementById('hours').value);
             const submissionType = document.getElementById('submission_type').value;
+            if (submissionType === 'ob') {
+                const preview = await refreshObPreview(false);
+                if (!preview) return;
+            }
+            const hoursVal = parseFloat(document.getElementById('hours').value);
 
             try {
                 const checkRes = await fetch('/check-employee-shifts', {
@@ -762,7 +877,14 @@
         async function executeShiftSubmission() {
             const selectedDate = document.getElementById('date').value;
             const empName = document.getElementById('employee').value;
-            const hoursVal = parseFloat(document.getElementById('hours').value);
+            const submissionType = document.getElementById('submission_type').value;
+            let hoursVal = parseFloat(document.getElementById('hours').value);
+            let obPreview = null;
+            if (submissionType === 'ob') {
+                obPreview = await refreshObPreview(false);
+                if (!obPreview) return;
+                hoursVal = obPreview.total_hours;
+            }
 
             const formData = {
                 request_id: pendingShiftRequestId || (pendingShiftRequestId = generateUUID()),
@@ -773,8 +895,13 @@
                 hours: hoursVal,
                 transport: parseFloat(document.getElementById('transport').value || 0),
                 comment: document.getElementById('comment').value,
-                submission_type: document.getElementById('submission_type').value
+                submission_type: submissionType
             };
+            if (obPreview) {
+                formData.start_time = document.getElementById('ob-start-time').value;
+                formData.end_time = document.getElementById('ob-end-time').value;
+                formData.ob_base_rate = Number(document.getElementById('ob-base-rate').value);
+            }
 
             try {
                 const response = await fetch('/submit-shift', {
@@ -857,6 +984,8 @@
                 let totalWorkHours = 0;
                 let totalAtfHours = 0;
                 let totalSickHours = 0;
+                let totalObHours = 0;
+                let totalObAmount = 0;
                 let totalsByObject = {};
 
                 if (shiftsData.recent_shifts && shiftsData.recent_shifts.length > 0) {
@@ -865,7 +994,7 @@
                     for (const shift of shiftsData.recent_shifts) {
                         const li = document.createElement('li');
                         const submissionType = shift.submission_type || 'work';
-                        const typeLabels = { work: 'Работа', atf: 'АТФ', sick: 'Больничный' };
+                        const typeLabels = { work: 'Работа', atf: 'АТФ', sick: 'Больничный', ob: 'OB/сверхурочные' };
                         const typeLabel = typeLabels[submissionType] || 'Неизвестный тип';
 
                         const spanInfo = document.createElement('span');
@@ -893,6 +1022,22 @@
                         spanInfo.appendChild(typeLine);
                         spanInfo.appendChild(document.createElement('br'));
                         spanInfo.appendChild(small);
+                        if (submissionType === 'ob') {
+                            const obInfo = document.createElement('small');
+                            obInfo.style.display = 'block';
+                            obInfo.textContent = `${shift.start_time}–${shift.end_time}; базовая ставка ${Number(shift.ob_base_rate).toFixed(2)} kr/ч`;
+                            spanInfo.appendChild(document.createElement('br'));
+                            spanInfo.appendChild(obInfo);
+                            for (const segment of (shift.ob_segments || [])) {
+                                const segmentLine = document.createElement('small');
+                                segmentLine.style.display = 'block';
+                                segmentLine.textContent = `${segment.segment_date} ${segment.start_time}–${segment.end_time}: ` +
+                                    `${segment.hours.toFixed(2)} ч, +${segment.premium_percent}%, ` +
+                                    `${segment.base_rate.toFixed(2)} × ${segment.multiplier}, ` +
+                                    `${segment.calculated_rate.toFixed(2)} kr/ч, ${segment.amount.toFixed(2)} kr`;
+                                spanInfo.appendChild(segmentLine);
+                            }
+                        }
                         if (shift.company || shift.comment) {
                             const details = document.createElement('small');
                             details.style.color = '#636e72';
@@ -910,7 +1055,9 @@
 
                         const spanHours = document.createElement('span');
                         spanHours.style.cssText = `${badgeStyle} padding: 5px 10px; border-radius: 4px; font-weight: bold;`;
-                        spanHours.textContent = `${shift.hours} ч`;
+                        spanHours.textContent = submissionType === 'ob'
+                            ? `${shift.hours} ч · ${Number(shift.ob_total_amount || 0).toFixed(2)} kr`
+                            : `${shift.hours} ч`;
 
                         const actions = document.createElement('span');
                         actions.className = 'history-actions';
@@ -937,6 +1084,10 @@
                         if (submissionType === 'work') totalWorkHours += shift.hours;
                         else if (submissionType === 'atf') totalAtfHours += shift.hours;
                         else if (submissionType === 'sick') totalSickHours += shift.hours;
+                        else if (submissionType === 'ob') {
+                            totalObHours += shift.hours;
+                            totalObAmount += Number(shift.ob_total_amount || 0);
+                        }
 
                         let rawComment = shift.comment || "";
                         let translatedComment = rawComment;
@@ -981,12 +1132,12 @@
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
                     document.getElementById('print-total-hours').textContent = `Рабочие часы: ${totalWorkHours} ч`;
-                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч`;
-                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч`;
+                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${totalObHours.toFixed(2)} ч / ${totalObAmount.toFixed(2)} kr`;
+                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${totalObHours.toFixed(2)} ч / ${totalObAmount.toFixed(2)} kr`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
-                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч';
+                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · OB: 0 ч / 0 kr';
                 }
             } catch (err) {
                 listContainer.innerHTML = '<li style="color: #d63031; justify-content: center;">Ошибка загрузки данных.</li>';
