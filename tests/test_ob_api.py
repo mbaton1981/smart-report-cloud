@@ -178,6 +178,9 @@ class ObApiTests(unittest.TestCase):
             "shifts": [],
         })
         self.assertEqual(response.status_code, 200, response.json)
+        synced_profile = response.json["employee_sync"][0]["profiles"][0]
+        self.assertEqual(synced_profile["id"], 1)
+        self.assertEqual(synced_profile["salary_rate"], 245.80)
 
         conn = self.database()
         profiles = conn.execute(

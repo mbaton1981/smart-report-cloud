@@ -1567,6 +1567,7 @@ def sync_desktop_data():
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    employee_sync_results = []
 
     try:
         if employees:
@@ -1605,6 +1606,16 @@ def sync_desktop_data():
                             salary_rate = excluded.salary_rate,
                             is_active = excluded.is_active
                     ''', (emp_name, emp_rate, emp_active))
+                stored_profiles = find_employee_profiles(cursor, emp_name)
+                employee_sync_results.append({
+                    "employee_name": emp_name,
+                    "profiles": [{
+                        "id": profile["id"],
+                        "name": profile["name"],
+                        "salary_rate": float(profile["salary_rate"] or 0.0),
+                        "is_active": bool(profile["is_active"]),
+                    } for profile in stored_profiles],
+                })
 
         if companies:
             for comp in companies:
@@ -1633,7 +1644,12 @@ def sync_desktop_data():
     finally:
         conn.close()
 
-    return jsonify({"ok": True, "status": "metadata_synced", "shift_sync": "versioned_api_required"})
+    return jsonify({
+        "ok": True,
+        "status": "metadata_synced",
+        "shift_sync": "versioned_api_required",
+        "employee_sync": employee_sync_results,
+    })
 
 def serialize_submission(row):
     payload = {
