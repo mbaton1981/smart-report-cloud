@@ -159,6 +159,45 @@ class ObApiTests(unittest.TestCase):
         self.assertNotIn("base_rate", response.json["segments"][0])
         self.assertNotIn("ob_base_rate", response.json)
 
+    def test_desktop_sync_matches_employee_name_case_insensitively(self):
+        conn = self.database()
+        conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        response = self.client.post("/sync-desktop-data", headers={
+            "X-Sync-Key": "unit-test-sync-key",
+        }, json={
+            "employees": [{
+                "name": "  ALIAKSEI PATONICH  ",
+                "salary_rate": 245.80,
+                "is_active": 1,
+            }],
+            "companies": [],
+            "objects": [],
+            "shifts": [],
+        })
+        self.assertEqual(response.status_code, 200, response.json)
+
+        conn = self.database()
+        profiles = conn.execute(
+            "SELECT id, salary_rate FROM meta_employees WHERE lower(trim(name)) = ?",
+            ("aliaksei patonich",),
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["id"], 1)
+        self.assertEqual(profiles[0]["salary_rate"], 245.80)
+
+        preview = self.client.post("/calculate-ob", json={
+            "date": "2026-10-12",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "employee": "  aLiAkSeI   PaToNiCh  ",
+        })
+        self.assertEqual(preview.status_code, 200, preview.json)
+        self.assertTrue(preview.json["base_rate_configured"])
+
     def test_server_rejects_invalid_ob_and_does_not_trust_client_amount(self):
         invalid = dict(self.payload, request_id="invalid-ob", start_time="10:00", end_time="10:00")
         response = self.client.post("/submit-shift", json=invalid)

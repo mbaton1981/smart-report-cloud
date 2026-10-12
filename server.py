@@ -42,15 +42,28 @@ def ob_schema_ready(cursor):
     return required.issubset(columns) and cursor.fetchone() is not None
 
 
+def normalize_employee_name(name):
+    return " ".join(str(name or "").split()).casefold()
+
+
+def find_employee_profiles(cursor, name, active_only=False):
+    query = "SELECT id, name, salary_rate, is_active FROM meta_employees"
+    if active_only:
+        query += " WHERE is_active = 1"
+    cursor.execute(query)
+    normalized_name = normalize_employee_name(name)
+    return [
+        row for row in cursor.fetchall()
+        if normalize_employee_name(row["name"]) == normalized_name
+    ]
+
+
 def get_employee_ob_base_rate(cursor, employee):
-    cursor.execute(
-        "SELECT COALESCE(salary_rate, 0.0) FROM meta_employees WHERE name = ? AND is_active = 1",
-        (employee,),
-    )
-    row = cursor.fetchone()
-    if not row:
+    profiles = find_employee_profiles(cursor, employee, active_only=True)
+    if not profiles:
         raise ValueError("Для OB не найден активный профиль сотрудника")
-    return float(row[0])
+    profile = next((row for row in profiles if row["name"] == employee), profiles[0])
+    return float(profile["salary_rate"] or 0.0)
 
 
 def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
@@ -161,6 +174,10 @@ def resolve_session_employee(cursor, requested_employee=None):
         employee = str(requested_employee or '').strip()
         if not employee:
             raise ValueError("Не указан сотрудник.")
+        profiles = find_employee_profiles(cursor, employee, active_only=True)
+        if not profiles:
+            raise ValueError("Указанный сотрудник не найден или неактивен.")
+        employee = next((row['name'] for row in profiles if row['name'] == employee), profiles[0]['name'])
     else:
         employee_id = session.get('employee_id')
         if not employee_id:
@@ -170,10 +187,11 @@ def resolve_session_employee(cursor, requested_employee=None):
         if not row:
             raise PermissionError("Сотрудник не найден или деактивирован.")
         employee = row['name']
-        if requested_employee and str(requested_employee).strip() != employee:
+        if requested_employee and normalize_employee_name(requested_employee) != normalize_employee_name(employee):
             raise PermissionError("Нельзя изменять записи другого сотрудника.")
-    cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
-    if not cursor.fetchone():
+        if not find_employee_profiles(cursor, employee, active_only=True):
+            raise ValueError("Указанный сотрудник не найден или неактивен.")
+    if not find_employee_profiles(cursor, employee, active_only=True):
         raise ValueError("Указанный сотрудник не найден или неактивен.")
     return employee
 
@@ -1500,7 +1518,7 @@ def sync_desktop_data():
         if employees:
             for emp in employees:
                 if isinstance(emp, dict):
-                    emp_name = str(emp.get('name', '')).strip()
+                    emp_name = " ".join(str(emp.get('name', '')).split())
                     if not emp_name or len(emp_name) > 150:
                         raise ValueError("Недопустимое имя сотрудника")
                     try:
@@ -1511,19 +1529,28 @@ def sync_desktop_data():
                         return jsonify({"ok": False, "error": "Некорректная ставка сотрудника"}), 400
                     emp_active = int(emp.get('is_active', 1))
                 else:
-                    emp_name = str(emp).strip() if emp else ""
+                    emp_name = " ".join(str(emp).split()) if emp else ""
                     if not emp_name or len(emp_name) > 150:
                         raise ValueError("Недопустимое имя сотрудника")
                     emp_rate = 0.0
                     emp_active = 1
 
-                cursor.execute('''
-                    INSERT INTO meta_employees (name, salary_rate, is_active) 
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET 
-                        salary_rate = excluded.salary_rate,
-                        is_active = excluded.is_active
-                ''', (emp_name, emp_rate, emp_active))
+                matching_profiles = find_employee_profiles(cursor, emp_name)
+                if matching_profiles:
+                    profile_ids = [profile['id'] for profile in matching_profiles]
+                    placeholders = ', '.join('?' for _ in profile_ids)
+                    cursor.execute(
+                        f"UPDATE meta_employees SET salary_rate = ?, is_active = ? WHERE id IN ({placeholders})",
+                        (emp_rate, emp_active, *profile_ids),
+                    )
+                else:
+                    cursor.execute('''
+                        INSERT INTO meta_employees (name, salary_rate, is_active)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET
+                            salary_rate = excluded.salary_rate,
+                            is_active = excluded.is_active
+                    ''', (emp_name, emp_rate, emp_active))
 
         if companies:
             for comp in companies:
