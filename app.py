@@ -305,6 +305,14 @@ def ob_schema_ready(cursor):
     return required.issubset(columns) and cursor.fetchone() is not None
 
 
+def get_local_employee_ob_base_rate(cursor, employee):
+    cursor.execute("SELECT COALESCE(salary_rate, 0.0) FROM employees WHERE name = ?", (employee,))
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Для OB не найден профиль сотрудника с базовой ставкой")
+    return float(row[0])
+
+
 def replace_ob_segments(cursor, sync_id, segments):
     cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
     now = datetime.now(timezone.utc).isoformat()
@@ -373,7 +381,6 @@ def shift_payload(row):
         payload.update({
             "start_time": row["start_time"],
             "end_time": row["end_time"],
-            "ob_base_rate": row["ob_base_rate"],
         })
     return payload
 
@@ -784,9 +791,7 @@ class SmartReportApp(QMainWindow):
         self.ob_end_time = QTimeEdit()
         self.ob_end_time.setDisplayFormat("HH:mm")
         self.ob_end_time.setTime(QTime(18, 0))
-        self.ob_base_rate_input = QLineEdit()
-        self.ob_base_rate_input.setPlaceholderText("Базовая ставка, SEK/ч")
-        self.ob_preview_lbl = QLabel("Введите время и базовую ставку для расчёта сегментов.")
+        self.ob_preview_lbl = QLabel("Введите интервал для расчёта сегментов.")
         self.ob_preview_lbl.setWordWrap(True)
 
         card_layout.addRow("Дата (ГГГГ-ММ-ДД):", self.date_input)
@@ -803,18 +808,17 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
         card_layout.addRow("Начало (Europe/Stockholm):", self.ob_start_time)
         card_layout.addRow("Окончание:", self.ob_end_time)
-        card_layout.addRow("Базовая ставка (SEK/ч):", self.ob_base_rate_input)
         card_layout.addRow("Рассчитанные сегменты:", self.ob_preview_lbl)
 
         self._ob_form_widgets = (
-            self.ob_start_time, self.ob_end_time, self.ob_base_rate_input, self.ob_preview_lbl,
+            self.ob_start_time, self.ob_end_time, self.ob_preview_lbl,
         )
         self._standard_hour_widgets = (self.hours_input, self.rate_input, self.trans_input)
         self.record_type_cb.currentIndexChanged.connect(self.update_ob_form_visibility)
         self.date_input.dateChanged.connect(self.refresh_ob_preview)
         self.ob_start_time.timeChanged.connect(self.refresh_ob_preview)
         self.ob_end_time.timeChanged.connect(self.refresh_ob_preview)
-        self.ob_base_rate_input.textChanged.connect(self.refresh_ob_preview)
+        self.emp_cb.currentTextChanged.connect(self.refresh_ob_preview)
         self.update_ob_form_visibility()
 
         save_btn = QPushButton("💾 Сохранить смену")
@@ -933,11 +937,10 @@ class SmartReportApp(QMainWindow):
     def refresh_ob_preview(self, *_):
         if not hasattr(self, "ob_preview_lbl") or self.record_type_cb.currentData() != RECORD_TYPE_OB:
             return
-        base_rate = parse_float(self.ob_base_rate_input.text(), None)
-        if base_rate is None:
-            self.ob_preview_lbl.setText("Укажите базовую ставку, чтобы увидеть расчёт.")
-            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
         try:
+            base_rate = get_local_employee_ob_base_rate(cursor, self.emp_cb.currentText().strip())
             result = calculate_work_interval(
                 self.date_input.text(),
                 self.ob_start_time.time().toString("HH:mm"),
@@ -947,6 +950,8 @@ class SmartReportApp(QMainWindow):
         except (TypeError, ValueError) as error:
             self.ob_preview_lbl.setText(f"Ошибка интервала: {error}")
             return
+        finally:
+            conn.close()
         category_labels = {
             "weekday_early_morning_unpaid_pending_confirmation": "00:00–07:00 без оплаты до подтверждения договора",
             "weekday_day": "Дневное время",
@@ -959,8 +964,7 @@ class SmartReportApp(QMainWindow):
             f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']}: "
             f"{category_labels.get(segment['category'], segment['category'])}, "
             f"{segment['hours']:.2f} ч, +{segment['premium_percent']:.0f}%, "
-                f"{segment['base_rate']:.2f} × {segment['multiplier']:.2f} = "
-            f"{segment['calculated_rate']:.2f} kr/ч; сумма {segment['amount']:.2f} kr"
+            f"×{segment['multiplier']:.2f}, сумма {segment['amount']:.2f} kr"
             for segment in result["segments"]
         ]
         self.ob_preview_lbl.setText(
@@ -2996,7 +3000,7 @@ class SmartReportApp(QMainWindow):
                 ob_result = calculate_work_interval(
                     date, self.ob_start_time.time().toString("HH:mm"),
                     self.ob_end_time.time().toString("HH:mm"),
-                    parse_float(self.ob_base_rate_input.text(), None),
+                    get_local_employee_ob_base_rate(cursor, emp),
                 )
             except (TypeError, ValueError) as error:
                 conn.close()
@@ -3071,7 +3075,6 @@ class SmartReportApp(QMainWindow):
             payload.update({
                 "start_time": ob_result["start_time"],
                 "end_time": ob_result["end_time"],
-                "ob_base_rate": ob_result["segments"][0]["base_rate"],
             })
         enqueue_shift_operation(cursor, sync_id, 'upsert', 0, payload)
         conn.commit()
@@ -3194,10 +3197,6 @@ class SmartReportApp(QMainWindow):
         ob_end_field = QTimeEdit()
         ob_end_field.setDisplayFormat("HH:mm")
         ob_end_field.setTime(QTime.fromString((shift["end_time"] if has_ob_schema else None) or "18:00", "HH:mm"))
-        ob_base_rate_field = QDoubleSpinBox()
-        ob_base_rate_field.setRange(0, 100000)
-        ob_base_rate_field.setDecimals(2)
-        ob_base_rate_field.setValue(float(shift["ob_base_rate"] or 0.0) if has_ob_schema else 0.0)
         ob_preview_field = QLabel("")
         ob_preview_field.setWordWrap(True)
 
@@ -3220,20 +3219,25 @@ class SmartReportApp(QMainWindow):
             if record_type_field.currentData() != RECORD_TYPE_OB:
                 ob_preview_field.setText("")
                 return
+            preview_conn = get_db_connection()
             try:
+                base_rate = get_local_employee_ob_base_rate(
+                    preview_conn.cursor(), employee_field.currentText().strip()
+                )
                 result = calculate_work_interval(
                     date_field.text(), ob_start_field.time().toString("HH:mm"),
-                    ob_end_field.time().toString("HH:mm"), ob_base_rate_field.value(),
+                    ob_end_field.time().toString("HH:mm"), base_rate,
                 )
             except (TypeError, ValueError) as error:
                 ob_preview_field.setText(f"Ошибка интервала: {error}")
                 return
+            finally:
+                preview_conn.close()
             ob_preview_field.setText(
                 "<br>".join(
                     f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']}: "
                     f"{segment['hours']:.2f} ч, +{segment['premium_percent']:.0f}%, "
-                    f"{segment['base_rate']:.2f} × {segment['multiplier']:.2f} = "
-                    f"{segment['calculated_rate']:.2f} kr/ч; сумма {segment['amount']:.2f} kr"
+                    f"×{segment['multiplier']:.2f}, сумма {segment['amount']:.2f} kr"
                     for segment in result["segments"]
                 ) + f"<br><b>Всего: {result['total_hours']:.2f} ч; {result['total_amount']:.2f} kr</b>"
                 + "<br><small>Начальные тарифы требуют подтверждения по применяемому kollektivavtal.</small>"
@@ -3246,7 +3250,7 @@ class SmartReportApp(QMainWindow):
                 label = form.labelForField(widget)
                 if label:
                     label.setVisible(not is_ob)
-            for widget in (ob_start_field, ob_end_field, ob_base_rate_field, ob_preview_field):
+            for widget in (ob_start_field, ob_end_field, ob_preview_field):
                 widget.setVisible(is_ob)
                 label = form.labelForField(widget)
                 if label:
@@ -3255,7 +3259,8 @@ class SmartReportApp(QMainWindow):
 
         record_type_field.currentIndexChanged.connect(update_type_values)
         record_type_field.currentIndexChanged.connect(update_dialog_ob_visibility)
-        for ob_widget in (ob_start_field, ob_end_field, ob_base_rate_field):
+        employee_field.currentTextChanged.connect(refresh_dialog_ob_preview)
+        for ob_widget in (ob_start_field, ob_end_field):
             if isinstance(ob_widget, QTimeEdit):
                 ob_widget.timeChanged.connect(refresh_dialog_ob_preview)
             else:
@@ -3273,7 +3278,6 @@ class SmartReportApp(QMainWindow):
         form.addRow("Комментарий:", comment_field)
         form.addRow("Время начала:", ob_start_field)
         form.addRow("Время окончания:", ob_end_field)
-        form.addRow("Базовая ставка (SEK/ч):", ob_base_rate_field)
         form.addRow("Рассчитанные OB-сегменты:", ob_preview_field)
         update_dialog_ob_visibility()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -3310,6 +3314,15 @@ class SmartReportApp(QMainWindow):
         if record_type == RECORD_TYPE_OB:
             schema_conn = get_db_connection()
             schema_ready = ob_schema_ready(schema_conn.cursor())
+            rate_cursor = schema_conn.cursor()
+            try:
+                employee_base_rate = get_local_employee_ob_base_rate(
+                    rate_cursor, employee_field.currentText().strip()
+                ) if schema_ready else None
+            except ValueError as error:
+                schema_conn.close()
+                QMessageBox.warning(self, "Профиль сотрудника", str(error))
+                return
             schema_conn.close()
             if not schema_ready:
                 QMessageBox.warning(self, "Требуется миграция", "Сначала выполните migrate_ob.py с резервной копией desktop-базы.")
@@ -3317,7 +3330,7 @@ class SmartReportApp(QMainWindow):
             try:
                 ob_result = calculate_work_interval(
                     date_field.text(), ob_start_field.time().toString("HH:mm"),
-                    ob_end_field.time().toString("HH:mm"), ob_base_rate_field.value(),
+                    ob_end_field.time().toString("HH:mm"), employee_base_rate,
                 )
             except (TypeError, ValueError) as error:
                 QMessageBox.warning(self, "Некорректный интервал OB", str(error))
@@ -3335,7 +3348,6 @@ class SmartReportApp(QMainWindow):
         if ob_result:
             payload.update({
                 "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
-                "ob_base_rate": ob_base_rate_field.value(),
             })
         if not payload['employee'] or not payload['company'] or not payload['object_name']:
             QMessageBox.warning(self, "Ошибка", "Заполните сотрудника, фирму и объект.")

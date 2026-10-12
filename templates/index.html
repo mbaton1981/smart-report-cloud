@@ -206,10 +206,6 @@
                         <label for="ob-end-time">Время окончания:</label>
                         <input type="time" id="ob-end-time" step="60">
                     </div>
-                    <div class="form-group">
-                        <label for="ob-base-rate">Базовая ставка (SEK/ч):</label>
-                        <input type="number" id="ob-base-rate" min="0" step="0.01">
-                    </div>
                     <div id="ob-preview" role="status" aria-live="polite"></div>
                 </div>
 
@@ -296,8 +292,6 @@
                 <input id="edit-ob-start-time" type="time" step="60">
                 <label for="edit-ob-end-time">Время окончания</label>
                 <input id="edit-ob-end-time" type="time" step="60">
-                <label for="edit-ob-base-rate">Базовая ставка (SEK/ч)</label>
-                <input id="edit-ob-base-rate" type="number" min="0" step="0.01">
                 <div id="edit-ob-preview" role="status" aria-live="polite"></div>
             </div>
             <label for="edit-transport-check">Транспорт (только для работы)</label>
@@ -456,6 +450,10 @@
 
         function renderObPreview(container, result) {
             container.replaceChildren();
+            const formatNumber = (value, digits = 2) => {
+                const number = Number(value);
+                return Number.isFinite(number) ? number.toFixed(digits) : (0).toFixed(digits);
+            };
             const labels = {
                 weekday_early_morning_unpaid_pending_confirmation: '00:00–07:00 без оплаты до подтверждения договора',
                 weekday_day: 'Дневное время',
@@ -464,16 +462,16 @@
                 saturday: 'Суббота',
                 sunday: 'Воскресенье'
             };
-            result.segments.forEach(segment => {
+            (Array.isArray(result.segments) ? result.segments : []).forEach(segment => {
                 const line = document.createElement('div');
-                line.textContent = `${segment.segment_date} ${segment.start_time}–${segment.end_time}: ` +
-                    `${labels[segment.category] || segment.category}, ${segment.hours.toFixed(2)} ч, ` +
-                    `+${segment.premium_percent}%, ${segment.base_rate.toFixed(2)} × ${segment.multiplier}, ` +
-                    `${segment.calculated_rate.toFixed(2)} kr/ч, ${segment.amount.toFixed(2)} kr`;
+                line.textContent = `${segment.segment_date || ''} ${segment.start_time || ''}–${segment.end_time || ''}: ` +
+                    `${labels[segment.category] || segment.category || 'OB'}, ${formatNumber(segment.hours)} ч, ` +
+                    `+${formatNumber(segment.premium_percent, 0)}%, ×${formatNumber(segment.multiplier)}, ` +
+                    `${formatNumber(segment.amount)} kr`;
                 container.appendChild(line);
             });
             const total = document.createElement('b');
-            total.textContent = `Всего: ${result.total_hours.toFixed(2)} ч; OB сумма: ${result.total_amount.toFixed(2)} kr`;
+            total.textContent = `Всего: ${formatNumber(result.total_hours)} ч; OB сумма: ${formatNumber(result.total_amount)} kr`;
             container.appendChild(total);
             const note = document.createElement('small');
             note.style.display = 'block';
@@ -488,17 +486,19 @@
             const date = document.getElementById(edit ? 'edit-date' : 'date').value;
             const start = document.getElementById(`${prefix}ob-start-time`).value;
             const end = document.getElementById(`${prefix}ob-end-time`).value;
-            const baseRate = document.getElementById(`${prefix}ob-base-rate`).value;
             const preview = document.getElementById(edit ? 'edit-ob-preview' : 'ob-preview');
-            if (!date || !start || !end || baseRate === '') {
-                preview.textContent = 'Укажите дату, время начала/окончания и базовую ставку.';
+            if (!date || !start || !end) {
+                preview.textContent = 'Укажите дату, время начала и окончания.';
                 return null;
             }
             try {
                 const response = await fetch('/calculate-ob', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ date, start_time: start, end_time: end, ob_base_rate: Number(baseRate) })
+                    body: JSON.stringify({
+                        date, start_time: start, end_time: end,
+                        employee: edit ? activeEditShift.employee : document.getElementById('employee').value
+                    })
                 });
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.error || 'Не удалось рассчитать OB-интервал.');
@@ -575,7 +575,6 @@
             document.getElementById('edit-hours').value = shift.hours;
             document.getElementById('edit-ob-start-time').value = shift.start_time || '';
             document.getElementById('edit-ob-end-time').value = shift.end_time || '';
-            document.getElementById('edit-ob-base-rate').value = shift.ob_base_rate ?? '';
             document.getElementById('edit-comment').value = shift.comment || '';
             filterEditObjects(shift.object_name);
             document.getElementById('edit-transport-check').checked = editOriginalTransport > 0;
@@ -585,10 +584,10 @@
 
         document.getElementById('edit-type').addEventListener('change', updateEditTypeForm);
         document.getElementById('edit-company').addEventListener('change', () => filterEditObjects());
-        for (const id of ['edit-date', 'edit-ob-start-time', 'edit-ob-end-time', 'edit-ob-base-rate']) {
+        for (const id of ['edit-date', 'edit-ob-start-time', 'edit-ob-end-time']) {
             document.getElementById(id).addEventListener('change', () => refreshObPreview(true));
         }
-        for (const id of ['date', 'ob-start-time', 'ob-end-time', 'ob-base-rate']) {
+        for (const id of ['date', 'employee', 'ob-start-time', 'ob-end-time']) {
             document.getElementById(id).addEventListener('change', () => refreshObPreview(false));
         }
         document.getElementById('edit-cancel').addEventListener('click', () => {
@@ -617,7 +616,6 @@
                 payload.hours = preview.total_hours;
                 payload.start_time = document.getElementById('edit-ob-start-time').value;
                 payload.end_time = document.getElementById('edit-ob-end-time').value;
-                payload.ob_base_rate = Number(document.getElementById('edit-ob-base-rate').value);
             }
             if (submissionType === 'work') {
                 payload.transport = document.getElementById('edit-transport-check').checked ? 1 : 0;
@@ -892,15 +890,15 @@
                 employee: empName,
                 company: document.getElementById('company').value,
                 object_name: document.getElementById('object_name').value,
-                hours: hoursVal,
-                transport: parseFloat(document.getElementById('transport').value || 0),
                 comment: document.getElementById('comment').value,
                 submission_type: submissionType
             };
             if (obPreview) {
                 formData.start_time = document.getElementById('ob-start-time').value;
                 formData.end_time = document.getElementById('ob-end-time').value;
-                formData.ob_base_rate = Number(document.getElementById('ob-base-rate').value);
+            } else {
+                formData.hours = hoursVal;
+                formData.transport = parseFloat(document.getElementById('transport').value || 0);
             }
 
             try {
@@ -1025,16 +1023,15 @@
                         if (submissionType === 'ob') {
                             const obInfo = document.createElement('small');
                             obInfo.style.display = 'block';
-                            obInfo.textContent = `${shift.start_time}–${shift.end_time}; базовая ставка ${Number(shift.ob_base_rate).toFixed(2)} kr/ч`;
+                            obInfo.textContent = `${shift.start_time || ''}–${shift.end_time || ''}`;
                             spanInfo.appendChild(document.createElement('br'));
                             spanInfo.appendChild(obInfo);
                             for (const segment of (shift.ob_segments || [])) {
                                 const segmentLine = document.createElement('small');
                                 segmentLine.style.display = 'block';
-                                segmentLine.textContent = `${segment.segment_date} ${segment.start_time}–${segment.end_time}: ` +
-                                    `${segment.hours.toFixed(2)} ч, +${segment.premium_percent}%, ` +
-                                    `${segment.base_rate.toFixed(2)} × ${segment.multiplier}, ` +
-                                    `${segment.calculated_rate.toFixed(2)} kr/ч, ${segment.amount.toFixed(2)} kr`;
+                                segmentLine.textContent = `${segment.segment_date || ''} ${segment.start_time || ''}–${segment.end_time || ''}: ` +
+                                    `${Number(segment.hours || 0).toFixed(2)} ч, +${Number(segment.premium_percent || 0)}%, ` +
+                                    `×${Number(segment.multiplier || 0).toFixed(2)}, ${Number(segment.amount || 0).toFixed(2)} kr`;
                                 spanInfo.appendChild(segmentLine);
                             }
                         }
