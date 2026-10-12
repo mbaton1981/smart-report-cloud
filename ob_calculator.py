@@ -95,11 +95,13 @@ def _validated_periods(day, config):
             multiplier = Decimal(str(period["multiplier"]))
         except (KeyError, InvalidOperation, TypeError, ValueError) as error:
             raise ValueError("Некорректный OB-тариф в конфигурации") from error
-        if start >= end or premium < 0 or multiplier < 1 or not premium.is_finite() or not multiplier.is_finite():
+        paid = bool(period.get("paid", True))
+        if start >= end or premium < 0 or multiplier < 0 or not premium.is_finite() or not multiplier.is_finite():
             raise ValueError("Некорректные границы или тариф OB в конфигурации")
-        if multiplier != Decimal("1") + premium / Decimal("100"):
+        expected_multiplier = Decimal("1") + premium / Decimal("100") if paid else Decimal("0")
+        if multiplier != expected_multiplier or (not paid and premium != 0):
             raise ValueError("Коэффициент должен соответствовать проценту надбавки")
-        validated.append((start, end, period, premium, multiplier))
+        validated.append((start, end, period, premium, multiplier, paid))
     validated.sort(key=lambda item: item[0])
     if validated[0][0] != 0 or validated[-1][1] != 24 * 60:
         raise ValueError("OB-конфигурация должна покрывать все сутки")
@@ -138,7 +140,7 @@ def calculate_work_interval(work_date, start_time, end_time, base_rate, rules=No
     while day <= end_day:
         day_start = start_minute if day == start_day else 0
         day_end = end_minute if day == end_day else 24 * 60
-        for period_start, period_end, period, premium, multiplier in _validated_periods(day, config):
+        for period_start, period_end, period, premium, multiplier, paid in _validated_periods(day, config):
             segment_start_minute = max(day_start, period_start)
             segment_end_minute = min(day_end, period_end)
             if segment_start_minute >= segment_end_minute:
@@ -160,6 +162,7 @@ def calculate_work_interval(work_date, start_time, end_time, base_rate, rules=No
                 "category": str(period["category"]),
                 "premium_percent": float(premium),
                 "multiplier": float(multiplier),
+                "paid": paid,
                 "base_rate": float(rate),
                 "calculated_rate": float(calculated_rate),
                 "amount": float(amount),

@@ -948,7 +948,7 @@ class SmartReportApp(QMainWindow):
             self.ob_preview_lbl.setText(f"Ошибка интервала: {error}")
             return
         category_labels = {
-            "weekday_early_morning_unconfirmed": "Раннее утро (правило требует подтверждения)",
+            "weekday_early_morning_unpaid_pending_confirmation": "00:00–07:00 без оплаты до подтверждения договора",
             "weekday_day": "Дневное время",
             "weekday_early_evening": "Ранний вечер",
             "weekday_late_evening_night": "Поздний вечер/ночь",
@@ -959,7 +959,7 @@ class SmartReportApp(QMainWindow):
             f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']}: "
             f"{category_labels.get(segment['category'], segment['category'])}, "
             f"{segment['hours']:.2f} ч, +{segment['premium_percent']:.0f}%, "
-            f"{segment['base_rate']:.2f} × {segment['multiplier']:.2f} = "
+                f"{segment['base_rate']:.2f} × {segment['multiplier']:.2f} = "
             f"{segment['calculated_rate']:.2f} kr/ч; сумма {segment['amount']:.2f} kr"
             for segment in result["segments"]
         ]

@@ -30,6 +30,15 @@ class ObCalculatorTests(unittest.TestCase):
         self.assertEqual(result["total_amount"], 680.0)
         self.assertEqual(result["segments"][0]["multiplier"], 1.7)
 
+    def test_weekday_midnight_to_seven_is_unpaid_pending_agreement(self):
+        result = self.calculate("2026-10-12", "02:00", "06:00")
+        segment = result["segments"][0]
+        self.assertEqual(segment["category"], "weekday_early_morning_unpaid_pending_confirmation")
+        self.assertFalse(segment["paid"])
+        self.assertEqual(segment["multiplier"], 0.0)
+        self.assertEqual(segment["calculated_rate"], 0.0)
+        self.assertEqual(segment["amount"], 0.0)
+
     def test_saturday_and_sunday_use_double_rate(self):
         saturday = self.calculate("2026-10-10", "09:00", "13:00")
         sunday = self.calculate("2026-10-11", "09:00", "13:00")
