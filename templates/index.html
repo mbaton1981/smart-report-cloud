@@ -1195,17 +1195,34 @@
                             date: shift.date,
                             description: objDisplay,
                             type: typeLabel,
-                            hours: shift.hours
+                            hours: shift.hours,
+                            obIntervals: submissionType === 'ob'
+                                ? (shift.ob_segments || []).map(segment => ({
+                                    startTime: segment.start_time || '',
+                                    endTime: segment.end_time || '',
+                                    hours: Number(segment.hours || 0)
+                                }))
+                                : []
                         });
                     }
 
                     let printTableHtml = '';
                     printRowsData.forEach(row => {
+                        const escapePrintText = value => {
+                            const element = document.createElement('span');
+                            element.textContent = String(value ?? '');
+                            return element.innerHTML;
+                        };
+                        const obIntervalsHtml = row.obIntervals.length
+                            ? `<div class="print-ob-intervals"><b>OB-интервалы:</b><br>${row.obIntervals.map(segment =>
+                                `${escapePrintText(segment.startTime)}–${escapePrintText(segment.endTime)} (${segment.hours.toFixed(2)} ч)`
+                            ).join('<br>')}</div>`
+                            : '';
                         printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
-                            <td style="padding: 8px;">${row.date}</td>
-                            <td style="padding: 8px;">${row.description}</td>
-                            <td style="padding: 8px;">${row.type}</td>
-                            <td style="padding: 8px; text-align: right; font-weight: bold;">${row.hours} ч</td>
+                            <td style="padding: 8px;">${escapePrintText(row.date)}</td>
+                            <td style="padding: 8px;">${escapePrintText(row.description)}${obIntervalsHtml}</td>
+                            <td style="padding: 8px;">${escapePrintText(row.type)}</td>
+                            <td style="padding: 8px; text-align: right; font-weight: bold;">${escapePrintText(row.hours)} ч</td>
                         </tr>`;
                     });
 

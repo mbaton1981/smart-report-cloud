@@ -144,6 +144,9 @@ class ObApiTests(unittest.TestCase):
         self.assertIn('id="ob-start-minute"', page_text)
         self.assertIn('id="edit-ob-start-hour"', page_text)
         self.assertIn('id="edit-ob-start-minute"', page_text)
+        self.assertIn("obIntervals: submissionType === 'ob'", page_text)
+        self.assertIn("row.obIntervals.map", page_text)
+        self.assertIn("OB-интервалы:", page_text)
         self.assertNotIn('type="time"', page_text)
         self.assertNotIn("ob-base-rate", page_text)
 
