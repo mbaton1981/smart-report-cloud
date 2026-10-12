@@ -8,15 +8,16 @@ import logging
 import csv
 import io
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, jsonify, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
+from ob_calculator import calculate_work_interval
 
 # Настройка системного логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick"}
+SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick", "ob"}
 SPECIAL_SUBMISSION_OBJECTS = {
     "atf": ("Arbetstidsförkortning", "p1000"),
     "sick": ("Sjuk", "p1001"),
@@ -31,6 +32,55 @@ def resolve_submission_type(data, default="work"):
     if submission_type not in SUPPORTED_SUBMISSION_TYPES:
         raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick.")
     return submission_type
+
+
+def ob_schema_ready(cursor):
+    cursor.execute("PRAGMA table_info(incoming_submissions)")
+    columns = {row[1] for row in cursor.fetchall()}
+    required = {"start_time", "end_time", "ob_base_rate"}
+    cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ob_segments'")
+    return required.issubset(columns) and cursor.fetchone() is not None
+
+
+def calculate_ob_payload(work_date, start_time, end_time, base_rate):
+    result = calculate_work_interval(work_date, start_time, end_time, base_rate)
+    return {
+        "start_time": str(start_time),
+        "end_time": str(end_time),
+        "ob_base_rate": float(base_rate),
+        "hours": result["total_hours"],
+        "rate": 0.0,
+        "transport": 0.0,
+        "segments": result["segments"],
+        "total_amount": result["total_amount"],
+        "rules_version": result["rules_version"],
+    }
+
+
+def replace_ob_segments(cursor, shift_id, segments):
+    cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (shift_id,))
+    now = datetime.now(timezone.utc).isoformat()
+    cursor.executemany('''
+        INSERT INTO ob_segments (
+            shift_id, segment_date, start_time, end_time, hours, category,
+            premium_percent, multiplier, base_rate, calculated_rate, amount,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [(
+        shift_id, segment["segment_date"], segment["start_time"], segment["end_time"],
+        segment["hours"], segment["category"], segment["premium_percent"],
+        segment["multiplier"], segment["base_rate"], segment["calculated_rate"],
+        segment["amount"], now, now,
+    ) for segment in segments])
+
+
+def get_ob_segments(cursor, shift_id):
+    cursor.execute("""
+        SELECT segment_date, start_time, end_time, hours, category, premium_percent,
+               multiplier, base_rate, calculated_rate, amount
+        FROM ob_segments WHERE shift_id = ? ORDER BY segment_date, start_time, id
+    """, (shift_id,))
+    return [dict(row) for row in cursor.fetchall()]
 
 
 def validate_submission_object(cursor, submission_type, company, object_name):
@@ -643,6 +693,7 @@ def submit_shift():
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    ob_result = None
 
     if session.get('role') == 'admin':
         employee = str(data.get('employee', '')).strip()
@@ -668,28 +719,43 @@ def submit_shift():
         conn.close()
         return jsonify({"ok": False, "error": "Некорректная дата (ожидается формат YYYY-MM-DD)"}), 400
 
-    try:
-        hours = float(data.get('hours'))
-        if not (0.5 <= hours <= 24) or (hours % 0.5 != 0) or str(hours).lower() in ['nan', 'inf', '-inf']:
-            raise ValueError()
-    except (TypeError, ValueError):
-        conn.close()
-        return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
+    if submission_type == "ob":
+        if not ob_schema_ready(cursor):
+            conn.close()
+            return jsonify({"ok": False, "error": "OB-схема не подготовлена. Выполните migrate_ob.py с backup."}), 503
+        try:
+            ob_result = calculate_ob_payload(
+                date_str, data.get("start_time"), data.get("end_time"), data.get("ob_base_rate")
+            )
+            hours = ob_result["hours"]
+            rate = 0.0
+            transport = 0.0
+        except (TypeError, ValueError) as error:
+            conn.close()
+            return jsonify({"ok": False, "error": str(error)}), 400
+    else:
+        try:
+            hours = float(data.get('hours'))
+            if not (0.5 <= hours <= 24) or (hours % 0.5 != 0) or str(hours).lower() in ['nan', 'inf', '-inf']:
+                raise ValueError()
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify({"ok": False, "error": "Некорректное значение часов (от 0.5 до 24, шаг 0.5)"}), 400
 
-    try:
-        rate = round(float(data.get('rate', 0.0)), 2)
-        transport = round(float(data.get('transport', 0.0)), 2)
-        if rate < 0 or transport < 0 or rate > 100000 or transport > 10000:
-            raise ValueError()
-        if str(rate).lower() in ['nan', 'inf', '-inf'] or str(transport).lower() in ['nan', 'inf', '-inf']:
-            raise ValueError()
-    except (TypeError, ValueError):
-        conn.close()
-        return jsonify({"ok": False, "error": "Некорректные числовые значения ставки или транспорта"}), 400
+        try:
+            rate = round(float(data.get('rate', 0.0)), 2)
+            transport = round(float(data.get('transport', 0.0)), 2)
+            if rate < 0 or transport < 0 or rate > 100000 or transport > 10000:
+                raise ValueError()
+            if str(rate).lower() in ['nan', 'inf', '-inf'] or str(transport).lower() in ['nan', 'inf', '-inf']:
+                raise ValueError()
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify({"ok": False, "error": "Некорректные числовые значения ставки или транспорта"}), 400
 
-    if submission_type != "work":
-        rate = 0.0
-        transport = 0.0
+        if submission_type != "work":
+            rate = 0.0
+            transport = 0.0
 
     try:
         cursor.execute("SELECT id FROM meta_employees WHERE name = ? AND is_active = 1", (employee,))
@@ -717,6 +783,11 @@ def submit_shift():
             "hours": hours, "rate": rate, "transport": transport, "comment": comment,
             "submission_type": submission_type
         }
+        if ob_result:
+            payload.update({
+                "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
+                "ob_base_rate": ob_result["ob_base_rate"],
+            })
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
         cursor.execute("SELECT id, payload_hash, submission_type FROM incoming_submissions WHERE request_id = ?", (request_id,))
         existing = cursor.fetchone()
@@ -733,27 +804,50 @@ def submit_shift():
             return jsonify({"ok": False, "error": "request_id уже использован для другой смены"}), 409
 
         sixty_secs_ago = (datetime.utcnow() - timedelta(seconds=60)).strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute('''
-            SELECT id FROM incoming_submissions
-            WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ?
-              AND submission_type = ? AND created_at >= ? AND is_deleted = 0
-          ''', (employee, date_str, company, final_obj_name, hours, submission_type, sixty_secs_ago))
+        if ob_result:
+            cursor.execute('''
+                SELECT id FROM incoming_submissions
+                WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ?
+                  AND submission_type = ? AND start_time = ? AND end_time = ? AND created_at >= ? AND is_deleted = 0
+            ''', (employee, date_str, company, final_obj_name, hours, submission_type,
+                  ob_result["start_time"], ob_result["end_time"], sixty_secs_ago))
+        else:
+            cursor.execute('''
+                SELECT id FROM incoming_submissions
+                WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ?
+                  AND submission_type = ? AND created_at >= ? AND is_deleted = 0
+            ''', (employee, date_str, company, final_obj_name, hours, submission_type, sixty_secs_ago))
         if cursor.fetchone():
             conn.rollback()
             return jsonify({"ok": False, "error": "Похожая смена уже была зарегистрирована только что. Подождите немного."}), 409
 
         change_seq = next_change_sequence(cursor)
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute('''
-            INSERT INTO incoming_submissions (
-                request_id, sync_id, submission_type, date, employee, company, object_name,
-                hours, rate, transport, comment, version, change_seq, is_deleted,
-                desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, 0, 'web', NULL, ?, ?, ?)
-        ''', (
-            request_id, request_id, submission_type, date_str, employee, company, final_obj_name,
-            hours, rate, transport, comment, change_seq, payload_hash, now, now
-        ))
+        if ob_result:
+            cursor.execute('''
+                INSERT INTO incoming_submissions (
+                    request_id, sync_id, submission_type, date, employee, company, object_name,
+                    hours, rate, transport, comment, version, change_seq, is_deleted,
+                    desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at,
+                    start_time, end_time, ob_base_rate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, 0, 'web', NULL, ?, ?, ?, ?, ?, ?)
+            ''', (
+                request_id, request_id, submission_type, date_str, employee, company, final_obj_name,
+                hours, rate, transport, comment, change_seq, payload_hash, now, now,
+                ob_result["start_time"], ob_result["end_time"], ob_result["ob_base_rate"],
+            ))
+            replace_ob_segments(cursor, request_id, ob_result["segments"])
+        else:
+            cursor.execute('''
+                INSERT INTO incoming_submissions (
+                    request_id, sync_id, submission_type, date, employee, company, object_name,
+                    hours, rate, transport, comment, version, change_seq, is_deleted,
+                    desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, 0, 'web', NULL, ?, ?, ?)
+            ''', (
+                request_id, request_id, submission_type, date_str, employee, company, final_obj_name,
+                hours, rate, transport, comment, change_seq, payload_hash, now, now
+            ))
         
         conn.commit()
     except ValueError as e:
@@ -766,7 +860,26 @@ def submit_shift():
     finally:
         conn.close()
 
-    return jsonify({"ok": True, "message": "Смена успешно сохранена!", "request_id": request_id}), 201
+    response = {"ok": True, "message": "Смена успешно сохранена!", "request_id": request_id}
+    if ob_result:
+        response.update({"hours": ob_result["hours"], "segments": ob_result["segments"], "total_amount": ob_result["total_amount"]})
+    return jsonify(response), 201
+
+
+@app.route('/calculate-ob', methods=['POST'])
+def calculate_ob_preview():
+    if 'user_id' not in session:
+        return jsonify({"ok": False, "error": "Требуется авторизация"}), 401
+    data = request.json
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Неверный формат данных"}), 400
+    try:
+        result = calculate_ob_payload(
+            data.get("date"), data.get("start_time"), data.get("end_time"), data.get("ob_base_rate")
+        )
+    except (TypeError, ValueError) as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    return jsonify({"ok": True, **result})
 
 @app.route('/edit-shift', methods=['POST'])
 def edit_shift():
@@ -782,6 +895,7 @@ def edit_shift():
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    ob_result = None
     try:
         cursor.execute("BEGIN IMMEDIATE")
         cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ?", (sync_id,))
@@ -807,12 +921,25 @@ def edit_shift():
         company = str(data.get('company', existing['company'])).strip()
         object_name = str(data.get('object_name', existing['object_name'])).strip()
         validate_submission_object(cursor, submission_type, company, object_name)
-        hours = float(data.get('hours', existing['hours']))
-        transport = round(float(data.get('transport', existing['transport'])), 2)
-        if not (0.5 <= hours <= 24) or hours % 0.5 != 0 or not (0 <= transport <= 10000):
-            raise ValueError("Часы или транспорт вне допустимого диапазона.")
-        if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, transport)):
-            raise ValueError("Числовое поле должно быть конечным.")
+        if submission_type == "ob":
+            if not ob_schema_ready(cursor):
+                conn.rollback()
+                return jsonify({"ok": False, "error": "OB-схема не подготовлена. Выполните migrate_ob.py с backup."}), 503
+            ob_result = calculate_ob_payload(
+                date_val,
+                data.get("start_time", existing["start_time"]),
+                data.get("end_time", existing["end_time"]),
+                data.get("ob_base_rate", existing["ob_base_rate"]),
+            )
+            hours = ob_result["hours"]
+            transport = 0.0
+        else:
+            hours = float(data.get('hours', existing['hours']))
+            transport = round(float(data.get('transport', existing['transport'])), 2)
+            if not (0.5 <= hours <= 24) or hours % 0.5 != 0 or not (0 <= transport <= 10000):
+                raise ValueError("Часы или транспорт вне допустимого диапазона.")
+            if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, transport)):
+                raise ValueError("Числовое поле должно быть конечным.")
         comment = str(data.get('comment', existing['comment'] or ''))[:2000]
         invoiced = int(existing['invoiced']) if submission_type == 'work' else 0
         normalized = {
@@ -821,6 +948,11 @@ def edit_shift():
             "transport": transport, "comment": comment, "invoiced": invoiced,
             "submission_type": submission_type
         }
+        if ob_result:
+            normalized.update({
+                "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
+                "ob_base_rate": ob_result["ob_base_rate"],
+            })
         operation_hash = hashlib.sha256(json.dumps(
             {"operation": "upsert", "shift": normalized}, sort_keys=True
         ).encode('utf-8')).hexdigest()
@@ -836,20 +968,46 @@ def edit_shift():
 
         change_seq = next_change_sequence(cursor)
         new_version = existing['version'] + 1
-        cursor.execute('''
-            UPDATE incoming_submissions SET
-                date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
-                transport = ?, comment = ?, invoiced = ?, submission_type = ?,
-                version = ?, change_seq = ?, desktop_acked = 0,
-                last_operation_id = ?, payload_hash = ?, updated_at = ?
-            WHERE id = ? AND is_deleted = 0
-        ''', (
-            date_val, employee, company, object_name, hours, transport, comment,
-            invoiced, submission_type, new_version, change_seq, operation_id,
-            operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
-        ))
+        if ob_schema_ready(cursor):
+            cursor.execute('''
+                UPDATE incoming_submissions SET
+                    date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
+                    transport = ?, comment = ?, invoiced = ?, submission_type = ?,
+                    start_time = ?, end_time = ?, ob_base_rate = ?,
+                    version = ?, change_seq = ?, desktop_acked = 0,
+                    last_operation_id = ?, payload_hash = ?, updated_at = ?
+                WHERE id = ? AND is_deleted = 0
+            ''', (
+                date_val, employee, company, object_name, hours, transport, comment,
+                invoiced, submission_type,
+                ob_result["start_time"] if ob_result else None,
+                ob_result["end_time"] if ob_result else None,
+                ob_result["ob_base_rate"] if ob_result else None,
+                new_version, change_seq, operation_id,
+                operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
+            ))
+        else:
+            cursor.execute('''
+                UPDATE incoming_submissions SET
+                    date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
+                    transport = ?, comment = ?, invoiced = ?, submission_type = ?,
+                    version = ?, change_seq = ?, desktop_acked = 0,
+                    last_operation_id = ?, payload_hash = ?, updated_at = ?
+                WHERE id = ? AND is_deleted = 0
+            ''', (
+                date_val, employee, company, object_name, hours, transport, comment,
+                invoiced, submission_type, new_version, change_seq, operation_id,
+                operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
+            ))
+        if ob_result:
+            replace_ob_segments(cursor, sync_id, ob_result["segments"])
+        elif ob_schema_ready(cursor) and existing['submission_type'] == "ob":
+            cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
         conn.commit()
-        return jsonify({"ok": True, "sync_id": sync_id, "version": new_version, "change_seq": change_seq}), 200
+        response = {"ok": True, "sync_id": sync_id, "version": new_version, "change_seq": change_seq}
+        if ob_result:
+            response.update({"hours": ob_result["hours"], "segments": ob_result["segments"], "total_amount": ob_result["total_amount"]})
+        return jsonify(response), 200
     except PermissionError as e:
         conn.rollback()
         return jsonify({"ok": False, "error": str(e)}), 403
@@ -922,6 +1080,8 @@ def delete_shift():
             submission_type, new_version, change_seq, operation_id, operation_hash,
             datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
         ))
+        if existing['submission_type'] == "ob" and ob_schema_ready(cursor):
+            cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
         if existing['legacy_cloud_id'] is not None:
             cursor.execute("UPDATE cloud_shifts SET synced = 1 WHERE id = ?", (existing['legacy_cloud_id'],))
         conn.commit()
@@ -1092,6 +1252,21 @@ def check_employee_shifts():
             "change_seq": r['change_seq'],
             "submission_type": r['submission_type'] or "work"
         })
+        if r['submission_type'] == "ob" and ob_schema_ready(cursor):
+            cursor.execute(
+                "SELECT start_time, end_time, ob_base_rate FROM incoming_submissions WHERE sync_id = ?",
+                (r['sync_id'],),
+            )
+            ob_record = cursor.fetchone()
+            if ob_record:
+                segments = get_ob_segments(cursor, r['sync_id'])
+                shifts[-1].update({
+                    "start_time": ob_record["start_time"],
+                    "end_time": ob_record["end_time"],
+                    "ob_base_rate": ob_record["ob_base_rate"],
+                    "ob_segments": segments,
+                    "ob_total_amount": round(sum(segment["amount"] for segment in segments), 2),
+                })
         
     conn.close()
     return jsonify({"ok": True, "recent_shifts": shifts})
@@ -1127,7 +1302,7 @@ def check_missing_shifts():
     
     cursor.execute("""
         SELECT date FROM incoming_submissions
-        WHERE employee = ? AND date >= ? AND date <= ? AND is_deleted = 0 AND submission_type = 'work'
+        WHERE employee = ? AND date >= ? AND date <= ? AND is_deleted = 0 AND submission_type IN ('work', 'ob')
     """, (emp, start_check.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')))
     
     existing_dates = {row['date'] for row in cursor.fetchall()}
@@ -1182,24 +1357,44 @@ def export_shifts_csv():
         else:
             end_date = datetime(year, month + 1, 1).strftime('%Y-%m-%d')
         
-        cursor.execute("""
-            SELECT date, company, object_name, hours, rate, transport, comment, submission_type
-            FROM incoming_submissions
-            WHERE employee = ? AND date >= ? AND date < ? AND is_deleted = 0
-            ORDER BY date ASC
-        """, (empName, start_date, end_date))
+        ob_export_enabled = ob_schema_ready(cursor)
+        if ob_export_enabled:
+            cursor.execute("""
+                SELECT date, company, object_name, hours, rate, transport, comment, submission_type,
+                       sync_id, start_time, end_time, ob_base_rate
+                FROM incoming_submissions
+                WHERE employee = ? AND date >= ? AND date < ? AND is_deleted = 0
+                ORDER BY date ASC
+            """, (empName, start_date, end_date))
+        else:
+            cursor.execute("""
+                SELECT date, company, object_name, hours, rate, transport, comment, submission_type
+                FROM incoming_submissions
+                WHERE employee = ? AND date >= ? AND date < ? AND is_deleted = 0
+                ORDER BY date ASC
+            """, (empName, start_date, end_date))
         rows = cursor.fetchall()
     except Exception as e:
         conn.close()
         return jsonify({"ok": False, "error": str(e)}), 400
     
-    conn.close()
-
     output = io.StringIO()
     writer = csv.writer(output, delimiter=';')
-    writer.writerow(['Дата', 'Сотрудник', 'Фирма', 'Объект', 'Тип записи', 'Часы', 'Ставка', 'Транспорт', 'Комментарий'])
+    writer.writerow([
+        'Дата', 'Сотрудник', 'Фирма', 'Объект', 'Тип записи', 'Часы', 'Ставка',
+        'Транспорт', 'Комментарий', 'Время начала', 'Время окончания', 'Базовая ставка OB',
+        'OB сегменты', 'OB сумма'
+    ])
     
     for r in rows:
+        ob_values = ["", "", "", "", ""]
+        if ob_export_enabled and (r['submission_type'] or 'work') == 'ob':
+            ob_segments = get_ob_segments(cursor, r['sync_id'])
+            ob_values = [
+                r['start_time'] or '', r['end_time'] or '', r['ob_base_rate'] or 0,
+                json.dumps(ob_segments, ensure_ascii=False),
+                round(sum(segment['amount'] for segment in ob_segments), 2),
+            ]
         writer.writerow([
             r['date'], 
             empName, 
@@ -1210,8 +1405,9 @@ def export_shifts_csv():
             r['rate'], 
             r['transport'], 
             r['comment'] or ''
-        ])
+        ] + ob_values)
 
+    conn.close()
     csv_data = output.getvalue().encode('utf-8-sig')
     response = make_response(csv_data)
     response.headers["Content-Disposition"] = f"attachment; filename=report_{empName}_{selected_month}.csv"
@@ -1298,7 +1494,7 @@ def sync_desktop_data():
     return jsonify({"ok": True, "status": "metadata_synced", "shift_sync": "versioned_api_required"})
 
 def serialize_submission(row):
-    return {
+    payload = {
         "id": f"submission:{row['id']}",
         "request_id": row['request_id'],
         "sync_id": row['sync_id'],
@@ -1317,6 +1513,13 @@ def serialize_submission(row):
         "submission_type": row['submission_type'] or "work",
         "invoiced": row['invoiced']
     }
+    if "start_time" in row.keys() and (row["submission_type"] or "work") == "ob":
+        payload.update({
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "ob_base_rate": row["ob_base_rate"],
+        })
+    return payload
 
 @app.route('/sync/pull', methods=['GET'])
 def sync_pull():
@@ -1347,9 +1550,16 @@ def sync_pull():
 def sync_capabilities():
     if not verify_sync_key():
         return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    supports_ob = ob_schema_ready(cursor)
+    conn.close()
+    submission_types = set(SUPPORTED_SUBMISSION_TYPES)
+    if not supports_ob:
+        submission_types.discard("ob")
     return jsonify({
         "ok": True,
-        "submission_types": sorted(SUPPORTED_SUBMISSION_TYPES),
+        "submission_types": sorted(submission_types),
         "typed_tombstones": True
     })
 
@@ -1390,6 +1600,7 @@ def sync_push():
                 raise ValueError("Некорректные данные смены.")
             cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ? OR request_id = ?", (sync_id, sync_id))
             existing = cursor.fetchone()
+            ob_result = None
 
             if operation == 'upsert':
                 date_val = str(payload.get('date', '')).strip()
@@ -1416,7 +1627,16 @@ def sync_push():
                     submission_type = infer_submission_type_from_object(cursor, company, object_name)
                 validate_submission_object(cursor, submission_type, company, object_name)
                 invoiced = int(bool(payload.get('invoiced', 0))) if submission_type == 'work' else 0
-                if submission_type != 'work':
+                if submission_type == "ob":
+                    if not ob_schema_ready(cursor):
+                        raise ValueError("OB-схема не подготовлена; выполните миграцию с backup")
+                    ob_result = calculate_ob_payload(
+                        date_val, payload.get("start_time"), payload.get("end_time"), payload.get("ob_base_rate")
+                    )
+                    hours = ob_result["hours"]
+                    rate = 0.0
+                    transport = 0.0
+                elif submission_type != 'work':
                     rate = float(existing['rate']) if existing else 0.0
                     transport = float(existing['transport']) if existing else 0.0
                 normalized = {
@@ -1425,6 +1645,12 @@ def sync_push():
                     "transport": transport, "comment": comment, "invoiced": invoiced,
                     "submission_type": submission_type
                 }
+                if ob_result:
+                    normalized.update({
+                        "start_time": ob_result["start_time"],
+                        "end_time": ob_result["end_time"],
+                        "ob_base_rate": ob_result["ob_base_rate"],
+                    })
             else:
                 has_type = 'submission_type' in payload or 'record_type' in payload
                 if has_type:
@@ -1480,39 +1706,81 @@ def sync_push():
             change_seq = next_change_sequence(cursor)
             version = existing['version'] + 1 if existing else 1
             if existing:
-                cursor.execute('''
-                    UPDATE incoming_submissions SET
-                        date = COALESCE(?, date), employee = COALESCE(?, employee),
-                        company = COALESCE(?, company), object_name = COALESCE(?, object_name),
-                        hours = COALESCE(?, hours), rate = COALESCE(?, rate),
-                        transport = COALESCE(?, transport), comment = COALESCE(?, comment),
-                        invoiced = COALESCE(?, invoiced),
-                        submission_type = COALESCE(?, submission_type),
-                        version = ?, change_seq = ?, is_deleted = ?, desktop_acked = 1,
-                        last_operation_id = ?, payload_hash = ?, updated_at = ?
-                    WHERE id = ?
-                ''', (
-                    normalized.get('date'), normalized.get('employee'), normalized.get('company'),
-                    normalized.get('object_name'), normalized.get('hours'), normalized.get('rate'),
-                    normalized.get('transport'), normalized.get('comment'), normalized.get('invoiced'),
-                    normalized.get('submission_type'), version, change_seq,
-                    int(operation == 'delete'), operation_id, operation_hash, now, existing['id']
-                ))
+                if ob_schema_ready(cursor):
+                    cursor.execute('''
+                        UPDATE incoming_submissions SET
+                            date = COALESCE(?, date), employee = COALESCE(?, employee),
+                            company = COALESCE(?, company), object_name = COALESCE(?, object_name),
+                            hours = COALESCE(?, hours), rate = COALESCE(?, rate),
+                            transport = COALESCE(?, transport), comment = COALESCE(?, comment),
+                            invoiced = COALESCE(?, invoiced),
+                            submission_type = COALESCE(?, submission_type),
+                            start_time = ?, end_time = ?, ob_base_rate = ?,
+                            version = ?, change_seq = ?, is_deleted = ?, desktop_acked = 1,
+                            last_operation_id = ?, payload_hash = ?, updated_at = ?
+                        WHERE id = ?
+                    ''', (
+                        normalized.get('date'), normalized.get('employee'), normalized.get('company'),
+                        normalized.get('object_name'), normalized.get('hours'), normalized.get('rate'),
+                        normalized.get('transport'), normalized.get('comment'), normalized.get('invoiced'),
+                        normalized.get('submission_type'), normalized.get('start_time'), normalized.get('end_time'),
+                        normalized.get('ob_base_rate'), version, change_seq,
+                        int(operation == 'delete'), operation_id, operation_hash, now, existing['id']
+                    ))
+                else:
+                    cursor.execute('''
+                        UPDATE incoming_submissions SET
+                            date = COALESCE(?, date), employee = COALESCE(?, employee),
+                            company = COALESCE(?, company), object_name = COALESCE(?, object_name),
+                            hours = COALESCE(?, hours), rate = COALESCE(?, rate),
+                            transport = COALESCE(?, transport), comment = COALESCE(?, comment),
+                            invoiced = COALESCE(?, invoiced),
+                            submission_type = COALESCE(?, submission_type),
+                            version = ?, change_seq = ?, is_deleted = ?, desktop_acked = 1,
+                            last_operation_id = ?, payload_hash = ?, updated_at = ?
+                        WHERE id = ?
+                    ''', (
+                        normalized.get('date'), normalized.get('employee'), normalized.get('company'),
+                        normalized.get('object_name'), normalized.get('hours'), normalized.get('rate'),
+                        normalized.get('transport'), normalized.get('comment'), normalized.get('invoiced'),
+                        normalized.get('submission_type'), version, change_seq,
+                        int(operation == 'delete'), operation_id, operation_hash, now, existing['id']
+                    ))
             else:
                 if operation == 'delete':
                     results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
                     continue
-                cursor.execute('''
-                    INSERT INTO incoming_submissions (
-                        request_id, sync_id, submission_type, date, employee, company, object_name,
-                        hours, rate, transport, comment, invoiced, version, change_seq, is_deleted,
-                        desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?)
-                ''', (
-                    sync_id, sync_id, normalized['submission_type'], normalized['date'], normalized['employee'], normalized['company'],
-                    normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
-                    normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now
-                ))
+                if ob_schema_ready(cursor):
+                    cursor.execute('''
+                        INSERT INTO incoming_submissions (
+                            request_id, sync_id, submission_type, date, employee, company, object_name,
+                            hours, rate, transport, comment, invoiced, version, change_seq, is_deleted,
+                            desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at,
+                            start_time, end_time, ob_base_rate
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        sync_id, sync_id, normalized['submission_type'], normalized['date'], normalized['employee'], normalized['company'],
+                        normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
+                        normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now,
+                        normalized.get('start_time'), normalized.get('end_time'), normalized.get('ob_base_rate'),
+                    ))
+                else:
+                    cursor.execute('''
+                        INSERT INTO incoming_submissions (
+                            request_id, sync_id, submission_type, date, employee, company, object_name,
+                            hours, rate, transport, comment, invoiced, version, change_seq, is_deleted,
+                            desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?)
+                    ''', (
+                        sync_id, sync_id, normalized['submission_type'], normalized['date'], normalized['employee'], normalized['company'],
+                        normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
+                        normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now
+                    ))
+            if ob_schema_ready(cursor):
+                if operation == "delete" and existing and existing["submission_type"] == "ob":
+                    cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
+                elif ob_result:
+                    replace_ob_segments(cursor, sync_id, ob_result["segments"])
             results.append({"operation_id": operation_id, "ok": True, "version": version, "change_seq": change_seq})
 
         conn.commit()

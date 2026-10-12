@@ -4,3 +4,4 @@ requests
 reportlab
 python-multipart
 deep-translator
+tzdata>=2025.2

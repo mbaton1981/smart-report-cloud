@@ -1,0 +1,19 @@
+{
+  "version": "initial-ob-2026-10",
+  "timezone": "Europe/Stockholm",
+  "ambiguous_time_policy": "earlier",
+  "notes": "Initial configurable values supplied for implementation; confirm against the applicable kollektivavtal before treating them as contractual. Weekday 00:00-07:00 is explicitly unpaid pending confirmation.",
+  "weekdays": [
+    {"start": "00:00", "end": "07:00", "category": "weekday_early_morning_unpaid_pending_confirmation", "premium_percent": 0, "multiplier": 0.0, "paid": false},
+    {"start": "07:00", "end": "18:00", "category": "weekday_day", "premium_percent": 0, "multiplier": 1.0},
+    {"start": "18:00", "end": "20:00", "category": "weekday_early_evening", "premium_percent": 50, "multiplier": 1.5},
+    {"start": "20:00", "end": "24:00", "category": "weekday_late_evening_night", "premium_percent": 70, "multiplier": 1.7}
+  ],
+  "saturday": [
+    {"start": "00:00", "end": "24:00", "category": "saturday", "premium_percent": 100, "multiplier": 2.0}
+  ],
+  "sunday": [
+    {"start": "00:00", "end": "24:00", "category": "sunday", "premium_percent": 100, "multiplier": 2.0}
+  ],
+  "holidays": {}
+}
