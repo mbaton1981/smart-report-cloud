@@ -1585,17 +1585,23 @@ def sync_desktop_data():
                     emp_name = " ".join(str(emp).split()) if emp else ""
                     if not emp_name or len(emp_name) > 150:
                         raise ValueError("Недопустимое имя сотрудника")
-                    emp_rate = 0.0
+                    emp_rate = None
                     emp_active = 1
 
                 matching_profiles = find_employee_profiles(cursor, emp_name)
                 if matching_profiles:
                     profile_ids = [profile['id'] for profile in matching_profiles]
                     placeholders = ', '.join('?' for _ in profile_ids)
-                    cursor.execute(
-                        f"UPDATE meta_employees SET salary_rate = ?, is_active = ? WHERE id IN ({placeholders})",
-                        (emp_rate, emp_active, *profile_ids),
-                    )
+                    if emp_rate is None:
+                        cursor.execute(
+                            f"UPDATE meta_employees SET is_active = ? WHERE id IN ({placeholders})",
+                            (emp_active, *profile_ids),
+                        )
+                    else:
+                        cursor.execute(
+                            f"UPDATE meta_employees SET salary_rate = ?, is_active = ? WHERE id IN ({placeholders})",
+                            (emp_rate, emp_active, *profile_ids),
+                        )
                 else:
                     cursor.execute('''
                         INSERT INTO meta_employees (name, salary_rate, is_active)
@@ -1603,7 +1609,7 @@ def sync_desktop_data():
                         ON CONFLICT(name) DO UPDATE SET
                             salary_rate = excluded.salary_rate,
                             is_active = excluded.is_active
-                    ''', (emp_name, emp_rate, emp_active))
+                    ''', (emp_name, emp_rate if emp_rate is not None else 0.0, emp_active))
                 stored_profiles = find_employee_profiles(cursor, emp_name)
                 employee_sync_results.append({
                     "employee_name": emp_name,

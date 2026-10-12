@@ -201,6 +201,23 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(preview.status_code, 200, preview.json)
         self.assertTrue(preview.json["base_rate_configured"])
 
+    def test_legacy_name_only_sync_preserves_existing_salary_rate(self):
+        conn = self.database()
+        conn.execute("UPDATE meta_employees SET salary_rate = 220 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        response = self.client.post("/sync-desktop-data", headers={
+            "X-Sync-Key": "unit-test-sync-key",
+        }, json={
+            "employees": ["  ALIAKSEI PATONICH  "],
+            "companies": [],
+            "objects": [],
+            "shifts": [],
+        })
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json["employee_sync"][0]["profiles"][0]["salary_rate"], 220.0)
+
     def test_new_desktop_employee_rate_flows_to_ob_preview(self):
         response = self.client.post("/sync-desktop-data", headers={
             "X-Sync-Key": "unit-test-sync-key",
