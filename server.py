@@ -58,11 +58,23 @@ def find_employee_profiles(cursor, name, active_only=False):
     ]
 
 
+def select_employee_profile(profiles, preferred_id=None, preferred_name=None):
+    if not profiles:
+        return None
+    preferred = next((row for row in profiles if row["id"] == preferred_id), None)
+    if preferred and float(preferred["salary_rate"] or 0.0) > 0:
+        return preferred
+    configured = [row for row in profiles if float(row["salary_rate"] or 0.0) > 0]
+    candidates = configured or profiles
+    exact = next((row for row in candidates if row["name"] == preferred_name), None)
+    return exact or max(candidates, key=lambda row: row["id"])
+
+
 def get_employee_ob_base_rate(cursor, employee):
     profiles = find_employee_profiles(cursor, employee, active_only=True)
-    if not profiles:
+    profile = select_employee_profile(profiles, preferred_name=employee)
+    if not profile:
         raise ValueError("Для OB не найден активный профиль сотрудника")
-    profile = next((row for row in profiles if row["name"] == employee), profiles[0])
     return float(profile["salary_rate"] or 0.0)
 
 
@@ -175,24 +187,33 @@ def resolve_session_employee(cursor, requested_employee=None):
         if not employee:
             raise ValueError("Не указан сотрудник.")
         profiles = find_employee_profiles(cursor, employee, active_only=True)
-        if not profiles:
+        profile = select_employee_profile(profiles, preferred_name=employee)
+        if not profile:
             raise ValueError("Указанный сотрудник не найден или неактивен.")
-        employee = next((row['name'] for row in profiles if row['name'] == employee), profiles[0]['name'])
+        employee = profile['name']
     else:
-        employee_id = session.get('employee_id')
-        if not employee_id:
-            raise PermissionError("Доступ запрещен.")
-        cursor.execute("SELECT name FROM meta_employees WHERE id = ? AND is_active = 1", (employee_id,))
-        row = cursor.fetchone()
-        if not row:
+        employee_name = session.get('username')
+        profiles = find_employee_profiles(cursor, employee_name, active_only=True) if employee_name else []
+        profile = select_employee_profile(
+            profiles,
+            preferred_id=session.get('employee_id'),
+            preferred_name=employee_name,
+        )
+        if not profile:
+            employee_id = session.get('employee_id')
+            if not employee_id:
+                raise PermissionError("Доступ запрещен.")
+            cursor.execute(
+                "SELECT id, name, salary_rate, is_active FROM meta_employees WHERE id = ? AND is_active = 1",
+                (employee_id,),
+            )
+            profile = cursor.fetchone()
+        if not profile:
             raise PermissionError("Сотрудник не найден или деактивирован.")
-        employee = row['name']
+        employee = profile['name']
+        session['employee_id'] = profile['id']
         if requested_employee and normalize_employee_name(requested_employee) != normalize_employee_name(employee):
             raise PermissionError("Нельзя изменять записи другого сотрудника.")
-        if not find_employee_profiles(cursor, employee, active_only=True):
-            raise ValueError("Указанный сотрудник не найден или неактивен.")
-    if not find_employee_profiles(cursor, employee, active_only=True):
-        raise ValueError("Указанный сотрудник не найден или неактивен.")
     return employee
 
 app = Flask(__name__)
@@ -600,6 +621,14 @@ def logout():
 def get_current_user():
     if 'user_id' not in session:
         return jsonify({"ok": False, "error": "Не авторизован"}), 401
+    if session.get('role') != 'admin':
+        conn = get_db_connection()
+        try:
+            resolve_session_employee(conn.cursor())
+        except (PermissionError, ValueError) as error:
+            return jsonify({"ok": False, "error": str(error)}), 403
+        finally:
+            conn.close()
     return jsonify({
         "ok": True,
         "user": {

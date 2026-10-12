@@ -198,6 +198,37 @@ class ObApiTests(unittest.TestCase):
         self.assertEqual(preview.status_code, 200, preview.json)
         self.assertTrue(preview.json["base_rate_configured"])
 
+    def test_ob_preview_repairs_stale_session_employee_id_by_username(self):
+        conn = self.database()
+        conn.execute("UPDATE meta_employees SET salary_rate = 0 WHERE id = 1")
+        conn.execute(
+            "INSERT INTO meta_employees (id, name, salary_rate, is_active) VALUES (?, ?, ?, 1)",
+            (2, "ALIAKSEI   PATONICH", 245.80),
+        )
+        conn.commit()
+        conn.close()
+
+        with self.client.session_transaction() as session:
+            session["username"] = "Aliaksei Patonich"
+            session["employee_id"] = 1
+
+        current_user = self.client.get("/me")
+        self.assertEqual(current_user.status_code, 200, current_user.json)
+        self.assertEqual(current_user.json["user"]["employee_id"], 2)
+
+        preview = self.client.post("/calculate-ob", json={
+            "date": "2026-10-12",
+            "start_time": "17:00",
+            "end_time": "21:00",
+            "employee": "Aliaksei Patonich",
+        })
+        self.assertEqual(preview.status_code, 200, preview.json)
+        self.assertTrue(preview.json["base_rate_configured"])
+        self.assertGreater(preview.json["total_amount"], 0)
+
+        with self.client.session_transaction() as session:
+            self.assertEqual(session["employee_id"], 2)
+
     def test_server_rejects_invalid_ob_and_does_not_trust_client_amount(self):
         invalid = dict(self.payload, request_id="invalid-ob", start_time="10:00", end_time="10:00")
         response = self.client.post("/submit-shift", json=invalid)
