@@ -14,6 +14,11 @@ OB_COLUMNS = {
 }
 
 
+def backup_filename(database_path, backup_date=None):
+    backup_date = backup_date or datetime.now(timezone.utc).date()
+    return f"{Path(database_path).stem}_before_ob_{backup_date.isoformat()}.db"
+
+
 def backup_database(database_path, backup_path):
     source_path = Path(database_path).resolve()
     destination_path = Path(backup_path).resolve()
@@ -117,7 +122,7 @@ def main():
     parser.add_argument("--backup-dir", required=True, help="Каталог для обязательной резервной копии")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    backup_name = f"{Path(args.database).stem}.pre-ob.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.db"
+    backup_name = backup_filename(args.database)
     result = migrate_database(args.database, Path(args.backup_dir) / backup_name)
     print(f"OB schema migration complete. Backup: {result['backup_path']}")
 

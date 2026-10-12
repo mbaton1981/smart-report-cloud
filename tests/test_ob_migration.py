@@ -1,12 +1,19 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
-from migrate_ob import MIGRATION_ID, migrate_database
+from migrate_ob import MIGRATION_ID, backup_filename, migrate_database
 
 
 class ObMigrationTests(unittest.TestCase):
+    def test_production_backup_name_matches_requested_path(self):
+        self.assertEqual(
+            backup_filename("/data/cloud_database.db", date(2026, 10, 12)),
+            "cloud_database_before_ob_2026-10-12.db",
+        )
+
     def test_migration_is_idempotent_backed_up_and_preserves_legacy_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

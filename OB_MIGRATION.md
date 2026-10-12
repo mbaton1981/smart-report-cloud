@@ -10,7 +10,7 @@ From the desktop project directory, first close Smart Report and run:
 python migrate_ob.py --database smart_report.db --backup-dir backups/ob-migration
 ```
 
-If `SMARTREPORT_DB_FILE` points elsewhere, pass that exact file as `--database`. The script writes a timestamped SQLite-consistent backup before opening a schema transaction. It is safe to rerun; it does not rewrite old shift rows.
+If `SMARTREPORT_DB_FILE` points elsewhere, pass that exact file as `--database`. The script writes a SQLite-consistent backup named `<database-stem>_before_ob_<UTC-date>.db` before opening a schema transaction. For `/data/cloud_database.db` on 2026-10-12 this is the requested `cloud_database_before_ob_2026-10-12.db`. It is safe to rerun on a later date; it does not rewrite old shift rows. If that day's backup already exists, the command stops rather than overwriting it.
 
 ## Server SQLite
 
