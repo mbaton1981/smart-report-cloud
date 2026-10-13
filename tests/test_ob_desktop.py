@@ -21,6 +21,7 @@ _QAPP = QApplication.instance() or QApplication([])
 class ObDesktopHarness(QWidget):
     setup_hours_tab = desktop.SmartReportApp.setup_hours_tab
     setup_salary_tab = desktop.SmartReportApp.setup_salary_tab
+    resize_salary_table_columns = desktop.SmartReportApp.resize_salary_table_columns
     update_ob_form_visibility = desktop.SmartReportApp.update_ob_form_visibility
     refresh_ob_preview = desktop.SmartReportApp.refresh_ob_preview
     save_shift = desktop.SmartReportApp.save_shift
@@ -355,6 +356,19 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(window.sal_employer_fee_percent.value(), 31.42)
         self.assertEqual(window.sal_atf_percent.value(), 0.0)
         self.assertEqual(window.sal_sick_percent.value(), 0.0)
+
+        window.tab_salary.resize(1800, 900)
+        window.tab_salary.show()
+        _QAPP.processEvents()
+        window.resize_salary_table_columns()
+        self.assertEqual(window.table_salary.columnWidth(5), 200)
+        self.assertGreater(window.table_salary.columnWidth(0), 140)
+        self.assertGreater(window.table_salary.columnWidth(13), 110)
+        self.assertAlmostEqual(
+            sum(window.table_salary.columnWidth(column) for column in range(14)),
+            window.table_salary.viewport().width(),
+            delta=2,
+        )
 
     def test_payroll_components_apply_configured_atf_and_sick_percentages(self):
         result = desktop.calculate_payroll_components(

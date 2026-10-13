@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal, QEvent
 from PyQt6.QtGui import QIcon, QColor
 
 # Импорты для генерации PDF
@@ -1684,7 +1684,40 @@ class SmartReportApp(QMainWindow):
         self.table_salary.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_salary.setAlternatingRowColors(True)
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
+        self.table_salary.installEventFilter(self)
         layout.addWidget(self.table_salary)
+        QTimer.singleShot(0, self.resize_salary_table_columns)
+
+    def eventFilter(self, watched, event):
+        if getattr(self, "table_salary", None) is watched and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self.resize_salary_table_columns)
+        return False
+
+    def resize_salary_table_columns(self):
+        if not hasattr(self, "table_salary"):
+            return
+        minimum_widths = {
+            0: 140, 1: 75, 2: 75, 3: 75, 4: 85, 5: 200,
+            6: 110, 7: 120, 8: 90, 9: 90, 10: 95, 11: 100,
+            12: 120, 13: 110,
+        }
+        available_width = self.table_salary.viewport().width()
+        extra_width = max(0, available_width - sum(minimum_widths.values()))
+        widths = dict(minimum_widths)
+        if extra_width:
+            name_extra = extra_width // 3
+            widths[0] += name_extra
+            finance_extra = extra_width - name_extra
+            finance_columns = (6, 7, 8, 9, 10, 11, 12, 13)
+            finance_weight = sum(minimum_widths[column] for column in finance_columns)
+            distributed = 0
+            for column in finance_columns[:-1]:
+                addition = finance_extra * minimum_widths[column] // finance_weight
+                widths[column] += addition
+                distributed += addition
+            widths[finance_columns[-1]] += finance_extra - distributed
+        for column, width in widths.items():
+            self.table_salary.setColumnWidth(column, width)
 
     def load_salary_table_template(self):
         try:
