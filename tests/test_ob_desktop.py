@@ -12,6 +12,7 @@ from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtWidgets import QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QWidget
 
 import app as desktop
+from expense_documents import apply_expense_documents_migration
 from migrate_ob import migrate_database
 
 
@@ -27,12 +28,22 @@ class ObDesktopHarness(QWidget):
     save_shift = desktop.SmartReportApp.save_shift
     load_salary_table_template = desktop.SmartReportApp.load_salary_table_template
     export_salary_to_pdf = desktop.SmartReportApp.export_salary_to_pdf
+    _format_currency_totals = desktop.SmartReportApp._format_currency_totals
+    load_expense_document_filters = desktop.SmartReportApp.load_expense_document_filters
+    load_expense_documents = desktop.SmartReportApp.load_expense_documents
+    upload_expense_document = desktop.SmartReportApp.upload_expense_document
+    open_manual_document_dialog = desktop.SmartReportApp.open_manual_document_dialog
+    review_selected_document = desktop.SmartReportApp.review_selected_document
+    open_selected_document_original = desktop.SmartReportApp.open_selected_document_original
+    record_selected_document_payment = desktop.SmartReportApp.record_selected_document_payment
     setup_expenses_tab = desktop.SmartReportApp.setup_expenses_tab
     apply_expense_period_preset = desktop.SmartReportApp.apply_expense_period_preset
     on_expense_date_changed = desktop.SmartReportApp.on_expense_date_changed
     open_add_expense_dialog = desktop.SmartReportApp.open_add_expense_dialog
     apply_expense_journal_filters = desktop.SmartReportApp.apply_expense_journal_filters
     show_expense_details = desktop.SmartReportApp.show_expense_details
+    edit_company_expense = desktop.SmartReportApp.edit_company_expense
+    update_company_expense = desktop.SmartReportApp.update_company_expense
     auto_calculate_taxes_and_fora = desktop.SmartReportApp.auto_calculate_taxes_and_fora
     add_company_expense = desktop.SmartReportApp.add_company_expense
     load_expenses_table = desktop.SmartReportApp.load_expenses_table
@@ -99,6 +110,7 @@ class ObDesktopTests(unittest.TestCase):
         conn.commit()
         conn.close()
         migrate_database(self.database_path, Path(self.temp_dir.name) / "desktop_ob.pre-migration.db")
+        apply_expense_documents_migration(self.database_path, Path(self.temp_dir.name) / "backups")
 
         self.window = ObDesktopHarness()
         self.window.date_input = desktop.create_date_field("2026-10-12")
@@ -423,11 +435,11 @@ class ObDesktopTests(unittest.TestCase):
 
         self.assertEqual(window.table_expenses.rowCount(), 3)
         self.assertEqual(window.exp_summary_expenses_lbl.text(), "100.00 SEK")
-        self.assertEqual(window.exp_summary_employer_lbl.text(), "20.00 SEK")
-        self.assertEqual(window.exp_summary_fora_lbl.text(), "10.00 SEK")
-        self.assertEqual(window.exp_summary_total_lbl.text(), "130.00 SEK")
+        self.assertEqual(window.exp_summary_employer_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_fora_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_review_lbl.text(), "2 шт.")
         self.assertIn("Выбранный период: 2026-10-01 — 2026-10-31", window.exp_period_label.text())
-        self.assertIn("Требует проверки", window.exp_warning_lbl.text())
+        self.assertIn("Требуют проверки", window.exp_warning_lbl.text())
         legacy_fora_row = next(
             row for row in range(window.table_expenses.rowCount())
             if "FORA" in window.table_expenses.item(row, 2).text()
@@ -442,7 +454,9 @@ class ObDesktopTests(unittest.TestCase):
         window.exp_date_to.setText("2026-11-30")
         window.load_expenses_table()
         self.assertEqual(window.table_expenses.rowCount(), 1)
-        self.assertEqual(window.exp_summary_total_lbl.text(), "999.00 SEK")
+        self.assertEqual(window.exp_summary_expenses_lbl.text(), "999.00 SEK")
+        self.assertEqual(window.exp_summary_fora_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_employer_lbl.text(), "0.00 SEK")
 
         window.add_company_expense("2026-11-05", "Инструменты", "Manual test expense", 12.5)
         self.assertEqual(window.table_expenses.rowCount(), 2)
@@ -470,7 +484,7 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(window.exp_summary_expenses_lbl.text(), "0.00 SEK")
         self.assertEqual(window.exp_summary_employer_lbl.text(), "0.00 SEK")
         self.assertEqual(window.exp_summary_fora_lbl.text(), "0.00 SEK")
-        self.assertEqual(window.exp_summary_total_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_review_lbl.text(), "0 шт.")
 
     def test_expense_calculation_preview_is_read_only_and_repeat_is_idempotent(self):
         conn = self.database()
@@ -556,11 +570,11 @@ class ObDesktopTests(unittest.TestCase):
         conn.close()
         preview = FakeMessageBox.instances[-1].message
         self.assertIn("Период: 2026-10-01 — 2026-10-31", preview)
-        self.assertIn("База текущего preview: обычные рабочие часы", preview)
-        self.assertIn("OB в расчётную базу не входит", preview)
+        self.assertIn("текущие ставки профиля", preview)
+        self.assertIn("OB исключён", preview)
         self.assertIn("5.20%", preview)
         self.assertIn("31.42%", preview)
-        self.assertIn("Итого начислений: 292.96 SEK", preview)
+        self.assertIn("Оценка начислений (не оплата): 292.96 SEK", preview)
         self.assertIn("800.00 SEK", preview)
 
         with patch.object(desktop, "QMessageBox", FakeMessageBox):
