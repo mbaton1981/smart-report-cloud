@@ -27,6 +27,16 @@ class ObDesktopHarness(QWidget):
     save_shift = desktop.SmartReportApp.save_shift
     load_salary_table_template = desktop.SmartReportApp.load_salary_table_template
     export_salary_to_pdf = desktop.SmartReportApp.export_salary_to_pdf
+    setup_expenses_tab = desktop.SmartReportApp.setup_expenses_tab
+    apply_expense_period_preset = desktop.SmartReportApp.apply_expense_period_preset
+    on_expense_date_changed = desktop.SmartReportApp.on_expense_date_changed
+    open_add_expense_dialog = desktop.SmartReportApp.open_add_expense_dialog
+    apply_expense_journal_filters = desktop.SmartReportApp.apply_expense_journal_filters
+    show_expense_details = desktop.SmartReportApp.show_expense_details
+    auto_calculate_taxes_and_fora = desktop.SmartReportApp.auto_calculate_taxes_and_fora
+    add_company_expense = desktop.SmartReportApp.add_company_expense
+    load_expenses_table = desktop.SmartReportApp.load_expenses_table
+    delete_company_expense = desktop.SmartReportApp.delete_company_expense
     edit_shift = desktop.SmartReportApp.edit_shift
     delete_shift = desktop.SmartReportApp.delete_shift
     sync_with_cloud = desktop.SmartReportApp.sync_with_cloud
@@ -77,6 +87,10 @@ class ObDesktopTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT UNIQUE NOT NULL,
                 sync_id TEXT NOT NULL, operation TEXT NOT NULL, base_version INTEGER NOT NULL,
                 payload_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+            );
+            CREATE TABLE company_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL,
+                category TEXT NOT NULL, description TEXT, amount REAL NOT NULL
             );
             INSERT INTO employees VALUES (1, 'Alice', 100, 1);
             INSERT INTO companies VALUES (1, 'Privat');
@@ -382,6 +396,227 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(result["vacation_pay"], 110.5)
         self.assertEqual(result["tax"], 372.15)
         self.assertEqual(result["net_pay"], 868.35)
+
+    def test_expense_period_cards_filters_manual_add_delete_and_empty_period(self):
+        conn = self.database()
+        conn.executemany('''
+            INSERT INTO company_expenses (date, category, description, amount)
+            VALUES (?, ?, ?, ?)
+        ''', [
+            ("2026-10-05", "Инструменты", "Диски", 100.0),
+            ("2026-10-31", "FORA и страхование рабочих (Kollektivavtal)",
+             "Авторасчет FORA за период 2026-10-01 - 2026-10-31", 10.0),
+            ("2026-10-31", "Налоги компании (Arbetsgivareavgift 31.42%)",
+             "Авторасчет социального налога за период 2026-10-01 - 2026-10-31; Основа: historical", 20.0),
+            ("2026-11-01", "Инструменты", "Вне периода", 999.0),
+        ])
+        conn.commit()
+        conn.close()
+
+        window = ObDesktopHarness()
+        window.tab_expenses = QWidget()
+        window.setup_expenses_tab()
+        window.background_sync_with_cloud = Mock()
+        window.exp_date_from.setText("2026-10-01")
+        window.exp_date_to.setText("2026-10-31")
+        window.load_expenses_table()
+
+        self.assertEqual(window.table_expenses.rowCount(), 3)
+        self.assertEqual(window.exp_summary_expenses_lbl.text(), "100.00 SEK")
+        self.assertEqual(window.exp_summary_employer_lbl.text(), "20.00 SEK")
+        self.assertEqual(window.exp_summary_fora_lbl.text(), "10.00 SEK")
+        self.assertEqual(window.exp_summary_total_lbl.text(), "130.00 SEK")
+        self.assertIn("Выбранный период: 2026-10-01 — 2026-10-31", window.exp_period_label.text())
+        self.assertIn("Требует проверки", window.exp_warning_lbl.text())
+        legacy_fora_row = next(
+            row for row in range(window.table_expenses.rowCount())
+            if "FORA" in window.table_expenses.item(row, 2).text()
+        )
+        self.assertIn("Требует проверки", window.table_expenses.item(legacy_fora_row, 5).text())
+
+        window.exp_filter_category.setCurrentText("Инструменты")
+        self.assertEqual(sum(not window.table_expenses.isRowHidden(row) for row in range(3)), 1)
+        window.exp_filter_category.setCurrentIndex(0)
+
+        window.exp_date_from.setText("2026-11-01")
+        window.exp_date_to.setText("2026-11-30")
+        window.load_expenses_table()
+        self.assertEqual(window.table_expenses.rowCount(), 1)
+        self.assertEqual(window.exp_summary_total_lbl.text(), "999.00 SEK")
+
+        window.add_company_expense("2026-11-05", "Инструменты", "Manual test expense", 12.5)
+        self.assertEqual(window.table_expenses.rowCount(), 2)
+        manual_row = next(
+            row for row in range(2)
+            if window.table_expenses.item(row, 3).text() == "Manual test expense"
+        )
+        window.table_expenses.selectRow(manual_row)
+        delete_confirmation = Mock(return_value=desktop.QMessageBox.StandardButton.Yes)
+        with patch.object(desktop.QMessageBox, "question", delete_confirmation):
+            window.delete_company_expense()
+        confirmation_text = delete_confirmation.call_args.args[2]
+        self.assertIn("2026-11-05", confirmation_text)
+        self.assertIn("Инструменты", confirmation_text)
+        self.assertIn("12.50 SEK", confirmation_text)
+        self.assertEqual(window.table_expenses.rowCount(), 1)
+        conn = self.database()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM company_expenses WHERE description = 'Manual test expense'").fetchone()[0], 0)
+        conn.close()
+
+        window.exp_date_from.setText("2026-12-01")
+        window.exp_date_to.setText("2026-11-01")
+        window.load_expenses_table()
+        self.assertEqual(window.table_expenses.rowCount(), 0)
+        self.assertEqual(window.exp_summary_expenses_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_employer_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_fora_lbl.text(), "0.00 SEK")
+        self.assertEqual(window.exp_summary_total_lbl.text(), "0.00 SEK")
+
+    def test_expense_calculation_preview_is_read_only_and_repeat_is_idempotent(self):
+        conn = self.database()
+        conn.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, '', 0, ?, 1, 'work', ?, 0)
+        ''', ("2026-10-12", "Alice", "Privat", "Bygg och renovering", 8, 100, "expense-work", 100))
+        ob_result = desktop.calculate_work_interval("2026-10-12", "18:00", "21:00", 100)
+        conn.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache,
+                start_time, end_time, ob_base_rate
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, '', 0, ?, 1, 'ob', 0, 0, ?, ?, ?)
+        ''', ("2026-10-12", "Alice", "Privat", "Bygg och renovering", ob_result["total_hours"], "expense-ob", "18:00", "21:00", 100))
+        desktop.replace_ob_segments(conn.cursor(), "expense-ob", ob_result["segments"])
+        conn.commit()
+        conn.close()
+
+        window = ObDesktopHarness()
+        window.tab_expenses = QWidget()
+        window.setup_expenses_tab()
+        window.exp_date_from.setText("2026-10-01")
+        window.exp_date_to.setText("2026-10-31")
+        window.background_sync_with_cloud = Mock()
+
+        class FakeButton:
+            def __init__(self, text):
+                self.text = text
+
+        class FakeMessageBox:
+            class Icon:
+                Information = 1
+
+            class ButtonRole:
+                AcceptRole = 1
+                RejectRole = 0
+
+            instances = []
+            information_messages = []
+            accept_preview = False
+
+            def __init__(self, *_args):
+                self.buttons = []
+                self.message = ""
+                self.__class__.instances.append(self)
+
+            def setWindowTitle(self, _title):
+                pass
+
+            def setIcon(self, _icon):
+                pass
+
+            def setText(self, text):
+                self.message = text
+
+            def addButton(self, text, _role):
+                button = FakeButton(text)
+                self.buttons.append(button)
+                return button
+
+            def exec(self):
+                return 1
+
+            def clickedButton(self):
+                return self.buttons[0] if self.accept_preview else None
+
+            @staticmethod
+            def warning(*_args):
+                pass
+
+            @staticmethod
+            def information(*args):
+                FakeMessageBox.information_messages.append(args)
+
+        with patch.object(desktop, "QMessageBox", FakeMessageBox):
+            FakeMessageBox.accept_preview = False
+            window.auto_calculate_taxes_and_fora()
+        conn = self.database()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM company_expenses").fetchone()[0], 0)
+        conn.close()
+        preview = FakeMessageBox.instances[-1].message
+        self.assertIn("Период: 2026-10-01 — 2026-10-31", preview)
+        self.assertIn("База текущего preview: обычные рабочие часы", preview)
+        self.assertIn("OB в расчётную базу не входит", preview)
+        self.assertIn("5.20%", preview)
+        self.assertIn("31.42%", preview)
+        self.assertIn("Итого начислений: 292.96 SEK", preview)
+        self.assertIn("800.00 SEK", preview)
+
+        with patch.object(desktop, "QMessageBox", FakeMessageBox):
+            FakeMessageBox.accept_preview = True
+            window.auto_calculate_taxes_and_fora()
+        conn = self.database()
+        saved = conn.execute("SELECT category, amount, description FROM company_expenses ORDER BY category").fetchall()
+        self.assertEqual(len(saved), 2)
+        self.assertAlmostEqual(sum(float(row[1]) for row in saved), 292.96)
+        self.assertTrue(all("Основа:" in row[2] and "OB исключён" in row[2] for row in saved))
+        conn.close()
+
+        with patch.object(desktop, "QMessageBox", FakeMessageBox):
+            FakeMessageBox.accept_preview = True
+            window.auto_calculate_taxes_and_fora()
+        conn = self.database()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM company_expenses").fetchone()[0], 2)
+        conn.close()
+        self.assertIn("уже сохранены", FakeMessageBox.information_messages[-1][2])
+
+    def test_expense_legacy_accrual_without_basis_is_not_reconstructed(self):
+        conn = self.database()
+        conn.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, '', 0, ?, 1, 'work', ?, 0)
+        ''', ("2026-10-12", "Alice", "Privat", "Bygg och renovering", 8, 100, "legacy-work", 100))
+        conn.execute('''
+            INSERT INTO company_expenses (date, category, description, amount)
+            VALUES (?, ?, ?, ?)
+        ''', (
+            "2026-10-31", "FORA и страхование рабочих (Kollektivavtal)",
+            "Авторасчет FORA за период 2026-10-01 - 2026-10-31", 41.6,
+        ))
+        conn.commit()
+        conn.close()
+
+        window = ObDesktopHarness()
+        window.tab_expenses = QWidget()
+        window.setup_expenses_tab()
+        window.exp_date_from.setText("2026-10-01")
+        window.exp_date_to.setText("2026-10-31")
+        window.background_sync_with_cloud = Mock()
+        warning = Mock()
+        with patch.object(desktop.QMessageBox, "warning", warning):
+            window.auto_calculate_taxes_and_fora()
+
+        conn = self.database()
+        rows = conn.execute("SELECT category, amount, description FROM company_expenses").fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0][1], 41.6)
+        self.assertNotIn("Основа:", rows[0][2])
+        self.assertIn("Требует проверки", warning.call_args.args[2])
+        self.assertIn("2026-10-01 — 2026-10-31", warning.call_args.args[2])
 
     def test_ob_outbox_requires_server_capability_before_release(self):
         self.window.save_shift()
