@@ -21,8 +21,8 @@ from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QColor
 
 # Импорты для генерации PDF
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, LongTable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
@@ -449,13 +449,20 @@ def collect_invoice_ob_details(cursor, company, object_name, date_from, date_to)
         "saturday": "lördag",
         "sunday": "söndag",
     }
-    cursor.execute("""
+    filters = ["date >= ?", "date <= ?", "entry_type = 'ob'"]
+    params = [date_from, date_to]
+    if company is not None:
+        filters.insert(0, "company = ?")
+        params.insert(0, company)
+    if object_name is not None:
+        filters.insert(1 if company is not None else 0, "object_name = ?")
+        params.insert(1 if company is not None else 0, object_name)
+    cursor.execute(f"""
         SELECT employee, date, sync_id, start_time, end_time, hours
         FROM shifts
-        WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-          AND entry_type = 'ob'
+        WHERE {' AND '.join(filters)}
         ORDER BY employee, date, start_time, id
-    """, (company, object_name, date_from, date_to))
+    """, params)
 
     details_by_employee = {}
     for shift in cursor.fetchall():
@@ -486,6 +493,36 @@ def collect_invoice_ob_details(cursor, company, object_name, date_from, date_to)
             "tooltip": "\n".join(details),
         }
         for employee, details in details_by_employee.items()
+    }
+
+
+def calculate_payroll_components(
+    work_hours, atf_hours, sick_hours, salary_rate, ob_amount,
+    vacation_percent, tax_percent, employer_fee_percent,
+    atf_percent=0.0, sick_percent=0.0,
+):
+    work_pay = float(work_hours or 0.0) * float(salary_rate or 0.0)
+    ob_pay = float(ob_amount or 0.0)
+    base_salary = work_pay + ob_pay
+    atf_pay = float(atf_hours or 0.0) * float(salary_rate or 0.0) * float(atf_percent or 0.0) / 100
+    sick_pay = float(sick_hours or 0.0) * float(salary_rate or 0.0) * float(sick_percent or 0.0) / 100
+    vacation_pay = base_salary * float(vacation_percent or 0.0) / 100
+    taxable_gross = base_salary + atf_pay + sick_pay + vacation_pay
+    tax = taxable_gross * float(tax_percent or 0.0) / 100
+    net_pay = taxable_gross - tax
+    employer_fee = taxable_gross * float(employer_fee_percent or 0.0) / 100
+    return {
+        "work_pay": round(work_pay, 2),
+        "ob_pay": round(ob_pay, 2),
+        "base_salary": round(base_salary, 2),
+        "atf_pay": round(atf_pay, 2),
+        "sick_pay": round(sick_pay, 2),
+        "vacation_pay": round(vacation_pay, 2),
+        "taxable_gross": round(taxable_gross, 2),
+        "tax": round(tax, 2),
+        "net_pay": round(net_pay, 2),
+        "employer_fee": round(employer_fee, 2),
+        "employer_total_cost": round(taxable_gross + employer_fee, 2),
     }
 
 
@@ -1545,48 +1582,113 @@ class SmartReportApp(QMainWindow):
         total_card.setObjectName("card")
         total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 8px; margin-bottom: 5px;")
         t_layout = QHBoxLayout(total_card)
-        t_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        t_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         
         self.sal_summary_hours_lbl = QLabel("<b>Рабочие часы: 0.0</b>")
-        self.sal_summary_hours_lbl.setStyleSheet("font-size: 14px; color: #63b3ed; border: none;")
-        self.sal_summary_atf_lbl = QLabel("<b>АТФ: 0.0 ч</b>")
-        self.sal_summary_sick_lbl = QLabel("<b>Больничный: 0.0 ч</b>")
-        self.sal_summary_ob_lbl = QLabel("<b>OB: 0.0 ч / 0.00 kr отдельно</b>")
-        self.sal_summary_total_lbl = QLabel("<b>Итого к выплате: 0.00 kr</b>")
-        self.sal_summary_total_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #ffffff; border: none;")
-        
+        self.sal_summary_ob_lbl = QLabel("<b>OB: 0 tim / 0.00 SEK</b>")
+        self.sal_summary_net_lbl = QLabel("<b>Nettolön: 0.00 SEK</b>")
+        self.sal_summary_employer_lbl = QLabel("<b>Arbetskostnad: 0.00 SEK</b>")
+
         t_layout.addWidget(self.sal_summary_hours_lbl)
-        t_layout.addWidget(self.sal_summary_atf_lbl)
-        t_layout.addWidget(self.sal_summary_sick_lbl)
         t_layout.addWidget(self.sal_summary_ob_lbl)
-        t_layout.addSpacing(30)
-        t_layout.addWidget(self.sal_summary_total_lbl)
+        t_layout.addWidget(self.sal_summary_net_lbl)
+        t_layout.addWidget(self.sal_summary_employer_lbl)
         layout.addWidget(total_card)
 
         card = QFrame()
         card.setObjectName("card")
-        card_layout = QHBoxLayout(card)
+        card_layout = QVBoxLayout(card)
+        period_layout = QHBoxLayout()
 
-        card_layout.addWidget(QLabel("<b>Период расчета:</b>"))
+        period_layout.addWidget(QLabel("<b>Период:</b>"))
         self.sal_date_from = create_date_field("2026-10-01")
         self.sal_date_to = create_date_field("2026-10-31")
         calc_btn = QPushButton("🔄 Рассчитать зарплату")
         calc_btn.clicked.connect(self.calculate_salary)
 
-        card_layout.addWidget(self.sal_date_from)
-        card_layout.addWidget(QLabel("по"))
-        card_layout.addWidget(self.sal_date_to)
-        card_layout.addWidget(calc_btn)
-        card_layout.addStretch()
+        period_layout.addWidget(self.sal_date_from)
+        period_layout.addWidget(QLabel("по"))
+        period_layout.addWidget(self.sal_date_to)
+        period_layout.addWidget(calc_btn)
+
+        export_salary_pdf_btn = QPushButton("🖨 Экспорт зарплат в PDF")
+        export_salary_pdf_btn.setObjectName("secondaryAction")
+        export_salary_pdf_btn.clicked.connect(self.export_salary_to_pdf)
+        period_layout.addWidget(export_salary_pdf_btn)
+        period_layout.addStretch()
+        card_layout.addLayout(period_layout)
+
+        settings_layout = QHBoxLayout()
+        settings_layout.addWidget(QLabel("Semesterersättning %"))
+        self.sal_vacation_percent = QDoubleSpinBox()
+        self.sal_vacation_percent.setRange(0, 100)
+        self.sal_vacation_percent.setDecimals(2)
+        self.sal_vacation_percent.setValue(13.0)
+        self.sal_vacation_percent.setSuffix(" %")
+        settings_layout.addWidget(self.sal_vacation_percent)
+
+        settings_layout.addWidget(QLabel("Preliminär skatt %"))
+        self.sal_tax_percent = QDoubleSpinBox()
+        self.sal_tax_percent.setRange(0, 100)
+        self.sal_tax_percent.setDecimals(2)
+        self.sal_tax_percent.setValue(30.06)
+        self.sal_tax_percent.setSuffix(" %")
+        settings_layout.addWidget(self.sal_tax_percent)
+
+        settings_layout.addWidget(QLabel("Arbetsgivaravgifter %"))
+        self.sal_employer_fee_percent = QDoubleSpinBox()
+        self.sal_employer_fee_percent.setRange(0, 100)
+        self.sal_employer_fee_percent.setDecimals(2)
+        self.sal_employer_fee_percent.setValue(31.42)
+        self.sal_employer_fee_percent.setSuffix(" %")
+        settings_layout.addWidget(self.sal_employer_fee_percent)
+
+        settings_layout.addWidget(QLabel("ATF/KLS %"))
+        self.sal_atf_percent = QDoubleSpinBox()
+        self.sal_atf_percent.setRange(0, 100)
+        self.sal_atf_percent.setDecimals(2)
+        self.sal_atf_percent.setValue(0.0)
+        self.sal_atf_percent.setSuffix(" %")
+        self.sal_atf_percent.setToolTip("Задайте внутреннюю долю оплаты ATF/KLS; 0% означает, что автоматическая доплата не задана.")
+        settings_layout.addWidget(self.sal_atf_percent)
+
+        settings_layout.addWidget(QLabel("Sjuklön %"))
+        self.sal_sick_percent = QDoubleSpinBox()
+        self.sal_sick_percent.setRange(0, 100)
+        self.sal_sick_percent.setDecimals(2)
+        self.sal_sick_percent.setValue(0.0)
+        self.sal_sick_percent.setSuffix(" %")
+        self.sal_sick_percent.setToolTip("Задайте внутреннюю долю оплаты больничных; 0% означает, что автоматическая доплата не задана.")
+        settings_layout.addWidget(self.sal_sick_percent)
+        settings_layout.addStretch()
+        card_layout.addLayout(settings_layout)
+        for rate_control in (
+            self.sal_vacation_percent, self.sal_tax_percent,
+            self.sal_employer_fee_percent, self.sal_atf_percent,
+            self.sal_sick_percent,
+        ):
+            rate_control.valueChanged.connect(lambda _value: self.calculate_salary())
 
         layout.addWidget(card)
         
         self.table_salary = QTableWidget()
-        self.table_salary.setColumnCount(10)
+        self.table_salary.setColumnCount(14)
         self.table_salary.setHorizontalHeaderLabels([
-            "Сотрудник", "Рабочие часы", "АТФ, ч", "Больничный, ч", "Зарп. ставка", "Отпускные (13%)", "Налог (Skatt ~30%)", "Итого к выплате", "OB часы", "OB сумма отдельно"
+            "Anställd", "Arbete tim", "ATF tim", "Sjukfrånvaro tim", "Timlön (SEK)",
+            "OB timmar / specifikation", "Grundlön + OB (SEK)", "Semesterersättning (SEK)",
+            "ATF/KLS (SEK)", "Sjuklön (SEK)", "Skatt (SEK)", "Nettolön (SEK)",
+            "Arbetsgivaravgifter (SEK)", "Total kostnad (SEK)",
         ])
-        self.table_salary.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        salary_header = self.table_salary.horizontalHeader()
+        salary_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column, width in {
+            0: 120, 1: 75, 2: 55, 3: 85, 4: 78,
+            6: 100, 7: 105, 8: 90, 9: 90, 10: 82, 11: 90, 12: 110, 13: 105,
+        }.items():
+            self.table_salary.setColumnWidth(column, width)
+        salary_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table_salary.setWordWrap(True)
+        self.table_salary.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_salary.setAlternatingRowColors(True)
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
         layout.addWidget(self.table_salary)
@@ -1609,6 +1711,9 @@ class SmartReportApp(QMainWindow):
         orig_names = {str(row[0]).strip().lower(): row[0] for row in emp_rows}
 
         has_ob_schema = ob_schema_ready(cursor)
+        ob_details_by_employee = collect_invoice_ob_details(
+            cursor, None, None, d_from, d_to
+        ) if has_ob_schema else {}
         if has_ob_schema:
             cursor.execute("""
                 SELECT employee,
@@ -1652,6 +1757,7 @@ class SmartReportApp(QMainWindow):
         sum_ob_hours_all = 0.0
         sum_ob_amount_all = 0.0
         sum_net_all = 0.0
+        sum_employer_cost_all = 0.0
 
         for row_idx, key in enumerate(sorted_keys):
             emp_display_name = orig_names.get(key, key.title())
@@ -1663,11 +1769,14 @@ class SmartReportApp(QMainWindow):
             sum_ob_hours_all += ob_hours
             sum_ob_amount_all += ob_amount
 
-            work_sum = hrs * salary_rate
-            vacation_pay = work_sum * 0.13
-            tax = (work_sum + vacation_pay) * 0.3006
-            net_total = (work_sum + vacation_pay) - tax
-            sum_net_all += net_total
+            payroll = calculate_payroll_components(
+                hrs, atf_hours, sick_hours, salary_rate, ob_amount,
+                self.sal_vacation_percent.value(), self.sal_tax_percent.value(),
+                self.sal_employer_fee_percent.value(), self.sal_atf_percent.value(),
+                self.sal_sick_percent.value(),
+            )
+            sum_net_all += payroll["net_pay"]
+            sum_employer_cost_all += payroll["employer_total_cost"]
 
             item_emp = QTableWidgetItem(str(emp_display_name))
             item_emp.setFlags(item_emp.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1688,21 +1797,32 @@ class SmartReportApp(QMainWindow):
             item_rate.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.table_salary.setItem(row_idx, 4, item_rate)
 
-            for col_i, val in enumerate([vacation_pay, tax, net_total], start=5):
+            ob_details = ob_details_by_employee.get(emp_display_name, {})
+            ob_spec = QTableWidgetItem(
+                f"{ob_hours:g} tim" + (f"\n{ob_details['display']}" if ob_details else "")
+            )
+            ob_spec.setData(Qt.ItemDataRole.UserRole, ob_hours)
+            ob_spec.setData(Qt.ItemDataRole.UserRole + 1, ob_amount)
+            if ob_details:
+                ob_spec.setToolTip(ob_details["tooltip"])
+            ob_spec.setFlags(ob_spec.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_salary.setItem(row_idx, 5, ob_spec)
+
+            payroll_values = (
+                payroll["base_salary"], payroll["vacation_pay"], payroll["atf_pay"],
+                payroll["sick_pay"], payroll["tax"], payroll["net_pay"],
+                payroll["employer_fee"], payroll["employer_total_cost"],
+            )
+            for col_i, val in enumerate(payroll_values, start=6):
                 item_res = QTableWidgetItem(f"{val:.2f}")
                 item_res.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 item_res.setFlags(item_res.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table_salary.setItem(row_idx, col_i, item_res)
-            for column, value in ((8, ob_hours), (9, ob_amount)):
-                ob_item = QTableWidgetItem(f"{value:.2f}")
-                ob_item.setFlags(ob_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table_salary.setItem(row_idx, column, ob_item)
 
         self.sal_summary_hours_lbl.setText(f"<b>Рабочие часы: {sum_hrs_all:.1f}</b>")
-        self.sal_summary_atf_lbl.setText(f"<b>АТФ: {sum_atf_all:.1f} ч</b>")
-        self.sal_summary_sick_lbl.setText(f"<b>Больничный: {sum_sick_all:.1f} ч</b>")
-        self.sal_summary_ob_lbl.setText(f"<b>OB отдельно: {sum_ob_hours_all:.2f} ч / {sum_ob_amount_all:,.2f} kr</b>")
-        self.sal_summary_total_lbl.setText(f"<b>Итого к выплате: {sum_net_all:,.2f} kr</b>")
+        self.sal_summary_ob_lbl.setText(f"<b>OB: {sum_ob_hours_all:g} tim / {sum_ob_amount_all:,.2f} SEK</b>")
+        self.sal_summary_net_lbl.setText(f"<b>Nettolön: {sum_net_all:,.2f} SEK</b>")
+        self.sal_summary_employer_lbl.setText(f"<b>Arbetskostnad: {sum_employer_cost_all:,.2f} SEK</b>")
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
 
     def on_salary_cell_changed(self, row, col):
@@ -1728,23 +1848,36 @@ class SmartReportApp(QMainWindow):
 
     def calculate_salary_row(self, row_idx):
         hrs_item = self.table_salary.item(row_idx, 1)
+        atf_item = self.table_salary.item(row_idx, 2)
+        sick_item = self.table_salary.item(row_idx, 3)
         rate_item = self.table_salary.item(row_idx, 4)
-        if not hrs_item or not rate_item:
+        ob_item = self.table_salary.item(row_idx, 5)
+        if not hrs_item or not atf_item or not sick_item or not rate_item or not ob_item:
             return
         hrs = parse_float(hrs_item.text(), 0.0)
+        atf_hours = parse_float(atf_item.text(), 0.0)
+        sick_hours = parse_float(sick_item.text(), 0.0)
         salary_rate = parse_float(rate_item.text(), 0.0)
-
-        work_sum = hrs * salary_rate
-        vacation_pay = work_sum * 0.13
-        tax = (work_sum + vacation_pay) * 0.3006
-        net_total = (work_sum + vacation_pay) - tax
+        ob_hours = float(ob_item.data(Qt.ItemDataRole.UserRole) or 0.0)
+        ob_amount = float(ob_item.data(Qt.ItemDataRole.UserRole + 1) or 0.0)
+        payroll = calculate_payroll_components(
+            hrs, atf_hours, sick_hours, salary_rate, ob_amount,
+            self.sal_vacation_percent.value(), self.sal_tax_percent.value(),
+            self.sal_employer_fee_percent.value(), self.sal_atf_percent.value(),
+            self.sal_sick_percent.value(),
+        )
 
         try:
             self.table_salary.cellChanged.disconnect(self.on_salary_cell_changed)
         except TypeError:
             pass
 
-        for c_idx, val in enumerate([vacation_pay, tax, net_total], start=5):
+        row_values = (
+            payroll["base_salary"], payroll["vacation_pay"], payroll["atf_pay"],
+            payroll["sick_pay"], payroll["tax"], payroll["net_pay"],
+            payroll["employer_fee"], payroll["employer_total_cost"],
+        )
+        for c_idx, val in enumerate(row_values, start=6):
             it = QTableWidgetItem(f"{val:.2f}")
             it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1752,24 +1885,153 @@ class SmartReportApp(QMainWindow):
 
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
         
-        sum_hrs, sum_atf, sum_sick, sum_net = 0.0, 0.0, 0.0, 0.0
+        sum_hrs = sum_atf = sum_sick = sum_ob_hrs = sum_ob_amount = 0.0
+        sum_net = sum_employer_total = 0.0
         for r in range(self.table_salary.rowCount()):
             h_it = self.table_salary.item(r, 1)
             atf_it = self.table_salary.item(r, 2)
             sick_it = self.table_salary.item(r, 3)
-            n_it = self.table_salary.item(r, 7)
+            ob_it = self.table_salary.item(r, 5)
+            n_it = self.table_salary.item(r, 11)
+            employer_it = self.table_salary.item(r, 13)
             if h_it: sum_hrs += parse_float(h_it.text(), 0.0)
             if atf_it: sum_atf += parse_float(atf_it.text(), 0.0)
             if sick_it: sum_sick += parse_float(sick_it.text(), 0.0)
             if n_it: sum_net += parse_float(n_it.text(), 0.0)
+            if employer_it: sum_employer_total += parse_float(employer_it.text(), 0.0)
+            if ob_it:
+                sum_ob_hrs += float(ob_it.data(Qt.ItemDataRole.UserRole) or 0.0)
+                sum_ob_amount += float(ob_it.data(Qt.ItemDataRole.UserRole + 1) or 0.0)
             
         self.sal_summary_hours_lbl.setText(f"<b>Рабочие часы: {sum_hrs:.1f}</b>")
-        self.sal_summary_atf_lbl.setText(f"<b>АТФ: {sum_atf:.1f} ч</b>")
-        self.sal_summary_sick_lbl.setText(f"<b>Больничный: {sum_sick:.1f} ч</b>")
-        self.sal_summary_total_lbl.setText(f"<b>Итого к выплате: {sum_net:,.2f} kr</b>")
+        self.sal_summary_ob_lbl.setText(f"<b>OB: {sum_ob_hrs:g} tim / {sum_ob_amount:,.2f} SEK</b>")
+        self.sal_summary_net_lbl.setText(f"<b>Nettolön: {sum_net:,.2f} SEK</b>")
+        self.sal_summary_employer_lbl.setText(f"<b>Arbetskostnad: {sum_employer_total:,.2f} SEK</b>")
 
     def calculate_salary(self):
         self.load_salary_table_template()
+
+    def export_salary_to_pdf(self):
+        self.load_salary_table_template()
+        d_from = self.sal_date_from.text().strip()
+        d_to = self.sal_date_to.text().strip()
+        if self.table_salary.rowCount() == 0:
+            QMessageBox.warning(self, "Löneunderlag", "Нет сотрудников или данных для выбранного периода.")
+            return
+
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        base_filename = f"Loneunderlag_{d_from}_till_{d_to}.pdf"
+        filepath = os.path.join(REPORTS_DIR, base_filename)
+        try:
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle(
+                "SalaryReportTitle", parent=styles["Heading1"],
+                fontName=DEFAULT_FONT_BOLD, fontSize=16, spaceAfter=6,
+            )
+            meta_style = ParagraphStyle(
+                "SalaryReportMeta", parent=styles["Normal"],
+                fontName=DEFAULT_FONT, fontSize=8, leading=11, spaceAfter=3,
+            )
+            header_style = ParagraphStyle(
+                "SalaryReportHeader", parent=styles["Normal"],
+                fontName=DEFAULT_FONT_BOLD, fontSize=7, leading=8, wordWrap="CJK",
+            )
+            cell_style = ParagraphStyle(
+                "SalaryReportCell", parent=styles["Normal"],
+                fontName=DEFAULT_FONT, fontSize=7, leading=9, wordWrap="CJK",
+            )
+            labels = [
+                "Anställd", "Arbete tim", "ATF tim", "Sjukfrånvaro tim", "Timlön (SEK)",
+                "OB timmar / specifikation", "Grundlön + OB (SEK)",
+                "Semesterersättning (SEK)", "ATF/KLS (SEK)", "Sjuklön (SEK)",
+                "Skatt (SEK)", "Nettolön (SEK)", "Arbetsgivaravgifter (SEK)",
+                "Total kostnad (SEK)",
+            ]
+            table_data = [[Paragraph(escape(label), header_style) for label in labels]]
+            totals = [0.0] * 14
+            for row_idx in range(self.table_salary.rowCount()):
+                row_values = []
+                for column in range(self.table_salary.columnCount()):
+                    item = self.table_salary.item(row_idx, column)
+                    text = item.text() if item else ""
+                    if column in (0, 5):
+                        if column == 0:
+                            row_values.append(Paragraph(escape(text), cell_style))
+                        else:
+                            row_values.append(Paragraph(escape(text).replace("\n", "<br/>"), cell_style))
+                    else:
+                        numeric_value = parse_float(text, 0.0)
+                        row_values.append(f"{numeric_value:.2f}" if column >= 4 else f"{numeric_value:g}")
+                        if column in (1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13):
+                            totals[column] += numeric_value
+                table_data.append(row_values)
+
+            total_ob_hours = sum(
+                float(self.table_salary.item(row, 5).data(Qt.ItemDataRole.UserRole) or 0.0)
+                for row in range(self.table_salary.rowCount())
+                if self.table_salary.item(row, 5)
+            )
+            total_ob_amount = sum(
+                float(self.table_salary.item(row, 5).data(Qt.ItemDataRole.UserRole + 1) or 0.0)
+                for row in range(self.table_salary.rowCount())
+                if self.table_salary.item(row, 5)
+            )
+            totals_row = ["Totalt:"] + [f"{totals[column]:.2f}" for column in range(1, 14)]
+            totals_row[4] = ""
+            totals_row[5] = f"OB totalt: {total_ob_hours:g} tim / {total_ob_amount:,.2f} SEK"
+            table_data.append([
+                Paragraph(escape(str(value)), cell_style) if index in (0, 5) else value
+                for index, value in enumerate(totals_row)
+            ])
+
+            table = LongTable(
+                table_data,
+                colWidths=[75, 32, 24, 35, 40, 218, 50, 46, 40, 40, 40, 44, 54, 54],
+                repeatRows=1,
+            )
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2b6cb0")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+                ("FONTNAME", (0, 0), (-1, -1), DEFAULT_FONT),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("GRID", (0, 0), (-1, -2), 0.35, colors.HexColor("#b8c2cc")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.HexColor("#f7f9fb"), colors.white]),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8edf2")),
+                ("FONTNAME", (0, -1), (-1, -1), DEFAULT_FONT_BOLD),
+                ("LINEABOVE", (0, -1), (-1, -1), 1, colors.HexColor("#2b6cb0")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            document = SimpleDocTemplate(
+                filepath, pagesize=landscape(A4),
+                rightMargin=25, leftMargin=25, topMargin=25, bottomMargin=25,
+                title=f"Löneunderlag {d_from}–{d_to}",
+            )
+            story = [
+                Paragraph("Löneunderlag", title_style),
+                Paragraph(f"Period: {escape(d_from)} – {escape(d_to)}", meta_style),
+                Paragraph(
+                    "Semesterersättning: " + f"{self.sal_vacation_percent.value():.2f}%" +
+                    " · Preliminär skatt: " + f"{self.sal_tax_percent.value():.2f}%" +
+                    " · Arbetsgivaravgifter: " + f"{self.sal_employer_fee_percent.value():.2f}%" +
+                    " · ATF/KLS: " + f"{self.sal_atf_percent.value():.2f}%" +
+                    " · Sjuklön: " + f"{self.sal_sick_percent.value():.2f}%",
+                    meta_style,
+                ),
+                Spacer(1, 6), table,
+            ]
+            document.build(story)
+            QMessageBox.information(self, "Löneunderlag", f"PDF sparad:\n{base_filename}")
+            if sys.platform == "win32":
+                os.startfile(filepath)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", filepath])
+            else:
+                subprocess.run(["xdg-open", filepath])
+        except Exception as error:
+            QMessageBox.critical(self, "Löneunderlag", f"Kunde inte skapa PDF: {error}")
 
     def setup_balance_tab(self):
         layout = QVBoxLayout(self.tab_balance)

@@ -20,15 +20,18 @@ _QAPP = QApplication.instance() or QApplication([])
 
 class ObDesktopHarness(QWidget):
     setup_hours_tab = desktop.SmartReportApp.setup_hours_tab
+    setup_salary_tab = desktop.SmartReportApp.setup_salary_tab
     update_ob_form_visibility = desktop.SmartReportApp.update_ob_form_visibility
     refresh_ob_preview = desktop.SmartReportApp.refresh_ob_preview
     save_shift = desktop.SmartReportApp.save_shift
     load_salary_table_template = desktop.SmartReportApp.load_salary_table_template
+    export_salary_to_pdf = desktop.SmartReportApp.export_salary_to_pdf
     edit_shift = desktop.SmartReportApp.edit_shift
     delete_shift = desktop.SmartReportApp.delete_shift
     sync_with_cloud = desktop.SmartReportApp.sync_with_cloud
     load_objects_for_company = desktop.SmartReportApp.load_objects_for_company
     setup_invoice_tab = desktop.SmartReportApp.setup_invoice_tab
+    setup_salary_tab = desktop.SmartReportApp.setup_salary_tab
     mark_period_as_invoiced = desktop.SmartReportApp.mark_period_as_invoiced
     unmark_period_as_invoiced = desktop.SmartReportApp.unmark_period_as_invoiced
     apply_remote_shift = desktop.SmartReportApp.apply_remote_shift
@@ -36,6 +39,11 @@ class ObDesktopHarness(QWidget):
     apply_shifts_filters = desktop.SmartReportApp.apply_shifts_filters
     load_dropdowns = desktop.SmartReportApp.load_dropdowns
     export_dagbok_to_pdf = desktop.SmartReportApp.export_dagbok_to_pdf
+    load_salary_table_template = desktop.SmartReportApp.load_salary_table_template
+    calculate_salary = desktop.SmartReportApp.calculate_salary
+    calculate_salary_row = desktop.SmartReportApp.calculate_salary_row
+    on_salary_cell_changed = desktop.SmartReportApp.on_salary_cell_changed
+    export_salary_to_pdf = desktop.SmartReportApp.export_salary_to_pdf
     generate_invoice = desktop.SmartReportApp.generate_invoice
     export_invoice_to_pdf = desktop.SmartReportApp.export_invoice_to_pdf
 
@@ -227,7 +235,7 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM ob_segments").fetchone()[0], original_segments)
         conn.close()
 
-    def test_ob_amount_is_separate_from_existing_salary_formula(self):
+    def test_salary_base_includes_ob_and_employer_cost_is_separate(self):
         conn = self.database()
         conn.execute('''
             INSERT INTO shifts (
@@ -250,20 +258,112 @@ class ObDesktopTests(unittest.TestCase):
 
         self.window.sal_date_from = desktop.create_date_field("2026-10-01")
         self.window.sal_date_to = desktop.create_date_field("2026-10-31")
-        self.window.table_salary = QTableWidget(0, 10)
+        self.window.sal_vacation_percent = QDoubleSpinBox()
+        self.window.sal_vacation_percent.setValue(13.0)
+        self.window.sal_tax_percent = QDoubleSpinBox()
+        self.window.sal_tax_percent.setValue(30.06)
+        self.window.sal_employer_fee_percent = QDoubleSpinBox()
+        self.window.sal_employer_fee_percent.setValue(31.42)
+        self.window.sal_atf_percent = QDoubleSpinBox()
+        self.window.sal_atf_percent.setValue(0.0)
+        self.window.sal_sick_percent = QDoubleSpinBox()
+        self.window.sal_sick_percent.setValue(0.0)
+        self.window.table_salary = QTableWidget(0, 14)
         self.window.sal_summary_hours_lbl = QLabel()
-        self.window.sal_summary_atf_lbl = QLabel()
-        self.window.sal_summary_sick_lbl = QLabel()
         self.window.sal_summary_ob_lbl = QLabel()
-        self.window.sal_summary_total_lbl = QLabel()
+        self.window.sal_summary_net_lbl = QLabel()
+        self.window.sal_summary_employer_lbl = QLabel()
         self.window.on_salary_cell_changed = Mock()
         self.window.load_salary_table_template()
 
         self.assertEqual(self.window.table_salary.item(0, 1).text(), "8.0")
-        self.assertEqual(self.window.table_salary.item(0, 8).text(), "4.00")
-        self.assertEqual(self.window.table_salary.item(0, 9).text(), "570.00")
-        self.assertEqual(self.window.table_salary.item(0, 7).text(), "632.26")
-        self.assertIn("570.00 kr", self.window.sal_summary_ob_lbl.text())
+        self.assertEqual(self.window.table_salary.item(0, 5).data(Qt.ItemDataRole.UserRole), 4.0)
+        self.assertIn("dagtid", self.window.table_salary.item(0, 5).toolTip() or "")
+        self.assertEqual(self.window.table_salary.item(0, 6).text(), "1370.00")
+        self.assertEqual(self.window.table_salary.item(0, 7).text(), "178.10")
+        self.assertEqual(self.window.table_salary.item(0, 10).text(), "465.36")
+        self.assertEqual(self.window.table_salary.item(0, 11).text(), "1082.74")
+        self.assertEqual(self.window.table_salary.item(0, 12).text(), "486.41")
+        self.assertEqual(self.window.table_salary.item(0, 13).text(), "2034.51")
+        self.assertIn("570.00 SEK", self.window.sal_summary_ob_lbl.text())
+
+        captured_tables = []
+        reportlab_long_table = desktop.LongTable
+
+        def capture_long_table(data, **kwargs):
+            table = reportlab_long_table(data, **kwargs)
+            captured_tables.append(table)
+            return table
+
+        class DocumentStub:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def build(self, _story):
+                return None
+
+        reports_path = Path(self.temp_dir.name) / "salary-reports"
+        with patch.object(desktop, "REPORTS_DIR", str(reports_path)), \
+             patch.object(desktop, "LongTable", side_effect=capture_long_table), \
+             patch.object(desktop, "SimpleDocTemplate", DocumentStub), \
+             patch.object(desktop.QMessageBox, "information"), \
+             patch("os.startfile", create=True), \
+             patch("subprocess.run"):
+            self.window.export_salary_to_pdf()
+
+        self.assertEqual(len(captured_tables), 1)
+        salary_pdf_table = captured_tables[0]
+        self.assertEqual(len(salary_pdf_table._argW), 14)
+        self.assertEqual(salary_pdf_table._argW[5], 218)
+        self.assertAlmostEqual(sum(salary_pdf_table._argW), 792)
+        pdf_headers = [cell.getPlainText() for cell in salary_pdf_table._cellvalues[0]]
+        self.assertIn("OB timmar / specifikation", pdf_headers)
+        self.assertIn("Skatt (SEK)", pdf_headers)
+        self.assertIn("Arbetsgivaravgifter (SEK)", pdf_headers)
+        pdf_ob_cell = salary_pdf_table._cellvalues[1][5]
+        self.assertIn("OB1", pdf_ob_cell.getPlainText())
+        self.assertIn("OB2", pdf_ob_cell.getPlainText())
+        self.assertIn("1.70", pdf_ob_cell.getPlainText())
+        totals_row = salary_pdf_table._cellvalues[-1]
+        self.assertEqual(totals_row[4], "")
+        self.assertIn("OB totalt: 4 tim / 570.00 SEK", totals_row[5].getPlainText())
+
+    def test_salary_tab_has_configurable_rates_ob_column_and_pdf_button(self):
+        window = ObDesktopHarness()
+        window.tab_salary = QWidget()
+        window.setup_salary_tab()
+
+        self.assertEqual(window.table_salary.columnCount(), 14)
+        headers = [window.table_salary.horizontalHeaderItem(i).text() for i in range(14)]
+        self.assertIn("OB timmar / specifikation", headers)
+        self.assertIn("Arbetsgivaravgifter (SEK)", headers)
+        self.assertEqual(
+            window.table_salary.horizontalHeader().sectionResizeMode(5),
+            desktop.QHeaderView.ResizeMode.Stretch,
+        )
+        export_button = next(
+            button for button in window.tab_salary.findChildren(QPushButton)
+            if "PDF" in button.text() and "зарплат" in button.text().lower()
+        )
+        self.assertEqual(export_button.text(), "🖨 Экспорт зарплат в PDF")
+        self.assertEqual(window.sal_vacation_percent.value(), 13.0)
+        self.assertEqual(window.sal_tax_percent.value(), 30.06)
+        self.assertEqual(window.sal_employer_fee_percent.value(), 31.42)
+        self.assertEqual(window.sal_atf_percent.value(), 0.0)
+        self.assertEqual(window.sal_sick_percent.value(), 0.0)
+
+    def test_payroll_components_apply_configured_atf_and_sick_percentages(self):
+        result = desktop.calculate_payroll_components(
+            work_hours=8, atf_hours=2, sick_hours=1, salary_rate=100,
+            ob_amount=50, vacation_percent=13, tax_percent=30,
+            employer_fee_percent=31.42, atf_percent=100, sick_percent=80,
+        )
+        self.assertEqual(result["base_salary"], 850.0)
+        self.assertEqual(result["atf_pay"], 200.0)
+        self.assertEqual(result["sick_pay"], 80.0)
+        self.assertEqual(result["vacation_pay"], 110.5)
+        self.assertEqual(result["tax"], 372.15)
+        self.assertEqual(result["net_pay"], 868.35)
 
     def test_ob_outbox_requires_server_capability_before_release(self):
         self.window.save_shift()
