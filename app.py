@@ -1102,17 +1102,8 @@ class SmartReportApp(QMainWindow):
         shifts_header = self.table_shifts.horizontalHeader()
         shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in {
-            1: 95,   # Дата: узкая ровно под YYYY-MM-DD
-            2: 125,  # Сотрудник: ровно под ФИО
-            3: 105,  # Фирма
-            4: 135,  # Объект
-            5: 75,   # Тип: узкая (Работа / OB / АТФ / Больничный)
-            6: 60,   # Часы: узкая под 2-3 цифры (напр. 8.0)
-            7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
-            8: 80,   # Факт. ставка: максимально узкая
-            9: 70,   # Транспорт: узкая под 0.0 / 1.0
-            11: 110, # Статус фактуры: узкая под статус (⌛ В работе / ✅ Выставлен)
-            12: 95,  # OB сумма (SEK)
+            1: 95, 2: 130, 3: 110, 4: 170, 5: 85, 6: 65,
+            7: 175, 8: 80, 9: 210, 11: 110, 12: 95,
         }.items():
             self.table_shifts.setColumnWidth(column, width)
         shifts_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)  # Комментарий: забирает всё свободное место
@@ -1674,19 +1665,21 @@ class SmartReportApp(QMainWindow):
         self.table_salary = QTableWidget()
         self.table_salary.setColumnCount(14)
         self.table_salary.setHorizontalHeaderLabels([
-            "Anställd", "Arbete tim", "ATF tim", "Sjukfrånvaro tim", "Timlön (SEK)",
-            "OB timmar / specifikation", "Grundlön + OB (SEK)", "Semesterersättning (SEK)",
-            "ATF/KLS (SEK)", "Sjuklön (SEK)", "Skatt (SEK)", "Nettolön (SEK)",
-            "Arbetsgivaravgifter (SEK)", "Total kostnad (SEK)",
+            "Anställd", "Arbete\ntim", "ATF\ntim", "Sjukfrånvaro\ntim", "Timlön\n(SEK)",
+            "OB timmar /\nspecifikation", "Grundlön + OB\n(SEK)", "Semesterersättning\n(SEK)",
+            "ATF/KLS\n(SEK)", "Sjuklön\n(SEK)", "Skatt\n(SEK)", "Nettolön\n(SEK)",
+            "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)",
         ])
         salary_header = self.table_salary.horizontalHeader()
         salary_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        salary_header.setMinimumHeight(46)
         for column, width in {
-            0: 120, 1: 75, 2: 55, 3: 85, 4: 78,
-            6: 100, 7: 105, 8: 90, 9: 90, 10: 82, 11: 90, 12: 110, 13: 105,
+            0: 140, 1: 75, 2: 75, 3: 75, 4: 85, 5: 200,
+            6: 110, 7: 120, 8: 90, 9: 90, 10: 95, 11: 100,
+            12: 120, 13: 110,
         }.items():
             self.table_salary.setColumnWidth(column, width)
-        salary_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table_salary.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.table_salary.setWordWrap(True)
         self.table_salary.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_salary.setAlternatingRowColors(True)

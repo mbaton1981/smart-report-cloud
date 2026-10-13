@@ -335,12 +335,16 @@ class ObDesktopTests(unittest.TestCase):
 
         self.assertEqual(window.table_salary.columnCount(), 14)
         headers = [window.table_salary.horizontalHeaderItem(i).text() for i in range(14)]
-        self.assertIn("OB timmar / specifikation", headers)
-        self.assertIn("Arbetsgivaravgifter (SEK)", headers)
-        self.assertEqual(
-            window.table_salary.horizontalHeader().sectionResizeMode(5),
-            desktop.QHeaderView.ResizeMode.Stretch,
-        )
+        self.assertIn("OB timmar /\nspecifikation", headers)
+        self.assertIn("Arbetsgivaravgifter\n(SEK)", headers)
+        self.assertEqual(window.table_salary.columnWidth(0), 140)
+        self.assertEqual(window.table_salary.columnWidth(1), 75)
+        self.assertEqual(window.table_salary.columnWidth(4), 85)
+        self.assertEqual(window.table_salary.columnWidth(5), 200)
+        self.assertEqual(window.table_salary.columnWidth(7), 120)
+        self.assertEqual(window.table_salary.columnWidth(12), 120)
+        self.assertEqual(window.table_salary.horizontalHeader().sectionResizeMode(5), desktop.QHeaderView.ResizeMode.Interactive)
+        self.assertEqual(window.table_salary.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         export_button = next(
             button for button in window.tab_salary.findChildren(QPushButton)
             if "PDF" in button.text() and "зарплат" in button.text().lower()
