@@ -7,6 +7,7 @@ import sqlite3
 import requests
 import json
 import uuid
+from xml.sax.saxutils import escape
 from datetime import datetime, timezone
 
 from PyQt6.QtWidgets import (
@@ -437,6 +438,55 @@ def get_ob_segments(cursor, sync_id):
         FROM ob_segments WHERE shift_id = ? ORDER BY segment_date, start_time, id
     """, (sync_id,))
     return [dict(row) for row in cursor.fetchall()]
+
+
+def collect_invoice_ob_details(cursor, company, object_name, date_from, date_to):
+    category_labels = {
+        "weekday_day": "dagtid",
+        "weekday_early_evening": "OB1",
+        "weekday_late_evening_night": "OB2",
+        "weekday_early_morning_unpaid_pending_confirmation": "morgon",
+        "saturday": "lördag",
+        "sunday": "söndag",
+    }
+    cursor.execute("""
+        SELECT employee, date, sync_id, start_time, end_time, hours
+        FROM shifts
+        WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
+          AND entry_type = 'ob'
+        ORDER BY employee, date, start_time, id
+    """, (company, object_name, date_from, date_to))
+
+    details_by_employee = {}
+    for shift in cursor.fetchall():
+        segments = get_ob_segments(cursor, shift["sync_id"])
+        if segments:
+            segment_details = []
+            for segment in segments:
+                category = category_labels.get(segment["category"], segment["category"])
+                segment_details.append(
+                    f"{segment['start_time']}–{segment['end_time']}: "
+                    f"{float(segment['hours']):.2f} tim {category} "
+                    f"(×{float(segment['multiplier']):.2f})"
+                )
+            detail = (
+                f"{shift['date']} {shift['start_time']}–{shift['end_time']}: "
+                + " / ".join(segment_details)
+            )
+        else:
+            detail = (
+                f"{shift['date']} {shift['start_time']}–{shift['end_time']} "
+                f"({float(shift['hours'] or 0.0):.2f} tim)"
+            )
+        details_by_employee.setdefault(shift["employee"], []).append(detail)
+
+    return {
+        employee: {
+            "display": "\n".join(details),
+            "tooltip": "\n".join(details),
+        }
+        for employee, details in details_by_employee.items()
+    }
 
 
 def compact_blocked_shift_operations(cursor, allowed_types=None):
@@ -2071,7 +2121,15 @@ class SmartReportApp(QMainWindow):
         self.table_invoice = QTableWidget()
         self.table_invoice.setColumnCount(11)
         self.table_invoice.setHorizontalHeaderLabels(["Сотрудник", "Рабочие часы", "АТФ, ч", "Больничный, ч", "Ставка", "Сумма (работа)", "Транспорт", "Итого", "Статус", "OB часы", "OB сумма отдельно"])
-        self.table_invoice.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        invoice_header = self.table_invoice.horizontalHeader()
+        invoice_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column, width in {
+            0: 145, 1: 95, 2: 65, 3: 90, 4: 80, 5: 110,
+            6: 85, 7: 90, 8: 105, 10: 125,
+        }.items():
+            self.table_invoice.setColumnWidth(column, width)
+        invoice_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        self.table_invoice.setWordWrap(True)
         self.table_invoice.setAlternatingRowColors(True)
         layout.addWidget(self.table_invoice)
 
@@ -2112,6 +2170,9 @@ class SmartReportApp(QMainWindow):
         fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
 
         has_ob_schema = ob_schema_ready(cursor)
+        ob_details_by_employee = collect_invoice_ob_details(
+            cursor, comp, obj, d_from, d_to
+        ) if has_ob_schema else {}
         if has_ob_schema:
             cursor.execute('''
                 SELECT employee,
@@ -2182,9 +2243,13 @@ class SmartReportApp(QMainWindow):
 
             total_sum_all += row_total
 
-            row_values = [emp, f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str, f"{ob_hours:.2f}", f"{ob_amount:.2f}"]
+            ob_details = ob_details_by_employee.get(emp, {})
+            ob_cell_text = f"{ob_hours:.2f} ч" + (" · интервалы" if ob_details else "")
+            row_values = [emp, f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str, ob_cell_text, f"{ob_amount:.2f}"]
             for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
+                if col_idx == 9 and ob_details:
+                    it.setToolTip(ob_details["tooltip"])
                 if is_inv:
                     it.setBackground(QColor("#1c4532"))
                 self.table_invoice.setItem(row_idx, col_idx, it)
@@ -2223,6 +2288,9 @@ class SmartReportApp(QMainWindow):
         fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
 
         has_ob_schema = ob_schema_ready(cursor)
+        ob_details_by_employee = collect_invoice_ob_details(
+            cursor, comp, obj, d_from, d_to
+        ) if has_ob_schema else {}
         if has_ob_schema:
             cursor.execute('''
                 SELECT employee,
@@ -2275,7 +2343,18 @@ class SmartReportApp(QMainWindow):
             story.append(Paragraph(f"<b>Fakturaunderlag (Underlag för faktura)</b><br/>Beställare (Firma): <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
             story.append(Spacer(1, 5))
 
-            table_data = [["Anställd", "Arbete h", "ATF h", "Sjuk h", "Pris/tim", "Arbete (SEK)", "Resa (SEK)", "Totalt (SEK)", "OB h", "OB отдельно (SEK)"]]
+            pdf_header_style = ParagraphStyle(
+                "InvoiceHeader", parent=styles['Normal'], fontName=DEFAULT_FONT_BOLD,
+                fontSize=7, leading=8, wordWrap='CJK'
+            )
+            table_data = [[
+                Paragraph(escape(label), pdf_header_style)
+                for label in (
+                    "Anställd", "Arbete h", "ATF h", "Sjuk h", "Pris/tim",
+                    "Arbete (SEK)", "Resa (SEK)", "Totalt (SEK)",
+                    "OB h / specifikation", "OB отдельно (SEK)",
+                )
+            ]]
             total_hours_all = 0.0
             total_atf_all = 0.0
             total_sick_all = 0.0
@@ -2306,7 +2385,27 @@ class SmartReportApp(QMainWindow):
                     row_total = work_sum + transport_total_sum
 
                 total_sum_all += row_total
-                table_data.append([str(emp), f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", f"{ob_hours:.2f}", f"{ob_amount:.2f}"])
+                ob_details = ob_details_by_employee.get(emp, {}).get("display", "")
+                ob_spec = Paragraph(
+                    f"{ob_hours:.2f} tim<br/>{escape(ob_details).replace(chr(10), '<br/>')}",
+                    ParagraphStyle(
+                        f"InvoiceObCell{len(table_data)}",
+                        parent=styles['Normal'],
+                        fontName=DEFAULT_FONT,
+                        fontSize=7,
+                        leading=9,
+                        wordWrap='CJK',
+                    ),
+                )
+                table_data.append([
+                    Paragraph(escape(str(emp)), ParagraphStyle(
+                        f"InvoiceEmployee{len(table_data)}", parent=styles['Normal'],
+                        fontName=DEFAULT_FONT, fontSize=8, leading=10, wordWrap='CJK'
+                    )),
+                    f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}",
+                    f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}",
+                    f"{row_total:.2f}", ob_spec, f"{ob_amount:.2f}"
+                ])
 
             if is_fast_pris:
                 total_sum_all = fast_pris_amount
@@ -2314,7 +2413,7 @@ class SmartReportApp(QMainWindow):
 
             table_data.append(["Totalt:", f"{total_hours_all:.1f}", f"{total_atf_all:.1f}", f"{total_sick_all:.1f}", "", "", "", f"{total_sum_all:,.2f}", f"{total_ob_hours_all:.2f}", f"{total_ob_amount_all:.2f}"])
 
-            t = Table(table_data, colWidths=[90, 38, 35, 42, 48, 66, 58, 76, 42, 74])
+            t = Table(table_data, colWidths=[74, 32, 28, 32, 38, 52, 46, 54, 115, 64])
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),

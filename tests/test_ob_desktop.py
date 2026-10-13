@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from PyQt6.QtCore import QDate, Qt
-from PyQt6.QtWidgets import QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QWidget
+from PyQt6.QtWidgets import QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QWidget
 
 import app as desktop
 from migrate_ob import migrate_database
@@ -33,6 +33,8 @@ class ObDesktopHarness(QWidget):
     apply_shifts_filters = desktop.SmartReportApp.apply_shifts_filters
     load_dropdowns = desktop.SmartReportApp.load_dropdowns
     export_dagbok_to_pdf = desktop.SmartReportApp.export_dagbok_to_pdf
+    generate_invoice = desktop.SmartReportApp.generate_invoice
+    export_invoice_to_pdf = desktop.SmartReportApp.export_invoice_to_pdf
 
 
 class ObDesktopTests(unittest.TestCase):
@@ -309,6 +311,86 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM ob_segments").fetchone()[0], 0)
         self.assertEqual(conn.execute("SELECT name FROM employees").fetchone()[0], "Alice")
         conn.close()
+
+    def test_invoice_ob_column_and_pdf_include_segment_specification(self):
+        conn = self.database()
+        result = desktop.calculate_work_interval("2026-10-12", "17:00", "21:00", 100)
+        sync_id = "invoice-ob-shift"
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache,
+                start_time, end_time, ob_base_rate
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1, 'ob', 0, 0, ?, ?, ?)
+        ''', (
+            "2026-10-12", "Alice", "Privat", "Bygg och renovering",
+            result["total_hours"], "", sync_id, "17:00", "21:00", 100,
+        ))
+        desktop.replace_ob_segments(cursor, sync_id, result["segments"])
+        conn.commit()
+        conn.close()
+
+        self.window.inv_date_from = desktop.create_date_field("2026-10-01")
+        self.window.inv_date_to = desktop.create_date_field("2026-10-31")
+        self.window.inv_comp_cb = QComboBox()
+        self.window.inv_comp_cb.addItem("Privat")
+        self.window.inv_obj_cb = QComboBox()
+        self.window.inv_obj_cb.addItem("Bygg och renovering", userData="Bygg och renovering")
+        self.window.fast_pris_check = QCheckBox()
+        self.window.fast_pris_input = QLineEdit()
+        self.window.table_invoice = QTableWidget(0, 11)
+        self.window.inv_total_hours_lbl = QLabel()
+        self.window.inv_total_atf_lbl = QLabel()
+        self.window.inv_total_sick_lbl = QLabel()
+        self.window.inv_total_ob_lbl = QLabel()
+        self.window.inv_total_sum_lbl = QLabel()
+        self.window.generate_invoice()
+
+        ob_cell = self.window.table_invoice.item(0, 9)
+        self.assertEqual(ob_cell.text(), "4.00 ч · интервалы")
+        self.assertIn("OB1", ob_cell.toolTip())
+        self.assertIn("OB2", ob_cell.toolTip())
+
+        captured_tables = []
+        reportlab_table = desktop.Table
+
+        def capture_table(data, **kwargs):
+            table = reportlab_table(data, **kwargs)
+            captured_tables.append(table)
+            return table
+
+        class DocumentStub:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def build(self, _story):
+                return None
+
+        reports_path = Path(self.temp_dir.name) / "invoice-reports"
+        with patch.object(desktop, "REPORTS_DIR", str(reports_path)), \
+             patch.object(desktop, "Table", side_effect=capture_table), \
+             patch.object(desktop, "SimpleDocTemplate", DocumentStub), \
+             patch.object(desktop, "translate_to_swedish", side_effect=lambda text: text), \
+             patch.object(desktop.QMessageBox, "information"), \
+             patch("os.startfile", create=True), \
+             patch("subprocess.run"):
+            self.window.export_invoice_to_pdf()
+
+        self.assertEqual(len(captured_tables), 1)
+        invoice_table = captured_tables[0]
+        self.assertEqual(invoice_table._argW[8], 115)
+        pdf_ob_cell = next(
+            row[8] for row in invoice_table._cellvalues
+            if hasattr(row[8], "getPlainText") and "OB1" in row[8].getPlainText()
+        )
+        self.assertIn("OB1", pdf_ob_cell.getPlainText())
+        self.assertIn("OB2", pdf_ob_cell.getPlainText())
+        self.assertIn("1.50", pdf_ob_cell.getPlainText())
+        self.assertIn("1.70", pdf_ob_cell.getPlainText())
+        self.assertEqual(pdf_ob_cell.style.wordWrap, "CJK")
+        wrapped_width, _ = invoice_table.wrap(535.28, 780)
+        self.assertLessEqual(wrapped_width, 535.28)
 
     def test_apply_remote_shift_imports_and_repairs_ob_record(self):
         conn = self.database()
