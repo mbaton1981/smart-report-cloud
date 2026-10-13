@@ -28,6 +28,9 @@ class ObDesktopHarness(QWidget):
     delete_shift = desktop.SmartReportApp.delete_shift
     sync_with_cloud = desktop.SmartReportApp.sync_with_cloud
     load_objects_for_company = desktop.SmartReportApp.load_objects_for_company
+    setup_invoice_tab = desktop.SmartReportApp.setup_invoice_tab
+    mark_period_as_invoiced = desktop.SmartReportApp.mark_period_as_invoiced
+    unmark_period_as_invoiced = desktop.SmartReportApp.unmark_period_as_invoiced
     apply_remote_shift = desktop.SmartReportApp.apply_remote_shift
     load_shifts_history = desktop.SmartReportApp.load_shifts_history
     apply_shifts_filters = desktop.SmartReportApp.apply_shifts_filters
@@ -328,6 +331,16 @@ class ObDesktopTests(unittest.TestCase):
             result["total_hours"], "", sync_id, "17:00", "21:00", 100,
         ))
         desktop.replace_ob_segments(cursor, sync_id, result["segments"])
+        cursor.execute("UPDATE objects SET transport_rate = 15 WHERE name = ?", ("Bygg och renovering",))
+        cursor.execute('''
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, transport, comment,
+                invoiced, sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 1, 'work', ?, ?)
+        ''', (
+            "2026-10-12", "Alice", "Privat", "Bygg och renovering", 8.0,
+            100.0, 2.0, "work with transport", "invoice-work-shift", 100.0, 2.0,
+        ))
         conn.commit()
         conn.close()
 
@@ -339,7 +352,12 @@ class ObDesktopTests(unittest.TestCase):
         self.window.inv_obj_cb.addItem("Bygg och renovering", userData="Bygg och renovering")
         self.window.fast_pris_check = QCheckBox()
         self.window.fast_pris_input = QLineEdit()
-        self.window.table_invoice = QTableWidget(0, 11)
+        self.window.table_invoice = QTableWidget(0, 9)
+        self.window.table_invoice.setHorizontalHeaderLabels([
+            "Сотрудник", "Рабочие часы", "Ставка", "Сумма (работа)",
+            "Resa (SEK)", "Итого (SEK)", "Статус", "OB часы / спецификация",
+            "OB сумма отдельно",
+        ])
         self.window.inv_total_hours_lbl = QLabel()
         self.window.inv_total_atf_lbl = QLabel()
         self.window.inv_total_sick_lbl = QLabel()
@@ -347,10 +365,41 @@ class ObDesktopTests(unittest.TestCase):
         self.window.inv_total_sum_lbl = QLabel()
         self.window.generate_invoice()
 
-        ob_cell = self.window.table_invoice.item(0, 9)
-        self.assertEqual(ob_cell.text(), "4.00 ч · интервалы")
+        self.assertEqual(self.window.table_invoice.columnCount(), 9)
+        invoice_headers = [
+            self.window.table_invoice.horizontalHeaderItem(i).text()
+            for i in range(self.window.table_invoice.columnCount())
+        ]
+        self.assertNotIn("ATF, ч", invoice_headers)
+        self.assertNotIn("Больничный, ч", invoice_headers)
+        self.assertIn("Resa (SEK)", invoice_headers)
+        self.assertIn("OB часы / спецификация", invoice_headers)
+
+        ob_cell = self.window.table_invoice.item(0, 7)
+        self.assertEqual(ob_cell.text(), "4 tim · intervaller")
         self.assertIn("OB1", ob_cell.toolTip())
         self.assertIn("OB2", ob_cell.toolTip())
+        self.assertEqual(self.window.table_invoice.columnCount(), 9)
+        self.assertEqual(self.window.table_invoice.item(0, 4).text(), "30.00")
+        self.assertEqual(self.window.table_invoice.item(0, 5).text(), "830.00")
+
+        tab_window = ObDesktopHarness()
+        tab_window.tab_invoice = QWidget()
+        tab_window.load_companies_into_combobox = lambda combo: combo.addItem("Privat")
+        tab_window.load_objects_for_company = lambda _company, combo: combo.addItem(
+            "Bygg och renovering", userData="Bygg och renovering"
+        )
+        tab_window.setup_invoice_tab()
+        setup_headers = [
+            tab_window.table_invoice.horizontalHeaderItem(i).text()
+            for i in range(tab_window.table_invoice.columnCount())
+        ]
+        self.assertNotIn("АТФ, ч", setup_headers)
+        self.assertNotIn("Больничный, ч", setup_headers)
+        self.assertEqual(
+            tab_window.table_invoice.horizontalHeader().sectionResizeMode(7),
+            desktop.QHeaderView.ResizeMode.Stretch,
+        )
 
         captured_tables = []
         reportlab_table = desktop.Table
@@ -379,10 +428,18 @@ class ObDesktopTests(unittest.TestCase):
 
         self.assertEqual(len(captured_tables), 1)
         invoice_table = captured_tables[0]
-        self.assertEqual(invoice_table._argW[8], 115)
+        self.assertEqual(len(invoice_table._argW), 8)
+        self.assertEqual(invoice_table._argW[6], 170)
+        header_labels = [cell.getPlainText() for cell in invoice_table._cellvalues[0]]
+        self.assertNotIn("ATF h", header_labels)
+        self.assertNotIn("Sjuk h", header_labels)
+        self.assertIn("Resa (SEK)", header_labels)
+        self.assertIn("OB h / specifikation", header_labels)
+        self.assertEqual(invoice_table._cellvalues[1][4], "30.00")
+        self.assertEqual(invoice_table._cellvalues[1][5], "830.00")
         pdf_ob_cell = next(
-            row[8] for row in invoice_table._cellvalues
-            if hasattr(row[8], "getPlainText") and "OB1" in row[8].getPlainText()
+            row[6] for row in invoice_table._cellvalues
+            if hasattr(row[6], "getPlainText") and "OB1" in row[6].getPlainText()
         )
         self.assertIn("OB1", pdf_ob_cell.getPlainText())
         self.assertIn("OB2", pdf_ob_cell.getPlainText())
@@ -391,6 +448,13 @@ class ObDesktopTests(unittest.TestCase):
         self.assertEqual(pdf_ob_cell.style.wordWrap, "CJK")
         wrapped_width, _ = invoice_table.wrap(535.28, 780)
         self.assertLessEqual(wrapped_width, 535.28)
+        totals_row = invoice_table._cellvalues[-1]
+        self.assertEqual(totals_row[1], "8.0")
+        self.assertEqual(totals_row[3], "800.00")
+        self.assertEqual(totals_row[4], "30.00")
+        self.assertEqual(totals_row[5], "830.00")
+        self.assertEqual(totals_row[6], "4 tim")
+        self.assertFalse(any("ATF" in str(cell) or "Sjuk" in str(cell) for cell in totals_row))
 
     def test_apply_remote_shift_imports_and_repairs_ob_record(self):
         conn = self.database()

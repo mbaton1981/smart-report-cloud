@@ -2119,29 +2119,25 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>Результат по объекту за период (зеленые строки уже закрыты):</b>"))
         
         self.table_invoice = QTableWidget()
-        self.table_invoice.setColumnCount(11)
-        self.table_invoice.setHorizontalHeaderLabels(["Сотрудник", "Рабочие часы", "АТФ, ч", "Больничный, ч", "Ставка", "Сумма (работа)", "Транспорт", "Итого", "Статус", "OB часы", "OB сумма отдельно"])
+        self.table_invoice.setColumnCount(9)
+        self.table_invoice.setHorizontalHeaderLabels(["Сотрудник", "Рабочие часы", "Ставка", "Сумма (работа)", "Resa (SEK)", "Итого (SEK)", "Статус", "OB часы / спецификация", "OB сумма отдельно"])
         invoice_header = self.table_invoice.horizontalHeader()
         invoice_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in {
-            0: 145, 1: 95, 2: 65, 3: 90, 4: 80, 5: 110,
-            6: 85, 7: 90, 8: 105, 10: 125,
+            0: 145, 1: 95, 2: 80, 3: 110, 4: 90,
+            5: 95, 6: 105, 8: 125,
         }.items():
             self.table_invoice.setColumnWidth(column, width)
-        invoice_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        invoice_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.table_invoice.setWordWrap(True)
         self.table_invoice.setAlternatingRowColors(True)
         layout.addWidget(self.table_invoice)
 
         summary_box = QHBoxLayout()
         self.inv_total_hours_lbl = QLabel("<b>Всего часов: 0</b>")
-        self.inv_total_atf_lbl = QLabel("<b>АТФ: 0 ч</b>")
-        self.inv_total_sick_lbl = QLabel("<b>Больничный: 0 ч</b>")
         self.inv_total_ob_lbl = QLabel("<b>OB отдельно: 0 ч / 0.00 kr</b>")
         self.inv_total_sum_lbl = QLabel("<b>Общая сумма: 0.00 kr</b>")
         summary_box.addWidget(self.inv_total_hours_lbl)
-        summary_box.addWidget(self.inv_total_atf_lbl)
-        summary_box.addWidget(self.inv_total_sick_lbl)
         summary_box.addWidget(self.inv_total_ob_lbl)
         summary_box.addStretch()
         summary_box.addWidget(self.inv_total_sum_lbl)
@@ -2177,8 +2173,6 @@ class SmartReportApp(QMainWindow):
             cursor.execute('''
                 SELECT employee,
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END) as atf_hours,
-                    SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END) as sick_hours,
                     SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
                     MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status,
                     SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END) as ob_hours,
@@ -2196,8 +2190,6 @@ class SmartReportApp(QMainWindow):
             cursor.execute('''
                 SELECT employee,
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END) as atf_hours,
-                    SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END) as sick_hours,
                     SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
                     MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status,
                     0 as ob_hours, 0 as ob_amount
@@ -2211,23 +2203,21 @@ class SmartReportApp(QMainWindow):
 
         self.table_invoice.setRowCount(len(rows))
         total_hours_all = 0.0
-        total_atf_all = 0.0
-        total_sick_all = 0.0
         total_ob_hours_all = 0.0
         total_ob_amount_all = 0.0
         total_sum_all = 0.0
+        total_transport_sum_all = 0.0
+        total_work_sum_all = 0.0
 
         for row_idx, row in enumerate(rows):
             emp = row[0]
-            hrs, atf_hours, sick_hours = row[1], row[2], row[3]
-            trans_count = row[4] or 0.0
-            is_inv = row[5] == 1
-            ob_hours, ob_amount = row[6] or 0.0, row[7] or 0.0
+            hrs = row[1] or 0.0
+            trans_count = row[2] or 0.0
+            is_inv = row[3] == 1
+            ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
             status_str = "✅ Выставлен" * is_inv or "⏳ В работе"
             
             total_hours_all += hrs
-            total_atf_all += atf_hours
-            total_sick_all += sick_hours
             total_ob_hours_all += ob_hours
             total_ob_amount_all += ob_amount
             transport_total_sum = trans_count * object_transport_rate
@@ -2242,13 +2232,15 @@ class SmartReportApp(QMainWindow):
                 row_total = work_sum + transport_total_sum
 
             total_sum_all += row_total
+            total_transport_sum_all += transport_total_sum
+            total_work_sum_all += work_sum
 
             ob_details = ob_details_by_employee.get(emp, {})
-            ob_cell_text = f"{ob_hours:.2f} ч" + (" · интервалы" if ob_details else "")
-            row_values = [emp, f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str, ob_cell_text, f"{ob_amount:.2f}"]
+            ob_cell_text = f"{ob_hours:g} tim" + (" · intervaller" if ob_details else "")
+            row_values = [emp, f"{hrs:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str, ob_cell_text, f"{ob_amount:.2f}"]
             for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
-                if col_idx == 9 and ob_details:
+                if col_idx == 7 and ob_details:
                     it.setToolTip(ob_details["tooltip"])
                 if is_inv:
                     it.setBackground(QColor("#1c4532"))
@@ -2261,9 +2253,7 @@ class SmartReportApp(QMainWindow):
         else:
             self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f}</b>")
             self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
-        self.inv_total_atf_lbl.setText(f"<b>АТФ: {total_atf_all:.1f} ч</b>")
-        self.inv_total_sick_lbl.setText(f"<b>Больничный: {total_sick_all:.1f} ч</b>")
-        self.inv_total_ob_lbl.setText(f"<b>OB отдельно: {total_ob_hours_all:.2f} ч / {total_ob_amount_all:,.2f} kr</b>")
+        self.inv_total_ob_lbl.setText(f"<b>OB: {total_ob_hours_all:g} tim / {total_ob_amount_all:,.2f} kr</b>")
 
     def export_invoice_to_pdf(self):
         d_from = self.inv_date_from.text().strip()
@@ -2295,8 +2285,6 @@ class SmartReportApp(QMainWindow):
             cursor.execute('''
                 SELECT employee,
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END) as atf_hours,
-                    SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END) as sick_hours,
                     SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
                     SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END) as ob_hours,
                     SUM(CASE WHEN entry_type = 'ob' THEN COALESCE(ob_segment.segment_amount, 0) ELSE 0 END) as ob_amount
@@ -2310,8 +2298,6 @@ class SmartReportApp(QMainWindow):
             cursor.execute('''
                 SELECT employee,
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END) as atf_hours,
-                    SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END) as sick_hours,
                     SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
                     0 as ob_hours, 0 as ob_amount
                 FROM shifts
@@ -2350,26 +2336,24 @@ class SmartReportApp(QMainWindow):
             table_data = [[
                 Paragraph(escape(label), pdf_header_style)
                 for label in (
-                    "Anställd", "Arbete h", "ATF h", "Sjuk h", "Pris/tim",
-                    "Arbete (SEK)", "Resa (SEK)", "Totalt (SEK)",
-                    "OB h / specifikation", "OB отдельно (SEK)",
+                    "Anställd", "Arbete h", "Pris/tim", "Arbete (SEK)",
+                    "Resa (SEK)", "Totalt (SEK)", "OB h / specifikation",
+                    "OB separat (SEK)",
                 )
             ]]
             total_hours_all = 0.0
-            total_atf_all = 0.0
-            total_sick_all = 0.0
             total_ob_hours_all = 0.0
             total_ob_amount_all = 0.0
             total_sum_all = 0.0
+            total_work_sum_all = 0.0
+            total_transport_sum_all = 0.0
 
             for row in rows:
                 emp = row[0]
-                hrs, atf_hours, sick_hours = row[1], row[2], row[3]
-                trans_count = row[4] or 0.0
-                ob_hours, ob_amount = row[5] or 0.0, row[6] or 0.0
+                hrs = row[1] or 0.0
+                trans_count = row[2] or 0.0
+                ob_hours, ob_amount = row[3] or 0.0, row[4] or 0.0
                 total_hours_all += hrs
-                total_atf_all += atf_hours
-                total_sick_all += sick_hours
                 total_ob_hours_all += ob_hours
                 total_ob_amount_all += ob_amount
 
@@ -2385,9 +2369,11 @@ class SmartReportApp(QMainWindow):
                     row_total = work_sum + transport_total_sum
 
                 total_sum_all += row_total
+                total_work_sum_all += work_sum
+                total_transport_sum_all += transport_total_sum
                 ob_details = ob_details_by_employee.get(emp, {}).get("display", "")
                 ob_spec = Paragraph(
-                    f"{ob_hours:.2f} tim<br/>{escape(ob_details).replace(chr(10), '<br/>')}",
+                    f"{ob_hours:g} tim<br/>{escape(ob_details).replace(chr(10), '<br/>')}",
                     ParagraphStyle(
                         f"InvoiceObCell{len(table_data)}",
                         parent=styles['Normal'],
@@ -2402,18 +2388,27 @@ class SmartReportApp(QMainWindow):
                         f"InvoiceEmployee{len(table_data)}", parent=styles['Normal'],
                         fontName=DEFAULT_FONT, fontSize=8, leading=10, wordWrap='CJK'
                     )),
-                    f"{hrs:.1f}", f"{atf_hours:.1f}", f"{sick_hours:.1f}",
-                    f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}",
-                    f"{row_total:.2f}", ob_spec, f"{ob_amount:.2f}"
+                    f"{hrs:.1f}", f"{rate:.2f}", f"{work_sum:.2f}",
+                    f"{transport_total_sum:.2f}", f"{row_total:.2f}", ob_spec,
+                    f"{ob_amount:.2f}"
                 ])
 
             if is_fast_pris:
                 total_sum_all = fast_pris_amount
-                table_data.append(["Fast pris (Enligt avtal)", "", "", "", "", "", "", f"{fast_pris_amount:.2f}", f"{total_ob_hours_all:.2f}", f"{total_ob_amount_all:.2f}"])
+                table_data.append([
+                    "Fast pris (Enligt avtal)", "", "", "", "",
+                    f"{fast_pris_amount:.2f}", f"{total_ob_hours_all:g} tim",
+                    f"{total_ob_amount_all:.2f}",
+                ])
 
-            table_data.append(["Totalt:", f"{total_hours_all:.1f}", f"{total_atf_all:.1f}", f"{total_sick_all:.1f}", "", "", "", f"{total_sum_all:,.2f}", f"{total_ob_hours_all:.2f}", f"{total_ob_amount_all:.2f}"])
+            table_data.append([
+                "Totalt:", f"{total_hours_all:.1f}", "",
+                f"{total_work_sum_all:,.2f}", f"{total_transport_sum_all:,.2f}",
+                f"{total_sum_all:,.2f}", f"{total_ob_hours_all:g} tim",
+                f"{total_ob_amount_all:,.2f}",
+            ])
 
-            t = Table(table_data, colWidths=[74, 32, 28, 32, 38, 52, 46, 54, 115, 64])
+            t = Table(table_data, colWidths=[78, 35, 34, 55, 48, 55, 170, 60])
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
