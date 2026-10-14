@@ -33,9 +33,16 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ob_calculator import calculate_work_interval, round_time_to_half_hour
 from expense_documents import (
-    apply_expense_documents_migration, decimal_text, document_storage_root,
-    extract_local_document, find_document_duplicates, get_object_expense_summary,
-    match_objects, parse_decimal, parse_document_text, store_original_file,
+    apply_expense_documents_migration,
+    decimal_text,
+    document_storage_root,
+    extract_local_document,
+    find_document_duplicates,
+    get_object_expense_summary,
+    match_objects,
+    parse_decimal,
+    parse_document_text,
+    store_original_file,
     validate_allocations,
 )
 
@@ -353,7 +360,9 @@ def init_db_once():
 
     conn.commit()
     conn.close()
-    apply_expense_documents_migration(DB_FILE, Path(DB_FILE).resolve().parent / BACKUP_DIR)
+    apply_expense_documents_migration(
+        DB_FILE, Path(DB_FILE).resolve().parent / BACKUP_DIR
+    )
 
 def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, state=None):
     record_type = payload.get('record_type', RECORD_TYPE_WORK)
@@ -1119,8 +1128,17 @@ class SmartReportApp(QMainWindow):
         shifts_header = self.table_shifts.horizontalHeader()
         shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in {
-            1: 95, 2: 130, 3: 110, 4: 170, 5: 85, 6: 65,
-            7: 175, 8: 80, 9: 210, 11: 110, 12: 95,
+            1: 95,   # Дата: узкая ровно под YYYY-MM-DD
+            2: 125,  # Сотрудник: ровно под ФИО
+            3: 105,  # Фирма
+            4: 135,  # Объект
+            5: 75,   # Тип: узкая (Работа / OB / АТФ / Больничный)
+            6: 60,   # Часы: узкая под 2-3 цифры (напр. 8.0)
+            7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
+            8: 80,   # Факт. ставка: максимально узкая
+            9: 70,   # Транспорт: узкая под 0.0 / 1.0
+            11: 110, # Статус фактуры: узкая под статус (⌛ В работе / ✅ Выставлен)
+            12: 95,  # OB сумма (SEK)
         }.items():
             self.table_shifts.setColumnWidth(column, width)
         shifts_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)  # Комментарий: забирает всё свободное место
@@ -2171,6 +2189,69 @@ class SmartReportApp(QMainWindow):
         self.load_balance_table()
         return True
 
+    def edit_balance_entry(self, balance_id=None, *_):
+        if balance_id is None:
+            selected = self.table_balance.currentRow()
+            item = self.table_balance.item(selected, 0) if selected >= 0 else None
+            balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if balance_id is None:
+            QMessageBox.information(self, "Баланс", "Выберите операцию для изменения.")
+            return
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT id, date, employee, description, change_amount FROM balance WHERE id = ?",
+            (int(balance_id),),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
+            self.load_balance_table()
+            return
+        self._editing_balance_id = int(row["id"])
+        self.bal_date.setText(str(row["date"]))
+        self.bal_emp_cb.setCurrentText(str(row["employee"]))
+        self.bal_desc.setText(str(row["description"]))
+        self.bal_amount.setText(str(row["change_amount"]))
+        self.add_balance_button.setText("Сохранить изменения")
+
+    def update_balance_entry(self, balance_id=None, date=None, employee=None, description=None, amount=None):
+        balance_id = int(balance_id or self.__dict__.get("_editing_balance_id", 0) or 0)
+        if not balance_id:
+            QMessageBox.warning(self, "Баланс", "Сначала выберите операцию для изменения.")
+            return False
+        date = self.bal_date.text().strip() if date is None else str(date)
+        employee = self.bal_emp_cb.currentText().strip() if employee is None else str(employee).strip()
+        description = self.bal_desc.text().strip() if description is None else str(description).strip()
+        amount = parse_float(self.bal_amount.text(), None) if amount is None else parse_float(amount, None)
+        if amount is None or not employee:
+            QMessageBox.warning(self, "Баланс", "Введите сотрудника/контакт и корректную сумму.")
+            return False
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "UPDATE balance SET date = ?, employee = ?, description = ?, change_amount = ? WHERE id = ?",
+            (date, employee, description, amount, balance_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount == 1
+        conn.close()
+        if not updated:
+            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
+            self.cancel_balance_edit()
+            self.load_balance_table()
+            return False
+        self.cancel_balance_edit()
+        self.load_balance_table()
+        QMessageBox.information(self, "Баланс", f"Операция #{balance_id} обновлена.")
+        return True
+
+    def cancel_balance_edit(self):
+        self.__dict__["_editing_balance_id"] = None
+        self.bal_date.setDate(QDate.currentDate())
+        self.bal_emp_cb.setCurrentText("")
+        self.bal_desc.clear()
+        self.bal_amount.clear()
+        self.add_balance_button.setText("Добавить операцию")
+
     def load_balance_table(self):
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -2206,6 +2287,32 @@ class SmartReportApp(QMainWindow):
             edit_button = QPushButton("Изменить")
             edit_button.clicked.connect(lambda _checked=False, row_id=int(balance_id): self.edit_balance_entry(row_id))
             self.table_balance.setCellWidget(row_idx, 4, edit_button)
+
+    def delete_balance_entry(self):
+        selected = self.table_balance.currentRow()
+        item = self.table_balance.item(selected, 0) if selected >= 0 else None
+        balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if balance_id is None:
+            QMessageBox.information(self, "Баланс", "Выберите операцию для удаления.")
+            return False
+        confirmation = QMessageBox.question(
+            self, "Удаление операции",
+            f"Удалить операцию #{balance_id}?\nДата: {item.text()}\n"
+            f"Сотрудник/контакт: {self.table_balance.item(selected, 1).text()}\n"
+            f"Сумма: {self.table_balance.item(selected, 3).text()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return False
+        conn = get_db_connection()
+        cursor = conn.execute("DELETE FROM balance WHERE id = ?", (int(balance_id),))
+        conn.commit()
+        deleted = cursor.rowcount == 1
+        conn.close()
+        if deleted:
+            self.load_balance_table()
+        return deleted
 
     def setup_expenses_tab(self):
         layout = QVBoxLayout(self.tab_expenses)
@@ -2405,592 +2512,6 @@ class SmartReportApp(QMainWindow):
         self.load_expense_document_filters()
         self.load_expense_documents()
         self.load_expenses_table()
-
-    def apply_expense_period_preset(self, *_):
-        if self._updating_expense_dates:
-            return
-        preset = self.exp_period_preset.currentData()
-        today = QDate.currentDate()
-        if preset == "custom":
-            self.load_expenses_table()
-            return
-        if preset == "this_month":
-            date_from = QDate(today.year(), today.month(), 1)
-            date_to = date_from.addMonths(1).addDays(-1)
-        elif preset == "last_month":
-            date_from = QDate(today.year(), today.month(), 1).addMonths(-1)
-            date_to = date_from.addMonths(1).addDays(-1)
-        elif preset == "last_30":
-            date_from = today.addDays(-29)
-            date_to = today
-        else:
-            date_from = QDate(today.year(), 1, 1)
-            date_to = QDate(today.year(), 12, 31)
-        self._updating_expense_dates = True
-        self.exp_date_from.setDate(date_from)
-        self.exp_date_to.setDate(date_to)
-        self._updating_expense_dates = False
-        self.load_expenses_table()
-
-    def on_expense_date_changed(self, *_):
-        if not self._updating_expense_dates:
-            custom_index = self.exp_period_preset.findData("custom")
-            if custom_index >= 0 and self.exp_period_preset.currentIndex() != custom_index:
-                self._updating_expense_dates = True
-                self.exp_period_preset.setCurrentIndex(custom_index)
-                self._updating_expense_dates = False
-            self.load_expenses_table()
-
-    def open_add_expense_dialog(self):
-        if self.exp_date_from.date() > self.exp_date_to.date():
-            QMessageBox.warning(self, "Расход", "Сначала выберите корректный период.")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Добавить расход")
-        dialog.setMinimumWidth(480)
-        form = QFormLayout(dialog)
-        today = QDate.currentDate()
-        period_start = self.exp_date_from.date()
-        period_end = self.exp_date_to.date()
-        default_date = today if period_start <= today <= period_end else period_end
-        expense_date = create_date_field(default_date.toString("yyyy-MM-dd"))
-        expense_date.setMinimumDate(period_start)
-        expense_date.setMaximumDate(period_end)
-        category = QComboBox()
-        category.addItems([
-            "Инструменты и расходники",
-            "Аренда склада / офиса",
-            "Лизинг и топливо транспорта (Ford Transit)",
-            "Бухгалтерия и страховка",
-            "Прочие накладные расходы",
-        ])
-        description = QLineEdit()
-        description.setPlaceholderText("Комментарий к расходу")
-        amount = QLineEdit()
-        amount.setPlaceholderText("Сумма в SEK")
-        form.addRow("Дата:", expense_date)
-        form.addRow("Категория:", category)
-        form.addRow("Комментарий:", description)
-        form.addRow("Сумма (SEK):", amount)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Добавить")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            expense_amount = parse_float(amount.text(), None)
-            if expense_amount is None or expense_amount < 0:
-                QMessageBox.warning(self, "Расход", "Введите корректную неотрицательную сумму в SEK.")
-                return
-            self.add_company_expense(
-                expense_date.text(), category.currentText(), description.text().strip(), expense_amount
-            )
-
-    def apply_expense_journal_filters(self, *_):
-        if not hasattr(self, "table_expenses"):
-            return
-        selected_category = self.exp_filter_category.currentText()
-        search_text = self.exp_filter_search.text().strip().casefold()
-        for row in range(self.table_expenses.rowCount()):
-            category_item = self.table_expenses.item(row, 2)
-            description_item = self.table_expenses.item(row, 3)
-            matches_category = (
-                selected_category == "Все категории"
-                or (category_item and category_item.text() == selected_category)
-            )
-            searchable = " ".join(
-                item.text() for item in (category_item, description_item) if item
-            ).casefold()
-            self.table_expenses.setRowHidden(
-                row, not matches_category or bool(search_text and search_text not in searchable)
-            )
-
-    def show_expense_details(self, *_):
-        row = self.table_expenses.currentRow()
-        if row < 0:
-            return
-        date_item = self.table_expenses.item(row, 1)
-        category_item = self.table_expenses.item(row, 2)
-        description_item = self.table_expenses.item(row, 3)
-        amount_item = self.table_expenses.item(row, 4)
-        status_item = self.table_expenses.item(row, 5)
-        details = [
-            f"ID: {self.table_expenses.item(row, 0).text() if self.table_expenses.item(row, 0) else ''}",
-            f"Дата: {date_item.text() if date_item else ''}",
-            f"Категория: {category_item.text() if category_item else ''}",
-            f"Сумма: {amount_item.text() if amount_item else ''}",
-            f"Статус: {status_item.text() if status_item else ''}",
-            "",
-            description_item.text() if description_item else "",
-        ]
-        QMessageBox.information(self, "Подробности записи", "\n".join(details))
-
-    def auto_calculate_taxes_and_fora(self):
-        d_from = self.exp_date_from.text().strip()
-        d_to = self.exp_date_to.text().strip()
-        if d_from > d_to:
-            QMessageBox.warning(self, "Расчёт", "Сначала выберите корректный период.")
-            return
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, COALESCE(salary_rate, 0.0) FROM employees")
-        rates = {str(row[0]).strip().lower(): row[1] for row in cursor.fetchall()}
-
-        cursor.execute("""
-            SELECT employee, SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as total_hours
-            FROM shifts 
-            WHERE date >= ? AND date <= ? 
-            GROUP BY employee
-        """, (d_from, d_to))
-        shift_rows = cursor.fetchall()
-
-        if not shift_rows:
-            conn.close()
-            QMessageBox.warning(self, "Внимание", "За выбранный период нет отработанных смен для расчета отчислений!")
-            return
-
-        total_payroll = 0.0
-        basis_lines = []
-        missing_rates = []
-        for row in shift_rows:
-            emp_key = str(row[0]).strip().lower()
-            employee_name = str(row[0])
-            work_hours = float(row[1] or 0.0)
-            rate = float(rates.get(emp_key, 0.0) or 0.0)
-            if work_hours <= 0:
-                continue
-            if rate <= 0:
-                missing_rates.append(employee_name)
-                continue
-            employee_base = work_hours * rate
-            total_payroll += employee_base
-            basis_lines.append(
-                f"{employee_name}: {work_hours:.2f} ч × {rate:.2f} SEK/ч "
-                f"(текущая ставка профиля) = {employee_base:.2f} SEK"
-            )
-
-        if missing_rates:
-            conn.close()
-            QMessageBox.warning(
-                self, "Оценка не рассчитана",
-                "Не найдена положительная текущая зарплатная ставка для: "
-                + ", ".join(missing_rates)
-                + ". Условную сумму не показываю и не сохраняю.",
-            )
-            return
-
-        if total_payroll <= 0:
-            conn.close()
-            QMessageBox.warning(self, "Внимание", "Фонд оплаты труда за период равен нулю. Проверьте ставки сотрудников!")
-            return
-
-        fora_rate = 0.052
-        employer_rate = 0.3142
-        fora_amount = total_payroll * fora_rate
-        employer_amount = total_payroll * employer_rate
-        payroll_basis = (
-            f"Источник часов: только обычная Работа; OB исключён. "
-            f"Источник ставки: employees.salary_rate (текущий профиль, не историческая ставка). "
-            f"База оценки: {total_payroll:.2f} SEK. "
-            + "; ".join(basis_lines)
-        )
-        estimate_disclaimer = "Оценка по текущей логике; процент и формула не подтверждены как обязательство"
-        calculations = [
-            {
-                "category": "FORA и страхование рабочих (Kollektivavtal)",
-                "prefix": f"Авторасчет FORA за период {d_from} - {d_to}",
-                "description": (
-                    f"Авторасчет FORA за период {d_from} - {d_to}; Основа: {payroll_basis}; "
-                    f"Ставка: {fora_rate * 100:.2f}%; {estimate_disclaimer}"
-                ),
-                "amount": fora_amount, "rate": fora_rate, "label": "FORA",
-            },
-            {
-                "category": "Налоги компании (Arbetsgivareavgift 31.42%)",
-                "prefix": f"Авторасчет социального налога за период {d_from} - {d_to}",
-                "description": (
-                    f"Авторасчет социального налога за период {d_from} - {d_to}; Основа: {payroll_basis}; "
-                    f"Ставка: {employer_rate * 100:.2f}%; {estimate_disclaimer}"
-                ),
-                "amount": employer_amount, "rate": employer_rate, "label": "Arbetsgivaravgift",
-            },
-        ]
-
-        review_warnings = []
-        pending_calculations = []
-        for calculation in calculations:
-            cursor.execute(
-                "SELECT id, amount, description FROM company_expenses WHERE category = ? AND description LIKE ? ORDER BY id",
-                (calculation["category"], calculation["prefix"] + "%"),
-            )
-            existing = cursor.fetchall()
-            if len(existing) > 1:
-                review_warnings.append(
-                    f"{calculation['label']}: найдено записей: {len(existing)}. Старые строки не меняются; проверьте их вручную."
-                )
-            elif existing:
-                saved = existing[0]
-                if abs(float(saved["amount"] or 0.0) - calculation["amount"]) > 0.01:
-                    review_warnings.append(
-                        f"{calculation['label']}: сохранено {float(saved['amount']):,.2f} SEK, "
-                        f"текущий preview {calculation['amount']:,.2f} SEK. Автоизменение запрещено, проверьте вручную."
-                    )
-                else:
-                    calculation["already_saved"] = True
-                    saved_description = str(saved["description"] or "")
-                    if not all(marker in saved_description for marker in (
-                        "Основа:", "Ставка:", "employees.salary_rate", estimate_disclaimer
-                    )):
-                        review_warnings.append(
-                            f"{calculation['label']}: источник исторической базы не подтверждён. "
-                            "Требует проверки; сумма оставлена без изменений."
-                        )
-            else:
-                pending_calculations.append(calculation)
-
-        conn.close()
-        preview_lines = [
-            f"Период: {d_from} — {d_to}",
-            "Это условная оценка, не подтверждённое налоговое обязательство. "
-            "База использует текущие ставки профиля, а не исторические ставки смен. OB исключён.",
-            f"Расчётная база: {total_payroll:,.2f} SEK (обычные часы × текущая ставка)",
-            *basis_lines,
-            "",
-            f"FORA: {total_payroll:,.2f} × {fora_rate * 100:.2f}% = {fora_amount:,.2f} SEK",
-            f"Arbetsgivaravgift: {total_payroll:,.2f} × {employer_rate * 100:.2f}% = {employer_amount:,.2f} SEK",
-            f"Оценка начислений (не оплата): {fora_amount + employer_amount:,.2f} SEK",
-        ]
-        if review_warnings:
-            preview_lines.extend(["", "Проверки:", *review_warnings])
-        if not pending_calculations:
-            ending = (
-                "За период уже найдены начисления; повторные начисления не добавлены. "
-                "При отсутствии сохранённой базы требуется ручная проверка."
-                if review_warnings else
-                "Оценки за этот период уже сохранены; повторно не добавлялись."
-            )
-            QMessageBox.information(
-                self, "Предварительный расчёт",
-                "\n".join(preview_lines + ["", ending]),
-            )
-            return
-        if review_warnings:
-            QMessageBox.warning(
-                self, "Нужна проверка", "\n".join(preview_lines + ["", "Ничего не сохранено. Проверьте исторические записи вручную."]),
-            )
-            return
-
-        confirmation = QMessageBox(self)
-        confirmation.setWindowTitle("Предварительный расчёт начислений")
-        confirmation.setIcon(QMessageBox.Icon.Information)
-        confirmation.setText("\n".join(preview_lines))
-        save_button = confirmation.addButton("Сохранить оценки", QMessageBox.ButtonRole.AcceptRole)
-        confirmation.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
-        confirmation.exec()
-        if confirmation.clickedButton() != save_button:
-            return
-
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
-            inserted = 0
-            for calculation in pending_calculations:
-                cursor.execute(
-                    "SELECT id, amount FROM company_expenses WHERE category = ? AND description LIKE ? ORDER BY id",
-                    (calculation["category"], calculation["prefix"] + "%"),
-                )
-                concurrent_existing = cursor.fetchall()
-                if concurrent_existing:
-                    if (len(concurrent_existing) == 1 and
-                            abs(float(concurrent_existing[0]["amount"] or 0.0) - calculation["amount"]) <= 0.01):
-                        continue
-                    raise RuntimeError(
-                        f"Период {d_from}–{d_to} уже имеет начисления {calculation['label']}; проверьте журнал."
-                    )
-                cursor.execute(
-                    "INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)",
-                    (d_to, calculation["category"], calculation["description"], calculation["amount"]),
-                )
-                inserted += 1
-            conn.commit()
-        except Exception as error:
-            if conn:
-                conn.rollback()
-            QMessageBox.warning(self, "Начисления не сохранены", str(error))
-            return
-        finally:
-            if conn:
-                conn.close()
-
-        self.load_expenses_table()
-        if inserted:
-            self.background_sync_with_cloud()
-        QMessageBox.information(
-              self, "Оценка расчёта",
-              (f"Сохранено оценок: {inserted}. Это не подтверждение обязанности или оплаты." if inserted else
-               "Оценки за этот период уже сохранены; повторные строки не добавлены.")
-        )
-
-    def add_company_expense(self, expense_date, category, description, amount):
-        expense_qdate = QDate.fromString(str(expense_date), "yyyy-MM-dd")
-        if amount is None or amount < 0:
-            QMessageBox.warning(self, "Расход", "Введите корректную неотрицательную сумму в SEK.")
-            return
-        if not expense_qdate.isValid() or not self.exp_date_from.date() <= expense_qdate <= self.exp_date_to.date():
-            QMessageBox.warning(self, "Расход", "Дата расхода должна входить в выбранный период.")
-            return
-        if str(description).startswith("Авторасчет"):
-            QMessageBox.warning(self, "Расход", "Комментарий зарезервирован для автооценок.")
-            return
-        conn = get_db_connection()
-        conn.execute(
-            "INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)",
-            (expense_date, category, description, amount),
-        )
-        conn.commit()
-        conn.close()
-        self.load_expenses_table()
-        self.background_sync_with_cloud()
-
-    def load_expenses_table(self):
-        date_from = self.exp_date_from.text().strip()
-        date_to = self.exp_date_to.text().strip()
-        self.exp_period_label.setText(f"Выбранный период: {date_from} — {date_to}")
-        if date_from > date_to:
-            self.exp_warning_lbl.setText("Период некорректен: дата начала позже даты окончания.")
-            self.exp_warning_lbl.show()
-            self.exp_summary_expenses_lbl.setText("0.00 SEK")
-            self.exp_summary_fora_lbl.setText("0.00 SEK")
-            self.exp_summary_employer_lbl.setText("0.00 SEK")
-            self.exp_summary_review_lbl.setText("0 шт.")
-            self.table_expenses.setRowCount(0)
-            return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        accrual_pattern = f"Авторасчет%за период {date_from} - {date_to}%"
-        cursor.execute("""
-            SELECT id, date, category, description, amount
-            FROM company_expenses
-            WHERE description LIKE ?
-               OR ((description IS NULL OR description NOT LIKE 'Авторасчет%') AND date >= ? AND date <= ?)
-            ORDER BY date DESC, id DESC
-        """, (accrual_pattern, date_from, date_to))
-        rows = cursor.fetchall()
-        conn.close()
-
-        ordinary_expenses = employer_estimate = fora_estimate = 0.0
-        auto_counts = {}
-        for row in rows:
-            category = str(row["category"] or "")
-            description = str(row["description"] or "")
-            is_auto = description.startswith("Авторасчет")
-            if not is_auto:
-                ordinary_expenses += float(row["amount"] or 0.0)
-            else:
-                auto_key = (category, description.split(";", 1)[0])
-                auto_counts[auto_key] = auto_counts.get(auto_key, 0) + 1
-
-        estimate_fora = estimate_employer = 0.0
-        review_rows = []
-        statuses = {}
-        for row in rows:
-            expense_id = int(row["id"])
-            category = str(row["category"] or "")
-            description = str(row["description"] or "")
-            if not description.startswith("Авторасчет"):
-                statuses[expense_id] = "Расход внесён вручную"
-                continue
-
-            auto_key = (category, description.split(";", 1)[0])
-            category_key = category.casefold()
-            is_fora = "fora" in category_key
-            is_employer = "arbetsgivareavgift" in category_key or "arbetsgivaravgift" in category_key
-            provenance_ok = all(marker in description for marker in (
-                "Основа:", "Ставка:", "employees.salary_rate",
-                "формула не подтверждены как обязательство",
-            ))
-            reason = None
-            if auto_counts[auto_key] > 1:
-                reason = "дубли периода"
-            elif not provenance_ok:
-                reason = "нет подтверждённого источника базы/ставки"
-            elif not (is_fora or is_employer):
-                reason = "неизвестная категория оценки"
-
-            if reason:
-                statuses[expense_id] = f"Требует проверки: {reason}; исключено из оценок"
-                review_rows.append(expense_id)
-            else:
-                statuses[expense_id] = "Условная оценка; не подтверждённое обязательство"
-                if is_fora:
-                    estimate_fora += float(row["amount"] or 0.0)
-                else:
-                    estimate_employer += float(row["amount"] or 0.0)
-
-        self.exp_summary_expenses_lbl.setText(f"{ordinary_expenses:,.2f} SEK")
-        self.exp_summary_fora_lbl.setText(f"{estimate_fora:,.2f} SEK")
-        self.exp_summary_employer_lbl.setText(f"{estimate_employer:,.2f} SEK")
-        self.exp_summary_review_lbl.setText(f"{len(review_rows)} шт.")
-
-        categories = sorted({str(row["category"] or "") for row in rows if row["category"]})
-        selected_category = self.exp_filter_category.currentText()
-        self.exp_filter_category.blockSignals(True)
-        self.exp_filter_category.clear()
-        self.exp_filter_category.addItem("Все категории")
-        self.exp_filter_category.addItems(categories)
-        category_index = self.exp_filter_category.findText(selected_category)
-        if category_index >= 0:
-            self.exp_filter_category.setCurrentIndex(category_index)
-        self.exp_filter_category.blockSignals(False)
-
-        self.table_expenses.setRowCount(len(rows))
-        for row_idx, row in enumerate(rows):
-            expense_id, date, category, description, amount = row
-            category = str(category or "")
-            description = str(description or "")
-            status = statuses[int(expense_id)]
-            for column, value in enumerate((expense_id, date, category, description, f"{float(amount):,.2f} SEK", status)):
-                item = QTableWidgetItem(str(value))
-                if column in (2, 3, 5):
-                    item.setToolTip(str(value))
-                self.table_expenses.setItem(row_idx, column, item)
-
-        if review_rows:
-            self.exp_warning_lbl.setText(
-                f"Требуют проверки: {len(review_rows)} старых/дублирующихся автооценок исключены из карточек. "
-                "Их суммы не считаются подтверждёнными и не складываются с ручными расходами."
-            )
-            self.exp_warning_lbl.show()
-        else:
-            self.exp_warning_lbl.clear()
-            self.exp_warning_lbl.hide()
-        self.apply_expense_journal_filters()
-
-    def delete_company_expense(self, index=None):
-        selected = self.table_expenses.currentRow()
-        if selected < 0:
-            return
-        id_item = self.table_expenses.item(selected, 0)
-        date_item = self.table_expenses.item(selected, 1)
-        category_item = self.table_expenses.item(selected, 2)
-        description_item = self.table_expenses.item(selected, 3)
-        amount_item = self.table_expenses.item(selected, 4)
-        if not all((id_item, date_item, category_item, amount_item)):
-            return
-        confirmation_text = (
-            f"Удалить выбранную запись #{id_item.text()}?\n\n"
-            f"Дата: {date_item.text()}\n"
-            f"Категория: {category_item.text()}\n"
-            f"Сумма: {amount_item.text()}"
-        )
-        if QMessageBox.question(
-            self, "Удаление расхода", confirmation_text,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        conn = get_db_connection()
-        cursor = conn.execute("DELETE FROM company_expenses WHERE id = ?", (int(id_item.text()),))
-        conn.commit()
-        deleted = cursor.rowcount == 1
-        conn.close()
-        if deleted:
-            self.load_expenses_table()
-            self.background_sync_with_cloud()
-
-    def edit_balance_entry(self, balance_id=None, *_):
-        if balance_id is None:
-            selected = self.table_balance.currentRow()
-            item = self.table_balance.item(selected, 0) if selected >= 0 else None
-            balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if balance_id is None:
-            QMessageBox.information(self, "Баланс", "Выберите операцию для изменения.")
-            return
-        conn = get_db_connection()
-        row = conn.execute(
-            "SELECT id, date, employee, description, change_amount FROM balance WHERE id = ?",
-            (int(balance_id),),
-        ).fetchone()
-        conn.close()
-        if row is None:
-            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
-            self.load_balance_table()
-            return
-        self._editing_balance_id = int(row["id"])
-        self.bal_date.setText(str(row["date"]))
-        self.bal_emp_cb.setCurrentText(str(row["employee"]))
-        self.bal_desc.setText(str(row["description"]))
-        self.bal_amount.setText(str(row["change_amount"]))
-        self.add_balance_button.setText("Сохранить изменения")
-
-    def update_balance_entry(self, balance_id=None, date=None, employee=None, description=None, amount=None):
-        balance_id = int(balance_id or self.__dict__.get("_editing_balance_id", 0) or 0)
-        if not balance_id:
-            QMessageBox.warning(self, "Баланс", "Сначала выберите операцию для изменения.")
-            return False
-        date = self.bal_date.text().strip() if date is None else str(date)
-        employee = self.bal_emp_cb.currentText().strip() if employee is None else str(employee).strip()
-        description = self.bal_desc.text().strip() if description is None else str(description).strip()
-        amount = parse_float(self.bal_amount.text(), None) if amount is None else parse_float(amount, None)
-        if amount is None or not employee:
-            QMessageBox.warning(self, "Баланс", "Введите сотрудника/контакт и корректную сумму.")
-            return False
-        conn = get_db_connection()
-        cursor = conn.execute(
-            "UPDATE balance SET date = ?, employee = ?, description = ?, change_amount = ? WHERE id = ?",
-            (date, employee, description, amount, balance_id),
-        )
-        conn.commit()
-        updated = cursor.rowcount == 1
-        conn.close()
-        if not updated:
-            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
-            self.cancel_balance_edit()
-            self.load_balance_table()
-            return False
-        self.cancel_balance_edit()
-        self.load_balance_table()
-        QMessageBox.information(self, "Баланс", f"Операция #{balance_id} обновлена.")
-        return True
-
-    def cancel_balance_edit(self):
-        self.__dict__["_editing_balance_id"] = None
-        self.bal_date.setDate(QDate.currentDate())
-        self.bal_emp_cb.setCurrentText("")
-        self.bal_desc.clear()
-        self.bal_amount.clear()
-        self.add_balance_button.setText("Добавить операцию")
-
-    def delete_balance_entry(self):
-        selected = self.table_balance.currentRow()
-        item = self.table_balance.item(selected, 0) if selected >= 0 else None
-        balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if balance_id is None:
-            QMessageBox.information(self, "Баланс", "Выберите операцию для удаления.")
-            return False
-        confirmation = QMessageBox.question(
-            self, "Удаление операции",
-            f"Удалить операцию #{balance_id}?\nДата: {item.text()}\n"
-            f"Сотрудник/контакт: {self.table_balance.item(selected, 1).text()}\n"
-            f"Сумма: {self.table_balance.item(selected, 3).text()}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirmation != QMessageBox.StandardButton.Yes:
-            return False
-        conn = get_db_connection()
-        cursor = conn.execute("DELETE FROM balance WHERE id = ?", (int(balance_id),))
-        conn.commit()
-        deleted = cursor.rowcount == 1
-        conn.close()
-        if deleted:
-            self.load_balance_table()
-        return deleted
 
     def _format_currency_totals(self, totals):
         if not totals:
@@ -3795,6 +3316,127 @@ class SmartReportApp(QMainWindow):
         QMessageBox.information(self, "Оплата", f"Платёж сохранён. Состояние: {status}.")
         self.load_expense_documents()
 
+    def apply_expense_period_preset(self, *_):
+        if self._updating_expense_dates:
+            return
+        preset = self.exp_period_preset.currentData()
+        today = QDate.currentDate()
+        if preset == "custom":
+            self.load_expenses_table()
+            return
+        if preset == "this_month":
+            date_from = QDate(today.year(), today.month(), 1)
+            date_to = date_from.addMonths(1).addDays(-1)
+        elif preset == "last_month":
+            date_from = QDate(today.year(), today.month(), 1).addMonths(-1)
+            date_to = date_from.addMonths(1).addDays(-1)
+        elif preset == "last_30":
+            date_from = today.addDays(-29)
+            date_to = today
+        else:
+            date_from = QDate(today.year(), 1, 1)
+            date_to = QDate(today.year(), 12, 31)
+        self._updating_expense_dates = True
+        self.exp_date_from.setDate(date_from)
+        self.exp_date_to.setDate(date_to)
+        self._updating_expense_dates = False
+        self.load_expenses_table()
+
+    def on_expense_date_changed(self, *_):
+        if not self._updating_expense_dates:
+            custom_index = self.exp_period_preset.findData("custom")
+            if custom_index >= 0 and self.exp_period_preset.currentIndex() != custom_index:
+                self._updating_expense_dates = True
+                self.exp_period_preset.setCurrentIndex(custom_index)
+                self._updating_expense_dates = False
+            self.load_expenses_table()
+
+    def open_add_expense_dialog(self):
+        if self.exp_date_from.date() > self.exp_date_to.date():
+            QMessageBox.warning(self, "Расход", "Сначала выберите корректный период.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Добавить расход")
+        dialog.setMinimumWidth(480)
+        form = QFormLayout(dialog)
+        today = QDate.currentDate()
+        period_start = self.exp_date_from.date()
+        period_end = self.exp_date_to.date()
+        default_date = today if period_start <= today <= period_end else period_end
+        expense_date = create_date_field(default_date.toString("yyyy-MM-dd"))
+        expense_date.setMinimumDate(period_start)
+        expense_date.setMaximumDate(period_end)
+        category = QComboBox()
+        category.addItems([
+            "Инструменты и расходники",
+            "Аренда склада / офиса",
+            "Лизинг и топливо транспорта (Ford Transit)",
+            "Бухгалтерия и страховка",
+            "Прочие накладные расходы",
+        ])
+        description = QLineEdit()
+        description.setPlaceholderText("Комментарий к расходу")
+        amount = QLineEdit()
+        amount.setPlaceholderText("Сумма в SEK")
+        form.addRow("Дата:", expense_date)
+        form.addRow("Категория:", category)
+        form.addRow("Комментарий:", description)
+        form.addRow("Сумма (SEK):", amount)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Добавить")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            expense_amount = parse_float(amount.text(), None)
+            if expense_amount is None or expense_amount < 0:
+                QMessageBox.warning(self, "Расход", "Введите корректную неотрицательную сумму в SEK.")
+                return
+            self.add_company_expense(
+                expense_date.text(), category.currentText(), description.text().strip(), expense_amount
+            )
+
+    def apply_expense_journal_filters(self, *_):
+        if not hasattr(self, "table_expenses"):
+            return
+        selected_category = self.exp_filter_category.currentText()
+        search_text = self.exp_filter_search.text().strip().casefold()
+        for row in range(self.table_expenses.rowCount()):
+            category_item = self.table_expenses.item(row, 2)
+            description_item = self.table_expenses.item(row, 3)
+            matches_category = (
+                selected_category == "Все категории"
+                or (category_item and category_item.text() == selected_category)
+            )
+            searchable = " ".join(
+                item.text() for item in (category_item, description_item) if item
+            ).casefold()
+            self.table_expenses.setRowHidden(
+                row, not matches_category or bool(search_text and search_text not in searchable)
+            )
+
+    def show_expense_details(self, *_):
+        row = self.table_expenses.currentRow()
+        if row < 0:
+            return
+        date_item = self.table_expenses.item(row, 1)
+        category_item = self.table_expenses.item(row, 2)
+        description_item = self.table_expenses.item(row, 3)
+        amount_item = self.table_expenses.item(row, 4)
+        status_item = self.table_expenses.item(row, 5)
+        details = [
+            f"ID: {self.table_expenses.item(row, 0).text() if self.table_expenses.item(row, 0) else ''}",
+            f"Дата: {date_item.text() if date_item else ''}",
+            f"Категория: {category_item.text() if category_item else ''}",
+            f"Сумма: {amount_item.text() if amount_item else ''}",
+            f"Статус: {status_item.text() if status_item else ''}",
+            "",
+            description_item.text() if description_item else "",
+        ]
+        QMessageBox.information(self, "Подробности записи", "\n".join(details))
+
     def edit_company_expense(self, *_):
         selected = self.table_expenses.currentRow()
         id_item = self.table_expenses.item(selected, 0) if selected >= 0 else None
@@ -3891,6 +3533,382 @@ class SmartReportApp(QMainWindow):
         self.load_expenses_table()
         self.background_sync_with_cloud()
         return True
+
+    def auto_calculate_taxes_and_fora(self):
+        d_from = self.exp_date_from.text().strip()
+        d_to = self.exp_date_to.text().strip()
+        if d_from > d_to:
+            QMessageBox.warning(self, "Расчёт", "Сначала выберите корректный период.")
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, COALESCE(salary_rate, 0.0) FROM employees")
+        rates = {str(row[0]).strip().lower(): row[1] for row in cursor.fetchall()}
+
+        cursor.execute("""
+            SELECT employee, SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as total_hours
+            FROM shifts
+            WHERE date >= ? AND date <= ?
+            GROUP BY employee
+        """, (d_from, d_to))
+        shift_rows = cursor.fetchall()
+
+        if not shift_rows:
+            conn.close()
+            QMessageBox.warning(self, "Внимание", "За выбранный период нет отработанных смен для расчета отчислений!")
+            return
+
+        total_payroll = 0.0
+        basis_lines = []
+        missing_rates = []
+        for row in shift_rows:
+            emp_key = str(row[0]).strip().lower()
+            employee_name = str(row[0])
+            work_hours = float(row[1] or 0.0)
+            rate = float(rates.get(emp_key, 0.0) or 0.0)
+            if work_hours <= 0:
+                continue
+            if rate <= 0:
+                missing_rates.append(employee_name)
+                continue
+            employee_base = work_hours * rate
+            total_payroll += employee_base
+            basis_lines.append(
+                f"{employee_name}: {work_hours:.2f} ч × {rate:.2f} SEK/ч "
+                f"(текущая ставка профиля) = {employee_base:.2f} SEK"
+            )
+
+        if missing_rates:
+            conn.close()
+            QMessageBox.warning(
+                self, "Оценка не рассчитана",
+                "Не найдена положительная текущая зарплатная ставка для: "
+                + ", ".join(missing_rates)
+                + ". Условную сумму не показываю и не сохраняю.",
+            )
+            return
+
+        if total_payroll <= 0:
+            conn.close()
+            QMessageBox.warning(self, "Внимание", "Фонд оплаты труда за период равен нулю. Проверьте ставки сотрудников!")
+            return
+
+        fora_rate = 0.052
+        employer_rate = 0.3142
+        fora_amount = total_payroll * fora_rate
+        employer_amount = total_payroll * employer_rate
+        payroll_basis = (
+            f"Источник часов: только обычная Работа; OB исключён. "
+            f"Источник ставки: employees.salary_rate (текущий профиль, не историческая ставка). "
+            f"База оценки: {total_payroll:.2f} SEK. "
+            + "; ".join(basis_lines)
+        )
+        estimate_disclaimer = "Оценка по текущей логике; процент и формула не подтверждены как обязательство"
+        calculations = [
+            {
+                "category": "FORA и страхование рабочих (Kollektivavtal)",
+                "prefix": f"Авторасчет FORA за период {d_from} - {d_to}",
+                "description": (
+                    f"Авторасчет FORA за период {d_from} - {d_to}; Основа: {payroll_basis}; "
+                    f"Ставка: {fora_rate * 100:.2f}%; {estimate_disclaimer}"
+                ),
+                "amount": fora_amount, "rate": fora_rate, "label": "FORA",
+            },
+            {
+                "category": "Налоги компании (Arbetsgivareavgift 31.42%)",
+                "prefix": f"Авторасчет социального налога за период {d_from} - {d_to}",
+                "description": (
+                    f"Авторасчет социального налога за период {d_from} - {d_to}; Основа: {payroll_basis}; "
+                    f"Ставка: {employer_rate * 100:.2f}%; {estimate_disclaimer}"
+                ),
+                "amount": employer_amount, "rate": employer_rate, "label": "Arbetsgivaravgift",
+            },
+        ]
+
+        review_warnings = []
+        pending_calculations = []
+        for calculation in calculations:
+            cursor.execute(
+                "SELECT id, amount, description FROM company_expenses WHERE category = ? AND description LIKE ? ORDER BY id",
+                (calculation["category"], calculation["prefix"] + "%"),
+            )
+            existing = cursor.fetchall()
+            if len(existing) > 1:
+                review_warnings.append(
+                    f"{calculation['label']}: найдено записей: {len(existing)}. Старые строки не меняются; проверьте их вручную."
+                )
+            elif existing:
+                saved = existing[0]
+                if abs(float(saved["amount"] or 0.0) - calculation["amount"]) > 0.01:
+                    review_warnings.append(
+                        f"{calculation['label']}: сохранено {float(saved['amount']):,.2f} SEK, "
+                        f"текущий preview {calculation['amount']:,.2f} SEK. Автоизменение запрещено, проверьте вручную."
+                    )
+                else:
+                    calculation["already_saved"] = True
+                    saved_description = str(saved["description"] or "")
+                    if not all(marker in saved_description for marker in (
+                        "Основа:", "Ставка:", "employees.salary_rate", estimate_disclaimer
+                    )):
+                        review_warnings.append(
+                            f"{calculation['label']}: источник исторической базы не подтверждён. "
+                            "Требует проверки; сумма оставлена без изменений."
+                        )
+            else:
+                pending_calculations.append(calculation)
+
+        conn.close()
+        preview_lines = [
+            f"Период: {d_from} — {d_to}",
+            "Это условная оценка, не подтверждённое налоговое обязательство. "
+            "База использует текущие ставки профиля, а не исторические ставки смен. OB исключён.",
+            f"Расчётная база: {total_payroll:,.2f} SEK (обычные часы × текущая ставка)",
+            *basis_lines,
+            "",
+            f"FORA: {total_payroll:,.2f} × {fora_rate * 100:.2f}% = {fora_amount:,.2f} SEK",
+            f"Arbetsgivaravgift: {total_payroll:,.2f} × {employer_rate * 100:.2f}% = {employer_amount:,.2f} SEK",
+            f"Оценка начислений (не оплата): {fora_amount + employer_amount:,.2f} SEK",
+        ]
+        if review_warnings:
+            preview_lines.extend(["", "Проверки:", *review_warnings])
+        if not pending_calculations:
+            ending = (
+                "За период уже найдены начисления; повторные начисления не добавлены. "
+                "При отсутствии сохранённой базы требуется ручная проверка."
+                if review_warnings else
+                "Оценки за этот период уже сохранены; повторно не добавлялись."
+            )
+            QMessageBox.information(
+                self, "Предварительный расчёт",
+                "\n".join(preview_lines + ["", ending]),
+            )
+            return
+        if review_warnings:
+            QMessageBox.warning(
+                self, "Нужна проверка", "\n".join(preview_lines + ["", "Ничего не сохранено. Проверьте исторические записи вручную."]),
+            )
+            return
+
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle("Предварительный расчёт начислений")
+        confirmation.setIcon(QMessageBox.Icon.Information)
+        confirmation.setText("\n".join(preview_lines))
+        save_button = confirmation.addButton("Сохранить оценки", QMessageBox.ButtonRole.AcceptRole)
+        confirmation.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        confirmation.exec()
+        if confirmation.clickedButton() != save_button:
+            return
+
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            inserted = 0
+            for calculation in pending_calculations:
+                cursor.execute(
+                    "SELECT id, amount FROM company_expenses WHERE category = ? AND description LIKE ? ORDER BY id",
+                    (calculation["category"], calculation["prefix"] + "%"),
+                )
+                concurrent_existing = cursor.fetchall()
+                if concurrent_existing:
+                    if (len(concurrent_existing) == 1 and
+                            abs(float(concurrent_existing[0]["amount"] or 0.0) - calculation["amount"]) <= 0.01):
+                        continue
+                    raise RuntimeError(
+                        f"Период {d_from}–{d_to} уже имеет начисления {calculation['label']}; проверьте журнал."
+                    )
+                cursor.execute(
+                    "INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)",
+                    (d_to, calculation["category"], calculation["description"], calculation["amount"]),
+                )
+                inserted += 1
+            conn.commit()
+        except Exception as error:
+            if conn:
+                conn.rollback()
+            QMessageBox.warning(self, "Начисления не сохранены", str(error))
+            return
+        finally:
+            if conn:
+                conn.close()
+
+        self.load_expenses_table()
+        if inserted:
+            self.background_sync_with_cloud()
+        QMessageBox.information(
+              self, "Оценка расчёта",
+              (f"Сохранено оценок: {inserted}. Это не подтверждение обязанности или оплаты." if inserted else
+               "Оценки за этот период уже сохранены; повторные строки не добавлены.")
+        )
+
+    def add_company_expense(self, expense_date, category, description, amount):
+        expense_qdate = QDate.fromString(str(expense_date), "yyyy-MM-dd")
+        if amount is None or amount < 0:
+            QMessageBox.warning(self, "Расход", "Введите корректную неотрицательную сумму в SEK.")
+            return
+        if not expense_qdate.isValid() or not self.exp_date_from.date() <= expense_qdate <= self.exp_date_to.date():
+            QMessageBox.warning(self, "Расход", "Дата расхода должна входить в выбранный период.")
+            return
+        if str(description).startswith("Авторасчет"):
+            QMessageBox.warning(self, "Расход", "Комментарий зарезервирован для автооценок.")
+            return
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO company_expenses (date, category, description, amount) VALUES (?, ?, ?, ?)",
+            (expense_date, category, description, amount),
+        )
+        conn.commit()
+        conn.close()
+        self.load_expenses_table()
+        self.background_sync_with_cloud()
+
+    def load_expenses_table(self):
+        date_from = self.exp_date_from.text().strip()
+        date_to = self.exp_date_to.text().strip()
+        self.exp_period_label.setText(f"Выбранный период: {date_from} — {date_to}")
+        if date_from > date_to:
+            self.exp_warning_lbl.setText("Период некорректен: дата начала позже даты окончания.")
+            self.exp_warning_lbl.show()
+            self.exp_summary_expenses_lbl.setText("0.00 SEK")
+            self.exp_summary_fora_lbl.setText("0.00 SEK")
+            self.exp_summary_employer_lbl.setText("0.00 SEK")
+            self.exp_summary_review_lbl.setText("0 шт.")
+            self.table_expenses.setRowCount(0)
+            return
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        accrual_pattern = f"Авторасчет%за период {date_from} - {date_to}%"
+        cursor.execute("""
+            SELECT id, date, category, description, amount
+            FROM company_expenses
+            WHERE description LIKE ?
+               OR ((description IS NULL OR description NOT LIKE 'Авторасчет%') AND date >= ? AND date <= ?)
+            ORDER BY date DESC, id DESC
+        """, (accrual_pattern, date_from, date_to))
+        rows = cursor.fetchall()
+        conn.close()
+
+        ordinary_expenses = employer_estimate = fora_estimate = 0.0
+        auto_counts = {}
+        for row in rows:
+            category = str(row["category"] or "")
+            description = str(row["description"] or "")
+            is_auto = description.startswith("Авторасчет")
+            if not is_auto:
+                ordinary_expenses += float(row["amount"] or 0.0)
+            else:
+                auto_key = (category, description.split(";", 1)[0])
+                auto_counts[auto_key] = auto_counts.get(auto_key, 0) + 1
+
+        estimate_fora = estimate_employer = 0.0
+        review_rows = []
+        statuses = {}
+        for row in rows:
+            expense_id = int(row["id"])
+            category = str(row["category"] or "")
+            description = str(row["description"] or "")
+            if not description.startswith("Авторасчет"):
+                statuses[expense_id] = "Расход внесён вручную"
+                continue
+
+            auto_key = (category, description.split(";", 1)[0])
+            category_key = category.casefold()
+            is_fora = "fora" in category_key
+            is_employer = "arbetsgivareavgift" in category_key or "arbetsgivaravgift" in category_key
+            provenance_ok = all(marker in description for marker in (
+                "Основа:", "Ставка:", "employees.salary_rate",
+                "формула не подтверждены как обязательство",
+            ))
+            reason = None
+            if auto_counts[auto_key] > 1:
+                reason = "дубли периода"
+            elif not provenance_ok:
+                reason = "нет подтверждённого источника базы/ставки"
+            elif not (is_fora or is_employer):
+                reason = "неизвестная категория оценки"
+
+            if reason:
+                statuses[expense_id] = f"Требует проверки: {reason}; исключено из оценок"
+                review_rows.append(expense_id)
+            else:
+                statuses[expense_id] = "Условная оценка; не подтверждённое обязательство"
+                if is_fora:
+                    estimate_fora += float(row["amount"] or 0.0)
+                else:
+                    estimate_employer += float(row["amount"] or 0.0)
+
+        self.exp_summary_expenses_lbl.setText(f"{ordinary_expenses:,.2f} SEK")
+        self.exp_summary_fora_lbl.setText(f"{estimate_fora:,.2f} SEK")
+        self.exp_summary_employer_lbl.setText(f"{estimate_employer:,.2f} SEK")
+        self.exp_summary_review_lbl.setText(f"{len(review_rows)} шт.")
+
+        categories = sorted({str(row["category"] or "") for row in rows if row["category"]})
+        selected_category = self.exp_filter_category.currentText()
+        self.exp_filter_category.blockSignals(True)
+        self.exp_filter_category.clear()
+        self.exp_filter_category.addItem("Все категории")
+        self.exp_filter_category.addItems(categories)
+        category_index = self.exp_filter_category.findText(selected_category)
+        if category_index >= 0:
+            self.exp_filter_category.setCurrentIndex(category_index)
+        self.exp_filter_category.blockSignals(False)
+
+        self.table_expenses.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            expense_id, date, category, description, amount = row
+            category = str(category or "")
+            description = str(description or "")
+            status = statuses[int(expense_id)]
+            for column, value in enumerate((expense_id, date, category, description, f"{float(amount):,.2f} SEK", status)):
+                item = QTableWidgetItem(str(value))
+                if column in (2, 3, 5):
+                    item.setToolTip(str(value))
+                self.table_expenses.setItem(row_idx, column, item)
+
+        if review_rows:
+            self.exp_warning_lbl.setText(
+                f"Требуют проверки: {len(review_rows)} старых/дублирующихся автооценок исключены из карточек. "
+                "Их суммы не считаются подтверждёнными и не складываются с ручными расходами."
+            )
+            self.exp_warning_lbl.show()
+        else:
+            self.exp_warning_lbl.clear()
+            self.exp_warning_lbl.hide()
+        self.apply_expense_journal_filters()
+
+    def delete_company_expense(self, index=None):
+        selected = self.table_expenses.currentRow()
+        if selected < 0:
+            return
+        id_item = self.table_expenses.item(selected, 0)
+        date_item = self.table_expenses.item(selected, 1)
+        category_item = self.table_expenses.item(selected, 2)
+        description_item = self.table_expenses.item(selected, 3)
+        amount_item = self.table_expenses.item(selected, 4)
+        if not all((id_item, date_item, category_item, amount_item)):
+            return
+        confirmation_text = (
+            f"Удалить выбранную запись #{id_item.text()}?\n\n"
+            f"Дата: {date_item.text()}\n"
+            f"Категория: {category_item.text()}\n"
+            f"Сумма: {amount_item.text()}"
+        )
+        if QMessageBox.question(
+            self, "Удаление расхода", confirmation_text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        conn = get_db_connection()
+        cursor = conn.execute("DELETE FROM company_expenses WHERE id = ?", (int(id_item.text()),))
+        conn.commit()
+        deleted = cursor.rowcount == 1
+        conn.close()
+        if deleted:
+            self.load_expenses_table()
+            self.background_sync_with_cloud()
 
     def setup_object_expenses_tab(self):
         layout = QVBoxLayout(self.tab_object_expenses)
