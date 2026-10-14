@@ -99,6 +99,7 @@
         .login-card { background: #ffffff; padding: 30px; border-radius: 12px; width: 100%; max-width: 380px; border: 1px solid #dcdde1; box-shadow: 0 10px 30px rgba(0,0,0,0.15); }
         
         /* Шапка пользователя */
+        #user-info-text b { font-size: 22px; font-weight: 800; color: #1b6ca8; }
         .user-header { background: #ffffff; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #dcdde1; display: flex; justify-content: space-between; align-items: center; font-size: 15px; color: #2d3436; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
         .btn-logout { background: #d63031; width: auto; padding: 8px 14px; font-size: 14px; }
         .btn-logout:hover { background: #c0392b; }
@@ -163,10 +164,10 @@
                     <input type="date" id="date" name="date" required>
                 </div>
 
-                <div class="form-group">
+                <div class="form-group" id="employee-group" style="display: none;">
                     <label for="employee">Сотрудник:</label>
-                    <select id="employee" name="employee" required>
-                        <option value="">-- Выберите ваше имя --</option>
+                    <select id="employee" name="employee">
+                        <option value="">-- Выберите сотрудника --</option>
                         {% for emp in employees %}
                         <option value="{{ emp }}">{{ emp }}</option>
                         {% endfor %}
@@ -368,7 +369,26 @@
         let activeEditOperationId = null;
         let editOriginalTransport = 0;
         let reportPdfUrl = '';
-        document.getElementById('date').value = new Date().toISOString().split('T')[0];
+        const MAX_FUTURE_DAYS = 7;
+        let currentEmployeeName = '';
+        function getShiftEmployee() {
+            return currentUser && currentUser.role === 'admin'
+                ? document.getElementById('employee').value
+                : currentEmployeeName;
+        }
+        function localDateString(date) {
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+        function maxShiftDate() {
+            const limit = new Date();
+            limit.setDate(limit.getDate() + MAX_FUTURE_DAYS);
+            return localDateString(limit);
+        }
+        document.getElementById('date').value = localDateString(new Date());
+        document.getElementById('date').max = maxShiftDate();
         
         const now = new Date();
         const year = now.getFullYear();
@@ -560,7 +580,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         date, start_time: start, end_time: end,
-                        employee: edit ? activeEditShift.employee : document.getElementById('employee').value
+                        employee: edit ? activeEditShift.employee : getShiftEmployee()
                     })
                 });
                 const result = await response.json();
@@ -811,15 +831,18 @@
 
         async function setupUserInterface() {
             const userInfoText = document.getElementById('user-info-text');
-            const employeeSelect = document.getElementById('employee');
             const historyEmployeeSelect = document.getElementById('history-employee');
 
             if (currentUser.role === 'admin') {
                 userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>`;
-                employeeSelect.disabled = false;
+                currentEmployeeName = currentUser.username;
+                document.getElementById('employee-group').style.display = '';
+                document.getElementById('employee').required = true;
                 historyEmployeeSelect.disabled = false;
             } else {
                 userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
+                document.getElementById('employee-group').style.display = 'none';
+                document.getElementById('employee').required = false;
                 
                 try {
                     const res = await fetch('/get-active-employees');
@@ -833,7 +856,8 @@
                         }
                     }
 
-                    [employeeSelect, historyEmployeeSelect].forEach(select => {
+                    currentEmployeeName = matchedName;
+                    [historyEmployeeSelect].forEach(select => {
                         select.innerHTML = '';
                         const opt = document.createElement('option');
                         opt.value = matchedName;
@@ -893,8 +917,12 @@
             e.preventDefault();
             
             const selectedDate = document.getElementById('date').value;
-            const empName = document.getElementById('employee').value;
+            const empName = getShiftEmployee();
             const submissionType = document.getElementById('submission_type').value;
+            if (selectedDate > maxShiftDate()) {
+                showFormAlert("Нельзя отправлять смены более чем на 7 дней вперёд", "error");
+                return;
+            }
             if (submissionType === 'ob') {
                 const preview = await refreshObPreview(false);
                 if (!preview) return;
@@ -940,8 +968,12 @@
 
         async function executeShiftSubmission() {
             const selectedDate = document.getElementById('date').value;
-            const empName = document.getElementById('employee').value;
+            const empName = getShiftEmployee();
             const submissionType = document.getElementById('submission_type').value;
+            if (selectedDate > maxShiftDate()) {
+                showFormAlert("Нельзя отправлять смены более чем на 7 дней вперед", "error");
+                return;
+            }
             let hoursVal = parseFloat(document.getElementById('hours').value);
             let obPreview = null;
             if (submissionType === 'ob') {

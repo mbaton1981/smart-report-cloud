@@ -818,6 +818,10 @@ def submit_shift():
         conn.close()
         return jsonify({"ok": False, "error": "Некорректная дата (ожидается формат YYYY-MM-DD)"}), 400
 
+    if datetime.strptime(date_str, '%Y-%m-%d').date() > datetime.now().date() + timedelta(days=7):
+        conn.close()
+        return jsonify({"ok": False, "error": "Нельзя отправлять смены более чем на 7 дней вперед"}), 400
+
     if submission_type == "ob":
         if not ob_schema_ready(cursor):
             conn.close()
