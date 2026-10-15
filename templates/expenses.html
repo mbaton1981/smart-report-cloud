@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Фактуры и расходы по объектам</title>
+    <style>
+        :root { color-scheme: light; --ink: #24323a; --muted: #63727a; --line: #d6dfe2; --paper: #fff; --ground: #eef2f3; --blue: #087ca5; --green: #087f5b; --alert: #9b5a00; }
+        * { box-sizing: border-box; }
+        body { margin: 0; background: var(--ground); color: var(--ink); font: 15px/1.45 "Segoe UI", sans-serif; }
+        header { background: var(--paper); border-bottom: 1px solid var(--line); padding: 14px max(18px, calc((100vw - 1280px) / 2)); display: flex; align-items: center; gap: 18px; }
+        header h1 { margin: 0 auto 0 0; font-size: 21px; }
+        a { color: var(--blue); }
+        button, input, select, textarea { font: inherit; }
+        button { border: 0; border-radius: 4px; padding: 9px 13px; background: var(--blue); color: #fff; cursor: pointer; }
+        button.secondary { background: #e2eaed; color: var(--ink); }
+        button:hover { filter: brightness(.94); }
+        main { max-width: 1280px; margin: 20px auto; padding: 0 18px 30px; }
+        nav { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+        nav button { border-radius: 4px 4px 0 0; background: transparent; color: var(--muted); border-bottom: 3px solid transparent; }
+        nav button.active { color: var(--green); border-color: var(--green); font-weight: 700; }
+        .toolbar, .filters, .actions { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+        .toolbar { justify-content: space-between; margin: 12px 0; }
+        .filters { padding: 10px 0; }
+        label { display: grid; gap: 4px; color: var(--muted); font-size: 13px; }
+        input, select, textarea { min-width: 0; border: 1px solid #b8c5ca; border-radius: 4px; padding: 8px 9px; background: #fff; color: var(--ink); }
+        input[type="file"] { max-width: 100%; }
+        textarea { width: 100%; resize: vertical; }
+        .stats { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 8px; margin: 12px 0; }
+        .stat { background: var(--paper); border: 1px solid var(--line); padding: 10px 12px; }
+        .stat span { display: block; color: var(--muted); font-size: 12px; }
+        .stat strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+        .editor { background: var(--paper); border: 1px solid var(--line); padding: 14px; margin: 12px 0; }
+        .editor h2 { font-size: 17px; margin: 0 0 10px; }
+        .fields { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 10px; }
+        .fields .wide { grid-column: span 2; }
+        .allocation-head, .allocation-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(120px, 220px) auto; gap: 8px; align-items: center; margin: 7px 0; }
+        .allocation-head { color: var(--muted); font-size: 12px; }
+        .allocation-row button { background: #a83e36; }
+        .allocation-total { display: flex; flex-wrap: wrap; gap: 16px; border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+        .allocation-total strong { color: var(--ink); }
+        .actions { margin-top: 12px; }
+        .status { min-height: 24px; color: var(--alert); }
+        .table-wrap { overflow: auto; border: 1px solid var(--line); background: var(--paper); }
+        table { border-collapse: collapse; width: 100%; min-width: 850px; }
+        th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #e5ebed; vertical-align: top; }
+        th { position: sticky; top: 0; background: #e8eef0; color: #405159; font-size: 12px; }
+        tr[data-id] { cursor: pointer; }
+        tr[data-id]:hover { background: #f0f7f8; }
+        .empty { padding: 22px; color: var(--muted); }
+        [hidden] { display: none !important; }
+        @media (max-width: 760px) {
+            header { align-items: flex-start; flex-wrap: wrap; }
+            header h1 { order: -1; flex-basis: 100%; }
+            main { margin-top: 12px; padding: 0 12px 20px; }
+            .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .fields .wide { grid-column: span 2; }
+            .allocation-head { display: none; }
+            .allocation-row { grid-template-columns: minmax(0, 1fr) minmax(95px, 140px) auto; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <a href="/">К сменам</a>
+    <h1>Фактуры и расходы по объектам</h1>
+    <button class="secondary" type="button" onclick="logout()">Выйти</button>
+</header>
+<main>
+    <nav aria-label="Представление расходов">
+        <button class="active" type="button" data-view="archive">Архив фактур</button>
+        <button type="button" data-view="objects">Расходы по объектам</button>
+    </nav>
+    <div id="page-status" class="status" role="status"></div>
+    <section id="archive-view">
+        <div class="toolbar">
+            <div class="filters">
+                <label>С даты<input id="date-from" type="date"></label>
+                <label>По дату<input id="date-to" type="date"></label>
+                <label>Объект<select id="filter-object"><option value="">Все объекты</option></select></label>
+                <label>Поставщик<select id="filter-supplier"><option value="">Все поставщики</option></select></label>
+                <button id="apply-filters" type="button">Показать</button>
+            </div>
+            <button id="new-document" type="button">Добавить фактуру</button>
+        </div>
+        <div class="stats">
+            <div class="stat"><span>Подтверждено без НДС</span><strong id="sum-net">0.00</strong></div>
+            <div class="stat"><span>НДС по документам</span><strong id="sum-vat">0.00</strong></div>
+            <div class="stat"><span>Итог подтверждённых фактур</span><strong id="sum-gross">0.00</strong></div>
+            <div class="stat"><span>Не распределено</span><strong id="sum-unallocated">0.00</strong></div>
+            <div class="stat"><span>Проверить</span><strong id="sum-review">0</strong></div>
+        </div>
+        <form id="document-form" class="editor" hidden>
+            <h2 id="editor-title">Новая фактура</h2>
+            <div class="fields">
+                <label>Поставщик<input id="supplier" maxlength="250"></label>
+                <label>Номер документа<input id="invoice-number" maxlength="120"></label>
+                <label>Дата документа<input id="document-date" type="date"></label>
+                <label>Валюта<select id="currency"><option>SEK</option><option>EUR</option><option>NOK</option><option>DKK</option><option>USD</option><option>GBP</option><option>CHF</option><option>PLN</option><option>UNKNOWN</option></select></label>
+                <label>Сумма без НДС<input id="net-amount" inputmode="decimal"></label>
+                <label>НДС<input id="vat-amount" inputmode="decimal"></label>
+                <label>Сумма с НДС<input id="gross-amount" inputmode="decimal"></label>
+                <label>Категория<select id="category"><option>Материалы</option><option>Услуги</option><option>Аренда</option><option>Транспорт</option><option>Инструменты</option><option>Прочие расходы</option></select></label>
+                <label class="wide">Комментарий<textarea id="comment" rows="2" maxlength="4000"></textarea></label>
+                <label class="wide">Оригинал<input id="original" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp"></label>
+            </div>
+            <h3>Распределение</h3>
+            <div class="allocation-head"><span>Объект</span><span>Сумма с НДС</span><span></span></div>
+            <div id="allocation-rows"></div>
+            <button id="add-allocation" class="secondary" type="button">Добавить объект</button>
+            <div class="allocation-total">
+                <span>Итого: <strong id="allocation-document-total">0.00</strong></span>
+                <span>Распределено: <strong id="allocation-allocated">0.00</strong></span>
+                <span>Не распределено: <strong id="allocation-unallocated">0.00</strong></span>
+            </div>
+            <div class="actions">
+                <button type="button" data-save-status="draft">Сохранить черновик</button>
+                <button type="button" data-save-status="requires_review">Требует проверки</button>
+                <button type="button" data-save-status="confirmed">Подтвердить</button>
+                <button id="cancel-edit" class="secondary" type="button">Отмена</button>
+            </div>
+            <div id="editor-status" class="status" role="status"></div>
+        </form>
+        <div class="table-wrap"><table>
+            <thead><tr><th>Дата</th><th>Поставщик</th><th>Номер</th><th>Объекты</th><th>Итог</th><th>Распределено</th><th>Не распределено</th><th>Статус</th><th>Оригинал</th></tr></thead>
+            <tbody id="archive-rows"></tbody>
+        </table></div>
+    </section>
+    <section id="objects-view" hidden>
+        <div class="filters">
+            <label>Объект<select id="object-select"></select></label>
+            <label>С даты<input id="object-date-from" type="date"></label>
+            <label>По дату<input id="object-date-to" type="date"></label>
+            <button id="load-object-summary" type="button">Показать</button>
+        </div>
+        <div class="stats">
+            <div class="stat"><span>Расход с НДС</span><strong id="object-gross">0.00</strong></div>
+            <div class="stat"><span>Расход без НДС</span><strong id="object-net">0.00</strong></div>
+            <div class="stat"><span>НДС по документам</span><strong id="object-vat">0.00</strong></div>
+            <div class="stat"><span>Материалы</span><strong id="object-materials">0.00</strong></div>
+            <div class="stat"><span>Прочие расходы</span><strong id="object-other">0.00</strong></div>
+        </div>
+        <div id="object-status" class="status"></div>
+        <div class="table-wrap"><table>
+            <thead><tr><th>Дата</th><th>Поставщик</th><th>Номер</th><th>Категория</th><th>Доля без НДС</th><th>Доля НДС</th><th>Доля с НДС</th><th>Вся фактура</th><th>Не распределено</th><th>Статус</th></tr></thead>
+            <tbody id="object-rows"></tbody>
+        </table></div>
+    </section>
+</main>
+<script>
+    const csrfToken = "{{ csrf_token }}";
+    const objects = [];
+    let documents = [];
+    let archiveSuppliers = [];
+    let editingDocument = null;
+    let clientId = newClientId();
+    const $ = (id) => document.getElementById(id);
+    const money = (value) => {
+        const number = Number(value || 0);
+        return Number.isFinite(number) ? number.toFixed(2) : "0.00";
+    };
+    function newClientId() {
+        return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+    async function api(url, options = {}) {
+        const headers = new Headers(options.headers || {});
+        if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", csrfToken);
+        const response = await fetch(url, { credentials: "same-origin", ...options, headers });
+        const payload = response.headers.get("content-type")?.includes("application/json") ? await response.json() : {};
+        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        return payload;
+    }
+    function setStatus(message, target = "page-status") { $(target).textContent = message || ""; }
+    function addAllocationRow(allocation = {}) {
+        const row = document.createElement("div");
+        row.className = "allocation-row";
+        const select = document.createElement("select");
+        select.innerHTML = '<option value="">Выберите объект</option>';
+        for (const item of objects) {
+            const option = document.createElement("option");
+            option.value = item.id;
+            option.textContent = `${item.name}${item.markning ? ` (${item.markning})` : ""}${item.company ? ` · ${item.company}` : ""}`;
+            select.appendChild(option);
+        }
+        select.value = allocation.object_id || "";
+        const amount = document.createElement("input");
+        amount.inputMode = "decimal";
+        amount.placeholder = "0.00";
+        amount.value = allocation.gross_amount || "";
+        amount.addEventListener("input", updateAllocationTotals);
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "Удалить";
+        remove.addEventListener("click", () => { row.remove(); updateAllocationTotals(); });
+        row.append(select, amount, remove);
+        $("allocation-rows").appendChild(row);
+        updateAllocationTotals();
+    }
+    function updateAllocationTotals() {
+        const total = Number($("gross-amount").value.replace(",", ".") || 0);
+        const allocated = [...$("allocation-rows").querySelectorAll(".allocation-row input")]
+            .reduce((sum, input) => sum + Number(input.value.replace(",", ".") || 0), 0);
+        $("allocation-document-total").textContent = money(total);
+        $("allocation-allocated").textContent = money(allocated);
+        $("allocation-unallocated").textContent = money(total - allocated);
+    }
+    function formatCurrency(amount, currency) { return amount == null ? "—" : `${currency} ${money(amount)}`; }
+    function renderArchive() {
+        const body = $("archive-rows");
+        body.replaceChildren();
+        const totals = new Map();
+        let reviewCount = 0;
+        for (const doc of documents) {
+            const currency = doc.currency_code || "UNKNOWN";
+            const bucket = totals.get(currency) || { net: 0, vat: 0, gross: 0, unallocated: 0 };
+            if (doc.verification_status === "confirmed") {
+                bucket.net += Number(doc.net_amount || 0);
+                bucket.vat += Number(doc.vat_amount || 0);
+                bucket.gross += Number(doc.gross_amount || 0);
+            } else reviewCount++;
+            bucket.unallocated += Number(doc.unallocated_gross || 0);
+            totals.set(currency, bucket);
+            const row = document.createElement("tr");
+            row.dataset.id = doc.id;
+            const names = [...new Set(doc.allocations.map((item) => item.object_name))].join(", ") || "Без объекта";
+            const values = [doc.document_date || "—", doc.supplier_name || "Не указан", doc.invoice_number || "—", names,
+                formatCurrency(doc.gross_amount, currency), formatCurrency(doc.allocated_gross, currency),
+                formatCurrency(doc.unallocated_gross, currency), doc.verification_status, doc.has_original ? "Открыть" : "Нет"];
+            for (const value of values) {
+                const cell = document.createElement("td");
+                cell.textContent = value;
+                row.appendChild(cell);
+            }
+            row.addEventListener("click", () => editDocument(doc.id));
+            const originalCell = row.lastElementChild;
+            originalCell.addEventListener("click", (event) => {
+                event.stopPropagation();
+                if (doc.has_original) window.open(`/api/expense-documents/${doc.id}/original`, "_blank", "noopener");
+            });
+            body.appendChild(row);
+        }
+        if (!documents.length) body.innerHTML = '<tr><td class="empty" colspan="9">Документов за выбранный период нет.</td></tr>';
+        const formatTotals = (key) => [...totals.entries()].map(([currency, value]) => `${currency} ${money(value[key])}`).join(" · ") || "0.00";
+        $("sum-net").textContent = formatTotals("net");
+        $("sum-vat").textContent = formatTotals("vat");
+        $("sum-gross").textContent = formatTotals("gross");
+        $("sum-unallocated").textContent = formatTotals("unallocated");
+        $("sum-review").textContent = String(reviewCount);
+        const supplierSelect = $("filter-supplier");
+        const selectedSupplier = supplierSelect.value;
+        supplierSelect.replaceChildren(new Option("Все поставщики", ""));
+        for (const name of archiveSuppliers) supplierSelect.add(new Option(name, name));
+        supplierSelect.value = selectedSupplier;
+    }
+    async function loadArchive() {
+        const params = new URLSearchParams();
+        if ($("date-from").value) params.set("date_from", $("date-from").value);
+        if ($("date-to").value) params.set("date_to", $("date-to").value);
+        if ($("filter-object").value) params.set("object_id", $("filter-object").value);
+        try {
+            const result = await api(`/api/expense-documents?${params}`);
+            archiveSuppliers = result.suppliers;
+            documents = result.documents;
+            const selectedSupplier = $("filter-supplier").value;
+            if (selectedSupplier) documents = documents.filter((doc) => doc.supplier_name === selectedSupplier);
+            renderArchive();
+            setStatus("");
+        } catch (error) { setStatus(error.message); }
+    }
+    function clearEditor() {
+        editingDocument = null;
+        clientId = newClientId();
+        $("document-form").reset();
+        $("editor-title").textContent = "Новая фактура";
+        $("currency").value = "SEK";
+        $("category").value = "Материалы";
+        $("allocation-rows").replaceChildren();
+        $("document-form").hidden = false;
+        setStatus("", "editor-status");
+        updateAllocationTotals();
+    }
+    async function editDocument(id) {
+        try {
+            const result = await api(`/api/expense-documents/${id}`);
+            const doc = result.document;
+            editingDocument = doc.id;
+            clientId = doc.client_id;
+            $("document-form").reset();
+            $("editor-title").textContent = `Документ #${doc.id}`;
+            $("supplier").value = doc.supplier_name || "";
+            $("invoice-number").value = doc.invoice_number || "";
+            $("document-date").value = doc.document_date || "";
+            const currency = $("currency");
+            if (![...currency.options].some((option) => option.value === doc.currency_code)) currency.add(new Option(doc.currency_code, doc.currency_code));
+            currency.value = doc.currency_code || "SEK";
+            $("net-amount").value = doc.net_amount || "";
+            $("vat-amount").value = doc.vat_amount || "";
+            $("gross-amount").value = doc.gross_amount || "";
+            const category = $("category");
+            if (![...category.options].some((option) => option.value === doc.expense_category)) category.add(new Option(doc.expense_category, doc.expense_category));
+            category.value = doc.expense_category || "Материалы";
+            $("comment").value = doc.document_comment || "";
+            $("allocation-rows").replaceChildren();
+            for (const allocation of doc.allocations) addAllocationRow(allocation);
+            $("document-form").hidden = false;
+            updateAllocationTotals();
+            $("document-form").scrollIntoView({ behavior: "smooth", block: "start" });
+        } catch (error) { setStatus(error.message); }
+    }
+    async function saveDocument(status) {
+        const allocations = [];
+        for (const row of $("allocation-rows").querySelectorAll(".allocation-row")) {
+            const objectId = row.querySelector("select").value;
+            const amount = row.querySelector("input").value.trim();
+            if (!amount) continue;
+            if (!objectId) { setStatus("Выберите объект для каждой распределённой суммы.", "editor-status"); return; }
+            allocations.push({ object_id: Number(objectId), gross_amount: amount });
+        }
+        const payload = {
+            client_id: clientId,
+            supplier_name: $("supplier").value.trim(),
+            invoice_number: $("invoice-number").value.trim(),
+            document_date: $("document-date").value || null,
+            currency_code: $("currency").value,
+            net_amount: $("net-amount").value.trim() || null,
+            vat_amount: $("vat-amount").value.trim() || null,
+            gross_amount: $("gross-amount").value.trim() || null,
+            expense_category: $("category").value,
+            document_comment: $("comment").value.trim(),
+            verification_status: status,
+            allocations,
+        };
+        const file = $("original").files[0];
+        try {
+            let result;
+            if (editingDocument) {
+                result = await api(`/api/expense-documents/${editingDocument}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+            } else if (file) {
+                const form = new FormData();
+                form.append("payload", JSON.stringify(payload));
+                form.append("original", file);
+                result = await api("/api/expense-documents", { method: "POST", body: form });
+            } else {
+                result = await api("/api/expense-documents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+            }
+            setStatus(`Сохранён документ #${result.document.id}.`, "editor-status");
+            $("document-form").hidden = true;
+            clientId = newClientId();
+            await loadArchive();
+            await loadObjectSummary();
+        } catch (error) { setStatus(error.message, "editor-status"); }
+    }
+    async function loadObjectSummary() {
+        const id = $("object-select").value;
+        if (!id) return;
+        const params = new URLSearchParams();
+        if ($("object-date-from").value) params.set("date_from", $("object-date-from").value);
+        if ($("object-date-to").value) params.set("date_to", $("object-date-to").value);
+        try {
+            const result = await api(`/api/expense-objects/${id}/expenses?${params}`);
+            const currencies = Object.entries(result.summary).map(([currency, amounts]) => ({ currency, amounts }));
+            const display = (key) => currencies.map(({ currency, amounts }) => `${currency} ${money(amounts[key])}`).join(" · ") || "0.00";
+            $("object-gross").textContent = display("gross");
+            $("object-net").textContent = display("net");
+            $("object-vat").textContent = display("vat");
+            $("object-materials").textContent = display("materials");
+            $("object-other").textContent = display("other");
+            const body = $("object-rows");
+            body.replaceChildren();
+            for (const doc of result.documents) {
+                const row = document.createElement("tr");
+                const values = [doc.document_date || "—", doc.supplier_name || "Не указан", doc.invoice_number || "—", doc.expense_category,
+                    formatCurrency(doc.object_net, doc.currency_code), formatCurrency(doc.object_vat, doc.currency_code),
+                    formatCurrency(doc.object_gross, doc.currency_code), formatCurrency(doc.gross_amount, doc.currency_code),
+                    formatCurrency(doc.unallocated_gross, doc.currency_code), doc.verification_status];
+                for (const value of values) { const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell); }
+                row.addEventListener("click", () => editDocument(doc.id));
+                body.appendChild(row);
+            }
+            if (!result.documents.length) body.innerHTML = '<tr><td class="empty" colspan="10">Нет документов по объекту за выбранный период.</td></tr>';
+            $("object-status").textContent = `Черновики: ${result.draft_count}; требуют проверки: ${result.review_count}.`;
+        } catch (error) { $("object-status").textContent = error.message; }
+    }
+    async function logout() { await api("/logout", { method: "POST" }); location.href = "/"; }
+    async function initialize() {
+        try {
+            const [objectResult] = await Promise.all([api("/api/expense-objects"), loadArchive()]);
+            objects.push(...objectResult.objects);
+            for (const object of objects) {
+                const label = `${object.name}${object.markning ? ` (${object.markning})` : ""}${object.company ? ` · ${object.company}` : ""}`;
+                $("filter-object").add(new Option(label, object.id));
+                $("object-select").add(new Option(label, object.id));
+            }
+            await loadArchive();
+            await loadObjectSummary();
+        } catch (error) { setStatus(error.message); }
+    }
+    document.querySelectorAll("nav button").forEach((button) => button.addEventListener("click", () => {
+        document.querySelectorAll("nav button").forEach((item) => item.classList.toggle("active", item === button));
+        $("archive-view").hidden = button.dataset.view !== "archive";
+        $("objects-view").hidden = button.dataset.view !== "objects";
+        if (button.dataset.view === "objects") loadObjectSummary();
+    }));
+    $("apply-filters").addEventListener("click", loadArchive);
+    $("filter-supplier").addEventListener("change", loadArchive);
+    $("filter-object").addEventListener("change", loadArchive);
+    $("new-document").addEventListener("click", clearEditor);
+    $("add-allocation").addEventListener("click", () => addAllocationRow());
+    $("gross-amount").addEventListener("input", updateAllocationTotals);
+    $("cancel-edit").addEventListener("click", () => { $("document-form").hidden = true; });
+    document.querySelectorAll("[data-save-status]").forEach((button) => button.addEventListener("click", () => saveDocument(button.dataset.saveStatus)));
+    $("load-object-summary").addEventListener("click", loadObjectSummary);
+    $("object-select").addEventListener("change", loadObjectSummary);
+    initialize();
+</script>
+</body>
+</html>

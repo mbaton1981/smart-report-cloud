@@ -276,7 +276,10 @@ def save_supplier_document(
         gross = parse_decimal(fields["gross_amount"])
         if net is None or vat is None or gross is None:
             raise ValueError("Суммы должны быть корректными десятичными значениями.")
-        if abs(net + vat - gross) > Decimal("0.02"):
+        rounded_net = Decimal(decimal_text(net))
+        rounded_vat = Decimal(decimal_text(vat))
+        rounded_gross = Decimal(decimal_text(gross))
+        if rounded_net + rounded_vat != rounded_gross:
             raise ValueError("Нетто + НДС не сходятся с итоговой суммой; исправьте документ перед подтверждением.")
         if allocations:
             valid, message = validate_allocations(gross, allocations)
@@ -329,31 +332,24 @@ def save_supplier_document(
         cursor = conn.execute("""
             INSERT INTO supplier_documents (
                 supplier_id, supplier_name, supplier_org_number, supplier_vat_number,
-                original_name, file_sha256, document_type, invoice_number, payment_reference,
-                document_date, due_date, currency_code, net_amount, vat_amount, gross_amount,
-                amount_due, expense_category, document_comment, is_reverse_charge, verification_status,
-                payment_status, recognized_text, review_reasons, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                original_name, file_sha256, document_type, invoice_number,
+                document_date, currency_code, net_amount, vat_amount, gross_amount,
+                expense_category, document_comment, verification_status,
+                recognized_text, review_reasons, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             supplier_id, supplier_name or None, supplier_org, supplier_vat,
             Path(source_path).name if source_path else None, file_hash, document_type,
-            fields.get("invoice_number"), fields.get("payment_reference"),
-            fields.get("document_date"), fields.get("due_date"),
+            fields.get("invoice_number"), fields.get("document_date"),
             str(fields.get("currency_code") or "UNKNOWN").upper(),
             decimal_text(fields.get("net_amount")), decimal_text(fields.get("vat_amount")),
-            decimal_text(fields.get("gross_amount")), decimal_text(fields.get("amount_due")),
+            decimal_text(fields.get("gross_amount")),
             str(fields.get("expense_category") or "Прочее"), str(fields.get("document_comment") or ""),
-            int(bool(fields.get("reverse_charge"))),
-            verification_status, str(fields.get("payment_status") or "unknown"),
+            verification_status,
             str(fields.get("raw_text") or ""), "\n".join(fields.get("review_reasons") or []),
             timestamp, timestamp,
         ))
         document_id = int(cursor.lastrowid)
-        for vat_line in fields.get("vat_lines") or []:
-            conn.execute(
-                "INSERT INTO supplier_document_vat_lines (document_id, vat_rate, taxable_base, vat_amount, note) VALUES (?, ?, ?, ?, ?)",
-                (document_id, str(vat_line.get("rate") or ""), decimal_text(vat_line.get("taxable_base")), decimal_text(vat_line.get("amount")) or "0.00", str(vat_line.get("note") or "")),
-            )
         for allocation in allocations:
             conn.execute(
                 "INSERT INTO supplier_document_allocations (document_id, object_id, allocated_net, allocated_vat, allocated_gross, allocation_note) VALUES (?, ?, ?, ?, ?, ?)",
@@ -374,54 +370,6 @@ def save_supplier_document(
             conn.rollback()
         if destination:
             destination.unlink(missing_ok=True)
-        raise
-
-
-def record_document_payment(
-    conn: sqlite3.Connection,
-    document_id: int,
-    paid_at: str,
-    amount: Decimal | str,
-    reference: str = "",
-) -> str:
-    payment_amount = parse_decimal(amount)
-    if payment_amount is None or payment_amount <= 0:
-        raise ValueError("Сумма оплаты должна быть больше нуля.")
-    conn.row_factory = sqlite3.Row
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        document = conn.execute(
-            "SELECT currency_code, amount_due, gross_amount FROM supplier_documents WHERE id = ?",
-            (int(document_id),),
-        ).fetchone()
-        if document is None:
-            raise ValueError("Документ не найден.")
-        paid_before = sum((parse_decimal(row[0]) or Decimal(0) for row in conn.execute(
-            "SELECT amount FROM supplier_document_payments WHERE document_id = ?", (int(document_id),)
-        )), Decimal(0))
-        due = parse_decimal(document["amount_due"]) or parse_decimal(document["gross_amount"])
-        paid_total = paid_before + payment_amount
-        if due is not None and paid_total - due > Decimal("0.02"):
-            raise ValueError("Сумма платежей превысит сумму документа.")
-        timestamp = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "INSERT INTO supplier_document_payments (document_id, paid_at, amount, currency_code, reference, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (int(document_id), paid_at, decimal_text(payment_amount), document["currency_code"], reference.strip(), timestamp),
-        )
-        if due is None:
-            status = "partially_paid"
-        elif paid_total >= due - Decimal("0.02"):
-            status = "paid"
-        else:
-            status = "partially_paid"
-        conn.execute(
-            "UPDATE supplier_documents SET payment_status = ?, updated_at = ? WHERE id = ?",
-            (status, timestamp, int(document_id)),
-        )
-        conn.commit()
-        return status
-    except Exception:
-        conn.rollback()
         raise
 
 
@@ -471,19 +419,96 @@ def validate_allocations(total_gross: Decimal | str, allocations: list[dict[str,
     total = parse_decimal(total_gross)
     if total is None:
         return False, "Сначала укажите общую сумму документа."
-    if not allocations:
-        return True, "Документ сохранится без объекта и может быть распределён позже."
-    allocated = []
+    total = total.quantize(CENT, rounding=ROUND_HALF_UP)
+    allocated = Decimal(0)
     for item in allocations:
         amount = parse_decimal(item.get("gross_amount"))
         if amount is None:
             return False, "У каждой строки распределения должна быть сумма."
-        allocated.append(amount)
-    summed = sum(allocated, Decimal(0)).quantize(CENT, rounding=ROUND_HALF_UP)
-    expected = total.quantize(CENT, rounding=ROUND_HALF_UP)
-    if summed != expected:
-        return False, f"Сумма распределения {decimal_text(summed)} не совпадает с документом {decimal_text(expected)}."
-    return True, "Распределение сходится с общей суммой документа."
+        amount = amount.quantize(CENT, rounding=ROUND_HALF_UP)
+        if amount and (total == 0 or (amount > 0) != (total > 0)):
+            return False, "Сумма распределения должна иметь тот же знак, что и сумма документа."
+        allocated += amount
+    allocated = allocated.quantize(CENT, rounding=ROUND_HALF_UP)
+    if abs(allocated) > abs(total):
+        return False, f"Распределено {decimal_text(allocated)}, что больше суммы документа {decimal_text(total)}."
+    remaining = (total - allocated).quantize(CENT, rounding=ROUND_HALF_UP)
+    if remaining:
+        return True, f"Не распределено: {decimal_text(remaining)}."
+    return True, "Документ распределён полностью."
+
+
+def allocation_breakdown(
+    total_gross: Decimal | str,
+    total_net: Decimal | str | None,
+    total_vat: Decimal | str | None,
+    allocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    valid, message = validate_allocations(total_gross, allocations)
+    if not valid:
+        raise ValueError(message)
+
+    gross = (parse_decimal(total_gross) or Decimal(0)).quantize(CENT, rounding=ROUND_HALF_UP)
+    net = parse_decimal(total_net)
+    vat = parse_decimal(total_vat)
+    net = net.quantize(CENT, rounding=ROUND_HALF_UP) if net is not None else None
+    vat = vat.quantize(CENT, rounding=ROUND_HALF_UP) if vat is not None else None
+    gross_rows = [
+        (parse_decimal(item.get("gross_amount")) or Decimal(0)).quantize(CENT, rounding=ROUND_HALF_UP)
+        for item in allocations
+    ]
+    assigned_gross = sum(gross_rows, Decimal(0))
+    fully_allocated = assigned_gross == gross
+    assigned_net = Decimal(0)
+    assigned_vat = Decimal(0)
+    rows = []
+
+    for index, (allocation, row_gross) in enumerate(zip(allocations, gross_rows)):
+        is_last = index == len(gross_rows) - 1
+        if net is None:
+            row_net = None
+        elif fully_allocated and is_last:
+            row_net = net - assigned_net
+        elif gross:
+            row_net = (net * abs(row_gross / gross)).quantize(CENT, rounding=ROUND_HALF_UP)
+            remaining_net = net - assigned_net
+            row_net = min(max(row_net, Decimal(0)), max(remaining_net, Decimal(0))) if net >= 0 else max(min(row_net, Decimal(0)), min(remaining_net, Decimal(0)))
+        else:
+            row_net = Decimal(0)
+        if vat is None:
+            row_vat = None
+        elif fully_allocated and is_last:
+            row_vat = vat - assigned_vat
+        elif net is not None and net + vat == gross and row_net is not None:
+            row_vat = row_gross - row_net
+        elif gross:
+            row_vat = (vat * abs(row_gross / gross)).quantize(CENT, rounding=ROUND_HALF_UP)
+            remaining_vat = vat - assigned_vat
+            row_vat = min(max(row_vat, Decimal(0)), max(remaining_vat, Decimal(0))) if vat >= 0 else max(min(row_vat, Decimal(0)), min(remaining_vat, Decimal(0)))
+        else:
+            row_vat = Decimal(0)
+
+        rows.append({
+            **allocation,
+            "gross_amount": row_gross,
+            "net_amount": row_net,
+            "vat_amount": row_vat,
+        })
+        if row_net is not None:
+            assigned_net += row_net
+        if row_vat is not None:
+            assigned_vat += row_vat
+
+    return {
+        "allocations": rows,
+        "allocated_gross": assigned_gross,
+        "unallocated_gross": gross - assigned_gross,
+        "allocated_net": assigned_net if net is not None else None,
+        "unallocated_net": net - assigned_net if net is not None else None,
+        "allocated_vat": assigned_vat if vat is not None else None,
+        "unallocated_vat": vat - assigned_vat if vat is not None else None,
+        "fully_allocated": fully_allocated,
+    }
 
 
 def is_material_expense_category(category: str | None) -> bool:
@@ -510,9 +535,8 @@ def get_object_expense_summary(
     def empty_totals() -> dict[str, Any]:
         return {
             "net": Decimal(0), "vat": Decimal(0), "gross": Decimal(0),
-            "paid": Decimal(0), "remaining": Decimal(0),
             "materials_gross": Decimal(0), "other_gross": Decimal(0),
-            "documents": set(), "unknown_payment_documents": set(),
+            "documents": set(),
         }
 
     lifetime: dict[str, dict[str, Any]] = {}
@@ -542,80 +566,42 @@ def get_object_expense_summary(
             continue
 
         allocations = conn.execute("""
-            SELECT id, object_id, allocated_net, allocated_vat, allocated_gross
+            SELECT id, object_id, allocated_net AS net_amount,
+                   allocated_vat AS vat_amount, allocated_gross AS gross_amount
             FROM supplier_document_allocations
             WHERE document_id = ? ORDER BY id
         """, (document_id,)).fetchall()
-        document_gross = parse_decimal(document["gross_amount"])
-        document_net = parse_decimal(document["net_amount"])
-        document_vat = parse_decimal(document["vat_amount"])
-        document_due = parse_decimal(document["amount_due"]) or document_gross
-        paid_total = sum((parse_decimal(row[0]) or Decimal(0) for row in conn.execute(
-            "SELECT amount FROM supplier_document_payments WHERE document_id = ?", (document_id,)
-        ).fetchall()), Decimal(0))
-        total_allocated = sum((parse_decimal(item["allocated_gross"]) or Decimal(0) for item in allocations), Decimal(0))
-        denominator = document_gross if document_gross not in (None, Decimal(0)) else total_allocated
-        if denominator == 0:
+        try:
+            breakdown = allocation_breakdown(
+                document["gross_amount"], document["net_amount"], document["vat_amount"],
+                [dict(item) for item in allocations],
+            )
+        except ValueError:
             continue
 
-        shares: list[dict[str, Any]] = []
-        net_assigned = vat_assigned = paid_assigned = due_assigned = Decimal(0)
-        for index, allocation in enumerate(allocations):
-            allocated_gross = parse_decimal(allocation["allocated_gross"]) or Decimal(0)
-            is_last = index == len(allocations) - 1
-            ratio = allocated_gross / denominator
-            allocated_net = parse_decimal(allocation["allocated_net"])
-            if allocated_net is None and document_net is not None:
-                allocated_net = document_net - net_assigned if is_last else (document_net * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
-            allocated_vat = parse_decimal(allocation["allocated_vat"])
-            if allocated_vat is None and document_vat is not None:
-                allocated_vat = document_vat - vat_assigned if is_last else (document_vat * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
-            paid_share = paid_total - paid_assigned if is_last else (paid_total * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
-            due_share = (document_due - due_assigned) if is_last and document_due is not None else (
-                (document_due * ratio).quantize(CENT, rounding=ROUND_HALF_UP) if document_due is not None else allocated_gross
-            )
-            shares.append({
-                "object_id": int(allocation["object_id"]) if allocation["object_id"] is not None else None,
-                "gross": allocated_gross, "net": allocated_net or Decimal(0),
-                "vat": allocated_vat or Decimal(0), "paid": paid_share,
-                "remaining": max(Decimal(0), due_share - paid_share),
-            })
-            net_assigned += allocated_net or Decimal(0)
-            vat_assigned += allocated_vat or Decimal(0)
-            paid_assigned += paid_share
-            due_assigned += due_share
-
-        for share in shares:
+        for share in breakdown["allocations"]:
             if share["object_id"] != int(object_id):
                 continue
             currency = str(document["currency_code"] or "UNKNOWN").upper()
             bucket = lifetime.setdefault(currency, empty_totals())
-            bucket["net"] += share["net"]
-            bucket["vat"] += share["vat"]
-            bucket["gross"] += share["gross"]
-            bucket["paid"] += share["paid"]
-            bucket["remaining"] += share["remaining"]
+            bucket["net"] += share["net_amount"] or Decimal(0)
+            bucket["vat"] += share["vat_amount"] or Decimal(0)
+            bucket["gross"] += share["gross_amount"]
             bucket["documents"].add(document_id)
-            if str(document["payment_status"]) == "unknown":
-                bucket["unknown_payment_documents"].add(document_id)
             if is_material_expense_category(document["expense_category"]):
-                bucket["materials_gross"] += share["gross"]
+                bucket["materials_gross"] += share["gross_amount"]
             else:
-                bucket["other_gross"] += share["gross"]
+                bucket["other_gross"] += share["gross_amount"]
             if in_period:
                 period_bucket = period.setdefault(currency, empty_totals())
-                period_bucket["net"] += share["net"]
-                period_bucket["vat"] += share["vat"]
-                period_bucket["gross"] += share["gross"]
-                period_bucket["paid"] += share["paid"]
-                period_bucket["remaining"] += share["remaining"]
+                period_bucket["net"] += share["net_amount"] or Decimal(0)
+                period_bucket["vat"] += share["vat_amount"] or Decimal(0)
+                period_bucket["gross"] += share["gross_amount"]
                 if is_material_expense_category(document["expense_category"]):
-                    period_bucket["materials_gross"] += share["gross"]
+                    period_bucket["materials_gross"] += share["gross_amount"]
                 else:
-                    period_bucket["other_gross"] += share["gross"]
+                    period_bucket["other_gross"] += share["gross_amount"]
                 period_bucket["documents"].add(document_id)
-                if str(document["payment_status"]) == "unknown":
-                    period_bucket["unknown_payment_documents"].add(document_id)
 
     return {
         "lifetime": lifetime,
@@ -745,7 +731,6 @@ def apply_expense_documents_migration(database_path: str | Path, backup_dir: str
             )""",
             """CREATE TABLE supplier_documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                expense_id INTEGER UNIQUE REFERENCES company_expenses(id) ON DELETE SET NULL,
                 supplier_id INTEGER REFERENCES expense_suppliers(id) ON DELETE SET NULL,
                 supplier_name TEXT,
                 supplier_org_number TEXT,
@@ -755,19 +740,14 @@ def apply_expense_documents_migration(database_path: str | Path, backup_dir: str
                 file_sha256 TEXT,
                 document_type TEXT NOT NULL CHECK (document_type IN ('invoice','receipt','credit_note','manual')),
                 invoice_number TEXT,
-                payment_reference TEXT,
                 document_date TEXT,
-                due_date TEXT,
                 currency_code TEXT NOT NULL DEFAULT 'UNKNOWN',
                 net_amount TEXT,
                 vat_amount TEXT,
                 gross_amount TEXT,
-                amount_due TEXT,
                 expense_category TEXT NOT NULL DEFAULT 'Прочее',
                 document_comment TEXT NOT NULL DEFAULT '',
-                is_reverse_charge INTEGER NOT NULL DEFAULT 0,
                 verification_status TEXT NOT NULL DEFAULT 'draft' CHECK (verification_status IN ('draft','requires_review','confirmed')),
-                payment_status TEXT NOT NULL DEFAULT 'unknown' CHECK (payment_status IN ('unknown','unpaid','partially_paid','paid')),
                 recognized_text TEXT NOT NULL DEFAULT '',
                 review_reasons TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -776,14 +756,6 @@ def apply_expense_documents_migration(database_path: str | Path, backup_dir: str
             "CREATE INDEX idx_supplier_documents_date ON supplier_documents(document_date)",
             "CREATE INDEX idx_supplier_documents_hash ON supplier_documents(file_sha256)",
             "CREATE INDEX idx_supplier_documents_invoice ON supplier_documents(supplier_id, invoice_number, document_date, gross_amount)",
-            """CREATE TABLE supplier_document_vat_lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER NOT NULL REFERENCES supplier_documents(id) ON DELETE CASCADE,
-                vat_rate TEXT,
-                taxable_base TEXT,
-                vat_amount TEXT NOT NULL,
-                note TEXT NOT NULL DEFAULT ''
-            )""",
             """CREATE TABLE supplier_document_allocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 document_id INTEGER NOT NULL REFERENCES supplier_documents(id) ON DELETE CASCADE,
@@ -794,15 +766,6 @@ def apply_expense_documents_migration(database_path: str | Path, backup_dir: str
                 allocation_note TEXT NOT NULL DEFAULT ''
             )""",
             "CREATE INDEX idx_supplier_document_allocations_object ON supplier_document_allocations(object_id)",
-            """CREATE TABLE supplier_document_payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER NOT NULL REFERENCES supplier_documents(id) ON DELETE RESTRICT,
-                paid_at TEXT NOT NULL,
-                amount TEXT NOT NULL,
-                currency_code TEXT NOT NULL,
-                reference TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            )""",
             """CREATE TABLE expense_object_aliases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
@@ -815,7 +778,7 @@ def apply_expense_documents_migration(database_path: str | Path, backup_dir: str
             conn.execute(statement)
         conn.execute(
             "INSERT INTO schema_migrations (migration_id, applied_at, description) VALUES (?, ?, ?)",
-            (MIGRATION_ID, datetime.now(timezone.utc).isoformat(), "Local supplier-document register, VAT details, allocations and payments"),
+            (MIGRATION_ID, datetime.now(timezone.utc).isoformat(), "Local supplier-document register and object allocations"),
         )
         conn.commit()
     except Exception:
