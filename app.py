@@ -5639,14 +5639,20 @@ class SmartReportApp(QMainWindow):
             self.load_shifts_history()
             self.background_sync_with_cloud()
 
-    def load_objects_for_company(self, comp_name, obj_cb, record_type=None):
-        selected_name = obj_cb.currentData()
+    def load_objects_for_company(self, comp_name, obj_cb, record_type=None, archived_object_name=None):
+        selected_name = obj_cb.currentData() or archived_object_name
         obj_cb.clear()
         if not comp_name:
             return False
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects WHERE company = ? AND is_active = 1 ORDER BY name", (comp_name,))
+        cursor.execute("""
+            SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0),
+                   COALESCE(transport_rate, 0.0), is_active
+            FROM objects
+            WHERE company = ? AND (is_active = 1 OR (? = 1 AND name = ?))
+            ORDER BY name
+        """, (comp_name, int(archived_object_name is not None), archived_object_name or ""))
         rows = cursor.fetchall()
         conn.close()
         if record_type in SPECIAL_OBJECTS:
@@ -5658,8 +5664,10 @@ class SmartReportApp(QMainWindow):
             special_refs = set(SPECIAL_OBJECTS.values())
             rows = [row for row in rows if (row[0], row[1]) not in special_refs]
         for row in rows:
-            name, mark, rate, tr_rate = row[0], row[1], row[2], row[3]
+            name, mark, rate, tr_rate, is_active = row[0], row[1], row[2], row[3], bool(row[4])
             display = f"{mark} | {name} ({rate} kr/ч, тр: {tr_rate})" if mark else f"{name} ({rate} kr/ч)"
+            if not is_active:
+                display += " — В архиве"
             obj_cb.addItem(display, userData=name)
         if selected_name:
             selected_index = obj_cb.findData(selected_name)
@@ -6011,21 +6019,40 @@ class SmartReportApp(QMainWindow):
         emp_add_layout.addWidget(add_emp_btn)
         emp_card_layout.addLayout(emp_add_layout)
 
+        employee_view_layout = QHBoxLayout()
+        archive_filter_style = (
+            "QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #718096; "
+            "border-radius: 3px; background-color: #1A202C; } "
+            "QCheckBox::indicator:checked { background-color: #3182CE; border-color: #90CDF4; }"
+        )
+        self.show_inactive_employees_check = QCheckBox("Показать неактивных")
+        self.show_inactive_employees_check.setStyleSheet(archive_filter_style)
+        self.show_inactive_employees_check.setChecked(False)
+        self.show_inactive_employees_check.toggled.connect(self.load_employees_table)
+        self.employee_counts_label = QLabel()
+        employee_view_layout.addWidget(self.show_inactive_employees_check)
+        employee_view_layout.addStretch()
+        employee_view_layout.addWidget(self.employee_counts_label)
+        emp_card_layout.addLayout(employee_view_layout)
+
         self.table_employees = QTableWidget()
-        self.table_employees.setColumnCount(3)
-        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Состояние / ПИН"])
+        self.table_employees.setColumnCount(4)
+        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус", "ПИН"])
+        self.table_employees.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_employees.itemSelectionChanged.connect(self.update_employee_status_action)
         self.table_employees.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         emp_card_layout.addWidget(self.table_employees, stretch=1)
 
         emp_btn_layout = QHBoxLayout()
-        del_emp_btn = QPushButton("Деактивировать сотрудника")
-        del_emp_btn.setObjectName("danger")
-        del_emp_btn.clicked.connect(self.delete_employee)
+        self.employee_status_button = QPushButton("Деактивировать сотрудника")
+        self.employee_status_button.setObjectName("danger")
+        self.employee_status_button.setEnabled(False)
+        self.employee_status_button.clicked.connect(self.toggle_employee_active)
         
         set_pin_btn = QPushButton("🔑 Задать ПИН")
         set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
-        emp_btn_layout.addWidget(del_emp_btn)
+        emp_btn_layout.addWidget(self.employee_status_button)
         emp_btn_layout.addWidget(set_pin_btn)
         emp_card_layout.addLayout(emp_btn_layout)
         top_layout.addWidget(emp_card, stretch=1)
@@ -6038,6 +6065,17 @@ class SmartReportApp(QMainWindow):
         obj_card_layout = QVBoxLayout(obj_card)
         obj_card_layout.setSpacing(6)
         obj_card_layout.addWidget(QLabel("<b>🏗 Управление объектами (Ставки и транспорт):</b>"))
+
+        object_view_layout = QHBoxLayout()
+        self.show_archived_objects_check = QCheckBox("Показать архив")
+        self.show_archived_objects_check.setStyleSheet(archive_filter_style)
+        self.show_archived_objects_check.setChecked(False)
+        self.show_archived_objects_check.toggled.connect(self.load_objects_table)
+        self.object_counts_label = QLabel()
+        object_view_layout.addWidget(self.show_archived_objects_check)
+        object_view_layout.addStretch()
+        object_view_layout.addWidget(self.object_counts_label)
+        obj_card_layout.addLayout(object_view_layout)
 
         obj_add_layout = QHBoxLayout()
         self.new_obj_comp_cb = QComboBox()
@@ -6086,14 +6124,17 @@ class SmartReportApp(QMainWindow):
         self.table_objects.setColumnWidth(3, 140)
         self.table_objects.setColumnWidth(4, 150)
         self.table_objects.setColumnWidth(5, 120)
+        self.table_objects.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
 
         self.table_objects.cellChanged.connect(self.on_object_cell_changed)
+        self.table_objects.itemSelectionChanged.connect(self.update_object_archive_action)
         obj_card_layout.addWidget(self.table_objects, stretch=1)
 
-        del_obj_btn = QPushButton("🗑 Удалить выбранный объект")
-        del_obj_btn.setObjectName("danger")
-        del_obj_btn.clicked.connect(self.delete_object)
-        obj_card_layout.addWidget(del_obj_btn)
+        self.object_archive_button = QPushButton("В архив")
+        self.object_archive_button.setObjectName("danger")
+        self.object_archive_button.setEnabled(False)
+        self.object_archive_button.clicked.connect(self.toggle_object_archive)
+        obj_card_layout.addWidget(self.object_archive_button)
 
         layout.addWidget(obj_card, stretch=1)
 
@@ -6443,6 +6484,12 @@ class SmartReportApp(QMainWindow):
             self.load_companies_table()
 
     def load_objects_table(self):
+        selected_object_id = None
+        current_row = self.table_objects.currentRow()
+        if current_row >= 0:
+            selected_item = self.table_objects.item(current_row, 0)
+            if selected_item is not None:
+                selected_object_id = selected_item.data(Qt.ItemDataRole.UserRole)
         try:
             self.table_objects.cellChanged.disconnect(self.on_object_cell_changed)
         except TypeError:
@@ -6450,10 +6497,23 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, company, name, markning, COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0), is_active, sync_id FROM objects ORDER BY company, name")
+        cursor.execute("SELECT is_active, COUNT(*) FROM objects GROUP BY is_active")
+        counts = {int(row[0]): int(row[1]) for row in cursor.fetchall()}
+        self.object_counts_label.setText(
+            f"Активных: {counts.get(1, 0)} | В архиве: {counts.get(0, 0)}"
+        )
+        cursor.execute("""
+            SELECT id, company, name, markning, COALESCE(rate, 0.0),
+                   COALESCE(transport_rate, 0.0), is_active, sync_id, server_id
+            FROM objects
+            WHERE is_active = 1 OR ? = 1
+            ORDER BY company, name, id
+        """, (int(self.show_archived_objects_check.isChecked()),))
         rows = cursor.fetchall()
         conn.close()
 
+        self.table_objects.clearSelection()
+        self.table_objects.setCurrentCell(-1, -1)
         self.table_objects.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
             company_item = QTableWidgetItem(row[1] or "")
@@ -6477,17 +6537,115 @@ class SmartReportApp(QMainWindow):
                 trans_item.setFlags(trans_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_objects.setItem(row_idx, 3, rate_item)
             self.table_objects.setItem(row_idx, 4, trans_item)
-            state_label = "Legacy: не связан" if not row[7] else "Активен" if row[6] else "Архив"
+            state_label = "В архиве" if not row[6] else "Активен" if row[7] else "Legacy: не связан"
             state_item = QTableWidgetItem(state_label)
             state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_objects.setItem(row_idx, 5, state_item)
+            if not row[6]:
+                for column in range(self.table_objects.columnCount()):
+                    cell = self.table_objects.item(row_idx, column)
+                    cell.setForeground(QColor("#A0AEC0"))
+                    cell.setBackground(QColor("#2D3748"))
+            if selected_object_id is not None and int(row[0]) == int(selected_object_id):
+                self.table_objects.selectRow(row_idx)
 
         self.table_objects.cellChanged.connect(self.on_object_cell_changed)
+        self.update_object_archive_action()
 
-    def load_employees_table(self):
+    def update_object_archive_action(self):
+        selected = self.table_objects.currentRow()
+        if selected < 0:
+            self.object_archive_button.setText("Выберите объект")
+            self.object_archive_button.setEnabled(False)
+            return
+        item = self.table_objects.item(selected, 0)
+        object_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT is_active, sync_id, server_id FROM objects WHERE id = ?", (object_id,)
+        ).fetchone() if object_id is not None else None
+        pending = conn.execute(
+            "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1", (object_id,)
+        ).fetchone() if object_id is not None else None
+        conn.close()
+        if row is None:
+            self.object_archive_button.setText("Выберите объект")
+            self.object_archive_button.setEnabled(False)
+        elif not row["sync_id"] or not row["server_id"]:
+            self.object_archive_button.setText("Ожидает связи с сервером")
+            self.object_archive_button.setToolTip("Изменение активности доступно после устойчивой синхронизации объекта.")
+            self.object_archive_button.setEnabled(False)
+        elif pending:
+            self.object_archive_button.setText("Синхронизация ожидается")
+            self.object_archive_button.setToolTip("Дождитесь подтверждения текущего изменения объекта.")
+            self.object_archive_button.setEnabled(False)
+        else:
+            archived = not bool(row["is_active"])
+            self.object_archive_button.setText("Восстановить из архива" if archived else "В архив")
+            self.object_archive_button.setToolTip("")
+            self.object_archive_button.setEnabled(True)
+
+    def toggle_object_archive(self):
+        selected = self.table_objects.currentRow()
+        if selected < 0:
+            return
+        item = self.table_objects.item(selected, 0)
+        object_id = int(item.data(Qt.ItemDataRole.UserRole)) if item is not None else 0
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, salary_rate, is_active FROM employees ORDER BY is_active DESC, name")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                "SELECT is_active, sync_id, server_id FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Выбранный объект больше не существует.")
+            if not row["sync_id"] or not row["server_id"]:
+                raise ValueError("Объект ещё не имеет устойчивой связи с сервером.")
+            if cursor.execute(
+                "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1", (object_id,)
+            ).fetchone():
+                raise ValueError("Предыдущее изменение объекта ещё не подтверждено сервером.")
+            activating = not bool(row["is_active"])
+            operation = "activate" if activating else "deactivate"
+            cursor.execute(
+                "UPDATE objects SET is_active = ? WHERE id = ? AND is_active = ?",
+                (int(activating), object_id, int(bool(row["is_active"]))),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Состояние объекта изменилось; обновите справочник и повторите действие.")
+            enqueue_object_sync_event(cursor, object_id, operation)
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            conn.close()
+            QMessageBox.warning(self, "Архив объектов", str(error))
+            self.load_objects_table()
+            return
+        conn.close()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
+
+    def load_employees_table(self):
+        selected_employee_id = None
+        current_row = self.table_employees.currentRow()
+        if current_row >= 0:
+            selected_item = self.table_employees.item(current_row, 0)
+            if selected_item is not None:
+                selected_employee_id = selected_item.data(Qt.ItemDataRole.UserRole)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active, COUNT(*) FROM employees GROUP BY is_active")
+        counts = {int(row[0]): int(row[1]) for row in cursor.fetchall()}
+        self.employee_counts_label.setText(
+            f"Активных: {counts.get(1, 0)} | Неактивных: {counts.get(0, 0)}"
+        )
+        cursor.execute("""
+            SELECT id, name, salary_rate, is_active
+            FROM employees
+            WHERE is_active = 1 OR ? = 1
+            ORDER BY is_active DESC, name, id
+        """, (int(self.show_inactive_employees_check.isChecked()),))
         rows = cursor.fetchall()
         conn.close()
 
@@ -6502,29 +6660,56 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
+        self.table_employees.clearSelection()
+        self.table_employees.setCurrentCell(-1, -1)
         self.table_employees.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
-            name, rate, is_active = row[0], row[1], bool(row[2])
+            employee_id, name, rate, is_active = int(row[0]), row[1], row[2], bool(row[3])
             has_pin = pin_statuses.get(name.strip().lower(), None)
-
-            if not is_active:
-                pin_text = "Неактивен"
-            elif has_pin is None:
-                pin_text = "❓ Неизвестно"
-            elif has_pin:
-                pin_text = "✅ Пин задан"
-            else:
-                pin_text = "⏳ Не задан"
-
-            self.table_employees.setItem(row_idx, 0, QTableWidgetItem(name))
+            name_item = QTableWidgetItem(name)
+            name_item.setData(Qt.ItemDataRole.UserRole, employee_id)
+            self.table_employees.setItem(row_idx, 0, name_item)
             self.table_employees.setItem(row_idx, 1, QTableWidgetItem(f"{rate:.2f}" if rate else "0.00"))
-            
+
+            status_item = QTableWidgetItem("Активен" if is_active else "Неактивен")
+            self.table_employees.setItem(row_idx, 2, status_item)
+            pin_text = "Неизвестно" if has_pin is None else "Задан" if has_pin else "Не задан"
             pin_item = QTableWidgetItem(pin_text)
             if has_pin:
                 pin_item.setForeground(QColor("#68D391"))
             elif has_pin is False:
                 pin_item.setForeground(QColor("#F6AD55"))
-            self.table_employees.setItem(row_idx, 2, pin_item)
+            self.table_employees.setItem(row_idx, 3, pin_item)
+            if not is_active:
+                for column in range(self.table_employees.columnCount()):
+                    cell = self.table_employees.item(row_idx, column)
+                    cell.setForeground(QColor("#A0AEC0"))
+                    cell.setBackground(QColor("#2D3748"))
+            if selected_employee_id is not None and employee_id == int(selected_employee_id):
+                self.table_employees.selectRow(row_idx)
+        self.update_employee_status_action()
+
+    def update_employee_status_action(self):
+        selected = self.table_employees.currentRow()
+        if selected < 0:
+            self.employee_status_button.setText("Выберите сотрудника")
+            self.employee_status_button.setEnabled(False)
+            return
+        item = self.table_employees.item(selected, 0)
+        employee_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT name, is_active FROM employees WHERE id = ?", (employee_id,)
+        ).fetchone() if employee_id is not None else None
+        conn.close()
+        if row is None:
+            self.employee_status_button.setText("Выберите сотрудника")
+            self.employee_status_button.setEnabled(False)
+            return
+        self.employee_status_button.setText(
+            "Деактивировать сотрудника" if row["is_active"] else "Активировать сотрудника"
+        )
+        self.employee_status_button.setEnabled(True)
 
     def reset_employee_pin_desktop(self):
         selected = self.table_employees.currentRow()
@@ -6582,26 +6767,48 @@ class SmartReportApp(QMainWindow):
         self.load_dropdowns()
         self.background_sync_with_cloud()
 
-    def delete_employee(self):
+    def toggle_employee_active(self):
         selected = self.table_employees.currentRow()
         if selected < 0:
             return
-        emp_name = self.table_employees.item(selected, 0).text()
+        item = self.table_employees.item(selected, 0)
+        employee_id = int(item.data(Qt.ItemDataRole.UserRole)) if item is not None else 0
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                "SELECT name, is_active FROM employees WHERE id = ?", (employee_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Выбранный сотрудник больше не существует.")
+            employee_name = row["name"]
+            employee_key = employee_sync_key(employee_name)
+            pending = cursor.execute(
+                "SELECT 1 FROM employee_sync_outbox WHERE employee_key = ? "
+                "UNION ALL SELECT 1 FROM employee_restore_outbox WHERE employee_key = ? LIMIT 1",
+                (employee_key, employee_key),
+            ).fetchone()
+            if pending:
+                raise ValueError("Предыдущее изменение сотрудника ещё не подтверждено сервером.")
+            activating = not bool(row["is_active"])
+            operation = "activate" if activating else "deactivate"
             cursor.execute(
-                "UPDATE employees SET is_active = 0 WHERE name = ? AND is_active = 1",
-                (emp_name,),
+                "UPDATE employees SET is_active = ? WHERE id = ? AND is_active = ?",
+                (int(activating), employee_id, int(bool(row["is_active"]))),
             )
-            if cursor.rowcount:
-                enqueue_employee_sync_event(cursor, emp_name, "deactivate")
+            if cursor.rowcount != 1:
+                raise ValueError("Состояние сотрудника изменилось; обновите список и повторите действие.")
+            event_id = enqueue_employee_sync_event(cursor, employee_name, operation)
+            if activating and event_id is None:
+                raise ValueError("Активация не поставлена в очередь: локальный tombstone не подтверждён.")
             conn.commit()
-        except Exception:
+        except Exception as error:
             conn.rollback()
             conn.close()
-            raise
+            QMessageBox.warning(self, "Сотрудники", str(error))
+            self.load_employees_table()
+            return
         conn.close()
         self.load_dropdowns()
         self.sync_with_cloud()
@@ -6820,8 +7027,8 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT * FROM shifts WHERE id = ?", (local_id,))
         shift = cursor.fetchone()
         has_ob_schema = ob_schema_ready(cursor)
-        cursor.execute("SELECT name FROM employees ORDER BY name")
-        employees = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name, is_active FROM employees ORDER BY name")
+        employees = cursor.fetchall()
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
         conn.close()
@@ -6834,8 +7041,22 @@ class SmartReportApp(QMainWindow):
         date_field = create_date_field(shift['date'])
         employee_field = QComboBox()
         employee_field.setEditable(True)
-        employee_field.addItems(employees)
-        employee_field.setCurrentText(shift['employee'])
+        for employee in employees:
+            name = employee["name"]
+            is_active = bool(employee["is_active"])
+            display = name if is_active else f"{name} — Неактивен"
+            employee_field.addItem(display, userData=name)
+        if employee_field.findData(shift['employee']) < 0:
+            employee_field.addItem(f"{shift['employee']} — Неактивен", userData=shift['employee'])
+        employee_field.setCurrentIndex(employee_field.findData(shift['employee']))
+
+        def selected_employee_name():
+            current_index = employee_field.currentIndex()
+            selected_name = employee_field.itemData(current_index) if current_index >= 0 else None
+            if selected_name and employee_field.currentText() == employee_field.itemText(current_index):
+                return str(selected_name).strip()
+            return employee_field.currentText().strip()
+
         company_field = QComboBox()
         company_field.setEditable(True)
         company_field.addItems(companies)
@@ -6855,12 +7076,25 @@ class SmartReportApp(QMainWindow):
             type_index = 0
         record_type_field.setCurrentIndex(type_index)
         object_field = QComboBox()
-        self.load_objects_for_company(shift['company'], object_field, current_type)
+        self.load_objects_for_company(
+            shift['company'], object_field, current_type,
+            archived_object_name=shift['object_name'],
+        )
         object_index = object_field.findData(shift['object_name'])
         if object_index >= 0:
             object_field.setCurrentIndex(object_index)
-        company_field.currentTextChanged.connect(lambda company: self.load_objects_for_company(company, object_field, record_type_field.currentData()))
-        record_type_field.currentIndexChanged.connect(lambda *_: self.load_objects_for_company(company_field.currentText(), object_field, record_type_field.currentData()))
+        def reload_dialog_objects(*_):
+            company = company_field.currentText()
+            record_type = record_type_field.currentData()
+            archived_name = shift['object_name'] if (
+                company == shift['company'] and record_type == current_type
+            ) else None
+            self.load_objects_for_company(
+                company, object_field, record_type, archived_object_name=archived_name
+            )
+
+        company_field.currentTextChanged.connect(reload_dialog_objects)
+        record_type_field.currentIndexChanged.connect(reload_dialog_objects)
         hours_field = QDoubleSpinBox()
         hours_field.setRange(0.5, 24)
         hours_field.setSingleStep(0.5)
@@ -6902,7 +7136,7 @@ class SmartReportApp(QMainWindow):
             preview_conn = get_db_connection()
             try:
                 base_rate = get_local_employee_ob_base_rate(
-                    preview_conn.cursor(), employee_field.currentText().strip()
+                    preview_conn.cursor(), selected_employee_name()
                 )
                 if base_rate <= 0:
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
@@ -6996,7 +7230,7 @@ class SmartReportApp(QMainWindow):
             rate_cursor = schema_conn.cursor()
             try:
                 employee_base_rate = get_local_employee_ob_base_rate(
-                    rate_cursor, employee_field.currentText().strip()
+                    rate_cursor, selected_employee_name()
                 ) if schema_ready else None
                 if employee_base_rate is not None and employee_base_rate <= 0:
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
@@ -7021,7 +7255,7 @@ class SmartReportApp(QMainWindow):
             payload_date = date_field.text()
 
         payload = {
-            "date": payload_date, "employee": employee_field.currentText().strip(),
+            "date": payload_date, "employee": selected_employee_name(),
             "company": company_field.currentText().strip(), "object_name": object_name,
             "hours": ob_result["total_hours"] if ob_result else hours_field.value(),
             "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,

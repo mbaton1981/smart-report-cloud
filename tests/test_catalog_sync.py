@@ -328,6 +328,7 @@ class CatalogSyncTests(unittest.TestCase):
     def test_desktop_employee_deactivation_is_soft_and_survives_repeat_sync(self):
         employee_name = f"Deactivate Test {uuid.uuid4().hex[:8]}"
         employee_key = self.desktop.employee_sync_key(employee_name)
+        pin_hash = generate_password_hash("isolated-test-pin")
         server_conn = self.server.get_db_connection()
         profile_id = server_conn.execute(
             "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, 450, 1)",
@@ -336,7 +337,7 @@ class CatalogSyncTests(unittest.TestCase):
         server_conn.execute("""
             INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
             VALUES (?, ?, 'user', ?, 1, 'test')
-        """, (employee_name, generate_password_hash("isolated-test-pin"), profile_id))
+        """, (employee_name, pin_hash, profile_id))
         server_conn.commit()
         server_conn.close()
 
@@ -345,6 +346,9 @@ class CatalogSyncTests(unittest.TestCase):
             "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, 450, 1)",
             (employee_name,),
         )
+        employee_id = desktop_conn.execute(
+            "SELECT id FROM employees WHERE name = ?", (employee_name,)
+        ).fetchone()[0]
         desktop_conn.execute("""
             INSERT INTO shifts (
                 date, employee, company, object_name, hours, rate, sync_id, sync_version
@@ -358,14 +362,17 @@ class CatalogSyncTests(unittest.TestCase):
                 return 0
 
             def item(self, _row, _column):
-                return SimpleNamespace(text=lambda: employee_name)
+                return SimpleNamespace(
+                    text=lambda: employee_name,
+                    data=lambda _role: employee_id,
+                )
 
         harness = SimpleNamespace(
             table_employees=EmployeeTable(),
             load_dropdowns=lambda: None,
             sync_with_cloud=lambda: self._worker(),
         )
-        self.desktop.SmartReportApp.delete_employee(harness)
+        self.desktop.SmartReportApp.toggle_employee_active(harness)
         desktop_conn = self.desktop.get_db_connection()
         local_profile = desktop_conn.execute(
             "SELECT salary_rate, is_active FROM employees WHERE name = ?", (employee_name,)
@@ -428,6 +435,295 @@ class CatalogSyncTests(unittest.TestCase):
             "SELECT COUNT(*) FROM employee_sync_events WHERE employee_key = ? AND operation = 'deactivate'",
             (employee_key,),
         ).fetchone()[0], 1)
+        server_conn.close()
+
+        self.desktop.SmartReportApp.toggle_employee_active(harness)
+        self.assertEqual(self._worker()["conflicts"], 0)
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(tuple(server_conn.execute(
+            "SELECT salary_rate, is_active FROM meta_employees WHERE id = ?", (profile_id,)
+        ).fetchone()), (450, 1))
+        self.assertEqual(tuple(server_conn.execute(
+            "SELECT password_hash, is_active FROM users WHERE employee_id = ?", (profile_id,)
+        ).fetchone()), (pin_hash, 1))
+        self.assertEqual(server_conn.execute(
+            "SELECT COUNT(*) FROM employee_sync_events WHERE employee_key = ? AND operation = 'activate'",
+            (employee_key,),
+        ).fetchone()[0], 1)
+        server_conn.close()
+        desktop_conn = self.desktop.get_db_connection()
+        self.assertEqual(tuple(desktop_conn.execute(
+            "SELECT id, salary_rate, is_active FROM employees WHERE name = ?", (employee_name,)
+        ).fetchone()), (employee_id, 450, 1))
+        self.assertEqual(desktop_conn.execute(
+            "SELECT COUNT(*) FROM shifts WHERE employee = ?", (employee_name,)
+        ).fetchone()[0], 1)
+        self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM employee_sync_outbox").fetchone()[0], 0)
+        desktop_conn.close()
+
+    def test_archive_filters_counts_stable_selection_and_action_state(self):
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute("DELETE FROM objects")
+        desktop_conn.execute("DELETE FROM employees")
+        for is_active, name in ((1, "Active"), (0, "Archived")):
+            desktop_conn.execute("""
+                INSERT INTO objects (company, name, markning, rate, transport_rate,
+                                     is_active, sync_id, server_id, sync_version)
+                VALUES ('Renatur', ?, ?, 520, 450, ?, ?, ?, 2)
+            """, (name, name, is_active, str(uuid.uuid4()), 100 + is_active))
+            desktop_conn.execute(
+                "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, 450, ?)",
+                (name, is_active),
+            )
+        desktop_conn.commit()
+        object_id = desktop_conn.execute(
+            "SELECT id FROM objects WHERE name = 'Archived'"
+        ).fetchone()[0]
+        employee_id = desktop_conn.execute(
+            "SELECT id FROM employees WHERE name = 'Archived'"
+        ).fetchone()[0]
+        desktop_conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+        response = SimpleNamespace(status_code=200, json=lambda: {
+            "users": [{"username": "Archived", "has_pin": True}]
+        })
+        try:
+            with patch.object(self.desktop.requests, "get", return_value=response):
+                window.load_objects_table()
+                window.load_employees_table()
+                self.assertFalse(window.show_archived_objects_check.isChecked())
+                self.assertFalse(window.show_inactive_employees_check.isChecked())
+                self.assertEqual(window.table_objects.rowCount(), 1)
+                self.assertEqual(window.table_employees.rowCount(), 1)
+                self.assertEqual(window.object_counts_label.text(), "Активных: 1 | В архиве: 1")
+                self.assertEqual(window.employee_counts_label.text(), "Активных: 1 | Неактивных: 1")
+                self.assertFalse(window.object_archive_button.isEnabled())
+                self.assertFalse(window.employee_status_button.isEnabled())
+                window.show_archived_objects_check.setChecked(True)
+                window.show_inactive_employees_check.setChecked(True)
+                self.assertEqual(window.table_objects.rowCount(), 2)
+                self.assertEqual(window.table_employees.rowCount(), 2)
+                role = self.desktop.Qt.ItemDataRole.UserRole
+                object_row = next(row for row in range(2) if window.table_objects.item(row, 0).data(role) == object_id)
+                employee_row = next(row for row in range(2) if window.table_employees.item(row, 0).data(role) == employee_id)
+                window.table_objects.selectRow(object_row)
+                window.table_employees.selectRow(employee_row)
+                self.assertEqual(window.object_archive_button.text(), "Восстановить из архива")
+                self.assertEqual(window.employee_status_button.text(), "Активировать сотрудника")
+                self.assertEqual(window.table_employees.item(employee_row, 2).text(), "Неактивен")
+                self.assertEqual(window.table_employees.item(employee_row, 3).text(), "Задан")
+                window.load_objects_table()
+                window.load_employees_table()
+                self.assertEqual(window.table_objects.item(window.table_objects.currentRow(), 0).data(role), object_id)
+                self.assertEqual(window.table_employees.item(window.table_employees.currentRow(), 0).data(role), employee_id)
+                window.show_archived_objects_check.setChecked(False)
+                window.show_inactive_employees_check.setChecked(False)
+                self.assertEqual(window.table_objects.currentRow(), -1)
+                self.assertEqual(window.table_employees.currentRow(), -1)
+                self.assertFalse(window.object_archive_button.isEnabled())
+                self.assertFalse(window.employee_status_button.isEnabled())
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_history_selector_keeps_only_original_archived_object(self):
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute("DELETE FROM objects")
+        for name, is_active in (("Active", 1), ("Original", 0), ("Other archive", 0)):
+            desktop_conn.execute("""
+                INSERT INTO objects (company, name, rate, transport_rate, is_active)
+                VALUES ('Renatur', ?, 520, 450, ?)
+            """, (name, is_active))
+        desktop_conn.commit()
+        desktop_conn.close()
+        combo = self.desktop.QComboBox()
+        load = self.desktop.SmartReportApp.load_objects_for_company
+        load(SimpleNamespace(), "Renatur", combo, self.desktop.RECORD_TYPE_WORK)
+        self.assertEqual([combo.itemData(index) for index in range(combo.count())], ["Active"])
+        combo.clear()
+        load(SimpleNamespace(), "Renatur", combo, self.desktop.RECORD_TYPE_WORK,
+             archived_object_name="Original")
+        self.assertEqual(combo.currentData(), "Original")
+        self.assertIn("В архиве", combo.currentText())
+        self.assertEqual([combo.itemData(index) for index in range(combo.count())], ["Active", "Original"])
+        load(SimpleNamespace(), "Renatur", combo, self.desktop.RECORD_TYPE_WORK)
+        self.assertEqual([combo.itemData(index) for index in range(combo.count())], ["Active"])
+
+    def test_edit_history_preserves_archived_object_inactive_employee_and_rates(self):
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES ('Inactive employee', 450, 0)"
+        )
+        desktop_conn.execute("""
+            INSERT INTO objects (company, name, rate, transport_rate, is_active)
+            VALUES ('Renatur', 'Archived history object', 520, 450, 0)
+        """)
+        shift_id = desktop_conn.execute("""
+            INSERT INTO shifts (date, employee, company, object_name, hours, rate,
+                                transport, comment, sync_id, sync_version, entry_type)
+            VALUES ('2026-10-16', 'Inactive employee', 'Renatur', 'Archived history object',
+                    8, 510, 440, 'history', ?, 1, 'work')
+        """, (str(uuid.uuid4()),)).lastrowid
+        desktop_conn.commit()
+        desktop_conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.table_shifts = self.desktop.QTableWidget(1, 1)
+        window.table_shifts.setItem(0, 0, self.desktop.QTableWidgetItem(str(shift_id)))
+        window.table_shifts.selectRow(0)
+
+        def accept_edit(dialog):
+            combos = dialog.findChildren(self.desktop.QComboBox)
+            employee = next(combo for combo in combos if combo.currentData() == "Inactive employee")
+            self.assertIn("Неактивен", employee.currentText())
+            archived = next(combo for combo in combos if combo.currentData() == "Archived history object")
+            self.assertIn("В архиве", archived.currentText())
+            return self.desktop.QDialog.DialogCode.Accepted
+
+        try:
+            with patch.object(self.desktop.QDialog, "exec", accept_edit), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(window, "load_shifts_history"), \
+                 patch.object(window, "background_sync_with_cloud"):
+                window.edit_shift()
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(tuple(desktop_conn.execute(
+                "SELECT employee, object_name, rate, transport, comment FROM shifts WHERE id = ?",
+                (shift_id,),
+            ).fetchone()), ("Inactive employee", "Archived history object", 510, 440, "history"))
+            self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0], 1)
+            desktop_conn.close()
+
+            def accept_correction(dialog):
+                employee = next(combo for combo in dialog.findChildren(self.desktop.QComboBox)
+                                if combo.currentData() == "Inactive employee")
+                employee.setEditText("Corrected employee")
+                return self.desktop.QDialog.DialogCode.Accepted
+
+            with patch.object(self.desktop.QDialog, "exec", accept_correction), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(window, "load_shifts_history"), \
+                 patch.object(window, "background_sync_with_cloud"):
+                window.edit_shift()
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(desktop_conn.execute(
+                "SELECT employee FROM shifts WHERE id = ?", (shift_id,)
+            ).fetchone()[0], "Corrected employee")
+            desktop_conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_service_objects_restore_through_outbox_without_duplicates(self):
+        company = "Bygger och Renoverar i Sthm AB"
+        self._add_company(company)
+        desktop_conn = self.desktop.get_db_connection()
+        identities = []
+        for name, markning, record_type in (
+            ("Arbetstidsförkortning", "p1000", self.desktop.RECORD_TYPE_ATF),
+            ("Sjuk", "p1001", self.desktop.RECORD_TYPE_SICK),
+        ):
+            sync_id = str(uuid.uuid4())
+            object_id = desktop_conn.execute("""
+                INSERT INTO objects (company, name, markning, rate, transport_rate, is_active, sync_id)
+                VALUES (?, ?, ?, 520, 450, 1, ?)
+            """, (company, name, markning, sync_id)).lastrowid
+            self.desktop.enqueue_object_sync_event(desktop_conn.cursor(), object_id, "upsert")
+            identities.append((object_id, name, markning, sync_id, record_type))
+        desktop_conn.commit()
+        desktop_conn.close()
+        self.assertEqual(self._worker()["conflicts"], 0)
+
+        for object_id, name, _markning, _sync_id, record_type in identities:
+            item = self.desktop.QTableWidgetItem(name)
+            item.setData(self.desktop.Qt.ItemDataRole.UserRole, object_id)
+            table = SimpleNamespace(currentRow=lambda: 0, item=lambda *_: item)
+            harness = SimpleNamespace(
+                table_objects=table, load_dropdowns=lambda: None,
+                background_sync_with_cloud=lambda: None,
+            )
+            self.desktop.SmartReportApp.toggle_object_archive(harness)
+            self.assertEqual(self._worker()["conflicts"], 0)
+            combo = self.desktop.QComboBox()
+            self.assertFalse(self.desktop.SmartReportApp.load_objects_for_company(
+                SimpleNamespace(), company, combo, record_type
+            ))
+            self.desktop.SmartReportApp.toggle_object_archive(harness)
+            with self.assertRaises(self.desktop.requests.ConnectionError):
+                self._worker("offline")
+            with self.assertRaises(self.desktop.requests.ConnectionError):
+                self._worker("lost_ack")
+            self.assertEqual(self._worker()["conflicts"], 0)
+            self.assertEqual(self._worker()["conflicts"], 0)
+            self.assertTrue(self.desktop.SmartReportApp.load_objects_for_company(
+                SimpleNamespace(), company, combo, record_type
+            ))
+            self.assertEqual(combo.count(), 1)
+            self.assertEqual(combo.currentData(), name)
+
+        desktop_conn = self.desktop.get_db_connection()
+        server_conn = self.server.get_db_connection()
+        for object_id, name, markning, sync_id, _record_type in identities:
+            self.assertEqual(tuple(desktop_conn.execute(
+                "SELECT id, name, markning, sync_id, rate, transport_rate, is_active, sync_version "
+                "FROM objects WHERE sync_id = ?", (sync_id,),
+            ).fetchone()), (object_id, name, markning, sync_id, 520, 450, 1, 3))
+            self.assertEqual(tuple(server_conn.execute(
+                "SELECT name, markning, rate, transport_rate, is_active, sync_version "
+                "FROM meta_objects WHERE sync_id = ?", (sync_id,),
+            ).fetchone()), (name, markning, 520, 450, 1, 3))
+            self.assertEqual(server_conn.execute(
+                "SELECT COUNT(*) FROM object_sync_events WHERE sync_id = ?", (sync_id,)
+            ).fetchone()[0], 3)
+        self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+        self.assertEqual(server_conn.execute(
+            "SELECT COUNT(*) FROM meta_objects WHERE company = ?", (company,)
+        ).fetchone()[0], 2)
+        desktop_conn.close()
+        server_conn.close()
+
+    def test_archived_object_allows_existing_history_edit_but_not_new_shift(self):
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("""
+            INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active)
+            VALUES ('Renatur', 'History object', '', 520, 450, 1)
+        """)
+        server_conn.commit()
+        server_conn.close()
+        sync_id = str(uuid.uuid4())
+        payload = {
+            "date": "2026-10-16", "employee": "Historical employee", "company": "Renatur",
+            "object_name": "History object", "hours": 8, "rate": 520,
+            "transport": 450, "comment": "before", "record_type": "work", "invoiced": 0,
+        }
+
+        def push(target_id, revision):
+            return self.server_client.post("/sync/push", headers={
+                "X-Sync-Key": "isolated-sync-test-key",
+            }, json={"changes": [{
+                "sync_id": target_id, "operation_id": str(uuid.uuid4()),
+                "operation": "upsert", "base_version": revision, "shift": payload,
+            }]})
+
+        self.assertEqual(push(sync_id, 0).status_code, 200)
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("UPDATE meta_objects SET is_active = 0 WHERE name = 'History object'")
+        server_conn.commit()
+        server_conn.close()
+        payload["comment"] = "after"
+        response = push(sync_id, 1)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(push(str(uuid.uuid4()), 0).status_code, 400)
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(tuple(server_conn.execute(
+            "SELECT object_name, rate, transport, comment FROM incoming_submissions WHERE sync_id = ?",
+            (sync_id,),
+        ).fetchone()), ("History object", 520, 450, "after"))
+        self.assertEqual(server_conn.execute("SELECT COUNT(*) FROM incoming_submissions WHERE sync_id = ?", (sync_id,)).fetchone()[0], 1)
         server_conn.close()
 
     def test_stable_id_revision_merge_and_deactivation_preserve_history(self):

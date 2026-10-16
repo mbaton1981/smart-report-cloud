@@ -165,14 +165,19 @@ def get_ob_segments(cursor, shift_id):
     return [dict(row) for row in cursor.fetchall()]
 
 
-def validate_submission_object(cursor, submission_type, company, object_name):
+def validate_submission_object(cursor, submission_type, company, object_name, allow_inactive=False):
     reference = SPECIAL_SUBMISSION_OBJECTS.get(submission_type)
     if not reference:
-        cursor.execute("SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND is_active = 1", (object_name, company))
+        cursor.execute(
+            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? "
+            "AND (is_active = 1 OR ? = 1)",
+            (object_name, company, int(allow_inactive)),
+        )
     else:
         cursor.execute(
-            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ? AND is_active = 1",
-            (reference[0], company, reference[1])
+            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ? "
+            "AND (is_active = 1 OR ? = 1)",
+            (reference[0], company, reference[1], int(allow_inactive))
         )
     matches = cursor.fetchall()
     if len(matches) != 1:
@@ -3337,7 +3342,16 @@ def sync_push():
                     submission_type = existing['submission_type'] or infer_submission_type_from_object(cursor, company, object_name)
                 else:
                     submission_type = infer_submission_type_from_object(cursor, company, object_name)
-                validate_submission_object(cursor, submission_type, company, object_name)
+                preserve_history_object = bool(
+                    existing and not existing['is_deleted']
+                    and existing['company'] == company
+                    and existing['object_name'] == object_name
+                    and existing['submission_type'] == submission_type
+                )
+                validate_submission_object(
+                    cursor, submission_type, company, object_name,
+                    allow_inactive=preserve_history_object,
+                )
                 invoiced = int(bool(payload.get('invoiced', 0))) if submission_type == 'work' else 0
                 if submission_type == "ob":
                     if not ob_schema_ready(cursor):
