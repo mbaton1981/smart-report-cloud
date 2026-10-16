@@ -322,6 +322,111 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 1)
         desktop_conn.close()
 
+    def test_desktop_employee_deactivation_is_soft_and_survives_repeat_sync(self):
+        employee_name = f"Deactivate Test {uuid.uuid4().hex[:8]}"
+        employee_key = self.desktop.employee_sync_key(employee_name)
+        server_conn = self.server.get_db_connection()
+        profile_id = server_conn.execute(
+            "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, 450, 1)",
+            (employee_name,),
+        ).lastrowid
+        server_conn.execute("""
+            INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
+            VALUES (?, ?, 'user', ?, 1, 'test')
+        """, (employee_name, generate_password_hash("isolated-test-pin"), profile_id))
+        server_conn.commit()
+        server_conn.close()
+
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, 450, 1)",
+            (employee_name,),
+        )
+        desktop_conn.execute("""
+            INSERT INTO shifts (
+                date, employee, company, object_name, hours, rate, sync_id, sync_version
+            ) VALUES ('2026-10-16', ?, 'Renatur', 'Tomteboda doors', 8, 0, ?, 1)
+        """, (employee_name, str(uuid.uuid4())))
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        class EmployeeTable:
+            def currentRow(self):
+                return 0
+
+            def item(self, _row, _column):
+                return SimpleNamespace(text=lambda: employee_name)
+
+        harness = SimpleNamespace(
+            table_employees=EmployeeTable(),
+            load_dropdowns=lambda: None,
+            sync_with_cloud=lambda: self._worker(),
+        )
+        self.desktop.SmartReportApp.delete_employee(harness)
+        desktop_conn = self.desktop.get_db_connection()
+        local_profile = desktop_conn.execute(
+            "SELECT salary_rate, is_active FROM employees WHERE name = ?", (employee_name,)
+        ).fetchone()
+        local_history = desktop_conn.execute(
+            "SELECT COUNT(*) FROM shifts WHERE employee = ?", (employee_name,)
+        ).fetchone()[0]
+        desktop_conn.close()
+        self.assertEqual(tuple(local_profile), (450, 0))
+        self.assertEqual(local_history, 1)
+
+        class EmployeeCombo:
+            def __init__(self):
+                self.items = []
+
+            def clear(self):
+                self.items.clear()
+
+            def addItem(self, item):
+                self.items.append(item)
+
+        combo = EmployeeCombo()
+        self.desktop.SmartReportApp.load_dropdowns(SimpleNamespace(emp_cb=combo))
+        self.assertNotIn(employee_name, combo.items)
+        server_conn = self.server.get_db_connection()
+        server_profile = server_conn.execute(
+            "SELECT salary_rate, is_active FROM meta_employees WHERE id = ?", (profile_id,)
+        ).fetchone()
+        user_active = server_conn.execute(
+            "SELECT is_active FROM users WHERE employee_id = ?", (profile_id,)
+        ).fetchone()[0]
+        event_count = server_conn.execute(
+            "SELECT COUNT(*) FROM employee_sync_events WHERE employee_key = ? AND operation = 'deactivate'",
+            (employee_key,),
+        ).fetchone()[0]
+        server_conn.close()
+        self.assertEqual(tuple(server_profile), (450, 0))
+        self.assertEqual(user_active, 0)
+        self.assertEqual(event_count, 1)
+
+        second_result = self._worker()
+        self.assertEqual(second_result["conflicts"], 0)
+        desktop_conn = self.desktop.get_db_connection()
+        self.assertEqual(tuple(desktop_conn.execute(
+            "SELECT salary_rate, is_active FROM employees WHERE name = ?", (employee_name,)
+        ).fetchone()), (450, 0))
+        self.assertEqual(desktop_conn.execute(
+            "SELECT COUNT(*) FROM shifts WHERE employee = ?", (employee_name,)
+        ).fetchone()[0], 1)
+        self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM employee_sync_outbox").fetchone()[0], 0)
+        desktop_conn.close()
+        combo = EmployeeCombo()
+        self.desktop.SmartReportApp.load_dropdowns(SimpleNamespace(emp_cb=combo))
+        self.assertNotIn(employee_name, combo.items)
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(tuple(server_conn.execute(
+            "SELECT salary_rate, is_active FROM meta_employees WHERE id = ?", (profile_id,)
+        ).fetchone()), (450, 0))
+        self.assertEqual(server_conn.execute(
+            "SELECT COUNT(*) FROM employee_sync_events WHERE employee_key = ? AND operation = 'deactivate'",
+            (employee_key,),
+        ).fetchone()[0], 1)
+        server_conn.close()
+
     def test_stable_id_revision_merge_and_deactivation_preserve_history(self):
         sync_id = str(uuid.uuid4())
         desktop_conn = self.desktop.get_db_connection()

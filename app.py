@@ -950,7 +950,7 @@ def apply_employee_sync_ack(cursor, event, result):
                 (state["name"], float(state["salary_rate"] or 0.0)),
             )
     elif local_matches:
-        cursor.execute("DELETE FROM employees WHERE name = ?", (local_matches[0],))
+        cursor.execute("UPDATE employees SET is_active = 0 WHERE name = ?", (local_matches[0],))
 
 def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, state=None):
     record_type = payload.get('record_type', RECORD_TYPE_WORK)
@@ -5948,12 +5948,12 @@ class SmartReportApp(QMainWindow):
 
         self.table_employees = QTableWidget()
         self.table_employees.setColumnCount(3)
-        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус ПИН-кода"])
+        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Состояние / ПИН"])
         self.table_employees.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         emp_card_layout.addWidget(self.table_employees, stretch=1)
 
         emp_btn_layout = QHBoxLayout()
-        del_emp_btn = QPushButton("🗑 Удалить сотрудника")
+        del_emp_btn = QPushButton("Деактивировать сотрудника")
         del_emp_btn.setObjectName("danger")
         del_emp_btn.clicked.connect(self.delete_employee)
         
@@ -6310,7 +6310,7 @@ class SmartReportApp(QMainWindow):
 
         if hasattr(self, 'emp_cb'):
             self.emp_cb.clear()
-            cursor.execute("SELECT name FROM employees ORDER BY name")
+            cursor.execute("SELECT name FROM employees WHERE is_active = 1 ORDER BY name")
             for row in cursor.fetchall():
                 self.emp_cb.addItem(row[0])
 
@@ -6426,7 +6426,7 @@ class SmartReportApp(QMainWindow):
     def load_employees_table(self):
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, salary_rate FROM employees ORDER BY name")
+        cursor.execute("SELECT name, salary_rate, is_active FROM employees ORDER BY is_active DESC, name")
         rows = cursor.fetchall()
         conn.close()
 
@@ -6443,10 +6443,12 @@ class SmartReportApp(QMainWindow):
 
         self.table_employees.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
-            name, rate = row[0], row[1]
+            name, rate, is_active = row[0], row[1], bool(row[2])
             has_pin = pin_statuses.get(name.strip().lower(), None)
 
-            if has_pin is None:
+            if not is_active:
+                pin_text = "Неактивен"
+            elif has_pin is None:
                 pin_text = "❓ Неизвестно"
             elif has_pin:
                 pin_text = "✅ Пин задан"
@@ -6528,7 +6530,10 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute('DELETE FROM employees WHERE name = ?', (emp_name,))
+            cursor.execute(
+                "UPDATE employees SET is_active = 0 WHERE name = ? AND is_active = 1",
+                (emp_name,),
+            )
             if cursor.rowcount:
                 enqueue_employee_sync_event(cursor, emp_name, "deactivate")
             conn.commit()
