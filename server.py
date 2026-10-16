@@ -905,7 +905,7 @@ def expense_objects_api():
     conn = get_db_connection()
     try:
         include_inactive = request.args.get("include_inactive") == "1"
-        query = "SELECT id, sync_id, name, markning, company, rate, transport_rate, is_active FROM meta_objects"
+        query = "SELECT id, sync_id, name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects"
         if not include_inactive:
             query += " WHERE is_active = 1"
         rows = conn.execute(query + " ORDER BY company, name, id").fetchall()

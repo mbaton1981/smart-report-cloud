@@ -595,6 +595,104 @@ def enqueue_object_sync_event(cursor, object_id, operation, extra=None):
     return event
 
 
+def merge_server_object_catalog(cursor, remote_objects):
+    if not isinstance(remote_objects, list) or len(remote_objects) > 2000:
+        raise ValueError("Серверный справочник объектов имеет неверный формат или размер.")
+
+    stats = {"imported": 0, "updated": 0, "unresolved_legacy": 0, "conflicts": 0}
+    for remote in remote_objects:
+        if not isinstance(remote, dict):
+            raise ValueError("Некорректная запись серверного объекта.")
+        try:
+            server_id = int(remote.get("id"))
+            name = str(remote.get("name") or "").strip()
+            company = " ".join(str(remote.get("company") or "").split())
+            markning = str(remote.get("markning") or "").strip()
+            sync_id = str(remote.get("sync_id") or "").strip() or None
+            rate = float(remote.get("rate") or 0.0)
+            transport_rate = float(remote.get("transport_rate") or 0.0)
+            active_value = remote.get("is_active", 1)
+            if active_value not in (0, 1, False, True):
+                raise ValueError()
+            is_active = int(active_value)
+            server_revision = int(remote.get("sync_version") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректные поля серверного объекта.")
+        if (server_id <= 0 or not name or len(name) > 200 or not company or len(company) > 150
+                or len(markning) > 50 or server_revision < 0):
+            raise ValueError("Некорректные поля серверного объекта.")
+        if not 0 <= rate <= 100000 or not 0 <= transport_rate <= 100000 or not math.isfinite(rate) or not math.isfinite(transport_rate):
+            raise ValueError("Некорректные ставки серверного объекта.")
+
+        if sync_id:
+            local = cursor.execute(
+                "SELECT id, name, markning, company, rate, transport_rate, is_active, sync_version "
+                "FROM objects WHERE sync_id = ?",
+                (sync_id,),
+            ).fetchone()
+            if local:
+                if local["company"] != company:
+                    stats["conflicts"] += 1
+                    continue
+                pending = cursor.execute(
+                    "SELECT 1 FROM object_sync_outbox WHERE sync_id = ? LIMIT 1", (sync_id,)
+                ).fetchone()
+                if pending:
+                    stats["conflicts"] += 1
+                    continue
+                local_revision = int(local["sync_version"] or 0)
+                if server_revision < local_revision:
+                    stats["conflicts"] += 1
+                    continue
+                if server_revision == local_revision:
+                    local_state = (
+                        local["name"], local["markning"] or "", local["company"],
+                        float(local["rate"] or 0.0), float(local["transport_rate"] or 0.0),
+                        int(bool(local["is_active"])),
+                    )
+                    remote_state = (name, markning, company, rate, transport_rate, is_active)
+                    if local_state != remote_state:
+                        stats["conflicts"] += 1
+                        continue
+                    if local_revision == server_revision:
+                        cursor.execute(
+                            "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ?",
+                            (server_id, int(local["id"]), sync_id),
+                        )
+                        continue
+                cursor.execute("""
+                    UPDATE objects
+                    SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = ?,
+                        server_id = ?, sync_version = ?
+                    WHERE id = ? AND sync_id = ?
+                """, (
+                    name, markning, rate, transport_rate, is_active, server_id, server_revision,
+                    int(local["id"]), sync_id,
+                ))
+                stats["updated"] += 1
+                continue
+
+        collision = cursor.execute(
+            "SELECT id FROM objects WHERE name = ? AND company = ?", (name, company)
+        ).fetchone()
+        if collision:
+            stats["unresolved_legacy"] += 1
+            continue
+
+        cursor.execute("INSERT OR IGNORE INTO companies (name) VALUES (?)", (company,))
+        cursor.execute("""
+            INSERT INTO objects (
+                name, markning, company, rate, transport_rate, sync_id, server_id,
+                is_active, sync_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            name, markning, company, rate, transport_rate, sync_id,
+            server_id if sync_id else None, is_active, server_revision if sync_id else 0,
+        ))
+        stats["imported"] += 1
+    return stats
+
+
 def exact_legacy_object_candidates(objects, company, name, markning):
     return [
         item for item in objects
@@ -2068,6 +2166,27 @@ class SmartReportApp(QMainWindow):
                 raise
             finally:
                 conn.close()
+        catalog_response = requests.get(
+            f"{CLOUD_URL}/api/expense-objects?include_inactive=1",
+            headers=headers,
+            timeout=4,
+        )
+        catalog_response.raise_for_status()
+        catalog_result = catalog_response.json()
+        if not isinstance(catalog_result, dict) or catalog_result.get("ok") is not True:
+            raise RuntimeError("Сервер не вернул справочник объектов для синхронизации.")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            catalog_stats = merge_server_object_catalog(cursor, catalog_result.get("objects"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        conflicts += catalog_stats["unresolved_legacy"] + catalog_stats["conflicts"]
         return conflicts
 
     def _on_sync_completed(self, success, conflicts, error):
