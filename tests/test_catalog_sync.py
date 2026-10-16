@@ -128,7 +128,7 @@ class CatalogSyncTests(unittest.TestCase):
              patch.object(self.desktop.requests, "post", side_effect=fake_post):
             return self.desktop.SmartReportApp.perform_sync_logic(SimpleNamespace())
 
-    def test_catalog_pull_imports_legacy_rows_without_linking_or_rewriting_history(self):
+    def test_catalog_pull_links_exact_legacy_rows_and_preserves_history_and_allocations(self):
         server_objects = (
             ("***", "Tomteboda arbetsledning"),
             ("p1032", "Tomteboda doors"),
@@ -139,11 +139,12 @@ class CatalogSyncTests(unittest.TestCase):
         )
         server_conn = self.server.get_db_connection()
         for markning, name in server_objects:
+            server_rate = 0 if markning in {"p1034", "p1038"} else 550
             server_conn.execute("""
                 INSERT INTO meta_objects (
                     name, markning, company, rate, transport_rate, is_active, sync_version
-                ) VALUES (?, ?, 'Renatur', 550, 0, 1, 1)
-            """, (name, markning))
+                ) VALUES (?, ?, 'Renatur', ?, 0, 1, 0)
+            """, (name, markning, server_rate))
         server_conn.commit()
         server_conn.close()
 
@@ -152,9 +153,25 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.execute("""
             INSERT INTO objects (
                 name, markning, company, rate, transport_rate, is_active, sync_version
-            ) VALUES ('Tomteboda ÄTA', 'p1034', 'Renatur', 550, 0, 1, 0),
-                     ('Tomteboda ÄTA Rivning', 'p1038', 'Renatur', 550, 0, 1, 0)
+            ) VALUES ('Tomteboda ÄTA', 'p1034', 'Renatur', 520, 450, 1, 0),
+                     ('Tomteboda ÄTA Rivning', 'p1038', 'Renatur', 425, 450, 1, 0)
         """)
+        local_object_ids = {
+            row["markning"]: int(row["id"])
+            for row in desktop_conn.execute(
+                "SELECT id, markning FROM objects WHERE company = 'Renatur'"
+            )
+        }
+        document_id = desktop_conn.execute("""
+            INSERT INTO supplier_documents (
+                document_type, document_date, currency_code, gross_amount,
+                expense_category, created_at, updated_at
+            ) VALUES ('manual', '2026-10-12', 'SEK', '37500.00', 'Тестовая allocation', 'test', 'test')
+        """).lastrowid
+        desktop_conn.execute("""
+            INSERT INTO supplier_document_allocations (document_id, object_id, allocated_gross)
+            VALUES (?, ?, '37500.00')
+        """, (document_id, local_object_ids["p1034"]))
         desktop_conn.executemany("""
             INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport, comment, invoiced)
             VALUES (?, 'Test Employee', 'Renatur', ?, 8, 0, 0, ?, 0)
@@ -165,10 +182,10 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.commit()
         desktop_conn.close()
 
-        self._worker()
+        result = self._worker()
         desktop_conn = self.desktop.get_db_connection()
         rows = desktop_conn.execute("""
-            SELECT name, markning, sync_id, server_id, is_active
+            SELECT id, name, markning, sync_id, server_id, is_active
             FROM objects WHERE company = 'Renatur' ORDER BY markning
         """).fetchall()
         history = {
@@ -178,11 +195,37 @@ class CatalogSyncTests(unittest.TestCase):
         }
         desktop_conn.close()
         self.assertEqual(len(rows), 6)
-        self.assertTrue(all(row[2] is None and row[3] is None and row[4] == 1 for row in rows))
+        self.assertEqual(result, {"conflicts": 0, "linked_legacy": 7, "unresolved_legacy": 0})
+        self.assertTrue(all(row[3] and row[4] and row[5] == 1 for row in rows))
+        self.assertEqual(
+            {row[2]: row[0] for row in rows if row[2] in local_object_ids},
+            local_object_ids,
+        )
         self.assertEqual(history, {
             ("Tomteboda doors", "history-p1032"),
             ("Tomteboda glass", "history-p1031"),
         })
+        server_conn = self.server.get_db_connection()
+        server_rows = {
+            row["markning"]: row
+            for row in server_conn.execute(
+                "SELECT id, markning, rate, transport_rate, sync_id, sync_version "
+                "FROM meta_objects WHERE company = 'Renatur'"
+            )
+        }
+        self.assertEqual((server_rows["p1034"]["rate"], server_rows["p1034"]["transport_rate"]), (520, 450))
+        self.assertEqual((server_rows["p1038"]["rate"], server_rows["p1038"]["transport_rate"]), (425, 450))
+        self.assertTrue(all(row["sync_id"] and row["sync_version"] == 1 for row in server_rows.values()))
+        self.assertEqual(server_conn.execute("SELECT COUNT(*) FROM object_sync_events").fetchone()[0], 7)
+        server_conn.close()
+        desktop_conn = self.desktop.get_db_connection()
+        allocation = desktop_conn.execute(
+            "SELECT object_id FROM supplier_document_allocations WHERE document_id = ?", (document_id,)
+        ).fetchone()
+        self.assertEqual(allocation[0], local_object_ids["p1034"])
+        self.assertEqual(desktop_conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+        desktop_conn.close()
         combo = self.desktop.QComboBox()
         self.desktop.SmartReportApp.load_objects_for_company(
             SimpleNamespace(), "Renatur", combo, self.desktop.RECORD_TYPE_WORK
@@ -192,13 +235,47 @@ class CatalogSyncTests(unittest.TestCase):
             for index in range(combo.count())
         }
         self.assertEqual(visible_codes, {"***", "****", "p1031", "p1032", "p1034", "p1038"})
-        self._worker()
+        repeated = self._worker()
+        self.assertEqual(repeated["linked_legacy"], 0)
+        self.assertEqual(repeated["conflicts"], 0)
         desktop_conn = self.desktop.get_db_connection()
         self.assertEqual(
             desktop_conn.execute("SELECT COUNT(*) FROM objects WHERE company = 'Renatur'").fetchone()[0],
             6,
         )
         desktop_conn.close()
+
+    def test_legacy_rate_conflict_is_not_linked_or_overwritten(self):
+        server_conn = self.server.get_db_connection()
+        server_id = server_conn.execute("""
+            INSERT INTO meta_objects (name, markning, company, rate, transport_rate, is_active, sync_version)
+            VALUES ('Conflicting Rate', 'p-rate-conflict', 'Renatur', 120, 10, 1, 0)
+        """).lastrowid
+        server_conn.commit()
+        server_conn.close()
+        desktop_conn = self.desktop.get_db_connection()
+        local_id = desktop_conn.execute("""
+            INSERT INTO objects (name, markning, company, rate, transport_rate, is_active, sync_version)
+            VALUES ('Conflicting Rate', 'p-rate-conflict', 'Renatur', 100, 10, 1, 0)
+        """).lastrowid
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        result = self._worker()
+        self.assertEqual(result, {"conflicts": 0, "linked_legacy": 1, "unresolved_legacy": 1})
+        desktop_conn = self.desktop.get_db_connection()
+        local = desktop_conn.execute(
+            "SELECT sync_id, server_id, rate, transport_rate FROM objects WHERE id = ?", (local_id,)
+        ).fetchone()
+        self.assertEqual(tuple(local), (None, None, 100, 10))
+        self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+        desktop_conn.close()
+        server_conn = self.server.get_db_connection()
+        remote = server_conn.execute(
+            "SELECT sync_id, rate, transport_rate, sync_version FROM meta_objects WHERE id = ?", (server_id,)
+        ).fetchone()
+        self.assertEqual(tuple(remote), (None, 120, 10, 0))
+        server_conn.close()
 
     def test_stable_id_revision_merge_and_deactivation_preserve_history(self):
         sync_id = str(uuid.uuid4())
@@ -230,6 +307,66 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(tuple(row), (local_id, "New Name", 20, 0, 2, 9001))
         self.assertEqual(history_name, "Old Name")
 
+    def test_legacy_link_preserves_local_rates_and_checks_server_revision(self):
+        server_conn = self.server.get_db_connection()
+        server_id = server_conn.execute("""
+            INSERT INTO meta_objects (name, markning, company, rate, transport_rate, is_active, sync_version)
+            VALUES ('Local Rate Wins', 'p-link-rate', 'Renatur', 0, 0, 1, 0)
+        """).lastrowid
+        server_conn.commit()
+        server_conn.close()
+        sync_id = str(uuid.uuid4())
+        event = {
+            "operation_id": str(uuid.uuid4()), "sync_id": sync_id, "revision": 1,
+            "operation": "link_legacy",
+            "object": {
+                "name": "Local Rate Wins", "markning": "p-link-rate", "company": "Renatur",
+                "rate": 520, "transport_rate": 450, "server_object_id": server_id,
+                "expected_server_name": "Local Rate Wins", "expected_server_company": "Renatur",
+                "expected_server_markning": "p-link-rate", "expected_server_rate": 0,
+                "expected_server_transport_rate": 0, "expected_server_is_active": 1,
+                "expected_server_revision": 0,
+            },
+        }
+
+        response = self._server_post({"object_events": [event]})
+        self.assertEqual(response.status_code, 200)
+        server_conn = self.server.get_db_connection()
+        row = server_conn.execute(
+            "SELECT sync_id, rate, transport_rate, sync_version FROM meta_objects WHERE id = ?",
+            (server_id,),
+        ).fetchone()
+        server_conn.close()
+        self.assertEqual(tuple(row), (sync_id, 520, 450, 1))
+
+        server_conn = self.server.get_db_connection()
+        stale_id = server_conn.execute("""
+            INSERT INTO meta_objects (name, markning, company, rate, transport_rate, is_active, sync_version)
+            VALUES ('Changed During Link', 'p-link-stale', 'Renatur', 100, 10, 1, 1)
+        """).lastrowid
+        server_conn.commit()
+        server_conn.close()
+        stale_event = {
+            **event,
+            "operation_id": str(uuid.uuid4()),
+            "sync_id": str(uuid.uuid4()),
+            "object": {
+                **event["object"], "name": "Changed During Link", "markning": "p-link-stale",
+                "server_object_id": stale_id, "expected_server_name": "Changed During Link",
+                "expected_server_markning": "p-link-stale", "expected_server_rate": 0,
+                "expected_server_transport_rate": 0, "expected_server_revision": 0,
+            },
+        }
+        stale_response = self._server_post({"object_events": [stale_event]})
+        self.assertEqual(stale_response.status_code, 400)
+        server_conn = self.server.get_db_connection()
+        unchanged = server_conn.execute(
+            "SELECT sync_id, rate, transport_rate, sync_version FROM meta_objects WHERE id = ?",
+            (stale_id,),
+        ).fetchone()
+        server_conn.close()
+        self.assertEqual(tuple(unchanged), (None, 100, 10, 1))
+
     def test_offline_lost_ack_and_employee_restore_rate(self):
         employee_name = f"Sync Test {uuid.uuid4().hex[:8]}"
         object_name = f"Sync Object {uuid.uuid4().hex[:8]}"
@@ -257,7 +394,12 @@ class CatalogSyncTests(unittest.TestCase):
             (object_event["operation_id"],),
         ).fetchone()[0], 1)
         desktop_conn.close()
-        self._worker()
+        retry_result = self._worker()
+        self.assertEqual(retry_result["conflicts"], 0)
+        self.assertEqual(retry_result["linked_legacy"], 0)
+        desktop_conn = self.desktop.get_db_connection()
+        self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+        desktop_conn.close()
 
         server_conn = self.server.get_db_connection()
         remote_object = server_conn.execute(

@@ -2615,6 +2615,8 @@ def apply_object_sync_event(cursor, event):
             key: object_data.get(key) for key in (
                 "server_object_id", "expected_server_name",
                 "expected_server_company", "expected_server_markning",
+                "expected_server_rate", "expected_server_transport_rate",
+                "expected_server_is_active", "expected_server_revision",
             )
         })
     state_hash = hashlib.sha256(json.dumps(
@@ -2698,10 +2700,18 @@ def apply_object_sync_event(cursor, event):
     if operation == "link_legacy":
         try:
             server_object_id = int(object_data.get("server_object_id"))
+            expected_server_rate = float(object_data.get("expected_server_rate"))
+            expected_server_transport_rate = float(object_data.get("expected_server_transport_rate"))
+            expected_server_is_active = int(object_data.get("expected_server_is_active"))
+            expected_server_revision = int(object_data.get("expected_server_revision"))
         except (TypeError, ValueError) as error:
-            raise ValueError("Для подтверждения связи нужен ID серверного объекта.") from error
+            raise ValueError("Для подтверждения связи нужны ID и состояние серверного объекта.") from error
+        if (expected_server_is_active not in (0, 1) or expected_server_revision < 0
+                or not math.isfinite(expected_server_rate) or not math.isfinite(expected_server_transport_rate)):
+            raise ValueError("Некорректное ожидаемое состояние серверного объекта.")
         cursor.execute(
-            "SELECT id, name, company, markning, sync_id FROM meta_objects WHERE id = ?",
+            "SELECT id, name, company, markning, sync_id, rate, transport_rate, is_active, sync_version "
+            "FROM meta_objects WHERE id = ?",
             (server_object_id,),
         )
         target = cursor.fetchone()
@@ -2717,19 +2727,30 @@ def apply_object_sync_event(cursor, event):
             str(object_data.get("expected_server_name") or "").strip(),
             " ".join(str(object_data.get("expected_server_company") or "").split()),
             str(object_data.get("expected_server_markning") or "").strip(),
+            expected_server_rate, expected_server_transport_rate,
+            expected_server_is_active, expected_server_revision,
         )
-        actual_server = (target["name"], target["company"], target["markning"] or "")
+        actual_server = (
+            target["name"], target["company"], target["markning"] or "",
+            float(target["rate"] or 0.0), float(target["transport_rate"] or 0.0),
+            int(bool(target["is_active"])), int(target["sync_version"] or 0),
+        )
         if actual_server != expected_server or target["company"] != company:
             raise ValueError("Данные серверного объекта изменились; связь не применена.")
+        if revision != expected_server_revision + 1:
+            raise ValueError("Revision legacy-связи не следует за серверной revision.")
         if target["sync_id"] not in (None, sync_id):
             raise ValueError("Серверный объект уже связан с другим устойчивым ID.")
         cursor.execute("SELECT id FROM meta_objects WHERE sync_id = ? AND id <> ?", (sync_id, server_object_id))
         if cursor.fetchone():
             raise ValueError("Устойчивый ID уже связан с другим серверным объектом.")
         cursor.execute(
-            "UPDATE meta_objects SET sync_id = ?, sync_version = ? WHERE id = ?",
-            (sync_id, revision, server_object_id),
+            "UPDATE meta_objects SET sync_id = ?, rate = ?, transport_rate = ?, sync_version = ? "
+            "WHERE id = ? AND sync_id IS NULL AND sync_version = ?",
+            (sync_id, rate, transport_rate, revision, server_object_id, expected_server_revision),
         )
+        if cursor.rowcount != 1:
+            raise ValueError("Серверный объект изменился во время подтверждения связи.")
     else:
         cursor.execute("SELECT id, company, is_active FROM meta_objects WHERE sync_id = ?", (sync_id,))
         target = cursor.fetchone()

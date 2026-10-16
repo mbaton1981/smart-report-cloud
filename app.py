@@ -599,7 +599,18 @@ def merge_server_object_catalog(cursor, remote_objects):
     if not isinstance(remote_objects, list) or len(remote_objects) > 2000:
         raise ValueError("Серверный справочник объектов имеет неверный формат или размер.")
 
-    stats = {"imported": 0, "updated": 0, "unresolved_legacy": 0, "conflicts": 0}
+    stats = {"imported": 0, "updated": 0, "linked": 0, "unresolved_legacy": 0, "conflicts": 0}
+    remote_legacy_counts = {}
+    for item in remote_objects:
+        if not isinstance(item, dict) or str(item.get("sync_id") or "").strip():
+            continue
+        remote_key = (
+            str(item.get("name") or "").strip(),
+            " ".join(str(item.get("company") or "").split()),
+            str(item.get("markning") or "").strip(),
+        )
+        remote_legacy_counts[remote_key] = remote_legacy_counts.get(remote_key, 0) + 1
+
     for remote in remote_objects:
         if not isinstance(remote, dict):
             raise ValueError("Некорректная запись серверного объекта.")
@@ -638,7 +649,6 @@ def merge_server_object_catalog(cursor, remote_objects):
                     "SELECT 1 FROM object_sync_outbox WHERE sync_id = ? LIMIT 1", (sync_id,)
                 ).fetchone()
                 if pending:
-                    stats["conflicts"] += 1
                     continue
                 local_revision = int(local["sync_version"] or 0)
                 if server_revision < local_revision:
@@ -676,6 +686,44 @@ def merge_server_object_catalog(cursor, remote_objects):
             "SELECT id FROM objects WHERE name = ? AND company = ?", (name, company)
         ).fetchone()
         if collision:
+            legacy_key = (name, company, markning)
+            local_candidates = cursor.execute(
+                "SELECT id, sync_id, server_id, sync_version, rate, transport_rate, is_active "
+                "FROM objects WHERE name = ? AND company = ? AND COALESCE(markning, '') = ?",
+                legacy_key,
+            ).fetchall()
+            if len(local_candidates) == 1 and not sync_id and remote_legacy_counts.get(legacy_key) == 1:
+                local = local_candidates[0]
+                pending = cursor.execute(
+                    "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1",
+                    (int(local["id"]),),
+                ).fetchone()
+                local_rate = float(local["rate"] or 0.0)
+                local_transport = float(local["transport_rate"] or 0.0)
+                rate_compatible = local_rate == rate or (rate == 0 and local_rate > 0)
+                transport_compatible = (
+                    local_transport == transport_rate
+                    or (transport_rate == 0 and local_transport > 0)
+                )
+                if (
+                    local["sync_id"] is None and local["server_id"] is None and not pending
+                    and int(local["sync_version"] or 0) == server_revision
+                    and int(bool(local["is_active"])) == is_active
+                    and rate_compatible and transport_compatible and server_revision == 0
+                ):
+                    enqueue_object_sync_event(cursor, int(local["id"]), "link_legacy", {
+                        "sync_id": str(uuid.uuid4()),
+                        "server_object_id": server_id,
+                        "expected_server_name": name,
+                        "expected_server_company": company,
+                        "expected_server_markning": markning,
+                        "expected_server_rate": rate,
+                        "expected_server_transport_rate": transport_rate,
+                        "expected_server_is_active": is_active,
+                        "expected_server_revision": server_revision,
+                    })
+                    stats["linked"] += 1
+                    continue
             stats["unresolved_legacy"] += 1
             continue
 
@@ -690,6 +738,22 @@ def merge_server_object_catalog(cursor, remote_objects):
             server_id if sync_id else None, is_active, server_revision if sync_id else 0,
         ))
         stats["imported"] += 1
+        if not sync_id:
+            if server_revision == 0 and remote_legacy_counts.get((name, company, markning)) == 1:
+                enqueue_object_sync_event(cursor, int(cursor.lastrowid), "link_legacy", {
+                    "sync_id": str(uuid.uuid4()),
+                    "server_object_id": server_id,
+                    "expected_server_name": name,
+                    "expected_server_company": company,
+                    "expected_server_markning": markning,
+                    "expected_server_rate": rate,
+                    "expected_server_transport_rate": transport_rate,
+                    "expected_server_is_active": is_active,
+                    "expected_server_revision": server_revision,
+                })
+                stats["linked"] += 1
+            else:
+                stats["unresolved_legacy"] += 1
     return stats
 
 
@@ -1072,7 +1136,7 @@ def enqueue_matching_shifts(cursor, where_clause, params):
         enqueue_shift_operation(cursor, sync_id, 'upsert', row['sync_version'], shift_payload(row))
 
 class SyncWorker(QThread):
-    completed = pyqtSignal(bool, int, str)
+    completed = pyqtSignal(bool, int, int, int, str)
 
     def __init__(self, window):
         super().__init__(window)
@@ -1080,10 +1144,13 @@ class SyncWorker(QThread):
 
     def run(self):
         try:
-            conflicts = self.window.perform_sync_logic()
-            self.completed.emit(True, conflicts, "")
+            result = self.window.perform_sync_logic()
+            self.completed.emit(
+                True, result["conflicts"], result["linked_legacy"],
+                result["unresolved_legacy"], "",
+            )
         except Exception as error:
-            self.completed.emit(False, 0, str(error))
+            self.completed.emit(False, 0, 0, 0, str(error))
 
 def parse_float(val_str, default=0.0):
     if not val_str:
@@ -2004,6 +2071,28 @@ class SmartReportApp(QMainWindow):
             finally:
                 conn.close()
 
+        catalog_response = requests.get(
+            f"{CLOUD_URL}/api/expense-objects?include_inactive=1",
+            headers=headers,
+            timeout=4,
+        )
+        catalog_response.raise_for_status()
+        catalog_result = catalog_response.json()
+        if not isinstance(catalog_result, dict) or catalog_result.get("ok") is not True:
+            raise RuntimeError("Сервер не вернул справочник объектов для синхронизации.")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            catalog_stats = merge_server_object_catalog(cursor, catalog_result.get("objects"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        conflicts += catalog_stats["conflicts"]
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT name, COALESCE(salary_rate, 0.0) AS salary_rate, is_active FROM employees ORDER BY name")
@@ -2166,39 +2255,38 @@ class SmartReportApp(QMainWindow):
                 raise
             finally:
                 conn.close()
-        catalog_response = requests.get(
-            f"{CLOUD_URL}/api/expense-objects?include_inactive=1",
-            headers=headers,
-            timeout=4,
-        )
-        catalog_response.raise_for_status()
-        catalog_result = catalog_response.json()
-        if not isinstance(catalog_result, dict) or catalog_result.get("ok") is not True:
-            raise RuntimeError("Сервер не вернул справочник объектов для синхронизации.")
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("BEGIN IMMEDIATE")
-            catalog_stats = merge_server_object_catalog(cursor, catalog_result.get("objects"))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-        conflicts += catalog_stats["unresolved_legacy"] + catalog_stats["conflicts"]
-        return conflicts
+        return {
+            "conflicts": conflicts,
+            "linked_legacy": catalog_stats["linked"],
+            "unresolved_legacy": catalog_stats["unresolved_legacy"],
+        }
 
-    def _on_sync_completed(self, success, conflicts, error):
+    def _on_sync_completed(self, success, conflicts, linked_legacy, unresolved_legacy, error):
         self._sync_worker = None
         if success:
             self.load_shifts_history()
         if self._manual_sync_requested:
             self._manual_sync_requested = False
-            if success and not conflicts:
-                QMessageBox.information(self, "Синхронизация", "Синхронизация завершена.")
+            if success and conflicts:
+                QMessageBox.warning(
+                    self, "Конфликт синхронизации",
+                    f"Есть конфликтующих изменений: {conflicts}. "
+                    f"Связано legacy-объектов: {linked_legacy}; "
+                    f"не сопоставлено: {unresolved_legacy}.",
+                )
+            elif success and unresolved_legacy:
+                QMessageBox.warning(
+                    self, "Legacy-объекты",
+                    f"Синхронизация завершена, но {unresolved_legacy} legacy-объектов "
+                    "не сопоставлены из-за неоднозначности или расхождения ставок.",
+                )
+            elif success and linked_legacy:
+                QMessageBox.information(
+                    self, "Синхронизация",
+                    f"Синхронизация завершена. Связано legacy-объектов: {linked_legacy}.",
+                )
             elif success:
-                QMessageBox.warning(self, "Конфликт синхронизации", f"Есть конфликтующих изменений: {conflicts}. Несохранённые данные оставлены в локальной очереди.")
+                QMessageBox.information(self, "Синхронизация", "Синхронизация завершена.")
             else:
                 QMessageBox.warning(self, "Нет связи", f"Изменения сохранены локально и будут отправлены после восстановления связи.\n{error}")
 
@@ -6029,7 +6117,9 @@ class SmartReportApp(QMainWindow):
         object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
         conn = get_db_connection()
         row = conn.execute(
-            "SELECT name, markning, company, sync_id FROM objects WHERE id = ?", (object_id,)
+            "SELECT name, markning, company, sync_id, rate, transport_rate, is_active, sync_version "
+            "FROM objects WHERE id = ?",
+            (object_id,),
         ).fetchone()
         conn.close()
         if row is None or row["sync_id"]:
@@ -6051,10 +6141,32 @@ class SmartReportApp(QMainWindow):
             )
             return
         candidate = candidates[0]
+        local_rate = float(row["rate"] or 0.0)
+        local_transport = float(row["transport_rate"] or 0.0)
+        server_rate = float(candidate.get("rate") or 0.0)
+        server_transport = float(candidate.get("transport_rate") or 0.0)
+        rates_compatible = (
+            (local_rate == server_rate or (server_rate == 0 and local_rate > 0))
+            and (local_transport == server_transport or (server_transport == 0 and local_transport > 0))
+        )
+        if (
+            int(bool(row["is_active"])) != int(bool(candidate.get("is_active", 1)))
+            or int(row["sync_version"] or 0) != int(candidate.get("sync_version") or 0)
+            or int(candidate.get("sync_version") or 0) != 0
+            or not rates_compatible
+        ):
+            QMessageBox.information(
+                self,
+                "Сопоставление объекта",
+                "Состояния или ненулевые ставки различаются; запись оставлена без изменений.",
+            )
+            return
         confirmation = QMessageBox.question(
             self,
             "Подтвердить связь",
-            f"Связать локальную запись «{row['name']}» фирмы «{row['company']}» с серверным ID {candidate['id']}? Серверные ставки не будут перезаписаны.",
+            f"Связать «{row['name']}» с серверным ID {candidate['id']}? "
+            f"Локальные ставки {local_rate:g}/{local_transport:g} сохранятся; "
+            "нулевые серверные ставки будут заменены локальными.",
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
@@ -6067,21 +6179,16 @@ class SmartReportApp(QMainWindow):
             ).fetchone()
             if current is None or current["sync_id"]:
                 raise ValueError("Локальная запись уже была связана или удалена.")
-            cursor.execute(
-                "UPDATE objects SET rate = ?, transport_rate = ?, is_active = ? WHERE id = ?",
-                (
-                    float(candidate.get("rate") or 0.0),
-                    float(candidate.get("transport_rate") or 0.0),
-                    int(bool(candidate.get("is_active", 1))),
-                    object_id,
-                ),
-            )
             enqueue_object_sync_event(cursor, object_id, "link_legacy", {
                 "sync_id": str(uuid.uuid4()),
                 "server_object_id": int(candidate["id"]),
                 "expected_server_name": candidate["name"],
                 "expected_server_company": candidate["company"],
                 "expected_server_markning": candidate.get("markning") or "",
+                "expected_server_rate": server_rate,
+                "expected_server_transport_rate": server_transport,
+                "expected_server_is_active": int(bool(candidate.get("is_active", 1))),
+                "expected_server_revision": int(candidate.get("sync_version") or 0),
             })
             conn.commit()
         except Exception as error:
