@@ -300,6 +300,194 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_invoice_object_selection_survives_dropdown_refresh(self):
+        sync_id = str(uuid.uuid4())
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Renatur', 'ZZ selected invoice object', 'invoice-selection', 520, 450, ?, 1)
+        """, (sync_id,))
+        desktop_conn.commit()
+        desktop_conn.close()
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("""
+            INSERT INTO meta_objects (id,company,name,markning,rate,transport_rate,sync_id,sync_version,is_active)
+            VALUES (9002,'Renatur','ZZ selected invoice object','invoice-selection',520,450,?,0,1)
+        """, (sync_id,))
+        server_conn.commit()
+        server_conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            window.inv_comp_cb.setCurrentText("Renatur")
+            index = window.inv_obj_cb.findText("invoice-selection", self.desktop.Qt.MatchFlag.MatchContains)
+            self.assertGreaterEqual(index, 0)
+            window.inv_obj_cb.setCurrentIndex(index)
+            selected = window.inv_obj_cb.currentText()
+            object_id = window.inv_obj_cb.currentData()
+            for _iteration in range(3):
+                self.assertEqual(self._worker()['conflicts'], 0)
+                window.load_dropdowns()
+                self.assertEqual(window.inv_obj_cb.currentText(), selected)
+                self.assertEqual(window.inv_obj_cb.currentData(), object_id)
+            server_conn = self.server.get_db_connection()
+            server_conn.execute("""
+                UPDATE meta_objects SET name='AA renamed invoice object', markning='new-code', sync_version=1
+                WHERE id=9002
+            """)
+            server_conn.commit()
+            server_conn.close()
+            self.assertEqual(self._worker()['conflicts'], 0)
+            window.load_dropdowns()
+            self.assertEqual(window.inv_obj_cb.currentData(), object_id)
+            self.assertIn('new-code', window.inv_obj_cb.currentText())
+            desktop_conn = self.desktop.get_db_connection()
+            desktop_conn.execute('DELETE FROM objects WHERE id=?', (object_id,))
+            desktop_conn.commit()
+            desktop_conn.close()
+            window.load_dropdowns()
+            self.assertEqual(window.inv_obj_cb.currentIndex(), -1)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_pdf_matches_table_and_recalculates_changed_filters(self):
+        desktop_conn = self.desktop.get_db_connection()
+        identities = {}
+        for name, markning, rate in (('Invoice work', 'p1038', 425), ('Invoice hotel', 'p1039', 520)):
+            identities[name] = desktop_conn.execute("""
+                INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+                VALUES ('Renatur',?,?,?,450,?,1)
+            """, (name, markning, rate, str(uuid.uuid4()))).lastrowid
+        desktop_conn.executemany("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+            VALUES (?,?,'Renatur',?,?,400,?,?,?)
+        """, (
+            ('2026-10-01', 'Alice', 'Invoice work', 2, 1, 0, 'work'),
+            ('2026-10-31', 'Alice', 'Invoice work', 3, 0, 1, 'work'),
+            ('2026-10-31', 'Bob', 'Invoice work', 1, 1, 1, 'work'),
+            ('2026-11-01', 'Alice', 'Invoice work', 9, 0, 0, 'work'),
+            ('2026-09-30', 'Alice', 'Invoice work', 9, 0, 0, 'work'),
+            ('2026-10-31', 'Carol', 'Invoice hotel', 4, 1, 0, 'work'),
+            ('2026-10-31', 'Excluded', 'Invoice work', 8, 0, 0, 'atf'),
+            ('2026-10-31', 'Excluded', 'Invoice work', 8, 0, 0, 'sick'),
+        ))
+        ob_id = str(uuid.uuid4())
+        result = self.desktop.calculate_work_interval('2026-10-31', '18:00', '19:00', 400)
+        desktop_conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                                entry_type,sync_id,start_time,end_time,ob_base_rate)
+            VALUES ('2026-10-31','Alice','Renatur','Invoice work',1,0,0,0,'ob',?,'18:00','19:00',400)
+        """, (ob_id,))
+        self.desktop.replace_ob_segments(desktop_conn.cursor(), ob_id, result['segments'])
+        desktop_conn.commit()
+        original_shifts = [tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')]
+        desktop_conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            window.inv_comp_cb.setCurrentText('Renatur')
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identities['Invoice work']))
+            report = window.generate_invoice()
+            self.assertEqual([row[0] for row in report['rows']], ['Alice', 'Bob'])
+            self.assertEqual([row[1] for row in report['rows']], [5, 1])
+            self.assertEqual([row[3] for row in report['rows']], [2, 1])
+            self.assertEqual(report['rows'][0][4], 1)
+            self.assertAlmostEqual(report['rows'][0][5], result['total_amount'])
+            self.assertIn('3,450.00', window.inv_total_sum_lbl.text())
+
+            def check_pdf(build, object_name):
+                story = build.call_args.args[0]
+                heading = '\n'.join(flow.getPlainText() for flow in story if hasattr(flow, 'getPlainText'))
+                self.assertIn(object_name, heading)
+                self.assertIn('Renatur', heading)
+                self.assertIn(window.inv_date_to.text(), heading)
+                pdf_table = next(flow for flow in story if isinstance(flow, self.desktop.Table))
+                for row_index in range(window.table_invoice.rowCount()):
+                    pdf_row = pdf_table._cellvalues[row_index + 1]
+                    self.assertEqual(pdf_row[0].getPlainText(), window.table_invoice.item(row_index, 0).text())
+                    self.assertEqual(pdf_row[1:6], [window.table_invoice.item(row_index, column).text() for column in range(1, 6)])
+                    self.assertEqual(pdf_row[7], window.table_invoice.item(row_index, 8).text())
+
+            with patch.object(self.desktop, 'REPORTS_DIR', str(Path(self._case.name) / 'reports')), \
+                 patch.object(self.desktop.SimpleDocTemplate, 'build') as build, \
+                 patch.object(self.desktop.os, 'startfile', create=True), \
+                 patch.object(self.desktop.QMessageBox, 'information'), \
+                 patch.object(self.desktop.QMessageBox, 'critical') as critical, \
+                 patch.object(self.desktop.QMessageBox, 'warning') as warning:
+                window.export_invoice_to_pdf()
+                check_pdf(build, 'Invoice work')
+                window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identities['Invoice hotel']))
+                window.export_invoice_to_pdf()
+                check_pdf(build, 'Invoice hotel')
+                self.assertEqual(window.table_invoice.rowCount(), 1)
+                self.assertEqual(window.table_invoice.item(0, 0).text(), 'Carol')
+                self.assertIn('2,530.00', window.inv_total_sum_lbl.text())
+                window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identities['Invoice work']))
+                window.inv_date_from.setDate(self.desktop.QDate(2026, 10, 31))
+                window.export_invoice_to_pdf()
+                check_pdf(build, 'Invoice work')
+                self.assertEqual([row[1] for row in window._invoice_report['rows']], [3, 1])
+                self.assertEqual([row[3] for row in window._invoice_report['rows']], [1, 1])
+                window.inv_date_from.setDate(self.desktop.QDate(2026, 11, 2))
+                window.inv_date_to.setDate(self.desktop.QDate(2026, 11, 3))
+                build.reset_mock()
+                window.export_invoice_to_pdf()
+                build.assert_not_called()
+                warning.assert_called_once()
+                self.assertIn('Invoice work', warning.call_args.args[2])
+                self.assertIn('Закрытые и незакрытые', warning.call_args.args[2])
+                self.assertEqual(window.table_invoice.rowCount(), 0)
+                critical.assert_not_called()
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual([tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')], original_shifts)
+            desktop_conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_rename_keeps_historical_shifts_without_rewriting_them(self):
+        desktop_conn = self.desktop.get_db_connection()
+        sync_id = str(uuid.uuid4())
+        object_id = desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,sync_version,is_active)
+            VALUES ('Renatur','Invoice old name','p1038',425,450,?,1,1)
+        """, (sync_id,)).lastrowid
+        desktop_conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,entry_type,
+                                sync_id,work_rate_cache,work_transport_cache)
+            VALUES ('2026-10-31','Historical worker','Renatur','Invoice old name',8,425,1,'work',?,425,1)
+        """, (str(uuid.uuid4()),))
+        desktop_conn.commit()
+        original = [tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts')]
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            window.inv_comp_cb.setCurrentText('Renatur')
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_id))
+            self.desktop.merge_server_object_catalog(desktop_conn.cursor(), [{
+                'id': 9003, 'sync_id': sync_id, 'company': 'Renatur', 'name': 'Invoice new name',
+                'markning': 'p1039', 'rate': 425, 'transport_rate': 450, 'is_active': 1, 'sync_version': 2,
+            }])
+            desktop_conn.commit()
+            self.desktop.init_db_once()
+            window.load_dropdowns()
+            report = window.generate_invoice()
+            self.assertEqual(report['object_id'], object_id)
+            self.assertEqual(report['object'], 'Invoice new name')
+            self.assertEqual(report['rows'][0][:3], ('Historical worker', 8, 1))
+            self.assertEqual([tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts')], original)
+        finally:
+            desktop_conn.close()
+            window.close()
+            window.deleteLater()
+
     def test_catalog_pull_links_exact_legacy_rows_and_preserves_history_and_allocations(self):
         server_objects = (
             ("***", "Tomteboda arbetsledning"),

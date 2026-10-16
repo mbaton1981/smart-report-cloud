@@ -546,11 +546,52 @@ def init_db_once():
                 INSERT OR IGNORE INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
             ''', (name, mark, comp, rate, tr))
 
+    ensure_object_name_history(cursor)
     conn.commit()
     conn.close()
     apply_expense_documents_migration(
         DB_FILE, Path(DB_FILE).resolve().parent / BACKUP_DIR
     )
+
+
+def ensure_object_name_history(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS object_name_history (
+            sync_id TEXT NOT NULL, company TEXT NOT NULL, name TEXT NOT NULL,
+            PRIMARY KEY (sync_id, company, name)
+        )
+    """)
+    cursor.execute("""
+        INSERT OR IGNORE INTO object_name_history (sync_id, company, name)
+        SELECT sync_id, company, name FROM objects WHERE sync_id IS NOT NULL
+    """)
+
+
+def invoice_object_names(cursor, object_row):
+    names = {object_row['name']}
+    exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='object_name_history'"
+    ).fetchone()
+    if exists and object_row['sync_id']:
+        names.update(row[0] for row in cursor.execute(
+            "SELECT name FROM object_name_history WHERE sync_id=? AND company=?",
+            (object_row['sync_id'], object_row['company']),
+        ))
+    placeholders = ','.join('?' for _name in names)
+    parameters = (object_row['company'], *sorted(names), object_row['id'])
+    collision = cursor.execute(
+        f"SELECT id FROM objects WHERE company=? AND name IN ({placeholders}) AND id<>? LIMIT 1",
+        parameters,
+    ).fetchone()
+    if exists and not collision:
+        collision = cursor.execute(
+            "SELECT other.id FROM object_name_history history JOIN objects other ON other.sync_id=history.sync_id "
+            f"WHERE history.company=? AND history.name IN ({placeholders}) AND other.id<>? LIMIT 1",
+            parameters,
+        ).fetchone()
+    if collision:
+        raise ValueError("Историческое название связано с несколькими объектами; автоматический отбор заблокирован.")
+    return sorted(names)
 
 
 def enqueue_object_sync_event(cursor, object_id, operation, extra=None):
@@ -680,6 +721,8 @@ def merge_server_object_catalog(cursor, remote_objects):
                             (server_id, int(local["id"]), sync_id),
                         )
                         continue
+                if local['name'] != name:
+                    ensure_object_name_history(cursor)
                 cursor.execute("""
                     UPDATE objects
                     SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = ?,
@@ -5227,8 +5270,8 @@ class SmartReportApp(QMainWindow):
         self.load_companies_into_combobox(self.inv_comp_cb)
         
         self.inv_obj_cb = QComboBox()
-        self.load_objects_for_company(self.inv_comp_cb.currentText(), self.inv_obj_cb)
-        self.inv_comp_cb.currentTextChanged.connect(lambda comp: self.load_objects_for_company(comp, self.inv_obj_cb))
+        self.load_invoice_objects(self.inv_comp_cb.currentText())
+        self.inv_comp_cb.currentTextChanged.connect(self.load_invoice_objects)
 
         card_layout.addRow("Период с:", self.inv_date_from)
         card_layout.addRow("Период по:", self.inv_date_to)
@@ -5297,63 +5340,105 @@ class SmartReportApp(QMainWindow):
         summary_box.addWidget(self.inv_total_sum_lbl)
         layout.addLayout(summary_box)
 
-    def generate_invoice(self):
+    def load_invoice_objects(self, company):
+        selected_id = self.inv_obj_cb.currentData()
+        blocked = self.inv_obj_cb.blockSignals(True)
+        self.inv_obj_cb.clear()
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT id, name, markning, sync_id FROM objects WHERE company = ? ORDER BY name, id",
+            (company,),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            display = f"{row['markning']} | {row['name']}" if row['markning'] else row['name']
+            self.inv_obj_cb.addItem(display, int(row['id']))
+            self.inv_obj_cb.setItemData(self.inv_obj_cb.count() - 1, row['sync_id'], Qt.ItemDataRole.UserRole + 1)
+        if selected_id is not None:
+            self.inv_obj_cb.setCurrentIndex(self.inv_obj_cb.findData(selected_id))
+        else:
+            self.inv_obj_cb.setCurrentIndex(-1)
+        self.inv_obj_cb.blockSignals(blocked)
+
+    def collect_invoice_report(self):
         d_from = self.inv_date_from.text().strip()
         d_to = self.inv_date_to.text().strip()
         comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
-            return
-
+        object_id = self.inv_obj_cb.currentData()
+        if not comp or object_id is None:
+            raise ValueError("Выберите фирму и объект. Если объект исчез из справочника, выберите его заново.")
+        datetime.strptime(d_from, "%Y-%m-%d")
+        datetime.strptime(d_to, "%Y-%m-%d")
+        if d_from > d_to:
+            raise ValueError("Начало периода должно быть не позже окончания.")
         conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj, comp))
-        obj_row = cursor.fetchone()
-        object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
-        object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
-
-        is_fast_pris = self.fast_pris_check.isChecked()
-        fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
-
-        has_ob_schema = ob_schema_ready(cursor)
-        ob_details_by_employee = collect_invoice_ob_details(
-            cursor, comp, obj, d_from, d_to
-        ) if has_ob_schema else {}
-        if has_ob_schema:
-            cursor.execute('''
+        try:
+            cursor = conn.cursor()
+            obj_row = cursor.execute(
+                "SELECT * FROM objects WHERE id = ? AND company = ?", (object_id, comp)
+            ).fetchone()
+            if obj_row is None or obj_row['sync_id'] != self.inv_obj_cb.currentData(Qt.ItemDataRole.UserRole + 1):
+                raise ValueError("Выбранный объект изменился или больше не существует. Обновите справочник.")
+            obj = obj_row['name']
+            object_names = invoice_object_names(cursor, obj_row)
+            object_placeholders = ','.join('?' for _name in object_names)
+            has_ob_schema = ob_schema_ready(cursor)
+            ob_details = {}
+            if has_ob_schema:
+                for object_name in object_names:
+                    for employee, details in collect_invoice_ob_details(cursor, comp, object_name, d_from, d_to).items():
+                        previous = ob_details.setdefault(employee, {'display': '', 'tooltip': ''})
+                        for key in previous:
+                            previous[key] = '\n'.join(filter(None, (previous[key], details[key])))
+            ob_join = """
+                LEFT JOIN (SELECT shift_id, SUM(amount) AS segment_amount
+                           FROM ob_segments GROUP BY shift_id) ob_segment
+                ON ob_segment.shift_id = shifts.sync_id
+            """ if has_ob_schema else ""
+            ob_amount_sql = "COALESCE(ob_segment.segment_amount, 0)" if has_ob_schema else "0"
+            rows = cursor.execute(f'''
                 SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status,
-                    SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END) as ob_hours,
-                    SUM(CASE WHEN entry_type = 'ob' THEN COALESCE(ob_segment.segment_amount, 0) ELSE 0 END) as ob_amount
-                FROM shifts
-                LEFT JOIN (
-                    SELECT shift_id, SUM(amount) AS segment_amount
-                    FROM ob_segments GROUP BY shift_id
-                ) ob_segment ON ob_segment.shift_id = shifts.sync_id
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee
-                ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        else:
-            cursor.execute('''
-                SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status,
-                    0 as ob_hours, 0 as ob_amount
-                FROM shifts
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee
-                ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        conn.close()
+                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END),
+                    MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'ob' THEN {ob_amount_sql} ELSE 0 END),
+                    MIN(CASE WHEN entry_type = 'work' THEN COALESCE(invoiced, 0) ELSE 1 END)
+                FROM shifts {ob_join}
+                WHERE company = ? AND object_name IN ({object_placeholders}) AND date >= ? AND date <= ?
+                    AND entry_type IN ('work', 'ob')
+                GROUP BY employee ORDER BY employee
+            ''', (comp, *object_names, d_from, d_to)).fetchall()
+            rows = [tuple(row[:3]) + (2 if row[3] and not row[6] else row[3],) + tuple(row[4:6]) for row in rows]
+            is_fast_pris = self.fast_pris_check.isChecked()
+            return {
+                'object_id': object_id, 'sync_id': obj_row['sync_id'], 'company': comp, 'object': obj,
+                'object_names': object_names,
+                'date_from': d_from, 'date_to': d_to, 'rows': rows, 'ob_details': ob_details,
+                'rate': float(obj_row['rate'] or 0), 'transport_rate': float(obj_row['transport_rate'] or 0),
+                'is_fast_pris': is_fast_pris,
+                'fast_pris_amount': parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0,
+            }
+        finally:
+            conn.close()
+
+    def generate_invoice(self):
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            self.table_invoice.setRowCount(0)
+            self._invoice_report = None
+            self.inv_total_hours_lbl.setText("<b>Рабочие часы: 0.0</b>")
+            self.inv_total_ob_lbl.setText("<b>OB: 0 tim / 0.00 kr</b>")
+            self.inv_total_sum_lbl.setText("<b>Общая сумма: 0.00 kr</b>")
+            QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
+            return None
+        rows = report['rows']
+        object_default_rate = report['rate']
+        object_transport_rate = report['transport_rate']
+        is_fast_pris = report['is_fast_pris']
+        fast_pris_amount = report['fast_pris_amount']
+        ob_details_by_employee = report['ob_details']
 
         self.table_invoice.setRowCount(len(rows))
         total_hours_all = 0.0
@@ -5369,7 +5454,7 @@ class SmartReportApp(QMainWindow):
             trans_count = row[2] or 0.0
             is_inv = row[3] == 1
             ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
-            status_str = "✅ Выставлен" * is_inv or "⏳ В работе"
+            status_str = "Частично закрыт" if row[3] == 2 else "✅ Выставлен" if is_inv else "⏳ В работе"
             
             total_hours_all += hrs
             total_ob_hours_all += ob_hours
@@ -5408,61 +5493,26 @@ class SmartReportApp(QMainWindow):
             self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f}</b>")
             self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
         self.inv_total_ob_lbl.setText(f"<b>OB: {total_ob_hours_all:g} tim / {total_ob_amount_all:,.2f} kr</b>")
+        self._invoice_report = report
+        return report
 
     def export_invoice_to_pdf(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для формирования PDF-счета!")
+        report = self.generate_invoice()
+        if report is None:
             return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj, comp))
-        obj_row = cursor.fetchone()
-        object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
-        object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
-
-        is_fast_pris = self.fast_pris_check.isChecked()
-        fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
-
-        has_ob_schema = ob_schema_ready(cursor)
-        ob_details_by_employee = collect_invoice_ob_details(
-            cursor, comp, obj, d_from, d_to
-        ) if has_ob_schema else {}
-        if has_ob_schema:
-            cursor.execute('''
-                SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END) as ob_hours,
-                    SUM(CASE WHEN entry_type = 'ob' THEN COALESCE(ob_segment.segment_amount, 0) ELSE 0 END) as ob_amount
-                FROM shifts
-                LEFT JOIN (SELECT shift_id, SUM(amount) AS segment_amount FROM ob_segments GROUP BY shift_id) ob_segment
-                    ON ob_segment.shift_id = shifts.sync_id
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        else:
-            cursor.execute('''
-                SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    0 as ob_hours, 0 as ob_amount
-                FROM shifts
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        conn.close()
+        d_from, d_to = report['date_from'], report['date_to']
+        comp, obj = report['company'], report['object']
+        rows = report['rows']
+        object_default_rate, object_transport_rate = report['rate'], report['transport_rate']
+        is_fast_pris, fast_pris_amount = report['is_fast_pris'], report['fast_pris_amount']
+        ob_details_by_employee = report['ob_details']
 
         if not rows and not is_fast_pris:
-            QMessageBox.warning(self, "Внимание", "За выбранный период нет данных для отчета!")
+            QMessageBox.warning(
+                self, "Нет данных для счёта",
+                f"{comp} / {obj}: за {d_from} — {d_to} нет записей работы или OB. "
+                "Закрытые и незакрытые записи включены; АТФ и больничные в счёт не входят.",
+            )
             return
 
         if not os.path.exists(REPORTS_DIR):
@@ -5506,7 +5556,7 @@ class SmartReportApp(QMainWindow):
                 emp = row[0]
                 hrs = row[1] or 0.0
                 trans_count = row[2] or 0.0
-                ob_hours, ob_amount = row[3] or 0.0, row[4] or 0.0
+                ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
                 total_hours_all += hrs
                 total_ob_hours_all += ob_hours
                 total_ob_amount_all += ob_amount
@@ -5592,15 +5642,13 @@ class SmartReportApp(QMainWindow):
             QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF счета: {e}")
 
     def mark_period_as_invoiced(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для закрытия периода!")
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return
+        d_from, d_to = report['date_from'], report['date_to']
+        comp, obj = report['company'], report['object']
 
         reply = QMessageBox.question(
             self, "Подтверждение",
@@ -5610,14 +5658,18 @@ class SmartReportApp(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            if (self.inv_obj_cb.currentData() != report['object_id']
+                    or self.inv_comp_cb.currentText() != comp
+                    or self.inv_date_from.text() != d_from or self.inv_date_to.text() != d_to):
+                QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; период не закрыт.")
+                return
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE shifts 
-                SET invoiced = 1 
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'
-            ''', (comp, obj, d_from, d_to))
-            enqueue_matching_shifts(cursor, "company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'", (comp, obj, d_from, d_to))
+            placeholders = ','.join('?' for _name in report['object_names'])
+            work_filter = f"company = ? AND object_name IN ({placeholders}) AND date >= ? AND date <= ? AND entry_type = 'work'"
+            parameters = (comp, *report['object_names'], d_from, d_to)
+            cursor.execute(f"UPDATE shifts SET invoiced = 1 WHERE {work_filter}", parameters)
+            enqueue_matching_shifts(cursor, work_filter, parameters)
             conn.commit()
             conn.close()
 
@@ -5627,15 +5679,13 @@ class SmartReportApp(QMainWindow):
             self.background_sync_with_cloud()
 
     def unmark_period_as_invoiced(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для отмены закрытия!")
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return
+        d_from, d_to = report['date_from'], report['date_to']
+        comp, obj = report['company'], report['object']
 
         reply = QMessageBox.question(
             self, "Подтверждение",
@@ -5645,14 +5695,18 @@ class SmartReportApp(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            if (self.inv_obj_cb.currentData() != report['object_id']
+                    or self.inv_comp_cb.currentText() != comp
+                    or self.inv_date_from.text() != d_from or self.inv_date_to.text() != d_to):
+                QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; статус периода не изменён.")
+                return
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE shifts 
-                SET invoiced = 0 
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'
-            ''', (comp, obj, d_from, d_to))
-            enqueue_matching_shifts(cursor, "company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'", (comp, obj, d_from, d_to))
+            placeholders = ','.join('?' for _name in report['object_names'])
+            work_filter = f"company = ? AND object_name IN ({placeholders}) AND date >= ? AND date <= ? AND entry_type = 'work'"
+            parameters = (comp, *report['object_names'], d_from, d_to)
+            cursor.execute(f"UPDATE shifts SET invoiced = 0 WHERE {work_filter}", parameters)
+            enqueue_matching_shifts(cursor, work_filter, parameters)
             conn.commit()
             conn.close()
 
@@ -6162,6 +6216,7 @@ class SmartReportApp(QMainWindow):
 
     def load_companies_into_combobox(self, cb):
         current_val = cb.currentText()
+        signals_blocked = cb.blockSignals(True)
         cb.clear()
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -6172,8 +6227,8 @@ class SmartReportApp(QMainWindow):
             cb.addItem(row[0])
         if current_val:
             idx = cb.findText(current_val)
-            if idx >= 0:
-                cb.setCurrentIndex(idx)
+            cb.setCurrentIndex(idx)
+        cb.blockSignals(signals_blocked)
 
     def add_company(self):
         comp_name = self.new_comp_input.text().strip()
@@ -6309,6 +6364,8 @@ class SmartReportApp(QMainWindow):
                     1: ("name", name), 2: ("markning", mark),
                     3: ("rate", new_rate), 4: ("transport_rate", new_trans),
                 }[col]
+                if col == 1:
+                    ensure_object_name_history(cursor)
                 cursor.execute(
                     f"UPDATE objects SET {column_name} = ? "
                     "WHERE id = ? AND sync_id = ? AND sync_version = ? AND is_active = 1",
@@ -6512,7 +6569,7 @@ class SmartReportApp(QMainWindow):
             self.load_objects_for_company(self.comp_cb.currentText(), self.obj_cb, record_type)
 
         if hasattr(self, 'inv_obj_cb') and hasattr(self, 'inv_comp_cb'):
-            self.load_objects_for_company(self.inv_comp_cb.currentText(), self.inv_obj_cb)
+            self.load_invoice_objects(self.inv_comp_cb.currentText())
 
         if hasattr(self, 'dag_obj_cb') and hasattr(self, 'dag_comp_cb'):
             self.load_objects_for_company(self.dag_comp_cb.currentText(), self.dag_obj_cb)
