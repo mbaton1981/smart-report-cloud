@@ -479,11 +479,16 @@ def init_cloud_db():
             payload_hash TEXT NOT NULL,
             employee_key TEXT NOT NULL,
             revision INTEGER NOT NULL,
+            state_hash TEXT,
             operation TEXT NOT NULL,
             profile_id INTEGER,
             created_at TEXT NOT NULL
         )
     ''')
+    cursor.execute("PRAGMA table_info(employee_sync_events)")
+    employee_event_columns = {column[1] for column in cursor.fetchall()}
+    if "state_hash" not in employee_event_columns:
+        cursor.execute("ALTER TABLE employee_sync_events ADD COLUMN state_hash TEXT")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_companies (
@@ -2852,10 +2857,24 @@ def apply_employee_sync_event(cursor, event, operation):
         raise ValueError("Некорректные данные события сотрудника.")
     if not employee_key or employee_key != normalize_employee_name(employee_name) or revision < 1:
         raise ValueError("Некорректный ключ или revision события сотрудника.")
+    salary_rate = event.get("salary_rate")
+    if operation == "activate" and salary_rate is not None:
+        try:
+            salary_rate = round(float(salary_rate), 2)
+            if not 0 <= salary_rate <= 100000 or not math.isfinite(salary_rate):
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная ставка восстанавливаемого сотрудника.")
 
     payload_hash = hashlib.sha256(json.dumps(
         {"operation_id": operation_id, "employee_key": employee_key,
-         "revision": revision, "operation": operation, "name": employee_name},
+         "revision": revision, "operation": operation, "name": employee_name,
+         "salary_rate": salary_rate},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    state_hash = hashlib.sha256(json.dumps(
+        {"employee_key": employee_key, "revision": revision, "operation": operation,
+         "salary_rate": salary_rate if operation == "activate" else None},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
     cursor.execute(
@@ -2887,10 +2906,10 @@ def apply_employee_sync_event(cursor, event, operation):
     if revision < latest_revision:
         cursor.execute("""
             INSERT INTO employee_sync_events (
-                operation_id, payload_hash, employee_key, revision, operation, profile_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            operation_id, payload_hash, employee_key, revision, operation, profile_id,
+            operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id,
             datetime.now(timezone.utc).isoformat(),
         ))
         return {
@@ -2902,18 +2921,19 @@ def apply_employee_sync_event(cursor, event, operation):
         }
     if revision == latest_revision:
         cursor.execute(
-            "SELECT operation FROM employee_sync_events WHERE employee_key = ? AND revision = ? ORDER BY rowid DESC LIMIT 1",
+            "SELECT operation, state_hash FROM employee_sync_events WHERE employee_key = ? AND revision = ? ORDER BY rowid DESC LIMIT 1",
             (employee_key, revision),
         )
         previous_revision = cursor.fetchone()
-        if previous_revision is None or previous_revision["operation"] != operation:
+        if (previous_revision is None or previous_revision["operation"] != operation
+                or previous_revision["state_hash"] != state_hash):
             raise ValueError("Конфликт сотрудника: revision уже занята другой операцией.")
         cursor.execute("""
             INSERT INTO employee_sync_events (
-                operation_id, payload_hash, employee_key, revision, operation, profile_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            operation_id, payload_hash, employee_key, revision, operation, profile_id,
+            operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id,
             datetime.now(timezone.utc).isoformat(),
         ))
         return {
@@ -2941,7 +2961,13 @@ def apply_employee_sync_event(cursor, event, operation):
     elif operation == "activate":
         if profile_id is None:
             raise ValueError("Не найден профиль сотрудника для явного восстановления.")
-        cursor.execute("UPDATE meta_employees SET is_active = 1 WHERE id = ?", (profile_id,))
+        if salary_rate is None:
+            cursor.execute("UPDATE meta_employees SET is_active = 1 WHERE id = ?", (profile_id,))
+        else:
+            cursor.execute(
+                "UPDATE meta_employees SET salary_rate = ?, is_active = 1 WHERE id = ?",
+                (salary_rate, profile_id),
+            )
         cursor.execute(
             "UPDATE users SET is_active = 1 WHERE role <> 'admin' AND "
             "(username = ? COLLATE NOCASE OR employee_id = ?)",
@@ -2952,10 +2978,10 @@ def apply_employee_sync_event(cursor, event, operation):
 
     cursor.execute("""
         INSERT INTO employee_sync_events (
-            operation_id, payload_hash, employee_key, revision, operation, profile_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        operation_id, payload_hash, employee_key, revision, operation, profile_id,
+        operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id,
         datetime.now(timezone.utc).isoformat(),
     ))
     return {
@@ -3024,6 +3050,14 @@ def sync_desktop_data():
             revision = int(restoration.get("revision"))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "Некорректная revision восстановления сотрудника"}), 400
+        salary_rate = restoration.get("salary_rate")
+        if salary_rate is not None:
+            try:
+                salary_rate = round(float(salary_rate), 2)
+                if not 0 <= salary_rate <= 100000 or not math.isfinite(salary_rate):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "Некорректная ставка восстановления сотрудника"}), 400
         if (not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150
                 or employee_key != normalize_employee_name(employee_name) or revision < 1):
             return jsonify({"ok": False, "error": "Некорректные данные восстановления сотрудника"}), 400
@@ -3033,6 +3067,7 @@ def sync_desktop_data():
         normalized_restorations.append({
             "operation_id": operation_id, "name": employee_name,
             "employee_key": employee_key, "revision": revision,
+            "salary_rate": salary_rate,
         })
 
     conn = get_db_connection()

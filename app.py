@@ -4,6 +4,7 @@ import shutil
 import traceback
 import subprocess
 import sqlite3
+import math
 import requests
 import json
 import uuid
@@ -295,6 +296,7 @@ def init_db_once():
             operation_id TEXT PRIMARY KEY,
             employee_key TEXT NOT NULL,
             employee_name TEXT NOT NULL,
+            salary_rate REAL,
             revision INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )
@@ -303,7 +305,7 @@ def init_db_once():
     for table_name, columns_to_add in (
         ("employee_sync_outbox", (("employee_key", "TEXT"), ("revision", "INTEGER NOT NULL DEFAULT 0"))),
         ("employee_sync_state", (("sync_version", "INTEGER NOT NULL DEFAULT 0"),)),
-        ("employee_restore_outbox", (("revision", "INTEGER NOT NULL DEFAULT 0"),)),
+        ("employee_restore_outbox", (("salary_rate", "REAL"), ("revision", "INTEGER NOT NULL DEFAULT 0"))),
     ):
         cursor.execute(f"PRAGMA table_info({table_name})")
         existing_columns = {column[1] for column in cursor.fetchall()}
@@ -642,11 +644,21 @@ def enqueue_employee_sync_event(cursor, employee_name, operation):
         """, (operation_id, employee_name, employee_key, revision, created_at))
         state_value = "deleted"
     else:
+        matching_employees = [
+            row for row in cursor.execute("SELECT name, salary_rate FROM employees").fetchall()
+            if employee_sync_key(row["name"]) == employee_key
+        ]
+        if len(matching_employees) != 1:
+            raise ValueError("Для восстановления нужна ровно одна активная локальная запись сотрудника.")
+        salary_rate = float(matching_employees[0]["salary_rate"] or 0.0)
+        if not 0 <= salary_rate <= 100000 or not math.isfinite(salary_rate):
+            raise ValueError("Ставка восстанавливаемого сотрудника вне допустимого диапазона.")
         cursor.execute("DELETE FROM employee_sync_outbox WHERE employee_key = ?", (employee_key,))
         cursor.execute("""
-            INSERT INTO employee_restore_outbox (operation_id, employee_key, employee_name, revision, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (operation_id, employee_key, employee_name, revision, created_at))
+            INSERT INTO employee_restore_outbox (
+                operation_id, employee_key, employee_name, salary_rate, revision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (operation_id, employee_key, employee_name, salary_rate, revision, created_at))
         state_value = "active"
     cursor.execute("""
         INSERT INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
@@ -1914,11 +1926,13 @@ class SmartReportApp(QMainWindow):
             }
             for row in cursor.fetchall()
         ]
-        cursor.execute("SELECT operation_id, employee_name, employee_key, revision FROM employee_restore_outbox ORDER BY created_at, operation_id")
+        cursor.execute("SELECT operation_id, employee_name, employee_key, salary_rate, revision FROM employee_restore_outbox ORDER BY created_at, operation_id")
         restored_employees = [
             {
                 "operation_id": row["operation_id"], "name": row["employee_name"],
-                "employee_key": row["employee_key"], "revision": int(row["revision"] or 0),
+                "employee_key": row["employee_key"],
+                "salary_rate": float(row["salary_rate"]) if row["salary_rate"] is not None else None,
+                "revision": int(row["revision"] or 0),
             }
             for row in cursor.fetchall()
         ]
