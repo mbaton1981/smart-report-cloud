@@ -2266,7 +2266,14 @@ class SmartReportApp(QMainWindow):
             f"{CLOUD_URL}/sync-desktop-data", headers=headers,
             json=metadata_payload, timeout=4
         )
-        metadata_response.raise_for_status()
+        try:
+            metadata_response.raise_for_status()
+        except requests.HTTPError as error:
+            try:
+                reason = metadata_response.json().get("error")
+            except (ValueError, AttributeError):
+                reason = None
+            raise RuntimeError(f"Сервер отклонил изменение справочника: {reason or error}") from error
         metadata_result = metadata_response.json()
         if not isinstance(metadata_result, dict) or metadata_result.get("ok") is not True:
             raise RuntimeError("Сервер не подтвердил синхронизацию справочников.")
@@ -2429,6 +2436,21 @@ class SmartReportApp(QMainWindow):
         self._sync_worker = None
         if success:
             self.load_shifts_history()
+        if getattr(self, "_object_edit_sync_pending", False):
+            if not success or conflicts:
+                self._object_edit_sync_pending = False
+                if not self._manual_sync_requested:
+                    reason = conflict_details if conflicts else error
+                    message = (
+                        "Сервер вернул конфликт; проверьте актуальное состояние объекта."
+                        if success else "Изменение сохранено локально и остаётся в очереди синхронизации."
+                    )
+                    QMessageBox.warning(self, "Изменение объекта", f"{message}\nПричина: {reason}")
+            else:
+                conn = get_db_connection()
+                pending = conn.execute("SELECT 1 FROM object_sync_outbox LIMIT 1").fetchone()
+                conn.close()
+                self._object_edit_sync_pending = pending is not None
         if self._manual_sync_requested:
             self._manual_sync_requested = False
             if success and conflicts:
@@ -6267,26 +6289,47 @@ class SmartReportApp(QMainWindow):
                 cursor = conn.cursor()
                 cursor.execute("BEGIN IMMEDIATE")
                 object_state = cursor.execute(
-                    "SELECT sync_id, is_active FROM objects WHERE id = ?", (object_id,)
+                    "SELECT sync_id, is_active, sync_version FROM objects WHERE id = ?", (object_id,)
                 ).fetchone()
-                if not object_state or not object_state["sync_id"] or not object_state["is_active"]:
-                    conn.rollback()
-                    conn.close()
-                    self.load_objects_table()
-                    return
-                cursor.execute("""
-                    UPDATE objects SET name = ?, markning = ?, rate = ?, transport_rate = ? WHERE id = ?
-                """, (name, mark, new_rate, new_trans, object_id))
-                enqueue_object_sync_event(cursor, object_id, "upsert")
+                if object_state is None:
+                    raise ValueError("Объект больше не существует. Обновите список.")
+                if not object_state["sync_id"]:
+                    raise ValueError("Объект ещё не связан с сервером; дождитесь синхронизации.")
+                if not object_state["is_active"]:
+                    raise ValueError("Объект находится в архиве. Сначала восстановите его.")
+                expected_revision = object_item.data(Qt.ItemDataRole.UserRole + 1)
+                expected_sync_id = object_item.data(Qt.ItemDataRole.UserRole + 2)
+                if (expected_revision != object_state["sync_version"]
+                        or expected_sync_id != object_state["sync_id"]):
+                    raise ValueError(
+                        f"Объект изменился после загрузки таблицы. Введённый markning «{mark}» "
+                        "не применён; проверьте обновлённую запись и повторите изменение."
+                    )
+                column_name, new_value = {
+                    1: ("name", name), 2: ("markning", mark),
+                    3: ("rate", new_rate), 4: ("transport_rate", new_trans),
+                }[col]
+                cursor.execute(
+                    f"UPDATE objects SET {column_name} = ? "
+                    "WHERE id = ? AND sync_id = ? AND sync_version = ? AND is_active = 1",
+                    (new_value, object_id, expected_sync_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Состояние объекта изменилось; обновите список и повторите действие.")
+                event = enqueue_object_sync_event(cursor, object_id, "upsert")
                 conn.commit()
-                conn.close()
-                self.background_sync_with_cloud()
+                object_item.setData(Qt.ItemDataRole.UserRole + 1, event["revision"])
+                self._object_edit_sync_pending = True
             except Exception as error:
                 if conn is not None:
                     conn.rollback()
-                    conn.close()
                 QMessageBox.warning(self, "Объект", f"Изменение не сохранено: {error}")
-                self.load_objects_table()
+                QTimer.singleShot(0, self.load_objects_table)
+                return
+            finally:
+                if conn is not None:
+                    conn.close()
+            self.background_sync_with_cloud()
 
     def delete_object(self):
         selected = self.table_objects.currentRow()
@@ -6484,6 +6527,8 @@ class SmartReportApp(QMainWindow):
             self.load_companies_table()
 
     def load_objects_table(self):
+        if self.table_objects.state() == QTableWidget.State.EditingState:
+            return
         selected_object_id = None
         current_row = self.table_objects.currentRow()
         if current_row >= 0:
@@ -6504,7 +6549,7 @@ class SmartReportApp(QMainWindow):
         )
         cursor.execute("""
             SELECT id, company, name, markning, COALESCE(rate, 0.0),
-                   COALESCE(transport_rate, 0.0), is_active, sync_id, server_id
+                   COALESCE(transport_rate, 0.0), is_active, sync_id, server_id, sync_version
             FROM objects
             WHERE is_active = 1 OR ? = 1
             ORDER BY company, name, id
@@ -6518,6 +6563,8 @@ class SmartReportApp(QMainWindow):
         for row_idx, row in enumerate(rows):
             company_item = QTableWidgetItem(row[1] or "")
             company_item.setData(Qt.ItemDataRole.UserRole, int(row[0]))
+            company_item.setData(Qt.ItemDataRole.UserRole + 1, int(row[9] or 0))
+            company_item.setData(Qt.ItemDataRole.UserRole + 2, row[7])
             self.table_objects.setItem(row_idx, 0, company_item)
             name_item = QTableWidgetItem(row[2])
             mark_item = QTableWidgetItem(row[3] or "")

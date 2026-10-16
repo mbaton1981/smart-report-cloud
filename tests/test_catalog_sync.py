@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -127,6 +129,176 @@ class CatalogSyncTests(unittest.TestCase):
         with patch.object(self.desktop.requests, "get", side_effect=fake_get), \
              patch.object(self.desktop.requests, "post", side_effect=fake_post):
             return self.desktop.SmartReportApp.perform_sync_logic(SimpleNamespace())
+
+    def test_markning_editor_survives_background_table_refresh(self):
+        from PyQt6.QtTest import QTest
+
+        sync_id = str(uuid.uuid4())
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("""
+            INSERT INTO meta_objects (id, company, name, markning, rate, transport_rate,
+                                      sync_id, sync_version, is_active)
+            VALUES (9001, 'Renatur', 'Editor test', 'p1038', 520.12345, 450.98765, ?, 1, 1)
+        """, (sync_id,))
+        server_conn.commit()
+        server_conn.close()
+        desktop_conn = self.desktop.get_db_connection()
+        object_id = desktop_conn.execute("""
+            INSERT INTO objects (company, name, markning, rate, transport_rate,
+                                 sync_id, server_id, sync_version, is_active)
+            VALUES ('Renatur', 'Editor test', 'p1038', 520.12345, 450.98765, ?, 9001, 1, 1)
+        """, (sync_id,)).lastrowid
+        desktop_conn.execute("""
+            INSERT INTO shifts (date, employee, company, object_name, hours, rate, transport)
+            VALUES ('2026-10-16', 'History worker', 'Renatur', 'Editor test', 8, 510, 440)
+        """)
+        document_id = desktop_conn.execute("""
+            INSERT INTO supplier_documents (document_type, currency_code, gross_amount,
+                                            expense_category, created_at, updated_at)
+            VALUES ('manual', 'SEK', '100.00', 'Test allocation', 'test', 'test')
+        """).lastrowid
+        desktop_conn.execute("""
+            INSERT INTO supplier_document_allocations (document_id, object_id, allocated_gross)
+            VALUES (?, ?, '100.00')
+        """, (document_id, object_id))
+        original_history = [tuple(row) for row in desktop_conn.execute("SELECT * FROM shifts")]
+        original_allocations = [tuple(row) for row in desktop_conn.execute("SELECT * FROM supplier_document_allocations")]
+        desktop_conn.commit()
+        desktop_conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+        window.setCentralWidget(window.tab_sprav)
+        window.show()
+        try:
+            window.load_objects_table()
+            role = self.desktop.Qt.ItemDataRole.UserRole
+            row = next(row for row in range(window.table_objects.rowCount())
+                       if window.table_objects.item(row, 0).data(role) == object_id)
+            item = window.table_objects.item(row, 2)
+            window.table_objects.setCurrentItem(item)
+            window.table_objects.editItem(item)
+            editor = window.table_objects.findChild(self.desktop.QLineEdit)
+            self.assertIsNotNone(editor)
+            editor.setText("isolated-confirmed-code")
+            window.load_objects_table()
+            self.assertEqual(window.table_objects.state(), self.desktop.QTableWidget.State.EditingState)
+            self.assertEqual(editor.text(), "isolated-confirmed-code")
+            with patch.object(window, "background_sync_with_cloud") as sync:
+                QTest.keyClick(editor, self.desktop.Qt.Key.Key_Return)
+                self.qt_app.processEvents()
+                sync.assert_called_once()
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(tuple(desktop_conn.execute(
+                "SELECT markning, rate, transport_rate, sync_version FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()), ("isolated-confirmed-code", 520.12345, 450.98765, 2))
+            self.assertEqual(desktop_conn.execute(
+                "SELECT COUNT(*) FROM object_sync_outbox WHERE object_id = ?", (object_id,)
+            ).fetchone()[0], 1)
+            desktop_conn.close()
+            with patch.object(self.server, "apply_object_sync_event", side_effect=ValueError("Test revision refusal")):
+                with self.assertRaisesRegex(RuntimeError, "Test revision refusal") as failure:
+                    self._worker()
+            window._manual_sync_requested = False
+            with patch.object(self.desktop.QMessageBox, "warning") as warning:
+                window._on_sync_completed(False, 0, 0, 0, 0, 0, "", "", str(failure.exception))
+                warning.assert_called_once()
+                self.assertIn("Test revision refusal", warning.call_args.args[2])
+                self.assertIn("очереди", warning.call_args.args[2])
+            with self.assertRaises(self.desktop.requests.ConnectionError):
+                self._worker("offline")
+            with self.assertRaises(self.desktop.requests.ConnectionError):
+                self._worker("lost_ack")
+            self.assertEqual(self._worker()["conflicts"], 0)
+            self.assertEqual(self._worker()["conflicts"], 0)
+            window.load_objects_table()
+            row = next(row for row in range(window.table_objects.rowCount())
+                       if window.table_objects.item(row, 0).data(role) == object_id)
+            self.assertEqual(window.table_objects.item(row, 2).text(), "isolated-confirmed-code")
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(tuple(desktop_conn.execute(
+                "SELECT id,sync_id,server_id,rate,transport_rate FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()), (object_id, sync_id, 9001, 520.12345, 450.98765))
+            self.assertEqual([tuple(row) for row in desktop_conn.execute("SELECT * FROM shifts")], original_history)
+            self.assertEqual([tuple(row) for row in desktop_conn.execute("SELECT * FROM supplier_document_allocations")], original_allocations)
+            self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+            self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM objects WHERE sync_id = ?", (sync_id,)).fetchone()[0], 1)
+            desktop_conn.close()
+            server_conn = self.server.get_db_connection()
+            self.assertEqual(tuple(server_conn.execute(
+                "SELECT id,sync_id,markning,rate,transport_rate,sync_version FROM meta_objects WHERE sync_id = ?",
+                (sync_id,),
+            ).fetchone()), (9001, sync_id, "isolated-confirmed-code", 520.12345, 450.98765, 2))
+            self.assertEqual(server_conn.execute("SELECT COUNT(*) FROM meta_objects WHERE sync_id = ?", (sync_id,)).fetchone()[0], 1)
+            self.assertEqual(server_conn.execute("SELECT COUNT(*) FROM object_sync_events WHERE sync_id = ?", (sync_id,)).fetchone()[0], 1)
+            server_conn.close()
+            restart_code = (
+                "import app,sys; app.DB_FILE=sys.argv[1]; app.init_db_once(); "
+                "connection=app.get_db_connection(); "
+                "print(connection.execute('SELECT markning FROM objects WHERE id = ?', (int(sys.argv[2]),)).fetchone()[0]); "
+                "connection.close()"
+            )
+            persisted = subprocess.check_output(
+                [sys.executable, "-c", restart_code, self.desktop.DB_FILE, str(object_id)], text=True
+            )
+            self.assertEqual(persisted.strip(), "isolated-confirmed-code")
+            server_conn = self.server.get_db_connection()
+            server_conn.execute(
+                "UPDATE meta_objects SET markning = 'newer-server-code', sync_version = 4 WHERE id = 9001"
+            )
+            server_conn.commit()
+            server_conn.close()
+            with patch.object(window, "background_sync_with_cloud"):
+                window.table_objects.item(row, 2).setText("second-proposal")
+            result = self._worker()
+            self.assertEqual(result["conflicts"], 1)
+            with patch.object(window, "load_shifts_history"), \
+                 patch.object(self.desktop.QMessageBox, "warning") as warning:
+                window._on_sync_completed(True, **result, error="")
+                warning.assert_called_once()
+                self.assertIn("revision", warning.call_args.args[2])
+            window.load_objects_table()
+            self.assertEqual(window.table_objects.item(row, 2).text(), "newer-server-code")
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_markning_edit_rejects_stale_revision_with_visible_reason(self):
+        desktop_conn = self.desktop.get_db_connection()
+        object_id = desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,sync_version,is_active)
+            VALUES ('Renatur', 'Stale editor test', 'p1038', 520, 450, ?, 9001, 1, 1)
+        """, (str(uuid.uuid4()),)).lastrowid
+        desktop_conn.commit()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+        try:
+            window.load_objects_table()
+            row = next(row for row in range(window.table_objects.rowCount())
+                       if window.table_objects.item(row, 0).data(self.desktop.Qt.ItemDataRole.UserRole) == object_id)
+            desktop_conn.execute(
+                "UPDATE objects SET markning = 'remote-change', sync_version = 2 WHERE id = ?", (object_id,)
+            )
+            desktop_conn.commit()
+            with patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                 patch.object(window, "background_sync_with_cloud") as sync:
+                window.table_objects.item(row, 2).setText("attempted-code")
+                self.qt_app.processEvents()
+                warning.assert_called_once()
+                self.assertIn("изменился", warning.call_args.args[2])
+                self.assertIn("attempted-code", warning.call_args.args[2])
+                sync.assert_not_called()
+            self.assertEqual(desktop_conn.execute(
+                "SELECT markning FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()[0], "remote-change")
+            self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+        finally:
+            desktop_conn.close()
+            window.close()
+            window.deleteLater()
 
     def test_catalog_pull_links_exact_legacy_rows_and_preserves_history_and_allocations(self):
         server_objects = (
