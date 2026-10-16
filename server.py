@@ -1269,6 +1269,27 @@ def get_active_employees():
     employees = [{"id": r['id'], "name": r['name']} for r in rows]
     return jsonify({"ok": True, "employees": employees})
 
+
+@app.route('/api/sync/employee-catalog', methods=['GET'])
+def sync_employee_catalog_api():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("""
+            SELECT e.id, e.name, e.salary_rate, e.is_active,
+                   COALESCE((
+                       SELECT MAX(event.revision)
+                       FROM employee_sync_events event
+                       WHERE event.employee_key = normalize_employee_name(e.name)
+                   ), 0) AS sync_version
+            FROM meta_employees e
+            ORDER BY e.name, e.id
+        """).fetchall()
+        return jsonify({"ok": True, "employees": [dict(row) for row in rows]})
+    finally:
+        conn.close()
+
 @app.route('/check-user-pin', methods=['POST'])
 def check_user_pin():
     data = request.json or {}

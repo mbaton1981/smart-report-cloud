@@ -195,7 +195,10 @@ class CatalogSyncTests(unittest.TestCase):
         }
         desktop_conn.close()
         self.assertEqual(len(rows), 6)
-        self.assertEqual(result, {"conflicts": 0, "linked_legacy": 7, "unresolved_legacy": 0})
+        self.assertEqual(result, {
+            "conflicts": 0, "linked_legacy": 7, "unresolved_legacy": 0,
+            "imported_employees": 0, "unresolved_employees": 0,
+        })
         self.assertTrue(all(row[3] and row[4] and row[5] == 1 for row in rows))
         self.assertEqual(
             {row[2]: row[0] for row in rows if row[2] in local_object_ids},
@@ -262,7 +265,10 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.close()
 
         result = self._worker()
-        self.assertEqual(result, {"conflicts": 0, "linked_legacy": 1, "unresolved_legacy": 1})
+        self.assertEqual(result, {
+            "conflicts": 0, "linked_legacy": 1, "unresolved_legacy": 1,
+            "imported_employees": 0, "unresolved_employees": 0,
+        })
         desktop_conn = self.desktop.get_db_connection()
         local = desktop_conn.execute(
             "SELECT sync_id, server_id, rate, transport_rate FROM objects WHERE id = ?", (local_id,)
@@ -276,6 +282,45 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(remote), (None, 120, 10, 0))
         server_conn.close()
+
+    def test_server_employee_catalog_imports_missing_profile_but_respects_local_delete(self):
+        server_conn = self.server.get_db_connection()
+        server_conn.executemany(
+            "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, ?, 1)",
+            (("Server Only Employee", 450), ("Locally Deleted Employee", 320)),
+        )
+        server_conn.commit()
+        server_conn.close()
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute("""
+            INSERT INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+            VALUES (?, ?, 'deleted', 1, 'test')
+        """, (self.desktop.employee_sync_key("Locally Deleted Employee"), "Locally Deleted Employee"))
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        response = self.server_client.get(
+            "/api/sync/employee-catalog", headers={"X-Sync-Key": "wrong-test-key"}
+        )
+        self.assertEqual(response.status_code, 403)
+        result = self._worker()
+        self.assertEqual(result["imported_employees"], 1)
+        self.assertEqual(result["unresolved_employees"], 0)
+        desktop_conn = self.desktop.get_db_connection()
+        imported = desktop_conn.execute(
+            "SELECT salary_rate, is_active FROM employees WHERE name = 'Server Only Employee'"
+        ).fetchone()
+        deleted = desktop_conn.execute(
+            "SELECT id FROM employees WHERE name = 'Locally Deleted Employee'"
+        ).fetchone()
+        self.assertEqual(tuple(imported), (450, 1))
+        self.assertIsNone(deleted)
+        second_result = self._worker()
+        self.assertEqual(second_result["imported_employees"], 0)
+        self.assertEqual(desktop_conn.execute(
+            "SELECT COUNT(*) FROM employees WHERE name = 'Server Only Employee'"
+        ).fetchone()[0], 1)
+        desktop_conn.close()
 
     def test_stable_id_revision_merge_and_deactivation_preserve_history(self):
         sync_id = str(uuid.uuid4())

@@ -771,6 +771,79 @@ def employee_sync_key(name):
     return " ".join(str(name or "").split()).casefold()
 
 
+def merge_server_employee_catalog(cursor, remote_employees):
+    if not isinstance(remote_employees, list) or len(remote_employees) > 1000:
+        raise ValueError("Серверный справочник сотрудников имеет неверный формат или размер.")
+
+    remote_counts = {}
+    for item in remote_employees:
+        if not isinstance(item, dict):
+            raise ValueError("Некорректная запись серверного сотрудника.")
+        employee_name = " ".join(str(item.get("name") or "").split())
+        employee_key = employee_sync_key(employee_name)
+        if employee_key:
+            remote_counts[employee_key] = remote_counts.get(employee_key, 0) + 1
+
+    local_by_key = {}
+    for row in cursor.execute("SELECT name FROM employees").fetchall():
+        local_by_key.setdefault(employee_sync_key(row["name"]), []).append(row["name"])
+
+    stats = {"imported": 0, "unresolved": 0}
+    for item in remote_employees:
+        employee_name = " ".join(str(item.get("name") or "").split())
+        employee_key = employee_sync_key(employee_name)
+        try:
+            salary_rate = round(float(item.get("salary_rate") or 0.0), 2)
+            is_active = int(item.get("is_active", 1))
+            server_revision = int(item.get("sync_version") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректные поля серверного сотрудника.")
+        if (not employee_key or len(employee_name) > 150 or not math.isfinite(salary_rate)
+                or not 0 <= salary_rate <= 100000 or is_active not in (0, 1) or server_revision < 0):
+            raise ValueError("Некорректные поля серверного сотрудника.")
+        if remote_counts[employee_key] > 1:
+            stats["unresolved"] += 1
+            continue
+        local_matches = local_by_key.get(employee_key, [])
+        if local_matches:
+            if len(local_matches) > 1:
+                stats["unresolved"] += 1
+            continue
+
+        state = cursor.execute(
+            "SELECT state FROM employee_sync_state WHERE employee_key = ?", (employee_key,)
+        ).fetchone()
+        pending = cursor.execute(
+            "SELECT 1 FROM employee_sync_outbox WHERE employee_key = ? "
+            "UNION ALL SELECT 1 FROM employee_restore_outbox WHERE employee_key = ? LIMIT 1",
+            (employee_key, employee_key),
+        ).fetchone()
+        if (state and state["state"] == "deleted") or pending:
+            continue
+
+        cursor.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, ?, ?)",
+            (employee_name, salary_rate, is_active),
+        )
+        state_value = "active" if is_active else "deleted"
+        cursor.execute("""
+            INSERT INTO employee_sync_state (
+                employee_key, employee_name, state, sync_version, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(employee_key) DO UPDATE SET
+                employee_name = excluded.employee_name,
+                state = excluded.state,
+                sync_version = MAX(employee_sync_state.sync_version, excluded.sync_version),
+                updated_at = excluded.updated_at
+        """, (
+            employee_key, employee_name, state_value, server_revision,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        local_by_key[employee_key] = [employee_name]
+        stats["imported"] += 1
+    return stats
+
+
 def enqueue_employee_sync_event(cursor, employee_name, operation):
     employee_key = employee_sync_key(employee_name)
     if not employee_key or operation not in {"deactivate", "activate"}:
@@ -1136,7 +1209,7 @@ def enqueue_matching_shifts(cursor, where_clause, params):
         enqueue_shift_operation(cursor, sync_id, 'upsert', row['sync_version'], shift_payload(row))
 
 class SyncWorker(QThread):
-    completed = pyqtSignal(bool, int, int, int, str)
+    completed = pyqtSignal(bool, int, int, int, int, int, str)
 
     def __init__(self, window):
         super().__init__(window)
@@ -1147,10 +1220,11 @@ class SyncWorker(QThread):
             result = self.window.perform_sync_logic()
             self.completed.emit(
                 True, result["conflicts"], result["linked_legacy"],
-                result["unresolved_legacy"], "",
+                result["unresolved_legacy"], result["imported_employees"],
+                result["unresolved_employees"], "",
             )
         except Exception as error:
-            self.completed.emit(False, 0, 0, 0, str(error))
+            self.completed.emit(False, 0, 0, 0, 0, 0, str(error))
 
 def parse_float(val_str, default=0.0):
     if not val_str:
@@ -2255,13 +2329,40 @@ class SmartReportApp(QMainWindow):
                 raise
             finally:
                 conn.close()
+        employee_catalog_response = requests.get(
+            f"{CLOUD_URL}/api/sync/employee-catalog",
+            headers=headers,
+            timeout=4,
+        )
+        employee_catalog_response.raise_for_status()
+        employee_catalog_result = employee_catalog_response.json()
+        if not isinstance(employee_catalog_result, dict) or employee_catalog_result.get("ok") is not True:
+            raise RuntimeError("Сервер не вернул справочник сотрудников для синхронизации.")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            employee_catalog_stats = merge_server_employee_catalog(
+                cursor, employee_catalog_result.get("employees")
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         return {
             "conflicts": conflicts,
             "linked_legacy": catalog_stats["linked"],
             "unresolved_legacy": catalog_stats["unresolved_legacy"],
+            "imported_employees": employee_catalog_stats["imported"],
+            "unresolved_employees": employee_catalog_stats["unresolved"],
         }
 
-    def _on_sync_completed(self, success, conflicts, linked_legacy, unresolved_legacy, error):
+    def _on_sync_completed(
+        self, success, conflicts, linked_legacy, unresolved_legacy,
+        imported_employees, unresolved_employees, error,
+    ):
         self._sync_worker = None
         if success:
             self.load_shifts_history()
@@ -2272,18 +2373,21 @@ class SmartReportApp(QMainWindow):
                     self, "Конфликт синхронизации",
                     f"Есть конфликтующих изменений: {conflicts}. "
                     f"Связано legacy-объектов: {linked_legacy}; "
-                    f"не сопоставлено: {unresolved_legacy}.",
+                    f"не сопоставлено: {unresolved_legacy}; "
+                    f"импортировано сотрудников: {imported_employees}; "
+                    f"не сопоставлено сотрудников: {unresolved_employees}.",
                 )
-            elif success and unresolved_legacy:
+            elif success and (unresolved_legacy or unresolved_employees):
                 QMessageBox.warning(
                     self, "Legacy-объекты",
-                    f"Синхронизация завершена, но {unresolved_legacy} legacy-объектов "
-                    "не сопоставлены из-за неоднозначности или расхождения ставок.",
+                    f"Синхронизация завершена. Не сопоставлено legacy-объектов: {unresolved_legacy}; "
+                    f"сотрудников: {unresolved_employees}.",
                 )
-            elif success and linked_legacy:
+            elif success and (linked_legacy or imported_employees):
                 QMessageBox.information(
                     self, "Синхронизация",
-                    f"Синхронизация завершена. Связано legacy-объектов: {linked_legacy}.",
+                    f"Синхронизация завершена. Связано legacy-объектов: {linked_legacy}; "
+                    f"импортировано сотрудников: {imported_employees}.",
                 )
             elif success:
                 QMessageBox.information(self, "Синхронизация", "Синхронизация завершена.")
