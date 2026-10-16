@@ -6,6 +6,7 @@ import json
 import hashlib
 import hmac
 import logging
+import math
 import csv
 import io
 import uuid
@@ -167,10 +168,10 @@ def get_ob_segments(cursor, shift_id):
 def validate_submission_object(cursor, submission_type, company, object_name):
     reference = SPECIAL_SUBMISSION_OBJECTS.get(submission_type)
     if not reference:
-        cursor.execute("SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ?", (object_name, company))
+        cursor.execute("SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND is_active = 1", (object_name, company))
     else:
         cursor.execute(
-            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ?",
+            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ? AND is_active = 1",
             (reference[0], company, reference[1])
         )
     matches = cursor.fetchall()
@@ -189,7 +190,7 @@ def validate_submission_object(cursor, submission_type, company, object_name):
 
 def infer_submission_type_from_object(cursor, company, object_name):
     cursor.execute(
-        "SELECT name, markning FROM meta_objects WHERE company = ? AND name = ?",
+        "SELECT name, markning FROM meta_objects WHERE company = ? AND name = ? AND is_active = 1",
         (company, object_name)
     )
     matches = cursor.fetchall()
@@ -472,6 +473,17 @@ def init_cloud_db():
             is_active INTEGER NOT NULL DEFAULT 1
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_sync_events (
+            operation_id TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL,
+            employee_key TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            profile_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    ''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_companies (
@@ -483,12 +495,47 @@ def init_cloud_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_objects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sync_id TEXT,
             name TEXT NOT NULL,
             markning TEXT,
             company TEXT,
+            rate REAL NOT NULL DEFAULT 0.0,
+            transport_rate REAL NOT NULL DEFAULT 0.0,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+            sync_version INTEGER NOT NULL DEFAULT 0,
             UNIQUE(name, company)
         )
     ''')
+    cursor.execute("PRAGMA table_info(meta_objects)")
+    object_columns = {column[1] for column in cursor.fetchall()}
+    for column_name, column_sql in (
+        ("sync_id", "TEXT"),
+        ("rate", "REAL NOT NULL DEFAULT 0.0"),
+        ("transport_rate", "REAL NOT NULL DEFAULT 0.0"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+        ("sync_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column_name not in object_columns:
+            cursor.execute(f"ALTER TABLE meta_objects ADD COLUMN {column_name} {column_sql}")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_objects_sync_id ON meta_objects(sync_id) WHERE sync_id IS NOT NULL")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_sync_events (
+            operation_id TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL,
+            sync_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            state_hash TEXT,
+            operation TEXT NOT NULL,
+            server_object_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("PRAGMA table_info(object_sync_events)")
+    event_columns = {column[1] for column in cursor.fetchall()}
+    if "revision" not in event_columns:
+        cursor.execute("ALTER TABLE object_sync_events ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+    if "state_hash" not in event_columns:
+        cursor.execute("ALTER TABLE object_sync_events ADD COLUMN state_hash TEXT")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS expense_documents (
@@ -577,6 +624,44 @@ def init_cloud_db():
     conn.close()
 
 init_cloud_db()
+
+
+@app.before_request
+def enforce_active_session():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, username, role, employee_id, is_active FROM users WHERE id = ?",
+            (user_id,),
+        )
+        user = cursor.fetchone()
+        if user is None or not user["is_active"]:
+            session.clear()
+            return None
+        session["username"] = user["username"]
+        session["role"] = user["role"]
+        session["employee_id"] = user["employee_id"]
+        if user["role"] != "admin":
+            if user["employee_id"]:
+                cursor.execute(
+                    "SELECT id FROM meta_employees WHERE id = ? AND is_active = 1",
+                    (user["employee_id"],),
+                )
+                active_profile = cursor.fetchone()
+            else:
+                active_profile = select_employee_profile(
+                    find_employee_profiles(cursor, user["username"], active_only=True),
+                    preferred_name=user["username"],
+                )
+            if active_profile is None:
+                session.clear()
+    finally:
+        conn.close()
+    return None
 
 def verify_sync_key():
     sync_key = request.headers.get('X-Sync-Key') or request.headers.get('X-API-Key')
@@ -693,9 +778,9 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             object_id = int(object_id)
         except (TypeError, ValueError) as error:
             raise ValueError("Некорректный объект распределения.") from error
-        cursor.execute("SELECT id FROM meta_objects WHERE id = ?", (object_id,))
+        cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
         if cursor.fetchone() is None:
-            raise ValueError("Объект не найден в серверном справочнике.")
+            raise ValueError("Активный объект не найден в серверном справочнике.")
         normalized.append({
             "object_id": object_id,
             "gross_amount": item.get("gross_amount"),
@@ -814,9 +899,11 @@ def expense_objects_api():
         return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
     conn = get_db_connection()
     try:
-        rows = conn.execute(
-            "SELECT id, name, markning, company FROM meta_objects ORDER BY company, name"
-        ).fetchall()
+        include_inactive = request.args.get("include_inactive") == "1"
+        query = "SELECT id, sync_id, name, markning, company, rate, transport_rate, is_active FROM meta_objects"
+        if not include_inactive:
+            query += " WHERE is_active = 1"
+        rows = conn.execute(query + " ORDER BY company, name, id").fetchall()
         return jsonify({"ok": True, "objects": [dict(row) for row in rows]})
     finally:
         conn.close()
@@ -1227,11 +1314,17 @@ def login():
         return jsonify({"ok": False, "error": "Неверный пин-код или пароль"}), 401
 
     emp_id = user['employee_id']
-    if not emp_id and user['role'] != 'admin':
-        cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (user['username'],))
-        emp_row = cursor.fetchone()
-        if emp_row:
-            emp_id = emp_row['id']
+    if user['role'] != 'admin':
+        active_profiles = find_employee_profiles(cursor, user['username'], active_only=True)
+        if emp_id:
+            profile = next((item for item in active_profiles if item['id'] == emp_id), None)
+        else:
+            profile = active_profiles[0] if len(active_profiles) == 1 else None
+        if profile is None:
+            conn.close()
+            return jsonify({"ok": False, "error": "Профиль сотрудника не найден или неактивен"}), 401
+        emp_id = profile['id']
+        if user['employee_id'] != emp_id:
             cursor.execute("UPDATE users SET employee_id = ? WHERE id = ?", (emp_id, user['id']))
             conn.commit()
 
@@ -1359,7 +1452,7 @@ def index():
     if not companies:
         companies = ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
+    cursor.execute("SELECT name, markning, company FROM meta_objects WHERE is_active = 1 ORDER BY company, name")
     obj_rows = cursor.fetchall()
     
     objects = []
@@ -2438,6 +2531,442 @@ def export_shifts_csv():
     response.headers["Content-type"] = "text/csv; charset=utf-8-sig"
     return response
 
+def apply_object_sync_event(cursor, event):
+    if not isinstance(event, dict):
+        raise ValueError("Некорректное событие синхронизации объекта.")
+    operation_id = str(event.get("operation_id") or "").strip()
+    sync_id = str(event.get("sync_id") or "").strip()
+    operation = str(event.get("operation") or "").strip()
+    object_data = event.get("object")
+    if not operation_id or len(operation_id) > 100 or not sync_id or len(sync_id) > 100:
+        raise ValueError("В событии объекта отсутствует устойчивый ID.")
+    if operation not in {"upsert", "deactivate", "activate", "link_legacy"}:
+        raise ValueError("Неизвестная операция объекта.")
+    if not isinstance(object_data, dict):
+        raise ValueError("В событии объекта отсутствуют данные.")
+
+    payload_hash = hashlib.sha256(json.dumps(
+        event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    cursor.execute(
+        "SELECT payload_hash, sync_id, revision, operation, server_object_id FROM object_sync_events WHERE operation_id = ?",
+        (operation_id,),
+    )
+    previous = cursor.fetchone()
+    if previous:
+        if previous["payload_hash"] != payload_hash or previous["sync_id"] != sync_id or previous["operation"] != operation:
+            raise ValueError("operation_id объекта повторно использован с другими данными.")
+        cursor.execute(
+            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+            (previous["server_object_id"],),
+        )
+        object_state = cursor.fetchone()
+        cursor.execute("SELECT MAX(revision) FROM object_sync_events WHERE sync_id = ?", (sync_id,))
+        latest_revision = int(cursor.fetchone()[0] or 0)
+        if object_state is not None:
+            latest_revision = max(latest_revision, int(object_state["sync_version"] or 0))
+        stale = latest_revision > int(previous["revision"])
+        return {
+            "operation_id": operation_id,
+            "sync_id": sync_id,
+            "operation": operation,
+            "server_object_id": previous["server_object_id"],
+            "object": dict(object_state) if object_state else None,
+            "stale": stale,
+            "equivalent": not stale,
+            "revision": latest_revision,
+        }
+
+    object_name = str(object_data.get("name") or "").strip()
+    company = " ".join(str(object_data.get("company") or "").split())
+    markning = str(object_data.get("markning") or "").strip()
+    if not object_name or len(object_name) > 200 or not company or len(company) > 150 or len(markning) > 50:
+        raise ValueError("Некорректное имя объекта, фирмы или markning.")
+    try:
+        revision = int(event.get("revision"))
+    except (TypeError, ValueError):
+        raise ValueError("В событии объекта отсутствует revision.")
+    if revision < 1:
+        raise ValueError("Некорректная revision события объекта.")
+    try:
+        rate = float(object_data.get("rate", 0.0))
+        transport_rate = float(object_data.get("transport_rate", 0.0))
+        if not (0 <= rate <= 100000 and 0 <= transport_rate <= 100000) or not math.isfinite(rate) or not math.isfinite(transport_rate):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError("Некорректная ставка или транспортная ставка объекта.")
+
+    state_payload = {
+        "sync_id": sync_id,
+        "revision": revision,
+        "operation": operation,
+        "object": {
+            "name": object_name, "company": company, "markning": markning,
+            "rate": rate, "transport_rate": transport_rate,
+        },
+    }
+    if operation == "link_legacy":
+        state_payload["object"].update({
+            key: object_data.get(key) for key in (
+                "server_object_id", "expected_server_name",
+                "expected_server_company", "expected_server_markning",
+            )
+        })
+    state_hash = hashlib.sha256(json.dumps(
+        state_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+    cursor.execute("SELECT id FROM meta_companies WHERE name = ? COLLATE NOCASE", (company,))
+    if cursor.fetchone() is None:
+        raise ValueError("Фирма объекта отсутствует в серверном справочнике.")
+
+    cursor.execute("SELECT MAX(revision) FROM object_sync_events WHERE sync_id = ?", (sync_id,))
+    latest_event_revision = int(cursor.fetchone()[0] or 0)
+    cursor.execute("SELECT id, company, sync_version FROM meta_objects WHERE sync_id = ?", (sync_id,))
+    current_object = cursor.fetchone()
+    if current_object is not None and current_object["company"] != company:
+        raise ValueError("Устойчивый ID принадлежит другой фирме.")
+    current_revision = max(
+        latest_event_revision,
+        int(current_object["sync_version"] or 0) if current_object is not None else 0,
+    )
+    if revision < current_revision:
+        if operation == "link_legacy" and current_object is None:
+            raise ValueError("Запоздавшую legacy-связь нельзя подтвердить: серверный ID не был связан.")
+        server_object_id = int(current_object["id"]) if current_object is not None else None
+        cursor.execute("""
+            INSERT INTO object_sync_events (
+                operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        cursor.execute(
+            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+            (server_object_id,),
+        )
+        object_state = cursor.fetchone()
+        return {
+            "operation_id": operation_id,
+            "sync_id": sync_id,
+            "operation": operation,
+            "server_object_id": server_object_id,
+            "stale": True,
+            "revision": current_revision,
+            "object": dict(object_state) if object_state else None,
+        }
+    if revision == current_revision:
+        cursor.execute(
+            "SELECT state_hash FROM object_sync_events WHERE sync_id = ? AND revision = ? ORDER BY rowid DESC LIMIT 1",
+            (sync_id, revision),
+        )
+        previous_state = cursor.fetchone()
+        if previous_state is None or previous_state["state_hash"] != state_hash:
+            raise ValueError("Конфликт объекта: revision уже занята другим содержимым.")
+        server_object_id = int(current_object["id"]) if current_object is not None else None
+        cursor.execute("""
+            INSERT INTO object_sync_events (
+                operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        cursor.execute(
+            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+            (server_object_id,),
+        )
+        object_state = cursor.fetchone()
+        return {
+            "operation_id": operation_id,
+            "sync_id": sync_id,
+            "operation": operation,
+            "server_object_id": server_object_id,
+            "stale": True,
+            "equivalent": True,
+            "revision": current_revision,
+            "object": dict(object_state) if object_state else None,
+        }
+
+    server_object_id = None
+    if operation == "link_legacy":
+        try:
+            server_object_id = int(object_data.get("server_object_id"))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Для подтверждения связи нужен ID серверного объекта.") from error
+        cursor.execute(
+            "SELECT id, name, company, markning, sync_id FROM meta_objects WHERE id = ?",
+            (server_object_id,),
+        )
+        target = cursor.fetchone()
+        if target is None:
+            raise ValueError("Подтверждаемый серверный объект не найден.")
+        cursor.execute(
+            "SELECT COUNT(*) FROM meta_objects WHERE sync_id IS NULL AND name = ? AND company = ? AND COALESCE(markning, '') = ?",
+            (object_name, company, markning),
+        )
+        if cursor.fetchone()[0] != 1:
+            raise ValueError("Legacy-связь неоднозначна или кандидат уже связан; изменений не внесено.")
+        expected_server = (
+            str(object_data.get("expected_server_name") or "").strip(),
+            " ".join(str(object_data.get("expected_server_company") or "").split()),
+            str(object_data.get("expected_server_markning") or "").strip(),
+        )
+        actual_server = (target["name"], target["company"], target["markning"] or "")
+        if actual_server != expected_server or target["company"] != company:
+            raise ValueError("Данные серверного объекта изменились; связь не применена.")
+        if target["sync_id"] not in (None, sync_id):
+            raise ValueError("Серверный объект уже связан с другим устойчивым ID.")
+        cursor.execute("SELECT id FROM meta_objects WHERE sync_id = ? AND id <> ?", (sync_id, server_object_id))
+        if cursor.fetchone():
+            raise ValueError("Устойчивый ID уже связан с другим серверным объектом.")
+        cursor.execute(
+            "UPDATE meta_objects SET sync_id = ?, sync_version = ? WHERE id = ?",
+            (sync_id, revision, server_object_id),
+        )
+    else:
+        cursor.execute("SELECT id, company, is_active FROM meta_objects WHERE sync_id = ?", (sync_id,))
+        target = cursor.fetchone()
+        if target is not None:
+            server_object_id = int(target["id"])
+            if target["company"] != company:
+                raise ValueError("Устойчивый ID принадлежит другой фирме.")
+            if operation == "upsert":
+                if not target["is_active"]:
+                    raise ValueError("Неактивный объект нельзя восстановить обычным upsert; нужна явная операция activate.")
+                cursor.execute(
+                    "UPDATE meta_objects SET name = ?, markning = ?, rate = ?, transport_rate = ?, sync_version = ? WHERE id = ?",
+                    (object_name, markning, rate, transport_rate, revision, server_object_id),
+                )
+            elif operation == "deactivate":
+                cursor.execute("UPDATE meta_objects SET is_active = 0, sync_version = ? WHERE id = ?", (revision, server_object_id))
+            else:
+                cursor.execute("""
+                    UPDATE meta_objects
+                    SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = 1, sync_version = ?
+                    WHERE id = ?
+                """, (object_name, markning, rate, transport_rate, revision, server_object_id))
+        elif operation == "deactivate":
+            server_object_id = None
+        elif operation == "activate":
+            raise ValueError("Не найден объект для явного восстановления.")
+        else:
+            cursor.execute(
+                "SELECT id FROM meta_objects WHERE name = ? AND company = ?",
+                (object_name, company),
+            )
+            if cursor.fetchone():
+                raise ValueError(
+                    f"Объект «{object_name}» в фирме «{company}» не сопоставлен с устойчивым ID; "
+                    "сначала подтвердите связь с серверной записью."
+                )
+            cursor.execute("""
+                INSERT INTO meta_objects (sync_id, name, markning, company, rate, transport_rate, is_active, sync_version)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """, (sync_id, object_name, markning, company, rate, transport_rate, revision))
+            server_object_id = int(cursor.lastrowid)
+
+    cursor.execute("""
+        INSERT INTO object_sync_events (
+            operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    cursor.execute(
+        "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+        (server_object_id,),
+    )
+    object_state = cursor.fetchone()
+    return {
+        "operation_id": operation_id,
+        "sync_id": sync_id,
+        "operation": operation,
+        "server_object_id": server_object_id,
+        "object": dict(object_state) if object_state else None,
+        "stale": False,
+        "revision": revision,
+    }
+
+
+def apply_employee_sync_snapshot(cursor, employee_name, salary_rate, is_active):
+    profiles = find_employee_profiles(cursor, employee_name)
+    if profiles:
+        profile_ids = [profile["id"] for profile in profiles]
+        placeholders = ", ".join("?" for _ in profile_ids)
+        if salary_rate is None:
+            if not is_active:
+                cursor.execute(
+                    f"UPDATE meta_employees SET is_active = 0 WHERE id IN ({placeholders})",
+                    profile_ids,
+                )
+        elif is_active:
+            cursor.execute(
+                f"UPDATE meta_employees SET salary_rate = ? WHERE id IN ({placeholders}) AND is_active = 1",
+                (salary_rate, *profile_ids),
+            )
+        else:
+            cursor.execute(
+                f"UPDATE meta_employees SET salary_rate = ?, is_active = 0 WHERE id IN ({placeholders})",
+                (salary_rate, *profile_ids),
+            )
+    else:
+        cursor.execute(
+            "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, ?, ?)",
+            (employee_name, salary_rate if salary_rate is not None else 0.0, is_active),
+        )
+    return find_employee_profiles(cursor, employee_name)
+
+
+def get_employee_sync_state(cursor, profile_id):
+    if profile_id is None:
+        return None
+    cursor.execute(
+        "SELECT id, name, salary_rate, is_active FROM meta_employees WHERE id = ?",
+        (profile_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "salary_rate": float(row["salary_rate"] or 0.0),
+        "is_active": bool(row["is_active"]),
+    }
+
+
+def apply_employee_sync_event(cursor, event, operation):
+    if not isinstance(event, dict):
+        raise ValueError("Некорректное событие сотрудника.")
+    operation_id = str(event.get("operation_id") or "").strip()
+    employee_name = " ".join(str(event.get("name") or "").split())
+    employee_key = str(event.get("employee_key") or normalize_employee_name(employee_name)).strip()
+    try:
+        revision = int(event.get("revision", 1))
+    except (TypeError, ValueError):
+        raise ValueError("Некорректная revision события сотрудника.")
+    if not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150:
+        raise ValueError("Некорректные данные события сотрудника.")
+    if not employee_key or employee_key != normalize_employee_name(employee_name) or revision < 1:
+        raise ValueError("Некорректный ключ или revision события сотрудника.")
+
+    payload_hash = hashlib.sha256(json.dumps(
+        {"operation_id": operation_id, "employee_key": employee_key,
+         "revision": revision, "operation": operation, "name": employee_name},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cursor.execute(
+        "SELECT payload_hash, employee_key, revision, operation, profile_id FROM employee_sync_events WHERE operation_id = ?",
+        (operation_id,),
+    )
+    previous = cursor.fetchone()
+    if previous:
+        if (previous["payload_hash"] != payload_hash or previous["employee_key"] != employee_key
+                or previous["revision"] != revision or previous["operation"] != operation):
+            raise ValueError("operation_id сотрудника повторно использован с другими данными.")
+        cursor.execute("SELECT MAX(revision) FROM employee_sync_events WHERE employee_key = ?", (employee_key,))
+        latest_revision = int(cursor.fetchone()[0] or 0)
+        return {
+            "operation_id": operation_id,
+            "profile_id": previous["profile_id"],
+            "stale": latest_revision > revision,
+            "equivalent": latest_revision == revision,
+            "revision": latest_revision,
+            "employee": get_employee_sync_state(cursor, previous["profile_id"]),
+        }
+
+    profiles = find_employee_profiles(cursor, employee_name)
+    if len(profiles) > 1:
+        raise ValueError(f"Удаление/восстановление «{employee_name}» неоднозначно: найдено несколько профилей.")
+    profile_id = int(profiles[0]["id"]) if profiles else None
+    cursor.execute("SELECT MAX(revision) FROM employee_sync_events WHERE employee_key = ?", (employee_key,))
+    latest_revision = int(cursor.fetchone()[0] or 0)
+    if revision < latest_revision:
+        cursor.execute("""
+            INSERT INTO employee_sync_events (
+                operation_id, payload_hash, employee_key, revision, operation, profile_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, employee_key, revision, operation, profile_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        return {
+            "operation_id": operation_id,
+            "profile_id": profile_id,
+            "stale": True,
+            "revision": latest_revision,
+            "employee": get_employee_sync_state(cursor, profile_id),
+        }
+    if revision == latest_revision:
+        cursor.execute(
+            "SELECT operation FROM employee_sync_events WHERE employee_key = ? AND revision = ? ORDER BY rowid DESC LIMIT 1",
+            (employee_key, revision),
+        )
+        previous_revision = cursor.fetchone()
+        if previous_revision is None or previous_revision["operation"] != operation:
+            raise ValueError("Конфликт сотрудника: revision уже занята другой операцией.")
+        cursor.execute("""
+            INSERT INTO employee_sync_events (
+                operation_id, payload_hash, employee_key, revision, operation, profile_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, employee_key, revision, operation, profile_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        return {
+            "operation_id": operation_id,
+            "profile_id": profile_id,
+            "stale": True,
+            "equivalent": True,
+            "revision": latest_revision,
+            "employee": get_employee_sync_state(cursor, profile_id),
+        }
+
+    if operation == "deactivate":
+        if profile_id is not None:
+            cursor.execute("UPDATE meta_employees SET is_active = 0 WHERE id = ?", (profile_id,))
+            cursor.execute(
+                "UPDATE users SET is_active = 0 WHERE role <> 'admin' AND "
+                "(username = ? COLLATE NOCASE OR employee_id = ?)",
+                (employee_name, profile_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE users SET is_active = 0 WHERE role <> 'admin' AND username = ? COLLATE NOCASE",
+                (employee_name,),
+            )
+    elif operation == "activate":
+        if profile_id is None:
+            raise ValueError("Не найден профиль сотрудника для явного восстановления.")
+        cursor.execute("UPDATE meta_employees SET is_active = 1 WHERE id = ?", (profile_id,))
+        cursor.execute(
+            "UPDATE users SET is_active = 1 WHERE role <> 'admin' AND "
+            "(username = ? COLLATE NOCASE OR employee_id = ?)",
+            (employee_name, profile_id),
+        )
+    else:
+        raise ValueError("Неизвестная операция сотрудника.")
+
+    cursor.execute("""
+        INSERT INTO employee_sync_events (
+            operation_id, payload_hash, employee_key, revision, operation, profile_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        operation_id, payload_hash, employee_key, revision, operation, profile_id,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    return {
+        "operation_id": operation_id,
+        "profile_id": profile_id,
+        "stale": False,
+        "revision": revision,
+        "employee": get_employee_sync_state(cursor, profile_id),
+    }
+
+
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -2445,20 +2974,74 @@ def sync_desktop_data():
 
     data = request.json or {}
     employees = data.get("employees", [])
+    deleted_employees = data.get("deleted_employees", [])
+    restored_employees = data.get("restored_employees", [])
     companies = data.get("companies", [])
     objects = data.get("objects", [])
+    object_events = data.get("object_events", [])
     desktop_shifts = data.get("shifts", [])
 
-    if not isinstance(employees, list) or not isinstance(companies, list) or \
-       not isinstance(objects, list) or not isinstance(desktop_shifts, list):
+    if not isinstance(employees, list) or not isinstance(deleted_employees, list) or not isinstance(restored_employees, list) or not isinstance(companies, list) or \
+       not isinstance(objects, list) or not isinstance(object_events, list) or not isinstance(desktop_shifts, list):
         return jsonify({"ok": False, "error": "Неверный формат данных: ожидаются списки"}), 400
 
-    if len(employees) > 500 or len(companies) > 500 or len(objects) > 2000 or len(desktop_shifts) > 5000:
+    if len(employees) > 500 or len(deleted_employees) > 500 or len(restored_employees) > 500 or len(companies) > 500 or len(objects) > 2000 or len(object_events) > 2000 or len(desktop_shifts) > 5000:
         return jsonify({"ok": False, "error": "Превышен лимит записей в пакете синхронизации"}), 400
+
+    normalized_deletions = []
+    deletion_operation_ids = set()
+    for deletion in deleted_employees:
+        if not isinstance(deletion, dict):
+            return jsonify({"ok": False, "error": "Некорректная запись удаления сотрудника"}), 400
+        operation_id = str(deletion.get("operation_id") or "").strip()
+        employee_name = " ".join(str(deletion.get("name") or "").split())
+        if not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150:
+            return jsonify({"ok": False, "error": "Некорректные данные удаления сотрудника"}), 400
+        if operation_id in deletion_operation_ids:
+            return jsonify({"ok": False, "error": "Повторяется operation_id удаления сотрудника"}), 400
+        deletion_operation_ids.add(operation_id)
+        try:
+            revision = max(1, int(deletion.get("revision", 1)))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Некорректная revision удаления сотрудника"}), 400
+        employee_key = str(deletion.get("employee_key") or normalize_employee_name(employee_name)).strip()
+        if employee_key != normalize_employee_name(employee_name):
+            return jsonify({"ok": False, "error": "Ключ удаления сотрудника не совпадает с именем"}), 400
+        normalized_deletions.append({
+            "operation_id": operation_id, "name": employee_name,
+            "employee_key": employee_key, "revision": revision,
+        })
+
+    normalized_restorations = []
+    restoration_operation_ids = set()
+    for restoration in restored_employees:
+        if not isinstance(restoration, dict):
+            return jsonify({"ok": False, "error": "Некорректная запись восстановления сотрудника"}), 400
+        operation_id = str(restoration.get("operation_id") or "").strip()
+        employee_name = " ".join(str(restoration.get("name") or "").split())
+        employee_key = str(restoration.get("employee_key") or normalize_employee_name(employee_name)).strip()
+        try:
+            revision = int(restoration.get("revision"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Некорректная revision восстановления сотрудника"}), 400
+        if (not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150
+                or employee_key != normalize_employee_name(employee_name) or revision < 1):
+            return jsonify({"ok": False, "error": "Некорректные данные восстановления сотрудника"}), 400
+        if operation_id in restoration_operation_ids:
+            return jsonify({"ok": False, "error": "Повторяется operation_id восстановления сотрудника"}), 400
+        restoration_operation_ids.add(operation_id)
+        normalized_restorations.append({
+            "operation_id": operation_id, "name": employee_name,
+            "employee_key": employee_key, "revision": revision,
+        })
 
     conn = get_db_connection()
     cursor = conn.cursor()
     employee_sync_results = []
+    deleted_employee_operations = []
+    restored_employee_operations = []
+    employee_event_results = []
+    object_sync_results = []
 
     try:
         if employees:
@@ -2474,6 +3057,8 @@ def sync_desktop_data():
                     except (TypeError, ValueError):
                         return jsonify({"ok": False, "error": "Некорректная ставка сотрудника"}), 400
                     emp_active = int(emp.get('is_active', 1))
+                    if emp_active not in (0, 1):
+                        raise ValueError("Недопустимый статус сотрудника")
                 else:
                     emp_name = " ".join(str(emp).split()) if emp else ""
                     if not emp_name or len(emp_name) > 150:
@@ -2481,29 +3066,7 @@ def sync_desktop_data():
                     emp_rate = None
                     emp_active = 1
 
-                matching_profiles = find_employee_profiles(cursor, emp_name)
-                if matching_profiles:
-                    profile_ids = [profile['id'] for profile in matching_profiles]
-                    placeholders = ', '.join('?' for _ in profile_ids)
-                    if emp_rate is None:
-                        cursor.execute(
-                            f"UPDATE meta_employees SET is_active = ? WHERE id IN ({placeholders})",
-                            (emp_active, *profile_ids),
-                        )
-                    else:
-                        cursor.execute(
-                            f"UPDATE meta_employees SET salary_rate = ?, is_active = ? WHERE id IN ({placeholders})",
-                            (emp_rate, emp_active, *profile_ids),
-                        )
-                else:
-                    cursor.execute('''
-                        INSERT INTO meta_employees (name, salary_rate, is_active)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(name) DO UPDATE SET
-                            salary_rate = excluded.salary_rate,
-                            is_active = excluded.is_active
-                    ''', (emp_name, emp_rate if emp_rate is not None else 0.0, emp_active))
-                stored_profiles = find_employee_profiles(cursor, emp_name)
+                stored_profiles = apply_employee_sync_snapshot(cursor, emp_name, emp_rate, emp_active)
                 employee_sync_results.append({
                     "employee_name": emp_name,
                     "profiles": [{
@@ -2522,16 +3085,18 @@ def sync_desktop_data():
                         return jsonify({"ok": False, "error": "Слишком длинное имя компании"}), 400
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
 
-        if objects:
-            for obj in objects:
-                name, mark, comp = safe_parse_obj(obj)
-                if name and "{" not in name:
-                    if len(name) > 200 or len(mark) > 50 or len(comp) > 150:
-                        return jsonify({"ok": False, "error": "Превышена длина полей объекта"}), 400
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-                        ON CONFLICT(name, company) DO UPDATE SET markning = excluded.markning
-                    ''', (name, mark, comp if comp else "Privat"))
+        for event in object_events:
+            object_sync_results.append(apply_object_sync_event(cursor, event))
+
+        for restoration in normalized_restorations:
+            result = apply_employee_sync_event(cursor, restoration, "activate")
+            employee_event_results.append(result)
+            restored_employee_operations.append(restoration["operation_id"])
+
+        for deletion in normalized_deletions:
+            result = apply_employee_sync_event(cursor, deletion, "deactivate")
+            employee_event_results.append(result)
+            deleted_employee_operations.append(deletion["operation_id"])
 
         conn.commit()
     except Exception as e:
@@ -2546,6 +3111,11 @@ def sync_desktop_data():
         "status": "metadata_synced",
         "shift_sync": "versioned_api_required",
         "employee_sync": employee_sync_results,
+        "deleted_employee_operations": deleted_employee_operations,
+        "restored_employee_operations": restored_employee_operations,
+        "employee_event_results": employee_event_results,
+        "object_sync_status": "legacy_snapshot_ignored" if objects and not object_events else "event_sync",
+        "object_sync_operations": object_sync_results,
     })
 
 def serialize_submission(row, cursor=None):

@@ -132,6 +132,90 @@ def get_db_connection():
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
+
+def ensure_local_object_sync_schema(conn):
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(objects)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    for column_name, definition in (
+        ("sync_id", "TEXT"),
+        ("server_id", "INTEGER"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+        ("sync_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE objects ADD COLUMN {column_name} {definition}")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_sync_id ON objects(sync_id) WHERE sync_id IS NOT NULL")
+
+    cursor.execute("PRAGMA index_list(objects)")
+    indexes = cursor.fetchall()
+    unique_name_only = False
+    index_sql = []
+    for index in indexes:
+        index_name = str(index["name"])
+        escaped_name = index_name.replace('"', '""')
+        cursor.execute(f'PRAGMA index_info("{escaped_name}")')
+        indexed_columns = tuple(row["name"] for row in cursor.fetchall())
+        if index["unique"] and indexed_columns == ("name",):
+            unique_name_only = True
+            continue
+        definition = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (index_name,)
+        ).fetchone()
+        if definition and definition[0]:
+            index_sql.append(str(definition[0]))
+
+    if not unique_name_only:
+        conn.commit()
+        return
+
+    triggers = [row[0] for row in cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'objects' AND sql IS NOT NULL"
+    ).fetchall()]
+    conn.commit()
+    foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE objects_sync_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                markning TEXT,
+                company TEXT,
+                rate REAL DEFAULT 0.0,
+                transport_rate REAL DEFAULT 0.0,
+                sync_id TEXT UNIQUE,
+                server_id INTEGER,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                sync_version INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(name, company)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO objects_sync_migration (
+                id, name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+            )
+            SELECT id, name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+            FROM objects
+        """)
+        conn.execute("DROP TABLE objects")
+        conn.execute("ALTER TABLE objects_sync_migration RENAME TO objects")
+        for statement in index_sql:
+            conn.execute(statement)
+        for statement in triggers:
+            conn.execute(statement)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError("Object identity migration would break existing foreign-key links.")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            conn.execute("PRAGMA foreign_keys = ON")
+
 def init_db_once():
     is_new_db = not os.path.exists(DB_FILE)
     
@@ -145,11 +229,16 @@ def init_db_once():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS objects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
             markning TEXT,
             company TEXT,
             rate REAL DEFAULT 0.0,
-            transport_rate REAL DEFAULT 0.0
+            transport_rate REAL DEFAULT 0.0,
+            sync_id TEXT UNIQUE,
+            server_id INTEGER,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            sync_version INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(name, company)
         )
     ''')
     
@@ -159,6 +248,20 @@ def init_db_once():
         cursor.execute("ALTER TABLE objects ADD COLUMN rate REAL DEFAULT 0.0")
     if 'transport_rate' not in obj_columns:
         cursor.execute("ALTER TABLE objects ADD COLUMN transport_rate REAL DEFAULT 0.0")
+    ensure_local_object_sync_schema(conn)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_sync_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL UNIQUE,
+            object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
+            sync_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_object_sync_outbox_pending ON object_sync_outbox(id)")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS employees (
@@ -168,6 +271,71 @@ def init_db_once():
             is_active INTEGER NOT NULL DEFAULT 1
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_sync_outbox (
+            operation_id TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            employee_key TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_employee_sync_outbox_name ON employee_sync_outbox(employee_name)")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_sync_state (
+            employee_key TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('deleted', 'active')),
+            sync_version INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_restore_outbox (
+            operation_id TEXT PRIMARY KEY,
+            employee_key TEXT NOT NULL,
+            employee_name TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_employee_restore_outbox_order ON employee_restore_outbox(created_at, operation_id)")
+    for table_name, columns_to_add in (
+        ("employee_sync_outbox", (("employee_key", "TEXT"), ("revision", "INTEGER NOT NULL DEFAULT 0"))),
+        ("employee_sync_state", (("sync_version", "INTEGER NOT NULL DEFAULT 0"),)),
+        ("employee_restore_outbox", (("revision", "INTEGER NOT NULL DEFAULT 0"),)),
+    ):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        existing_columns = {column[1] for column in cursor.fetchall()}
+        for column_name, column_definition in columns_to_add:
+            if column_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+    cursor.execute("SELECT operation_id, employee_name FROM employee_sync_outbox WHERE employee_key IS NULL")
+    for pending_delete in cursor.fetchall():
+        employee_key = employee_sync_key(pending_delete["employee_name"])
+        updated_at = datetime.now(timezone.utc).isoformat()
+        cursor.execute(
+            "UPDATE employee_sync_outbox SET employee_key = ?, revision = MAX(revision, 1) WHERE operation_id = ?",
+            (employee_key, pending_delete["operation_id"]),
+        )
+        cursor.execute("""
+            INSERT OR IGNORE INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+            VALUES (?, ?, 'deleted', 1, ?)
+        """, (
+            employee_key, pending_delete["employee_name"], updated_at,
+        ))
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_sync_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL UNIQUE,
+            object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
+            sync_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_object_sync_outbox_order ON object_sync_outbox(id)")
 
     cursor.execute("PRAGMA table_info(employees)")
     emp_columns = [col[1] for col in cursor.fetchall()]
@@ -381,6 +549,161 @@ def init_db_once():
     apply_expense_documents_migration(
         DB_FILE, Path(DB_FILE).resolve().parent / BACKUP_DIR
     )
+
+
+def enqueue_object_sync_event(cursor, object_id, operation, extra=None):
+    row = cursor.execute("SELECT * FROM objects WHERE id = ?", (int(object_id),)).fetchone()
+    extra_payload = dict(extra or {})
+    sync_id = row["sync_id"] if row is not None else None
+    if operation == "link_legacy" and not sync_id:
+        sync_id = extra_payload.pop("sync_id", None)
+    if row is None or not sync_id:
+        raise ValueError("Объект legacy не сопоставлен с серверным ID; синхронизация заблокирована.")
+    revision = int(row["sync_version"] or 0) + 1
+    event = {
+        "operation_id": str(uuid.uuid4()),
+        "sync_id": str(sync_id),
+        "revision": revision,
+        "operation": str(operation),
+        "object_id": int(row["id"]),
+        "object": {
+            "name": str(row["name"]), "company": str(row["company"] or ""),
+            "markning": str(row["markning"] or ""),
+            "rate": float(row["rate"] or 0.0),
+            "transport_rate": float(row["transport_rate"] or 0.0),
+        },
+    }
+    if extra:
+        event["object"].update(extra_payload)
+    cursor.execute("""
+        INSERT INTO object_sync_outbox (
+            operation_id, object_id, sync_id, operation, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        event["operation_id"], int(row["id"]), event["sync_id"], event["operation"],
+        json.dumps(event, ensure_ascii=False, sort_keys=True), datetime.now(timezone.utc).isoformat(),
+    ))
+    if operation == "link_legacy":
+        cursor.execute(
+            "UPDATE objects SET sync_id = ?, sync_version = ? WHERE id = ?",
+            (event["sync_id"], revision, int(row["id"])),
+        )
+    else:
+        cursor.execute("UPDATE objects SET sync_version = ? WHERE id = ?", (revision, int(row["id"])))
+    return event
+
+
+def exact_legacy_object_candidates(objects, company, name, markning):
+    return [
+        item for item in objects
+        if not item.get("sync_id")
+        and item.get("company") == company
+        and item.get("name") == name
+        and str(item.get("markning") or "") == str(markning or "")
+    ]
+
+
+def employee_sync_key(name):
+    return " ".join(str(name or "").split()).casefold()
+
+
+def enqueue_employee_sync_event(cursor, employee_name, operation):
+    employee_key = employee_sync_key(employee_name)
+    if not employee_key or operation not in {"deactivate", "activate"}:
+        raise ValueError("Некорректная операция синхронизации сотрудника.")
+    state = cursor.execute(
+        "SELECT state, sync_version FROM employee_sync_state WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()
+    pending_delete = cursor.execute(
+        "SELECT MAX(revision) FROM employee_sync_outbox WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()[0]
+    pending_restore = cursor.execute(
+        "SELECT MAX(revision) FROM employee_restore_outbox WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()[0]
+    current_revision = max(
+        int(state["sync_version"] or 0) if state else 0,
+        int(pending_delete or 0),
+        int(pending_restore or 0),
+    )
+    if operation == "activate" and not (state and state["state"] == "deleted") and pending_delete is None:
+        return None
+    revision = current_revision + 1
+    operation_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    if operation == "deactivate":
+        cursor.execute("DELETE FROM employee_restore_outbox WHERE employee_key = ?", (employee_key,))
+        cursor.execute("DELETE FROM employee_sync_outbox WHERE employee_key = ?", (employee_key,))
+        cursor.execute("""
+            INSERT INTO employee_sync_outbox (operation_id, employee_name, employee_key, revision, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (operation_id, employee_name, employee_key, revision, created_at))
+        state_value = "deleted"
+    else:
+        cursor.execute("DELETE FROM employee_sync_outbox WHERE employee_key = ?", (employee_key,))
+        cursor.execute("""
+            INSERT INTO employee_restore_outbox (operation_id, employee_key, employee_name, revision, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (operation_id, employee_key, employee_name, revision, created_at))
+        state_value = "active"
+    cursor.execute("""
+        INSERT INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(employee_key) DO UPDATE SET
+            employee_name = excluded.employee_name,
+            state = excluded.state,
+            sync_version = excluded.sync_version,
+            updated_at = excluded.updated_at
+    """, (employee_key, employee_name, state_value, revision, created_at))
+    return operation_id
+
+
+def apply_employee_sync_ack(cursor, event, result):
+    state = result.get("employee")
+    if not isinstance(state, dict):
+        return
+    revision = int(result.get("revision", event["revision"]))
+    employee_key = event["employee_key"]
+    current = cursor.execute(
+        "SELECT state, sync_version FROM employee_sync_state WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()
+    if current and int(current["sync_version"] or 0) > revision:
+        return
+
+    cursor.execute("""
+        INSERT INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(employee_key) DO UPDATE SET
+            employee_name = excluded.employee_name,
+            state = excluded.state,
+            sync_version = excluded.sync_version,
+            updated_at = excluded.updated_at
+    """, (
+        employee_key, state["name"], "active" if state["is_active"] else "deleted", revision,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    local_matches = [
+        row["name"] for row in cursor.execute("SELECT name FROM employees").fetchall()
+        if employee_sync_key(row["name"]) == employee_key
+    ]
+    if len(local_matches) > 1:
+        raise ValueError(f"Локальная запись сотрудника «{state['name']}» неоднозначна.")
+    if state["is_active"]:
+        if local_matches:
+            cursor.execute(
+                "UPDATE employees SET name = ?, salary_rate = ?, is_active = 1 WHERE name = ?",
+                (state["name"], float(state["salary_rate"] or 0.0), local_matches[0]),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, ?, 1)",
+                (state["name"], float(state["salary_rate"] or 0.0)),
+            )
+    elif local_matches:
+        cursor.execute("DELETE FROM employees WHERE name = ?", (local_matches[0],))
 
 def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, state=None):
     record_type = payload.get('record_type', RECORD_TYPE_WORK)
@@ -620,7 +943,7 @@ def resolve_special_object(cursor, company, record_type):
     if not reference:
         return None, "Неизвестный тип записи."
     cursor.execute(
-        "SELECT id, name, markning, company FROM objects WHERE company = ? AND name = ? AND COALESCE(markning, '') = ?",
+        "SELECT id, name, markning, company FROM objects WHERE company = ? AND name = ? AND is_active = 1 AND COALESCE(markning, '') = ?",
         (company, reference[0], reference[1])
     )
     matches = cursor.fetchall()
@@ -1582,12 +1905,33 @@ class SmartReportApp(QMainWindow):
             }
             for row in cursor.fetchall()
         ]
+        cursor.execute("SELECT operation_id, employee_name, employee_key, revision FROM employee_sync_outbox ORDER BY created_at, operation_id")
+        deleted_employees = [
+            {
+                "operation_id": row["operation_id"], "name": row["employee_name"],
+                "employee_key": row["employee_key"] or employee_sync_key(row["employee_name"]),
+                "revision": int(row["revision"] or 0),
+            }
+            for row in cursor.fetchall()
+        ]
+        cursor.execute("SELECT operation_id, employee_name, employee_key, revision FROM employee_restore_outbox ORDER BY created_at, operation_id")
+        restored_employees = [
+            {
+                "operation_id": row["operation_id"], "name": row["employee_name"],
+                "employee_key": row["employee_key"], "revision": int(row["revision"] or 0),
+            }
+            for row in cursor.fetchall()
+        ]
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
-        cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
-        objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
+        cursor.execute("SELECT operation_id, payload_json FROM object_sync_outbox ORDER BY id")
+        object_events = [json.loads(row["payload_json"]) for row in cursor.fetchall()]
         conn.close()
-        metadata_payload = {"employees": employees, "companies": companies, "objects": objects, "shifts": []}
+        metadata_payload = {
+            "employees": employees, "deleted_employees": deleted_employees,
+            "restored_employees": restored_employees,
+            "companies": companies, "objects": [], "object_events": object_events, "shifts": [],
+        }
         if self.__dict__.get("_manual_sync_requested", False):
             print(
                 f"[SYNC] POST {CLOUD_URL}/sync-desktop-data employees="
@@ -1599,6 +1943,117 @@ class SmartReportApp(QMainWindow):
             json=metadata_payload, timeout=4
         )
         metadata_response.raise_for_status()
+        metadata_result = metadata_response.json()
+        if not isinstance(metadata_result, dict) or metadata_result.get("ok") is not True:
+            raise RuntimeError("Сервер не подтвердил синхронизацию справочников.")
+        expected_delete_ids = {item["operation_id"] for item in deleted_employees}
+        acknowledged_delete_ids = set(metadata_result.get("deleted_employee_operations", []))
+        if not expected_delete_ids.issubset(acknowledged_delete_ids):
+            raise RuntimeError("Сервер не подтвердил удаление сотрудника; удаление оставлено в очереди.")
+        expected_restore_ids = {item["operation_id"] for item in restored_employees}
+        acknowledged_restore_ids = set(metadata_result.get("restored_employee_operations", []))
+        if not expected_restore_ids.issubset(acknowledged_restore_ids):
+            raise RuntimeError("Сервер не подтвердил восстановление сотрудника; операция оставлена в очереди.")
+        employee_events = [*restored_employees, *deleted_employees]
+        employee_event_results = metadata_result.get("employee_event_results", [])
+        if not isinstance(employee_event_results, list):
+            raise RuntimeError("Ответ сервера по событиям сотрудников имеет неверный формат.")
+        employee_results_by_id = {
+            item.get("operation_id"): item
+            for item in employee_event_results if isinstance(item, dict)
+        }
+        expected_employee_ids = {item["operation_id"] for item in employee_events}
+        if not expected_employee_ids.issubset(employee_results_by_id):
+            raise RuntimeError("Сервер не подтвердил состояние сотрудника; события оставлены в очереди.")
+        if employee_events:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                for event in employee_events:
+                    result = employee_results_by_id[event["operation_id"]]
+                    if result.get("stale") and not result.get("equivalent"):
+                        conflicts += 1
+                    apply_employee_sync_ack(cursor, event, result)
+                    if event in restored_employees:
+                        cursor.execute(
+                            "DELETE FROM employee_restore_outbox WHERE operation_id = ? AND employee_key = ?",
+                            (event["operation_id"], event["employee_key"]),
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM employee_sync_outbox WHERE operation_id = ? AND employee_name = ?",
+                            (event["operation_id"], event["name"]),
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        expected_object_operation_ids = {event["operation_id"] for event in object_events}
+        object_results = metadata_result.get("object_sync_operations", [])
+        if not isinstance(object_results, list):
+            raise RuntimeError("Ответ сервера по событиям объектов имеет неверный формат.")
+        object_results_by_id = {
+            item.get("operation_id"): item for item in object_results if isinstance(item, dict)
+        }
+        if not expected_object_operation_ids.issubset(object_results_by_id):
+            raise RuntimeError("Сервер не подтвердил все изменения объектов; события оставлены в очереди.")
+        if object_events:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                for event in object_events:
+                    result = object_results_by_id[event["operation_id"]]
+                    if result.get("stale"):
+                        if not result.get("equivalent"):
+                            conflicts += 1
+                        state = result.get("object")
+                        if isinstance(state, dict):
+                            cursor.execute("""
+                                UPDATE objects
+                                SET server_id = ?, name = ?, markning = ?, rate = ?, transport_rate = ?,
+                                    is_active = ?, sync_version = ?
+                                WHERE id = ? AND sync_id = ? AND sync_version = ?
+                            """, (
+                                result.get("server_object_id"), state.get("name"), state.get("markning") or "",
+                                float(state.get("rate") or 0.0), float(state.get("transport_rate") or 0.0),
+                                int(bool(state.get("is_active"))), int(result.get("revision", event["revision"])),
+                                int(event["object_id"]), event["sync_id"], int(event["revision"]),
+                            ))
+                        else:
+                            cursor.execute("""
+                                UPDATE objects SET server_id = NULL, is_active = 0, sync_version = ?
+                                WHERE id = ? AND sync_id = ? AND sync_version = ?
+                            """, (
+                                int(result.get("revision", event["revision"])),
+                                int(event["object_id"]), event["sync_id"], int(event["revision"]),
+                            ))
+                    elif event["operation"] == "link_legacy" and isinstance(result.get("object"), dict):
+                        state = result["object"]
+                        cursor.execute("""
+                            UPDATE objects
+                            SET server_id = ?, rate = ?, transport_rate = ?, is_active = ?
+                            WHERE id = ? AND sync_id = ? AND sync_version = ?
+                        """, (
+                            result.get("server_object_id"), float(state.get("rate") or 0.0),
+                            float(state.get("transport_rate") or 0.0), int(bool(state.get("is_active"))),
+                            int(event["object_id"]), event["sync_id"], int(event["revision"]),
+                        ))
+                    else:
+                        cursor.execute(
+                            "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ?",
+                            (result.get("server_object_id"), int(event["object_id"]), event["sync_id"]),
+                        )
+                    cursor.execute("DELETE FROM object_sync_outbox WHERE operation_id = ?", (event["operation_id"],))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
         return conflicts
 
     def _on_sync_completed(self, success, conflicts, error):
@@ -2948,7 +3403,7 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         known_suppliers = conn.execute("SELECT name FROM expense_suppliers ORDER BY name COLLATE NOCASE").fetchall()
-        object_rows = conn.execute("SELECT id, name, markning FROM objects ORDER BY name").fetchall()
+        object_rows = conn.execute("SELECT id, name, markning, is_active FROM objects ORDER BY name").fetchall()
         conn.close()
         supplier = QComboBox()
         supplier.setEditable(True)
@@ -3067,12 +3522,17 @@ class SmartReportApp(QMainWindow):
             allocation_table.insertRow(row)
             object_combo = QComboBox()
             object_combo.addItem("Без объекта", None)
+            selected_object = allocation.get("object_id")
             for object_row in object_rows:
+                object_id = int(object_row["id"])
+                if not object_row["is_active"] and object_id != selected_object:
+                    continue
                 title = str(object_row["name"])
                 if object_row["markning"]:
                     title += f" ({object_row['markning']})"
-                object_combo.addItem(title, int(object_row["id"]))
-            selected_object = allocation.get("object_id")
+                if not object_row["is_active"]:
+                    title += " [архив]"
+                object_combo.addItem(title, object_id)
             object_combo.setCurrentIndex(max(0, object_combo.findData(int(selected_object)) if selected_object is not None else 0))
             allocation_table.setCellWidget(row, 0, object_combo)
             allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
@@ -4439,7 +4899,7 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ?", (obj,))
+        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj, comp))
         obj_row = cursor.fetchone()
         object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
         object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
@@ -4551,7 +5011,7 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ?", (obj,))
+        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj, comp))
         obj_row = cursor.fetchone()
         object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
         object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
@@ -4796,7 +5256,7 @@ class SmartReportApp(QMainWindow):
             return False
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects WHERE company = ? ORDER BY name", (comp_name,))
+        cursor.execute("SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects WHERE company = ? AND is_active = 1 ORDER BY name", (comp_name,))
         rows = cursor.fetchall()
         conn.close()
         if record_type in SPECIAL_OBJECTS:
@@ -5220,8 +5680,8 @@ class SmartReportApp(QMainWindow):
         obj_card_layout.addLayout(obj_add_layout)
         
         self.table_objects = QTableWidget()
-        self.table_objects.setColumnCount(5)
-        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Факт. ставка (kr/ч)", "Транспорт (kr/выезд)"])
+        self.table_objects.setColumnCount(6)
+        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Факт. ставка (kr/ч)", "Транспорт (kr/выезд)", "Состояние"])
         
         obj_header = self.table_objects.horizontalHeader()
         obj_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -5229,11 +5689,13 @@ class SmartReportApp(QMainWindow):
         obj_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         obj_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         obj_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        obj_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         
         self.table_objects.setColumnWidth(0, 150)
         self.table_objects.setColumnWidth(2, 110)
         self.table_objects.setColumnWidth(3, 140)
         self.table_objects.setColumnWidth(4, 150)
+        self.table_objects.setColumnWidth(5, 120)
 
         self.table_objects.cellChanged.connect(self.on_object_cell_changed)
         obj_card_layout.addWidget(self.table_objects, stretch=1)
@@ -5242,6 +5704,10 @@ class SmartReportApp(QMainWindow):
         del_obj_btn.setObjectName("danger")
         del_obj_btn.clicked.connect(self.delete_object)
         obj_card_layout.addWidget(del_obj_btn)
+
+        link_obj_btn = QPushButton("Связать выбранную legacy-запись с сервером…")
+        link_obj_btn.clicked.connect(self.link_legacy_object)
+        obj_card_layout.addWidget(link_obj_btn)
 
         layout.addWidget(obj_card, stretch=1)
 
@@ -5313,13 +5779,32 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('''
-                INSERT INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET markning = ?, company = ?, rate = ?, transport_rate = ?
-            ''', (name, mark, comp, rate_val, trans_rate_val, mark, comp, rate_val, trans_rate_val))
+            cursor.execute("BEGIN IMMEDIATE")
+            existing = cursor.execute(
+                "SELECT id, sync_id, is_active FROM objects WHERE name = ? AND company = ?",
+                (name, comp),
+            ).fetchone()
+            if existing and not existing["sync_id"]:
+                raise ValueError("Эта legacy-запись ещё не связана с сервером. Сначала выполните явное сопоставление.")
+            if existing:
+                cursor.execute(
+                    "UPDATE objects SET markning = ?, rate = ?, transport_rate = ?, is_active = 1 WHERE id = ?",
+                    (mark, rate_val, trans_rate_val, int(existing["id"])),
+                )
+                operation = "activate" if not existing["is_active"] else "upsert"
+                enqueue_object_sync_event(cursor, int(existing["id"]), operation)
+            else:
+                cursor.execute("""
+                    INSERT INTO objects (name, markning, company, rate, transport_rate, sync_id, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                """, (name, mark, comp, rate_val, trans_rate_val, str(uuid.uuid4())))
+                enqueue_object_sync_event(cursor, int(cursor.lastrowid), "upsert")
             conn.commit()
         except Exception as e:
+            conn.rollback()
             QMessageBox.critical(self, "Ошибка", f"Не удалось добавить объект: {e}")
+            conn.close()
+            return
         conn.close()
         self.new_obj_name_input.clear()
         self.new_obj_mark_input.clear()
@@ -5329,35 +5814,148 @@ class SmartReportApp(QMainWindow):
         self.background_sync_with_cloud()
 
     def on_object_cell_changed(self, row, col):
-        if col in [3, 4]:
+        if col in [1, 2, 3, 4]:
+            conn = None
             try:
                 name_item = self.table_objects.item(row, 1)
+                mark_item = self.table_objects.item(row, 2)
+                if not name_item or not mark_item:
+                    return
                 rate_item = self.table_objects.item(row, 3)
                 trans_item = self.table_objects.item(row, 4)
-                if not name_item or not rate_item or not trans_item:
+                if not rate_item or not trans_item:
                     return
-                obj_name = name_item.text().strip()
+                object_item = self.table_objects.item(row, 0)
+                object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
+                name = name_item.text().strip()
+                mark = mark_item.text().strip()
+                if not name or len(name) > 200 or len(mark) > 50:
+                    raise ValueError("Название должно содержать до 200 символов, markning — до 50.")
                 new_rate = parse_float(rate_item.text(), 0.0)
                 new_trans = parse_float(trans_item.text(), 0.0)
+                if not 0 <= new_rate <= 100000 or not 0 <= new_trans <= 100000:
+                    raise ValueError("Ставки должны быть в диапазоне от 0 до 100000.")
 
                 conn = get_db_connection()
                 cursor = conn.cursor()
-                cursor.execute("UPDATE objects SET rate = ?, transport_rate = ? WHERE name = ?", (new_rate, new_trans, obj_name))
+                cursor.execute("BEGIN IMMEDIATE")
+                object_state = cursor.execute(
+                    "SELECT sync_id, is_active FROM objects WHERE id = ?", (object_id,)
+                ).fetchone()
+                if not object_state or not object_state["sync_id"] or not object_state["is_active"]:
+                    conn.rollback()
+                    conn.close()
+                    self.load_objects_table()
+                    return
+                cursor.execute("""
+                    UPDATE objects SET name = ?, markning = ?, rate = ?, transport_rate = ? WHERE id = ?
+                """, (name, mark, new_rate, new_trans, object_id))
+                enqueue_object_sync_event(cursor, object_id, "upsert")
                 conn.commit()
                 conn.close()
                 self.background_sync_with_cloud()
-            except Exception:
-                pass
+            except Exception as error:
+                if conn is not None:
+                    conn.rollback()
+                    conn.close()
+                QMessageBox.warning(self, "Объект", f"Изменение не сохранено: {error}")
+                self.load_objects_table()
 
     def delete_object(self):
         selected = self.table_objects.currentRow()
         if selected < 0:
             return
-        obj_name = self.table_objects.item(selected, 1).text()
+        object_item = self.table_objects.item(selected, 0)
+        object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM objects WHERE name = ?', (obj_name,))
-        conn.commit()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            object_state = cursor.execute(
+                "SELECT sync_id, is_active FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if object_state and object_state["is_active"]:
+                cursor.execute("UPDATE objects SET is_active = 0 WHERE id = ?", (object_id,))
+                if object_state["sync_id"]:
+                    enqueue_object_sync_event(cursor, object_id, "deactivate")
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            QMessageBox.critical(self, "Ошибка", f"Не удалось архивировать объект: {error}")
+            conn.close()
+            return
+        conn.close()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
+
+    def link_legacy_object(self):
+        selected = self.table_objects.currentRow()
+        if selected < 0:
+            return
+        object_item = self.table_objects.item(selected, 0)
+        object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT name, markning, company, sync_id FROM objects WHERE id = ?", (object_id,)
+        ).fetchone()
+        conn.close()
+        if row is None or row["sync_id"]:
+            QMessageBox.information(self, "Сопоставление объекта", "Выберите legacy-запись без серверной связи.")
+            return
+        try:
+            payload = request_expense_api("GET", "/api/expense-objects?include_inactive=1")
+        except Exception as error:
+            QMessageBox.warning(self, "Сопоставление объекта", f"Не удалось загрузить серверный справочник: {error}")
+            return
+        candidates = exact_legacy_object_candidates(
+            payload.get("objects", []), row["company"], row["name"], row["markning"]
+        )
+        if len(candidates) != 1:
+            QMessageBox.information(
+                self,
+                "Сопоставление объекта",
+                "Нет единственной несвязанной серверной записи с точным совпадением фирмы, названия и markning. Изменения не внесены.",
+            )
+            return
+        candidate = candidates[0]
+        confirmation = QMessageBox.question(
+            self,
+            "Подтвердить связь",
+            f"Связать локальную запись «{row['name']}» фирмы «{row['company']}» с серверным ID {candidate['id']}? Серверные ставки не будут перезаписаны.",
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            current = cursor.execute(
+                "SELECT sync_id FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if current is None or current["sync_id"]:
+                raise ValueError("Локальная запись уже была связана или удалена.")
+            cursor.execute(
+                "UPDATE objects SET rate = ?, transport_rate = ?, is_active = ? WHERE id = ?",
+                (
+                    float(candidate.get("rate") or 0.0),
+                    float(candidate.get("transport_rate") or 0.0),
+                    int(bool(candidate.get("is_active", 1))),
+                    object_id,
+                ),
+            )
+            enqueue_object_sync_event(cursor, object_id, "link_legacy", {
+                "sync_id": str(uuid.uuid4()),
+                "server_object_id": int(candidate["id"]),
+                "expected_server_name": candidate["name"],
+                "expected_server_company": candidate["company"],
+                "expected_server_markning": candidate.get("markning") or "",
+            })
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Сопоставление объекта", f"Связь не поставлена в очередь: {error}")
+            conn.close()
+            return
         conn.close()
         self.load_dropdowns()
         self.background_sync_with_cloud()
@@ -5409,7 +6007,7 @@ class SmartReportApp(QMainWindow):
             curr_obj = self.filter_obj.currentText()
             self.filter_obj.clear()
             self.filter_obj.addItem("-- Все объекты --")
-            cursor.execute("SELECT name FROM objects ORDER BY name")
+            cursor.execute("SELECT name FROM objects WHERE is_active = 1 ORDER BY name")
             for row in cursor.fetchall():
                 self.filter_obj.addItem(row[0])
             idx = self.filter_obj.findText(curr_obj)
@@ -5447,23 +6045,37 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT company, name, markning, COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects ORDER BY company, name")
+        cursor.execute("SELECT id, company, name, markning, COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0), is_active, sync_id FROM objects ORDER BY company, name")
         rows = cursor.fetchall()
         conn.close()
 
         self.table_objects.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
-            self.table_objects.setItem(row_idx, 0, QTableWidgetItem(row[0] or ""))
-            self.table_objects.setItem(row_idx, 1, QTableWidgetItem(row[1]))
-            self.table_objects.setItem(row_idx, 2, QTableWidgetItem(row[2] or ""))
+            company_item = QTableWidgetItem(row[1] or "")
+            company_item.setData(Qt.ItemDataRole.UserRole, int(row[0]))
+            self.table_objects.setItem(row_idx, 0, company_item)
+            name_item = QTableWidgetItem(row[2])
+            mark_item = QTableWidgetItem(row[3] or "")
+            company_item.setFlags(company_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if not row[6] or not row[7]:
+                for item in (name_item, mark_item):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_objects.setItem(row_idx, 1, name_item)
+            self.table_objects.setItem(row_idx, 2, mark_item)
             
-            rate_item = QTableWidgetItem(f"{row[3]:.2f}")
+            rate_item = QTableWidgetItem(f"{row[4]:.2f}")
             rate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.table_objects.setItem(row_idx, 3, rate_item)
-
-            trans_item = QTableWidgetItem(f"{row[4]:.2f}")
+            trans_item = QTableWidgetItem(f"{row[5]:.2f}")
             trans_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if not row[6] or not row[7]:
+                rate_item.setFlags(rate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                trans_item.setFlags(trans_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_objects.setItem(row_idx, 3, rate_item)
             self.table_objects.setItem(row_idx, 4, trans_item)
+            state_label = "Legacy: не связан" if not row[7] else "Активен" if row[6] else "Архив"
+            state_item = QTableWidgetItem(state_label)
+            state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_objects.setItem(row_idx, 5, state_item)
 
         self.table_objects.cellChanged.connect(self.on_object_cell_changed)
 
@@ -5545,11 +6157,18 @@ class SmartReportApp(QMainWindow):
             return
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO employees (name, salary_rate) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET salary_rate = ?
-        ''', (name, rate_val, rate_val))
-        conn.commit()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute('''
+                INSERT INTO employees (name, salary_rate) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET salary_rate = ?
+            ''', (name, rate_val, rate_val))
+            enqueue_employee_sync_event(cursor, name, "activate")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
         conn.close()
         self.new_emp_input.clear()
         self.new_emp_rate_input.clear()
@@ -5563,11 +6182,19 @@ class SmartReportApp(QMainWindow):
         emp_name = self.table_employees.item(selected, 0).text()
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM employees WHERE name = ?', (emp_name,))
-        conn.commit()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute('DELETE FROM employees WHERE name = ?', (emp_name,))
+            if cursor.rowcount:
+                enqueue_employee_sync_event(cursor, emp_name, "deactivate")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
         conn.close()
         self.load_dropdowns()
-        self.background_sync_with_cloud()
+        self.sync_with_cloud()
 
     def save_shift(self):
         date = self.date_input.text().strip()
@@ -5608,7 +6235,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
             return
         else:
-            cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ?", (comp, obj_name))
+            cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (comp, obj_name))
             object_row = cursor.fetchone()
             if object_row and (obj_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
                 conn.close()
@@ -5623,7 +6250,7 @@ class SmartReportApp(QMainWindow):
         elif rate_input_str:
             rate_val = parse_float(rate_input_str, -1)
         else:
-            cursor.execute("SELECT rate FROM objects WHERE name = ?", (obj_name,))
+            cursor.execute("SELECT rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj_name, comp))
             obj_row = cursor.fetchone()
             rate_val = obj_row[0] if obj_row and obj_row[0] else 0.0
 
@@ -5945,7 +6572,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
             return
         else:
-            check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ?", (company_field.currentText().strip(), object_name))
+            check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (company_field.currentText().strip(), object_name))
             object_row = check_cursor.fetchone()
             if object_row and (object_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
                 check_conn.close()
