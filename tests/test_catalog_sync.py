@@ -198,6 +198,7 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(result, {
             "conflicts": 0, "linked_legacy": 7, "unresolved_legacy": 0,
             "imported_employees": 0, "unresolved_employees": 0,
+            "conflict_details": "", "unresolved_legacy_details": "",
         })
         self.assertTrue(all(row[3] and row[4] and row[5] == 1 for row in rows))
         self.assertEqual(
@@ -268,6 +269,8 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(result, {
             "conflicts": 0, "linked_legacy": 1, "unresolved_legacy": 1,
             "imported_employees": 0, "unresolved_employees": 0,
+            "conflict_details": "",
+            "unresolved_legacy_details": "ненулевые локальные и серверные ставки различаются: 1",
         })
         desktop_conn = self.desktop.get_db_connection()
         local = desktop_conn.execute(
@@ -689,6 +692,29 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()
         conn.close()
         self.assertEqual(tuple(row), (20, 1, 1))
+
+    def test_catalog_revision_conflict_returns_specific_reason(self):
+        sync_id = str(uuid.uuid4())
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("""
+            INSERT INTO meta_objects (
+                sync_id, name, markning, company, rate, transport_rate, is_active, sync_version
+            ) VALUES (?, 'Stable Object', 'p-revision', 'Renatur', 100, 10, 1, 2)
+        """, (sync_id,))
+        server_conn.commit()
+        server_conn.close()
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute("""
+            INSERT INTO objects (
+                name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+            ) VALUES ('Stable Object', 'p-revision', 'Renatur', 100, 10, ?, 9001, 1, 3)
+        """, (sync_id,))
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        result = self._worker()
+        self.assertEqual(result["conflicts"], 1)
+        self.assertEqual(result["conflict_details"], "серверная revision ниже локальной: 1")
 
 
 if __name__ == "__main__":
