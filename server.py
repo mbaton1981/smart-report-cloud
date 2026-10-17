@@ -841,6 +841,7 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         return []
 
     normalized = []
+    allocation_vat_unknown = False
     for item in raw_allocations:
         if not isinstance(item, dict):
             raise ValueError("Некорректная строка распределения.")
@@ -866,7 +867,7 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             if len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"]):
                 vat_amount = Decimal(fields["vat_amount"])
             else:
-                raise ValueError("Укажите сумму НДС для каждой части; распределять её пропорционально нельзя.")
+                allocation_vat_unknown = True
         if vat_amount is not None and allocated_gross and (vat_amount > allocated_gross if allocated_gross > 0 else vat_amount < allocated_gross):
             raise ValueError("НДС части не может превышать её сумму с НДС.")
         normalized.append({
@@ -889,8 +890,10 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         allocated_vat = sum(known_allocation_vat, Decimal(0))
         if abs(allocated_vat) > abs(Decimal(total_vat)):
             raise ValueError("Распределённый НДС не может превышать НДС документа.")
-        if allocated_gross == total_gross and allocated_vat != Decimal(total_vat):
+        if allocated_gross == total_gross and not allocation_vat_unknown and allocated_vat != Decimal(total_vat):
             raise ValueError("При полном распределении суммы частей должны покрыть весь НДС документа.")
+    if allocation_vat_unknown and fields["verification_status"] == "confirmed":
+        fields["verification_status"] = "requires_review"
     return normalized
 
 
@@ -1030,6 +1033,20 @@ def expense_objects_api():
         return jsonify({"ok": True, "objects": [dict(row) for row in rows]})
     finally:
         conn.close()
+
+
+@app.route("/api/expense-documents/capabilities", methods=["GET"])
+def expense_document_capabilities_api():
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    return jsonify({
+        "ok": True,
+        "api_version": 2,
+        "features": [
+            "client_id", "soft_delete", "attachments",
+            "nullable_company_allocations", "versioned_updates",
+        ],
+    })
 
 
 @app.route("/api/expense-documents", methods=["GET"])
@@ -1499,11 +1516,17 @@ def expense_object_summary_api(object_id):
                 item for item in document["allocations"] if item["object_id"] == object_id
             ]
             object_gross = sum((parse_decimal(item["gross_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
-            object_net = None if document["net_amount"] is None else sum(
-                (parse_decimal(item["net_amount"]) or Decimal(0) for item in object_allocations), Decimal(0)
+            object_net_values = [parse_decimal(item["net_amount"]) for item in object_allocations]
+            object_vat_values = [parse_decimal(item["vat_amount"]) for item in object_allocations]
+            object_net = (
+                sum(object_net_values, Decimal(0))
+                if document["net_amount"] is not None and all(value is not None for value in object_net_values)
+                else None
             )
-            object_vat = None if document["vat_amount"] is None else sum(
-                (parse_decimal(item["vat_amount"]) or Decimal(0) for item in object_allocations), Decimal(0)
+            object_vat = (
+                sum(object_vat_values, Decimal(0))
+                if document["vat_amount"] is not None and all(value is not None for value in object_vat_values)
+                else None
             )
             document["object_gross"] = decimal_text(object_gross)
             document["object_net"] = decimal_text(object_net)

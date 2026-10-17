@@ -316,6 +316,39 @@ class CatalogSyncTests(unittest.TestCase):
             "stale local edit",
         )
 
+    def test_legacy_gross_only_split_is_preserved_for_manual_vat_review(self):
+        conn = self.server.get_db_connection()
+        object_ids = [conn.execute("""
+            INSERT INTO meta_objects (company,name,markning,rate,transport_rate,is_active)
+            VALUES ('Renatur', ?, ?, 0, 0, 1)
+        """, (name, marking)).lastrowid for name, marking in (
+            ("Legacy split A", "p-legacy-split-a"),
+            ("Legacy split B", "p-legacy-split-b"),
+        )]
+        conn.commit()
+        conn.close()
+        client_id = str(uuid.uuid4())
+        response = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            json={
+                "client_id": client_id, "supplier_name": "Old client supplier",
+                "document_date": "2026-10-17", "currency_code": "SEK",
+                "gross_amount": "125.00", "vat_amount": "25.00",
+                "verification_status": "confirmed",
+                "allocations": [
+                    {"object_id": object_ids[0], "gross_amount": "60.00"},
+                    {"object_id": object_ids[1], "gross_amount": "65.00"},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.get_json())
+        document = response.get_json()["document"]
+        self.assertEqual(document["verification_status"], "requires_review")
+        self.assertEqual(document["allocated_gross"], "125.00")
+        self.assertIsNone(document["allocated_vat"])
+        self.assertTrue(all(item["vat_amount"] is None for item in document["allocations"]))
+
     def test_expense_parser_keeps_document_vat_total_across_repeated_pages(self):
         parsed = self.desktop.parse_document_text("""
             Leverantör: Test Supplier
@@ -484,6 +517,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         with patch.object(self.server, "create_database_backup", return_value=None):
             self.server.init_cloud_db()
+            self.server.init_cloud_db()
 
         conn = self.server.get_db_connection()
         allocation_columns = {
@@ -499,6 +533,10 @@ class CatalogSyncTests(unittest.TestCase):
             "SELECT original_name,stored_name,file_sha256 FROM expense_document_attachments "
             "WHERE document_id=?", (document_id,)
         ).fetchone()), ("legacy.pdf", "legacy-stored.pdf", "a" * 64))
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM expense_document_attachments WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()[0], 1)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         conn.close()
 
@@ -692,6 +730,46 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()
         server_conn.close()
         self.assertEqual(tuple(document), (client_id, "50.00", None, None))
+
+    def test_expense_outbox_blocks_mutations_when_server_is_old(self):
+        client_id = str(uuid.uuid4())
+        attachment_path = Path(self._case.name) / "pending-on-old-server.pdf"
+        attachment_path.write_bytes(b"pending original")
+        harness = SimpleNamespace()
+        self.desktop.SmartReportApp.queue_expense_document_operation(
+            harness, client_id, "upsert", {
+                "client_id": client_id, "supplier_name": "Old server test",
+                "currency_code": "SEK", "gross_amount": "25.00",
+                "verification_status": "requires_review", "allocations": [],
+            }, attachment_paths=[attachment_path],
+        )
+        calls = []
+
+        class OldServerResponse:
+            status_code = 404
+
+            @staticmethod
+            def json():
+                return {"error": "capabilities route is missing"}
+
+        def old_server_request(method, _url, **_kwargs):
+            calls.append(method)
+            return OldServerResponse()
+
+        with patch.object(self.desktop.requests, "request", side_effect=old_server_request):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(calls, ["GET"])
+        self.assertTrue(attachment_path.is_file())
+        desktop_conn = self.desktop.get_db_connection()
+        pending = desktop_conn.execute(
+            "SELECT state,last_error FROM expense_document_outbox WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        desktop_conn.close()
+        self.assertEqual(pending["state"], "pending")
+        self.assertIn("старый", pending["last_error"])
 
     def test_expense_ui_has_one_section_with_two_views(self):
         class Response:

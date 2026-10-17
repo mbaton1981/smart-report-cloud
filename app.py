@@ -2373,6 +2373,40 @@ class SmartReportApp(QMainWindow):
             ORDER BY updated_at, client_id
         """).fetchall()
         conn.close()
+        if rows:
+            required_features = {
+                "client_id", "soft_delete", "attachments",
+                "nullable_company_allocations", "versioned_updates",
+            }
+            try:
+                capability_response = requests.request(
+                    "GET",
+                    f"{CLOUD_URL.rstrip('/')}/api/expense-documents/capabilities",
+                    headers={"X-Sync-Key": SYNC_API_KEY}, timeout=5,
+                )
+                capability_payload = capability_response.json()
+                supported = (
+                    capability_response.status_code == 200
+                    and capability_payload.get("ok") is True
+                    and int(capability_payload.get("api_version", 0)) >= 2
+                    and required_features.issubset(set(capability_payload.get("features", [])))
+                )
+                capability_error = "Сервер расходов старый: обновите сервер до API v2; локальная очередь сохранена."
+            except Exception as error:
+                supported = False
+                capability_error = f"Сервер расходов недоступен; локальная очередь сохранена: {error}"
+            if not supported:
+                error_conn = get_db_connection()
+                try:
+                    error_conn.execute("""
+                        UPDATE expense_document_outbox
+                        SET last_error = ?, updated_at = ?
+                        WHERE state = 'pending'
+                    """, (capability_error[:1000], datetime.now(timezone.utc).isoformat()))
+                    error_conn.commit()
+                finally:
+                    error_conn.close()
+                return {"synced": 0, "conflicts": 0, "blocked": len(rows)}
         synced = conflicts = 0
         for queued in rows:
             client_id = queued["client_id"]
