@@ -65,6 +65,12 @@ SHA релизного коммита и статус deployment — в разд
 - **Статус сессии 2:** коммит `bb71666` отправлен в `main`, Render показывает его Live. После deploy: `/api/auth/me` без токена — 401, `/api/admin/storage-status` без входа — 403, вход с неверным паролем — 401. Подтверждено в настройках сервиса: `DATABASE_PATH=/data/cloud_database.db`, `SMARTREPORT_DOCUMENTS_DIR=/data/documents` — оба на постоянном диске 1 ГБ. Вход с настоящим паролем и проверка `storage-status` на Render не выполнялись (пароль в модель не передавался).
 - **Завтра первым шагом:** на домашнем компьютере (или в новом профиле Windows) установить `installer\SmartReport-Setup-1.0.0.exe`, войти `admin` и паролем `ADMIN_PASSWORD` с Render, убедиться, что данные и вложения видны; затем выполнить `SmartReport.exe --backup <папка>` и открыть `manifest.json` (проблем быть не должно). После этого — проверка на чистой виртуальной машине Windows.
 
+## Итог дня и следующий шаг (конец сессии 2026-10-17)
+- **Сделано:** очистка `app.py`, вход по логину и паролю с проверкой на сервере, установщик `installer\SmartReport-Setup-1.0.0.exe` (найден, SHA-256 `F888B27C1AAFB5D25326B714C229E277F4F8EDB170AB4C437086F37AD8BEA872`), проверка хранилища и копия сервера; тесты 85/85; на Render развёрнут `bb71666`.
+- **Не подтверждено:** перенос установщика на домашний компьютер, установка, вход с настоящим паролем, резервное копирование командой `--backup`, чистая Windows. Ссылку OneDrive я создать не мог.
+- **Начать с:** 1) перенести установщик через OneDrive; 2) сверить SHA-256 (`Get-FileHash .\SmartReport-Setup-1.0.0.exe -Algorithm SHA256`); 3) установить на домашнем компьютере, войти, проверить данные и вложения; 4) выполнить `SmartReport.exe --backup <папка>` и открыть `manifest.json`.
+- **Состояние Git:** запись этого итога закоммичена локально и НЕ отправлена, потому что push в `main` автоматически запускает deployment на Render. Отправлять только по решению владельца. Рабочие данные и Render в конце сессии не менялись.
+
 ## Резервные копии (вне Git)
 - `C:\Users\mbato\AppData\Local\SmartReport\release_backups\20261017T180704Z\`: `sqlite\` (31 БД через Backup API, integrity ok, включая `smart_report.db` и `cloud_database.db`), `project_and_untracked.zip` (файлы вне Git, отчёты), `repository.bundle`, `pre_release.patch`, `session_helpers.zip`, `manifest.json` (хэши).
 - Указатель: `reports/release_backup_latest.json`. Копия содержит финансовые данные; не публиковать.
