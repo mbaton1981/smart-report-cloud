@@ -39,16 +39,9 @@ from ob_calculator import (
     round_time_to_half_hour,
 )
 from expense_documents import (
-    apply_expense_documents_migration,
-    decimal_text,
-    document_storage_root,
-    extract_local_document,
-    find_document_duplicates,
-    get_object_expense_summary,
-    match_objects,
-    parse_decimal,
-    parse_document_text,
-    store_original_file,
+    apply_expense_documents_migration, decimal_text, document_storage_root,
+    extract_local_document, find_document_duplicates, get_object_expense_summary,
+    match_objects, parse_decimal, parse_document_text, store_original_file,
     validate_allocations,
 )
 
@@ -1747,7 +1740,7 @@ class SmartReportApp(QMainWindow):
         self.tabs.addTab(self.tab_hours, "📝 Ввод часов")
         self.tabs.addTab(self.tab_salary, "💰 Зарплата")
         self.tabs.addTab(self.tab_balance, "⚖️ Баланс")
-        self.tabs.addTab(self.tab_expenses, "Фактуры и расходы по объектам")
+        self.tabs.addTab(self.tab_expenses, "🏢 Расходы и налоги")
         self.tabs.addTab(self.tab_object_expenses, "Материалы и расходы по объектам")
         self.tabs.addTab(self.tab_invoice, "📄 Счёт для бухгалтера")
         self.tabs.addTab(self.tab_dagbok, "📖 Журнал работ")
@@ -1791,11 +1784,9 @@ class SmartReportApp(QMainWindow):
         elif index == 3:
             self.load_expense_document_filters()
             self.load_expense_documents()
+            self.load_expenses_table()
         elif index == 4:
-            if self.object_expenses_object.count() == 0:
-                self.load_object_expense_objects()
-            else:
-                self.load_object_expense_overview()
+            self.load_object_expense_overview()
         elif index == 7:
             self.load_companies_table()
             self.load_objects_table()
@@ -3268,7 +3259,6 @@ class SmartReportApp(QMainWindow):
         self.bal_amount.clear()
         self.load_balance_table()
         return True
-
     def edit_balance_entry(self, balance_id=None, *_):
         if balance_id is None:
             selected = self.table_balance.currentRow()
@@ -3367,7 +3357,6 @@ class SmartReportApp(QMainWindow):
             edit_button = QPushButton("Изменить")
             edit_button.clicked.connect(lambda _checked=False, row_id=int(balance_id): self.edit_balance_entry(row_id))
             self.table_balance.setCellWidget(row_idx, 4, edit_button)
-
     def delete_balance_entry(self):
         selected = self.table_balance.currentRow()
         item = self.table_balance.item(selected, 0) if selected >= 0 else None
@@ -3417,6 +3406,11 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(self.exp_date_from)
         period_layout.addWidget(QLabel("по"))
         period_layout.addWidget(self.exp_date_to)
+        self.exp_period_basis = QComboBox()
+        self.exp_period_basis.addItem("Дата документа", "document_date")
+        self.exp_period_basis.addItem("Срок оплаты", "due_date")
+        period_layout.addWidget(QLabel("Фильтр по:"))
+        period_layout.addWidget(self.exp_period_basis)
         period_layout.addWidget(QLabel("Быстрый период:"))
         period_layout.addWidget(self.exp_period_preset)
         period_layout.addStretch()
@@ -3444,7 +3438,7 @@ class SmartReportApp(QMainWindow):
             ("exp_docs_net_lbl", "Подтверждено без НДС"),
             ("exp_docs_vat_lbl", "НДС в документах (не к вычету)"),
             ("exp_docs_gross_lbl", "Подтверждённый итог"),
-            ("exp_docs_unallocated_lbl", "Не распределено"),
+            ("exp_docs_unpaid_lbl", "Известный неоплаченный остаток"),
             ("exp_docs_review_lbl", "Требуют проверки"),
         ):
             card = QFrame()
@@ -3460,8 +3454,8 @@ class SmartReportApp(QMainWindow):
             document_summary.addWidget(card, 1)
         document_layout.addLayout(document_summary)
         document_note = QLabel(
-            "Оригинал хранится один раз на документ. Распределённые суммы по объектам не могут превышать итог фактуры; "
-            "остаток остаётся нераспределённым. Старые локальные документы не переносятся автоматически."
+            "Черновики не входят в подтверждённые итоги. Валюты не суммируются между собой. "
+            "НДС из документа не означает право на вычет; это не налоговая декларация."
         )
         document_note.setWordWrap(True)
         document_layout.addWidget(document_note)
@@ -3470,7 +3464,6 @@ class SmartReportApp(QMainWindow):
         self.exp_docs_warning_lbl.setStyleSheet("background: #4a3b18; color: #f6e05e; padding: 8px; border-radius: 4px;")
         self.exp_docs_warning_lbl.hide()
         document_layout.addWidget(self.exp_docs_warning_lbl)
-
         document_actions = QHBoxLayout()
         upload_button = QPushButton("Загрузить документ")
         upload_button.clicked.connect(self.upload_expense_document)
@@ -3480,37 +3473,113 @@ class SmartReportApp(QMainWindow):
         check_document_button.clicked.connect(self.review_selected_document)
         open_document_button = QPushButton("Открыть оригинал")
         open_document_button.clicked.connect(self.open_selected_document_original)
-        for button in (upload_button, manual_document_button, check_document_button, open_document_button):
+        payment_button = QPushButton("Отметить оплату")
+        payment_button.clicked.connect(self.record_selected_document_payment)
+        for button in (upload_button, manual_document_button, check_document_button, open_document_button, payment_button):
             document_actions.addWidget(button)
         document_layout.addLayout(document_actions)
-        source_note = QLabel("Документы загружаются вручную; распознавание на desktop помогает заполнить поля, которые можно исправить перед сохранением.")
+        source_note = QLabel(
+            "E-post и Kivra не подключены: официальная авторизация отсутствует. "
+            "Скачанный оттуда PDF/скан можно загрузить вручную; распознавание выполняется локально."
+        )
         source_note.setWordWrap(True)
         document_layout.addWidget(source_note)
-        self.exp_api_status_lbl = QLabel("")
-        self.exp_api_status_lbl.setWordWrap(True)
-        document_layout.addWidget(self.exp_api_status_lbl)
 
         self.table_supplier_documents = QTableWidget()
-        self.table_supplier_documents.setColumnCount(10)
+        self.table_supplier_documents.setColumnCount(11)
         self.table_supplier_documents.setHorizontalHeaderLabels([
             "ID", "Fakturadatum", "Поставщик", "Номер документа", "Объект",
-            "Netto", "Moms", "Итого", "Не распределено", "Проверка",
+            "Netto", "Moms", "Итого", "Förfallodatum", "Проверка", "Оплата",
         ])
         self.table_supplier_documents.setColumnHidden(0, True)
         doc_header = self.table_supplier_documents.horizontalHeader()
         doc_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for column, width in {1: 105, 2: 170, 3: 140, 4: 170, 5: 100, 6: 95, 7: 100, 8: 125, 9: 145}.items():
+        for column, width in {1: 105, 2: 170, 3: 140, 4: 170, 5: 100, 6: 95, 7: 100, 8: 110, 9: 145, 10: 125}.items():
             doc_header.resizeSection(column, width)
         doc_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table_supplier_documents.setAlternatingRowColors(True)
         self.table_supplier_documents.cellDoubleClicked.connect(self.review_selected_document)
         document_layout.addWidget(self.table_supplier_documents, 1)
-        self.exp_document_tabs.addTab(self.exp_documents_page, "Архив фактур")
+        self.exp_document_tabs.addTab(self.exp_documents_page, "Leverantörsfakturor & Kvitton")
+
+        self.exp_legacy_page = QWidget()
+        legacy_layout = QVBoxLayout(self.exp_legacy_page)
+        legacy_note = QLabel(
+            "Это отдельный старый журнал ручных расходов и условных payroll-оценок. "
+            "Он не складывается со счетами и чеками выше. Ставки и формулы не подтверждены как обязательства; OB исключён."
+        )
+        legacy_note.setWordWrap(True)
+        legacy_layout.addWidget(legacy_note)
+        legacy_summary = QHBoxLayout()
+        for attribute, title in (
+            ("exp_summary_expenses_lbl", "Старые ручные расходы"),
+            ("exp_summary_fora_lbl", "Оценка FORA"),
+            ("exp_summary_employer_lbl", "Оценка работодателя"),
+            ("exp_summary_review_lbl", "Требуют проверки"),
+        ):
+            card = QFrame()
+            card.setObjectName("card")
+            card_layout = QVBoxLayout(card)
+            card_layout.addWidget(QLabel(title))
+            value = QLabel("0.00 SEK")
+            setattr(self, attribute, value)
+            card_layout.addWidget(value)
+            legacy_summary.addWidget(card, 1)
+        legacy_layout.addLayout(legacy_summary)
+        self.exp_warning_lbl = QLabel("")
+        self.exp_warning_lbl.setWordWrap(True)
+        self.exp_warning_lbl.hide()
+        legacy_layout.addWidget(self.exp_warning_lbl)
+        legacy_actions = QHBoxLayout()
+        add_exp_btn = QPushButton("Добавить расход")
+        add_exp_btn.clicked.connect(self.open_add_expense_dialog)
+        auto_calc_btn = QPushButton("Предварительно рассчитать payroll-оценку")
+        auto_calc_btn.clicked.connect(self.auto_calculate_taxes_and_fora)
+        legacy_actions.addWidget(add_exp_btn)
+        legacy_actions.addWidget(auto_calc_btn)
+        legacy_actions.addStretch()
+        legacy_layout.addLayout(legacy_actions)
+        self.exp_filter_category = QComboBox()
+        self.exp_filter_category.addItem("Все категории")
+        self.exp_filter_category.currentIndexChanged.connect(self.apply_expense_journal_filters)
+        self.exp_filter_search = QLineEdit()
+        self.exp_filter_search.setPlaceholderText("Поиск по описанию или категории")
+        self.exp_filter_search.textChanged.connect(self.apply_expense_journal_filters)
+        legacy_filters = QHBoxLayout()
+        legacy_filters.addWidget(self.exp_filter_category)
+        legacy_filters.addWidget(self.exp_filter_search, 1)
+        legacy_layout.addLayout(legacy_filters)
+        self.table_expenses = QTableWidget()
+        self.table_expenses.setColumnCount(6)
+        self.table_expenses.setHorizontalHeaderLabels(["ID", "Дата", "Категория", "Описание", "Сумма (SEK)", "Статус"])
+        self.table_expenses.setColumnHidden(0, True)
+        self.table_expenses.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table_expenses.cellDoubleClicked.connect(self.show_expense_details)
+        legacy_layout.addWidget(self.table_expenses, 1)
+        legacy_actions = QHBoxLayout()
+        details_button = QPushButton("Подробности")
+        details_button.clicked.connect(self.show_expense_details)
+        edit_button = QPushButton("Изменить по ID")
+        edit_button.clicked.connect(self.edit_company_expense)
+        delete_button = QPushButton("Удалить по ID")
+        delete_button.setObjectName("danger")
+        delete_button.clicked.connect(self.delete_company_expense)
+        for button in (details_button, edit_button, delete_button):
+            legacy_actions.addWidget(button)
+        legacy_layout.addLayout(legacy_actions)
+        self.exp_document_tabs.addTab(self.exp_legacy_page, "Ручные расходы и payroll-оценки")
         layout.addWidget(self.exp_document_tabs, 1)
 
         self.exp_date_from.dateChanged.connect(self.on_expense_date_changed)
         self.exp_date_to.dateChanged.connect(self.on_expense_date_changed)
         self.exp_period_preset.currentIndexChanged.connect(self.apply_expense_period_preset)
+        self.exp_period_basis.currentIndexChanged.connect(self.load_expense_documents)
+        self.exp_filter_object.currentIndexChanged.connect(self.load_expense_documents)
+        self.exp_filter_supplier.currentIndexChanged.connect(self.load_expense_documents)
+        self.exp_document_tabs.currentChanged.connect(lambda _: (self.load_expense_documents(), self.load_expenses_table()))
+        self.load_expense_document_filters()
+        self.load_expense_documents()
+        self.load_expenses_table()
         self.exp_filter_object.currentIndexChanged.connect(self.load_expense_documents)
         self.exp_filter_supplier.currentIndexChanged.connect(self.load_expense_documents)
 
@@ -3522,7 +3591,7 @@ class SmartReportApp(QMainWindow):
             for currency, amount in sorted(totals.items())
         )
 
-    def load_expense_document_filters(self, *_):
+    def _api_load_expense_document_filters(self, *_):
         object_selected = self.exp_filter_object.currentData() if hasattr(self, "exp_filter_object") else None
         supplier_selected = self.exp_filter_supplier.currentData() if hasattr(self, "exp_filter_supplier") else None
         try:
@@ -3560,7 +3629,7 @@ class SmartReportApp(QMainWindow):
         self.exp_filter_supplier.setCurrentIndex(max(0, supplier_index))
         self.exp_filter_supplier.blockSignals(False)
 
-    def load_expense_documents(self, *_):
+    def _api_load_expense_documents(self, *_):
         if not hasattr(self, "table_supplier_documents"):
             return
         date_from = self.exp_date_from.text().strip()
@@ -3645,7 +3714,7 @@ class SmartReportApp(QMainWindow):
         self._expense_objects = result["objects"]
         return self._expense_objects
 
-    def upload_expense_document(self, *_):
+    def _api_upload_expense_document(self, *_):
         path, _ = QFileDialog.getOpenFileName(
             self, "Загрузить счёт или чек", "",
             "Документы (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
@@ -3666,7 +3735,7 @@ class SmartReportApp(QMainWindow):
         if extraction.confidence is not None and extraction.confidence < 0.65:
             fields["review_reasons"].append("низкая уверенность OCR; проверьте все поля")
         suggestions = match_objects(extraction.text, self._expense_object_candidates())
-        self._expense_document_review_dialog(None, path, fields, suggestions, None)
+        self._api_expense_document_review_dialog(None, path, fields, suggestions, None)
 
     def open_manual_document_dialog(self, *_):
         if self.exp_date_from.date() > self.exp_date_to.date():
@@ -3680,7 +3749,7 @@ class SmartReportApp(QMainWindow):
             "document_comment": "", "recognized_text": "",
             "review_reasons": ["добавлено без оригинала; заполните данные документа"],
         }
-        self._expense_document_review_dialog(None, None, fields, [], None)
+        self._api_expense_document_review_dialog(None, None, fields, [], None)
 
     def review_selected_document(self, *_):
         row = self.table_supplier_documents.currentRow()
@@ -3701,7 +3770,7 @@ class SmartReportApp(QMainWindow):
             fields["document_type"] = "transfer_receipt"
             fields["suggested_verification_status"] = "requires_review"
         suggestions = match_objects(fields["raw_text"], self._expense_object_candidates())
-        self._expense_document_review_dialog(
+        self._api_expense_document_review_dialog(
             document_id, source_path, fields, suggestions, fields["allocations"]
         )
 
@@ -3722,7 +3791,7 @@ class SmartReportApp(QMainWindow):
             shutil.copyfileobj(response.raw, destination)
         return str(path)
 
-    def _expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
+    def _api_expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
         dialog = QDialog(self)
         dialog.setWindowTitle("Фактура и распределение" if document_id is None else f"Фактура #{document_id}")
         dialog.resize(1120, 760)
@@ -4400,7 +4469,7 @@ class SmartReportApp(QMainWindow):
                         status, allow_duplicate,
                     )
                 else:
-                    saved_id = self._update_supplier_document_record(
+                    saved_id = self._api_update_supplier_document_record(
                         conn, document_id, source_path, values, allocation_rows, status, allow_duplicate
                     )
                 conn.close()
@@ -4410,8 +4479,8 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(dialog, "Документ не сохранён", str(error))
                 return
             dialog.accept()
-            self.load_expense_document_filters()
-            self.load_expense_documents()
+            self._api_load_expense_document_filters()
+            self._api_load_expense_documents()
             QMessageBox.information(self, "Документ", f"Запись #{saved_id} сохранена со статусом: {status}.")
 
         save_draft.clicked.connect(lambda: save_document("draft"))
@@ -4420,7 +4489,7 @@ class SmartReportApp(QMainWindow):
         cancel.clicked.connect(dialog.reject)
         dialog.exec()
 
-    def _update_supplier_document_record(self, conn, document_id, source_path, fields, allocations, status, allow_duplicate):
+    def _api_update_supplier_document_record(self, conn, document_id, source_path, fields, allocations, status, allow_duplicate):
         existing = conn.execute(
             "SELECT stored_path, file_sha256 FROM supplier_documents WHERE id = ?", (int(document_id),)
         ).fetchone()
@@ -5130,6 +5199,192 @@ class SmartReportApp(QMainWindow):
             self.load_expenses_table()
             self.background_sync_with_cloud()
 
+    def edit_balance_entry(self, balance_id=None, *_):
+        if balance_id is None:
+            selected = self.table_balance.currentRow()
+            item = self.table_balance.item(selected, 0) if selected >= 0 else None
+            balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if balance_id is None:
+            QMessageBox.information(self, "Баланс", "Выберите операцию для изменения.")
+            return
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT id, date, employee, description, change_amount FROM balance WHERE id = ?",
+            (int(balance_id),),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
+            self.load_balance_table()
+            return
+        self._editing_balance_id = int(row["id"])
+        self.bal_date.setText(str(row["date"]))
+        self.bal_emp_cb.setCurrentText(str(row["employee"]))
+        self.bal_desc.setText(str(row["description"]))
+        self.bal_amount.setText(str(row["change_amount"]))
+        self.add_balance_button.setText("Сохранить изменения")
+
+    def update_balance_entry(self, balance_id=None, date=None, employee=None, description=None, amount=None):
+        balance_id = int(balance_id or self.__dict__.get("_editing_balance_id", 0) or 0)
+        if not balance_id:
+            QMessageBox.warning(self, "Баланс", "Сначала выберите операцию для изменения.")
+            return False
+        date = self.bal_date.text().strip() if date is None else str(date)
+        employee = self.bal_emp_cb.currentText().strip() if employee is None else str(employee).strip()
+        description = self.bal_desc.text().strip() if description is None else str(description).strip()
+        amount = parse_float(self.bal_amount.text(), None) if amount is None else parse_float(amount, None)
+        if amount is None or not employee:
+            QMessageBox.warning(self, "Баланс", "Введите сотрудника/контакт и корректную сумму.")
+            return False
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "UPDATE balance SET date = ?, employee = ?, description = ?, change_amount = ? WHERE id = ?",
+            (date, employee, description, amount, balance_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount == 1
+        conn.close()
+        if not updated:
+            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
+            self.cancel_balance_edit()
+            self.load_balance_table()
+            return False
+        self.cancel_balance_edit()
+        self.load_balance_table()
+        QMessageBox.information(self, "Баланс", f"Операция #{balance_id} обновлена.")
+        return True
+
+    def cancel_balance_edit(self):
+        self.__dict__["_editing_balance_id"] = None
+        self.bal_date.setDate(QDate.currentDate())
+        self.bal_emp_cb.setCurrentText("")
+        self.bal_desc.clear()
+        self.bal_amount.clear()
+        self.add_balance_button.setText("Добавить операцию")
+
+    def delete_balance_entry(self):
+        selected = self.table_balance.currentRow()
+        item = self.table_balance.item(selected, 0) if selected >= 0 else None
+        balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if balance_id is None:
+            QMessageBox.information(self, "Баланс", "Выберите операцию для удаления.")
+            return False
+        confirmation = QMessageBox.question(
+            self, "Удаление операции",
+            f"Удалить операцию #{balance_id}?\nДата: {item.text()}\n"
+            f"Сотрудник/контакт: {self.table_balance.item(selected, 1).text()}\n"
+            f"Сумма: {self.table_balance.item(selected, 3).text()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return False
+        conn = get_db_connection()
+        cursor = conn.execute("DELETE FROM balance WHERE id = ?", (int(balance_id),))
+        conn.commit()
+        deleted = cursor.rowcount == 1
+        conn.close()
+        if deleted:
+            self.load_balance_table()
+        return deleted
+
+    def edit_company_expense(self, *_):
+        selected = self.table_expenses.currentRow()
+        id_item = self.table_expenses.item(selected, 0) if selected >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Расход", "Выберите запись в журнале.")
+            return
+        expense_id = int(id_item.text())
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT id, date, category, description, amount FROM company_expenses WHERE id = ?",
+            (expense_id,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            QMessageBox.warning(self, "Расход", "Запись уже отсутствует. Обновите журнал.")
+            self.load_expenses_table()
+            return
+
+        old_description = str(row["description"] or "")
+        is_calculation = old_description.startswith("Авторасчет")
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Изменить запись #{expense_id}")
+        dialog.setMinimumWidth(480)
+        form = QFormLayout(dialog)
+        expense_date = create_date_field(str(row["date"]))
+        category = QComboBox()
+        category.setEditable(True)
+        category.addItems([
+            "Инструменты и расходники", "Аренда склада / офиса",
+            "Лизинг и топливо транспорта (Ford Transit)",
+            "Бухгалтерия и страховка", "Прочие накладные расходы",
+            str(row["category"]),
+        ])
+        category.setCurrentText(str(row["category"]))
+        description = QLineEdit(old_description)
+        amount = QLineEdit(str(row["amount"]))
+        amount.setPlaceholderText("Сумма в SEK")
+        if is_calculation:
+            category.setEnabled(False)
+            description.setReadOnly(True)
+            note = QLabel(
+                "У расчётной записи можно исправить дату/сумму. Категория и основание сохранены "
+                "для аудита и защиты от повторного расчёта. Ставки не подтверждают налоговое обязательство."
+            )
+            note.setWordWrap(True)
+            form.addRow(note)
+        else:
+            expense_date.setMinimumDate(self.exp_date_from.date())
+            expense_date.setMaximumDate(self.exp_date_to.date())
+        form.addRow("Дата:", expense_date)
+        form.addRow("Категория:", category)
+        form.addRow("Комментарий / основание:", description)
+        form.addRow("Сумма (SEK):", amount)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить изменения")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updated_amount = parse_float(amount.text(), None)
+        if updated_amount is None or updated_amount < 0:
+            QMessageBox.warning(self, "Расход", "Введите корректную неотрицательную сумму в SEK.")
+            return
+        if is_calculation:
+            updated_category = str(row["category"])
+            updated_description = old_description
+        else:
+            updated_category = category.currentText().strip()
+            updated_description = description.text().strip()
+        self.update_company_expense(
+            expense_id, expense_date.text(), updated_category, updated_description, updated_amount
+        )
+
+    def update_company_expense(self, expense_id, expense_date, category, description, amount):
+        if not str(description).startswith("Авторасчет"):
+            if not self.exp_date_from.date() <= create_date_field(expense_date).date() <= self.exp_date_to.date():
+                QMessageBox.warning(self, "Расход", "Дата ручного расхода должна входить в выбранный период.")
+                return False
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "UPDATE company_expenses SET date = ?, category = ?, description = ?, amount = ? WHERE id = ?",
+            (expense_date, category, description, amount, int(expense_id)),
+        )
+        conn.commit()
+        updated = cursor.rowcount == 1
+        conn.close()
+        if not updated:
+            QMessageBox.warning(self, "Расход", "Запись не найдена. Обновите журнал.")
+            return False
+        self.load_expenses_table()
+        self.background_sync_with_cloud()
+        return True
+
     def setup_object_expenses_tab(self):
         layout = QVBoxLayout(self.tab_object_expenses)
         selection = QHBoxLayout()
@@ -5162,28 +5417,32 @@ class SmartReportApp(QMainWindow):
         self.object_expenses_period_frame.setVisible(False)
         layout.addWidget(self.object_expenses_period_frame)
 
-        note = QLabel("Здесь показана только доля объекта из подтверждённых фактур. Двойной щелчок по строке открывает документ-основание.")
+        note = QLabel(
+            "Суммы показаны раздельно по валюте. Подтверждённые расходы берутся из счетов/чеков и allocation объекта; "
+            "материалы определяются только категорией расхода. Остаток рассчитан по зарегистрированным платежам "
+            "и не утверждает, что неизвестная оплата не производилась. Черновики не входят в подтверждённые суммы."
+        )
         note.setWordWrap(True)
         layout.addWidget(note)
         self.object_expenses_table = QTableWidget()
-        self.object_expenses_table.setColumnCount(11)
+        self.object_expenses_table.setColumnCount(12)
         self.object_expenses_table.setHorizontalHeaderLabels([
-            "ID", "Дата", "Поставщик", "Номер", "Категория", "Доля без НДС", "Доля НДС",
-            "Доля с НДС", "Итог фактуры", "Не распределено", "Статус",
+            "ID", "Fakturadatum", "Поставщик", "Номер", "Категория", "Netto", "Moms",
+            "Доля итоговой суммы", "Оплачено по записям", "Остаток по записям", "Проверка", "Оплата",
         ])
         self.object_expenses_table.setColumnHidden(0, True)
         header = self.object_expenses_table.horizontalHeader()
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        for column, width in {1: 105, 2: 165, 3: 125, 5: 120, 6: 100, 7: 120, 8: 120, 9: 125, 10: 140}.items():
+        for column, width in {1: 105, 2: 165, 3: 125, 5: 110, 6: 100, 7: 125, 8: 130, 9: 145, 10: 130, 11: 140}.items():
             header.resizeSection(column, width)
         self.object_expenses_table.setAlternatingRowColors(True)
-        self.object_expenses_table.cellDoubleClicked.connect(self.open_object_expense_document)
         layout.addWidget(self.object_expenses_table, 1)
 
         self.object_expenses_object.currentIndexChanged.connect(self.load_object_expense_overview)
         self.object_expenses_period_enabled.toggled.connect(self._set_object_expenses_period_enabled)
         self.object_expenses_date_from.dateChanged.connect(self.load_object_expense_overview)
         self.object_expenses_date_to.dateChanged.connect(self.load_object_expense_overview)
+        self.load_object_expense_objects()
 
     def _create_object_summary_frame(self, heading):
         frame = QFrame()
@@ -5193,9 +5452,9 @@ class SmartReportApp(QMainWindow):
         row = QHBoxLayout()
         labels = {}
         for key, title in (
-            ("gross", "Расход с НДС"),
-            ("net", "Расход без НДС"),
-            ("vat", "НДС по документам"),
+            ("gross", "Подтверждено с НДС"),
+            ("paid", "Оплачено по записям"),
+            ("remaining", "Остаток по записям"),
             ("materials", "Материалы"),
             ("other", "Прочие расходы"),
             ("drafts", "Черновики"),
@@ -5219,21 +5478,15 @@ class SmartReportApp(QMainWindow):
 
     def load_object_expense_objects(self, *_):
         selected_id = self.object_expenses_object.currentData()
-        try:
-            objects = request_expense_api("GET", "/api/expense-objects")["objects"]
-            self._expense_objects = objects
-        except Exception as error:
-            self.object_expenses_selected_label.setText(f"Не удалось загрузить объекты общего реестра: {error}")
-            self.object_expenses_table.setRowCount(0)
-            return
+        conn = get_db_connection()
+        objects = conn.execute("SELECT id, name, markning FROM objects ORDER BY name").fetchall()
+        conn.close()
         self.object_expenses_object.blockSignals(True)
         self.object_expenses_object.clear()
         for row in objects:
             label = str(row["name"])
-            if row.get("markning"):
+            if row["markning"]:
                 label += f" ({row['markning']})"
-            if row.get("company"):
-                label += f" · {row['company']}"
             self.object_expenses_object.addItem(label, int(row["id"]))
         if selected_id is not None:
             selected_index = self.object_expenses_object.findData(selected_id)
@@ -5254,7 +5507,7 @@ class SmartReportApp(QMainWindow):
                 entries.append(f"{currency} {amount:,.2f}")
         return " · ".join(entries) if entries else "0.00"
 
-    def _legacy_load_object_expense_overview(self, *_):
+    def load_object_expense_overview(self, *_):
         if not hasattr(self, "object_expenses_table"):
             return
         object_id = self.object_expenses_object.currentData()
@@ -5380,7 +5633,809 @@ class SmartReportApp(QMainWindow):
             for column, value in enumerate(values):
                 self.object_expenses_table.setItem(row_index, column, QTableWidgetItem(str(value)))
 
-    def load_object_expense_overview(self, *_):
+    def _format_currency_totals(self, totals):
+        if not totals:
+            return "0.00"
+        return " | ".join(
+            f"{currency} {amount:,.2f}"
+            for currency, amount in sorted(totals.items())
+        )
+
+    def load_expense_document_filters(self, *_):
+        object_selected = self.exp_filter_object.currentData() if hasattr(self, "exp_filter_object") else None
+        supplier_selected = self.exp_filter_supplier.currentData() if hasattr(self, "exp_filter_supplier") else None
+        conn = get_db_connection()
+        objects = conn.execute("SELECT id, name, markning FROM objects ORDER BY name").fetchall()
+        suppliers = conn.execute("SELECT id, name FROM expense_suppliers ORDER BY name COLLATE NOCASE").fetchall()
+        conn.close()
+
+        self.exp_filter_object.blockSignals(True)
+        self.exp_filter_object.clear()
+        self.exp_filter_object.addItem("Все объекты", None)
+        for row in objects:
+            label = str(row["name"])
+            if row["markning"]:
+                label += f" ({row['markning']})"
+            self.exp_filter_object.addItem(label, int(row["id"]))
+        object_index = self.exp_filter_object.findData(object_selected)
+        self.exp_filter_object.setCurrentIndex(max(0, object_index))
+        self.exp_filter_object.blockSignals(False)
+
+        self.exp_filter_supplier.blockSignals(True)
+        self.exp_filter_supplier.clear()
+        self.exp_filter_supplier.addItem("Все поставщики", None)
+        for row in suppliers:
+            self.exp_filter_supplier.addItem(str(row["name"]), int(row["id"]))
+        supplier_index = self.exp_filter_supplier.findData(supplier_selected)
+        self.exp_filter_supplier.setCurrentIndex(max(0, supplier_index))
+        self.exp_filter_supplier.blockSignals(False)
+
+    def load_expense_documents(self, *_):
+        if not hasattr(self, "table_supplier_documents"):
+            return
+        date_from = self.exp_date_from.text().strip()
+        date_to = self.exp_date_to.text().strip()
+        basis = self.exp_period_basis.currentData()
+        basis_label = "дату документа" if basis == "document_date" else "срок оплаты"
+        self.exp_period_label.setText(
+            f"Документы за {date_from} — {date_to}; фильтр по {basis_label}"
+        )
+        if date_from > date_to:
+            for label in (self.exp_docs_net_lbl, self.exp_docs_vat_lbl, self.exp_docs_gross_lbl, self.exp_docs_unpaid_lbl):
+                label.setText("0.00")
+            self.exp_docs_review_lbl.setText("0")
+            self.table_supplier_documents.setRowCount(0)
+            return
+
+        filters = [f"d.{basis} >= ?", f"d.{basis} <= ?"]
+        params: list[Any] = [date_from, date_to]
+        object_id = self.exp_filter_object.currentData()
+        supplier_id = self.exp_filter_supplier.currentData()
+        if object_id is not None:
+            filters.append("EXISTS (SELECT 1 FROM supplier_document_allocations a WHERE a.document_id = d.id AND a.object_id = ?)")
+            params.append(int(object_id))
+        if supplier_id is not None:
+            filters.append("d.supplier_id = ?")
+            params.append(int(supplier_id))
+
+        conn = get_db_connection()
+        rows = conn.execute(f"""
+            SELECT d.*, COALESCE(s.name, d.supplier_name, '') AS display_supplier
+            FROM supplier_documents d
+            LEFT JOIN expense_suppliers s ON s.id = d.supplier_id
+            WHERE {' AND '.join(filters)}
+            ORDER BY d.{basis} DESC, d.id DESC
+        """, params).fetchall()
+        objects_by_document = {}
+        for row in rows:
+            objects_by_document[row["id"]] = conn.execute("""
+                SELECT DISTINCT o.name
+                FROM supplier_document_allocations a
+                JOIN objects o ON o.id = a.object_id
+                WHERE a.document_id = ? ORDER BY o.name
+            """, (row["id"],)).fetchall()
+        payments_by_document: dict[int, Decimal] = {}
+        for payment in conn.execute("SELECT document_id, amount FROM supplier_document_payments").fetchall():
+            document_id = int(payment["document_id"])
+            payments_by_document[document_id] = payments_by_document.get(document_id, Decimal(0)) + (
+                parse_decimal(payment["amount"]) or Decimal(0)
+            )
+        undated = conn.execute(
+            f"SELECT COUNT(*) FROM supplier_documents d WHERE d.{basis} IS NULL"
+        ).fetchone()[0]
+        conn.close()
+
+        net_totals: dict[str, Decimal] = {}
+        vat_totals: dict[str, Decimal] = {}
+        gross_totals: dict[str, Decimal] = {}
+        unpaid_totals: dict[str, Decimal] = {}
+        review_count = 0
+        for row in rows:
+            currency = str(row["currency_code"] or "UNKNOWN")
+            if row["verification_status"] != "confirmed":
+                review_count += 1
+                continue
+            for field, totals in (("net_amount", net_totals), ("vat_amount", vat_totals), ("gross_amount", gross_totals)):
+                amount = parse_decimal(row[field])
+                if amount is not None:
+                    totals[currency] = totals.get(currency, Decimal(0)) + amount
+            if row["payment_status"] in ("unpaid", "partially_paid"):
+                due = parse_decimal(row["amount_due"]) or parse_decimal(row["gross_amount"])
+                paid = payments_by_document.get(int(row["id"]), Decimal(0))
+                outstanding = max(Decimal(0), (due or Decimal(0)) - paid)
+                unpaid_totals[currency] = unpaid_totals.get(currency, Decimal(0)) + outstanding
+
+        self.exp_docs_net_lbl.setText(self._format_currency_totals(net_totals))
+        self.exp_docs_vat_lbl.setText(self._format_currency_totals(vat_totals))
+        self.exp_docs_gross_lbl.setText(self._format_currency_totals(gross_totals))
+        self.exp_docs_unpaid_lbl.setText(self._format_currency_totals(unpaid_totals))
+        self.exp_docs_review_lbl.setText(str(review_count))
+
+        self.table_supplier_documents.setRowCount(len(rows))
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        verification_labels = {
+            "draft": "Черновик", "requires_review": "Требует проверки", "confirmed": "Подтверждён",
+        }
+        payment_labels = {
+            "unknown": "Неизвестно", "unpaid": "Не оплачен",
+            "partially_paid": "Частично оплачен", "paid": "Оплачен",
+        }
+        for row_index, row in enumerate(rows):
+            object_names = [str(item[0]) for item in objects_by_document[row["id"]]]
+            object_label = ", ".join(object_names) if object_names else "Без объекта"
+            payment_label = payment_labels.get(str(row["payment_status"]), str(row["payment_status"]))
+            overdue = bool(row["due_date"] and row["due_date"] < today and row["payment_status"] in ("unpaid", "partially_paid"))
+            if overdue:
+                payment_label = f"Просрочен: {payment_label.casefold()}"
+            values = (
+                row["id"], row["document_date"] or "—", row["display_supplier"] or "Не указан",
+                row["invoice_number"] or "—", object_label,
+                f"{row['net_amount']} {row['currency_code']}" if row["net_amount"] else "—",
+                f"{row['vat_amount']} {row['currency_code']}" if row["vat_amount"] else "—",
+                f"{row['gross_amount']} {row['currency_code']}" if row["gross_amount"] else "—",
+                row["due_date"] or "—", verification_labels.get(str(row["verification_status"]), str(row["verification_status"])), payment_label,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column in (2, 3, 4, 9, 10):
+                    item.setToolTip(str(value))
+                self.table_supplier_documents.setItem(row_index, column, item)
+            if overdue:
+                for column in range(self.table_supplier_documents.columnCount()):
+                    self.table_supplier_documents.item(row_index, column).setForeground(QColor("#fc8181"))
+
+        if undated:
+            self.exp_docs_warning_lbl.setText(
+                f"{undated} документ(ов) без даты {basis_label} не включено в выбранный период. "
+                "Откройте карточку и заполните дату."
+            )
+            self.exp_docs_warning_lbl.show()
+        else:
+            self.exp_docs_warning_lbl.clear()
+            self.exp_docs_warning_lbl.hide()
+
+    def _expense_object_candidates(self):
+        conn = get_db_connection()
+        objects = conn.execute("SELECT id, name, markning, company FROM objects ORDER BY name").fetchall()
+        candidates = []
+        for row in objects:
+            aliases = conn.execute(
+                "SELECT alias FROM expense_object_aliases WHERE object_id = ? ORDER BY alias",
+                (row["id"],),
+            ).fetchall()
+            candidates.append({
+                "id": int(row["id"]), "name": str(row["name"]),
+                "markning": str(row["markning"] or ""), "company": str(row["company"] or ""),
+                "aliases": [str(alias[0]) for alias in aliases],
+            })
+        conn.close()
+        return candidates
+
+    def upload_expense_document(self, *_):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Загрузить счёт или чек", "",
+            "Документы (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not path:
+            return
+        try:
+            extraction = extract_local_document(path)
+            fields = parse_document_text(extraction.text)
+        except Exception as error:
+            QMessageBox.warning(self, "Документ не прочитан", str(error))
+            return
+        fields["raw_text"] = extraction.text
+        fields["expense_category"] = "Прочие накладные расходы"
+        fields["ocr_method"] = extraction.method
+        fields["ocr_confidence"] = extraction.confidence
+        if extraction.confidence is not None and extraction.confidence < 0.65:
+            fields["review_reasons"].append("низкая уверенность OCR; проверьте все поля")
+        suggestions = match_objects(extraction.text, self._expense_object_candidates())
+        self._expense_document_review_dialog(None, path, fields, suggestions, None)
+
+    def open_manual_document_dialog(self, *_):
+        if self.exp_date_from.date() > self.exp_date_to.date():
+            QMessageBox.warning(self, "Расход", "Сначала выберите корректный период.")
+            return
+        fields = {
+            "supplier_name": None, "supplier_org_number": None, "supplier_vat_number": None,
+            "document_type": "manual", "document_date": QDate.currentDate().toString("yyyy-MM-dd"),
+            "due_date": None, "invoice_number": None, "payment_reference": None,
+            "currency_code": "UNKNOWN", "net_amount": None, "vat_amount": None,
+            "gross_amount": None, "amount_due": None,
+            "expense_category": "Прочие накладные расходы", "document_comment": "", "reverse_charge": False,
+            "vat_lines": [], "review_reasons": ["ручная запись без оригинала; укажите валюту и суммы документа"],
+            "raw_text": "", "payment_status": "unknown",
+        }
+        self._expense_document_review_dialog(None, None, fields, [], None)
+
+    def review_selected_document(self, *_):
+        row = self.table_supplier_documents.currentRow()
+        id_item = self.table_supplier_documents.item(row, 0) if row >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Документ", "Выберите документ в реестре.")
+            return
+        document_id = int(id_item.text())
+        conn = get_db_connection()
+        document = conn.execute("SELECT * FROM supplier_documents WHERE id = ?", (document_id,)).fetchone()
+        if document is None:
+            conn.close()
+            QMessageBox.warning(self, "Документ", "Запись не найдена. Обновите реестр.")
+            self.load_expense_documents()
+            return
+        vat_lines = conn.execute(
+            "SELECT vat_rate AS rate, taxable_base, vat_amount AS amount, note FROM supplier_document_vat_lines WHERE document_id = ? ORDER BY id",
+            (document_id,),
+        ).fetchall()
+        allocations = conn.execute(
+            "SELECT object_id, allocated_net AS net_amount, allocated_vat AS vat_amount, allocated_gross AS gross_amount, allocation_note AS note FROM supplier_document_allocations WHERE document_id = ? ORDER BY id",
+            (document_id,),
+        ).fetchall()
+        conn.close()
+        fields = dict(document)
+        fields["supplier_name"] = document["supplier_name"] or ""
+        fields["supplier_org_number"] = document["supplier_org_number"] or ""
+        fields["supplier_vat_number"] = document["supplier_vat_number"] or ""
+        fields["document_comment"] = document["document_comment"] or ""
+        fields["vat_lines"] = [dict(item) for item in vat_lines]
+        fields["review_reasons"] = [item for item in str(document["review_reasons"] or "").splitlines() if item]
+        fields["allocations"] = [dict(item) for item in allocations]
+        suggestions = match_objects(document["recognized_text"] or "", self._expense_object_candidates())
+        self._expense_document_review_dialog(
+            document_id, document["stored_path"], fields, suggestions, fields["allocations"]
+        )
+
+    def _expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Проверка документа" if source_path else "Ручная запись расхода")
+        dialog.resize(1380, 900)
+        root_layout = QVBoxLayout(dialog)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        preview_tabs = QTabWidget()
+        preview_widget = QLabel("Оригинал не загружен" if not source_path else "Загрузка предпросмотра…")
+        preview_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_widget.setMinimumWidth(420)
+        if source_path:
+            try:
+                suffix = Path(source_path).suffix.casefold()
+                if suffix == ".pdf":
+                    import pypdfium2 as pdfium
+                    image = pdfium.PdfDocument(str(source_path))[0].render(scale=1.35).to_pil().convert("RGB")
+                    qimage = QImage(image.tobytes(), image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(qimage)
+                else:
+                    pixmap = QPixmap(str(source_path))
+                if not pixmap.isNull():
+                    preview_widget.setPixmap(pixmap.scaled(650, 760, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            except Exception as error:
+                preview_widget.setText(f"Предпросмотр недоступен: {error}")
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setWidget(preview_widget)
+        preview_tabs.addTab(preview_scroll, "Оригинал")
+        recognized_text = QTextEdit()
+        recognized_text.setReadOnly(True)
+        recognized_text.setPlainText(str(fields.get("raw_text") or ""))
+        preview_tabs.addTab(recognized_text, "Текст распознавания")
+        splitter.addWidget(preview_tabs)
+
+        form_widget = QWidget()
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setWidget(form_widget)
+        form = QFormLayout(form_widget)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        conn = get_db_connection()
+        known_suppliers = conn.execute("SELECT name FROM expense_suppliers ORDER BY name COLLATE NOCASE").fetchall()
+        object_rows = conn.execute("SELECT id, name, markning FROM objects ORDER BY name").fetchall()
+        conn.close()
+        supplier = QComboBox()
+        supplier.setEditable(True)
+        supplier.addItems([str(row[0]) for row in known_suppliers])
+        supplier.setCurrentText(str(fields.get("supplier_name") or ""))
+        org_number = QLineEdit(str(fields.get("supplier_org_number") or ""))
+        vat_number = QLineEdit(str(fields.get("supplier_vat_number") or ""))
+        document_type = QComboBox()
+        for label, value in (("Счёт", "invoice"), ("Чек", "receipt"), ("Кредитный счёт", "credit_note"), ("Ручная запись", "manual")):
+            document_type.addItem(label, value)
+        type_index = document_type.findData(str(fields.get("document_type") or "invoice"))
+        document_type.setCurrentIndex(max(0, type_index))
+        doc_date = QLineEdit(str(fields.get("document_date") or ""))
+        doc_date.setPlaceholderText("YYYY-MM-DD")
+        due_date = QLineEdit(str(fields.get("due_date") or ""))
+        due_date.setPlaceholderText("YYYY-MM-DD; необязательно")
+        invoice_number = QLineEdit(str(fields.get("invoice_number") or ""))
+        payment_reference = QLineEdit(str(fields.get("payment_reference") or ""))
+        currency = QComboBox()
+        currency.setEditable(True)
+        currency.addItems(["UNKNOWN", "SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"])
+        currency.setCurrentText(str(fields.get("currency_code") or "UNKNOWN"))
+        net_amount = QLineEdit(str(fields.get("net_amount") or ""))
+        vat_amount = QLineEdit(str(fields.get("vat_amount") or ""))
+        gross_amount = QLineEdit(str(fields.get("gross_amount") or ""))
+        amount_due = QLineEdit(str(fields.get("amount_due") or ""))
+        category = QComboBox()
+        category.setEditable(True)
+        category.addItems([
+            "Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты",
+            "Связь", "Прочие накладные расходы",
+        ])
+        category.setCurrentText(str(fields.get("expense_category") or "Прочие накладные расходы"))
+        document_comment = QTextEdit(str(fields.get("document_comment") or ""))
+        document_comment.setMaximumHeight(90)
+        document_comment.setPlaceholderText("Необязательный комментарий пользователя")
+        reverse_charge = QCheckBox("В документе указано reverse charge / omvänd skattskyldighet")
+        reverse_charge.setChecked(bool(fields.get("reverse_charge")))
+        reverse_charge_reviewed = QCheckBox("Я сверил reverse-charge с оригиналом")
+        reverse_charge_reviewed.setEnabled(reverse_charge.isChecked())
+        reverse_charge.toggled.connect(reverse_charge_reviewed.setEnabled)
+        payment_status = QComboBox()
+        payment_status.addItem("Неизвестно", "unknown")
+        payment_status.addItem("Не оплачен", "unpaid")
+        current_payment_status = str(fields.get("payment_status") or "unknown")
+        if current_payment_status in {"partially_paid", "paid"}:
+            payment_status.addItem(
+                "Частично оплачен (из платежей)" if current_payment_status == "partially_paid" else "Оплачен (из платежей)",
+                current_payment_status,
+            )
+            payment_status.setEnabled(False)
+        else:
+            payment_status.setCurrentIndex(max(0, payment_status.findData(current_payment_status)))
+        for label, widget in (
+            ("Поставщик:", supplier), ("Org.nr:", org_number), ("VAT-номер:", vat_number),
+            ("Тип:", document_type), ("Fakturadatum:", doc_date), ("Förfallodatum:", due_date),
+            ("Fakturanummer:", invoice_number), ("Платёжная ссылка OCR:", payment_reference),
+            ("Валюта:", currency), ("Netto / Belopp exkl. moms:", net_amount),
+            ("Moms (в документе):", vat_amount), ("Общая сумма документа:", gross_amount),
+            ("Сумма к оплате, если отличается:", amount_due), ("Категория расхода:", category),
+            ("Комментарий:", document_comment),
+        ):
+            form.addRow(label, widget)
+        form.addRow(reverse_charge)
+        form.addRow(reverse_charge_reviewed)
+        form.addRow("Состояние оплаты:", payment_status)
+        reasons_label = QLabel(
+            "Сигналы распознавания: "
+            + ("; ".join(fields.get("review_reasons") or []) or "явных проблем не найдено; всё равно проверьте оригинал")
+            + f"\nМетод: {fields.get('ocr_method', 'распознанный текст / ручной ввод')}; "
+            + f"уверенность: {fields.get('ocr_confidence') if fields.get('ocr_confidence') is not None else 'не рассчитана'}"
+        )
+        reasons_label.setWordWrap(True)
+        form.addRow(reasons_label)
+
+        vat_table = QTableWidget()
+        vat_table.setColumnCount(3)
+        vat_table.setHorizontalHeaderLabels(["Ставка %", "База", "Moms"])
+        for vat_line in fields.get("vat_lines") or []:
+            row = vat_table.rowCount()
+            vat_table.insertRow(row)
+            for column, key in enumerate(("rate", "taxable_base", "amount")):
+                vat_table.setItem(row, column, QTableWidgetItem(str(vat_line.get(key) or "")))
+        vat_buttons = QHBoxLayout()
+        add_vat_button = QPushButton("Добавить ставку НДС")
+        remove_vat_button = QPushButton("Удалить строку НДС")
+        vat_buttons.addWidget(add_vat_button)
+        vat_buttons.addWidget(remove_vat_button)
+        vat_box = QVBoxLayout()
+        vat_box.addWidget(vat_table)
+        vat_box.addLayout(vat_buttons)
+        vat_container = QWidget()
+        vat_container.setLayout(vat_box)
+        form.addRow("Разбивка НДС:", vat_container)
+        add_vat_button.clicked.connect(lambda: vat_table.insertRow(vat_table.rowCount()))
+        remove_vat_button.clicked.connect(lambda: vat_table.removeRow(vat_table.currentRow()) if vat_table.currentRow() >= 0 else None)
+
+        suggestion_text = "; ".join(f"{item['name']}: {item['reason']}" for item in suggestions)
+        suggestion_label = QLabel(
+            "Предложение объекта: " + (suggestion_text if suggestion_text else "совпадение не найдено; объект выберите вручную")
+        )
+        suggestion_label.setWordWrap(True)
+        form.addRow(suggestion_label)
+
+        allocation_table = QTableWidget()
+        allocation_table.setColumnCount(2)
+        allocation_table.setHorizontalHeaderLabels(["Объект", "Распределённая сумма документа"])
+        allocations = existing_allocations if existing_allocations is not None else []
+        if not allocations and fields.get("gross_amount"):
+            suggestion_id = suggestions[0]["object_id"] if len(suggestions) == 1 else None
+            allocations = [{"object_id": suggestion_id, "gross_amount": fields.get("gross_amount"), "note": suggestions[0]["reason"] if len(suggestions) == 1 else ""}]
+
+        def add_allocation(allocation=None):
+            allocation = allocation or {}
+            row = allocation_table.rowCount()
+            allocation_table.insertRow(row)
+            object_combo = QComboBox()
+            object_combo.addItem("Без объекта", None)
+            for object_row in object_rows:
+                title = str(object_row["name"])
+                if object_row["markning"]:
+                    title += f" ({object_row['markning']})"
+                object_combo.addItem(title, int(object_row["id"]))
+            selected_object = allocation.get("object_id")
+            object_combo.setCurrentIndex(max(0, object_combo.findData(int(selected_object)) if selected_object is not None else 0))
+            allocation_table.setCellWidget(row, 0, object_combo)
+            allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
+        for allocation in allocations:
+            add_allocation(allocation)
+        allocation_buttons = QHBoxLayout()
+        add_allocation_button = QPushButton("Добавить объект")
+        remove_allocation_button = QPushButton("Удалить строку")
+        add_alias_button = QPushButton("Добавить альтернативное название")
+        allocation_buttons.addWidget(add_allocation_button)
+        allocation_buttons.addWidget(remove_allocation_button)
+        allocation_buttons.addWidget(add_alias_button)
+        allocation_box = QVBoxLayout()
+        allocation_box.addWidget(allocation_table)
+        allocation_box.addLayout(allocation_buttons)
+        allocation_container = QWidget()
+        allocation_container.setLayout(allocation_box)
+        form.addRow("Распределение:", allocation_container)
+        add_allocation_button.clicked.connect(lambda: add_allocation())
+        remove_allocation_button.clicked.connect(lambda: allocation_table.removeRow(allocation_table.currentRow()) if allocation_table.currentRow() >= 0 else None)
+
+        def add_object_alias():
+            row = allocation_table.currentRow()
+            combo = allocation_table.cellWidget(row, 0) if row >= 0 else None
+            object_id = combo.currentData() if combo else None
+            if object_id is None:
+                QMessageBox.information(dialog, "Объект", "Выберите объект в строке распределения.")
+                return
+            alias, accepted = QInputDialog.getText(dialog, "Альтернативное название", "Название / адрес / код:")
+            if not accepted or not alias.strip():
+                return
+            conn = get_db_connection()
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO expense_object_aliases (object_id, alias) VALUES (?, ?)",
+                    (int(object_id), alias.strip()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            QMessageBox.information(dialog, "Объект", "Альтернативное название сохранено.")
+
+        add_alias_button.clicked.connect(add_object_alias)
+
+        splitter.addWidget(form_scroll)
+        splitter.setSizes([620, 700])
+        root_layout.addWidget(splitter, 1)
+        action_row = QHBoxLayout()
+        save_draft = QPushButton("Сохранить черновик")
+        save_review = QPushButton("Сохранить: требует проверки")
+        confirm = QPushButton("Подтвердить документ")
+        cancel = QPushButton("Отмена")
+        for button in (save_draft, save_review, confirm, cancel):
+            action_row.addWidget(button)
+        root_layout.addLayout(action_row)
+
+        def save_document(status):
+            net_value = parse_decimal(net_amount.text())
+            vat_value = parse_decimal(vat_amount.text())
+            gross_value = parse_decimal(gross_amount.text())
+            due_value = parse_decimal(amount_due.text())
+            vat_lines = []
+            vat_sum = Decimal(0)
+            for row in range(vat_table.rowCount()):
+                rate_item = vat_table.item(row, 0)
+                base_item = vat_table.item(row, 1)
+                value_item = vat_table.item(row, 2)
+                if not any((rate_item, base_item, value_item)):
+                    continue
+                row_vat = parse_decimal(value_item.text() if value_item else None)
+                if row_vat is None:
+                    QMessageBox.warning(dialog, "НДС", f"Проверьте сумму НДС в строке {row + 1}.")
+                    return
+                vat_sum += row_vat
+                vat_lines.append({
+                    "rate": rate_item.text().strip() if rate_item else "",
+                    "taxable_base": parse_decimal(base_item.text() if base_item else None),
+                    "amount": row_vat,
+                })
+            if vat_lines:
+                vat_value = vat_sum
+                vat_amount.setText(decimal_text(vat_sum) or "")
+
+            doc_date_value = doc_date.text().strip()
+            due_date_value = due_date.text().strip() or None
+            date_error = None
+            for label, value in (("Fakturadatum", doc_date_value), ("Förfallodatum", due_date_value)):
+                if value:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError:
+                        date_error = f"{label} должен быть в формате YYYY-MM-DD."
+                        break
+            if date_error:
+                QMessageBox.warning(dialog, "Дата", date_error)
+                return
+
+            allocation_rows = []
+            for row in range(allocation_table.rowCount()):
+                combo = allocation_table.cellWidget(row, 0)
+                amount_item = allocation_table.item(row, 1)
+                value = parse_decimal(amount_item.text() if amount_item else None)
+                if value is None:
+                    if status == "confirmed":
+                        QMessageBox.warning(dialog, "Распределение", f"Укажите сумму распределения в строке {row + 1}.")
+                        return
+                    continue
+                allocation_rows.append({
+                    "object_id": combo.currentData() if combo else None,
+                    "gross_amount": value,
+                    "note": suggestion_text if combo and combo.currentData() is not None else "",
+                })
+            if status == "confirmed" and (not allocation_rows or any(item["object_id"] is None for item in allocation_rows)):
+                QMessageBox.warning(dialog, "Объект", "Для подтверждения выберите объект в каждой строке распределения. Черновик можно сохранить без объекта.")
+                return
+
+            reasons = []
+            supplier_name_value = supplier.currentText().strip()
+            if not supplier_name_value:
+                reasons.append("поставщик не указан")
+            if not doc_date_value:
+                reasons.append("дата документа не указана")
+            if document_type.currentData() == "invoice" and not invoice_number.text().strip():
+                reasons.append("номер счёта не указан")
+            currency_value = currency.currentText().strip().upper() or "UNKNOWN"
+            if currency_value == "UNKNOWN":
+                reasons.append("валюта не подтверждена")
+            if net_value is None:
+                reasons.append("нетто не указано")
+            if vat_value is None:
+                reasons.append("НДС неизвестен; не подставлен по умолчанию")
+            if gross_value is None:
+                reasons.append("общая сумма не указана")
+            if net_value is not None and vat_value is not None and gross_value is not None and abs(net_value + vat_value - gross_value) > Decimal("0.02"):
+                reasons.append("нетто + НДС не сходятся с итогом")
+            if reverse_charge.isChecked() and not reverse_charge_reviewed.isChecked():
+                reasons.append("reverse charge требует ручной проверки")
+            if status == "confirmed" and reasons:
+                QMessageBox.warning(dialog, "Нельзя подтвердить", "Проверьте документ:\n• " + "\n• ".join(reasons))
+                return
+
+            values = dict(fields)
+            values.update({
+                "supplier_name": supplier_name_value or None,
+                "supplier_org_number": org_number.text().strip() or None,
+                "supplier_vat_number": vat_number.text().strip() or None,
+                "document_type": document_type.currentData(),
+                "document_date": doc_date_value or None,
+                "due_date": due_date_value,
+                "invoice_number": invoice_number.text().strip() or None,
+                "payment_reference": payment_reference.text().strip() or None,
+                "currency_code": currency_value,
+                "net_amount": net_value,
+                "vat_amount": vat_value,
+                "gross_amount": gross_value,
+                "amount_due": due_value,
+                "expense_category": category.currentText().strip() or "Прочее",
+                "document_comment": document_comment.toPlainText().strip(),
+                "reverse_charge": reverse_charge.isChecked(),
+                "vat_lines": vat_lines,
+                "review_reasons": reasons,
+                "payment_status": payment_status.currentData(),
+            })
+            if status == "confirmed" and allocation_rows:
+                valid, message = validate_allocations(gross_value, allocation_rows)
+                if not valid:
+                    QMessageBox.warning(dialog, "Распределение", message)
+                    return
+
+            allow_duplicate = False
+            try:
+                conn = get_db_connection()
+                file_hash = None
+                if source_path:
+                    from expense_documents import sha256_file
+                    file_hash = sha256_file(source_path)
+                duplicates = find_document_duplicates(conn, values, file_hash)
+                if document_id is not None:
+                    duplicates = [item for item in duplicates if int(item["id"]) != int(document_id)]
+                if duplicates:
+                    answer = QMessageBox.question(
+                        dialog, "Возможный дубль",
+                        "Найден документ с тем же файлом или поставщиком/номером/датой/суммой. "
+                        "Сохранить копию всё равно?\n" + "\n".join(
+                            f"#{item['id']} {item['supplier_name']} {item['invoice_number']} {item['gross_amount']} {item['currency_code']}"
+                            for item in duplicates[:5]
+                        ),
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if answer != QMessageBox.StandardButton.Yes:
+                        conn.close()
+                        return
+                    allow_duplicate = True
+
+                if document_id is None:
+                    from expense_documents import save_supplier_document
+                    saved_id = save_supplier_document(
+                        conn, document_storage_root(), values, allocation_rows, source_path,
+                        status, allow_duplicate,
+                    )
+                else:
+                    saved_id = self._update_supplier_document_record(
+                        conn, document_id, source_path, values, allocation_rows, status, allow_duplicate
+                    )
+                conn.close()
+            except Exception as error:
+                if "conn" in locals():
+                    conn.close()
+                QMessageBox.warning(dialog, "Документ не сохранён", str(error))
+                return
+            dialog.accept()
+            self.load_expense_document_filters()
+            self.load_expense_documents()
+            QMessageBox.information(self, "Документ", f"Запись #{saved_id} сохранена со статусом: {status}.")
+
+        save_draft.clicked.connect(lambda: save_document("draft"))
+        save_review.clicked.connect(lambda: save_document("requires_review"))
+        confirm.clicked.connect(lambda: save_document("confirmed"))
+        cancel.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _update_supplier_document_record(self, conn, document_id, source_path, fields, allocations, status, allow_duplicate):
+        existing = conn.execute(
+            "SELECT stored_path, file_sha256 FROM supplier_documents WHERE id = ?", (int(document_id),)
+        ).fetchone()
+        if existing is None:
+            raise ValueError("Документ не найден.")
+        if status == "confirmed":
+            net, vat, gross = (parse_decimal(fields.get(key)) for key in ("net_amount", "vat_amount", "gross_amount"))
+            if None in (net, vat, gross) or abs(net + vat - gross) > Decimal("0.02"):
+                raise ValueError("Нетто + НДС не сходятся с итоговой суммой.")
+        file_hash = existing["file_sha256"]
+        if source_path:
+            from expense_documents import sha256_file
+            file_hash = sha256_file(source_path)
+        duplicates = find_document_duplicates(conn, fields, file_hash, exclude_document_id=document_id)
+        if duplicates and not allow_duplicate:
+            raise ValueError("Найден возможный дубль документа; сохранение отменено.")
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("BEGIN IMMEDIATE")
+        supplier_name = str(fields.get("supplier_name") or "").strip()
+        supplier_org = str(fields.get("supplier_org_number") or "").strip() or None
+        supplier_vat = str(fields.get("supplier_vat_number") or "").strip() or None
+        supplier_id = None
+        if supplier_name:
+            found = conn.execute(
+                "SELECT id FROM expense_suppliers WHERE name = ? COLLATE NOCASE AND COALESCE(org_number, '') = COALESCE(?, '') ORDER BY id LIMIT 1",
+                (supplier_name, supplier_org),
+            ).fetchone()
+            if found:
+                supplier_id = int(found[0])
+            else:
+                supplier_id = int(conn.execute(
+                    "INSERT INTO expense_suppliers (name, org_number, vat_number, created_at) VALUES (?, ?, ?, ?)",
+                    (supplier_name, supplier_org, supplier_vat, datetime.now(timezone.utc).isoformat()),
+                ).lastrowid)
+        object_ids = [int(item["object_id"]) for item in allocations if item.get("object_id") is not None]
+        if object_ids:
+            placeholders = ",".join("?" for _ in object_ids)
+            object_names = [str(item[0]) for item in conn.execute(
+                f"SELECT name FROM objects WHERE id IN ({placeholders}) ORDER BY name", object_ids
+            ).fetchall()]
+        else:
+            object_names = []
+        conn.execute("""
+            UPDATE supplier_documents SET supplier_id=?, supplier_name=?, supplier_org_number=?, supplier_vat_number=?,
+                document_type=?, invoice_number=?, payment_reference=?, document_date=?, due_date=?, currency_code=?,
+                net_amount=?, vat_amount=?, gross_amount=?, amount_due=?, expense_category=?, is_reverse_charge=?,
+                document_comment=?, verification_status=?, payment_status=?, recognized_text=?, review_reasons=?, updated_at=? WHERE id=?
+        """, (
+            supplier_id, supplier_name or None, supplier_org, supplier_vat, fields["document_type"],
+            fields.get("invoice_number"), fields.get("payment_reference"), fields.get("document_date"), fields.get("due_date"),
+            fields["currency_code"], decimal_text(fields.get("net_amount")), decimal_text(fields.get("vat_amount")),
+            decimal_text(fields.get("gross_amount")), decimal_text(fields.get("amount_due")), fields["expense_category"],
+            int(bool(fields.get("reverse_charge"))), str(fields.get("document_comment") or ""), status,
+            fields.get("payment_status") or "unknown",
+            fields.get("raw_text") or "", "\n".join(fields.get("review_reasons") or []), now, int(document_id),
+        ))
+        conn.execute("DELETE FROM supplier_document_vat_lines WHERE document_id=?", (int(document_id),))
+        conn.execute("DELETE FROM supplier_document_allocations WHERE document_id=?", (int(document_id),))
+        for line in fields.get("vat_lines") or []:
+            conn.execute(
+                "INSERT INTO supplier_document_vat_lines (document_id,vat_rate,taxable_base,vat_amount,note) VALUES (?,?,?,?,?)",
+                (int(document_id), str(line.get("rate") or ""), decimal_text(line.get("taxable_base")), decimal_text(line.get("amount")) or "0.00", str(line.get("note") or "")),
+            )
+        for allocation in allocations:
+            conn.execute(
+                "INSERT INTO supplier_document_allocations (document_id,object_id,allocated_net,allocated_vat,allocated_gross,allocation_note) VALUES (?,?,?,?,?,?)",
+                (int(document_id), allocation.get("object_id"), decimal_text(allocation.get("net_amount")), decimal_text(allocation.get("vat_amount")), decimal_text(allocation.get("gross_amount")) or "0.00", str(allocation.get("note") or "")),
+            )
+        stored_path = existing["stored_path"]
+        destination = None
+        if stored_path and Path(stored_path).is_file():
+            try:
+                destination, _ = store_original_file(
+                    stored_path, document_storage_root(), int(document_id), object_names
+                )
+                if destination != Path(stored_path):
+                    conn.execute(
+                        "UPDATE supplier_documents SET stored_path = ?, updated_at = ? WHERE id = ?",
+                        (str(destination), now, int(document_id)),
+                    )
+            except Exception:
+                conn.rollback()
+                if destination and destination != Path(stored_path):
+                    destination.unlink(missing_ok=True)
+                raise
+        try:
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            if destination and stored_path and destination != Path(stored_path):
+                destination.unlink(missing_ok=True)
+            raise
+        if destination and stored_path and destination != Path(stored_path):
+            old_path = Path(stored_path)
+            if old_path.is_relative_to(document_storage_root()):
+                old_path.unlink(missing_ok=True)
+        return int(document_id)
+
+    def open_selected_document_original(self, *_):
+        row = self.table_supplier_documents.currentRow()
+        id_item = self.table_supplier_documents.item(row, 0) if row >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Документ", "Выберите документ.")
+            return
+        conn = get_db_connection()
+        document = conn.execute("SELECT stored_path FROM supplier_documents WHERE id=?", (int(id_item.text()),)).fetchone()
+        conn.close()
+        if not document or not document["stored_path"] or not Path(document["stored_path"]).is_file():
+            QMessageBox.warning(self, "Оригинал", "Оригинал отсутствует или путь недоступен.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(document["stored_path"])))
+
+    def record_selected_document_payment(self, *_):
+        row = self.table_supplier_documents.currentRow()
+        id_item = self.table_supplier_documents.item(row, 0) if row >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Оплата", "Выберите документ.")
+            return
+        document_id = int(id_item.text())
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Платёж по документу #{document_id}")
+        form = QFormLayout(dialog)
+        paid_date = create_date_field(QDate.currentDate().toString("yyyy-MM-dd"))
+        amount = QLineEdit()
+        reference = QLineEdit()
+        conn = get_db_connection()
+        document = conn.execute(
+            "SELECT currency_code, amount_due, gross_amount FROM supplier_documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        paid = sum((parse_decimal(item[0]) or Decimal(0) for item in conn.execute(
+            "SELECT amount FROM supplier_document_payments WHERE document_id = ?", (document_id,)
+        ).fetchall()), Decimal(0))
+        conn.close()
+        if document:
+            due = parse_decimal(document["amount_due"]) or parse_decimal(document["gross_amount"])
+            if due is not None:
+                amount.setText(decimal_text(max(Decimal(0), due - paid)) or "")
+                amount.setPlaceholderText(str(document["currency_code"]))
+        form.addRow("Дата оплаты:", paid_date)
+        form.addRow("Сумма:", amount)
+        form.addRow("Платёжная ссылка / комментарий:", reference)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        conn = get_db_connection()
+        try:
+            from expense_documents import record_document_payment
+            status = record_document_payment(conn, document_id, paid_date.text(), amount.text(), reference.text())
+        except Exception as error:
+            conn.close()
+            QMessageBox.warning(self, "Оплата не записана", str(error))
+            return
+        conn.close()
+        QMessageBox.information(self, "Оплата", f"Платёж сохранён. Состояние: {status}.")
+        self.load_expense_documents()
+    def _api_load_object_expense_overview(self, *_):
         if not hasattr(self, "object_expenses_table"):
             return
         object_id = self.object_expenses_object.currentData()
