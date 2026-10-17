@@ -40,9 +40,10 @@ from ob_calculator import (
     round_time_to_half_hour,
 )
 from expense_documents import (
-    apply_expense_documents_migration, decimal_text, document_storage_root,
+    apply_expense_documents_migration, build_project_order_allocations, decimal_text, document_storage_root,
     extract_local_document, find_document_duplicates, get_object_expense_summary,
-    match_objects, parse_decimal, parse_document_text, safe_folder_name, sha256_file,
+    match_objects, parse_decimal, parse_document_text, parse_project_order_allocations,
+    safe_folder_name, sha256_file,
     store_original_file,
     validate_allocations,
 )
@@ -1718,7 +1719,7 @@ class DocumentPreviewDialog(QDialog):
 
 
 class DocumentGalleryDialog(QDialog):
-    def __init__(self, paths, title, parent=None):
+    def __init__(self, paths, title, parent=None, initial_page=0, initial_attachment=0):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1180, 900)
@@ -1726,7 +1727,10 @@ class DocumentGalleryDialog(QDialog):
         self._pdf_documents = []
         self._pages = []
         self._page_index = 0
-        for path in paths:
+        starting_page = 0
+        for attachment_index, path in enumerate(paths):
+            if attachment_index == initial_attachment:
+                starting_page = len(self._pages) + initial_page
             source = Path(path)
             if source.suffix.casefold() == ".pdf":
                 import pypdfium2 as pdfium
@@ -1766,7 +1770,7 @@ class DocumentGalleryDialog(QDialog):
         zoom_controls.addStretch()
         layout.addLayout(zoom_controls)
         layout.addWidget(self.preview, 1)
-        self.show_page(0)
+        self.show_page(starting_page)
 
     def show_page(self, index):
         if not self._pages:
@@ -2378,6 +2382,8 @@ class SmartReportApp(QMainWindow):
                 "client_id", "soft_delete", "attachments",
                 "nullable_company_allocations", "versioned_updates",
             }
+            if any(json.loads(row["payload_json"]).get("order_proposals") for row in rows):
+                required_features.update({"order_proposals", "supplier_project_code_links"})
             try:
                 capability_response = requests.request(
                     "GET",
@@ -4061,6 +4067,11 @@ class SmartReportApp(QMainWindow):
         try:
             extraction = extract_local_document(path)
             fields = parse_document_text(extraction.text)
+            page_texts = extraction.pages or (extraction.text,)
+            allocation_proposal = parse_project_order_allocations([
+                {"source": Path(path).name, "page": page + 1, "text": page_text}
+                for page, page_text in enumerate(page_texts)
+            ])
         except Exception as error:
             QMessageBox.warning(self, "Документ не прочитан", str(error))
             return
@@ -4068,6 +4079,9 @@ class SmartReportApp(QMainWindow):
         fields["expense_category"] = fields.get("expense_category") or "Прочие накладные расходы"
         fields["ocr_method"] = extraction.method
         fields["ocr_confidence"] = extraction.confidence
+        fields["order_proposals"] = allocation_proposal["orders"]
+        fields["order_proposal_warnings"] = allocation_proposal["warnings"]
+        fields["order_proposal_requires_review"] = allocation_proposal["requires_review"]
         fields["client_id"] = str(uuid.uuid4())
         if extraction.confidence is not None and extraction.confidence < 0.65:
             fields["review_reasons"].append("низкая уверенность OCR; проверьте все поля")
@@ -4128,7 +4142,12 @@ class SmartReportApp(QMainWindow):
             shutil.copyfileobj(response.raw, destination)
         return str(path)
 
-    def _api_expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
+    def _api_expense_document_review_dialog(
+        self, document_id, source_path, fields, suggestions, existing_allocations,
+        source_paths=None, preview_paths=None,
+    ):
+        new_paths = list(source_paths if source_paths is not None else ([source_path] if source_path else []))
+        paths = list(preview_paths or new_paths)
         dialog = QDialog(self)
         dialog.setWindowTitle("Фактура и распределение" if document_id is None else f"Фактура #{document_id}")
         dialog.resize(1120, 760)
@@ -4177,7 +4196,7 @@ class SmartReportApp(QMainWindow):
                 preview_controls.addWidget(button)
 
             def open_large_preview():
-                DocumentPreviewDialog(preview_pixmap, Path(source_path).name, dialog, source_path).exec()
+                DocumentGalleryDialog(paths, Path(source_path).name, dialog).exec()
 
             open_large_button = QPushButton("Открыть отдельно")
             open_large_button.setToolTip("Открыть оригинал в отдельном изменяемом окне")
@@ -4244,11 +4263,166 @@ class SmartReportApp(QMainWindow):
             reason_label.setWordWrap(True)
             form.addRow("Проверьте:", reason_label)
 
+        objects = list(getattr(self, "_expense_objects", []))
+        order_proposals = [dict(item) for item in fields.get("order_proposals") or []]
+        order_table = QTableWidget()
+        order_table.setObjectName("expenseOrderProposals")
+        order_table.setColumnCount(7)
+        order_table.setHorizontalHeaderLabels([
+            "Proj.nr.", "Order ID", "Объект", "Net", "VAT заказа", "Gross", "Источник",
+        ])
+        order_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        order_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        order_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        try:
+            supplier_links = request_expense_api(
+                "GET", "/api/expense-project-code-links",
+                params={"supplier_name": supplier.currentText().strip()},
+            ).get("links", [])
+        except Exception:
+            supplier_links = []
+        mapped_objects = {
+            str(link.get("project_code") or "").casefold(): int(link["object_id"])
+            for link in supplier_links if link.get("object_id") is not None
+        }
+
+        def add_order_proposal(proposal):
+            signals_blocked = order_table.blockSignals(True)
+            row = order_table.rowCount()
+            order_table.insertRow(row)
+            order_table.setItem(row, 0, QTableWidgetItem(str(proposal.get("project_code") or "")))
+            order_table.setItem(row, 1, QTableWidgetItem(str(proposal.get("order_id") or "")))
+            object_combo = QComboBox()
+            object_combo.addItem("Выберите объект", None)
+            for object_row in objects:
+                label = str(object_row["name"])
+                if object_row.get("markning"):
+                    label += f" ({object_row['markning']})"
+                if object_row.get("company"):
+                    label += f" · {object_row['company']}"
+                object_combo.addItem(label, int(object_row["id"]))
+            selected_object = proposal.get("object_id") or mapped_objects.get(
+                str(proposal.get("project_code") or "").casefold()
+            )
+            if selected_object is None:
+                exact_matches = [
+                    int(item["id"]) for item in objects
+                    if str(item.get("markning") or "").strip().casefold()
+                    == str(proposal.get("project_code") or "").strip().casefold()
+                    and str(proposal.get("project_code") or "").strip()
+                ]
+                if len(exact_matches) == 1:
+                    selected_object = exact_matches[0]
+            if selected_object is not None:
+                selected_index = object_combo.findData(int(selected_object))
+                if selected_index >= 0:
+                    object_combo.setCurrentIndex(selected_index)
+            order_table.setCellWidget(row, 2, object_combo)
+            order_table.setItem(row, 3, QTableWidgetItem(str(proposal.get("net_amount") or "")))
+            order_table.setItem(row, 4, QTableWidgetItem(str(proposal.get("vat_amount") or "")))
+            gross_item = QTableWidgetItem("")
+            gross_item.setFlags(gross_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            order_table.setItem(row, 5, gross_item)
+            sources = proposal.get("sources") or []
+            page = int(sources[0].get("page") or 1) if sources else 1
+            source_pages = ", ".join(dict.fromkeys(str(source.get("page")) for source in sources))
+            attachment_index = int(sources[0].get("attachment_index") or 0) if sources else 0
+            source_button = QPushButton(f"Стр. {source_pages}" if sources else "Нет страницы")
+            source_button.setEnabled(bool(paths and sources and 0 <= attachment_index < len(paths)))
+            if sources:
+                source_button.setToolTip("\n".join(
+                    f"{source.get('source')}, стр. {source.get('page')}, строка {source.get('line')}: {source.get('text') or ''}"
+                    for source in sources
+                ))
+            if paths and sources and 0 <= attachment_index < len(paths):
+                source_button.clicked.connect(
+                    lambda _checked=False, page_number=page, file_index=attachment_index: DocumentGalleryDialog(
+                        paths, f"Источник · страница {page_number}", dialog,
+                        initial_page=page_number - 1, initial_attachment=file_index,
+                    ).exec()
+                )
+            order_table.setCellWidget(row, 6, source_button)
+            order_table.blockSignals(signals_blocked)
+
+        for proposal in order_proposals:
+            add_order_proposal(proposal)
+        proposal_status = QLabel()
+        proposal_status.setWordWrap(True)
+        proposal_warnings = list(fields.get("order_proposal_warnings") or [])
+
+        def update_order_proposal_totals(*args):
+            if len(args) == 2 and args[1] == 5:
+                return
+            net_total = Decimal(0)
+            vat_total = Decimal(0)
+            gross_total = Decimal(0)
+            missing_vat = []
+            for row in range(order_table.rowCount()):
+                net_item = order_table.item(row, 3)
+                vat_item = order_table.item(row, 4)
+                net_value = parse_decimal(net_item.text() if net_item else None)
+                vat_value = parse_decimal(vat_item.text() if vat_item else None)
+                gross_item = order_table.item(row, 5)
+                gross_value = net_value + vat_value if net_value is not None and vat_value is not None else None
+                gross_item.setText(decimal_text(gross_value) or "")
+                if net_value is not None:
+                    net_total += net_value
+                if vat_value is not None:
+                    vat_total += vat_value
+                else:
+                    missing_vat.append(str(order_table.item(row, 1).text() or row + 1))
+                if gross_value is not None:
+                    gross_total += gross_value
+            messages = list(proposal_warnings)
+            if missing_vat:
+                messages.append("VAT не указан для заказов: " + ", ".join(missing_vat))
+            if order_table.rowCount():
+                messages.append(
+                    f"Итого предложения: net {decimal_text(net_total)}, VAT {decimal_text(vat_total)}, "
+                    f"gross {decimal_text(gross_total)}"
+                )
+            proposal_status.setText("\n".join(messages))
+
+        order_table.cellChanged.connect(update_order_proposal_totals)
+        update_order_proposal_totals()
+        if order_proposals:
+            form.addRow("Распределение по заказам:", order_table)
+            form.addRow("Проверка заказов:", proposal_status)
+        orders_reviewed = QCheckBox("Строки заказов и VAT сверены с оригиналом")
+        orders_reviewed.setObjectName("expenseOrdersReviewed")
+        order_buttons = QHBoxLayout()
+        add_order_button = QPushButton("Добавить заказ")
+        add_order_button.setObjectName("expenseAddOrder")
+        remove_order_button = QPushButton("Удалить заказ")
+        remove_order_button.setObjectName("expenseRemoveOrder")
+        order_buttons.addWidget(add_order_button)
+        order_buttons.addWidget(remove_order_button)
+        order_controls = QWidget()
+        order_controls.setLayout(order_buttons)
+        if order_proposals:
+            form.addRow(order_controls)
+            form.addRow(orders_reviewed)
+
+        def add_empty_order():
+            proposal = {"project_code": "", "order_id": "", "sources": [], "ambiguous": False}
+            order_proposals.append(proposal)
+            add_order_proposal(proposal)
+            update_order_proposal_totals()
+
+        def remove_order():
+            row = order_table.currentRow()
+            if row >= 0:
+                order_table.removeRow(row)
+                order_proposals.pop(row)
+                update_order_proposal_totals()
+
+        add_order_button.clicked.connect(add_empty_order)
+        remove_order_button.clicked.connect(remove_order)
+
         allocation_table = QTableWidget()
         allocation_table.setColumnCount(2)
         allocation_table.setHorizontalHeaderLabels(["Объект", "Сумма с НДС"])
         allocation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        objects = self._expense_object_candidates()
 
         def add_allocation(allocation=None):
             allocation = allocation or {}
@@ -4316,6 +4490,7 @@ class SmartReportApp(QMainWindow):
         save_draft = QPushButton("Сохранить черновик")
         save_review = QPushButton("Сохранить: требует проверки")
         confirm = QPushButton("Подтвердить")
+        confirm.setObjectName("expenseOrdersConfirm")
         cancel = QPushButton("Отмена")
         if is_transfer_receipt:
             save_draft.setEnabled(False)
@@ -4363,8 +4538,29 @@ class SmartReportApp(QMainWindow):
                     QMessageBox.warning(dialog, "Суммы", "Нетто и НДС не совпадают с итогом документа.")
                     return
 
+            proposal_rows = []
+            for row in range(order_table.rowCount()):
+                proposal = dict(order_proposals[row])
+                object_combo = order_table.cellWidget(row, 2)
+                for column in (3, 4):
+                    raw_value = order_table.item(row, column).text().strip()
+                    if raw_value and parse_decimal(raw_value) is None:
+                        QMessageBox.warning(dialog, "Заказы", f"Проверьте net/VAT в строке {row + 1}.")
+                        return
+                proposal.update({
+                    "project_code": order_table.item(row, 0).text().strip(),
+                    "order_id": order_table.item(row, 1).text().strip(),
+                    "object_id": object_combo.currentData() if object_combo else None,
+                    "net_amount": decimal_text(parse_decimal(order_table.item(row, 3).text())),
+                    "vat_amount": decimal_text(parse_decimal(order_table.item(row, 4).text())),
+                    "gross_amount": decimal_text(parse_decimal(order_table.item(row, 5).text())),
+                    "ambiguous": bool(proposal.get("ambiguous")) and not orders_reviewed.isChecked(),
+                })
+                proposal_rows.append(proposal)
+
             allocation_rows = []
-            for row in range(allocation_table.rowCount()):
+            manual_row_count = 0 if status == "confirmed" and fields.get("order_proposals") else allocation_table.rowCount()
+            for row in range(manual_row_count):
                 combo = allocation_table.cellWidget(row, 0)
                 amount_item = allocation_table.item(row, 1)
                 raw_amount = amount_item.text().strip() if amount_item else ""
@@ -4379,6 +4575,17 @@ class SmartReportApp(QMainWindow):
                     QMessageBox.warning(dialog, "Объект", f"Выберите объект в строке {row + 1}.")
                     return
                 allocation_rows.append({"object_id": int(object_id), "gross_amount": amount})
+            if status == "confirmed" and fields.get("order_proposals"):
+                if not orders_reviewed.isChecked():
+                    QMessageBox.warning(dialog, "Заказы", "Сверьте строки заказов и VAT с оригиналом.")
+                    return
+                try:
+                    allocation_rows = build_project_order_allocations(
+                        proposal_rows, net_value, vat_value, gross_value,
+                    )
+                except ValueError as error:
+                    QMessageBox.warning(dialog, "Распределение по заказам", str(error))
+                    return
             if allocation_rows:
                 valid, message = validate_allocations(gross_value or Decimal(0), allocation_rows)
                 if not valid:
@@ -4399,37 +4606,36 @@ class SmartReportApp(QMainWindow):
                 "verification_status": status,
                 "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
                 "allocations": allocation_rows,
+                "order_proposals": proposal_rows,
             }
+            if document_id is not None and fields.get("sync_version") is not None:
+                payload["expected_version"] = int(fields["sync_version"])
             fields["client_id"] = payload["client_id"]
+            staged_paths = []
             try:
-                if document_id is None:
-                    if source_path:
-                        with Path(source_path).open("rb") as original:
-                            result = request_expense_api(
-                                "POST", "/api/expense-documents",
-                                data={"payload": json.dumps(payload, ensure_ascii=False)},
-                                files={"original": (Path(source_path).name, original)},
-                            )
-                    else:
-                        result = request_expense_api("POST", "/api/expense-documents", json=payload)
-                else:
-                    result = request_expense_api(
-                        "PUT", f"/api/expense-documents/{document_id}", json=payload
-                    )
+                if new_paths:
+                    staged_paths = self._store_expense_originals(new_paths, payload["client_id"])
+                self.queue_expense_document_operation(
+                    payload["client_id"], "upsert", payload,
+                    server_document_id=document_id,
+                    server_version=fields.get("sync_version") or fields.get("server_version"),
+                    attachment_paths=staged_paths if new_paths else fields.get("local_attachment_paths"),
+                )
             except Exception as error:
+                for path in staged_paths:
+                    Path(path).unlink(missing_ok=True)
                 QMessageBox.warning(dialog, "Документ не сохранён", str(error))
                 return
-            saved_id = result["document"]["id"]
             dialog.accept()
-            self.load_expense_document_filters()
             self.load_expense_documents()
-            QMessageBox.information(dialog, "Документ", f"Документ #{saved_id} сохранён.")
+            self.background_sync_with_cloud()
+            QMessageBox.information(dialog, "Документ", "Документ сохранён в очереди синхронизации.")
 
         save_draft.clicked.connect(lambda: save_document("draft"))
         save_review.clicked.connect(lambda: save_document("requires_review"))
         confirm.clicked.connect(lambda: save_document("confirmed"))
         cancel.clicked.connect(dialog.reject)
-        dialog.exec()
+        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _legacy_expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
         dialog = QDialog(self)
@@ -7394,6 +7600,21 @@ class SmartReportApp(QMainWindow):
         parsed_fields = dict(parsed_fields or {})
         source_paths = list(source_paths or [])
         self.load_expense_document_filters()
+        if document.get("order_proposals") or parsed_fields.get("order_proposals"):
+            fields = {**parsed_fields, **document}
+            fields["client_id"] = fields.get("client_id") or str(uuid.uuid4())
+            fields["sync_version"] = server_document.get("server_version") or server_document.get("sync_version")
+            preview_paths = source_paths or document.get("local_attachment_paths") or []
+            if not preview_paths and document.get("has_original"):
+                preview_paths = self._expense_document_original_paths(server_document)
+            server_id = server_document.get("server_document_id")
+            if server_id is None and isinstance(server_document.get("id"), int):
+                server_id = server_document["id"]
+            return self._api_expense_document_review_dialog(
+                server_id, str(preview_paths[0]) if preview_paths else None,
+                fields, [], document.get("allocations") or [],
+                source_paths=source_paths, preview_paths=preview_paths,
+            )
         client_id = str(document.get("client_id") or parsed_fields.get("client_id") or uuid.uuid4())
         existing_allocations = list(document.get("allocations") or [])
         dialog = QDialog(self)
@@ -7677,6 +7898,13 @@ class SmartReportApp(QMainWindow):
             for path, extraction in extractions if extraction.text.strip()
         ]
         combined_text = "\n\n".join(text_parts)
+        source_indices = {str(path): index for index, path in enumerate(paths)}
+        order_proposal = parse_project_order_allocations([
+            {"source": Path(path).name, "page": page + 1, "text": page_text,
+             "attachment_index": source_indices[str(path)]}
+            for path, extraction in extractions
+            for page, page_text in enumerate(extraction.pages or (extraction.text,))
+        ])
         parsed = parse_document_text(combined_text) if combined_text else {
             "supplier_name": "", "document_date": None, "gross_amount": None,
             "vat_amount": None, "currency_code": "SEK", "document_type": "manual",
@@ -7691,6 +7919,10 @@ class SmartReportApp(QMainWindow):
         else:
             recognition_message = "Распознавание не выполнено; оригинал будет сохранён, заполните поля вручную."
         parsed["raw_text"] = combined_text
+        parsed["order_proposals"] = order_proposal["orders"]
+        parsed["order_proposal_warnings"] = order_proposal["warnings"]
+        if order_proposal["warnings"]:
+            recognition_message += " " + "; ".join(order_proposal["warnings"])
         self._expense_document_review_dialog(
             document=None, source_paths=paths, parsed_fields=parsed,
             recognition_message=recognition_message,
@@ -7762,7 +7994,7 @@ class SmartReportApp(QMainWindow):
         if document:
             self._open_expense_document_original(document)
 
-    def _open_expense_document_original(self, document):
+    def _expense_document_original_paths(self, document):
         local_paths = document.get("local_attachment_paths") or []
         if local_paths:
             paths = [Path(path) for path in local_paths if Path(path).is_file()]
@@ -7794,7 +8026,11 @@ class SmartReportApp(QMainWindow):
                     paths.append(path)
                 except Exception as error:
                     QMessageBox.warning(self, "Оригинал", f"Не удалось загрузить вложение: {error}")
-                    return
+                    return []
+        return paths
+
+    def _open_expense_document_original(self, document):
+        paths = self._expense_document_original_paths(document)
         if not paths:
             QMessageBox.information(self, "Оригинал", "У документа пока нет оригиналов.")
             return

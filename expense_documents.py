@@ -39,6 +39,7 @@ class ExtractionResult:
     text: str
     method: str
     confidence: float | None
+    pages: tuple[str, ...] = ()
 
 
 def parse_decimal(value: Any) -> Decimal | None:
@@ -267,6 +268,211 @@ def parse_document_text(text: str) -> dict[str, Any]:
         "review_reasons": reasons,
         "raw_text": full_text,
     }
+
+
+def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, Any]:
+    money_token = r"-?\d[\d.,' \u00a0]*"
+
+    def parse_order_amount(raw):
+        raw = raw.strip()
+        valid_formats = (
+            r"-?(?:\d+(?:[,.]\d{1,2})?"
+            r"|\d{1,3}(?:[ '\u00a0]\d{3})+(?:[,.]\d{1,2})?"
+            r"|\d{1,3}(?:\.\d{3})+,\d{1,2}"
+            r"|\d{1,3}(?:,\d{3})+\.\d{1,2})"
+        )
+        return parse_decimal(raw) if re.fullmatch(valid_formats, raw) else None
+
+    project_pattern = re.compile(
+        r"^\s*Proj\s*\.\s*nr\s*\.?\s*[:#]?\s*([\w][\w./-]*)\b",
+        re.IGNORECASE,
+    )
+    order_pattern = re.compile(
+        r"^\s*(?:Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer)\s*[:#]?\s*([\w./-]+)",
+        re.IGNORECASE,
+    )
+    total_pattern = re.compile(
+        r"^\s*Summa\s+order\s*(?:exkl\.?\s*moms)?\s*[:=]?\s*"
+        rf"({money_token})",
+        re.IGNORECASE,
+    )
+    vat_pattern = re.compile(
+        r"^\s*(?:Moms(?:belopp)?\s+(?:på\s+)?order|Ordermoms|VAT\s+order(?:\s+amount)?)"
+        r"\s*(?:(?P<rate>\d+(?:[,.]\d+)?)\s*%)?\s*[:=]\s*"
+        rf"(?P<amount>{money_token})",
+        re.IGNORECASE,
+    )
+
+    current_project = None
+    current_order = None
+    last_order_key = None
+    orders_by_key = {}
+    warnings = []
+    for page in pages:
+        source_name = str(page.get("source") or page.get("name") or "PDF")
+        page_number = int(page.get("page") or 1)
+        for line_number, line in enumerate(str(page.get("text") or "").splitlines(), 1):
+            project_match = project_pattern.search(line)
+            if project_match:
+                new_project = project_match.group(1).strip()
+                if current_project and new_project.casefold() != current_project.casefold():
+                    current_order = None
+                    last_order_key = None
+                current_project = new_project
+            order_match = order_pattern.search(line)
+            if order_match:
+                new_order = order_match.group(1).strip()
+                if current_order is None or new_order.casefold() != current_order.casefold():
+                    last_order_key = None
+                current_order = new_order
+            vat_match = vat_pattern.search(line)
+            if vat_match:
+                vat_amount = parse_order_amount(vat_match.group("amount"))
+                target = orders_by_key.get(last_order_key)
+                if vat_amount is not None and target is not None:
+                    components = target.setdefault("vat_components", {})
+                    vat_value = Decimal(decimal_text(vat_amount))
+                    component_key = decimal_text(parse_decimal(vat_match.group("rate"))) or "total"
+                    if (
+                        component_key in components and components[component_key] != vat_value
+                        or component_key == "total" and any(key != "total" for key in components)
+                        or component_key != "total" and "total" in components
+                    ):
+                        target["ambiguous"] = True
+                        target["vat_ambiguous"] = True
+                        warnings.append(f"Неоднозначный VAT заказа {current_order or current_project}: {source_name}, стр. {page_number}.")
+                    else:
+                        components[component_key] = vat_value
+                    target["sources"].append({
+                        "source": source_name, "page": page_number,
+                        "line": line_number, "text": line.strip(),
+                        "attachment_index": int(page.get("attachment_index") or 0),
+                    })
+                elif vat_amount is not None:
+                    warnings.append(f"Moms order utan найденного Summa order: {source_name}, стр. {page_number}.")
+                else:
+                    warnings.append(f"Неоднозначный формат VAT заказа: {source_name}, стр. {page_number}.")
+                continue
+            total_match = total_pattern.search(line)
+            if not total_match:
+                continue
+            amount = parse_order_amount(total_match.group(1))
+            if amount is None:
+                warnings.append(f"Не удалось прочитать Summa order: {source_name}, стр. {page_number}.")
+                continue
+            amount = Decimal(decimal_text(amount))
+            source = {
+                "source": source_name,
+                "page": page_number,
+                "line": line_number,
+                "text": line.strip(),
+                "attachment_index": int(page.get("attachment_index") or 0),
+            }
+            if current_order:
+                key = ("order", current_order.casefold(), (current_project or "").casefold())
+            else:
+                key = ("project-total", (current_project or "").casefold(), decimal_text(amount))
+            existing = orders_by_key.get(key)
+            if existing is not None:
+                if existing["net_amount"] != decimal_text(amount):
+                    existing["ambiguous"] = True
+                    warnings.append(
+                        f"Повторный Order/Summa order имеет разные суммы: {source_name}, стр. {page_number}."
+                    )
+                elif not current_order:
+                    existing["ambiguous"] = True
+                    warnings.append(
+                        f"Повторный итог без номера заказа неоднозначен и не просуммирован повторно: "
+                        f"{current_project or 'код не найден'}, {source_name}, стр. {page_number}."
+                    )
+                existing["sources"].append(source)
+                last_order_key = key
+                continue
+            orders_by_key[key] = {
+                "order_id": current_order,
+                "project_code": current_project,
+                "net_amount": decimal_text(amount),
+                "vat_amount": None,
+                "sources": [source],
+                "ambiguous": current_project is None,
+                "vat_components": {},
+            }
+            last_order_key = key
+            if current_project is None:
+                warnings.append(f"Summa order без Proj.nr: {source_name}, стр. {page_number}.")
+
+    orders = list(orders_by_key.values())
+    for order in orders:
+        components = order.pop("vat_components", {})
+        if components and not order.pop("vat_ambiguous", False):
+            vat_amount = sum(components.values(), Decimal(0))
+            order["vat_amount"] = decimal_text(vat_amount)
+            order["gross_amount"] = decimal_text(Decimal(order["net_amount"]) + vat_amount)
+        else:
+            warnings.append(
+                f"НДС для заказа {order.get('order_id') or order.get('project_code') or 'без кода'} "
+                "не распознан; распределение требует ручной сверки."
+            )
+    total_net = sum((Decimal(item["net_amount"]) for item in orders), Decimal(0))
+    return {
+        "orders": orders,
+        "net_total": decimal_text(total_net),
+        "warnings": list(dict.fromkeys(warnings)),
+        "requires_review": bool(warnings) or any(item["ambiguous"] for item in orders),
+    }
+
+
+def build_project_order_allocations(orders, net_amount, vat_amount, gross_amount):
+    totals = [parse_decimal(value) for value in (net_amount, vat_amount, gross_amount)]
+    if any(value is None for value in totals):
+        raise ValueError("Для сверки заказов укажите net, VAT и gross фактуры.")
+    expected = [Decimal(decimal_text(value)) for value in totals]
+    if expected[0] + expected[1] != expected[2]:
+        raise ValueError("Net плюс VAT должны равняться gross фактуры.")
+    actual = [Decimal(0), Decimal(0), Decimal(0)]
+    grouped = {}
+    project_objects = {}
+    for order in orders:
+        if order.get("ambiguous") or not str(order.get("project_code") or "").strip():
+            raise ValueError("Исправьте и сверьте неоднозначные строки заказов по оригиналу.")
+        if order.get("object_id") is None:
+            raise ValueError("Выберите существующий объект для каждого заказа.")
+        net_value = parse_decimal(order.get("net_amount"))
+        vat_value = parse_decimal(order.get("vat_amount"))
+        if net_value is None or vat_value is None:
+            raise ValueError("Для каждого заказа нужны явные net и VAT; пропорциональный расчёт запрещён.")
+        net_value = Decimal(decimal_text(net_value))
+        vat_value = Decimal(decimal_text(vat_value))
+        gross_value = net_value + vat_value
+        object_id = int(order["object_id"])
+        project_key = str(order["project_code"]).strip().casefold()
+        if project_key in project_objects and project_objects[project_key] != object_id:
+            raise ValueError("Один код проекта не может обозначать разные объекты одного поставщика.")
+        project_objects[project_key] = object_id
+        if object_id not in grouped:
+            grouped[object_id] = {
+                "object_id": object_id, "net_amount": Decimal(0),
+                "vat_amount": Decimal(0), "gross_amount": Decimal(0), "notes": [],
+            }
+        allocation = grouped[object_id]
+        for index, (key, value) in enumerate((
+            ("net_amount", net_value), ("vat_amount", vat_value), ("gross_amount", gross_value),
+        )):
+            allocation[key] += value
+            actual[index] += value
+        pages = ",".join(str(source.get("page")) for source in order.get("sources") or [])
+        allocation["notes"].append(
+            f"Proj.nr. {order['project_code']}; Order {order.get('order_id') or '—'}; стр. {pages}"
+        )
+    if actual != expected:
+        raise ValueError("Суммы заказов должны точно совпасть с net, VAT и gross фактуры.")
+    return [{
+        "object_id": item["object_id"],
+        "net_amount": decimal_text(item["net_amount"]),
+        "vat_amount": decimal_text(item["vat_amount"]),
+        "gross_amount": decimal_text(item["gross_amount"]),
+        "note": "; ".join(item["notes"])[:500],
+    } for item in grouped.values()]
 
 
 def find_document_duplicates(
@@ -831,7 +1037,7 @@ def extract_local_document(path: str | Path, ocr_engine: Any = None) -> Extracti
             method = "текст PDF"
         text = "\n\n".join(page for page in pages if page)
         confidence = sum(confidence_values) / len(confidence_values) if confidence_values else (1.0 if text else 0.0)
-        return ExtractionResult(text=text, method=method, confidence=confidence)
+        return ExtractionResult(text=text, method=method, confidence=confidence, pages=tuple(pages))
 
     try:
         import numpy as np
@@ -850,7 +1056,7 @@ def extract_local_document(path: str | Path, ocr_engine: Any = None) -> Extracti
             confidences.append(float(detection[2]))
     text = "\n".join(lines)
     confidence = sum(confidences) / len(confidences) if confidences else (0.0 if not text else None)
-    return ExtractionResult(text=text, method="локальный OCR", confidence=confidence)
+    return ExtractionResult(text=text, method="локальный OCR", confidence=confidence, pages=(text,))
 
 
 def create_migration_backup(database_path: str | Path, backup_dir: str | Path) -> Path:

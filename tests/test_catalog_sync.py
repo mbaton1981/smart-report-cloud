@@ -365,6 +365,180 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(parsed["vat_amount"], "25.00")
         self.assertEqual(parsed["gross_amount"], "125.00")
 
+    def test_project_order_parser_carries_page_state_deduplicates_and_keeps_code_prefix(self):
+        from expense_documents import parse_project_order_allocations
+
+        parsed = parse_project_order_allocations([
+            {"source": "invoice.pdf", "page": 1, "text": "Proj.nr.: P1022\nOrder nr: A-1\nOrder rows continue"},
+            {"source": "invoice.pdf", "page": 2, "text": "Summa order: 100.00\nProj.nr.: 1022\nOrder nr: B-1\nSumma order: 50.00"},
+            {"source": "invoice.pdf", "page": 3, "text": "Proj.nr.: P1022\nOrder nr: A-1\nSumma order: 100.00"},
+        ])
+        self.assertEqual(len(parsed["orders"]), 2)
+        self.assertEqual(parsed["orders"][0]["project_code"], "P1022")
+        self.assertEqual(parsed["orders"][0]["net_amount"], "100.00")
+        self.assertEqual([source["page"] for source in parsed["orders"][0]["sources"]], [2, 3])
+        self.assertEqual(parsed["orders"][1]["project_code"], "1022")
+        self.assertEqual(parsed["net_total"], "150.00")
+        self.assertTrue(parsed["requires_review"])
+        self.assertTrue(any("НДС для заказа" in warning for warning in parsed["warnings"]))
+
+    def test_project_order_parser_uses_only_explicit_order_vat_and_flags_ambiguous_repeat(self):
+        from expense_documents import parse_project_order_allocations
+
+        explicit = parse_project_order_allocations([
+            {"source": "vat-invoice.pdf", "page": 1, "text": "Proj.nr.: P1022\nOrder nr: A-10\nSumma order: 100.00\nMoms order: 25.00"},
+            {"source": "vat-invoice.pdf", "page": 2, "text": "Proj.nr.: P1022\nOrder nr: B-20\nSumma order: 50.00\nMoms order: 12.50"},
+        ])
+        self.assertEqual(explicit["net_total"], "150.00")
+        self.assertEqual([order["vat_amount"] for order in explicit["orders"]], ["25.00", "12.50"])
+        self.assertEqual([order["gross_amount"] for order in explicit["orders"]], ["125.00", "62.50"])
+        self.assertFalse(explicit["requires_review"])
+
+        ambiguous = parse_project_order_allocations([
+            {"source": "repeat.pdf", "page": 1, "text": "Proj.nr.: P1022\nSumma order: 100.00"},
+            {"source": "repeat.pdf", "page": 2, "text": "Proj.nr.: P1022\nSumma order: 100.00"},
+        ])
+        self.assertEqual(len(ambiguous["orders"]), 1)
+        self.assertEqual(ambiguous["net_total"], "100.00")
+        self.assertTrue(ambiguous["requires_review"])
+        self.assertEqual([source["page"] for source in ambiguous["orders"][0]["sources"]], [1, 2])
+
+    def test_project_order_parser_handles_rates_conflicts_and_new_order_vat(self):
+        from expense_documents import parse_project_order_allocations
+
+        rates = parse_project_order_allocations([
+            {"source": "rates.pdf", "page": 1, "text":
+             "Proj.nr.: P1022\nOrder nr: A\nSumma order: 200.00\nMoms order 25%: 25.00\nMoms order 12%: 25.00"},
+            {"source": "rates.pdf", "page": 2, "text":
+             "Order nr: A\nSumma order: 200.00\nMoms order 25%: 25.00\nMoms order 12%: 25.00"},
+        ])
+        self.assertEqual(rates["orders"][0]["vat_amount"], "50.00")
+        self.assertEqual(rates["orders"][0]["gross_amount"], "250.00")
+        self.assertFalse(rates["requires_review"])
+        conflict = parse_project_order_allocations([{
+            "source": "conflict.pdf", "page": 1, "text":
+            "Proj.nr.: P1022\nOrder nr: A\nSumma order: 100.00\nMoms order: 25.00\nMoms order: 12.00",
+        }])
+        self.assertTrue(conflict["requires_review"])
+        self.assertIsNone(conflict["orders"][0]["vat_amount"])
+        self.assertNotIn("gross_amount", conflict["orders"][0])
+        new_order = parse_project_order_allocations([{
+            "source": "orders.pdf", "page": 1, "text":
+            "Proj.nr.: P1022\nOrder nr: A\nSumma order: 100.00\nMoms order: 25.00\n"
+            "Order nr: B\nMoms order: 6.00\nSumma order: 50.00",
+        }])
+        self.assertEqual(new_order["orders"][0]["vat_amount"], "25.00")
+        self.assertIsNone(new_order["orders"][1]["vat_amount"])
+        self.assertTrue(new_order["requires_review"])
+
+    def test_project_order_parser_never_reads_partial_money_tokens(self):
+        from expense_documents import parse_project_order_allocations
+
+        for amount in ("1 234,56", "1.234,56", "1,234.56", "1234.56"):
+            with self.subTest(amount=amount):
+                result = parse_project_order_allocations([{
+                    "page": 1, "text":
+                    f"Proj.nr.: P1022\nOrder nr: A\nSumma order: {amount}\nMoms order: 0.00",
+                }])
+                self.assertEqual(result["orders"][0]["net_amount"], "1234.56")
+                self.assertFalse(result["requires_review"])
+        for amount in ("1.234", "1 23", "100.00.00"):
+            with self.subTest(ambiguous=amount):
+                result = parse_project_order_allocations([{
+                    "page": 1, "text": f"Proj.nr.: P1022\nOrder nr: A\nSumma order: {amount}",
+                }])
+                self.assertEqual(result["orders"], [])
+                self.assertTrue(result["requires_review"])
+
+    def test_project_order_allocations_group_objects_and_require_explicit_vat(self):
+        from expense_documents import build_project_order_allocations
+
+        orders = [
+            {"project_code": "P1022", "order_id": "A", "object_id": 11,
+             "net_amount": "100.00", "vat_amount": "25.00", "sources": [{"page": 1}]},
+            {"project_code": "P1022", "order_id": "B", "object_id": 11,
+             "net_amount": "100.00", "vat_amount": "12.00", "sources": [{"page": 2}]},
+        ]
+        allocations = build_project_order_allocations(orders, "200.00", "37.00", "237.00")
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0]["object_id"], 11)
+        self.assertEqual(allocations[0]["net_amount"], "200.00")
+        self.assertEqual(allocations[0]["vat_amount"], "37.00")
+        self.assertEqual(allocations[0]["gross_amount"], "237.00")
+        self.assertIn("Order B", allocations[0]["note"])
+        with self.assertRaisesRegex(ValueError, "точно совпасть"):
+            build_project_order_allocations(orders, "200.01", "37.00", "237.01")
+        orders[1]["vat_amount"] = None
+        with self.assertRaisesRegex(ValueError, "явные net и VAT"):
+            build_project_order_allocations(orders, "200.00", "37.00", "237.00")
+
+    def test_expense_order_api_roundtrip_confirmation_and_supplier_code_links(self):
+        connection = self.server.get_db_connection()
+        connection.executemany(
+            "INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active) "
+            "VALUES ('Renatur', ?, ?, 0, 0, 1)",
+            [("Order object one", "P1022"), ("Order object two", "1022")],
+        )
+        connection.commit()
+        objects = connection.execute(
+            "SELECT id FROM meta_objects WHERE name IN ('Order object one', 'Order object two') ORDER BY id"
+        ).fetchall()
+        connection.close()
+        first_id, second_id = [int(row["id"]) for row in objects]
+        source = {"source": "orders.pdf", "page": 2, "line": 3,
+                  "text": "Summa order: 20.00", "attachment_index": 0}
+        orders = [
+            {"project_code": "P1022", "order_id": "A", "object_id": first_id,
+             "net_amount": "100.00", "vat_amount": "25.00", "sources": []},
+            {"project_code": "P1022", "order_id": "B", "object_id": first_id,
+             "net_amount": "50.00", "vat_amount": "6.00", "sources": []},
+            {"project_code": "1022", "order_id": "C", "object_id": second_id,
+             "net_amount": "20.00", "vat_amount": None, "sources": [source]},
+        ]
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        payload = {
+            "client_id": str(uuid.uuid4()), "supplier_name": "Order supplier",
+            "document_date": "2026-10-17", "currency_code": "SEK",
+            "net_amount": "170.00", "vat_amount": "31.00", "gross_amount": "201.00",
+            "verification_status": "confirmed", "order_proposals": orders, "allocations": [],
+        }
+        blocked = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(blocked.status_code, 400, blocked.get_json())
+        payload["verification_status"] = "requires_review"
+        saved = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(saved.status_code, 201, saved.get_json())
+        document = saved.get_json()["document"]
+        self.assertEqual(document["allocations"], [])
+        self.assertEqual(document["order_proposals"][2]["sources"], [source])
+        links_endpoint = "/api/expense-project-code-links?supplier_name=Order%20supplier"
+        self.assertEqual(self.server_client.get(links_endpoint, headers=headers).get_json()["links"], [])
+
+        orders[2]["vat_amount"] = "0.00"
+        payload["verification_status"] = "confirmed"
+        payload["expected_version"] = document["sync_version"]
+        updated = self.server_client.put(
+            f"/api/expense-documents/{document['id']}", headers=headers, json=payload,
+        )
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        confirmed = updated.get_json()["document"]
+        self.assertEqual(confirmed["verification_status"], "confirmed")
+        self.assertEqual(len(confirmed["allocations"]), 2)
+        self.assertEqual(confirmed["allocations"][0]["gross_amount"], "181.00")
+        self.assertEqual(confirmed["allocations"][0]["vat_amount"], "31.00")
+        self.assertEqual(confirmed["allocations"][1]["gross_amount"], "20.00")
+        links = self.server_client.get(links_endpoint, headers=headers).get_json()["links"]
+        self.assertEqual({row["project_code"]: row["object_id"] for row in links}, {
+            "P1022": first_id, "1022": second_id,
+        })
+        other_supplier = self.server_client.get(
+            "/api/expense-project-code-links?supplier_name=Other", headers=headers,
+        ).get_json()
+        self.assertEqual(other_supplier["links"], [])
+        stale = self.server_client.put(
+            f"/api/expense-documents/{document['id']}", headers=headers, json=payload,
+        )
+        self.assertEqual(stale.status_code, 409, stale.get_json())
+
     def test_expense_company_allocation_attachments_and_delete_tombstone(self):
         client_id = str(uuid.uuid4())
         server_conn = self.server.get_db_connection()
@@ -556,11 +730,19 @@ class CatalogSyncTests(unittest.TestCase):
             "supplier_name": "Offline supplier",
             "document_date": "2026-10-17",
             "currency_code": "SEK",
+            "net_amount": "100.00",
             "gross_amount": "125.00",
             "vat_amount": "25.00",
             "verification_status": "requires_review",
             "allocations": [{
                 "object_id": None, "gross_amount": "50.00", "vat_amount": "10.00",
+            }],
+            "order_proposals": [{
+                "project_code": "P1022", "order_id": "Offline-order", "object_id": None,
+                "net_amount": "100.00", "vat_amount": "25.00", "gross_amount": "125.00",
+                "ambiguous": False,
+                "sources": [{"source": attachment_path.name, "page": 3, "line": 7,
+                             "text": "Summa order: 100.00", "attachment_index": 0}],
             }],
         }
         harness = SimpleNamespace()
@@ -646,6 +828,11 @@ class CatalogSyncTests(unittest.TestCase):
                 (document["id"],),
             ).fetchone()[0]
             server_conn.close()
+            second_client_document = self.server.app.test_client().get(
+                f"/api/expense-documents/{document['id']}",
+                headers={"X-Sync-Key": "isolated-sync-test-key"},
+            ).get_json()["document"]
+            self.assertEqual(second_client_document["order_proposals"], payload["order_proposals"])
             original = self.server_client.get(
                 f"/api/expense-documents/{document['id']}/attachments/{attachment_id}/original",
                 headers={"X-Sync-Key": "isolated-sync-test-key"},
@@ -741,6 +928,7 @@ class CatalogSyncTests(unittest.TestCase):
                 "client_id": client_id, "supplier_name": "Old server test",
                 "currency_code": "SEK", "gross_amount": "25.00",
                 "verification_status": "requires_review", "allocations": [],
+                "order_proposals": [{"project_code": "P1022", "net_amount": "20.00"}],
             }, attachment_paths=[attachment_path],
         )
         calls = []
@@ -770,6 +958,22 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.close()
         self.assertEqual(pending["state"], "pending")
         self.assertIn("старый", pending["last_error"])
+        calls.clear()
+
+        def version_two_without_orders(method, _url, **_kwargs):
+            calls.append(method)
+            return SimpleNamespace(status_code=200, json=lambda: {
+                "ok": True, "api_version": 2, "features": [
+                    "client_id", "soft_delete", "attachments",
+                    "nullable_company_allocations", "versioned_updates",
+                ],
+            })
+
+        with patch.object(self.desktop.requests, "request", side_effect=version_two_without_orders):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(calls, ["GET"])
+        self.assertTrue(attachment_path.is_file())
 
     def test_expense_ui_has_one_section_with_two_views(self):
         class Response:
@@ -1370,6 +1574,108 @@ class CatalogSyncTests(unittest.TestCase):
             'OB1 (19:00–21:00) — Helgdag 2026-10-19 19:00–21:00',
         )
 
+    def test_expense_order_upload_reviews_pages_and_queues_explicit_allocations(self):
+        from expense_documents import ExtractionResult
+
+        connection = self.server.get_db_connection()
+        connection.execute(
+            "INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active) "
+            "VALUES ('Renatur', 'Order UI object', 'P1022', 0, 0, 1)"
+        )
+        object_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        connection.commit()
+        connection.close()
+
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            return Response(self.server_client.open(
+                urlsplit(url).path, method=method, headers=kwargs.get("headers", {}),
+                query_string=kwargs.get("params"), json=kwargs.get("json"), data=kwargs.get("data"),
+            ))
+
+        pages = (
+            "Proj.nr.: P1022\nOrder nr: A\nSumma order: 100.00\nMoms order: 25.00",
+            "Proj.nr.: P1022\nOrder nr: B\nSumma order: 50.00\nMoms order: 6.00",
+            "Proj.nr.: 1022\nOrder nr: C\nSumma order: 20.00",
+        )
+        extraction = ExtractionResult("\n".join(pages), "test text", 1.0, pages)
+        source = Path(self._case.name) / "orders.pdf"
+        source.write_bytes(b"isolated synthetic invoice")
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+
+            def review_and_confirm(dialog):
+                table = dialog.findChild(self.desktop.QTableWidget, "expenseOrderProposals")
+                self.assertIsNotNone(table)
+                self.assertEqual(table.rowCount(), 3)
+                dialog.findChild(self.desktop.QPushButton, "expenseAddOrder").click()
+                self.assertEqual(table.rowCount(), 4)
+                table.setCurrentCell(3, 0)
+                dialog.findChild(self.desktop.QPushButton, "expenseRemoveOrder").click()
+                self.assertEqual(table.rowCount(), 3)
+                self.assertEqual(table.cellWidget(0, 2).currentData(), object_id)
+                self.assertIsNone(table.cellWidget(2, 2).currentData())
+                self.assertEqual(table.item(2, 4).text(), "")
+                self.assertEqual(table.item(2, 5).text(), "")
+                reviewed = dialog.findChild(self.desktop.QCheckBox, "expenseOrdersReviewed")
+                reviewed.setChecked(True)
+                confirm = dialog.findChild(self.desktop.QPushButton, "expenseOrdersConfirm")
+                confirm.click()
+                self.assertEqual(warnings.call_count, 1)
+                connection = self.desktop.get_db_connection()
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox").fetchone()[0], 0)
+                connection.close()
+                table.cellWidget(2, 2).setCurrentIndex(table.cellWidget(2, 2).findData(object_id))
+                table.item(2, 4).setText("0.00")
+                self.assertEqual(table.item(2, 5).text(), "20.00")
+                confirm.click()
+                return dialog.result()
+
+            with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(source)], "")), \
+                 patch("expense_documents.extract_local_document", return_value=extraction), \
+                 patch.object(self.desktop, "parse_document_text", return_value={
+                     "supplier_name": "UI order supplier", "document_date": "2026-10-17",
+                     "currency_code": "SEK", "net_amount": "170.00", "vat_amount": "31.00",
+                     "gross_amount": "201.00", "review_reasons": [],
+                 }), \
+                 patch.object(self.desktop, "load_document_preview_pixmap", return_value=self.desktop.QPixmap()), \
+                 patch.object(self.desktop.QDialog, "exec", new=review_and_confirm), \
+                 patch.object(self.desktop.QMessageBox, "warning") as warnings, \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.upload_expense_document()
+
+            connection = self.desktop.get_db_connection()
+            queued = connection.execute("SELECT payload_json, attachment_paths_json FROM expense_document_outbox").fetchone()
+            connection.close()
+            self.assertIsNotNone(queued)
+            payload = json.loads(queued["payload_json"])
+            self.assertEqual(payload["verification_status"], "confirmed")
+            self.assertEqual(len(payload["allocations"]), 1)
+            self.assertEqual(payload["allocations"][0]["gross_amount"], "201.00")
+            self.assertEqual(payload["allocations"][0]["vat_amount"], "31.00")
+            self.assertEqual([item["sources"][0]["page"] for item in payload["order_proposals"]], [1, 2, 3])
+            self.assertEqual(payload["order_proposals"][2]["project_code"], "1022")
+            self.assertEqual(len(json.loads(queued["attachment_paths_json"])), 1)
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_expense_form_queues_manual_company_document(self):
         class Response:
             def __init__(self, response):
@@ -1621,9 +1927,10 @@ class CatalogSyncTests(unittest.TestCase):
             pixmap.fill(self.desktop.QColor("#2b6cb0" if index == 0 else "#2f855a"))
             self.assertTrue(pixmap.save(str(path), "PNG"))
             photo_paths.append(path)
-        gallery = self.desktop.DocumentGalleryDialog(photo_paths, "Photo bundle")
+        gallery = self.desktop.DocumentGalleryDialog(photo_paths, "Photo bundle", initial_attachment=1)
         try:
             self.assertEqual(len(gallery._pages), 2)
+            self.assertIn("2 / 2", gallery.page_label.text())
             gallery.show_page(1)
             self.assertIn("2 / 2", gallery.page_label.text())
             self.assertFalse(gallery.preview._image.pixmap().isNull())

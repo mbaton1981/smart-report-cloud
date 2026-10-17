@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape
 from flask import Flask, render_template, request, jsonify, session, make_response, send_file, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from expense_documents import allocation_breakdown, decimal_text, parse_decimal
+from expense_documents import allocation_breakdown, build_project_order_allocations, decimal_text, parse_decimal
 from ob_calculator import calculate_work_interval
 import reportlab
 from reportlab.lib import colors
@@ -560,6 +560,7 @@ def init_cloud_db():
             gross_amount TEXT,
             expense_category TEXT NOT NULL DEFAULT 'Прочие расходы',
             document_comment TEXT NOT NULL DEFAULT '',
+            order_proposals_json TEXT NOT NULL DEFAULT '[]',
             verification_status TEXT NOT NULL DEFAULT 'draft'
                 CHECK (verification_status IN ('draft','requires_review','confirmed')),
             recognized_text TEXT NOT NULL DEFAULT '',
@@ -579,6 +580,7 @@ def init_cloud_db():
         ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
         ("deleted_at", "TEXT"),
         ("sync_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("order_proposals_json", "TEXT NOT NULL DEFAULT '[]'"),
     ):
         if column_name not in expense_document_columns:
             cursor.execute(f"ALTER TABLE expense_documents ADD COLUMN {column_name} {column_sql}")
@@ -636,6 +638,17 @@ def init_cloud_db():
         SELECT id, COALESCE(original_name, stored_name), stored_name, file_sha256, 0, created_at
         FROM expense_documents
         WHERE stored_name IS NOT NULL AND file_sha256 IS NOT NULL
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expense_project_code_links (
+            supplier_key TEXT NOT NULL,
+            supplier_name TEXT NOT NULL,
+            project_code_key TEXT NOT NULL,
+            project_code TEXT NOT NULL,
+            object_id INTEGER NOT NULL REFERENCES meta_objects(id) ON DELETE RESTRICT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (supplier_key, project_code_key)
+        )
     ''')
 
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
@@ -897,6 +910,94 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
     return normalized
 
 
+def normalize_project_code_link_part(value):
+    return " ".join(str(value or "").split()).casefold()
+
+
+def validate_expense_order_proposals(cursor, raw_proposals):
+    if not isinstance(raw_proposals, list) or len(raw_proposals) > 100:
+        raise ValueError("Предложения по заказам должны быть списком не более чем из 100 строк.")
+    proposals = []
+    for item in raw_proposals:
+        if not isinstance(item, dict):
+            raise ValueError("Некорректная строка предложения по заказу.")
+        project_code = str(item.get("project_code") or "").strip()[:100]
+        order_id = str(item.get("order_id") or "").strip()[:100]
+        net_amount = parse_decimal(item.get("net_amount"))
+        vat_amount = parse_decimal(item.get("vat_amount"))
+        gross_amount = parse_decimal(item.get("gross_amount"))
+        if gross_amount is not None and net_amount is not None and vat_amount is not None:
+            if Decimal(decimal_text(net_amount)) + Decimal(decimal_text(vat_amount)) != Decimal(decimal_text(gross_amount)):
+                raise ValueError("В предложении по заказу gross должен равняться net плюс явно указанный VAT.")
+        if net_amount is not None and vat_amount is not None:
+            gross_amount = Decimal(decimal_text(net_amount)) + Decimal(decimal_text(vat_amount))
+        object_id = item.get("object_id")
+        if object_id is not None:
+            try:
+                object_id = int(object_id)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Некорректный объект в предложении по заказу.") from error
+            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
+            if cursor.fetchone() is None:
+                raise ValueError("Объект предложения отсутствует в активном серверном справочнике.")
+        sources = item.get("sources") or []
+        if not isinstance(sources, list) or len(sources) > 50:
+            raise ValueError("Некорректные источники предложения по заказу.")
+        normalized_sources = []
+        for source in sources:
+            if not isinstance(source, dict):
+                raise ValueError("Некорректная ссылка на страницу документа.")
+            try:
+                page = int(source.get("page"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("Некорректный номер страницы в предложении.") from error
+            if page < 1:
+                raise ValueError("Номер страницы предложения должен быть положительным.")
+            try:
+                line = int(source.get("line") or 0)
+                attachment_index = int(source.get("attachment_index") or 0)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Некорректный индекс источника предложения.") from error
+            if line < 0 or attachment_index < 0 or attachment_index >= 20:
+                raise ValueError("Индекс источника предложения вне допустимого диапазона.")
+            normalized_sources.append({
+                "source": str(source.get("source") or "")[:255],
+                "page": page,
+                "line": line,
+                "text": str(source.get("text") or "")[:500],
+                "attachment_index": attachment_index,
+            })
+        proposals.append({
+            "project_code": project_code,
+            "order_id": order_id,
+            "net_amount": decimal_text(net_amount),
+            "vat_amount": decimal_text(vat_amount),
+            "gross_amount": decimal_text(gross_amount),
+            "object_id": object_id,
+            "sources": normalized_sources,
+            "ambiguous": bool(item.get("ambiguous")),
+        })
+    return proposals
+
+
+def save_expense_project_code_links(cursor, supplier_name, proposals, now):
+    supplier_key = normalize_project_code_link_part(supplier_name)
+    for proposal in proposals:
+        cursor.execute("""
+            INSERT INTO expense_project_code_links (
+                supplier_key, supplier_name, project_code_key, project_code, object_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(supplier_key, project_code_key) DO UPDATE SET
+                supplier_name = excluded.supplier_name,
+                project_code = excluded.project_code,
+                object_id = excluded.object_id,
+                updated_at = excluded.updated_at
+        """, (
+            supplier_key, supplier_name, normalize_project_code_link_part(proposal["project_code"]),
+            proposal["project_code"], proposal["object_id"], now,
+        ))
+
+
 def serialize_expense_document(cursor, document, include_text=False):
     cursor.execute("""
         SELECT a.object_id, o.name AS object_name, o.company, o.markning,
@@ -959,6 +1060,7 @@ def serialize_expense_document(cursor, document, include_text=False):
         "gross_amount": decimal_text(document["gross_amount"]),
         "expense_category": document["expense_category"],
         "document_comment": document["document_comment"],
+        "order_proposals": json.loads(document["order_proposals_json"] or "[]"),
         "verification_status": document["verification_status"],
         "original_name": document["original_name"],
         "has_original": bool(attachments),
@@ -1045,8 +1147,58 @@ def expense_document_capabilities_api():
         "features": [
             "client_id", "soft_delete", "attachments",
             "nullable_company_allocations", "versioned_updates",
+            "order_proposals", "supplier_project_code_links",
         ],
     })
+
+
+@app.route("/api/expense-project-code-links", methods=["GET", "POST"])
+def expense_project_code_links_api():
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    if request.method == "GET":
+        supplier_key = normalize_project_code_link_part(request.args.get("supplier_name"))
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT supplier_name, project_code, object_id FROM expense_project_code_links "
+                "WHERE supplier_key = ? ORDER BY project_code_key",
+                (supplier_key,),
+            ).fetchall()
+            return jsonify({"ok": True, "links": [dict(row) for row in rows]})
+        finally:
+            conn.close()
+
+    payload = expense_request_payload()
+    supplier_name = " ".join(str(payload.get("supplier_name") or "").split())[:200]
+    project_code = " ".join(str(payload.get("project_code") or "").split())[:100]
+    supplier_key = normalize_project_code_link_part(supplier_name)
+    project_code_key = normalize_project_code_link_part(project_code)
+    try:
+        object_id = int(payload.get("object_id"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Выберите существующий объект."}), 400
+    if not supplier_key or not project_code_key:
+        return jsonify({"ok": False, "error": "Поставщик и код проекта обязательны."}), 400
+    conn = get_db_connection()
+    try:
+        if conn.execute("SELECT 1 FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,)).fetchone() is None:
+            return jsonify({"ok": False, "error": "Объект отсутствует в активном серверном справочнике."}), 400
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            INSERT INTO expense_project_code_links (
+                supplier_key, supplier_name, project_code_key, project_code, object_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(supplier_key, project_code_key) DO UPDATE SET
+                supplier_name = excluded.supplier_name,
+                project_code = excluded.project_code,
+                object_id = excluded.object_id,
+                updated_at = excluded.updated_at
+        """, (supplier_key, supplier_name, project_code_key, project_code, object_id, now))
+        conn.commit()
+        return jsonify({"ok": True, "supplier_name": supplier_name, "project_code": project_code, "object_id": object_id})
+    finally:
+        conn.close()
 
 
 @app.route("/api/expense-documents", methods=["GET"])
@@ -1214,7 +1366,13 @@ def expense_document_create_api():
                     "existing_document_id": int(matching_document["id"]),
                 }), 409
 
-        allocations = resolve_expense_allocations(cursor, payload.get("allocations", []), fields)
+        order_proposals = validate_expense_order_proposals(cursor, payload.get("order_proposals", []))
+        raw_allocations = payload.get("allocations", [])
+        if order_proposals and fields["verification_status"] == "confirmed":
+            raw_allocations = build_project_order_allocations(
+                order_proposals, fields["net_amount"], fields["vat_amount"], fields["gross_amount"],
+            )
+        allocations = resolve_expense_allocations(cursor, raw_allocations, fields)
         uploads = [upload for upload in request.files.getlist("originals") if upload and upload.filename]
         if not uploads:
             upload = request.files.get("original")
@@ -1263,14 +1421,15 @@ def expense_document_create_api():
             INSERT INTO expense_documents (
                 client_id, supplier_name, invoice_number, document_date, currency_code,
                 net_amount, vat_amount, gross_amount, expense_category, document_comment,
-                verification_status, recognized_text, original_name, stored_name,
+                verification_status, recognized_text, order_proposals_json, original_name, stored_name,
                 file_sha256, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             client_id, fields["supplier_name"], fields["invoice_number"], fields["document_date"],
             fields["currency_code"], fields["net_amount"], fields["vat_amount"],
             fields["gross_amount"], fields["expense_category"], fields["document_comment"],
             fields["verification_status"], fields["recognized_text"],
+            json.dumps(order_proposals, ensure_ascii=False),
             primary["original_name"] if primary else None,
             primary["stored_name"] if primary else None,
             primary["file_sha256"] if primary else None, now, now,
@@ -1292,6 +1451,8 @@ def expense_document_create_api():
             document_id, item["original_name"], item["stored_name"],
             item["file_sha256"], item["ordinal"], now,
         ) for item in staged_files])
+        if order_proposals and fields["verification_status"] == "confirmed":
+            save_expense_project_code_links(cursor, fields["supplier_name"], order_proposals, now)
         conn.commit()
         committed = True
         document = cursor.execute(
@@ -1342,6 +1503,10 @@ def expense_document_update_api(document_id):
             }), 409
         if "recognized_text" not in payload:
             fields["recognized_text"] = existing["recognized_text"]
+        if "order_proposals" in payload:
+            order_proposals = validate_expense_order_proposals(cursor, payload.get("order_proposals"))
+        else:
+            order_proposals = json.loads(existing["order_proposals_json"] or "[]")
         if fields["supplier_name"] and fields["invoice_number"] and fields["document_date"] and fields["gross_amount"]:
             matching_document = cursor.execute("""
                 SELECT id FROM expense_documents
@@ -1359,19 +1524,25 @@ def expense_document_update_api(document_id):
                     "ok": False, "error": "Такая фактура уже есть в архиве.",
                     "existing_document_id": int(matching_document["id"]),
                 }), 409
-        allocations = resolve_expense_allocations(cursor, payload.get("allocations", []), fields)
+        raw_allocations = payload.get("allocations", [])
+        if order_proposals and fields["verification_status"] == "confirmed":
+            raw_allocations = build_project_order_allocations(
+                order_proposals, fields["net_amount"], fields["vat_amount"], fields["gross_amount"],
+            )
+        allocations = resolve_expense_allocations(cursor, raw_allocations, fields)
         now = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
             UPDATE expense_documents SET supplier_name=?, invoice_number=?, document_date=?,
                 currency_code=?, net_amount=?, vat_amount=?, gross_amount=?, expense_category=?,
-                document_comment=?, verification_status=?, recognized_text=?, updated_at=?,
+                document_comment=?, verification_status=?, recognized_text=?, order_proposals_json=?, updated_at=?,
                 sync_version=sync_version+1
             WHERE id=? AND sync_version=?
         """, (
             fields["supplier_name"], fields["invoice_number"], fields["document_date"],
             fields["currency_code"], fields["net_amount"], fields["vat_amount"],
             fields["gross_amount"], fields["expense_category"], fields["document_comment"],
-            fields["verification_status"], fields["recognized_text"], now, document_id,
+            fields["verification_status"], fields["recognized_text"],
+            json.dumps(order_proposals, ensure_ascii=False), now, document_id,
             int(existing["sync_version"]),
         ))
         if cursor.rowcount != 1:
@@ -1386,6 +1557,8 @@ def expense_document_update_api(document_id):
             document_id, item["object_id"], item["gross_amount"], item["net_amount"],
             item["vat_amount"], item["note"],
         ) for item in allocations])
+        if order_proposals and fields["verification_status"] == "confirmed":
+            save_expense_project_code_links(cursor, fields["supplier_name"], order_proposals, now)
         conn.commit()
         document = cursor.execute(
             "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
