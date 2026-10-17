@@ -328,14 +328,14 @@ def save_supplier_document(
 
         cursor = conn.execute("""
             INSERT INTO supplier_documents (
-                supplier_id, supplier_name, supplier_org_number, supplier_vat_number,
+                expense_id, supplier_id, supplier_name, supplier_org_number, supplier_vat_number,
                 original_name, file_sha256, document_type, invoice_number, payment_reference,
                 document_date, due_date, currency_code, net_amount, vat_amount, gross_amount,
                 amount_due, expense_category, document_comment, is_reverse_charge, verification_status,
                 payment_status, recognized_text, review_reasons, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            supplier_id, supplier_name or None, supplier_org, supplier_vat,
+            fields.get("expense_id"), supplier_id, supplier_name or None, supplier_org, supplier_vat,
             Path(source_path).name if source_path else None, file_hash, document_type,
             fields.get("invoice_number"), fields.get("payment_reference"),
             fields.get("document_date"), fields.get("due_date"),
@@ -467,23 +467,108 @@ def match_objects(document_text: str, objects: list[dict[str, Any]]) -> list[dic
     return sorted(matches, key=lambda item: (-item["score"], item["name"].casefold()))
 
 
-def validate_allocations(total_gross: Decimal | str, allocations: list[dict[str, Any]]) -> tuple[bool, str]:
+def validate_allocations(
+    total_gross: Decimal | str,
+    allocations: list[dict[str, Any]],
+    allow_partial: bool = False,
+) -> tuple[bool, str]:
     total = parse_decimal(total_gross)
     if total is None:
         return False, "Сначала укажите общую сумму документа."
-    if not allocations:
+    if not allocations and not allow_partial:
         return True, "Документ сохранится без объекта и может быть распределён позже."
-    allocated = []
+    total = total.quantize(CENT, rounding=ROUND_HALF_UP)
+    allocated = Decimal(0)
     for item in allocations:
         amount = parse_decimal(item.get("gross_amount"))
         if amount is None:
             return False, "У каждой строки распределения должна быть сумма."
-        allocated.append(amount)
-    summed = sum(allocated, Decimal(0)).quantize(CENT, rounding=ROUND_HALF_UP)
-    expected = total.quantize(CENT, rounding=ROUND_HALF_UP)
-    if summed != expected:
-        return False, f"Сумма распределения {decimal_text(summed)} не совпадает с документом {decimal_text(expected)}."
-    return True, "Распределение сходится с общей суммой документа."
+        amount = amount.quantize(CENT, rounding=ROUND_HALF_UP)
+        if amount and (total == 0 or (amount > 0) != (total > 0)):
+            return False, "Сумма распределения должна иметь тот же знак, что и сумма документа."
+        allocated += amount
+    allocated = allocated.quantize(CENT, rounding=ROUND_HALF_UP)
+    if abs(allocated) > abs(total):
+        return False, f"Распределено {decimal_text(allocated)}, что больше суммы документа {decimal_text(total)}."
+    remaining = (total - allocated).quantize(CENT, rounding=ROUND_HALF_UP)
+    if not allow_partial and remaining:
+        return False, f"Сумма распределения {decimal_text(allocated)} не совпадает с документом {decimal_text(total)}."
+    if remaining:
+        return True, f"Не распределено: {decimal_text(remaining)}."
+    return True, "Документ распределён полностью."
+
+
+def allocation_breakdown(
+    total_gross: Decimal | str,
+    total_net: Decimal | str | None,
+    total_vat: Decimal | str | None,
+    allocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    valid, message = validate_allocations(total_gross, allocations, allow_partial=True)
+    if not valid:
+        raise ValueError(message)
+
+    gross = (parse_decimal(total_gross) or Decimal(0)).quantize(CENT, rounding=ROUND_HALF_UP)
+    net = parse_decimal(total_net)
+    vat = parse_decimal(total_vat)
+    net = net.quantize(CENT, rounding=ROUND_HALF_UP) if net is not None else None
+    vat = vat.quantize(CENT, rounding=ROUND_HALF_UP) if vat is not None else None
+    gross_rows = [
+        (parse_decimal(item.get("gross_amount")) or Decimal(0)).quantize(CENT, rounding=ROUND_HALF_UP)
+        for item in allocations
+    ]
+    assigned_gross = sum(gross_rows, Decimal(0))
+    fully_allocated = assigned_gross == gross
+    assigned_net = Decimal(0)
+    assigned_vat = Decimal(0)
+    rows = []
+
+    for index, (allocation, row_gross) in enumerate(zip(allocations, gross_rows)):
+        is_last = index == len(gross_rows) - 1
+        if net is None:
+            row_net = None
+        elif fully_allocated and is_last:
+            row_net = net - assigned_net
+        elif gross:
+            row_net = (net * abs(row_gross / gross)).quantize(CENT, rounding=ROUND_HALF_UP)
+            remaining_net = net - assigned_net
+            row_net = min(max(row_net, Decimal(0)), max(remaining_net, Decimal(0))) if net >= 0 else max(min(row_net, Decimal(0)), min(remaining_net, Decimal(0)))
+        else:
+            row_net = Decimal(0)
+        if vat is None:
+            row_vat = None
+        elif fully_allocated and is_last:
+            row_vat = vat - assigned_vat
+        elif net is not None and net + vat == gross and row_net is not None:
+            row_vat = row_gross - row_net
+        elif gross:
+            row_vat = (vat * abs(row_gross / gross)).quantize(CENT, rounding=ROUND_HALF_UP)
+            remaining_vat = vat - assigned_vat
+            row_vat = min(max(row_vat, Decimal(0)), max(remaining_vat, Decimal(0))) if vat >= 0 else max(min(row_vat, Decimal(0)), min(remaining_vat, Decimal(0)))
+        else:
+            row_vat = Decimal(0)
+
+        rows.append({
+            **allocation,
+            "gross_amount": row_gross,
+            "net_amount": row_net,
+            "vat_amount": row_vat,
+        })
+        if row_net is not None:
+            assigned_net += row_net
+        if row_vat is not None:
+            assigned_vat += row_vat
+
+    return {
+        "allocations": rows,
+        "allocated_gross": assigned_gross,
+        "unallocated_gross": gross - assigned_gross,
+        "allocated_net": assigned_net if net is not None else None,
+        "unallocated_net": net - assigned_net if net is not None else None,
+        "allocated_vat": assigned_vat if vat is not None else None,
+        "unallocated_vat": vat - assigned_vat if vat is not None else None,
+        "fully_allocated": fully_allocated,
+    }
 
 
 def is_material_expense_category(category: str | None) -> bool:
@@ -558,21 +643,43 @@ def get_object_expense_summary(
         if denominator == 0:
             continue
 
+        allocation_breakdown_result = allocation_breakdown(
+            document_gross or total_allocated,
+            document_net,
+            document_vat,
+            [
+                {
+                    "object_id": allocation["object_id"],
+                    "gross_amount": allocation["allocated_gross"],
+                    "net_amount": allocation["allocated_net"],
+                    "vat_amount": allocation["allocated_vat"],
+                }
+                for allocation in allocations
+            ],
+        )
         shares: list[dict[str, Any]] = []
         net_assigned = vat_assigned = paid_assigned = due_assigned = Decimal(0)
         for index, allocation in enumerate(allocations):
-            allocated_gross = parse_decimal(allocation["allocated_gross"]) or Decimal(0)
+            breakdown_share = allocation_breakdown_result["allocations"][index]
+            allocated_gross = breakdown_share["gross_amount"]
             is_last = index == len(allocations) - 1
             ratio = allocated_gross / denominator
             allocated_net = parse_decimal(allocation["allocated_net"])
-            if allocated_net is None and document_net is not None:
-                allocated_net = document_net - net_assigned if is_last else (document_net * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
+            if allocated_net is None:
+                allocated_net = breakdown_share["net_amount"]
             allocated_vat = parse_decimal(allocation["allocated_vat"])
-            if allocated_vat is None and document_vat is not None:
-                allocated_vat = document_vat - vat_assigned if is_last else (document_vat * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
-            paid_share = paid_total - paid_assigned if is_last else (paid_total * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
-            due_share = (document_due - due_assigned) if is_last and document_due is not None else (
-                (document_due * ratio).quantize(CENT, rounding=ROUND_HALF_UP) if document_due is not None else allocated_gross
+            if allocated_vat is None:
+                allocated_vat = breakdown_share["vat_amount"]
+            paid_share = (
+                paid_total - paid_assigned
+                if is_last and allocation_breakdown_result["fully_allocated"]
+                else (paid_total * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
+            )
+            due_share = (
+                document_due - due_assigned
+                if is_last and allocation_breakdown_result["fully_allocated"] and document_due is not None
+                else (document_due * ratio).quantize(CENT, rounding=ROUND_HALF_UP)
+                if document_due is not None else allocated_gross
             )
             shares.append({
                 "object_id": int(allocation["object_id"]) if allocation["object_id"] is not None else None,

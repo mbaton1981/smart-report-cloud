@@ -4,9 +4,11 @@ import shutil
 import traceback
 import subprocess
 import sqlite3
+import math
 import requests
 import json
 import uuid
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -48,6 +50,23 @@ SALARIES_DIR = "salaries"
 # 🌐 Адрес облачного сервера на Render и ваш секретный ключ синхронизации
 CLOUD_URL = os.environ.get("SMARTREPORT_CLOUD_URL", "https://smart-report-server.onrender.com")
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
+
+
+def request_expense_api(method, path, **kwargs):
+    if not SYNC_API_KEY:
+        raise RuntimeError("Не задан ключ доступа к общему реестру документов.")
+    headers = dict(kwargs.pop("headers", {}) or {})
+    headers["X-Sync-Key"] = SYNC_API_KEY
+    response = requests.request(
+        method, f"{CLOUD_URL.rstrip('/')}{path}", headers=headers, timeout=20, **kwargs
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if not response.ok:
+        raise RuntimeError(payload.get("error") or f"Сервер вернул HTTP {response.status_code}.")
+    return payload
 
 RECORD_TYPE_WORK = "work"
 RECORD_TYPE_ATF = "atf"
@@ -107,6 +126,90 @@ def get_db_connection():
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
+
+def ensure_local_object_sync_schema(conn):
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(objects)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    for column_name, definition in (
+        ("sync_id", "TEXT"),
+        ("server_id", "INTEGER"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+        ("sync_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE objects ADD COLUMN {column_name} {definition}")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_sync_id ON objects(sync_id) WHERE sync_id IS NOT NULL")
+
+    cursor.execute("PRAGMA index_list(objects)")
+    indexes = cursor.fetchall()
+    unique_name_only = False
+    index_sql = []
+    for index in indexes:
+        index_name = str(index["name"])
+        escaped_name = index_name.replace('"', '""')
+        cursor.execute(f'PRAGMA index_info("{escaped_name}")')
+        indexed_columns = tuple(row["name"] for row in cursor.fetchall())
+        if index["unique"] and indexed_columns == ("name",):
+            unique_name_only = True
+            continue
+        definition = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (index_name,)
+        ).fetchone()
+        if definition and definition[0]:
+            index_sql.append(str(definition[0]))
+
+    if not unique_name_only:
+        conn.commit()
+        return
+
+    triggers = [row[0] for row in cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'objects' AND sql IS NOT NULL"
+    ).fetchall()]
+    conn.commit()
+    foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE objects_sync_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                markning TEXT,
+                company TEXT,
+                rate REAL DEFAULT 0.0,
+                transport_rate REAL DEFAULT 0.0,
+                sync_id TEXT UNIQUE,
+                server_id INTEGER,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                sync_version INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(name, company)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO objects_sync_migration (
+                id, name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+            )
+            SELECT id, name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+            FROM objects
+        """)
+        conn.execute("DROP TABLE objects")
+        conn.execute("ALTER TABLE objects_sync_migration RENAME TO objects")
+        for statement in index_sql:
+            conn.execute(statement)
+        for statement in triggers:
+            conn.execute(statement)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError("Object identity migration would break existing foreign-key links.")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            conn.execute("PRAGMA foreign_keys = ON")
+
 def init_db_once():
     is_new_db = not os.path.exists(DB_FILE)
     
@@ -120,11 +223,16 @@ def init_db_once():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS objects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
             markning TEXT,
             company TEXT,
             rate REAL DEFAULT 0.0,
-            transport_rate REAL DEFAULT 0.0
+            transport_rate REAL DEFAULT 0.0,
+            sync_id TEXT UNIQUE,
+            server_id INTEGER,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            sync_version INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(name, company)
         )
     ''')
     
@@ -134,6 +242,20 @@ def init_db_once():
         cursor.execute("ALTER TABLE objects ADD COLUMN rate REAL DEFAULT 0.0")
     if 'transport_rate' not in obj_columns:
         cursor.execute("ALTER TABLE objects ADD COLUMN transport_rate REAL DEFAULT 0.0")
+    ensure_local_object_sync_schema(conn)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_sync_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL UNIQUE,
+            object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
+            sync_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_object_sync_outbox_pending ON object_sync_outbox(id)")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS employees (
@@ -143,6 +265,72 @@ def init_db_once():
             is_active INTEGER NOT NULL DEFAULT 1
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_sync_outbox (
+            operation_id TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            employee_key TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_employee_sync_outbox_name ON employee_sync_outbox(employee_name)")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_sync_state (
+            employee_key TEXT PRIMARY KEY,
+            employee_name TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('deleted', 'active')),
+            sync_version INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_restore_outbox (
+            operation_id TEXT PRIMARY KEY,
+            employee_key TEXT NOT NULL,
+            employee_name TEXT NOT NULL,
+            salary_rate REAL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_employee_restore_outbox_order ON employee_restore_outbox(created_at, operation_id)")
+    for table_name, columns_to_add in (
+        ("employee_sync_outbox", (("employee_key", "TEXT"), ("revision", "INTEGER NOT NULL DEFAULT 0"))),
+        ("employee_sync_state", (("sync_version", "INTEGER NOT NULL DEFAULT 0"),)),
+        ("employee_restore_outbox", (("salary_rate", "REAL"), ("revision", "INTEGER NOT NULL DEFAULT 0"))),
+    ):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        existing_columns = {column[1] for column in cursor.fetchall()}
+        for column_name, column_definition in columns_to_add:
+            if column_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+    cursor.execute("SELECT operation_id, employee_name FROM employee_sync_outbox WHERE employee_key IS NULL")
+    for pending_delete in cursor.fetchall():
+        employee_key = employee_sync_key(pending_delete["employee_name"])
+        updated_at = datetime.now(timezone.utc).isoformat()
+        cursor.execute(
+            "UPDATE employee_sync_outbox SET employee_key = ?, revision = MAX(revision, 1) WHERE operation_id = ?",
+            (employee_key, pending_delete["operation_id"]),
+        )
+        cursor.execute("""
+            INSERT OR IGNORE INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+            VALUES (?, ?, 'deleted', 1, ?)
+        """, (
+            employee_key, pending_delete["employee_name"], updated_at,
+        ))
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_sync_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL UNIQUE,
+            object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
+            sync_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_object_sync_outbox_order ON object_sync_outbox(id)")
 
     cursor.execute("PRAGMA table_info(employees)")
     emp_columns = [col[1] for col in cursor.fetchall()]
@@ -351,9 +539,489 @@ def init_db_once():
                 INSERT OR IGNORE INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
             ''', (name, mark, comp, rate, tr))
 
+    ensure_object_name_history(cursor)
     conn.commit()
     conn.close()
-    apply_expense_documents_migration(DB_FILE, Path(DB_FILE).resolve().parent / BACKUP_DIR)
+    apply_expense_documents_migration(
+        DB_FILE, Path(DB_FILE).resolve().parent / BACKUP_DIR
+    )
+
+
+def ensure_object_name_history(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS object_name_history (
+            sync_id TEXT NOT NULL, company TEXT NOT NULL, name TEXT NOT NULL,
+            PRIMARY KEY (sync_id, company, name)
+        )
+    """)
+    cursor.execute("""
+        INSERT OR IGNORE INTO object_name_history (sync_id, company, name)
+        SELECT sync_id, company, name FROM objects WHERE sync_id IS NOT NULL
+    """)
+
+
+def invoice_object_names(cursor, object_row):
+    names = {object_row['name']}
+    exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='object_name_history'"
+    ).fetchone()
+    if exists and object_row['sync_id']:
+        names.update(row[0] for row in cursor.execute(
+            "SELECT name FROM object_name_history WHERE sync_id=? AND company=?",
+            (object_row['sync_id'], object_row['company']),
+        ))
+    placeholders = ','.join('?' for _name in names)
+    parameters = (object_row['company'], *sorted(names), object_row['id'])
+    collision = cursor.execute(
+        f"SELECT id FROM objects WHERE company=? AND name IN ({placeholders}) AND id<>? LIMIT 1",
+        parameters,
+    ).fetchone()
+    if exists and not collision:
+        collision = cursor.execute(
+            "SELECT other.id FROM object_name_history history JOIN objects other ON other.sync_id=history.sync_id "
+            f"WHERE history.company=? AND history.name IN ({placeholders}) AND other.id<>? LIMIT 1",
+            parameters,
+        ).fetchone()
+    if collision:
+        raise ValueError("Историческое название связано с несколькими объектами; автоматический отбор заблокирован.")
+    return sorted(names)
+
+
+def enqueue_object_sync_event(cursor, object_id, operation, extra=None):
+    row = cursor.execute("SELECT * FROM objects WHERE id = ?", (int(object_id),)).fetchone()
+    extra_payload = dict(extra or {})
+    sync_id = row["sync_id"] if row is not None else None
+    if operation == "link_legacy" and not sync_id:
+        sync_id = extra_payload.pop("sync_id", None)
+    if row is None or not sync_id:
+        raise ValueError("Объект legacy не сопоставлен с серверным ID; синхронизация заблокирована.")
+    revision = int(row["sync_version"] or 0) + 1
+    event = {
+        "operation_id": str(uuid.uuid4()),
+        "sync_id": str(sync_id),
+        "revision": revision,
+        "operation": str(operation),
+        "object_id": int(row["id"]),
+        "object": {
+            "name": str(row["name"]), "company": str(row["company"] or ""),
+            "markning": str(row["markning"] or ""),
+            "rate": float(row["rate"] or 0.0),
+            "transport_rate": float(row["transport_rate"] or 0.0),
+        },
+    }
+    if extra:
+        event["object"].update(extra_payload)
+    cursor.execute("""
+        INSERT INTO object_sync_outbox (
+            operation_id, object_id, sync_id, operation, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        event["operation_id"], int(row["id"]), event["sync_id"], event["operation"],
+        json.dumps(event, ensure_ascii=False, sort_keys=True), datetime.now(timezone.utc).isoformat(),
+    ))
+    if operation == "link_legacy":
+        cursor.execute(
+            "UPDATE objects SET sync_id = ?, sync_version = ? WHERE id = ?",
+            (event["sync_id"], revision, int(row["id"])),
+        )
+    else:
+        cursor.execute("UPDATE objects SET sync_version = ? WHERE id = ?", (revision, int(row["id"])))
+    return event
+
+
+def merge_server_object_catalog(cursor, remote_objects):
+    if not isinstance(remote_objects, list) or len(remote_objects) > 2000:
+        raise ValueError("Серверный справочник объектов имеет неверный формат или размер.")
+
+    stats = {
+        "imported": 0, "updated": 0, "linked": 0, "unresolved_legacy": 0,
+        "conflicts": 0, "unresolved_reasons": {}, "conflict_reasons": {},
+    }
+
+    def record_reason(bucket, reason):
+        bucket[reason] = bucket.get(reason, 0) + 1
+
+    remote_legacy_counts = {}
+    for item in remote_objects:
+        if not isinstance(item, dict) or str(item.get("sync_id") or "").strip():
+            continue
+        remote_key = (
+            str(item.get("name") or "").strip(),
+            " ".join(str(item.get("company") or "").split()),
+            str(item.get("markning") or "").strip(),
+        )
+        remote_legacy_counts[remote_key] = remote_legacy_counts.get(remote_key, 0) + 1
+
+    for remote in remote_objects:
+        if not isinstance(remote, dict):
+            raise ValueError("Некорректная запись серверного объекта.")
+        try:
+            server_id = int(remote.get("id"))
+            name = str(remote.get("name") or "").strip()
+            company = " ".join(str(remote.get("company") or "").split())
+            markning = str(remote.get("markning") or "").strip()
+            sync_id = str(remote.get("sync_id") or "").strip() or None
+            rate = float(remote.get("rate") or 0.0)
+            transport_rate = float(remote.get("transport_rate") or 0.0)
+            active_value = remote.get("is_active", 1)
+            if active_value not in (0, 1, False, True):
+                raise ValueError()
+            is_active = int(active_value)
+            server_revision = int(remote.get("sync_version") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректные поля серверного объекта.")
+        if (server_id <= 0 or not name or len(name) > 200 or not company or len(company) > 150
+                or len(markning) > 50 or server_revision < 0):
+            raise ValueError("Некорректные поля серверного объекта.")
+        if not 0 <= rate <= 100000 or not 0 <= transport_rate <= 100000 or not math.isfinite(rate) or not math.isfinite(transport_rate):
+            raise ValueError("Некорректные ставки серверного объекта.")
+
+        if sync_id:
+            local = cursor.execute(
+                "SELECT id, name, markning, company, rate, transport_rate, is_active, sync_version "
+                "FROM objects WHERE sync_id = ?",
+                (sync_id,),
+            ).fetchone()
+            if local:
+                if local["company"] != company:
+                    stats["conflicts"] += 1
+                    record_reason(stats["conflict_reasons"], "sync_id закреплён за другой фирмой")
+                    continue
+                pending = cursor.execute(
+                    "SELECT 1 FROM object_sync_outbox WHERE sync_id = ? LIMIT 1", (sync_id,)
+                ).fetchone()
+                if pending:
+                    continue
+                local_revision = int(local["sync_version"] or 0)
+                if server_revision < local_revision:
+                    stats["conflicts"] += 1
+                    record_reason(stats["conflict_reasons"], "серверная revision ниже локальной")
+                    continue
+                if server_revision == local_revision:
+                    local_state = (
+                        local["name"], local["markning"] or "", local["company"],
+                        float(local["rate"] or 0.0), float(local["transport_rate"] or 0.0),
+                        int(bool(local["is_active"])),
+                    )
+                    remote_state = (name, markning, company, rate, transport_rate, is_active)
+                    if local_state != remote_state:
+                        stats["conflicts"] += 1
+                        record_reason(stats["conflict_reasons"], "одинаковая revision содержит разные данные")
+                        continue
+                    if local_revision == server_revision:
+                        cursor.execute(
+                            "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ?",
+                            (server_id, int(local["id"]), sync_id),
+                        )
+                        continue
+                if local['name'] != name:
+                    ensure_object_name_history(cursor)
+                cursor.execute("""
+                    UPDATE objects
+                    SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = ?,
+                        server_id = ?, sync_version = ?
+                    WHERE id = ? AND sync_id = ?
+                """, (
+                    name, markning, rate, transport_rate, is_active, server_id, server_revision,
+                    int(local["id"]), sync_id,
+                ))
+                stats["updated"] += 1
+                continue
+
+        collision = cursor.execute(
+            "SELECT id FROM objects WHERE name = ? AND company = ?", (name, company)
+        ).fetchone()
+        if collision:
+            legacy_key = (name, company, markning)
+            local_candidates = cursor.execute(
+                "SELECT id, sync_id, server_id, sync_version, rate, transport_rate, is_active "
+                "FROM objects WHERE name = ? AND company = ? AND COALESCE(markning, '') = ?",
+                legacy_key,
+            ).fetchall()
+            reasons = []
+            if sync_id:
+                reasons.append("серверная запись уже связана с другим sync_id")
+            if len(local_candidates) == 0:
+                reasons.append("локальная запись не совпадает по markning")
+            elif len(local_candidates) > 1:
+                reasons.append("найдено несколько локальных записей с тем же markning")
+            if not sync_id and remote_legacy_counts.get(legacy_key) != 1:
+                reasons.append("найдено несколько серверных Legacy-кандидатов")
+            if len(local_candidates) == 1:
+                local = local_candidates[0]
+                pending = cursor.execute(
+                    "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1",
+                    (int(local["id"]),),
+                ).fetchone()
+                local_rate = float(local["rate"] or 0.0)
+                local_transport = float(local["transport_rate"] or 0.0)
+                rate_compatible = local_rate == rate or (rate == 0 and local_rate > 0)
+                transport_compatible = (
+                    local_transport == transport_rate
+                    or (transport_rate == 0 and local_transport > 0)
+                )
+                if local["sync_id"] is not None:
+                    reasons.append("локальная запись уже связана с другим sync_id")
+                if local["server_id"] is not None:
+                    reasons.append("у локальной записи уже задан server_id")
+                if pending:
+                    reasons.append("для объекта уже есть ожидающее sync-событие")
+                if int(local["sync_version"] or 0) != server_revision or server_revision != 0:
+                    reasons.append("revision не совпадают или Legacy-связь уже изменялась")
+                if int(bool(local["is_active"])) != is_active:
+                    reasons.append("локальное и серверное состояние активности различаются")
+                if not rate_compatible or not transport_compatible:
+                    reasons.append("ненулевые локальные и серверные ставки различаются")
+                if not reasons:
+                    enqueue_object_sync_event(cursor, int(local["id"]), "link_legacy", {
+                        "sync_id": str(uuid.uuid4()),
+                        "server_object_id": server_id,
+                        "expected_server_name": name,
+                        "expected_server_company": company,
+                        "expected_server_markning": markning,
+                        "expected_server_rate": rate,
+                        "expected_server_transport_rate": transport_rate,
+                        "expected_server_is_active": is_active,
+                        "expected_server_revision": server_revision,
+                    })
+                    stats["linked"] += 1
+                    continue
+            stats["unresolved_legacy"] += 1
+            for reason in set(reasons or ["нет безопасного точного соответствия"]):
+                record_reason(stats["unresolved_reasons"], reason)
+            continue
+
+        cursor.execute("INSERT OR IGNORE INTO companies (name) VALUES (?)", (company,))
+        cursor.execute("""
+            INSERT INTO objects (
+                name, markning, company, rate, transport_rate, sync_id, server_id,
+                is_active, sync_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            name, markning, company, rate, transport_rate, sync_id,
+            server_id if sync_id else None, is_active, server_revision if sync_id else 0,
+        ))
+        stats["imported"] += 1
+        if not sync_id:
+            reasons = []
+            if server_revision != 0:
+                reasons.append("Legacy-запись имеет ненулевую revision")
+            if remote_legacy_counts.get((name, company, markning)) != 1:
+                reasons.append("серверный Legacy-кандидат неоднозначен")
+            if not reasons:
+                enqueue_object_sync_event(cursor, int(cursor.lastrowid), "link_legacy", {
+                    "sync_id": str(uuid.uuid4()),
+                    "server_object_id": server_id,
+                    "expected_server_name": name,
+                    "expected_server_company": company,
+                    "expected_server_markning": markning,
+                    "expected_server_rate": rate,
+                    "expected_server_transport_rate": transport_rate,
+                    "expected_server_is_active": is_active,
+                    "expected_server_revision": server_revision,
+                })
+                stats["linked"] += 1
+            else:
+                stats["unresolved_legacy"] += 1
+                for reason in set(reasons):
+                    record_reason(stats["unresolved_reasons"], reason)
+    return stats
+
+
+def exact_legacy_object_candidates(objects, company, name, markning):
+    return [
+        item for item in objects
+        if not item.get("sync_id")
+        and item.get("company") == company
+        and item.get("name") == name
+        and str(item.get("markning") or "") == str(markning or "")
+    ]
+
+
+def employee_sync_key(name):
+    return " ".join(str(name or "").split()).casefold()
+
+
+def merge_server_employee_catalog(cursor, remote_employees):
+    if not isinstance(remote_employees, list) or len(remote_employees) > 1000:
+        raise ValueError("Серверный справочник сотрудников имеет неверный формат или размер.")
+
+    remote_counts = {}
+    for item in remote_employees:
+        if not isinstance(item, dict):
+            raise ValueError("Некорректная запись серверного сотрудника.")
+        employee_name = " ".join(str(item.get("name") or "").split())
+        employee_key = employee_sync_key(employee_name)
+        if employee_key:
+            remote_counts[employee_key] = remote_counts.get(employee_key, 0) + 1
+
+    local_by_key = {}
+    for row in cursor.execute("SELECT name FROM employees").fetchall():
+        local_by_key.setdefault(employee_sync_key(row["name"]), []).append(row["name"])
+
+    stats = {"imported": 0, "unresolved": 0}
+    for item in remote_employees:
+        employee_name = " ".join(str(item.get("name") or "").split())
+        employee_key = employee_sync_key(employee_name)
+        try:
+            salary_rate = round(float(item.get("salary_rate") or 0.0), 2)
+            is_active = int(item.get("is_active", 1))
+            server_revision = int(item.get("sync_version") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("Некорректные поля серверного сотрудника.")
+        if (not employee_key or len(employee_name) > 150 or not math.isfinite(salary_rate)
+                or not 0 <= salary_rate <= 100000 or is_active not in (0, 1) or server_revision < 0):
+            raise ValueError("Некорректные поля серверного сотрудника.")
+        if remote_counts[employee_key] > 1:
+            stats["unresolved"] += 1
+            continue
+        local_matches = local_by_key.get(employee_key, [])
+        if local_matches:
+            if len(local_matches) > 1:
+                stats["unresolved"] += 1
+            continue
+
+        state = cursor.execute(
+            "SELECT state FROM employee_sync_state WHERE employee_key = ?", (employee_key,)
+        ).fetchone()
+        pending = cursor.execute(
+            "SELECT 1 FROM employee_sync_outbox WHERE employee_key = ? "
+            "UNION ALL SELECT 1 FROM employee_restore_outbox WHERE employee_key = ? LIMIT 1",
+            (employee_key, employee_key),
+        ).fetchone()
+        if (state and state["state"] == "deleted") or pending:
+            continue
+
+        cursor.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, ?, ?)",
+            (employee_name, salary_rate, is_active),
+        )
+        state_value = "active" if is_active else "deleted"
+        cursor.execute("""
+            INSERT INTO employee_sync_state (
+                employee_key, employee_name, state, sync_version, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(employee_key) DO UPDATE SET
+                employee_name = excluded.employee_name,
+                state = excluded.state,
+                sync_version = MAX(employee_sync_state.sync_version, excluded.sync_version),
+                updated_at = excluded.updated_at
+        """, (
+            employee_key, employee_name, state_value, server_revision,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        local_by_key[employee_key] = [employee_name]
+        stats["imported"] += 1
+    return stats
+
+
+def enqueue_employee_sync_event(cursor, employee_name, operation):
+    employee_key = employee_sync_key(employee_name)
+    if not employee_key or operation not in {"deactivate", "activate"}:
+        raise ValueError("Некорректная операция синхронизации сотрудника.")
+    state = cursor.execute(
+        "SELECT state, sync_version FROM employee_sync_state WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()
+    pending_delete = cursor.execute(
+        "SELECT MAX(revision) FROM employee_sync_outbox WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()[0]
+    pending_restore = cursor.execute(
+        "SELECT MAX(revision) FROM employee_restore_outbox WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()[0]
+    current_revision = max(
+        int(state["sync_version"] or 0) if state else 0,
+        int(pending_delete or 0),
+        int(pending_restore or 0),
+    )
+    if operation == "activate" and not (state and state["state"] == "deleted") and pending_delete is None:
+        return None
+    revision = current_revision + 1
+    operation_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    if operation == "deactivate":
+        cursor.execute("DELETE FROM employee_restore_outbox WHERE employee_key = ?", (employee_key,))
+        cursor.execute("DELETE FROM employee_sync_outbox WHERE employee_key = ?", (employee_key,))
+        cursor.execute("""
+            INSERT INTO employee_sync_outbox (operation_id, employee_name, employee_key, revision, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (operation_id, employee_name, employee_key, revision, created_at))
+        state_value = "deleted"
+    else:
+        matching_employees = [
+            row for row in cursor.execute("SELECT name, salary_rate FROM employees").fetchall()
+            if employee_sync_key(row["name"]) == employee_key
+        ]
+        if len(matching_employees) != 1:
+            raise ValueError("Для восстановления нужна ровно одна активная локальная запись сотрудника.")
+        salary_rate = float(matching_employees[0]["salary_rate"] or 0.0)
+        if not 0 <= salary_rate <= 100000 or not math.isfinite(salary_rate):
+            raise ValueError("Ставка восстанавливаемого сотрудника вне допустимого диапазона.")
+        cursor.execute("DELETE FROM employee_sync_outbox WHERE employee_key = ?", (employee_key,))
+        cursor.execute("""
+            INSERT INTO employee_restore_outbox (
+                operation_id, employee_key, employee_name, salary_rate, revision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (operation_id, employee_key, employee_name, salary_rate, revision, created_at))
+        state_value = "active"
+    cursor.execute("""
+        INSERT INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(employee_key) DO UPDATE SET
+            employee_name = excluded.employee_name,
+            state = excluded.state,
+            sync_version = excluded.sync_version,
+            updated_at = excluded.updated_at
+    """, (employee_key, employee_name, state_value, revision, created_at))
+    return operation_id
+
+
+def apply_employee_sync_ack(cursor, event, result):
+    state = result.get("employee")
+    if not isinstance(state, dict):
+        return
+    revision = int(result.get("revision", event["revision"]))
+    employee_key = event["employee_key"]
+    current = cursor.execute(
+        "SELECT state, sync_version FROM employee_sync_state WHERE employee_key = ?",
+        (employee_key,),
+    ).fetchone()
+    if current and int(current["sync_version"] or 0) > revision:
+        return
+
+    cursor.execute("""
+        INSERT INTO employee_sync_state (employee_key, employee_name, state, sync_version, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(employee_key) DO UPDATE SET
+            employee_name = excluded.employee_name,
+            state = excluded.state,
+            sync_version = excluded.sync_version,
+            updated_at = excluded.updated_at
+    """, (
+        employee_key, state["name"], "active" if state["is_active"] else "deleted", revision,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    local_matches = [
+        row["name"] for row in cursor.execute("SELECT name FROM employees").fetchall()
+        if employee_sync_key(row["name"]) == employee_key
+    ]
+    if len(local_matches) > 1:
+        raise ValueError(f"Локальная запись сотрудника «{state['name']}» неоднозначна.")
+    if state["is_active"]:
+        if local_matches:
+            cursor.execute(
+                "UPDATE employees SET name = ?, salary_rate = ?, is_active = 1 WHERE name = ?",
+                (state["name"], float(state["salary_rate"] or 0.0), local_matches[0]),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, ?, 1)",
+                (state["name"], float(state["salary_rate"] or 0.0)),
+            )
+    elif local_matches:
+        cursor.execute("UPDATE employees SET is_active = 0 WHERE name = ?", (local_matches[0],))
 
 def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, state=None):
     record_type = payload.get('record_type', RECORD_TYPE_WORK)
@@ -593,7 +1261,7 @@ def resolve_special_object(cursor, company, record_type):
     if not reference:
         return None, "Неизвестный тип записи."
     cursor.execute(
-        "SELECT id, name, markning, company FROM objects WHERE company = ? AND name = ? AND COALESCE(markning, '') = ?",
+        "SELECT id, name, markning, company FROM objects WHERE company = ? AND name = ? AND is_active = 1 AND COALESCE(markning, '') = ?",
         (company, reference[0], reference[1])
     )
     matches = cursor.fetchall()
@@ -612,7 +1280,7 @@ def enqueue_matching_shifts(cursor, where_clause, params):
         enqueue_shift_operation(cursor, sync_id, 'upsert', row['sync_version'], shift_payload(row))
 
 class SyncWorker(QThread):
-    completed = pyqtSignal(bool, int, str)
+    completed = pyqtSignal(bool, int, int, int, int, int, str, str, str)
 
     def __init__(self, window):
         super().__init__(window)
@@ -620,10 +1288,15 @@ class SyncWorker(QThread):
 
     def run(self):
         try:
-            conflicts = self.window.perform_sync_logic()
-            self.completed.emit(True, conflicts, "")
+            result = self.window.perform_sync_logic()
+            self.completed.emit(
+                True, result["conflicts"], result["linked_legacy"],
+                result["unresolved_legacy"], result["imported_employees"],
+                result["unresolved_employees"], result["conflict_details"],
+                result["unresolved_legacy_details"], "",
+            )
         except Exception as error:
-            self.completed.emit(False, 0, str(error))
+            self.completed.emit(False, 0, 0, 0, 0, 0, "", "", str(error))
 
 def parse_float(val_str, default=0.0):
     if not val_str:
@@ -884,7 +1557,8 @@ def create_half_hour_time_field(default_time):
 class SmartReportApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SmartReport — Учет смен и отчеты")
+        self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
+        self.setWindowTitle("SmartReport — смены и расходы по объектам")
         self.resize(1240, 880)
         self.setStyleSheet(DARK_THEME_QSS)
 
@@ -961,6 +1635,8 @@ class SmartReportApp(QMainWindow):
         elif index == 2:
             self.load_balance_table()
         elif index == 3:
+            self.load_expense_document_filters()
+            self.load_expense_documents()
             self.load_expenses_table()
         elif index == 4:
             self.load_object_expense_overview()
@@ -1119,8 +1795,17 @@ class SmartReportApp(QMainWindow):
         shifts_header = self.table_shifts.horizontalHeader()
         shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in {
-            1: 95, 2: 130, 3: 110, 4: 170, 5: 85, 6: 65,
-            7: 175, 8: 80, 9: 210, 11: 110, 12: 95,
+            1: 95,   # Дата: узкая ровно под YYYY-MM-DD
+            2: 125,  # Сотрудник: ровно под ФИО
+            3: 105,  # Фирма
+            4: 135,  # Объект
+            5: 75,   # Тип: узкая (Работа / OB / АТФ / Больничный)
+            6: 60,   # Часы: узкая под 2-3 цифры (напр. 8.0)
+            7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
+            8: 80,   # Факт. ставка: максимально узкая
+            9: 70,   # Транспорт: узкая под 0.0 / 1.0
+            11: 110, # Статус фактуры: узкая под статус (⌛ В работе / ✅ Выставлен)
+            12: 95,  # OB сумма (SEK)
         }.items():
             self.table_shifts.setColumnWidth(column, width)
         shifts_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)  # Комментарий: забирает всё свободное место
@@ -1499,6 +2184,7 @@ class SmartReportApp(QMainWindow):
             })
 
         conflicts = 0
+        sync_conflict_reasons = {}
         if changes:
             pushed = requests.post(
                 f"{CLOUD_URL}/sync/push", headers=headers, json={"changes": changes}, timeout=4
@@ -1522,6 +2208,16 @@ class SmartReportApp(QMainWindow):
                         ''', (version, change['sync_id'], change['sync_id']))
                     elif result.get('conflict'):
                         conflicts += 1
+                        reason_labels = {
+                            "operation_id_reused": "operation_id смены повторно использован с другими данными",
+                            "deleted": "смена уже удалена на сервере",
+                            "stale_version": "на сервере есть более новая версия смены",
+                            "missing_record": "серверная смена отсутствует для указанной версии",
+                        }
+                        reason = reason_labels.get(
+                            result.get("reason"), "сервер отклонил изменение смены"
+                        )
+                        sync_conflict_reasons[reason] = sync_conflict_reasons.get(reason, 0) + 1
                         cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE operation_id = ?", (change['operation_id'],))
                 conn.commit()
             except Exception:
@@ -1529,6 +2225,30 @@ class SmartReportApp(QMainWindow):
                 raise
             finally:
                 conn.close()
+
+        catalog_response = requests.get(
+            f"{CLOUD_URL}/api/expense-objects?include_inactive=1",
+            headers=headers,
+            timeout=4,
+        )
+        catalog_response.raise_for_status()
+        catalog_result = catalog_response.json()
+        if not isinstance(catalog_result, dict) or catalog_result.get("ok") is not True:
+            raise RuntimeError("Сервер не вернул справочник объектов для синхронизации.")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            catalog_stats = merge_server_object_catalog(cursor, catalog_result.get("objects"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        conflicts += catalog_stats["conflicts"]
+        for reason, count in catalog_stats["conflict_reasons"].items():
+            sync_conflict_reasons[reason] = sync_conflict_reasons.get(reason, 0) + count
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1541,12 +2261,35 @@ class SmartReportApp(QMainWindow):
             }
             for row in cursor.fetchall()
         ]
+        cursor.execute("SELECT operation_id, employee_name, employee_key, revision FROM employee_sync_outbox ORDER BY created_at, operation_id")
+        deleted_employees = [
+            {
+                "operation_id": row["operation_id"], "name": row["employee_name"],
+                "employee_key": row["employee_key"] or employee_sync_key(row["employee_name"]),
+                "revision": int(row["revision"] or 0),
+            }
+            for row in cursor.fetchall()
+        ]
+        cursor.execute("SELECT operation_id, employee_name, employee_key, salary_rate, revision FROM employee_restore_outbox ORDER BY created_at, operation_id")
+        restored_employees = [
+            {
+                "operation_id": row["operation_id"], "name": row["employee_name"],
+                "employee_key": row["employee_key"],
+                "salary_rate": float(row["salary_rate"]) if row["salary_rate"] is not None else None,
+                "revision": int(row["revision"] or 0),
+            }
+            for row in cursor.fetchall()
+        ]
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
-        cursor.execute("SELECT name, markning, company, rate, transport_rate FROM objects ORDER BY name")
-        objects = [{"name": row[0], "markning": row[1], "company": row[2], "rate": row[3], "transport_rate": row[4]} for row in cursor.fetchall()]
+        cursor.execute("SELECT operation_id, payload_json FROM object_sync_outbox ORDER BY id")
+        object_events = [json.loads(row["payload_json"]) for row in cursor.fetchall()]
         conn.close()
-        metadata_payload = {"employees": employees, "companies": companies, "objects": objects, "shifts": []}
+        metadata_payload = {
+            "employees": employees, "deleted_employees": deleted_employees,
+            "restored_employees": restored_employees,
+            "companies": companies, "objects": [], "object_events": object_events, "shifts": [],
+        }
         if self.__dict__.get("_manual_sync_requested", False):
             print(
                 f"[SYNC] POST {CLOUD_URL}/sync-desktop-data employees="
@@ -1557,19 +2300,218 @@ class SmartReportApp(QMainWindow):
             f"{CLOUD_URL}/sync-desktop-data", headers=headers,
             json=metadata_payload, timeout=4
         )
-        metadata_response.raise_for_status()
-        return conflicts
+        try:
+            metadata_response.raise_for_status()
+        except requests.HTTPError as error:
+            try:
+                reason = metadata_response.json().get("error")
+            except (ValueError, AttributeError):
+                reason = None
+            raise RuntimeError(f"Сервер отклонил изменение справочника: {reason or error}") from error
+        metadata_result = metadata_response.json()
+        if not isinstance(metadata_result, dict) or metadata_result.get("ok") is not True:
+            raise RuntimeError("Сервер не подтвердил синхронизацию справочников.")
+        expected_delete_ids = {item["operation_id"] for item in deleted_employees}
+        acknowledged_delete_ids = set(metadata_result.get("deleted_employee_operations", []))
+        if not expected_delete_ids.issubset(acknowledged_delete_ids):
+            raise RuntimeError("Сервер не подтвердил удаление сотрудника; удаление оставлено в очереди.")
+        expected_restore_ids = {item["operation_id"] for item in restored_employees}
+        acknowledged_restore_ids = set(metadata_result.get("restored_employee_operations", []))
+        if not expected_restore_ids.issubset(acknowledged_restore_ids):
+            raise RuntimeError("Сервер не подтвердил восстановление сотрудника; операция оставлена в очереди.")
+        employee_events = [*restored_employees, *deleted_employees]
+        employee_event_results = metadata_result.get("employee_event_results", [])
+        if not isinstance(employee_event_results, list):
+            raise RuntimeError("Ответ сервера по событиям сотрудников имеет неверный формат.")
+        employee_results_by_id = {
+            item.get("operation_id"): item
+            for item in employee_event_results if isinstance(item, dict)
+        }
+        expected_employee_ids = {item["operation_id"] for item in employee_events}
+        if not expected_employee_ids.issubset(employee_results_by_id):
+            raise RuntimeError("Сервер не подтвердил состояние сотрудника; события оставлены в очереди.")
+        if employee_events:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                for event in employee_events:
+                    result = employee_results_by_id[event["operation_id"]]
+                    if result.get("stale") and not result.get("equivalent"):
+                        conflicts += 1
+                        reason = "revision сотрудника на сервере опережает локальную"
+                        sync_conflict_reasons[reason] = sync_conflict_reasons.get(reason, 0) + 1
+                    apply_employee_sync_ack(cursor, event, result)
+                    if event in restored_employees:
+                        cursor.execute(
+                            "DELETE FROM employee_restore_outbox WHERE operation_id = ? AND employee_key = ?",
+                            (event["operation_id"], event["employee_key"]),
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM employee_sync_outbox WHERE operation_id = ? AND employee_name = ?",
+                            (event["operation_id"], event["name"]),
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        expected_object_operation_ids = {event["operation_id"] for event in object_events}
+        object_results = metadata_result.get("object_sync_operations", [])
+        if not isinstance(object_results, list):
+            raise RuntimeError("Ответ сервера по событиям объектов имеет неверный формат.")
+        object_results_by_id = {
+            item.get("operation_id"): item for item in object_results if isinstance(item, dict)
+        }
+        if not expected_object_operation_ids.issubset(object_results_by_id):
+            raise RuntimeError("Сервер не подтвердил все изменения объектов; события оставлены в очереди.")
+        if object_events:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                for event in object_events:
+                    result = object_results_by_id[event["operation_id"]]
+                    if result.get("stale"):
+                        if not result.get("equivalent"):
+                            conflicts += 1
+                            reason = "revision или состояние объекта изменились на сервере"
+                            sync_conflict_reasons[reason] = sync_conflict_reasons.get(reason, 0) + 1
+                        state = result.get("object")
+                        if isinstance(state, dict):
+                            cursor.execute("""
+                                UPDATE objects
+                                SET server_id = ?, name = ?, markning = ?, rate = ?, transport_rate = ?,
+                                    is_active = ?, sync_version = ?
+                                WHERE id = ? AND sync_id = ? AND sync_version = ?
+                            """, (
+                                result.get("server_object_id"), state.get("name"), state.get("markning") or "",
+                                float(state.get("rate") or 0.0), float(state.get("transport_rate") or 0.0),
+                                int(bool(state.get("is_active"))), int(result.get("revision", event["revision"])),
+                                int(event["object_id"]), event["sync_id"], int(event["revision"]),
+                            ))
+                        else:
+                            cursor.execute("""
+                                UPDATE objects SET server_id = NULL, is_active = 0, sync_version = ?
+                                WHERE id = ? AND sync_id = ? AND sync_version = ?
+                            """, (
+                                int(result.get("revision", event["revision"])),
+                                int(event["object_id"]), event["sync_id"], int(event["revision"]),
+                            ))
+                    elif event["operation"] == "link_legacy" and isinstance(result.get("object"), dict):
+                        state = result["object"]
+                        cursor.execute("""
+                            UPDATE objects
+                            SET server_id = ?, rate = ?, transport_rate = ?, is_active = ?
+                            WHERE id = ? AND sync_id = ? AND sync_version = ?
+                        """, (
+                            result.get("server_object_id"), float(state.get("rate") or 0.0),
+                            float(state.get("transport_rate") or 0.0), int(bool(state.get("is_active"))),
+                            int(event["object_id"]), event["sync_id"], int(event["revision"]),
+                        ))
+                    else:
+                        cursor.execute(
+                            "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ?",
+                            (result.get("server_object_id"), int(event["object_id"]), event["sync_id"]),
+                        )
+                    cursor.execute("DELETE FROM object_sync_outbox WHERE operation_id = ?", (event["operation_id"],))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        employee_catalog_response = requests.get(
+            f"{CLOUD_URL}/api/sync/employee-catalog",
+            headers=headers,
+            timeout=4,
+        )
+        employee_catalog_response.raise_for_status()
+        employee_catalog_result = employee_catalog_response.json()
+        if not isinstance(employee_catalog_result, dict) or employee_catalog_result.get("ok") is not True:
+            raise RuntimeError("Сервер не вернул справочник сотрудников для синхронизации.")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            employee_catalog_stats = merge_server_employee_catalog(
+                cursor, employee_catalog_result.get("employees")
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        conflict_details = "; ".join(
+            f"{reason}: {count}" for reason, count in sync_conflict_reasons.items()
+        )
+        unresolved_legacy_details = "; ".join(
+            f"{reason}: {count}"
+            for reason, count in catalog_stats["unresolved_reasons"].items()
+        )
+        return {
+            "conflicts": conflicts,
+            "linked_legacy": catalog_stats["linked"],
+            "unresolved_legacy": catalog_stats["unresolved_legacy"],
+            "imported_employees": employee_catalog_stats["imported"],
+            "unresolved_employees": employee_catalog_stats["unresolved"],
+            "conflict_details": conflict_details,
+            "unresolved_legacy_details": unresolved_legacy_details,
+        }
 
-    def _on_sync_completed(self, success, conflicts, error):
+    def _on_sync_completed(
+        self, success, conflicts, linked_legacy, unresolved_legacy,
+        imported_employees, unresolved_employees, conflict_details,
+        unresolved_legacy_details, error,
+    ):
         self._sync_worker = None
         if success:
             self.load_shifts_history()
+        if getattr(self, "_object_edit_sync_pending", False):
+            if not success or conflicts:
+                self._object_edit_sync_pending = False
+                if not self._manual_sync_requested:
+                    reason = conflict_details if conflicts else error
+                    message = (
+                        "Сервер вернул конфликт; проверьте актуальное состояние объекта."
+                        if success else "Изменение сохранено локально и остаётся в очереди синхронизации."
+                    )
+                    QMessageBox.warning(self, "Изменение объекта", f"{message}\nПричина: {reason}")
+            else:
+                conn = get_db_connection()
+                pending = conn.execute("SELECT 1 FROM object_sync_outbox LIMIT 1").fetchone()
+                conn.close()
+                self._object_edit_sync_pending = pending is not None
         if self._manual_sync_requested:
             self._manual_sync_requested = False
-            if success and not conflicts:
-                QMessageBox.information(self, "Синхронизация", "Синхронизация завершена.")
+            if success and conflicts:
+                QMessageBox.warning(
+                    self, "Конфликт синхронизации",
+                    f"Есть конфликтующих изменений: {conflicts}. "
+                    f"Причины: {conflict_details or 'сервер отклонил часть изменений; проверьте версии и состояние записей'}. "
+                    f"Связано legacy-объектов: {linked_legacy}; "
+                    f"не сопоставлено: {unresolved_legacy}; "
+                    f"импортировано сотрудников: {imported_employees}; "
+                    f"не сопоставлено сотрудников: {unresolved_employees}.",
+                )
+            elif success and (unresolved_legacy or unresolved_employees):
+                QMessageBox.warning(
+                    self, "Legacy-объекты",
+                    f"Автоматически не сопоставлено legacy-объектов: {unresolved_legacy}. "
+                    f"Причины: {unresolved_legacy_details or 'нет безопасного точного соответствия'}. "
+                    f"Не сопоставлено сотрудников: {unresolved_employees}.",
+                )
+            elif success and (linked_legacy or imported_employees):
+                QMessageBox.information(
+                    self, "Синхронизация",
+                    f"Синхронизация завершена. Связано legacy-объектов: {linked_legacy}; "
+                    f"импортировано сотрудников: {imported_employees}.",
+                )
             elif success:
-                QMessageBox.warning(self, "Конфликт синхронизации", f"Есть конфликтующих изменений: {conflicts}. Несохранённые данные оставлены в локальной очереди.")
+                QMessageBox.information(self, "Синхронизация", "Синхронизация завершена.")
             else:
                 QMessageBox.warning(self, "Нет связи", f"Изменения сохранены локально и будут отправлены после восстановления связи.\n{error}")
 
@@ -2170,6 +3112,68 @@ class SmartReportApp(QMainWindow):
         self.bal_amount.clear()
         self.load_balance_table()
         return True
+    def edit_balance_entry(self, balance_id=None, *_):
+        if balance_id is None:
+            selected = self.table_balance.currentRow()
+            item = self.table_balance.item(selected, 0) if selected >= 0 else None
+            balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if balance_id is None:
+            QMessageBox.information(self, "Баланс", "Выберите операцию для изменения.")
+            return
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT id, date, employee, description, change_amount FROM balance WHERE id = ?",
+            (int(balance_id),),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
+            self.load_balance_table()
+            return
+        self._editing_balance_id = int(row["id"])
+        self.bal_date.setText(str(row["date"]))
+        self.bal_emp_cb.setCurrentText(str(row["employee"]))
+        self.bal_desc.setText(str(row["description"]))
+        self.bal_amount.setText(str(row["change_amount"]))
+        self.add_balance_button.setText("Сохранить изменения")
+
+    def update_balance_entry(self, balance_id=None, date=None, employee=None, description=None, amount=None):
+        balance_id = int(balance_id or self.__dict__.get("_editing_balance_id", 0) or 0)
+        if not balance_id:
+            QMessageBox.warning(self, "Баланс", "Сначала выберите операцию для изменения.")
+            return False
+        date = self.bal_date.text().strip() if date is None else str(date)
+        employee = self.bal_emp_cb.currentText().strip() if employee is None else str(employee).strip()
+        description = self.bal_desc.text().strip() if description is None else str(description).strip()
+        amount = parse_float(self.bal_amount.text(), None) if amount is None else parse_float(amount, None)
+        if amount is None or not employee:
+            QMessageBox.warning(self, "Баланс", "Введите сотрудника/контакт и корректную сумму.")
+            return False
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "UPDATE balance SET date = ?, employee = ?, description = ?, change_amount = ? WHERE id = ?",
+            (date, employee, description, amount, balance_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount == 1
+        conn.close()
+        if not updated:
+            QMessageBox.warning(self, "Баланс", "Операция с указанным ID не найдена.")
+            self.cancel_balance_edit()
+            self.load_balance_table()
+            return False
+        self.cancel_balance_edit()
+        self.load_balance_table()
+        QMessageBox.information(self, "Баланс", f"Операция #{balance_id} обновлена.")
+        return True
+
+    def cancel_balance_edit(self):
+        self.__dict__["_editing_balance_id"] = None
+        self.bal_date.setDate(QDate.currentDate())
+        self.bal_emp_cb.setCurrentText("")
+        self.bal_desc.clear()
+        self.bal_amount.clear()
+        self.add_balance_button.setText("Добавить операцию")
 
     def load_balance_table(self):
         conn = get_db_connection()
@@ -2206,6 +3210,31 @@ class SmartReportApp(QMainWindow):
             edit_button = QPushButton("Изменить")
             edit_button.clicked.connect(lambda _checked=False, row_id=int(balance_id): self.edit_balance_entry(row_id))
             self.table_balance.setCellWidget(row_idx, 4, edit_button)
+    def delete_balance_entry(self):
+        selected = self.table_balance.currentRow()
+        item = self.table_balance.item(selected, 0) if selected >= 0 else None
+        balance_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if balance_id is None:
+            QMessageBox.information(self, "Баланс", "Выберите операцию для удаления.")
+            return False
+        confirmation = QMessageBox.question(
+            self, "Удаление операции",
+            f"Удалить операцию #{balance_id}?\nДата: {item.text()}\n"
+            f"Сотрудник/контакт: {self.table_balance.item(selected, 1).text()}\n"
+            f"Сумма: {self.table_balance.item(selected, 3).text()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return False
+        conn = get_db_connection()
+        cursor = conn.execute("DELETE FROM balance WHERE id = ?", (int(balance_id),))
+        conn.commit()
+        deleted = cursor.rowcount == 1
+        conn.close()
+        if deleted:
+            self.load_balance_table()
+        return deleted
 
     def setup_expenses_tab(self):
         layout = QVBoxLayout(self.tab_expenses)
@@ -2288,7 +3317,6 @@ class SmartReportApp(QMainWindow):
         self.exp_docs_warning_lbl.setStyleSheet("background: #4a3b18; color: #f6e05e; padding: 8px; border-radius: 4px;")
         self.exp_docs_warning_lbl.hide()
         document_layout.addWidget(self.exp_docs_warning_lbl)
-
         document_actions = QHBoxLayout()
         upload_button = QPushButton("Загрузить документ")
         upload_button.clicked.connect(self.upload_expense_document)
@@ -2405,6 +3433,967 @@ class SmartReportApp(QMainWindow):
         self.load_expense_document_filters()
         self.load_expense_documents()
         self.load_expenses_table()
+        self.exp_filter_object.currentIndexChanged.connect(self.load_expense_documents)
+        self.exp_filter_supplier.currentIndexChanged.connect(self.load_expense_documents)
+
+    def _format_currency_totals(self, totals):
+        if not totals:
+            return "0.00"
+        return " | ".join(
+            f"{currency} {amount:,.2f}"
+            for currency, amount in sorted(totals.items())
+        )
+
+    def _api_load_expense_document_filters(self, *_):
+        object_selected = self.exp_filter_object.currentData() if hasattr(self, "exp_filter_object") else None
+        supplier_selected = self.exp_filter_supplier.currentData() if hasattr(self, "exp_filter_supplier") else None
+        try:
+            object_result = request_expense_api("GET", "/api/expense-objects")
+            document_result = request_expense_api("GET", "/api/expense-documents")
+            objects = object_result["objects"]
+            suppliers = document_result["suppliers"]
+            self._expense_objects = objects
+            self._expense_suppliers = suppliers
+            self.exp_api_status_lbl.setText("Общий реестр доступен. Локальные документы не переносились.")
+        except Exception as error:
+            self.exp_api_status_lbl.setText(f"Общий реестр недоступен: {error}")
+            return
+
+        self.exp_filter_object.blockSignals(True)
+        self.exp_filter_object.clear()
+        self.exp_filter_object.addItem("Все объекты", None)
+        for row in objects:
+            label = str(row["name"])
+            if row.get("markning"):
+                label += f" ({row['markning']})"
+            if row.get("company"):
+                label += f" · {row['company']}"
+            self.exp_filter_object.addItem(label, int(row["id"]))
+        object_index = self.exp_filter_object.findData(object_selected)
+        self.exp_filter_object.setCurrentIndex(max(0, object_index))
+        self.exp_filter_object.blockSignals(False)
+
+        self.exp_filter_supplier.blockSignals(True)
+        self.exp_filter_supplier.clear()
+        self.exp_filter_supplier.addItem("Все поставщики", None)
+        for supplier_name in suppliers:
+            self.exp_filter_supplier.addItem(str(supplier_name), str(supplier_name))
+        supplier_index = self.exp_filter_supplier.findData(supplier_selected)
+        self.exp_filter_supplier.setCurrentIndex(max(0, supplier_index))
+        self.exp_filter_supplier.blockSignals(False)
+
+    def _api_load_expense_documents(self, *_):
+        if not hasattr(self, "table_supplier_documents"):
+            return
+        date_from = self.exp_date_from.text().strip()
+        date_to = self.exp_date_to.text().strip()
+        self.exp_period_label.setText(f"Архив за {date_from} — {date_to}; фильтр по дате документа")
+        if date_from > date_to:
+            for label in (self.exp_docs_net_lbl, self.exp_docs_vat_lbl, self.exp_docs_gross_lbl, self.exp_docs_unallocated_lbl):
+                label.setText("0.00")
+            self.exp_docs_review_lbl.setText("0")
+            self.table_supplier_documents.setRowCount(0)
+            return
+
+        params = {"date_from": date_from, "date_to": date_to}
+        object_id = self.exp_filter_object.currentData()
+        if object_id is not None:
+            params["object_id"] = int(object_id)
+        supplier_name = self.exp_filter_supplier.currentData()
+        try:
+            result = request_expense_api("GET", "/api/expense-documents", params=params)
+            rows = result["documents"]
+        except Exception as error:
+            self.exp_api_status_lbl.setText(f"Не удалось загрузить общий архив: {error}")
+            self.table_supplier_documents.setRowCount(0)
+            return
+        if supplier_name:
+            rows = [row for row in rows if row["supplier_name"] == supplier_name]
+
+        net_totals: dict[str, Decimal] = {}
+        vat_totals: dict[str, Decimal] = {}
+        gross_totals: dict[str, Decimal] = {}
+        unallocated_totals: dict[str, Decimal] = {}
+        review_count = 0
+        for row in rows:
+            currency = str(row["currency_code"] or "UNKNOWN")
+            if row["verification_status"] != "confirmed":
+                review_count += 1
+            else:
+                for field, totals in (("net_amount", net_totals), ("vat_amount", vat_totals), ("gross_amount", gross_totals)):
+                    amount = parse_decimal(row[field])
+                    if amount is not None:
+                        totals[currency] = totals.get(currency, Decimal(0)) + amount
+            for field, totals in (("unallocated_gross", unallocated_totals),):
+                amount = parse_decimal(row[field])
+                if amount is not None:
+                    totals[currency] = totals.get(currency, Decimal(0)) + amount
+
+        self.exp_docs_net_lbl.setText(self._format_currency_totals(net_totals))
+        self.exp_docs_vat_lbl.setText(self._format_currency_totals(vat_totals))
+        self.exp_docs_gross_lbl.setText(self._format_currency_totals(gross_totals))
+        self.exp_docs_unallocated_lbl.setText(self._format_currency_totals(unallocated_totals))
+        self.exp_docs_review_lbl.setText(str(review_count))
+
+        self.table_supplier_documents.setRowCount(len(rows))
+        verification_labels = {
+            "draft": "Черновик", "requires_review": "Требует проверки", "confirmed": "Подтверждён",
+        }
+        for row_index, row in enumerate(rows):
+            object_names = sorted({str(item["object_name"]) for item in row["allocations"]})
+            object_label = ", ".join(object_names) if object_names else "Без объекта"
+            values = (
+                row["id"], row["document_date"] or "—", row["supplier_name"] or "Не указан",
+                row["invoice_number"] or "—", object_label,
+                f"{row['net_amount']} {row['currency_code']}" if row["net_amount"] else "—",
+                f"{row['vat_amount']} {row['currency_code']}" if row["vat_amount"] else "—",
+                f"{row['gross_amount']} {row['currency_code']}" if row["gross_amount"] else "—",
+                f"{row['unallocated_gross']} {row['currency_code']}" if row["unallocated_gross"] else "0.00",
+                verification_labels.get(str(row["verification_status"]), str(row["verification_status"])),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column in (2, 3, 4, 9):
+                    item.setToolTip(str(value))
+                self.table_supplier_documents.setItem(row_index, column, item)
+            self.table_supplier_documents.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, row)
+        self.exp_docs_warning_lbl.clear()
+        self.exp_docs_warning_lbl.hide()
+
+    def _expense_object_candidates(self):
+        if hasattr(self, "_expense_objects"):
+            return self._expense_objects
+        result = request_expense_api("GET", "/api/expense-objects")
+        self._expense_objects = result["objects"]
+        return self._expense_objects
+
+    def _api_upload_expense_document(self, *_):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Загрузить счёт или чек", "",
+            "Документы (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not path:
+            return
+        try:
+            extraction = extract_local_document(path)
+            fields = parse_document_text(extraction.text)
+        except Exception as error:
+            QMessageBox.warning(self, "Документ не прочитан", str(error))
+            return
+        fields["raw_text"] = extraction.text
+        fields["expense_category"] = "Прочие накладные расходы"
+        fields["ocr_method"] = extraction.method
+        fields["ocr_confidence"] = extraction.confidence
+        fields["client_id"] = str(uuid.uuid4())
+        if extraction.confidence is not None and extraction.confidence < 0.65:
+            fields["review_reasons"].append("низкая уверенность OCR; проверьте все поля")
+        suggestions = match_objects(extraction.text, self._expense_object_candidates())
+        self._api_expense_document_review_dialog(None, path, fields, suggestions, None)
+
+    def open_manual_document_dialog(self, *_):
+        if self.exp_date_from.date() > self.exp_date_to.date():
+            QMessageBox.warning(self, "Расход", "Сначала выберите корректный период.")
+            return
+        fields = {
+            "client_id": str(uuid.uuid4()), "supplier_name": "", "invoice_number": "",
+            "document_date": QDate.currentDate().toString("yyyy-MM-dd"),
+            "currency_code": "SEK", "net_amount": None, "vat_amount": None,
+            "gross_amount": None, "expense_category": "Прочие расходы",
+            "document_comment": "", "recognized_text": "",
+            "review_reasons": ["добавлено без оригинала; заполните данные документа"],
+        }
+        self._api_expense_document_review_dialog(None, None, fields, [], None)
+
+    def review_selected_document(self, *_):
+        row = self.table_supplier_documents.currentRow()
+        id_item = self.table_supplier_documents.item(row, 0) if row >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Документ", "Выберите документ в реестре.")
+            return
+        document_id = int(id_item.text())
+        try:
+            document = request_expense_api("GET", f"/api/expense-documents/{document_id}")["document"]
+            source_path = self._download_expense_original(document) if document["has_original"] else None
+        except Exception as error:
+            QMessageBox.warning(self, "Документ", f"Не удалось открыть общий документ: {error}")
+            return
+        fields = dict(document)
+        fields["raw_text"] = document.get("recognized_text") or ""
+        suggestions = match_objects(fields["raw_text"], self._expense_object_candidates())
+        self._api_expense_document_review_dialog(
+            document_id, source_path, fields, suggestions, fields["allocations"]
+        )
+
+    def _download_expense_original(self, document):
+        if not SYNC_API_KEY:
+            raise RuntimeError("Не задан ключ доступа к общему реестру документов.")
+        document_id = int(document["id"])
+        suffix = Path(document.get("original_name") or "document.pdf").suffix.casefold()
+        if suffix not in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+            suffix = ".pdf"
+        response = requests.get(
+            f"{CLOUD_URL.rstrip('/')}/api/expense-documents/{document_id}/original",
+            headers={"X-Sync-Key": SYNC_API_KEY}, timeout=30, stream=True,
+        )
+        response.raise_for_status()
+        path = Path(self._expense_temp_directory.name) / f"{document_id}{suffix}"
+        with path.open("wb") as destination:
+            shutil.copyfileobj(response.raw, destination)
+        return str(path)
+
+    def _api_expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Фактура и распределение" if document_id is None else f"Фактура #{document_id}")
+        dialog.resize(1120, 760)
+        layout = QVBoxLayout(dialog)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        preview = QLabel("Оригинал не загружен" if not source_path else "Предпросмотр недоступен")
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setMinimumWidth(350)
+        if source_path:
+            try:
+                suffix = Path(source_path).suffix.casefold()
+                if suffix == ".pdf":
+                    import pypdfium2 as pdfium
+                    image = pdfium.PdfDocument(str(source_path))[0].render(scale=1.2).to_pil().convert("RGB")
+                    qimage = QImage(image.tobytes(), image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(qimage)
+                else:
+                    pixmap = QPixmap(str(source_path))
+                if not pixmap.isNull():
+                    preview.setPixmap(pixmap.scaled(500, 680, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            except Exception as error:
+                preview.setText(f"Предпросмотр недоступен: {error}")
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setWidget(preview)
+        splitter.addWidget(preview_scroll)
+
+        form_widget = QWidget()
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setWidget(form_widget)
+        form = QFormLayout(form_widget)
+        supplier = QComboBox()
+        supplier.setEditable(True)
+        supplier.addItems(getattr(self, "_expense_suppliers", []))
+        supplier.setCurrentText(str(fields.get("supplier_name") or ""))
+        invoice_number = QLineEdit(str(fields.get("invoice_number") or ""))
+        document_date = QLineEdit(str(fields.get("document_date") or ""))
+        document_date.setPlaceholderText("YYYY-MM-DD")
+        currency = QComboBox()
+        currency.setEditable(True)
+        currency.addItems(["SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN", "UNKNOWN"])
+        currency.setCurrentText(str(fields.get("currency_code") or "SEK"))
+        net_amount = QLineEdit(str(fields.get("net_amount") or ""))
+        vat_amount = QLineEdit(str(fields.get("vat_amount") or ""))
+        gross_amount = QLineEdit(str(fields.get("gross_amount") or ""))
+        category = QComboBox()
+        category.setEditable(True)
+        category.addItems(["Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты", "Прочие расходы"])
+        category.setCurrentText(str(fields.get("expense_category") or "Прочие расходы"))
+        document_comment = QTextEdit(str(fields.get("document_comment") or ""))
+        document_comment.setMaximumHeight(80)
+        form.addRow("Поставщик:", supplier)
+        form.addRow("Номер документа:", invoice_number)
+        form.addRow("Дата документа:", document_date)
+        form.addRow("Валюта:", currency)
+        form.addRow("Сумма без НДС:", net_amount)
+        form.addRow("НДС:", vat_amount)
+        form.addRow("Сумма с НДС:", gross_amount)
+        form.addRow("Категория:", category)
+        form.addRow("Комментарий:", document_comment)
+
+        recognized_text = QTextEdit(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
+        recognized_text.setReadOnly(True)
+        recognized_text.setMaximumHeight(120)
+        form.addRow("Текст распознавания:", recognized_text)
+        reasons = "; ".join(fields.get("review_reasons") or [])
+        if reasons:
+            reason_label = QLabel(reasons)
+            reason_label.setWordWrap(True)
+            form.addRow("Проверьте:", reason_label)
+
+        allocation_table = QTableWidget()
+        allocation_table.setColumnCount(2)
+        allocation_table.setHorizontalHeaderLabels(["Объект", "Сумма с НДС"])
+        allocation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        objects = self._expense_object_candidates()
+
+        def add_allocation(allocation=None):
+            allocation = allocation or {}
+            row = allocation_table.rowCount()
+            allocation_table.insertRow(row)
+            object_combo = QComboBox()
+            object_combo.addItem("Выберите объект", None)
+            for object_row in objects:
+                label = str(object_row["name"])
+                if object_row.get("markning"):
+                    label += f" ({object_row['markning']})"
+                if object_row.get("company"):
+                    label += f" · {object_row['company']}"
+                object_combo.addItem(label, int(object_row["id"]))
+            selected_object = allocation.get("object_id")
+            if selected_object is not None:
+                object_combo.setCurrentIndex(max(0, object_combo.findData(int(selected_object))))
+            allocation_table.setCellWidget(row, 0, object_combo)
+            allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
+
+        for allocation in existing_allocations or []:
+            add_allocation(allocation)
+        allocation_buttons = QHBoxLayout()
+        add_button = QPushButton("Добавить объект")
+        remove_button = QPushButton("Удалить строку")
+        allocation_buttons.addWidget(add_button)
+        allocation_buttons.addWidget(remove_button)
+        allocation_box = QVBoxLayout()
+        allocation_box.addWidget(allocation_table)
+        allocation_box.addLayout(allocation_buttons)
+        allocation_container = QWidget()
+        allocation_container.setLayout(allocation_box)
+        form.addRow("Распределение:", allocation_container)
+
+        total_label = QLabel()
+        allocated_label = QLabel()
+        unallocated_label = QLabel()
+        form.addRow("Итого по документу:", total_label)
+        form.addRow("Распределено:", allocated_label)
+        form.addRow("Не распределено:", unallocated_label)
+
+        def update_allocation_totals(*_):
+            total = parse_decimal(gross_amount.text()) or Decimal(0)
+            allocated = Decimal(0)
+            for row in range(allocation_table.rowCount()):
+                amount_item = allocation_table.item(row, 1)
+                allocated += parse_decimal(amount_item.text() if amount_item else None) or Decimal(0)
+            total_label.setText(decimal_text(total) or "—")
+            allocated_label.setText(decimal_text(allocated) or "0.00")
+            unallocated_label.setText(decimal_text(total - allocated) or "—")
+
+        add_button.clicked.connect(lambda: add_allocation())
+        remove_button.clicked.connect(
+            lambda: allocation_table.removeRow(allocation_table.currentRow())
+            if allocation_table.currentRow() >= 0 else None
+        )
+        allocation_table.cellChanged.connect(update_allocation_totals)
+        gross_amount.textChanged.connect(update_allocation_totals)
+        update_allocation_totals()
+        splitter.addWidget(form_scroll)
+        splitter.setSizes([450, 650])
+        layout.addWidget(splitter, 1)
+
+        actions = QHBoxLayout()
+        save_draft = QPushButton("Сохранить черновик")
+        save_review = QPushButton("Сохранить: требует проверки")
+        confirm = QPushButton("Подтвердить")
+        cancel = QPushButton("Отмена")
+        for button in (save_draft, save_review, confirm, cancel):
+            actions.addWidget(button)
+        layout.addLayout(actions)
+
+        def save_document(status):
+            net_value = parse_decimal(net_amount.text())
+            vat_value = parse_decimal(vat_amount.text())
+            gross_value = parse_decimal(gross_amount.text())
+            date_value = document_date.text().strip() or None
+            if date_value:
+                try:
+                    datetime.strptime(date_value, "%Y-%m-%d")
+                except ValueError:
+                    QMessageBox.warning(dialog, "Дата", "Дата документа должна быть в формате YYYY-MM-DD.")
+                    return
+            if status == "confirmed":
+                if not supplier.currentText().strip() or not date_value or None in (net_value, vat_value, gross_value):
+                    QMessageBox.warning(dialog, "Документ", "Для подтверждения заполните поставщика, дату и все три суммы.")
+                    return
+                if currency.currentText().strip().upper() == "UNKNOWN":
+                    QMessageBox.warning(dialog, "Валюта", "Для подтверждения выберите валюту документа.")
+                    return
+                rounded_net = Decimal(decimal_text(net_value))
+                rounded_vat = Decimal(decimal_text(vat_value))
+                rounded_gross = Decimal(decimal_text(gross_value))
+                if rounded_net + rounded_vat != rounded_gross:
+                    QMessageBox.warning(dialog, "Суммы", "Нетто и НДС не совпадают с итогом документа.")
+                    return
+
+            allocation_rows = []
+            for row in range(allocation_table.rowCount()):
+                combo = allocation_table.cellWidget(row, 0)
+                amount_item = allocation_table.item(row, 1)
+                raw_amount = amount_item.text().strip() if amount_item else ""
+                amount = parse_decimal(raw_amount)
+                if not raw_amount:
+                    continue
+                if amount is None:
+                    QMessageBox.warning(dialog, "Распределение", f"Проверьте сумму в строке {row + 1}.")
+                    return
+                object_id = combo.currentData() if combo else None
+                if object_id is None:
+                    QMessageBox.warning(dialog, "Объект", f"Выберите объект в строке {row + 1}.")
+                    return
+                allocation_rows.append({"object_id": int(object_id), "gross_amount": amount})
+            if allocation_rows:
+                valid, message = validate_allocations(gross_value or Decimal(0), allocation_rows)
+                if not valid:
+                    QMessageBox.warning(dialog, "Распределение", message)
+                    return
+
+            payload = {
+                "client_id": fields.get("client_id") or str(uuid.uuid4()),
+                "supplier_name": supplier.currentText().strip(),
+                "invoice_number": invoice_number.text().strip(),
+                "document_date": date_value,
+                "currency_code": currency.currentText().strip().upper() or "SEK",
+                "net_amount": decimal_text(net_value),
+                "vat_amount": decimal_text(vat_value),
+                "gross_amount": decimal_text(gross_value),
+                "expense_category": category.currentText().strip() or "Прочие расходы",
+                "document_comment": document_comment.toPlainText().strip(),
+                "verification_status": status,
+                "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
+                "allocations": allocation_rows,
+            }
+            fields["client_id"] = payload["client_id"]
+            try:
+                if document_id is None:
+                    if source_path:
+                        with Path(source_path).open("rb") as original:
+                            result = request_expense_api(
+                                "POST", "/api/expense-documents",
+                                data={"payload": json.dumps(payload, ensure_ascii=False)},
+                                files={"original": (Path(source_path).name, original)},
+                            )
+                    else:
+                        result = request_expense_api("POST", "/api/expense-documents", json=payload)
+                else:
+                    result = request_expense_api(
+                        "PUT", f"/api/expense-documents/{document_id}", json=payload
+                    )
+            except Exception as error:
+                QMessageBox.warning(dialog, "Документ не сохранён", str(error))
+                return
+            saved_id = result["document"]["id"]
+            dialog.accept()
+            self.load_expense_document_filters()
+            self.load_expense_documents()
+            QMessageBox.information(dialog, "Документ", f"Документ #{saved_id} сохранён.")
+
+        save_draft.clicked.connect(lambda: save_document("draft"))
+        save_review.clicked.connect(lambda: save_document("requires_review"))
+        confirm.clicked.connect(lambda: save_document("confirmed"))
+        cancel.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _legacy_expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Проверка документа" if source_path else "Ручная запись расхода")
+        dialog.resize(1380, 900)
+        root_layout = QVBoxLayout(dialog)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        preview_tabs = QTabWidget()
+        preview_widget = QLabel("Оригинал не загружен" if not source_path else "Загрузка предпросмотра…")
+        preview_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_widget.setMinimumWidth(420)
+        if source_path:
+            try:
+                suffix = Path(source_path).suffix.casefold()
+                if suffix == ".pdf":
+                    import pypdfium2 as pdfium
+                    image = pdfium.PdfDocument(str(source_path))[0].render(scale=1.35).to_pil().convert("RGB")
+                    qimage = QImage(image.tobytes(), image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(qimage)
+                else:
+                    pixmap = QPixmap(str(source_path))
+                if not pixmap.isNull():
+                    preview_widget.setPixmap(pixmap.scaled(650, 760, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            except Exception as error:
+                preview_widget.setText(f"Предпросмотр недоступен: {error}")
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setWidget(preview_widget)
+        preview_tabs.addTab(preview_scroll, "Оригинал")
+        recognized_text = QTextEdit()
+        recognized_text.setReadOnly(True)
+        recognized_text.setPlainText(str(fields.get("raw_text") or ""))
+        preview_tabs.addTab(recognized_text, "Текст распознавания")
+        splitter.addWidget(preview_tabs)
+
+        form_widget = QWidget()
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setWidget(form_widget)
+        form = QFormLayout(form_widget)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        conn = get_db_connection()
+        known_suppliers = conn.execute("SELECT name FROM expense_suppliers ORDER BY name COLLATE NOCASE").fetchall()
+        object_rows = conn.execute("SELECT id, name, markning, is_active FROM objects ORDER BY name").fetchall()
+        conn.close()
+        supplier = QComboBox()
+        supplier.setEditable(True)
+        supplier.addItems([str(row[0]) for row in known_suppliers])
+        supplier.setCurrentText(str(fields.get("supplier_name") or ""))
+        org_number = QLineEdit(str(fields.get("supplier_org_number") or ""))
+        vat_number = QLineEdit(str(fields.get("supplier_vat_number") or ""))
+        document_type = QComboBox()
+        for label, value in (("Счёт", "invoice"), ("Чек", "receipt"), ("Кредитный счёт", "credit_note"), ("Ручная запись", "manual")):
+            document_type.addItem(label, value)
+        type_index = document_type.findData(str(fields.get("document_type") or "invoice"))
+        document_type.setCurrentIndex(max(0, type_index))
+        doc_date = QLineEdit(str(fields.get("document_date") or ""))
+        doc_date.setPlaceholderText("YYYY-MM-DD")
+        due_date = QLineEdit(str(fields.get("due_date") or ""))
+        due_date.setPlaceholderText("YYYY-MM-DD; необязательно")
+        invoice_number = QLineEdit(str(fields.get("invoice_number") or ""))
+        payment_reference = QLineEdit(str(fields.get("payment_reference") or ""))
+        currency = QComboBox()
+        currency.setEditable(True)
+        currency.addItems(["UNKNOWN", "SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"])
+        currency.setCurrentText(str(fields.get("currency_code") or "UNKNOWN"))
+        net_amount = QLineEdit(str(fields.get("net_amount") or ""))
+        vat_amount = QLineEdit(str(fields.get("vat_amount") or ""))
+        gross_amount = QLineEdit(str(fields.get("gross_amount") or ""))
+        amount_due = QLineEdit(str(fields.get("amount_due") or ""))
+        category = QComboBox()
+        category.setEditable(True)
+        category.addItems([
+            "Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты",
+            "Связь", "Прочие накладные расходы",
+        ])
+        category.setCurrentText(str(fields.get("expense_category") or "Прочие накладные расходы"))
+        document_comment = QTextEdit(str(fields.get("document_comment") or ""))
+        document_comment.setMaximumHeight(90)
+        document_comment.setPlaceholderText("Необязательный комментарий пользователя")
+        reverse_charge = QCheckBox("В документе указано reverse charge / omvänd skattskyldighet")
+        reverse_charge.setChecked(bool(fields.get("reverse_charge")))
+        reverse_charge_reviewed = QCheckBox("Я сверил reverse-charge с оригиналом")
+        reverse_charge_reviewed.setEnabled(reverse_charge.isChecked())
+        reverse_charge.toggled.connect(reverse_charge_reviewed.setEnabled)
+        payment_status = QComboBox()
+        payment_status.addItem("Неизвестно", "unknown")
+        payment_status.addItem("Не оплачен", "unpaid")
+        current_payment_status = str(fields.get("payment_status") or "unknown")
+        if current_payment_status in {"partially_paid", "paid"}:
+            payment_status.addItem(
+                "Частично оплачен (из платежей)" if current_payment_status == "partially_paid" else "Оплачен (из платежей)",
+                current_payment_status,
+            )
+            payment_status.setEnabled(False)
+        else:
+            payment_status.setCurrentIndex(max(0, payment_status.findData(current_payment_status)))
+        for label, widget in (
+            ("Поставщик:", supplier), ("Org.nr:", org_number), ("VAT-номер:", vat_number),
+            ("Тип:", document_type), ("Fakturadatum:", doc_date), ("Förfallodatum:", due_date),
+            ("Fakturanummer:", invoice_number), ("Платёжная ссылка OCR:", payment_reference),
+            ("Валюта:", currency), ("Netto / Belopp exkl. moms:", net_amount),
+            ("Moms (в документе):", vat_amount), ("Общая сумма документа:", gross_amount),
+            ("Сумма к оплате, если отличается:", amount_due), ("Категория расхода:", category),
+            ("Комментарий:", document_comment),
+        ):
+            form.addRow(label, widget)
+        form.addRow(reverse_charge)
+        form.addRow(reverse_charge_reviewed)
+        form.addRow("Состояние оплаты:", payment_status)
+        reasons_label = QLabel(
+            "Сигналы распознавания: "
+            + ("; ".join(fields.get("review_reasons") or []) or "явных проблем не найдено; всё равно проверьте оригинал")
+            + f"\nМетод: {fields.get('ocr_method', 'распознанный текст / ручной ввод')}; "
+            + f"уверенность: {fields.get('ocr_confidence') if fields.get('ocr_confidence') is not None else 'не рассчитана'}"
+        )
+        reasons_label.setWordWrap(True)
+        form.addRow(reasons_label)
+
+        vat_table = QTableWidget()
+        vat_table.setColumnCount(3)
+        vat_table.setHorizontalHeaderLabels(["Ставка %", "База", "Moms"])
+        for vat_line in fields.get("vat_lines") or []:
+            row = vat_table.rowCount()
+            vat_table.insertRow(row)
+            for column, key in enumerate(("rate", "taxable_base", "amount")):
+                vat_table.setItem(row, column, QTableWidgetItem(str(vat_line.get(key) or "")))
+        vat_buttons = QHBoxLayout()
+        add_vat_button = QPushButton("Добавить ставку НДС")
+        remove_vat_button = QPushButton("Удалить строку НДС")
+        vat_buttons.addWidget(add_vat_button)
+        vat_buttons.addWidget(remove_vat_button)
+        vat_box = QVBoxLayout()
+        vat_box.addWidget(vat_table)
+        vat_box.addLayout(vat_buttons)
+        vat_container = QWidget()
+        vat_container.setLayout(vat_box)
+        form.addRow("Разбивка НДС:", vat_container)
+        add_vat_button.clicked.connect(lambda: vat_table.insertRow(vat_table.rowCount()))
+        remove_vat_button.clicked.connect(lambda: vat_table.removeRow(vat_table.currentRow()) if vat_table.currentRow() >= 0 else None)
+
+        suggestion_text = "; ".join(f"{item['name']}: {item['reason']}" for item in suggestions)
+        suggestion_label = QLabel(
+            "Предложение объекта: " + (suggestion_text if suggestion_text else "совпадение не найдено; объект выберите вручную")
+        )
+        suggestion_label.setWordWrap(True)
+        form.addRow(suggestion_label)
+
+        allocation_table = QTableWidget()
+        allocation_table.setColumnCount(2)
+        allocation_table.setHorizontalHeaderLabels(["Объект", "Распределённая сумма документа"])
+        allocations = existing_allocations if existing_allocations is not None else []
+        if not allocations and fields.get("gross_amount"):
+            suggestion_id = suggestions[0]["object_id"] if len(suggestions) == 1 else None
+            allocations = [{"object_id": suggestion_id, "gross_amount": fields.get("gross_amount"), "note": suggestions[0]["reason"] if len(suggestions) == 1 else ""}]
+
+        def add_allocation(allocation=None):
+            allocation = allocation or {}
+            row = allocation_table.rowCount()
+            allocation_table.insertRow(row)
+            object_combo = QComboBox()
+            object_combo.addItem("Без объекта", None)
+            selected_object = allocation.get("object_id")
+            for object_row in object_rows:
+                object_id = int(object_row["id"])
+                if not object_row["is_active"] and object_id != selected_object:
+                    continue
+                title = str(object_row["name"])
+                if object_row["markning"]:
+                    title += f" ({object_row['markning']})"
+                if not object_row["is_active"]:
+                    title += " [архив]"
+                object_combo.addItem(title, object_id)
+            object_combo.setCurrentIndex(max(0, object_combo.findData(int(selected_object)) if selected_object is not None else 0))
+            allocation_table.setCellWidget(row, 0, object_combo)
+            allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
+        for allocation in allocations:
+            add_allocation(allocation)
+        allocation_buttons = QHBoxLayout()
+        add_allocation_button = QPushButton("Добавить объект")
+        remove_allocation_button = QPushButton("Удалить строку")
+        add_alias_button = QPushButton("Добавить альтернативное название")
+        allocation_buttons.addWidget(add_allocation_button)
+        allocation_buttons.addWidget(remove_allocation_button)
+        allocation_buttons.addWidget(add_alias_button)
+        allocation_box = QVBoxLayout()
+        allocation_box.addWidget(allocation_table)
+        allocation_box.addLayout(allocation_buttons)
+        allocation_container = QWidget()
+        allocation_container.setLayout(allocation_box)
+        form.addRow("Распределение:", allocation_container)
+        add_allocation_button.clicked.connect(lambda: add_allocation())
+        remove_allocation_button.clicked.connect(lambda: allocation_table.removeRow(allocation_table.currentRow()) if allocation_table.currentRow() >= 0 else None)
+
+        def add_object_alias():
+            row = allocation_table.currentRow()
+            combo = allocation_table.cellWidget(row, 0) if row >= 0 else None
+            object_id = combo.currentData() if combo else None
+            if object_id is None:
+                QMessageBox.information(dialog, "Объект", "Выберите объект в строке распределения.")
+                return
+            alias, accepted = QInputDialog.getText(dialog, "Альтернативное название", "Название / адрес / код:")
+            if not accepted or not alias.strip():
+                return
+            conn = get_db_connection()
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO expense_object_aliases (object_id, alias) VALUES (?, ?)",
+                    (int(object_id), alias.strip()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            QMessageBox.information(dialog, "Объект", "Альтернативное название сохранено.")
+
+        add_alias_button.clicked.connect(add_object_alias)
+
+        splitter.addWidget(form_scroll)
+        splitter.setSizes([620, 700])
+        root_layout.addWidget(splitter, 1)
+        action_row = QHBoxLayout()
+        save_draft = QPushButton("Сохранить черновик")
+        save_review = QPushButton("Сохранить: требует проверки")
+        confirm = QPushButton("Подтвердить документ")
+        cancel = QPushButton("Отмена")
+        for button in (save_draft, save_review, confirm, cancel):
+            action_row.addWidget(button)
+        root_layout.addLayout(action_row)
+
+        def save_document(status):
+            net_value = parse_decimal(net_amount.text())
+            vat_value = parse_decimal(vat_amount.text())
+            gross_value = parse_decimal(gross_amount.text())
+            due_value = parse_decimal(amount_due.text())
+            vat_lines = []
+            vat_sum = Decimal(0)
+            for row in range(vat_table.rowCount()):
+                rate_item = vat_table.item(row, 0)
+                base_item = vat_table.item(row, 1)
+                value_item = vat_table.item(row, 2)
+                if not any((rate_item, base_item, value_item)):
+                    continue
+                row_vat = parse_decimal(value_item.text() if value_item else None)
+                if row_vat is None:
+                    QMessageBox.warning(dialog, "НДС", f"Проверьте сумму НДС в строке {row + 1}.")
+                    return
+                vat_sum += row_vat
+                vat_lines.append({
+                    "rate": rate_item.text().strip() if rate_item else "",
+                    "taxable_base": parse_decimal(base_item.text() if base_item else None),
+                    "amount": row_vat,
+                })
+            if vat_lines:
+                vat_value = vat_sum
+                vat_amount.setText(decimal_text(vat_sum) or "")
+
+            doc_date_value = doc_date.text().strip()
+            due_date_value = due_date.text().strip() or None
+            date_error = None
+            for label, value in (("Fakturadatum", doc_date_value), ("Förfallodatum", due_date_value)):
+                if value:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError:
+                        date_error = f"{label} должен быть в формате YYYY-MM-DD."
+                        break
+            if date_error:
+                QMessageBox.warning(dialog, "Дата", date_error)
+                return
+
+            allocation_rows = []
+            for row in range(allocation_table.rowCount()):
+                combo = allocation_table.cellWidget(row, 0)
+                amount_item = allocation_table.item(row, 1)
+                value = parse_decimal(amount_item.text() if amount_item else None)
+                if value is None:
+                    if status == "confirmed":
+                        QMessageBox.warning(dialog, "Распределение", f"Укажите сумму распределения в строке {row + 1}.")
+                        return
+                    continue
+                allocation_rows.append({
+                    "object_id": combo.currentData() if combo else None,
+                    "gross_amount": value,
+                    "note": suggestion_text if combo and combo.currentData() is not None else "",
+                })
+            if status == "confirmed" and (not allocation_rows or any(item["object_id"] is None for item in allocation_rows)):
+                QMessageBox.warning(dialog, "Объект", "Для подтверждения выберите объект в каждой строке распределения. Черновик можно сохранить без объекта.")
+                return
+
+            reasons = []
+            supplier_name_value = supplier.currentText().strip()
+            if not supplier_name_value:
+                reasons.append("поставщик не указан")
+            if not doc_date_value:
+                reasons.append("дата документа не указана")
+            if document_type.currentData() == "invoice" and not invoice_number.text().strip():
+                reasons.append("номер счёта не указан")
+            currency_value = currency.currentText().strip().upper() or "UNKNOWN"
+            if currency_value == "UNKNOWN":
+                reasons.append("валюта не подтверждена")
+            if net_value is None:
+                reasons.append("нетто не указано")
+            if vat_value is None:
+                reasons.append("НДС неизвестен; не подставлен по умолчанию")
+            if gross_value is None:
+                reasons.append("общая сумма не указана")
+            if net_value is not None and vat_value is not None and gross_value is not None and abs(net_value + vat_value - gross_value) > Decimal("0.02"):
+                reasons.append("нетто + НДС не сходятся с итогом")
+            if reverse_charge.isChecked() and not reverse_charge_reviewed.isChecked():
+                reasons.append("reverse charge требует ручной проверки")
+            if status == "confirmed" and reasons:
+                QMessageBox.warning(dialog, "Нельзя подтвердить", "Проверьте документ:\n• " + "\n• ".join(reasons))
+                return
+
+            values = dict(fields)
+            values.update({
+                "supplier_name": supplier_name_value or None,
+                "supplier_org_number": org_number.text().strip() or None,
+                "supplier_vat_number": vat_number.text().strip() or None,
+                "document_type": document_type.currentData(),
+                "document_date": doc_date_value or None,
+                "due_date": due_date_value,
+                "invoice_number": invoice_number.text().strip() or None,
+                "payment_reference": payment_reference.text().strip() or None,
+                "currency_code": currency_value,
+                "net_amount": net_value,
+                "vat_amount": vat_value,
+                "gross_amount": gross_value,
+                "amount_due": due_value,
+                "expense_category": category.currentText().strip() or "Прочее",
+                "document_comment": document_comment.toPlainText().strip(),
+                "reverse_charge": reverse_charge.isChecked(),
+                "vat_lines": vat_lines,
+                "review_reasons": reasons,
+                "payment_status": payment_status.currentData(),
+            })
+            if status == "confirmed" and allocation_rows:
+                valid, message = validate_allocations(gross_value, allocation_rows)
+                if not valid:
+                    QMessageBox.warning(dialog, "Распределение", message)
+                    return
+
+            allow_duplicate = False
+            try:
+                conn = get_db_connection()
+                file_hash = None
+                if source_path:
+                    from expense_documents import sha256_file
+                    file_hash = sha256_file(source_path)
+                duplicates = find_document_duplicates(conn, values, file_hash)
+                if document_id is not None:
+                    duplicates = [item for item in duplicates if int(item["id"]) != int(document_id)]
+                if duplicates:
+                    answer = QMessageBox.question(
+                        dialog, "Возможный дубль",
+                        "Найден документ с тем же файлом или поставщиком/номером/датой/суммой. "
+                        "Сохранить копию всё равно?\n" + "\n".join(
+                            f"#{item['id']} {item['supplier_name']} {item['invoice_number']} {item['gross_amount']} {item['currency_code']}"
+                            for item in duplicates[:5]
+                        ),
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if answer != QMessageBox.StandardButton.Yes:
+                        conn.close()
+                        return
+                    allow_duplicate = True
+
+                if document_id is None:
+                    from expense_documents import save_supplier_document
+                    saved_id = save_supplier_document(
+                        conn, document_storage_root(), values, allocation_rows, source_path,
+                        status, allow_duplicate,
+                    )
+                else:
+                    saved_id = self._api_update_supplier_document_record(
+                        conn, document_id, source_path, values, allocation_rows, status, allow_duplicate
+                    )
+                conn.close()
+            except Exception as error:
+                if "conn" in locals():
+                    conn.close()
+                QMessageBox.warning(dialog, "Документ не сохранён", str(error))
+                return
+            dialog.accept()
+            self._api_load_expense_document_filters()
+            self._api_load_expense_documents()
+            QMessageBox.information(self, "Документ", f"Запись #{saved_id} сохранена со статусом: {status}.")
+
+        save_draft.clicked.connect(lambda: save_document("draft"))
+        save_review.clicked.connect(lambda: save_document("requires_review"))
+        confirm.clicked.connect(lambda: save_document("confirmed"))
+        cancel.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _api_update_supplier_document_record(self, conn, document_id, source_path, fields, allocations, status, allow_duplicate):
+        existing = conn.execute(
+            "SELECT stored_path, file_sha256 FROM supplier_documents WHERE id = ?", (int(document_id),)
+        ).fetchone()
+        if existing is None:
+            raise ValueError("Документ не найден.")
+        if status == "confirmed":
+            net, vat, gross = (parse_decimal(fields.get(key)) for key in ("net_amount", "vat_amount", "gross_amount"))
+            if None in (net, vat, gross) or abs(net + vat - gross) > Decimal("0.02"):
+                raise ValueError("Нетто + НДС не сходятся с итоговой суммой.")
+        file_hash = existing["file_sha256"]
+        if source_path:
+            from expense_documents import sha256_file
+            file_hash = sha256_file(source_path)
+        duplicates = find_document_duplicates(conn, fields, file_hash, exclude_document_id=document_id)
+        if duplicates and not allow_duplicate:
+            raise ValueError("Найден возможный дубль документа; сохранение отменено.")
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("BEGIN IMMEDIATE")
+        supplier_name = str(fields.get("supplier_name") or "").strip()
+        supplier_org = str(fields.get("supplier_org_number") or "").strip() or None
+        supplier_vat = str(fields.get("supplier_vat_number") or "").strip() or None
+        supplier_id = None
+        if supplier_name:
+            found = conn.execute(
+                "SELECT id FROM expense_suppliers WHERE name = ? COLLATE NOCASE AND COALESCE(org_number, '') = COALESCE(?, '') ORDER BY id LIMIT 1",
+                (supplier_name, supplier_org),
+            ).fetchone()
+            if found:
+                supplier_id = int(found[0])
+            else:
+                supplier_id = int(conn.execute(
+                    "INSERT INTO expense_suppliers (name, org_number, vat_number, created_at) VALUES (?, ?, ?, ?)",
+                    (supplier_name, supplier_org, supplier_vat, datetime.now(timezone.utc).isoformat()),
+                ).lastrowid)
+        object_ids = [int(item["object_id"]) for item in allocations if item.get("object_id") is not None]
+        if object_ids:
+            placeholders = ",".join("?" for _ in object_ids)
+            object_names = [str(item[0]) for item in conn.execute(
+                f"SELECT name FROM objects WHERE id IN ({placeholders}) ORDER BY name", object_ids
+            ).fetchall()]
+        else:
+            object_names = []
+        conn.execute("""
+            UPDATE supplier_documents SET supplier_id=?, supplier_name=?, supplier_org_number=?, supplier_vat_number=?,
+                document_type=?, invoice_number=?, payment_reference=?, document_date=?, due_date=?, currency_code=?,
+                net_amount=?, vat_amount=?, gross_amount=?, amount_due=?, expense_category=?, is_reverse_charge=?,
+                document_comment=?, verification_status=?, payment_status=?, recognized_text=?, review_reasons=?, updated_at=? WHERE id=?
+        """, (
+            supplier_id, supplier_name or None, supplier_org, supplier_vat, fields["document_type"],
+            fields.get("invoice_number"), fields.get("payment_reference"), fields.get("document_date"), fields.get("due_date"),
+            fields["currency_code"], decimal_text(fields.get("net_amount")), decimal_text(fields.get("vat_amount")),
+            decimal_text(fields.get("gross_amount")), decimal_text(fields.get("amount_due")), fields["expense_category"],
+            int(bool(fields.get("reverse_charge"))), str(fields.get("document_comment") or ""), status,
+            fields.get("payment_status") or "unknown",
+            fields.get("raw_text") or "", "\n".join(fields.get("review_reasons") or []), now, int(document_id),
+        ))
+        conn.execute("DELETE FROM supplier_document_vat_lines WHERE document_id=?", (int(document_id),))
+        conn.execute("DELETE FROM supplier_document_allocations WHERE document_id=?", (int(document_id),))
+        for line in fields.get("vat_lines") or []:
+            conn.execute(
+                "INSERT INTO supplier_document_vat_lines (document_id,vat_rate,taxable_base,vat_amount,note) VALUES (?,?,?,?,?)",
+                (int(document_id), str(line.get("rate") or ""), decimal_text(line.get("taxable_base")), decimal_text(line.get("amount")) or "0.00", str(line.get("note") or "")),
+            )
+        for allocation in allocations:
+            conn.execute(
+                "INSERT INTO supplier_document_allocations (document_id,object_id,allocated_net,allocated_vat,allocated_gross,allocation_note) VALUES (?,?,?,?,?,?)",
+                (int(document_id), allocation.get("object_id"), decimal_text(allocation.get("net_amount")), decimal_text(allocation.get("vat_amount")), decimal_text(allocation.get("gross_amount")) or "0.00", str(allocation.get("note") or "")),
+            )
+        stored_path = existing["stored_path"]
+        destination = None
+        if stored_path and Path(stored_path).is_file():
+            try:
+                destination, _ = store_original_file(
+                    stored_path, document_storage_root(), int(document_id), object_names
+                )
+                if destination != Path(stored_path):
+                    conn.execute(
+                        "UPDATE supplier_documents SET stored_path = ?, updated_at = ? WHERE id = ?",
+                        (str(destination), now, int(document_id)),
+                    )
+            except Exception:
+                conn.rollback()
+                if destination and destination != Path(stored_path):
+                    destination.unlink(missing_ok=True)
+                raise
+        try:
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            if destination and stored_path and destination != Path(stored_path):
+                destination.unlink(missing_ok=True)
+            raise
+        if destination and stored_path and destination != Path(stored_path):
+            old_path = Path(stored_path)
+            if old_path.is_relative_to(document_storage_root()):
+                old_path.unlink(missing_ok=True)
+        return int(document_id)
+
+    def open_selected_document_original(self, *_):
+        row = self.table_supplier_documents.currentRow()
+        id_item = self.table_supplier_documents.item(row, 0) if row >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Документ", "Выберите документ.")
+            return
+        document = id_item.data(Qt.ItemDataRole.UserRole)
+        if not document or not document.get("has_original"):
+            QMessageBox.warning(self, "Оригинал", "Для этой записи оригинал не загружен.")
+            return
+        try:
+            source_path = self._download_expense_original(document)
+        except Exception as error:
+            QMessageBox.warning(self, "Оригинал", str(error))
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(source_path))
 
     def apply_expense_period_preset(self, *_):
         if self._updating_expense_dates:
@@ -2412,7 +4401,7 @@ class SmartReportApp(QMainWindow):
         preset = self.exp_period_preset.currentData()
         today = QDate.currentDate()
         if preset == "custom":
-            self.load_expenses_table()
+            self.load_expense_documents()
             return
         if preset == "this_month":
             date_from = QDate(today.year(), today.month(), 1)
@@ -2430,7 +4419,7 @@ class SmartReportApp(QMainWindow):
         self.exp_date_from.setDate(date_from)
         self.exp_date_to.setDate(date_to)
         self._updating_expense_dates = False
-        self.load_expenses_table()
+        self.load_expense_documents()
 
     def on_expense_date_changed(self, *_):
         if not self._updating_expense_dates:
@@ -2439,7 +4428,7 @@ class SmartReportApp(QMainWindow):
                 self._updating_expense_dates = True
                 self.exp_period_preset.setCurrentIndex(custom_index)
                 self._updating_expense_dates = False
-            self.load_expenses_table()
+            self.load_expense_documents()
 
     def open_add_expense_dialog(self):
         if self.exp_date_from.date() > self.exp_date_to.date():
@@ -2527,6 +4516,103 @@ class SmartReportApp(QMainWindow):
         ]
         QMessageBox.information(self, "Подробности записи", "\n".join(details))
 
+    def edit_company_expense(self, *_):
+        selected = self.table_expenses.currentRow()
+        id_item = self.table_expenses.item(selected, 0) if selected >= 0 else None
+        if id_item is None:
+            QMessageBox.information(self, "Расход", "Выберите запись в журнале.")
+            return
+        expense_id = int(id_item.text())
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT id, date, category, description, amount FROM company_expenses WHERE id = ?",
+            (expense_id,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            QMessageBox.warning(self, "Расход", "Запись уже отсутствует. Обновите журнал.")
+            self.load_expenses_table()
+            return
+
+        old_description = str(row["description"] or "")
+        is_calculation = old_description.startswith("Авторасчет")
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Изменить запись #{expense_id}")
+        dialog.setMinimumWidth(480)
+        form = QFormLayout(dialog)
+        expense_date = create_date_field(str(row["date"]))
+        category = QComboBox()
+        category.setEditable(True)
+        category.addItems([
+            "Инструменты и расходники", "Аренда склада / офиса",
+            "Лизинг и топливо транспорта (Ford Transit)",
+            "Бухгалтерия и страховка", "Прочие накладные расходы",
+            str(row["category"]),
+        ])
+        category.setCurrentText(str(row["category"]))
+        description = QLineEdit(old_description)
+        amount = QLineEdit(str(row["amount"]))
+        amount.setPlaceholderText("Сумма в SEK")
+        if is_calculation:
+            category.setEnabled(False)
+            description.setReadOnly(True)
+            note = QLabel(
+                "У расчётной записи можно исправить дату/сумму. Категория и основание сохранены "
+                "для аудита и защиты от повторного расчёта. Ставки не подтверждают налоговое обязательство."
+            )
+            note.setWordWrap(True)
+            form.addRow(note)
+        else:
+            expense_date.setMinimumDate(self.exp_date_from.date())
+            expense_date.setMaximumDate(self.exp_date_to.date())
+        form.addRow("Дата:", expense_date)
+        form.addRow("Категория:", category)
+        form.addRow("Комментарий / основание:", description)
+        form.addRow("Сумма (SEK):", amount)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить изменения")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updated_amount = parse_float(amount.text(), None)
+        if updated_amount is None or updated_amount < 0:
+            QMessageBox.warning(self, "Расход", "Введите корректную неотрицательную сумму в SEK.")
+            return
+        if is_calculation:
+            updated_category = str(row["category"])
+            updated_description = old_description
+        else:
+            updated_category = category.currentText().strip()
+            updated_description = description.text().strip()
+        self.update_company_expense(
+            expense_id, expense_date.text(), updated_category, updated_description, updated_amount
+        )
+
+    def update_company_expense(self, expense_id, expense_date, category, description, amount):
+        if not str(description).startswith("Авторасчет"):
+            if not self.exp_date_from.date() <= create_date_field(expense_date).date() <= self.exp_date_to.date():
+                QMessageBox.warning(self, "Расход", "Дата ручного расхода должна входить в выбранный период.")
+                return False
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "UPDATE company_expenses SET date = ?, category = ?, description = ?, amount = ? WHERE id = ?",
+            (expense_date, category, description, amount, int(expense_id)),
+        )
+        conn.commit()
+        updated = cursor.rowcount == 1
+        conn.close()
+        if not updated:
+            QMessageBox.warning(self, "Расход", "Запись не найдена. Обновите журнал.")
+            return False
+        self.load_expenses_table()
+        self.background_sync_with_cloud()
+        return True
+
     def auto_calculate_taxes_and_fora(self):
         d_from = self.exp_date_from.text().strip()
         d_to = self.exp_date_to.text().strip()
@@ -2540,8 +4626,8 @@ class SmartReportApp(QMainWindow):
 
         cursor.execute("""
             SELECT employee, SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as total_hours
-            FROM shifts 
-            WHERE date >= ? AND date <= ? 
+            FROM shifts
+            WHERE date >= ? AND date <= ?
             GROUP BY employee
         """, (d_from, d_to))
         shift_rows = cursor.fetchall()
@@ -3204,11 +5290,11 @@ class SmartReportApp(QMainWindow):
         self.load_object_expense_overview()
 
     def _format_object_currency_totals(self, totals, key):
-        entries = [
-            f"{currency} {amount:,.2f}"
-            for currency, values in sorted(totals.items())
-            if (amount := values[key]) != 0
-        ]
+        entries = []
+        for currency, values in sorted(totals.items()):
+            amount = parse_decimal(values.get(key)) or Decimal(0)
+            if amount:
+                entries.append(f"{currency} {amount:,.2f}")
         return " · ".join(entries) if entries else "0.00"
 
     def load_object_expense_overview(self, *_):
@@ -4139,6 +6225,91 @@ class SmartReportApp(QMainWindow):
         conn.close()
         QMessageBox.information(self, "Оплата", f"Платёж сохранён. Состояние: {status}.")
         self.load_expense_documents()
+    def _api_load_object_expense_overview(self, *_):
+        if not hasattr(self, "object_expenses_table"):
+            return
+        object_id = self.object_expenses_object.currentData()
+        if object_id is None:
+            self.object_expenses_selected_label.setText("Выберите объект проекта.")
+            self.object_expenses_table.setRowCount(0)
+            return
+
+        period_enabled = self.object_expenses_period_enabled.isChecked()
+        date_from = self.object_expenses_date_from.text().strip() if period_enabled else ""
+        date_to = self.object_expenses_date_to.text().strip() if period_enabled else ""
+        if period_enabled and date_from > date_to:
+            self.object_expenses_selected_label.setText("Некорректный период; проверьте даты.")
+            self.object_expenses_table.setRowCount(0)
+            return
+
+        try:
+            lifetime = request_expense_api(
+                "GET", f"/api/expense-objects/{int(object_id)}/expenses"
+            )
+            selected = lifetime
+            if period_enabled:
+                selected = request_expense_api(
+                    "GET", f"/api/expense-objects/{int(object_id)}/expenses",
+                    params={"date_from": date_from, "date_to": date_to},
+                )
+        except Exception as error:
+            self.object_expenses_selected_label.setText(f"Объектный реестр недоступен: {error}")
+            self.object_expenses_table.setRowCount(0)
+            return
+
+        object_info = lifetime["object"]
+        object_name = object_info["name"]
+        self.object_expenses_selected_label.setText(
+            f"{object_name} · {date_from} — {date_to}" if period_enabled else f"{object_name} · весь срок проекта"
+        )
+
+        def apply_summary(labels, source):
+            totals = source["summary"]
+            for key in ("gross", "net", "vat", "materials", "other"):
+                labels[key].setText(self._format_object_currency_totals(totals, key))
+            labels["drafts"].setText(str(source["draft_count"]))
+            labels["reviews"].setText(str(source["review_count"]))
+
+        apply_summary(self.object_expenses_lifetime_labels, lifetime)
+        if period_enabled:
+            apply_summary(self.object_expenses_period_labels, selected)
+
+        rows = selected["documents"]
+        self.object_expenses_table.setRowCount(len(rows))
+        for row_index, document in enumerate(rows):
+            currency = document["currency_code"]
+            values = (
+                document["id"], document["document_date"] or "—",
+                document["supplier_name"] or "Не указан", document["invoice_number"] or "—",
+                document["expense_category"],
+                f"{currency} {document['object_net'] or '0.00'}",
+                f"{currency} {document['object_vat'] or '0.00'}",
+                f"{currency} {document['object_gross'] or '0.00'}",
+                f"{currency} {document['gross_amount']}" if document["gross_amount"] else "—",
+                f"{currency} {document['unallocated_gross']}" if document["unallocated_gross"] else "0.00",
+                document["verification_status"],
+            )
+            for column, value in enumerate(values):
+                self.object_expenses_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+            self.object_expenses_table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document["id"])
+
+    def open_object_expense_document(self, row, _column):
+        id_item = self.object_expenses_table.item(row, 0)
+        if id_item is None:
+            return
+        document_id = int(id_item.data(Qt.ItemDataRole.UserRole) or id_item.text())
+        try:
+            document = request_expense_api("GET", f"/api/expense-documents/{document_id}")["document"]
+            source_path = self._download_expense_original(document) if document["has_original"] else None
+        except Exception as error:
+            QMessageBox.warning(self, "Документ", f"Не удалось открыть основание: {error}")
+            return
+        fields = dict(document)
+        fields["raw_text"] = document.get("recognized_text") or ""
+        suggestions = match_objects(fields["raw_text"], self._expense_object_candidates())
+        self._expense_document_review_dialog(
+            document_id, source_path, fields, suggestions, document["allocations"]
+        )
 
     def setup_invoice_tab(self):
         layout = QVBoxLayout(self.tab_invoice)
@@ -4154,8 +6325,8 @@ class SmartReportApp(QMainWindow):
         self.load_companies_into_combobox(self.inv_comp_cb)
         
         self.inv_obj_cb = QComboBox()
-        self.load_objects_for_company(self.inv_comp_cb.currentText(), self.inv_obj_cb)
-        self.inv_comp_cb.currentTextChanged.connect(lambda comp: self.load_objects_for_company(comp, self.inv_obj_cb))
+        self.load_invoice_objects(self.inv_comp_cb.currentText())
+        self.inv_comp_cb.currentTextChanged.connect(self.load_invoice_objects)
 
         card_layout.addRow("Период с:", self.inv_date_from)
         card_layout.addRow("Период по:", self.inv_date_to)
@@ -4224,63 +6395,105 @@ class SmartReportApp(QMainWindow):
         summary_box.addWidget(self.inv_total_sum_lbl)
         layout.addLayout(summary_box)
 
-    def generate_invoice(self):
+    def load_invoice_objects(self, company):
+        selected_id = self.inv_obj_cb.currentData()
+        blocked = self.inv_obj_cb.blockSignals(True)
+        self.inv_obj_cb.clear()
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT id, name, markning, sync_id FROM objects WHERE company = ? ORDER BY name, id",
+            (company,),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            display = f"{row['markning']} | {row['name']}" if row['markning'] else row['name']
+            self.inv_obj_cb.addItem(display, int(row['id']))
+            self.inv_obj_cb.setItemData(self.inv_obj_cb.count() - 1, row['sync_id'], Qt.ItemDataRole.UserRole + 1)
+        if selected_id is not None:
+            self.inv_obj_cb.setCurrentIndex(self.inv_obj_cb.findData(selected_id))
+        else:
+            self.inv_obj_cb.setCurrentIndex(-1)
+        self.inv_obj_cb.blockSignals(blocked)
+
+    def collect_invoice_report(self):
         d_from = self.inv_date_from.text().strip()
         d_to = self.inv_date_to.text().strip()
         comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
-            return
-
+        object_id = self.inv_obj_cb.currentData()
+        if not comp or object_id is None:
+            raise ValueError("Выберите фирму и объект. Если объект исчез из справочника, выберите его заново.")
+        datetime.strptime(d_from, "%Y-%m-%d")
+        datetime.strptime(d_to, "%Y-%m-%d")
+        if d_from > d_to:
+            raise ValueError("Начало периода должно быть не позже окончания.")
         conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ?", (obj,))
-        obj_row = cursor.fetchone()
-        object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
-        object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
-
-        is_fast_pris = self.fast_pris_check.isChecked()
-        fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
-
-        has_ob_schema = ob_schema_ready(cursor)
-        ob_details_by_employee = collect_invoice_ob_details(
-            cursor, comp, obj, d_from, d_to
-        ) if has_ob_schema else {}
-        if has_ob_schema:
-            cursor.execute('''
+        try:
+            cursor = conn.cursor()
+            obj_row = cursor.execute(
+                "SELECT * FROM objects WHERE id = ? AND company = ?", (object_id, comp)
+            ).fetchone()
+            if obj_row is None or obj_row['sync_id'] != self.inv_obj_cb.currentData(Qt.ItemDataRole.UserRole + 1):
+                raise ValueError("Выбранный объект изменился или больше не существует. Обновите справочник.")
+            obj = obj_row['name']
+            object_names = invoice_object_names(cursor, obj_row)
+            object_placeholders = ','.join('?' for _name in object_names)
+            has_ob_schema = ob_schema_ready(cursor)
+            ob_details = {}
+            if has_ob_schema:
+                for object_name in object_names:
+                    for employee, details in collect_invoice_ob_details(cursor, comp, object_name, d_from, d_to).items():
+                        previous = ob_details.setdefault(employee, {'display': '', 'tooltip': ''})
+                        for key in previous:
+                            previous[key] = '\n'.join(filter(None, (previous[key], details[key])))
+            ob_join = """
+                LEFT JOIN (SELECT shift_id, SUM(amount) AS segment_amount
+                           FROM ob_segments GROUP BY shift_id) ob_segment
+                ON ob_segment.shift_id = shifts.sync_id
+            """ if has_ob_schema else ""
+            ob_amount_sql = "COALESCE(ob_segment.segment_amount, 0)" if has_ob_schema else "0"
+            rows = cursor.execute(f'''
                 SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status,
-                    SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END) as ob_hours,
-                    SUM(CASE WHEN entry_type = 'ob' THEN COALESCE(ob_segment.segment_amount, 0) ELSE 0 END) as ob_amount
-                FROM shifts
-                LEFT JOIN (
-                    SELECT shift_id, SUM(amount) AS segment_amount
-                    FROM ob_segments GROUP BY shift_id
-                ) ob_segment ON ob_segment.shift_id = shifts.sync_id
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee
-                ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        else:
-            cursor.execute('''
-                SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END) as invoiced_status,
-                    0 as ob_hours, 0 as ob_amount
-                FROM shifts
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee
-                ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        conn.close()
+                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END),
+                    MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'ob' THEN {ob_amount_sql} ELSE 0 END),
+                    MIN(CASE WHEN entry_type = 'work' THEN COALESCE(invoiced, 0) ELSE 1 END)
+                FROM shifts {ob_join}
+                WHERE company = ? AND object_name IN ({object_placeholders}) AND date >= ? AND date <= ?
+                    AND entry_type IN ('work', 'ob')
+                GROUP BY employee ORDER BY employee
+            ''', (comp, *object_names, d_from, d_to)).fetchall()
+            rows = [tuple(row[:3]) + (2 if row[3] and not row[6] else row[3],) + tuple(row[4:6]) for row in rows]
+            is_fast_pris = self.fast_pris_check.isChecked()
+            return {
+                'object_id': object_id, 'sync_id': obj_row['sync_id'], 'company': comp, 'object': obj,
+                'object_names': object_names,
+                'date_from': d_from, 'date_to': d_to, 'rows': rows, 'ob_details': ob_details,
+                'rate': float(obj_row['rate'] or 0), 'transport_rate': float(obj_row['transport_rate'] or 0),
+                'is_fast_pris': is_fast_pris,
+                'fast_pris_amount': parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0,
+            }
+        finally:
+            conn.close()
+
+    def generate_invoice(self):
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            self.table_invoice.setRowCount(0)
+            self._invoice_report = None
+            self.inv_total_hours_lbl.setText("<b>Рабочие часы: 0.0</b>")
+            self.inv_total_ob_lbl.setText("<b>OB: 0 tim / 0.00 kr</b>")
+            self.inv_total_sum_lbl.setText("<b>Общая сумма: 0.00 kr</b>")
+            QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
+            return None
+        rows = report['rows']
+        object_default_rate = report['rate']
+        object_transport_rate = report['transport_rate']
+        is_fast_pris = report['is_fast_pris']
+        fast_pris_amount = report['fast_pris_amount']
+        ob_details_by_employee = report['ob_details']
 
         self.table_invoice.setRowCount(len(rows))
         total_hours_all = 0.0
@@ -4296,7 +6509,7 @@ class SmartReportApp(QMainWindow):
             trans_count = row[2] or 0.0
             is_inv = row[3] == 1
             ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
-            status_str = "✅ Выставлен" * is_inv or "⏳ В работе"
+            status_str = "Частично закрыт" if row[3] == 2 else "✅ Выставлен" if is_inv else "⏳ В работе"
             
             total_hours_all += hrs
             total_ob_hours_all += ob_hours
@@ -4335,61 +6548,26 @@ class SmartReportApp(QMainWindow):
             self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f}</b>")
             self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
         self.inv_total_ob_lbl.setText(f"<b>OB: {total_ob_hours_all:g} tim / {total_ob_amount_all:,.2f} kr</b>")
+        self._invoice_report = report
+        return report
 
     def export_invoice_to_pdf(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для формирования PDF-счета!")
+        report = self.generate_invoice()
+        if report is None:
             return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT rate, transport_rate FROM objects WHERE name = ?", (obj,))
-        obj_row = cursor.fetchone()
-        object_default_rate = obj_row[0] if obj_row and obj_row[0] else 0.0
-        object_transport_rate = obj_row[1] if obj_row and obj_row[1] else 0.0
-
-        is_fast_pris = self.fast_pris_check.isChecked()
-        fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
-
-        has_ob_schema = ob_schema_ready(cursor)
-        ob_details_by_employee = collect_invoice_ob_details(
-            cursor, comp, obj, d_from, d_to
-        ) if has_ob_schema else {}
-        if has_ob_schema:
-            cursor.execute('''
-                SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END) as ob_hours,
-                    SUM(CASE WHEN entry_type = 'ob' THEN COALESCE(ob_segment.segment_amount, 0) ELSE 0 END) as ob_amount
-                FROM shifts
-                LEFT JOIN (SELECT shift_id, SUM(amount) AS segment_amount FROM ob_segments GROUP BY shift_id) ob_segment
-                    ON ob_segment.shift_id = shifts.sync_id
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        else:
-            cursor.execute('''
-                SELECT employee,
-                    SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END) as work_hours,
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END) as work_transport,
-                    0 as ob_hours, 0 as ob_amount
-                FROM shifts
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                GROUP BY employee ORDER BY employee
-            ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        conn.close()
+        d_from, d_to = report['date_from'], report['date_to']
+        comp, obj = report['company'], report['object']
+        rows = report['rows']
+        object_default_rate, object_transport_rate = report['rate'], report['transport_rate']
+        is_fast_pris, fast_pris_amount = report['is_fast_pris'], report['fast_pris_amount']
+        ob_details_by_employee = report['ob_details']
 
         if not rows and not is_fast_pris:
-            QMessageBox.warning(self, "Внимание", "За выбранный период нет данных для отчета!")
+            QMessageBox.warning(
+                self, "Нет данных для счёта",
+                f"{comp} / {obj}: за {d_from} — {d_to} нет записей работы или OB. "
+                "Закрытые и незакрытые записи включены; АТФ и больничные в счёт не входят.",
+            )
             return
 
         if not os.path.exists(REPORTS_DIR):
@@ -4433,7 +6611,7 @@ class SmartReportApp(QMainWindow):
                 emp = row[0]
                 hrs = row[1] or 0.0
                 trans_count = row[2] or 0.0
-                ob_hours, ob_amount = row[3] or 0.0, row[4] or 0.0
+                ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
                 total_hours_all += hrs
                 total_ob_hours_all += ob_hours
                 total_ob_amount_all += ob_amount
@@ -4519,15 +6697,13 @@ class SmartReportApp(QMainWindow):
             QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF счета: {e}")
 
     def mark_period_as_invoiced(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для закрытия периода!")
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return
+        d_from, d_to = report['date_from'], report['date_to']
+        comp, obj = report['company'], report['object']
 
         reply = QMessageBox.question(
             self, "Подтверждение",
@@ -4537,14 +6713,18 @@ class SmartReportApp(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            if (self.inv_obj_cb.currentData() != report['object_id']
+                    or self.inv_comp_cb.currentText() != comp
+                    or self.inv_date_from.text() != d_from or self.inv_date_to.text() != d_to):
+                QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; период не закрыт.")
+                return
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE shifts 
-                SET invoiced = 1 
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'
-            ''', (comp, obj, d_from, d_to))
-            enqueue_matching_shifts(cursor, "company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'", (comp, obj, d_from, d_to))
+            placeholders = ','.join('?' for _name in report['object_names'])
+            work_filter = f"company = ? AND object_name IN ({placeholders}) AND date >= ? AND date <= ? AND entry_type = 'work'"
+            parameters = (comp, *report['object_names'], d_from, d_to)
+            cursor.execute(f"UPDATE shifts SET invoiced = 1 WHERE {work_filter}", parameters)
+            enqueue_matching_shifts(cursor, work_filter, parameters)
             conn.commit()
             conn.close()
 
@@ -4554,15 +6734,13 @@ class SmartReportApp(QMainWindow):
             self.background_sync_with_cloud()
 
     def unmark_period_as_invoiced(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        obj_data = self.inv_obj_cb.currentData()
-        obj = obj_data if obj_data else self.inv_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект для отмены закрытия!")
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return
+        d_from, d_to = report['date_from'], report['date_to']
+        comp, obj = report['company'], report['object']
 
         reply = QMessageBox.question(
             self, "Подтверждение",
@@ -4572,14 +6750,18 @@ class SmartReportApp(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            if (self.inv_obj_cb.currentData() != report['object_id']
+                    or self.inv_comp_cb.currentText() != comp
+                    or self.inv_date_from.text() != d_from or self.inv_date_to.text() != d_to):
+                QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; статус периода не изменён.")
+                return
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE shifts 
-                SET invoiced = 0 
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'
-            ''', (comp, obj, d_from, d_to))
-            enqueue_matching_shifts(cursor, "company = ? AND object_name = ? AND date >= ? AND date <= ? AND entry_type = 'work'", (comp, obj, d_from, d_to))
+            placeholders = ','.join('?' for _name in report['object_names'])
+            work_filter = f"company = ? AND object_name IN ({placeholders}) AND date >= ? AND date <= ? AND entry_type = 'work'"
+            parameters = (comp, *report['object_names'], d_from, d_to)
+            cursor.execute(f"UPDATE shifts SET invoiced = 0 WHERE {work_filter}", parameters)
+            enqueue_matching_shifts(cursor, work_filter, parameters)
             conn.commit()
             conn.close()
 
@@ -4588,14 +6770,20 @@ class SmartReportApp(QMainWindow):
             self.load_shifts_history()
             self.background_sync_with_cloud()
 
-    def load_objects_for_company(self, comp_name, obj_cb, record_type=None):
-        selected_name = obj_cb.currentData()
+    def load_objects_for_company(self, comp_name, obj_cb, record_type=None, archived_object_name=None):
+        selected_name = obj_cb.currentData() or archived_object_name
         obj_cb.clear()
         if not comp_name:
             return False
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects WHERE company = ? ORDER BY name", (comp_name,))
+        cursor.execute("""
+            SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0),
+                   COALESCE(transport_rate, 0.0), is_active
+            FROM objects
+            WHERE company = ? AND (is_active = 1 OR (? = 1 AND name = ?))
+            ORDER BY name
+        """, (comp_name, int(archived_object_name is not None), archived_object_name or ""))
         rows = cursor.fetchall()
         conn.close()
         if record_type in SPECIAL_OBJECTS:
@@ -4607,8 +6795,10 @@ class SmartReportApp(QMainWindow):
             special_refs = set(SPECIAL_OBJECTS.values())
             rows = [row for row in rows if (row[0], row[1]) not in special_refs]
         for row in rows:
-            name, mark, rate, tr_rate = row[0], row[1], row[2], row[3]
+            name, mark, rate, tr_rate, is_active = row[0], row[1], row[2], row[3], bool(row[4])
             display = f"{mark} | {name} ({rate} kr/ч, тр: {tr_rate})" if mark else f"{name} ({rate} kr/ч)"
+            if not is_active:
+                display += " — В архиве"
             obj_cb.addItem(display, userData=name)
         if selected_name:
             selected_index = obj_cb.findData(selected_name)
@@ -4960,21 +7150,40 @@ class SmartReportApp(QMainWindow):
         emp_add_layout.addWidget(add_emp_btn)
         emp_card_layout.addLayout(emp_add_layout)
 
+        employee_view_layout = QHBoxLayout()
+        archive_filter_style = (
+            "QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #718096; "
+            "border-radius: 3px; background-color: #1A202C; } "
+            "QCheckBox::indicator:checked { background-color: #3182CE; border-color: #90CDF4; }"
+        )
+        self.show_inactive_employees_check = QCheckBox("Показать неактивных")
+        self.show_inactive_employees_check.setStyleSheet(archive_filter_style)
+        self.show_inactive_employees_check.setChecked(False)
+        self.show_inactive_employees_check.toggled.connect(self.load_employees_table)
+        self.employee_counts_label = QLabel()
+        employee_view_layout.addWidget(self.show_inactive_employees_check)
+        employee_view_layout.addStretch()
+        employee_view_layout.addWidget(self.employee_counts_label)
+        emp_card_layout.addLayout(employee_view_layout)
+
         self.table_employees = QTableWidget()
-        self.table_employees.setColumnCount(3)
-        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус ПИН-кода"])
+        self.table_employees.setColumnCount(4)
+        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус", "ПИН"])
+        self.table_employees.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_employees.itemSelectionChanged.connect(self.update_employee_status_action)
         self.table_employees.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         emp_card_layout.addWidget(self.table_employees, stretch=1)
 
         emp_btn_layout = QHBoxLayout()
-        del_emp_btn = QPushButton("🗑 Удалить сотрудника")
-        del_emp_btn.setObjectName("danger")
-        del_emp_btn.clicked.connect(self.delete_employee)
+        self.employee_status_button = QPushButton("Деактивировать сотрудника")
+        self.employee_status_button.setObjectName("danger")
+        self.employee_status_button.setEnabled(False)
+        self.employee_status_button.clicked.connect(self.toggle_employee_active)
         
         set_pin_btn = QPushButton("🔑 Задать ПИН")
         set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
-        emp_btn_layout.addWidget(del_emp_btn)
+        emp_btn_layout.addWidget(self.employee_status_button)
         emp_btn_layout.addWidget(set_pin_btn)
         emp_card_layout.addLayout(emp_btn_layout)
         top_layout.addWidget(emp_card, stretch=1)
@@ -4987,6 +7196,17 @@ class SmartReportApp(QMainWindow):
         obj_card_layout = QVBoxLayout(obj_card)
         obj_card_layout.setSpacing(6)
         obj_card_layout.addWidget(QLabel("<b>🏗 Управление объектами (Ставки и транспорт):</b>"))
+
+        object_view_layout = QHBoxLayout()
+        self.show_archived_objects_check = QCheckBox("Показать архив")
+        self.show_archived_objects_check.setStyleSheet(archive_filter_style)
+        self.show_archived_objects_check.setChecked(False)
+        self.show_archived_objects_check.toggled.connect(self.load_objects_table)
+        self.object_counts_label = QLabel()
+        object_view_layout.addWidget(self.show_archived_objects_check)
+        object_view_layout.addStretch()
+        object_view_layout.addWidget(self.object_counts_label)
+        obj_card_layout.addLayout(object_view_layout)
 
         obj_add_layout = QHBoxLayout()
         self.new_obj_comp_cb = QComboBox()
@@ -5019,8 +7239,8 @@ class SmartReportApp(QMainWindow):
         obj_card_layout.addLayout(obj_add_layout)
         
         self.table_objects = QTableWidget()
-        self.table_objects.setColumnCount(5)
-        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Факт. ставка (kr/ч)", "Транспорт (kr/выезд)"])
+        self.table_objects.setColumnCount(6)
+        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Факт. ставка (kr/ч)", "Транспорт (kr/выезд)", "Состояние"])
         
         obj_header = self.table_objects.horizontalHeader()
         obj_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -5028,24 +7248,30 @@ class SmartReportApp(QMainWindow):
         obj_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         obj_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         obj_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        obj_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         
         self.table_objects.setColumnWidth(0, 150)
         self.table_objects.setColumnWidth(2, 110)
         self.table_objects.setColumnWidth(3, 140)
         self.table_objects.setColumnWidth(4, 150)
+        self.table_objects.setColumnWidth(5, 120)
+        self.table_objects.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
 
         self.table_objects.cellChanged.connect(self.on_object_cell_changed)
+        self.table_objects.itemSelectionChanged.connect(self.update_object_archive_action)
         obj_card_layout.addWidget(self.table_objects, stretch=1)
 
-        del_obj_btn = QPushButton("🗑 Удалить выбранный объект")
-        del_obj_btn.setObjectName("danger")
-        del_obj_btn.clicked.connect(self.delete_object)
-        obj_card_layout.addWidget(del_obj_btn)
+        self.object_archive_button = QPushButton("В архив")
+        self.object_archive_button.setObjectName("danger")
+        self.object_archive_button.setEnabled(False)
+        self.object_archive_button.clicked.connect(self.toggle_object_archive)
+        obj_card_layout.addWidget(self.object_archive_button)
 
         layout.addWidget(obj_card, stretch=1)
 
     def load_companies_into_combobox(self, cb):
         current_val = cb.currentText()
+        signals_blocked = cb.blockSignals(True)
         cb.clear()
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -5056,8 +7282,8 @@ class SmartReportApp(QMainWindow):
             cb.addItem(row[0])
         if current_val:
             idx = cb.findText(current_val)
-            if idx >= 0:
-                cb.setCurrentIndex(idx)
+            cb.setCurrentIndex(idx)
+        cb.blockSignals(signals_blocked)
 
     def add_company(self):
         comp_name = self.new_comp_input.text().strip()
@@ -5112,13 +7338,32 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('''
-                INSERT INTO objects (name, markning, company, rate, transport_rate) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET markning = ?, company = ?, rate = ?, transport_rate = ?
-            ''', (name, mark, comp, rate_val, trans_rate_val, mark, comp, rate_val, trans_rate_val))
+            cursor.execute("BEGIN IMMEDIATE")
+            existing = cursor.execute(
+                "SELECT id, sync_id, is_active FROM objects WHERE name = ? AND company = ?",
+                (name, comp),
+            ).fetchone()
+            if existing and not existing["sync_id"]:
+                raise ValueError("Эта legacy-запись ещё не связана с сервером. Сначала выполните явное сопоставление.")
+            if existing:
+                cursor.execute(
+                    "UPDATE objects SET markning = ?, rate = ?, transport_rate = ?, is_active = 1 WHERE id = ?",
+                    (mark, rate_val, trans_rate_val, int(existing["id"])),
+                )
+                operation = "activate" if not existing["is_active"] else "upsert"
+                enqueue_object_sync_event(cursor, int(existing["id"]), operation)
+            else:
+                cursor.execute("""
+                    INSERT INTO objects (name, markning, company, rate, transport_rate, sync_id, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                """, (name, mark, comp, rate_val, trans_rate_val, str(uuid.uuid4())))
+                enqueue_object_sync_event(cursor, int(cursor.lastrowid), "upsert")
             conn.commit()
         except Exception as e:
+            conn.rollback()
             QMessageBox.critical(self, "Ошибка", f"Не удалось добавить объект: {e}")
+            conn.close()
+            return
         conn.close()
         self.new_obj_name_input.clear()
         self.new_obj_mark_input.clear()
@@ -5128,35 +7373,190 @@ class SmartReportApp(QMainWindow):
         self.background_sync_with_cloud()
 
     def on_object_cell_changed(self, row, col):
-        if col in [3, 4]:
+        if col in [1, 2, 3, 4]:
+            conn = None
             try:
                 name_item = self.table_objects.item(row, 1)
+                mark_item = self.table_objects.item(row, 2)
+                if not name_item or not mark_item:
+                    return
                 rate_item = self.table_objects.item(row, 3)
                 trans_item = self.table_objects.item(row, 4)
-                if not name_item or not rate_item or not trans_item:
+                if not rate_item or not trans_item:
                     return
-                obj_name = name_item.text().strip()
+                object_item = self.table_objects.item(row, 0)
+                object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
+                name = name_item.text().strip()
+                mark = mark_item.text().strip()
+                if not name or len(name) > 200 or len(mark) > 50:
+                    raise ValueError("Название должно содержать до 200 символов, markning — до 50.")
                 new_rate = parse_float(rate_item.text(), 0.0)
                 new_trans = parse_float(trans_item.text(), 0.0)
+                if not 0 <= new_rate <= 100000 or not 0 <= new_trans <= 100000:
+                    raise ValueError("Ставки должны быть в диапазоне от 0 до 100000.")
 
                 conn = get_db_connection()
                 cursor = conn.cursor()
-                cursor.execute("UPDATE objects SET rate = ?, transport_rate = ? WHERE name = ?", (new_rate, new_trans, obj_name))
+                cursor.execute("BEGIN IMMEDIATE")
+                object_state = cursor.execute(
+                    "SELECT sync_id, is_active, sync_version FROM objects WHERE id = ?", (object_id,)
+                ).fetchone()
+                if object_state is None:
+                    raise ValueError("Объект больше не существует. Обновите список.")
+                if not object_state["sync_id"]:
+                    raise ValueError("Объект ещё не связан с сервером; дождитесь синхронизации.")
+                if not object_state["is_active"]:
+                    raise ValueError("Объект находится в архиве. Сначала восстановите его.")
+                expected_revision = object_item.data(Qt.ItemDataRole.UserRole + 1)
+                expected_sync_id = object_item.data(Qt.ItemDataRole.UserRole + 2)
+                if (expected_revision != object_state["sync_version"]
+                        or expected_sync_id != object_state["sync_id"]):
+                    raise ValueError(
+                        f"Объект изменился после загрузки таблицы. Введённый markning «{mark}» "
+                        "не применён; проверьте обновлённую запись и повторите изменение."
+                    )
+                column_name, new_value = {
+                    1: ("name", name), 2: ("markning", mark),
+                    3: ("rate", new_rate), 4: ("transport_rate", new_trans),
+                }[col]
+                if col == 1:
+                    ensure_object_name_history(cursor)
+                cursor.execute(
+                    f"UPDATE objects SET {column_name} = ? "
+                    "WHERE id = ? AND sync_id = ? AND sync_version = ? AND is_active = 1",
+                    (new_value, object_id, expected_sync_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Состояние объекта изменилось; обновите список и повторите действие.")
+                event = enqueue_object_sync_event(cursor, object_id, "upsert")
                 conn.commit()
-                conn.close()
-                self.background_sync_with_cloud()
-            except Exception:
-                pass
+                object_item.setData(Qt.ItemDataRole.UserRole + 1, event["revision"])
+                self._object_edit_sync_pending = True
+            except Exception as error:
+                if conn is not None:
+                    conn.rollback()
+                QMessageBox.warning(self, "Объект", f"Изменение не сохранено: {error}")
+                QTimer.singleShot(0, self.load_objects_table)
+                return
+            finally:
+                if conn is not None:
+                    conn.close()
+            self.background_sync_with_cloud()
 
     def delete_object(self):
         selected = self.table_objects.currentRow()
         if selected < 0:
             return
-        obj_name = self.table_objects.item(selected, 1).text()
+        object_item = self.table_objects.item(selected, 0)
+        object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM objects WHERE name = ?', (obj_name,))
-        conn.commit()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            object_state = cursor.execute(
+                "SELECT sync_id, is_active FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if object_state and object_state["is_active"]:
+                cursor.execute("UPDATE objects SET is_active = 0 WHERE id = ?", (object_id,))
+                if object_state["sync_id"]:
+                    enqueue_object_sync_event(cursor, object_id, "deactivate")
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            QMessageBox.critical(self, "Ошибка", f"Не удалось архивировать объект: {error}")
+            conn.close()
+            return
+        conn.close()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
+
+    def link_legacy_object(self):
+        selected = self.table_objects.currentRow()
+        if selected < 0:
+            return
+        object_item = self.table_objects.item(selected, 0)
+        object_id = int(object_item.data(Qt.ItemDataRole.UserRole))
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT name, markning, company, sync_id, rate, transport_rate, is_active, sync_version "
+            "FROM objects WHERE id = ?",
+            (object_id,),
+        ).fetchone()
+        conn.close()
+        if row is None or row["sync_id"]:
+            QMessageBox.information(self, "Сопоставление объекта", "Выберите legacy-запись без серверной связи.")
+            return
+        try:
+            payload = request_expense_api("GET", "/api/expense-objects?include_inactive=1")
+        except Exception as error:
+            QMessageBox.warning(self, "Сопоставление объекта", f"Не удалось загрузить серверный справочник: {error}")
+            return
+        candidates = exact_legacy_object_candidates(
+            payload.get("objects", []), row["company"], row["name"], row["markning"]
+        )
+        if len(candidates) != 1:
+            QMessageBox.information(
+                self,
+                "Сопоставление объекта",
+                "Нет единственной несвязанной серверной записи с точным совпадением фирмы, названия и markning. Изменения не внесены.",
+            )
+            return
+        candidate = candidates[0]
+        local_rate = float(row["rate"] or 0.0)
+        local_transport = float(row["transport_rate"] or 0.0)
+        server_rate = float(candidate.get("rate") or 0.0)
+        server_transport = float(candidate.get("transport_rate") or 0.0)
+        rates_compatible = (
+            (local_rate == server_rate or (server_rate == 0 and local_rate > 0))
+            and (local_transport == server_transport or (server_transport == 0 and local_transport > 0))
+        )
+        if (
+            int(bool(row["is_active"])) != int(bool(candidate.get("is_active", 1)))
+            or int(row["sync_version"] or 0) != int(candidate.get("sync_version") or 0)
+            or int(candidate.get("sync_version") or 0) != 0
+            or not rates_compatible
+        ):
+            QMessageBox.information(
+                self,
+                "Сопоставление объекта",
+                "Состояния или ненулевые ставки различаются; запись оставлена без изменений.",
+            )
+            return
+        confirmation = QMessageBox.question(
+            self,
+            "Подтвердить связь",
+            f"Связать «{row['name']}» с серверным ID {candidate['id']}? "
+            f"Локальные ставки {local_rate:g}/{local_transport:g} сохранятся; "
+            "нулевые серверные ставки будут заменены локальными.",
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            current = cursor.execute(
+                "SELECT sync_id FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if current is None or current["sync_id"]:
+                raise ValueError("Локальная запись уже была связана или удалена.")
+            enqueue_object_sync_event(cursor, object_id, "link_legacy", {
+                "sync_id": str(uuid.uuid4()),
+                "server_object_id": int(candidate["id"]),
+                "expected_server_name": candidate["name"],
+                "expected_server_company": candidate["company"],
+                "expected_server_markning": candidate.get("markning") or "",
+                "expected_server_rate": server_rate,
+                "expected_server_transport_rate": server_transport,
+                "expected_server_is_active": int(bool(candidate.get("is_active", 1))),
+                "expected_server_revision": int(candidate.get("sync_version") or 0),
+            })
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Сопоставление объекта", f"Связь не поставлена в очередь: {error}")
+            conn.close()
+            return
         conn.close()
         self.load_dropdowns()
         self.background_sync_with_cloud()
@@ -5167,7 +7567,7 @@ class SmartReportApp(QMainWindow):
 
         if hasattr(self, 'emp_cb'):
             self.emp_cb.clear()
-            cursor.execute("SELECT name FROM employees ORDER BY name")
+            cursor.execute("SELECT name FROM employees WHERE is_active = 1 ORDER BY name")
             for row in cursor.fetchall():
                 self.emp_cb.addItem(row[0])
 
@@ -5208,7 +7608,7 @@ class SmartReportApp(QMainWindow):
             curr_obj = self.filter_obj.currentText()
             self.filter_obj.clear()
             self.filter_obj.addItem("-- Все объекты --")
-            cursor.execute("SELECT name FROM objects ORDER BY name")
+            cursor.execute("SELECT name FROM objects WHERE is_active = 1 ORDER BY name")
             for row in cursor.fetchall():
                 self.filter_obj.addItem(row[0])
             idx = self.filter_obj.findText(curr_obj)
@@ -5224,7 +7624,7 @@ class SmartReportApp(QMainWindow):
             self.load_objects_for_company(self.comp_cb.currentText(), self.obj_cb, record_type)
 
         if hasattr(self, 'inv_obj_cb') and hasattr(self, 'inv_comp_cb'):
-            self.load_objects_for_company(self.inv_comp_cb.currentText(), self.inv_obj_cb)
+            self.load_invoice_objects(self.inv_comp_cb.currentText())
 
         if hasattr(self, 'dag_obj_cb') and hasattr(self, 'dag_comp_cb'):
             self.load_objects_for_company(self.dag_comp_cb.currentText(), self.dag_obj_cb)
@@ -5239,6 +7639,14 @@ class SmartReportApp(QMainWindow):
             self.load_companies_table()
 
     def load_objects_table(self):
+        if self.table_objects.state() == QTableWidget.State.EditingState:
+            return
+        selected_object_id = None
+        current_row = self.table_objects.currentRow()
+        if current_row >= 0:
+            selected_item = self.table_objects.item(current_row, 0)
+            if selected_item is not None:
+                selected_object_id = selected_item.data(Qt.ItemDataRole.UserRole)
         try:
             self.table_objects.cellChanged.disconnect(self.on_object_cell_changed)
         except TypeError:
@@ -5246,30 +7654,157 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT company, name, markning, COALESCE(rate, 0.0), COALESCE(transport_rate, 0.0) FROM objects ORDER BY company, name")
+        cursor.execute("SELECT is_active, COUNT(*) FROM objects GROUP BY is_active")
+        counts = {int(row[0]): int(row[1]) for row in cursor.fetchall()}
+        self.object_counts_label.setText(
+            f"Активных: {counts.get(1, 0)} | В архиве: {counts.get(0, 0)}"
+        )
+        cursor.execute("""
+            SELECT id, company, name, markning, COALESCE(rate, 0.0),
+                   COALESCE(transport_rate, 0.0), is_active, sync_id, server_id, sync_version
+            FROM objects
+            WHERE is_active = 1 OR ? = 1
+            ORDER BY company, name, id
+        """, (int(self.show_archived_objects_check.isChecked()),))
         rows = cursor.fetchall()
         conn.close()
 
+        self.table_objects.clearSelection()
+        self.table_objects.setCurrentCell(-1, -1)
         self.table_objects.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
-            self.table_objects.setItem(row_idx, 0, QTableWidgetItem(row[0] or ""))
-            self.table_objects.setItem(row_idx, 1, QTableWidgetItem(row[1]))
-            self.table_objects.setItem(row_idx, 2, QTableWidgetItem(row[2] or ""))
+            company_item = QTableWidgetItem(row[1] or "")
+            company_item.setData(Qt.ItemDataRole.UserRole, int(row[0]))
+            company_item.setData(Qt.ItemDataRole.UserRole + 1, int(row[9] or 0))
+            company_item.setData(Qt.ItemDataRole.UserRole + 2, row[7])
+            self.table_objects.setItem(row_idx, 0, company_item)
+            name_item = QTableWidgetItem(row[2])
+            mark_item = QTableWidgetItem(row[3] or "")
+            company_item.setFlags(company_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if not row[6] or not row[7]:
+                for item in (name_item, mark_item):
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_objects.setItem(row_idx, 1, name_item)
+            self.table_objects.setItem(row_idx, 2, mark_item)
             
-            rate_item = QTableWidgetItem(f"{row[3]:.2f}")
+            rate_item = QTableWidgetItem(f"{row[4]:.2f}")
             rate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.table_objects.setItem(row_idx, 3, rate_item)
-
-            trans_item = QTableWidgetItem(f"{row[4]:.2f}")
+            trans_item = QTableWidgetItem(f"{row[5]:.2f}")
             trans_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if not row[6] or not row[7]:
+                rate_item.setFlags(rate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                trans_item.setFlags(trans_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_objects.setItem(row_idx, 3, rate_item)
             self.table_objects.setItem(row_idx, 4, trans_item)
+            state_label = "В архиве" if not row[6] else "Активен" if row[7] else "Legacy: не связан"
+            state_item = QTableWidgetItem(state_label)
+            state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_objects.setItem(row_idx, 5, state_item)
+            if not row[6]:
+                for column in range(self.table_objects.columnCount()):
+                    cell = self.table_objects.item(row_idx, column)
+                    cell.setForeground(QColor("#A0AEC0"))
+                    cell.setBackground(QColor("#2D3748"))
+            if selected_object_id is not None and int(row[0]) == int(selected_object_id):
+                self.table_objects.selectRow(row_idx)
 
         self.table_objects.cellChanged.connect(self.on_object_cell_changed)
+        self.update_object_archive_action()
 
-    def load_employees_table(self):
+    def update_object_archive_action(self):
+        selected = self.table_objects.currentRow()
+        if selected < 0:
+            self.object_archive_button.setText("Выберите объект")
+            self.object_archive_button.setEnabled(False)
+            return
+        item = self.table_objects.item(selected, 0)
+        object_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT is_active, sync_id, server_id FROM objects WHERE id = ?", (object_id,)
+        ).fetchone() if object_id is not None else None
+        pending = conn.execute(
+            "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1", (object_id,)
+        ).fetchone() if object_id is not None else None
+        conn.close()
+        if row is None:
+            self.object_archive_button.setText("Выберите объект")
+            self.object_archive_button.setEnabled(False)
+        elif not row["sync_id"] or not row["server_id"]:
+            self.object_archive_button.setText("Ожидает связи с сервером")
+            self.object_archive_button.setToolTip("Изменение активности доступно после устойчивой синхронизации объекта.")
+            self.object_archive_button.setEnabled(False)
+        elif pending:
+            self.object_archive_button.setText("Синхронизация ожидается")
+            self.object_archive_button.setToolTip("Дождитесь подтверждения текущего изменения объекта.")
+            self.object_archive_button.setEnabled(False)
+        else:
+            archived = not bool(row["is_active"])
+            self.object_archive_button.setText("Восстановить из архива" if archived else "В архив")
+            self.object_archive_button.setToolTip("")
+            self.object_archive_button.setEnabled(True)
+
+    def toggle_object_archive(self):
+        selected = self.table_objects.currentRow()
+        if selected < 0:
+            return
+        item = self.table_objects.item(selected, 0)
+        object_id = int(item.data(Qt.ItemDataRole.UserRole)) if item is not None else 0
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT name, salary_rate FROM employees ORDER BY name")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                "SELECT is_active, sync_id, server_id FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Выбранный объект больше не существует.")
+            if not row["sync_id"] or not row["server_id"]:
+                raise ValueError("Объект ещё не имеет устойчивой связи с сервером.")
+            if cursor.execute(
+                "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1", (object_id,)
+            ).fetchone():
+                raise ValueError("Предыдущее изменение объекта ещё не подтверждено сервером.")
+            activating = not bool(row["is_active"])
+            operation = "activate" if activating else "deactivate"
+            cursor.execute(
+                "UPDATE objects SET is_active = ? WHERE id = ? AND is_active = ?",
+                (int(activating), object_id, int(bool(row["is_active"]))),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Состояние объекта изменилось; обновите справочник и повторите действие.")
+            enqueue_object_sync_event(cursor, object_id, operation)
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            conn.close()
+            QMessageBox.warning(self, "Архив объектов", str(error))
+            self.load_objects_table()
+            return
+        conn.close()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
+
+    def load_employees_table(self):
+        selected_employee_id = None
+        current_row = self.table_employees.currentRow()
+        if current_row >= 0:
+            selected_item = self.table_employees.item(current_row, 0)
+            if selected_item is not None:
+                selected_employee_id = selected_item.data(Qt.ItemDataRole.UserRole)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active, COUNT(*) FROM employees GROUP BY is_active")
+        counts = {int(row[0]): int(row[1]) for row in cursor.fetchall()}
+        self.employee_counts_label.setText(
+            f"Активных: {counts.get(1, 0)} | Неактивных: {counts.get(0, 0)}"
+        )
+        cursor.execute("""
+            SELECT id, name, salary_rate, is_active
+            FROM employees
+            WHERE is_active = 1 OR ? = 1
+            ORDER BY is_active DESC, name, id
+        """, (int(self.show_inactive_employees_check.isChecked()),))
         rows = cursor.fetchall()
         conn.close()
 
@@ -5284,27 +7819,56 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
+        self.table_employees.clearSelection()
+        self.table_employees.setCurrentCell(-1, -1)
         self.table_employees.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
-            name, rate = row[0], row[1]
+            employee_id, name, rate, is_active = int(row[0]), row[1], row[2], bool(row[3])
             has_pin = pin_statuses.get(name.strip().lower(), None)
-
-            if has_pin is None:
-                pin_text = "❓ Неизвестно"
-            elif has_pin:
-                pin_text = "✅ Пин задан"
-            else:
-                pin_text = "⏳ Не задан"
-
-            self.table_employees.setItem(row_idx, 0, QTableWidgetItem(name))
+            name_item = QTableWidgetItem(name)
+            name_item.setData(Qt.ItemDataRole.UserRole, employee_id)
+            self.table_employees.setItem(row_idx, 0, name_item)
             self.table_employees.setItem(row_idx, 1, QTableWidgetItem(f"{rate:.2f}" if rate else "0.00"))
-            
+
+            status_item = QTableWidgetItem("Активен" if is_active else "Неактивен")
+            self.table_employees.setItem(row_idx, 2, status_item)
+            pin_text = "Неизвестно" if has_pin is None else "Задан" if has_pin else "Не задан"
             pin_item = QTableWidgetItem(pin_text)
             if has_pin:
                 pin_item.setForeground(QColor("#68D391"))
             elif has_pin is False:
                 pin_item.setForeground(QColor("#F6AD55"))
-            self.table_employees.setItem(row_idx, 2, pin_item)
+            self.table_employees.setItem(row_idx, 3, pin_item)
+            if not is_active:
+                for column in range(self.table_employees.columnCount()):
+                    cell = self.table_employees.item(row_idx, column)
+                    cell.setForeground(QColor("#A0AEC0"))
+                    cell.setBackground(QColor("#2D3748"))
+            if selected_employee_id is not None and employee_id == int(selected_employee_id):
+                self.table_employees.selectRow(row_idx)
+        self.update_employee_status_action()
+
+    def update_employee_status_action(self):
+        selected = self.table_employees.currentRow()
+        if selected < 0:
+            self.employee_status_button.setText("Выберите сотрудника")
+            self.employee_status_button.setEnabled(False)
+            return
+        item = self.table_employees.item(selected, 0)
+        employee_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT name, is_active FROM employees WHERE id = ?", (employee_id,)
+        ).fetchone() if employee_id is not None else None
+        conn.close()
+        if row is None:
+            self.employee_status_button.setText("Выберите сотрудника")
+            self.employee_status_button.setEnabled(False)
+            return
+        self.employee_status_button.setText(
+            "Деактивировать сотрудника" if row["is_active"] else "Активировать сотрудника"
+        )
+        self.employee_status_button.setEnabled(True)
 
     def reset_employee_pin_desktop(self):
         selected = self.table_employees.currentRow()
@@ -5344,29 +7908,69 @@ class SmartReportApp(QMainWindow):
             return
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO employees (name, salary_rate) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET salary_rate = ?
-        ''', (name, rate_val, rate_val))
-        conn.commit()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute('''
+                INSERT INTO employees (name, salary_rate) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET salary_rate = ?
+            ''', (name, rate_val, rate_val))
+            enqueue_employee_sync_event(cursor, name, "activate")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
         conn.close()
         self.new_emp_input.clear()
         self.new_emp_rate_input.clear()
         self.load_dropdowns()
         self.background_sync_with_cloud()
 
-    def delete_employee(self):
+    def toggle_employee_active(self):
         selected = self.table_employees.currentRow()
         if selected < 0:
             return
-        emp_name = self.table_employees.item(selected, 0).text()
+        item = self.table_employees.item(selected, 0)
+        employee_id = int(item.data(Qt.ItemDataRole.UserRole)) if item is not None else 0
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM employees WHERE name = ?', (emp_name,))
-        conn.commit()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                "SELECT name, is_active FROM employees WHERE id = ?", (employee_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Выбранный сотрудник больше не существует.")
+            employee_name = row["name"]
+            employee_key = employee_sync_key(employee_name)
+            pending = cursor.execute(
+                "SELECT 1 FROM employee_sync_outbox WHERE employee_key = ? "
+                "UNION ALL SELECT 1 FROM employee_restore_outbox WHERE employee_key = ? LIMIT 1",
+                (employee_key, employee_key),
+            ).fetchone()
+            if pending:
+                raise ValueError("Предыдущее изменение сотрудника ещё не подтверждено сервером.")
+            activating = not bool(row["is_active"])
+            operation = "activate" if activating else "deactivate"
+            cursor.execute(
+                "UPDATE employees SET is_active = ? WHERE id = ? AND is_active = ?",
+                (int(activating), employee_id, int(bool(row["is_active"]))),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Состояние сотрудника изменилось; обновите список и повторите действие.")
+            event_id = enqueue_employee_sync_event(cursor, employee_name, operation)
+            if activating and event_id is None:
+                raise ValueError("Активация не поставлена в очередь: локальный tombstone не подтверждён.")
+            conn.commit()
+        except Exception as error:
+            conn.rollback()
+            conn.close()
+            QMessageBox.warning(self, "Сотрудники", str(error))
+            self.load_employees_table()
+            return
         conn.close()
         self.load_dropdowns()
-        self.background_sync_with_cloud()
+        self.sync_with_cloud()
 
     def save_shift(self):
         date = self.date_input.text().strip()
@@ -5407,7 +8011,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
             return
         else:
-            cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ?", (comp, obj_name))
+            cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (comp, obj_name))
             object_row = cursor.fetchone()
             if object_row and (obj_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
                 conn.close()
@@ -5422,7 +8026,7 @@ class SmartReportApp(QMainWindow):
         elif rate_input_str:
             rate_val = parse_float(rate_input_str, -1)
         else:
-            cursor.execute("SELECT rate FROM objects WHERE name = ?", (obj_name,))
+            cursor.execute("SELECT rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj_name, comp))
             obj_row = cursor.fetchone()
             rate_val = obj_row[0] if obj_row and obj_row[0] else 0.0
 
@@ -5582,8 +8186,8 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT * FROM shifts WHERE id = ?", (local_id,))
         shift = cursor.fetchone()
         has_ob_schema = ob_schema_ready(cursor)
-        cursor.execute("SELECT name FROM employees ORDER BY name")
-        employees = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT name, is_active FROM employees ORDER BY name")
+        employees = cursor.fetchall()
         cursor.execute("SELECT name FROM companies ORDER BY name")
         companies = [row[0] for row in cursor.fetchall()]
         conn.close()
@@ -5596,8 +8200,22 @@ class SmartReportApp(QMainWindow):
         date_field = create_date_field(shift['date'])
         employee_field = QComboBox()
         employee_field.setEditable(True)
-        employee_field.addItems(employees)
-        employee_field.setCurrentText(shift['employee'])
+        for employee in employees:
+            name = employee["name"]
+            is_active = bool(employee["is_active"])
+            display = name if is_active else f"{name} — Неактивен"
+            employee_field.addItem(display, userData=name)
+        if employee_field.findData(shift['employee']) < 0:
+            employee_field.addItem(f"{shift['employee']} — Неактивен", userData=shift['employee'])
+        employee_field.setCurrentIndex(employee_field.findData(shift['employee']))
+
+        def selected_employee_name():
+            current_index = employee_field.currentIndex()
+            selected_name = employee_field.itemData(current_index) if current_index >= 0 else None
+            if selected_name and employee_field.currentText() == employee_field.itemText(current_index):
+                return str(selected_name).strip()
+            return employee_field.currentText().strip()
+
         company_field = QComboBox()
         company_field.setEditable(True)
         company_field.addItems(companies)
@@ -5617,12 +8235,25 @@ class SmartReportApp(QMainWindow):
             type_index = 0
         record_type_field.setCurrentIndex(type_index)
         object_field = QComboBox()
-        self.load_objects_for_company(shift['company'], object_field, current_type)
+        self.load_objects_for_company(
+            shift['company'], object_field, current_type,
+            archived_object_name=shift['object_name'],
+        )
         object_index = object_field.findData(shift['object_name'])
         if object_index >= 0:
             object_field.setCurrentIndex(object_index)
-        company_field.currentTextChanged.connect(lambda company: self.load_objects_for_company(company, object_field, record_type_field.currentData()))
-        record_type_field.currentIndexChanged.connect(lambda *_: self.load_objects_for_company(company_field.currentText(), object_field, record_type_field.currentData()))
+        def reload_dialog_objects(*_):
+            company = company_field.currentText()
+            record_type = record_type_field.currentData()
+            archived_name = shift['object_name'] if (
+                company == shift['company'] and record_type == current_type
+            ) else None
+            self.load_objects_for_company(
+                company, object_field, record_type, archived_object_name=archived_name
+            )
+
+        company_field.currentTextChanged.connect(reload_dialog_objects)
+        record_type_field.currentIndexChanged.connect(reload_dialog_objects)
         hours_field = QDoubleSpinBox()
         hours_field.setRange(0.5, 24)
         hours_field.setSingleStep(0.5)
@@ -5664,7 +8295,7 @@ class SmartReportApp(QMainWindow):
             preview_conn = get_db_connection()
             try:
                 base_rate = get_local_employee_ob_base_rate(
-                    preview_conn.cursor(), employee_field.currentText().strip()
+                    preview_conn.cursor(), selected_employee_name()
                 )
                 if base_rate <= 0:
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
@@ -5744,7 +8375,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
             return
         else:
-            check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ?", (company_field.currentText().strip(), object_name))
+            check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (company_field.currentText().strip(), object_name))
             object_row = check_cursor.fetchone()
             if object_row and (object_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
                 check_conn.close()
@@ -5758,7 +8389,7 @@ class SmartReportApp(QMainWindow):
             rate_cursor = schema_conn.cursor()
             try:
                 employee_base_rate = get_local_employee_ob_base_rate(
-                    rate_cursor, employee_field.currentText().strip()
+                    rate_cursor, selected_employee_name()
                 ) if schema_ready else None
                 if employee_base_rate is not None and employee_base_rate <= 0:
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
@@ -5783,7 +8414,7 @@ class SmartReportApp(QMainWindow):
             payload_date = date_field.text()
 
         payload = {
-            "date": payload_date, "employee": employee_field.currentText().strip(),
+            "date": payload_date, "employee": selected_employee_name(),
             "company": company_field.currentText().strip(), "object_name": object_name,
             "hours": ob_result["total_hours"] if ob_result else hours_field.value(),
             "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,

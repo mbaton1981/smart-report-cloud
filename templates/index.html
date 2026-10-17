@@ -71,7 +71,6 @@
             .main-container { gap: 12px; min-width: 0; max-width: 100%; }
             .form-box, .history-box { flex-basis: 100%; padding: 16px; }
             .user-header { gap: 8px; padding: 10px 12px; }
-            #user-info-text { min-width: 0; overflow-wrap: anywhere; }
             #history-list li { padding: 8px; gap: 6px; align-items: flex-start; }
             .history-actions { gap: 4px; }
             .history-actions button { padding: 5px 7px; font-size: 12px; min-height: 40px; }
@@ -99,8 +98,13 @@
         .login-card { background: #ffffff; padding: 30px; border-radius: 12px; width: 100%; max-width: 380px; border: 1px solid #dcdde1; box-shadow: 0 10px 30px rgba(0,0,0,0.15); }
         
         /* Шапка пользователя */
-        .user-header { background: #ffffff; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #dcdde1; display: flex; justify-content: space-between; align-items: center; font-size: 15px; color: #2d3436; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+        #user-info-text b { font-size: 22px; font-weight: 800; color: #1b6ca8; }
+        .user-header { background: #ffffff; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #dcdde1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr); align-items: center; font-size: 15px; color: #2d3436; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+        #user-info-text { grid-column: 2; min-width: 0; text-align: center; overflow-wrap: anywhere; }
+        .btn-expenses { grid-column: 1; justify-self: start; color: #087f5b; font-weight: bold; text-decoration: none; }
+        .btn-expenses:hover { text-decoration: underline; }
         .btn-logout { background: #d63031; width: auto; padding: 8px 14px; font-size: 14px; }
+        .user-header .btn-logout { grid-column: 3; justify-self: end; }
         .btn-logout:hover { background: #c0392b; }
 
         /* Скрытая область для печати/PDF */
@@ -148,6 +152,7 @@
 
     <div class="container" style="max-width: 800px; margin: 0 auto;">
         <div class="user-header">
+            <a id="expenses-link" class="btn-expenses" href="/expenses" hidden>Фактуры и расходы по объектам</a>
             <span id="user-info-text">Загрузка сессии...</span>
             <button type="button" class="btn-logout" onclick="handleLogout()">Выйти</button>
         </div>
@@ -163,10 +168,10 @@
                     <input type="date" id="date" name="date" required>
                 </div>
 
-                <div class="form-group">
+                <div class="form-group" id="employee-group" style="display: none;">
                     <label for="employee">Сотрудник:</label>
-                    <select id="employee" name="employee" required>
-                        <option value="">-- Выберите ваше имя --</option>
+                    <select id="employee" name="employee">
+                        <option value="">-- Выберите сотрудника --</option>
                         {% for emp in employees %}
                         <option value="{{ emp }}">{{ emp }}</option>
                         {% endfor %}
@@ -260,7 +265,7 @@
                 <input type="month" id="history-month" class="form-control">
             </div>
 
-            <div class="form-group">
+            <div class="form-group" id="history-employee-group">
                 <label for="history-employee">Выберите сотрудника:</label>
                 <select id="history-employee">
                     <option value="">-- Выберите сотрудника --</option>
@@ -368,7 +373,32 @@
         let activeEditOperationId = null;
         let editOriginalTransport = 0;
         let reportPdfUrl = '';
-        document.getElementById('date').value = new Date().toISOString().split('T')[0];
+        const MAX_FUTURE_DAYS = 7;
+        let currentEmployeeName = '';
+        function getShiftEmployee() {
+            return currentUser && currentUser.role === 'admin'
+                ? document.getElementById('employee').value
+                : currentEmployeeName;
+        }
+        function localDateString(date) {
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+        function maxShiftDate() {
+            const limit = new Date();
+            limit.setDate(limit.getDate() + MAX_FUTURE_DAYS);
+            return localDateString(limit);
+        }
+        function getHistoryEmployee() {
+            if (!currentUser) return '';
+            return currentUser.role === 'admin'
+                ? document.getElementById('history-employee').value
+                : currentEmployeeName;
+        }
+        document.getElementById('date').value = localDateString(new Date());
+        document.getElementById('date').max = maxShiftDate();
         
         const now = new Date();
         const year = now.getFullYear();
@@ -560,7 +590,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         date, start_time: start, end_time: end,
-                        employee: edit ? activeEditShift.employee : document.getElementById('employee').value
+                        employee: edit ? activeEditShift.employee : getShiftEmployee()
                     })
                 });
                 const result = await response.json();
@@ -759,7 +789,7 @@
 
         async function pollShiftHistory() {
             if (!currentUser || document.hidden || historyPollInFlight) return;
-            const employee = document.getElementById('history-employee').value;
+            const employee = getHistoryEmployee();
             const month = document.getElementById('history-month').value;
             if (!employee || !month) return;
 
@@ -811,15 +841,21 @@
 
         async function setupUserInterface() {
             const userInfoText = document.getElementById('user-info-text');
-            const employeeSelect = document.getElementById('employee');
             const historyEmployeeSelect = document.getElementById('history-employee');
+            document.getElementById('expenses-link').hidden = currentUser.role !== 'admin';
 
             if (currentUser.role === 'admin') {
                 userInfoText.innerHTML = `👤 Администратор: <b>${currentUser.username}</b>`;
-                employeeSelect.disabled = false;
+                currentEmployeeName = currentUser.username;
+                document.getElementById('employee-group').style.display = '';
+                document.getElementById('employee').required = true;
+                document.getElementById('history-employee-group').style.display = '';
                 historyEmployeeSelect.disabled = false;
             } else {
                 userInfoText.innerHTML = `👷 Работник: <b>${currentUser.username}</b>`;
+                document.getElementById('employee-group').style.display = 'none';
+                document.getElementById('employee').required = false;
+                document.getElementById('history-employee-group').style.display = 'none';
                 
                 try {
                     const res = await fetch('/get-active-employees');
@@ -833,21 +869,15 @@
                         }
                     }
 
-                    [employeeSelect, historyEmployeeSelect].forEach(select => {
-                        select.innerHTML = '';
-                        const opt = document.createElement('option');
-                        opt.value = matchedName;
-                        opt.textContent = matchedName;
-                        select.appendChild(opt);
-                        select.value = matchedName;
-                        select.disabled = true; // Обычный пользователь не может менять свое имя
-                    });
+                    currentEmployeeName = matchedName;
+                    historyEmployeeSelect.value = matchedName;
+                    historyEmployeeSelect.disabled = true;
                 } catch (e) {
                     console.error("Ошибка привязки сотрудника:", e);
                 }
             }
 
-            if (historyEmployeeSelect.value) {
+            if (getHistoryEmployee()) {
                 document.getElementById('load-history-btn').click();
             }
             if (historyPollTimer) clearInterval(historyPollTimer);
@@ -893,8 +923,12 @@
             e.preventDefault();
             
             const selectedDate = document.getElementById('date').value;
-            const empName = document.getElementById('employee').value;
+            const empName = getShiftEmployee();
             const submissionType = document.getElementById('submission_type').value;
+            if (selectedDate > maxShiftDate()) {
+                showFormAlert("Нельзя отправлять смены более чем на 7 дней вперёд", "error");
+                return;
+            }
             if (submissionType === 'ob') {
                 const preview = await refreshObPreview(false);
                 if (!preview) return;
@@ -940,8 +974,12 @@
 
         async function executeShiftSubmission() {
             const selectedDate = document.getElementById('date').value;
-            const empName = document.getElementById('employee').value;
+            const empName = getShiftEmployee();
             const submissionType = document.getElementById('submission_type').value;
+            if (selectedDate > maxShiftDate()) {
+                showFormAlert("Нельзя отправлять смены более чем на 7 дней вперед", "error");
+                return;
+            }
             let hoursVal = parseFloat(document.getElementById('hours').value);
             let obPreview = null;
             if (submissionType === 'ob') {
@@ -1018,7 +1056,7 @@
         });
 
         document.getElementById('load-history-btn').addEventListener('click', async function() {
-            const empName = document.getElementById('history-employee').value;
+            const empName = getHistoryEmployee();
             const selectedMonth = document.getElementById('history-month').value;
             const listContainer = document.getElementById('history-list');
             const warningContainer = document.getElementById('warning-container');

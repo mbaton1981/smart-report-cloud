@@ -4,14 +4,20 @@ import ast
 import os
 import json
 import hashlib
+import hmac
 import logging
+import math
 import csv
 import io
 import uuid
+from pathlib import Path
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape
-from flask import Flask, render_template, request, jsonify, session, make_response, send_file
+from flask import Flask, render_template, request, jsonify, session, make_response, send_file, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from expense_documents import allocation_breakdown, decimal_text, parse_decimal
 from ob_calculator import calculate_work_interval
 import reportlab
 from reportlab.lib import colors
@@ -159,14 +165,19 @@ def get_ob_segments(cursor, shift_id):
     return [dict(row) for row in cursor.fetchall()]
 
 
-def validate_submission_object(cursor, submission_type, company, object_name):
+def validate_submission_object(cursor, submission_type, company, object_name, allow_inactive=False):
     reference = SPECIAL_SUBMISSION_OBJECTS.get(submission_type)
     if not reference:
-        cursor.execute("SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ?", (object_name, company))
+        cursor.execute(
+            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? "
+            "AND (is_active = 1 OR ? = 1)",
+            (object_name, company, int(allow_inactive)),
+        )
     else:
         cursor.execute(
-            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ?",
-            (reference[0], company, reference[1])
+            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ? "
+            "AND (is_active = 1 OR ? = 1)",
+            (reference[0], company, reference[1], int(allow_inactive))
         )
     matches = cursor.fetchall()
     if len(matches) != 1:
@@ -184,7 +195,7 @@ def validate_submission_object(cursor, submission_type, company, object_name):
 
 def infer_submission_type_from_object(cursor, company, object_name):
     cursor.execute(
-        "SELECT name, markning FROM meta_objects WHERE company = ? AND name = ?",
+        "SELECT name, markning FROM meta_objects WHERE company = ? AND name = ? AND is_active = 1",
         (company, object_name)
     )
     matches = cursor.fetchall()
@@ -235,6 +246,7 @@ def resolve_session_employee(cursor, requested_employee=None):
 
 app = Flask(__name__)
 app.permanent_session_lifetime = timedelta(hours=8)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
@@ -466,6 +478,22 @@ def init_cloud_db():
             is_active INTEGER NOT NULL DEFAULT 1
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_sync_events (
+            operation_id TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL,
+            employee_key TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            state_hash TEXT,
+            operation TEXT NOT NULL,
+            profile_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("PRAGMA table_info(employee_sync_events)")
+    employee_event_columns = {column[1] for column in cursor.fetchall()}
+    if "state_hash" not in employee_event_columns:
+        cursor.execute("ALTER TABLE employee_sync_events ADD COLUMN state_hash TEXT")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_companies (
@@ -477,12 +505,85 @@ def init_cloud_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS meta_objects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sync_id TEXT,
             name TEXT NOT NULL,
             markning TEXT,
             company TEXT,
+            rate REAL NOT NULL DEFAULT 0.0,
+            transport_rate REAL NOT NULL DEFAULT 0.0,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+            sync_version INTEGER NOT NULL DEFAULT 0,
             UNIQUE(name, company)
         )
     ''')
+    cursor.execute("PRAGMA table_info(meta_objects)")
+    object_columns = {column[1] for column in cursor.fetchall()}
+    for column_name, column_sql in (
+        ("sync_id", "TEXT"),
+        ("rate", "REAL NOT NULL DEFAULT 0.0"),
+        ("transport_rate", "REAL NOT NULL DEFAULT 0.0"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+        ("sync_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column_name not in object_columns:
+            cursor.execute(f"ALTER TABLE meta_objects ADD COLUMN {column_name} {column_sql}")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_objects_sync_id ON meta_objects(sync_id) WHERE sync_id IS NOT NULL")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_sync_events (
+            operation_id TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL,
+            sync_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            state_hash TEXT,
+            operation TEXT NOT NULL,
+            server_object_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute("PRAGMA table_info(object_sync_events)")
+    event_columns = {column[1] for column in cursor.fetchall()}
+    if "revision" not in event_columns:
+        cursor.execute("ALTER TABLE object_sync_events ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+    if "state_hash" not in event_columns:
+        cursor.execute("ALTER TABLE object_sync_events ADD COLUMN state_hash TEXT")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expense_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id TEXT NOT NULL UNIQUE,
+            supplier_name TEXT NOT NULL DEFAULT '',
+            invoice_number TEXT NOT NULL DEFAULT '',
+            document_date TEXT,
+            currency_code TEXT NOT NULL DEFAULT 'SEK',
+            net_amount TEXT,
+            vat_amount TEXT,
+            gross_amount TEXT,
+            expense_category TEXT NOT NULL DEFAULT 'Прочие расходы',
+            document_comment TEXT NOT NULL DEFAULT '',
+            verification_status TEXT NOT NULL DEFAULT 'draft'
+                CHECK (verification_status IN ('draft','requires_review','confirmed')),
+            recognized_text TEXT NOT NULL DEFAULT '',
+            original_name TEXT,
+            stored_name TEXT,
+            file_sha256 TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expense_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+            object_id INTEGER NOT NULL REFERENCES meta_objects(id) ON DELETE RESTRICT,
+            allocated_gross TEXT NOT NULL,
+            allocated_net TEXT,
+            allocated_vat TEXT,
+            allocation_note TEXT NOT NULL DEFAULT ''
+        )
+    ''')
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expense_allocations_object ON expense_allocations(object_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expense_documents_date ON expense_documents(document_date)")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_documents_file_hash ON expense_documents(file_sha256) WHERE file_sha256 IS NOT NULL")
 
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
@@ -534,12 +635,633 @@ def init_cloud_db():
 
 init_cloud_db()
 
+
+@app.before_request
+def enforce_active_session():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, username, role, employee_id, is_active FROM users WHERE id = ?",
+            (user_id,),
+        )
+        user = cursor.fetchone()
+        if user is None or not user["is_active"]:
+            session.clear()
+            return None
+        session["username"] = user["username"]
+        session["role"] = user["role"]
+        session["employee_id"] = user["employee_id"]
+        if user["role"] != "admin":
+            if user["employee_id"]:
+                cursor.execute(
+                    "SELECT id FROM meta_employees WHERE id = ? AND is_active = 1",
+                    (user["employee_id"],),
+                )
+                active_profile = cursor.fetchone()
+            else:
+                active_profile = select_employee_profile(
+                    find_employee_profiles(cursor, user["username"], active_only=True),
+                    preferred_name=user["username"],
+                )
+            if active_profile is None:
+                session.clear()
+    finally:
+        conn.close()
+    return None
+
 def verify_sync_key():
     sync_key = request.headers.get('X-Sync-Key') or request.headers.get('X-API-Key')
     if not sync_key or sync_key != SYNC_API_KEY:
         logger.warning(f"Несанкционированная попытка доступа с IP: {request.remote_addr}")
         return False
     return True
+
+
+EXPENSE_DOCUMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+EXPENSE_DOCUMENT_STATUSES = {"draft", "requires_review", "confirmed"}
+
+
+def expense_api_authorized():
+    if session.get("role") == "admin":
+        if request.method in {"POST", "PUT", "DELETE"}:
+            supplied = request.headers.get("X-CSRF-Token", "")
+            expected = str(session.get("expense_csrf_token") or "")
+            return bool(expected and supplied and hmac.compare_digest(supplied, expected))
+        return True
+    return verify_sync_key()
+
+
+def expense_documents_root():
+    configured = os.environ.get("SMARTREPORT_DOCUMENTS_DIR", "").strip()
+    if not configured:
+        raise RuntimeError("SMARTREPORT_DOCUMENTS_DIR должен указывать на постоянное хранилище документов.")
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise ValueError("SMARTREPORT_DOCUMENTS_DIR должен быть абсолютным путём.")
+    return root.resolve()
+
+
+def expense_request_payload():
+    if request.is_json:
+        payload = request.get_json(silent=True)
+    else:
+        raw_payload = request.form.get("payload")
+        payload = json.loads(raw_payload) if raw_payload else request.form.to_dict()
+    if not isinstance(payload, dict):
+        raise ValueError("Ожидается объект с полями документа.")
+    return payload
+
+
+def validate_expense_fields(payload):
+    status = str(payload.get("verification_status") or "draft")
+    if status not in EXPENSE_DOCUMENT_STATUSES:
+        raise ValueError("Недопустимый статус документа.")
+
+    document_date = str(payload.get("document_date") or "").strip() or None
+    if document_date:
+        try:
+            datetime.strptime(document_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("Дата документа должна быть в формате YYYY-MM-DD.") from error
+
+    amount_values = {}
+    for key in ("net_amount", "vat_amount", "gross_amount"):
+        raw_value = payload.get(key)
+        value = parse_decimal(raw_value)
+        if raw_value not in (None, "") and value is None:
+            raise ValueError(f"Некорректная сумма: {key}.")
+        amount_values[key] = Decimal(decimal_text(value)) if value is not None else None
+
+    supplier_name = str(payload.get("supplier_name") or "").strip()
+    invoice_number = str(payload.get("invoice_number") or "").strip()
+    currency_code = str(payload.get("currency_code") or "SEK").strip().upper()
+    if len(supplier_name) > 250 or len(invoice_number) > 120:
+        raise ValueError("Поставщик или номер документа слишком длинный.")
+    if currency_code != "UNKNOWN" and (len(currency_code) != 3 or not currency_code.isalpha()):
+        raise ValueError("Укажите код валюты из трёх букв.")
+    if len(str(payload.get("document_comment") or "")) > 4000:
+        raise ValueError("Комментарий документа слишком длинный.")
+
+    if status == "confirmed":
+        if not supplier_name or not document_date or any(amount_values[key] is None for key in amount_values):
+            raise ValueError("Для подтверждения заполните поставщика, дату, нетто, НДС и итог.")
+        if currency_code == "UNKNOWN":
+            raise ValueError("Для подтверждения выберите валюту документа.")
+        if amount_values["net_amount"] + amount_values["vat_amount"] != amount_values["gross_amount"]:
+            raise ValueError("Нетто и НДС не совпадают с общей суммой документа.")
+
+    return {
+        "supplier_name": supplier_name,
+        "invoice_number": invoice_number,
+        "document_date": document_date,
+        "currency_code": currency_code,
+        "net_amount": decimal_text(amount_values["net_amount"]),
+        "vat_amount": decimal_text(amount_values["vat_amount"]),
+        "gross_amount": decimal_text(amount_values["gross_amount"]),
+        "expense_category": str(payload.get("expense_category") or "Прочие расходы").strip()[:100],
+        "document_comment": str(payload.get("document_comment") or "").strip(),
+        "verification_status": status,
+        "recognized_text": str(payload.get("recognized_text") or "")[:100000],
+    }
+
+
+def resolve_expense_allocations(cursor, raw_allocations, fields):
+    if not isinstance(raw_allocations, list) or len(raw_allocations) > 100:
+        raise ValueError("Распределение должно быть списком не более чем из 100 строк.")
+    if fields["gross_amount"] is None:
+        if raw_allocations:
+            raise ValueError("Сначала укажите итоговую сумму документа.")
+        return []
+
+    normalized = []
+    for item in raw_allocations:
+        if not isinstance(item, dict):
+            raise ValueError("Некорректная строка распределения.")
+        object_id = item.get("object_id")
+        if object_id is None:
+            raise ValueError("Для каждой распределённой суммы выберите объект.")
+        try:
+            object_id = int(object_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Некорректный объект распределения.") from error
+        cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
+        if cursor.fetchone() is None:
+            raise ValueError("Активный объект не найден в серверном справочнике.")
+        normalized.append({
+            "object_id": object_id,
+            "gross_amount": item.get("gross_amount"),
+            "note": str(item.get("note") or "")[:500],
+        })
+
+    breakdown = allocation_breakdown(
+        fields["gross_amount"], fields["net_amount"], fields["vat_amount"], normalized
+    )
+    return [{
+        "object_id": int(item["object_id"]),
+        "gross_amount": decimal_text(item["gross_amount"]),
+        "net_amount": decimal_text(item["net_amount"]),
+        "vat_amount": decimal_text(item["vat_amount"]),
+        "note": item["note"],
+    } for item in breakdown["allocations"]]
+
+
+def serialize_expense_document(cursor, document, include_text=False):
+    cursor.execute("""
+        SELECT a.object_id, o.name AS object_name, o.company, o.markning,
+               a.allocated_gross AS gross_amount, a.allocated_net AS net_amount,
+               a.allocated_vat AS vat_amount, a.allocation_note AS note
+        FROM expense_allocations a
+        JOIN meta_objects o ON o.id = a.object_id
+        WHERE a.document_id = ? ORDER BY a.id
+    """, (document["id"],))
+    allocations = [dict(row) for row in cursor.fetchall()]
+    gross = document["gross_amount"]
+    if gross is None:
+        breakdown = {"allocations": [], "allocated_gross": None, "unallocated_gross": None,
+                     "allocated_net": None, "unallocated_net": None,
+                     "allocated_vat": None, "unallocated_vat": None, "fully_allocated": False}
+    else:
+        breakdown = allocation_breakdown(
+            gross, document["net_amount"], document["vat_amount"], allocations
+        )
+    serialized_allocations = [{
+        **item,
+        "gross_amount": decimal_text(item["gross_amount"]),
+        "net_amount": decimal_text(item["net_amount"]),
+        "vat_amount": decimal_text(item["vat_amount"]),
+    } for item in breakdown["allocations"]]
+    serialized = {
+        "id": int(document["id"]),
+        "client_id": document["client_id"],
+        "supplier_name": document["supplier_name"],
+        "invoice_number": document["invoice_number"],
+        "document_date": document["document_date"],
+        "currency_code": document["currency_code"],
+        "net_amount": decimal_text(document["net_amount"]),
+        "vat_amount": decimal_text(document["vat_amount"]),
+        "gross_amount": decimal_text(document["gross_amount"]),
+        "expense_category": document["expense_category"],
+        "document_comment": document["document_comment"],
+        "verification_status": document["verification_status"],
+        "original_name": document["original_name"],
+        "has_original": bool(document["stored_name"]),
+        "allocations": serialized_allocations,
+        "allocated_gross": decimal_text(breakdown["allocated_gross"]),
+        "unallocated_gross": decimal_text(breakdown["unallocated_gross"]),
+        "allocated_net": decimal_text(breakdown["allocated_net"]),
+        "unallocated_net": decimal_text(breakdown["unallocated_net"]),
+        "allocated_vat": decimal_text(breakdown["allocated_vat"]),
+        "unallocated_vat": decimal_text(breakdown["unallocated_vat"]),
+        "fully_allocated": breakdown["fully_allocated"],
+        "created_at": document["created_at"],
+        "updated_at": document["updated_at"],
+    }
+    if include_text:
+        serialized["recognized_text"] = document["recognized_text"]
+    return serialized
+
+
+def stage_expense_original(upload):
+    if not upload or not upload.filename:
+        return None
+    original_name = secure_filename(upload.filename)
+    suffix = Path(original_name).suffix.casefold()
+    if suffix not in EXPENSE_DOCUMENT_EXTENSIONS:
+        raise ValueError("Поддерживаются PDF и распространённые форматы изображений.")
+    root = expense_documents_root()
+    root.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{uuid.uuid4().hex}{suffix}"
+    temporary = root / f".{stored_name}.part"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with temporary.open("xb") as destination:
+            while True:
+                chunk = upload.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > app.config["MAX_CONTENT_LENGTH"]:
+                    raise ValueError("Размер оригинала превышает 25 МБ.")
+                digest.update(chunk)
+                destination.write(chunk)
+        return root, temporary, stored_name, original_name, digest.hexdigest()
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+@app.route("/expenses", methods=["GET"])
+def expenses_page():
+    if session.get("role") != "admin":
+        return redirect("/")
+    csrf_token = session.setdefault("expense_csrf_token", uuid.uuid4().hex)
+    return render_template("expenses.html", csrf_token=csrf_token)
+
+
+@app.route("/api/expense-objects", methods=["GET"])
+def expense_objects_api():
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        include_inactive = request.args.get("include_inactive") == "1"
+        query = "SELECT id, sync_id, name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects"
+        if not include_inactive:
+            query += " WHERE is_active = 1"
+        rows = conn.execute(query + " ORDER BY company, name, id").fetchall()
+        return jsonify({"ok": True, "objects": [dict(row) for row in rows]})
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents", methods=["GET"])
+def expense_documents_list_api():
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    date_from = request.args.get("date_from", "").strip()
+    date_to = request.args.get("date_to", "").strip()
+    object_id = request.args.get("object_id", "").strip()
+    query = "SELECT * FROM expense_documents"
+    conditions = []
+    params = []
+    if date_from:
+        conditions.append("document_date >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("document_date <= ?")
+        params.append(date_to)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY document_date DESC, id DESC LIMIT 1000"
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        documents = [serialize_expense_document(cursor, row) for row in rows]
+        if object_id:
+            try:
+                selected_object = int(object_id)
+            except ValueError:
+                return jsonify({"ok": False, "error": "Некорректный ID объекта."}), 400
+            documents = [
+                document for document in documents
+                if any(item["object_id"] == selected_object for item in document["allocations"])
+            ]
+        supplier_names = sorted({
+            document["supplier_name"] for document in documents if document["supplier_name"]
+        }, key=str.casefold)
+        return jsonify({"ok": True, "documents": documents, "suppliers": supplier_names})
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/<int:document_id>", methods=["GET"])
+def expense_document_get_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        document = cursor.execute(
+            "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if document is None:
+            return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        return jsonify({"ok": True, "document": serialize_expense_document(cursor, document, include_text=True)})
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents", methods=["POST"])
+def expense_document_create_api():
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = None
+    temporary = target = None
+    committed = False
+    try:
+        payload = expense_request_payload()
+        client_id = str(payload.get("client_id") or "").strip()
+        if not client_id or len(client_id) > 100:
+            raise ValueError("Не указан client_id для безопасного повтора запроса.")
+        fields = validate_expense_fields(payload)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+
+        existing = cursor.execute(
+            "SELECT * FROM expense_documents WHERE client_id = ?", (client_id,)
+        ).fetchone()
+        if existing is not None:
+            document = serialize_expense_document(cursor, existing)
+            return jsonify({"ok": True, "duplicate_request": True, "document": document}), 200
+
+        if fields["supplier_name"] and fields["invoice_number"] and fields["document_date"] and fields["gross_amount"]:
+            matching_document = cursor.execute("""
+                SELECT id FROM expense_documents
+                WHERE supplier_name = ? COLLATE NOCASE AND invoice_number = ?
+                  AND document_date = ? AND currency_code = ? AND gross_amount = ?
+                ORDER BY id LIMIT 1
+            """, (
+                fields["supplier_name"], fields["invoice_number"], fields["document_date"],
+                fields["currency_code"], fields["gross_amount"],
+            )).fetchone()
+            if matching_document:
+                return jsonify({
+                    "ok": False, "error": "Такая фактура уже есть в архиве.",
+                    "existing_document_id": int(matching_document["id"]),
+                }), 409
+
+        allocations = resolve_expense_allocations(cursor, payload.get("allocations", []), fields)
+        upload = request.files.get("original")
+        staged = stage_expense_original(upload) if upload and upload.filename else None
+        stored_name = original_name = file_sha256 = None
+        if staged:
+            root, temporary, stored_name, original_name, file_sha256 = staged
+            duplicate = cursor.execute(
+                "SELECT id FROM expense_documents WHERE file_sha256 = ?", (file_sha256,)
+            ).fetchone()
+            if duplicate:
+                return jsonify({
+                    "ok": False, "error": "Этот оригинал уже находится в архиве.",
+                    "existing_document_id": int(duplicate["id"]),
+                }), 409
+            target = root / stored_name
+            temporary.replace(target)
+            temporary = None
+
+        now = datetime.now(timezone.utc).isoformat()
+        cursor.execute("""
+            INSERT INTO expense_documents (
+                client_id, supplier_name, invoice_number, document_date, currency_code,
+                net_amount, vat_amount, gross_amount, expense_category, document_comment,
+                verification_status, recognized_text, original_name, stored_name,
+                file_sha256, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            client_id, fields["supplier_name"], fields["invoice_number"], fields["document_date"],
+            fields["currency_code"], fields["net_amount"], fields["vat_amount"],
+            fields["gross_amount"], fields["expense_category"], fields["document_comment"],
+            fields["verification_status"], fields["recognized_text"], original_name,
+            stored_name, file_sha256, now, now,
+        ))
+        document_id = int(cursor.lastrowid)
+        cursor.executemany("""
+            INSERT INTO expense_allocations (
+                document_id, object_id, allocated_gross, allocated_net, allocated_vat, allocation_note
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, [(
+            document_id, item["object_id"], item["gross_amount"], item["net_amount"],
+            item["vat_amount"], item["note"],
+        ) for item in allocations])
+        conn.commit()
+        committed = True
+        document = cursor.execute(
+            "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        return jsonify({"ok": True, "document": serialize_expense_document(cursor, document)}), 201
+    except RuntimeError as error:
+        return jsonify({"ok": False, "error": str(error)}), 503
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception:
+        logger.exception("Не удалось сохранить документ расхода.")
+        return jsonify({"ok": False, "error": "Не удалось сохранить документ."}), 500
+    finally:
+        if conn is not None:
+            conn.close()
+        if temporary:
+            temporary.unlink(missing_ok=True)
+        if target and not committed:
+            target.unlink(missing_ok=True)
+
+
+@app.route("/api/expense-documents/<int:document_id>", methods=["PUT"])
+def expense_document_update_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        payload = expense_request_payload()
+        fields = validate_expense_fields(payload)
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        existing = cursor.execute(
+            "SELECT id FROM expense_documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if existing is None:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        if fields["supplier_name"] and fields["invoice_number"] and fields["document_date"] and fields["gross_amount"]:
+            matching_document = cursor.execute("""
+                SELECT id FROM expense_documents
+                WHERE supplier_name = ? COLLATE NOCASE AND invoice_number = ?
+                  AND document_date = ? AND currency_code = ? AND gross_amount = ?
+                  AND id <> ?
+                ORDER BY id LIMIT 1
+            """, (
+                fields["supplier_name"], fields["invoice_number"], fields["document_date"],
+                fields["currency_code"], fields["gross_amount"], document_id,
+            )).fetchone()
+            if matching_document:
+                conn.rollback()
+                return jsonify({
+                    "ok": False, "error": "Такая фактура уже есть в архиве.",
+                    "existing_document_id": int(matching_document["id"]),
+                }), 409
+        allocations = resolve_expense_allocations(cursor, payload.get("allocations", []), fields)
+        now = datetime.now(timezone.utc).isoformat()
+        cursor.execute("""
+            UPDATE expense_documents SET supplier_name=?, invoice_number=?, document_date=?,
+                currency_code=?, net_amount=?, vat_amount=?, gross_amount=?, expense_category=?,
+                document_comment=?, verification_status=?, recognized_text=?, updated_at=?
+            WHERE id=?
+        """, (
+            fields["supplier_name"], fields["invoice_number"], fields["document_date"],
+            fields["currency_code"], fields["net_amount"], fields["vat_amount"],
+            fields["gross_amount"], fields["expense_category"], fields["document_comment"],
+            fields["verification_status"], fields["recognized_text"], now, document_id,
+        ))
+        cursor.execute("DELETE FROM expense_allocations WHERE document_id = ?", (document_id,))
+        cursor.executemany("""
+            INSERT INTO expense_allocations (
+                document_id, object_id, allocated_gross, allocated_net, allocated_vat, allocation_note
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, [(
+            document_id, item["object_id"], item["gross_amount"], item["net_amount"],
+            item["vat_amount"], item["note"],
+        ) for item in allocations])
+        conn.commit()
+        document = cursor.execute(
+            "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        return jsonify({"ok": True, "document": serialize_expense_document(cursor, document)})
+    except (ValueError, json.JSONDecodeError) as error:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception:
+        conn.rollback()
+        logger.exception("Не удалось обновить документ расхода.")
+        return jsonify({"ok": False, "error": "Не удалось обновить документ."}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/<int:document_id>/original", methods=["GET"])
+def expense_document_original_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        document = conn.execute(
+            "SELECT original_name, stored_name FROM expense_documents WHERE id = ?", (document_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if document is None or not document["stored_name"]:
+        return jsonify({"ok": False, "error": "Оригинал не найден."}), 404
+    try:
+        root = expense_documents_root()
+    except (RuntimeError, ValueError) as error:
+        return jsonify({"ok": False, "error": str(error)}), 503
+    original = (root / document["stored_name"]).resolve()
+    if original.parent != root or not original.is_file():
+        return jsonify({"ok": False, "error": "Файл оригинала недоступен."}), 404
+    return send_file(
+        original, as_attachment=True,
+        download_name=document["original_name"] or original.name,
+        conditional=True,
+    )
+
+
+@app.route("/api/expense-objects/<int:object_id>/expenses", methods=["GET"])
+def expense_object_summary_api(object_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    date_from = request.args.get("date_from", "").strip()
+    date_to = request.args.get("date_to", "").strip()
+    for date_value in (date_from, date_to):
+        if date_value:
+            try:
+                datetime.strptime(date_value, "%Y-%m-%d")
+            except ValueError:
+                return jsonify({"ok": False, "error": "Даты должны быть в формате YYYY-MM-DD."}), 400
+    if date_from and date_to and date_from > date_to:
+        return jsonify({"ok": False, "error": "Начало периода позже его окончания."}), 400
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        object_row = cursor.execute(
+            "SELECT id, name, markning, company FROM meta_objects WHERE id = ?", (object_id,)
+        ).fetchone()
+        if object_row is None:
+            return jsonify({"ok": False, "error": "Объект не найден."}), 404
+        conditions = ["a.object_id = ?"]
+        params = [object_id]
+        if date_from:
+            conditions.append("d.document_date >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("d.document_date <= ?")
+            params.append(date_to)
+        rows = cursor.execute(f"""
+            SELECT DISTINCT d.*
+            FROM expense_documents d
+            JOIN expense_allocations a ON a.document_id = d.id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY d.document_date DESC, d.id DESC LIMIT 1000
+        """, params).fetchall()
+
+        totals = {}
+        draft_count = review_count = 0
+        documents = []
+        for row in rows:
+            document = serialize_expense_document(cursor, row)
+            object_allocations = [
+                item for item in document["allocations"] if item["object_id"] == object_id
+            ]
+            object_gross = sum((parse_decimal(item["gross_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
+            object_net = sum((parse_decimal(item["net_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
+            object_vat = sum((parse_decimal(item["vat_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
+            document["object_gross"] = decimal_text(object_gross)
+            document["object_net"] = decimal_text(object_net)
+            document["object_vat"] = decimal_text(object_vat)
+            if document["verification_status"] == "confirmed":
+                currency = document["currency_code"]
+                bucket = totals.setdefault(currency, {
+                    "gross": Decimal(0), "net": Decimal(0), "vat": Decimal(0),
+                    "materials": Decimal(0), "other": Decimal(0),
+                })
+                bucket["gross"] += object_gross
+                bucket["net"] += object_net
+                bucket["vat"] += object_vat
+                category = document["expense_category"].casefold()
+                bucket["materials" if "материал" in category or "material" in category else "other"] += object_gross
+            elif document["verification_status"] == "draft":
+                draft_count += 1
+            else:
+                review_count += 1
+            documents.append(document)
+
+        summary = {
+            currency: {key: decimal_text(value) for key, value in amounts.items()}
+            for currency, amounts in totals.items()
+        }
+        return jsonify({
+            "ok": True, "object": dict(object_row), "summary": summary,
+            "draft_count": draft_count, "review_count": review_count,
+            "documents": documents,
+        })
+    finally:
+        conn.close()
 
 @app.route('/get-active-employees', methods=['GET'])
 def get_active_employees():
@@ -551,6 +1273,27 @@ def get_active_employees():
     
     employees = [{"id": r['id'], "name": r['name']} for r in rows]
     return jsonify({"ok": True, "employees": employees})
+
+
+@app.route('/api/sync/employee-catalog', methods=['GET'])
+def sync_employee_catalog_api():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("""
+            SELECT e.id, e.name, e.salary_rate, e.is_active,
+                   COALESCE((
+                       SELECT MAX(event.revision)
+                       FROM employee_sync_events event
+                       WHERE event.employee_key = normalize_employee_name(e.name)
+                   ), 0) AS sync_version
+            FROM meta_employees e
+            ORDER BY e.name, e.id
+        """).fetchall()
+        return jsonify({"ok": True, "employees": [dict(row) for row in rows]})
+    finally:
+        conn.close()
 
 @app.route('/check-user-pin', methods=['POST'])
 def check_user_pin():
@@ -602,11 +1345,17 @@ def login():
         return jsonify({"ok": False, "error": "Неверный пин-код или пароль"}), 401
 
     emp_id = user['employee_id']
-    if not emp_id and user['role'] != 'admin':
-        cursor.execute("SELECT id FROM meta_employees WHERE name = ?", (user['username'],))
-        emp_row = cursor.fetchone()
-        if emp_row:
-            emp_id = emp_row['id']
+    if user['role'] != 'admin':
+        active_profiles = find_employee_profiles(cursor, user['username'], active_only=True)
+        if emp_id:
+            profile = next((item for item in active_profiles if item['id'] == emp_id), None)
+        else:
+            profile = active_profiles[0] if len(active_profiles) == 1 else None
+        if profile is None:
+            conn.close()
+            return jsonify({"ok": False, "error": "Профиль сотрудника не найден или неактивен"}), 401
+        emp_id = profile['id']
+        if user['employee_id'] != emp_id:
             cursor.execute("UPDATE users SET employee_id = ? WHERE id = ?", (emp_id, user['id']))
             conn.commit()
 
@@ -734,7 +1483,7 @@ def index():
     if not companies:
         companies = ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects ORDER BY company, name")
+    cursor.execute("SELECT name, markning, company FROM meta_objects WHERE is_active = 1 ORDER BY company, name")
     obj_rows = cursor.fetchall()
     
     objects = []
@@ -817,6 +1566,10 @@ def submit_shift():
     except ValueError:
         conn.close()
         return jsonify({"ok": False, "error": "Некорректная дата (ожидается формат YYYY-MM-DD)"}), 400
+
+    if datetime.strptime(date_str, '%Y-%m-%d').date() > datetime.now().date() + timedelta(days=7):
+        conn.close()
+        return jsonify({"ok": False, "error": "Нельзя отправлять смены более чем на 7 дней вперед"}), 400
 
     if submission_type == "ob":
         if not ob_schema_ready(cursor):
@@ -1809,6 +2562,484 @@ def export_shifts_csv():
     response.headers["Content-type"] = "text/csv; charset=utf-8-sig"
     return response
 
+def apply_object_sync_event(cursor, event):
+    if not isinstance(event, dict):
+        raise ValueError("Некорректное событие синхронизации объекта.")
+    operation_id = str(event.get("operation_id") or "").strip()
+    sync_id = str(event.get("sync_id") or "").strip()
+    operation = str(event.get("operation") or "").strip()
+    object_data = event.get("object")
+    if not operation_id or len(operation_id) > 100 or not sync_id or len(sync_id) > 100:
+        raise ValueError("В событии объекта отсутствует устойчивый ID.")
+    if operation not in {"upsert", "deactivate", "activate", "link_legacy"}:
+        raise ValueError("Неизвестная операция объекта.")
+    if not isinstance(object_data, dict):
+        raise ValueError("В событии объекта отсутствуют данные.")
+
+    payload_hash = hashlib.sha256(json.dumps(
+        event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    cursor.execute(
+        "SELECT payload_hash, sync_id, revision, operation, server_object_id FROM object_sync_events WHERE operation_id = ?",
+        (operation_id,),
+    )
+    previous = cursor.fetchone()
+    if previous:
+        if previous["payload_hash"] != payload_hash or previous["sync_id"] != sync_id or previous["operation"] != operation:
+            raise ValueError("operation_id объекта повторно использован с другими данными.")
+        cursor.execute(
+            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+            (previous["server_object_id"],),
+        )
+        object_state = cursor.fetchone()
+        cursor.execute("SELECT MAX(revision) FROM object_sync_events WHERE sync_id = ?", (sync_id,))
+        latest_revision = int(cursor.fetchone()[0] or 0)
+        if object_state is not None:
+            latest_revision = max(latest_revision, int(object_state["sync_version"] or 0))
+        stale = latest_revision > int(previous["revision"])
+        return {
+            "operation_id": operation_id,
+            "sync_id": sync_id,
+            "operation": operation,
+            "server_object_id": previous["server_object_id"],
+            "object": dict(object_state) if object_state else None,
+            "stale": stale,
+            "equivalent": not stale,
+            "revision": latest_revision,
+        }
+
+    object_name = str(object_data.get("name") or "").strip()
+    company = " ".join(str(object_data.get("company") or "").split())
+    markning = str(object_data.get("markning") or "").strip()
+    if not object_name or len(object_name) > 200 or not company or len(company) > 150 or len(markning) > 50:
+        raise ValueError("Некорректное имя объекта, фирмы или markning.")
+    try:
+        revision = int(event.get("revision"))
+    except (TypeError, ValueError):
+        raise ValueError("В событии объекта отсутствует revision.")
+    if revision < 1:
+        raise ValueError("Некорректная revision события объекта.")
+    try:
+        rate = float(object_data.get("rate", 0.0))
+        transport_rate = float(object_data.get("transport_rate", 0.0))
+        if not (0 <= rate <= 100000 and 0 <= transport_rate <= 100000) or not math.isfinite(rate) or not math.isfinite(transport_rate):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError("Некорректная ставка или транспортная ставка объекта.")
+
+    state_payload = {
+        "sync_id": sync_id,
+        "revision": revision,
+        "operation": operation,
+        "object": {
+            "name": object_name, "company": company, "markning": markning,
+            "rate": rate, "transport_rate": transport_rate,
+        },
+    }
+    if operation == "link_legacy":
+        state_payload["object"].update({
+            key: object_data.get(key) for key in (
+                "server_object_id", "expected_server_name",
+                "expected_server_company", "expected_server_markning",
+                "expected_server_rate", "expected_server_transport_rate",
+                "expected_server_is_active", "expected_server_revision",
+            )
+        })
+    state_hash = hashlib.sha256(json.dumps(
+        state_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+    cursor.execute("SELECT id FROM meta_companies WHERE name = ? COLLATE NOCASE", (company,))
+    if cursor.fetchone() is None:
+        raise ValueError("Фирма объекта отсутствует в серверном справочнике.")
+
+    cursor.execute("SELECT MAX(revision) FROM object_sync_events WHERE sync_id = ?", (sync_id,))
+    latest_event_revision = int(cursor.fetchone()[0] or 0)
+    cursor.execute("SELECT id, company, sync_version FROM meta_objects WHERE sync_id = ?", (sync_id,))
+    current_object = cursor.fetchone()
+    if current_object is not None and current_object["company"] != company:
+        raise ValueError("Устойчивый ID принадлежит другой фирме.")
+    current_revision = max(
+        latest_event_revision,
+        int(current_object["sync_version"] or 0) if current_object is not None else 0,
+    )
+    if revision < current_revision:
+        if operation == "link_legacy" and current_object is None:
+            raise ValueError("Запоздавшую legacy-связь нельзя подтвердить: серверный ID не был связан.")
+        server_object_id = int(current_object["id"]) if current_object is not None else None
+        cursor.execute("""
+            INSERT INTO object_sync_events (
+                operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        cursor.execute(
+            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+            (server_object_id,),
+        )
+        object_state = cursor.fetchone()
+        return {
+            "operation_id": operation_id,
+            "sync_id": sync_id,
+            "operation": operation,
+            "server_object_id": server_object_id,
+            "stale": True,
+            "revision": current_revision,
+            "object": dict(object_state) if object_state else None,
+        }
+    if revision == current_revision:
+        cursor.execute(
+            "SELECT state_hash FROM object_sync_events WHERE sync_id = ? AND revision = ? ORDER BY rowid DESC LIMIT 1",
+            (sync_id, revision),
+        )
+        previous_state = cursor.fetchone()
+        if previous_state is None or previous_state["state_hash"] != state_hash:
+            raise ValueError("Конфликт объекта: revision уже занята другим содержимым.")
+        server_object_id = int(current_object["id"]) if current_object is not None else None
+        cursor.execute("""
+            INSERT INTO object_sync_events (
+                operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        cursor.execute(
+            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+            (server_object_id,),
+        )
+        object_state = cursor.fetchone()
+        return {
+            "operation_id": operation_id,
+            "sync_id": sync_id,
+            "operation": operation,
+            "server_object_id": server_object_id,
+            "stale": True,
+            "equivalent": True,
+            "revision": current_revision,
+            "object": dict(object_state) if object_state else None,
+        }
+
+    server_object_id = None
+    if operation == "link_legacy":
+        try:
+            server_object_id = int(object_data.get("server_object_id"))
+            expected_server_rate = float(object_data.get("expected_server_rate"))
+            expected_server_transport_rate = float(object_data.get("expected_server_transport_rate"))
+            expected_server_is_active = int(object_data.get("expected_server_is_active"))
+            expected_server_revision = int(object_data.get("expected_server_revision"))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Для подтверждения связи нужны ID и состояние серверного объекта.") from error
+        if (expected_server_is_active not in (0, 1) or expected_server_revision < 0
+                or not math.isfinite(expected_server_rate) or not math.isfinite(expected_server_transport_rate)):
+            raise ValueError("Некорректное ожидаемое состояние серверного объекта.")
+        cursor.execute(
+            "SELECT id, name, company, markning, sync_id, rate, transport_rate, is_active, sync_version "
+            "FROM meta_objects WHERE id = ?",
+            (server_object_id,),
+        )
+        target = cursor.fetchone()
+        if target is None:
+            raise ValueError("Подтверждаемый серверный объект не найден.")
+        cursor.execute(
+            "SELECT COUNT(*) FROM meta_objects WHERE sync_id IS NULL AND name = ? AND company = ? AND COALESCE(markning, '') = ?",
+            (object_name, company, markning),
+        )
+        if cursor.fetchone()[0] != 1:
+            raise ValueError("Legacy-связь неоднозначна или кандидат уже связан; изменений не внесено.")
+        expected_server = (
+            str(object_data.get("expected_server_name") or "").strip(),
+            " ".join(str(object_data.get("expected_server_company") or "").split()),
+            str(object_data.get("expected_server_markning") or "").strip(),
+            expected_server_rate, expected_server_transport_rate,
+            expected_server_is_active, expected_server_revision,
+        )
+        actual_server = (
+            target["name"], target["company"], target["markning"] or "",
+            float(target["rate"] or 0.0), float(target["transport_rate"] or 0.0),
+            int(bool(target["is_active"])), int(target["sync_version"] or 0),
+        )
+        if actual_server != expected_server or target["company"] != company:
+            raise ValueError("Данные серверного объекта изменились; связь не применена.")
+        if revision != expected_server_revision + 1:
+            raise ValueError("Revision legacy-связи не следует за серверной revision.")
+        if target["sync_id"] not in (None, sync_id):
+            raise ValueError("Серверный объект уже связан с другим устойчивым ID.")
+        cursor.execute("SELECT id FROM meta_objects WHERE sync_id = ? AND id <> ?", (sync_id, server_object_id))
+        if cursor.fetchone():
+            raise ValueError("Устойчивый ID уже связан с другим серверным объектом.")
+        cursor.execute(
+            "UPDATE meta_objects SET sync_id = ?, rate = ?, transport_rate = ?, sync_version = ? "
+            "WHERE id = ? AND sync_id IS NULL AND sync_version = ?",
+            (sync_id, rate, transport_rate, revision, server_object_id, expected_server_revision),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("Серверный объект изменился во время подтверждения связи.")
+    else:
+        cursor.execute("SELECT id, company, is_active FROM meta_objects WHERE sync_id = ?", (sync_id,))
+        target = cursor.fetchone()
+        if target is not None:
+            server_object_id = int(target["id"])
+            if target["company"] != company:
+                raise ValueError("Устойчивый ID принадлежит другой фирме.")
+            if operation == "upsert":
+                if not target["is_active"]:
+                    raise ValueError("Неактивный объект нельзя восстановить обычным upsert; нужна явная операция activate.")
+                cursor.execute(
+                    "UPDATE meta_objects SET name = ?, markning = ?, rate = ?, transport_rate = ?, sync_version = ? WHERE id = ?",
+                    (object_name, markning, rate, transport_rate, revision, server_object_id),
+                )
+            elif operation == "deactivate":
+                cursor.execute("UPDATE meta_objects SET is_active = 0, sync_version = ? WHERE id = ?", (revision, server_object_id))
+            else:
+                cursor.execute("""
+                    UPDATE meta_objects
+                    SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = 1, sync_version = ?
+                    WHERE id = ?
+                """, (object_name, markning, rate, transport_rate, revision, server_object_id))
+        elif operation == "deactivate":
+            server_object_id = None
+        elif operation == "activate":
+            raise ValueError("Не найден объект для явного восстановления.")
+        else:
+            cursor.execute(
+                "SELECT id FROM meta_objects WHERE name = ? AND company = ?",
+                (object_name, company),
+            )
+            if cursor.fetchone():
+                raise ValueError(
+                    f"Объект «{object_name}» в фирме «{company}» не сопоставлен с устойчивым ID; "
+                    "сначала подтвердите связь с серверной записью."
+                )
+            cursor.execute("""
+                INSERT INTO meta_objects (sync_id, name, markning, company, rate, transport_rate, is_active, sync_version)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """, (sync_id, object_name, markning, company, rate, transport_rate, revision))
+            server_object_id = int(cursor.lastrowid)
+
+    cursor.execute("""
+        INSERT INTO object_sync_events (
+            operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    cursor.execute(
+        "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
+        (server_object_id,),
+    )
+    object_state = cursor.fetchone()
+    return {
+        "operation_id": operation_id,
+        "sync_id": sync_id,
+        "operation": operation,
+        "server_object_id": server_object_id,
+        "object": dict(object_state) if object_state else None,
+        "stale": False,
+        "revision": revision,
+    }
+
+
+def apply_employee_sync_snapshot(cursor, employee_name, salary_rate, is_active):
+    profiles = find_employee_profiles(cursor, employee_name)
+    if profiles:
+        profile_ids = [profile["id"] for profile in profiles]
+        placeholders = ", ".join("?" for _ in profile_ids)
+        if salary_rate is None:
+            if not is_active:
+                cursor.execute(
+                    f"UPDATE meta_employees SET is_active = 0 WHERE id IN ({placeholders})",
+                    profile_ids,
+                )
+        elif is_active:
+            cursor.execute(
+                f"UPDATE meta_employees SET salary_rate = ? WHERE id IN ({placeholders}) AND is_active = 1",
+                (salary_rate, *profile_ids),
+            )
+        else:
+            cursor.execute(
+                f"UPDATE meta_employees SET salary_rate = ?, is_active = 0 WHERE id IN ({placeholders})",
+                (salary_rate, *profile_ids),
+            )
+    else:
+        cursor.execute(
+            "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, ?, ?)",
+            (employee_name, salary_rate if salary_rate is not None else 0.0, is_active),
+        )
+    return find_employee_profiles(cursor, employee_name)
+
+
+def get_employee_sync_state(cursor, profile_id):
+    if profile_id is None:
+        return None
+    cursor.execute(
+        "SELECT id, name, salary_rate, is_active FROM meta_employees WHERE id = ?",
+        (profile_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "salary_rate": float(row["salary_rate"] or 0.0),
+        "is_active": bool(row["is_active"]),
+    }
+
+
+def apply_employee_sync_event(cursor, event, operation):
+    if not isinstance(event, dict):
+        raise ValueError("Некорректное событие сотрудника.")
+    operation_id = str(event.get("operation_id") or "").strip()
+    employee_name = " ".join(str(event.get("name") or "").split())
+    employee_key = str(event.get("employee_key") or normalize_employee_name(employee_name)).strip()
+    try:
+        revision = int(event.get("revision", 1))
+    except (TypeError, ValueError):
+        raise ValueError("Некорректная revision события сотрудника.")
+    if not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150:
+        raise ValueError("Некорректные данные события сотрудника.")
+    if not employee_key or employee_key != normalize_employee_name(employee_name) or revision < 1:
+        raise ValueError("Некорректный ключ или revision события сотрудника.")
+    salary_rate = event.get("salary_rate")
+    if operation == "activate" and salary_rate is not None:
+        try:
+            salary_rate = round(float(salary_rate), 2)
+            if not 0 <= salary_rate <= 100000 or not math.isfinite(salary_rate):
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("Некорректная ставка восстанавливаемого сотрудника.")
+
+    payload_hash = hashlib.sha256(json.dumps(
+        {"operation_id": operation_id, "employee_key": employee_key,
+         "revision": revision, "operation": operation, "name": employee_name,
+         "salary_rate": salary_rate},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    state_hash = hashlib.sha256(json.dumps(
+        {"employee_key": employee_key, "revision": revision, "operation": operation,
+         "salary_rate": salary_rate if operation == "activate" else None},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    cursor.execute(
+        "SELECT payload_hash, employee_key, revision, operation, profile_id FROM employee_sync_events WHERE operation_id = ?",
+        (operation_id,),
+    )
+    previous = cursor.fetchone()
+    if previous:
+        if (previous["payload_hash"] != payload_hash or previous["employee_key"] != employee_key
+                or previous["revision"] != revision or previous["operation"] != operation):
+            raise ValueError("operation_id сотрудника повторно использован с другими данными.")
+        cursor.execute("SELECT MAX(revision) FROM employee_sync_events WHERE employee_key = ?", (employee_key,))
+        latest_revision = int(cursor.fetchone()[0] or 0)
+        return {
+            "operation_id": operation_id,
+            "profile_id": previous["profile_id"],
+            "stale": latest_revision > revision,
+            "equivalent": latest_revision == revision,
+            "revision": latest_revision,
+            "employee": get_employee_sync_state(cursor, previous["profile_id"]),
+        }
+
+    profiles = find_employee_profiles(cursor, employee_name)
+    if len(profiles) > 1:
+        raise ValueError(f"Удаление/восстановление «{employee_name}» неоднозначно: найдено несколько профилей.")
+    profile_id = int(profiles[0]["id"]) if profiles else None
+    cursor.execute("SELECT MAX(revision) FROM employee_sync_events WHERE employee_key = ?", (employee_key,))
+    latest_revision = int(cursor.fetchone()[0] or 0)
+    if revision < latest_revision:
+        cursor.execute("""
+            INSERT INTO employee_sync_events (
+                operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        return {
+            "operation_id": operation_id,
+            "profile_id": profile_id,
+            "stale": True,
+            "revision": latest_revision,
+            "employee": get_employee_sync_state(cursor, profile_id),
+        }
+    if revision == latest_revision:
+        cursor.execute(
+            "SELECT operation, state_hash FROM employee_sync_events WHERE employee_key = ? AND revision = ? ORDER BY rowid DESC LIMIT 1",
+            (employee_key, revision),
+        )
+        previous_revision = cursor.fetchone()
+        if (previous_revision is None or previous_revision["operation"] != operation
+                or previous_revision["state_hash"] != state_hash):
+            raise ValueError("Конфликт сотрудника: revision уже занята другой операцией.")
+        cursor.execute("""
+            INSERT INTO employee_sync_events (
+                operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        return {
+            "operation_id": operation_id,
+            "profile_id": profile_id,
+            "stale": True,
+            "equivalent": True,
+            "revision": latest_revision,
+            "employee": get_employee_sync_state(cursor, profile_id),
+        }
+
+    if operation == "deactivate":
+        if profile_id is not None:
+            cursor.execute("UPDATE meta_employees SET is_active = 0 WHERE id = ?", (profile_id,))
+            cursor.execute(
+                "UPDATE users SET is_active = 0 WHERE role <> 'admin' AND "
+                "(username = ? COLLATE NOCASE OR employee_id = ?)",
+                (employee_name, profile_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE users SET is_active = 0 WHERE role <> 'admin' AND username = ? COLLATE NOCASE",
+                (employee_name,),
+            )
+    elif operation == "activate":
+        if profile_id is None:
+            raise ValueError("Не найден профиль сотрудника для явного восстановления.")
+        if salary_rate is None:
+            cursor.execute("UPDATE meta_employees SET is_active = 1 WHERE id = ?", (profile_id,))
+        else:
+            cursor.execute(
+                "UPDATE meta_employees SET salary_rate = ?, is_active = 1 WHERE id = ?",
+                (salary_rate, profile_id),
+            )
+        cursor.execute(
+            "UPDATE users SET is_active = 1 WHERE role <> 'admin' AND "
+            "(username = ? COLLATE NOCASE OR employee_id = ?)",
+            (employee_name, profile_id),
+        )
+    else:
+        raise ValueError("Неизвестная операция сотрудника.")
+
+    cursor.execute("""
+        INSERT INTO employee_sync_events (
+            operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        operation_id, payload_hash, employee_key, revision, state_hash, operation, profile_id,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+    return {
+        "operation_id": operation_id,
+        "profile_id": profile_id,
+        "stale": False,
+        "revision": revision,
+        "employee": get_employee_sync_state(cursor, profile_id),
+    }
+
+
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
     if not verify_sync_key():
@@ -1816,20 +3047,83 @@ def sync_desktop_data():
 
     data = request.json or {}
     employees = data.get("employees", [])
+    deleted_employees = data.get("deleted_employees", [])
+    restored_employees = data.get("restored_employees", [])
     companies = data.get("companies", [])
     objects = data.get("objects", [])
+    object_events = data.get("object_events", [])
     desktop_shifts = data.get("shifts", [])
 
-    if not isinstance(employees, list) or not isinstance(companies, list) or \
-       not isinstance(objects, list) or not isinstance(desktop_shifts, list):
+    if not isinstance(employees, list) or not isinstance(deleted_employees, list) or not isinstance(restored_employees, list) or not isinstance(companies, list) or \
+       not isinstance(objects, list) or not isinstance(object_events, list) or not isinstance(desktop_shifts, list):
         return jsonify({"ok": False, "error": "Неверный формат данных: ожидаются списки"}), 400
 
-    if len(employees) > 500 or len(companies) > 500 or len(objects) > 2000 or len(desktop_shifts) > 5000:
+    if len(employees) > 500 or len(deleted_employees) > 500 or len(restored_employees) > 500 or len(companies) > 500 or len(objects) > 2000 or len(object_events) > 2000 or len(desktop_shifts) > 5000:
         return jsonify({"ok": False, "error": "Превышен лимит записей в пакете синхронизации"}), 400
+
+    normalized_deletions = []
+    deletion_operation_ids = set()
+    for deletion in deleted_employees:
+        if not isinstance(deletion, dict):
+            return jsonify({"ok": False, "error": "Некорректная запись удаления сотрудника"}), 400
+        operation_id = str(deletion.get("operation_id") or "").strip()
+        employee_name = " ".join(str(deletion.get("name") or "").split())
+        if not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150:
+            return jsonify({"ok": False, "error": "Некорректные данные удаления сотрудника"}), 400
+        if operation_id in deletion_operation_ids:
+            return jsonify({"ok": False, "error": "Повторяется operation_id удаления сотрудника"}), 400
+        deletion_operation_ids.add(operation_id)
+        try:
+            revision = max(1, int(deletion.get("revision", 1)))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Некорректная revision удаления сотрудника"}), 400
+        employee_key = str(deletion.get("employee_key") or normalize_employee_name(employee_name)).strip()
+        if employee_key != normalize_employee_name(employee_name):
+            return jsonify({"ok": False, "error": "Ключ удаления сотрудника не совпадает с именем"}), 400
+        normalized_deletions.append({
+            "operation_id": operation_id, "name": employee_name,
+            "employee_key": employee_key, "revision": revision,
+        })
+
+    normalized_restorations = []
+    restoration_operation_ids = set()
+    for restoration in restored_employees:
+        if not isinstance(restoration, dict):
+            return jsonify({"ok": False, "error": "Некорректная запись восстановления сотрудника"}), 400
+        operation_id = str(restoration.get("operation_id") or "").strip()
+        employee_name = " ".join(str(restoration.get("name") or "").split())
+        employee_key = str(restoration.get("employee_key") or normalize_employee_name(employee_name)).strip()
+        try:
+            revision = int(restoration.get("revision"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Некорректная revision восстановления сотрудника"}), 400
+        salary_rate = restoration.get("salary_rate")
+        if salary_rate is not None:
+            try:
+                salary_rate = round(float(salary_rate), 2)
+                if not 0 <= salary_rate <= 100000 or not math.isfinite(salary_rate):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "Некорректная ставка восстановления сотрудника"}), 400
+        if (not operation_id or len(operation_id) > 100 or not employee_name or len(employee_name) > 150
+                or employee_key != normalize_employee_name(employee_name) or revision < 1):
+            return jsonify({"ok": False, "error": "Некорректные данные восстановления сотрудника"}), 400
+        if operation_id in restoration_operation_ids:
+            return jsonify({"ok": False, "error": "Повторяется operation_id восстановления сотрудника"}), 400
+        restoration_operation_ids.add(operation_id)
+        normalized_restorations.append({
+            "operation_id": operation_id, "name": employee_name,
+            "employee_key": employee_key, "revision": revision,
+            "salary_rate": salary_rate,
+        })
 
     conn = get_db_connection()
     cursor = conn.cursor()
     employee_sync_results = []
+    deleted_employee_operations = []
+    restored_employee_operations = []
+    employee_event_results = []
+    object_sync_results = []
 
     try:
         if employees:
@@ -1845,6 +3139,8 @@ def sync_desktop_data():
                     except (TypeError, ValueError):
                         return jsonify({"ok": False, "error": "Некорректная ставка сотрудника"}), 400
                     emp_active = int(emp.get('is_active', 1))
+                    if emp_active not in (0, 1):
+                        raise ValueError("Недопустимый статус сотрудника")
                 else:
                     emp_name = " ".join(str(emp).split()) if emp else ""
                     if not emp_name or len(emp_name) > 150:
@@ -1852,29 +3148,7 @@ def sync_desktop_data():
                     emp_rate = None
                     emp_active = 1
 
-                matching_profiles = find_employee_profiles(cursor, emp_name)
-                if matching_profiles:
-                    profile_ids = [profile['id'] for profile in matching_profiles]
-                    placeholders = ', '.join('?' for _ in profile_ids)
-                    if emp_rate is None:
-                        cursor.execute(
-                            f"UPDATE meta_employees SET is_active = ? WHERE id IN ({placeholders})",
-                            (emp_active, *profile_ids),
-                        )
-                    else:
-                        cursor.execute(
-                            f"UPDATE meta_employees SET salary_rate = ?, is_active = ? WHERE id IN ({placeholders})",
-                            (emp_rate, emp_active, *profile_ids),
-                        )
-                else:
-                    cursor.execute('''
-                        INSERT INTO meta_employees (name, salary_rate, is_active)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(name) DO UPDATE SET
-                            salary_rate = excluded.salary_rate,
-                            is_active = excluded.is_active
-                    ''', (emp_name, emp_rate if emp_rate is not None else 0.0, emp_active))
-                stored_profiles = find_employee_profiles(cursor, emp_name)
+                stored_profiles = apply_employee_sync_snapshot(cursor, emp_name, emp_rate, emp_active)
                 employee_sync_results.append({
                     "employee_name": emp_name,
                     "profiles": [{
@@ -1893,16 +3167,18 @@ def sync_desktop_data():
                         return jsonify({"ok": False, "error": "Слишком длинное имя компании"}), 400
                     cursor.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (comp_name,))
 
-        if objects:
-            for obj in objects:
-                name, mark, comp = safe_parse_obj(obj)
-                if name and "{" not in name:
-                    if len(name) > 200 or len(mark) > 50 or len(comp) > 150:
-                        return jsonify({"ok": False, "error": "Превышена длина полей объекта"}), 400
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO meta_objects (name, markning, company) VALUES (?, ?, ?)
-                        ON CONFLICT(name, company) DO UPDATE SET markning = excluded.markning
-                    ''', (name, mark, comp if comp else "Privat"))
+        for event in object_events:
+            object_sync_results.append(apply_object_sync_event(cursor, event))
+
+        for restoration in normalized_restorations:
+            result = apply_employee_sync_event(cursor, restoration, "activate")
+            employee_event_results.append(result)
+            restored_employee_operations.append(restoration["operation_id"])
+
+        for deletion in normalized_deletions:
+            result = apply_employee_sync_event(cursor, deletion, "deactivate")
+            employee_event_results.append(result)
+            deleted_employee_operations.append(deletion["operation_id"])
 
         conn.commit()
     except Exception as e:
@@ -1917,6 +3193,11 @@ def sync_desktop_data():
         "status": "metadata_synced",
         "shift_sync": "versioned_api_required",
         "employee_sync": employee_sync_results,
+        "deleted_employee_operations": deleted_employee_operations,
+        "restored_employee_operations": restored_employee_operations,
+        "employee_event_results": employee_event_results,
+        "object_sync_status": "legacy_snapshot_ignored" if objects and not object_events else "event_sync",
+        "object_sync_operations": object_sync_results,
     })
 
 def serialize_submission(row, cursor=None):
@@ -2061,7 +3342,16 @@ def sync_push():
                     submission_type = existing['submission_type'] or infer_submission_type_from_object(cursor, company, object_name)
                 else:
                     submission_type = infer_submission_type_from_object(cursor, company, object_name)
-                validate_submission_object(cursor, submission_type, company, object_name)
+                preserve_history_object = bool(
+                    existing and not existing['is_deleted']
+                    and existing['company'] == company
+                    and existing['object_name'] == object_name
+                    and existing['submission_type'] == submission_type
+                )
+                validate_submission_object(
+                    cursor, submission_type, company, object_name,
+                    allow_inactive=preserve_history_object,
+                )
                 invoiced = int(bool(payload.get('invoiced', 0))) if submission_type == 'work' else 0
                 if submission_type == "ob":
                     if not ob_schema_ready(cursor):
