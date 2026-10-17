@@ -18,7 +18,8 @@ from flask import Flask, render_template, request, jsonify, session, make_respon
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from expense_documents import allocation_breakdown, build_project_order_allocations, decimal_text, parse_decimal
-from expense_documents import invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations, parse_invoice_money
+from expense_documents import migrate_invoice_net_schema, invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations, parse_invoice_money, invoice_context
+from expense_documents import due_date_issues
 from ob_calculator import calculate_work_interval
 import reportlab
 from reportlab.lib import colors
@@ -555,6 +556,11 @@ def init_cloud_db():
             supplier_name TEXT NOT NULL DEFAULT '',
             invoice_number TEXT NOT NULL DEFAULT '',
             document_date TEXT,
+            due_date TEXT,
+            due_date_kind TEXT NOT NULL DEFAULT 'absent',
+            due_date_review_required INTEGER NOT NULL DEFAULT 0,
+            due_date_reviewed INTEGER NOT NULL DEFAULT 0,
+            due_date_evidence_json TEXT NOT NULL DEFAULT '[]',
             currency_code TEXT NOT NULL DEFAULT 'SEK',
             net_amount TEXT,
             vat_amount TEXT,
@@ -582,6 +588,11 @@ def init_cloud_db():
         ("deleted_at", "TEXT"),
         ("sync_version", "INTEGER NOT NULL DEFAULT 1"),
         ("order_proposals_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("due_date", "TEXT"),
+        ("due_date_kind", "TEXT NOT NULL DEFAULT 'absent'"),
+        ("due_date_review_required", "INTEGER NOT NULL DEFAULT 0"),
+        ("due_date_reviewed", "INTEGER NOT NULL DEFAULT 0"),
+        ("due_date_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
     ):
         if column_name not in expense_document_columns:
             cursor.execute(f"ALTER TABLE expense_documents ADD COLUMN {column_name} {column_sql}")
@@ -700,6 +711,15 @@ def init_cloud_db():
     conn.commit()
     conn.close()
 
+    # Перестройка таблицы распределений выполняется только по явному флагу; резервная копия создана выше.
+    if os.environ.get('SMARTREPORT_UPGRADE_NET_SCHEMA') == '1':
+        upgrade_connection = sqlite3.connect(DB_FILE, timeout=30.0, isolation_level=None)
+        try:
+            upgrade_connection.execute("PRAGMA foreign_keys=ON")
+            migrate_invoice_net_schema(upgrade_connection)
+        finally:
+            upgrade_connection.close()
+
 init_cloud_db()
 
 
@@ -783,10 +803,20 @@ def expense_request_payload():
     return payload
 
 
+def expense_due_date_schema_ready(connection):
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}
+    return {"due_date", "due_date_kind", "due_date_review_required", "due_date_reviewed", "due_date_evidence_json"}.issubset(columns)
+
+
 def validate_expense_fields(payload):
     status = str(payload.get("verification_status") or "draft")
     if status not in EXPENSE_DOCUMENT_STATUSES:
         raise ValueError("Недопустимый статус документа.")
+    context = invoice_context(str(payload.get("recognized_text") or ""))
+    if status == "confirmed" and context["prepaid"]:
+        raise ValueError("Предоплаченный чек: подтверждение пока не поддерживается; сохраните черновик, не заменяя остаток общей суммой.")
+    if status == "confirmed" and context["reverse_charge"] and payload.get("tax_reviewed") is not True:
+        raise ValueError("Обратное начисление НДС требует явной сверки по оригиналу.")
 
     document_date = str(payload.get("document_date") or "").strip() or None
     if document_date:
@@ -794,6 +824,27 @@ def validate_expense_fields(payload):
             datetime.strptime(document_date, "%Y-%m-%d")
         except ValueError as error:
             raise ValueError("Дата документа должна быть в формате YYYY-MM-DD.") from error
+    due_date = str(payload.get("due_date") or "").strip() or None
+    if due_date:
+        try:
+            due_date = datetime.strptime(due_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("Срок оплаты должен быть корректной датой ГГГГ-ММ-ДД.") from error
+    due_kind = str(payload.get("due_date_kind") or ("manual" if due_date else "absent"))
+    if due_kind not in {"explicit", "calculated", "manual", "ambiguous", "absent"}:
+        raise ValueError("Неизвестный источник срока оплаты.")
+    due_required = payload.get("due_date_review_required") is True or due_kind in {"calculated", "ambiguous"}
+    due_reviewed = payload.get("due_date_reviewed") is True
+    due_evidence = payload.get("due_date_evidence") or []
+    if (not isinstance(due_evidence, list) or len(due_evidence) > 50
+            or any(not isinstance(item, dict) for item in due_evidence)
+            or len(json.dumps(due_evidence, ensure_ascii=False)) > 20000):
+        raise ValueError("Некорректные свидетельства срока оплаты.")
+    if status == "confirmed":
+        date_issues = due_date_issues({"due_date": due_date, "due_date_kind": due_kind,
+                                      "due_date_review_required": due_required, "due_date_reviewed": due_reviewed})
+        if date_issues:
+            raise ValueError(" ".join(date_issues))
 
     amount_values = {}
     net_basis = payload.get("allocation_basis") == "net"
@@ -842,6 +893,12 @@ def validate_expense_fields(payload):
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
         "document_date": document_date,
+        "due_date": due_date,
+        "due_date_kind": due_kind,
+        "due_date_review_required": due_required,
+        "due_date_reviewed": due_reviewed,
+        "due_date_evidence": due_evidence,
+        "due_date_provided": any(key in payload for key in ("due_date", "due_date_kind", "due_date_review_required", "due_date_reviewed", "due_date_evidence")),
         "currency_code": currency_code,
         "net_amount": decimal_text(amount_values["net_amount"]),
         "vat_amount": decimal_text(amount_values["vat_amount"]),
@@ -850,6 +907,7 @@ def validate_expense_fields(payload):
         "document_comment": str(payload.get("document_comment") or "").strip(),
         "verification_status": status,
         "recognized_text": str(payload.get("recognized_text") or "")[:100000],
+        "tax_reviewed": payload.get("tax_reviewed") is True,
         "allocation_basis": "net" if net_basis else "gross",
         "rounding_amount": decimal_text(amount_values.get("rounding_amount")),
         "amount_due": decimal_text(amount_values.get("amount_due")),
@@ -857,6 +915,8 @@ def validate_expense_fields(payload):
 
 
 def resolve_expense_allocations(cursor, raw_allocations, fields):
+    if fields.get("due_date_provided") and not expense_due_date_schema_ready(cursor):
+        raise ValueError("Сервер не поддерживает сохранение срока оплаты; обновление схемы требует отдельного согласования.")
     if not isinstance(raw_allocations, list) or len(raw_allocations) > 100:
         raise ValueError("Распределение должно быть списком не более чем из 100 строк.")
     if fields.get("allocation_basis") == "net":
@@ -1037,6 +1097,11 @@ def save_expense_project_code_links(cursor, supplier_name, proposals, now):
 
 
 def store_expense_allocation_rows(cursor, document_id, allocations, fields):
+    if fields.get("due_date_provided"):
+        cursor.execute("""UPDATE expense_documents SET due_date=?, due_date_kind=?, due_date_review_required=?,
+                          due_date_reviewed=?, due_date_evidence_json=? WHERE id=?""",
+                       (fields["due_date"], fields["due_date_kind"], int(fields["due_date_review_required"]),
+                        int(fields["due_date_reviewed"]), json.dumps(fields["due_date_evidence"], ensure_ascii=False), document_id))
     columns = ["document_id", "object_id", "allocated_gross", "allocated_net", "allocated_vat", "allocation_note"]
     net_basis = fields.get("allocation_basis") == "net"
     net_schema = invoice_net_schema_ready(cursor)
@@ -1100,13 +1165,14 @@ def serialize_expense_document(cursor, document, include_text=False):
     )
     unallocated_net = document_net - allocated_net if document_net is not None and allocated_net is not None else None
     cursor.execute("""
-        SELECT id, original_name FROM expense_document_attachments
+        SELECT id, original_name, file_sha256 AS sha256 FROM expense_document_attachments
         WHERE document_id = ? ORDER BY ordinal, id
     """, (document["id"],))
     attachments = [dict(row) | {"has_original": True} for row in cursor.fetchall()]
     if not attachments and document["stored_name"]:
         attachments = [{
             "id": None, "original_name": document["original_name"], "has_original": True,
+            "sha256": document["file_sha256"],
         }]
     serialized = {
         "id": int(document["id"]),
@@ -1114,6 +1180,11 @@ def serialize_expense_document(cursor, document, include_text=False):
         "supplier_name": document["supplier_name"],
         "invoice_number": document["invoice_number"],
         "document_date": document["document_date"],
+        "due_date": document["due_date"] if "due_date" in document.keys() else None,
+        "due_date_kind": document["due_date_kind"] if "due_date_kind" in document.keys() else "absent",
+        "due_date_review_required": bool(document["due_date_review_required"]) if "due_date_review_required" in document.keys() else False,
+        "due_date_reviewed": bool(document["due_date_reviewed"]) if "due_date_reviewed" in document.keys() else False,
+        "due_date_evidence": json.loads(document["due_date_evidence_json"] or "[]") if "due_date_evidence_json" in document.keys() else [],
         "currency_code": document["currency_code"],
         "net_amount": decimal_text(document["net_amount"]),
         "vat_amount": decimal_text(document["vat_amount"]),
@@ -1121,6 +1192,7 @@ def serialize_expense_document(cursor, document, include_text=False):
         "expense_category": document["expense_category"],
         "document_comment": document["document_comment"],
         "order_proposals": json.loads(document["order_proposals_json"] or "[]"),
+        **invoice_context(document["recognized_text"] or ""),
         "verification_status": document["verification_status"],
         "original_name": document["original_name"],
         "has_original": bool(attachments),
@@ -1207,6 +1279,8 @@ def expense_document_capabilities_api():
     connection = get_db_connection()
     try:
         net_features = ["net_allocations_v1"] if invoice_net_schema_ready(connection) else []
+        if expense_due_date_schema_ready(connection):
+            net_features.append("due_date_v1")
     finally:
         connection.close()
     return jsonify({
@@ -1567,6 +1641,12 @@ def expense_document_update_api(document_id):
             }), 409
         if "recognized_text" not in payload:
             fields["recognized_text"] = existing["recognized_text"]
+        if not fields["due_date_provided"] and "due_date" in existing.keys() and fields["verification_status"] == "confirmed":
+            date_errors = due_date_issues({"due_date": existing["due_date"], "due_date_kind": existing["due_date_kind"],
+                                          "due_date_review_required": bool(existing["due_date_review_required"]),
+                                          "due_date_reviewed": bool(existing["due_date_reviewed"])})
+            if date_errors:
+                raise ValueError(" ".join(date_errors))
         if "order_proposals" in payload:
             order_proposals = validate_expense_order_proposals(cursor, payload.get("order_proposals"))
         else:

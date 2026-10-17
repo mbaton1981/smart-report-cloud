@@ -7,6 +7,7 @@ import sqlite3
 import math
 import requests
 import json
+import logging
 import uuid
 import tempfile
 import mimetypes
@@ -47,7 +48,7 @@ from expense_documents import (
     store_original_file,
     validate_allocations,
 )
-from expense_documents import parse_invoice_pages, parse_invoice_money, net_invoice_issues
+from expense_documents import parse_invoice_pages, parse_invoice_money, net_invoice_issues, invoice_context, due_date_issues, due_date_edit
 
 # Локальная база данных SQLite и папки
 DB_FILE = os.environ.get("SMARTREPORT_DB_FILE", "smart_report.db")
@@ -2402,6 +2403,8 @@ class SmartReportApp(QMainWindow):
                 required_features.update({"order_proposals", "supplier_project_code_links"})
             if any(json.loads(row["payload_json"]).get("allocation_basis") == "net" for row in rows):
                 required_features.add("net_allocations_v1")
+            if any("due_date" in json.loads(row["payload_json"]) for row in rows):
+                required_features.add("due_date_v1")
             try:
                 capability_response = requests.request(
                     "GET",
@@ -2431,7 +2434,7 @@ class SmartReportApp(QMainWindow):
                 finally:
                     error_conn.close()
                 return {"synced": 0, "conflicts": 0, "blocked": len(rows)}
-        synced = conflicts = 0
+        synced = conflicts = cleanup_warnings = 0
         for queued in rows:
             client_id = queued["client_id"]
             revision = int(queued["revision"])
@@ -2441,6 +2444,7 @@ class SmartReportApp(QMainWindow):
                 payload["expected_version"] = int(queued["server_version"])
             request_files = []
             opened_files = []
+            required_attachment_hashes = set(payload.get("required_attachment_sha256") or [])
             try:
                 if queued["operation"] == "delete":
                     method = "DELETE"
@@ -2463,6 +2467,7 @@ class SmartReportApp(QMainWindow):
                         path = Path(attachment_path)
                         if not path.is_file():
                             raise FileNotFoundError(f"Вложение расхода не найдено: {path.name}")
+                        required_attachment_hashes.add(sha256_file(path))
                         stream = path.open("rb")
                         opened_files.append(stream)
                         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -2470,21 +2475,27 @@ class SmartReportApp(QMainWindow):
                     files = request_files or None
                     data = {"payload": json.dumps(payload, ensure_ascii=False)} if files else None
 
-                response = requests.request(
-                    method,
-                    f"{CLOUD_URL.rstrip('/')}{endpoint}",
-                    headers={"X-Sync-Key": SYNC_API_KEY},
-                    json=payload if data is None else None,
-                    data=data,
-                    files=files,
-                    timeout=30,
-                )
+                try:
+                    response = requests.request(
+                        method,
+                        f"{CLOUD_URL.rstrip('/')}{endpoint}",
+                        headers={"X-Sync-Key": SYNC_API_KEY},
+                        json=payload if data is None else None,
+                        data=data,
+                        files=files,
+                        timeout=30,
+                    )
+                finally:
+                    for stream in opened_files:
+                        stream.close()
                 try:
                     result = response.json()
                 except ValueError:
                     result = {}
+                if not isinstance(result, dict):
+                    raise ValueError("Некорректный ACK сервера; очередь и оригиналы сохранены для повтора.")
                 status_code = int(response.status_code)
-                if status_code >= 400 or result.get("ok") is not True:
+                if not 200 <= status_code < 300 or result.get("ok") is not True:
                     error = str(result.get("error") or f"Сервер вернул HTTP {status_code}.")
                     conflict = status_code in (400, 404, 409, 410, 422)
                     error_conn = get_db_connection()
@@ -2506,7 +2517,33 @@ class SmartReportApp(QMainWindow):
                     continue
 
                 remote_document = result.get("document") or {}
+                if not isinstance(remote_document, dict):
+                    raise ValueError("Сервер не подтвердил документ; очередь и оригиналы сохранены.")
                 remote_id = remote_document.get("id")
+                if queued["operation"] != "delete" and (
+                    type(remote_id) is not int or remote_id <= 0
+                    or remote_document.get("client_id") != client_id
+                    or type(remote_document.get("sync_version")) is not int
+                    or remote_document["sync_version"] <= 0
+                    or queued["server_document_id"] is not None and remote_id != int(queued["server_document_id"])
+                    or queued["server_version"] is not None and remote_document["sync_version"] <= int(queued["server_version"])
+                ):
+                    raise ValueError("Сервер не подтвердил идентификатор документа; оригинал и очередь сохранены для повтора.")
+                if queued["operation"] != "delete" and required_attachment_hashes:
+                    attachments = remote_document.get("attachments")
+                    if not isinstance(attachments, list):
+                        raise ValueError("В ACK отсутствует список обязательных вложений; очередь и оригиналы сохранены.")
+                    confirmed_hashes = {item.get("sha256") for item in attachments
+                                        if isinstance(item, dict) and item.get("has_original") is True
+                                        and isinstance(item.get("sha256"), str)}
+                    if (remote_document.get("has_original") is not True
+                            or not required_attachment_hashes.issubset(confirmed_hashes)):
+                        raise ValueError("ACK не подтверждает сохранение всех обязательных вложений по SHA-256; очередь и оригиналы сохранены.")
+                if queued["operation"] != "delete" and "due_date" in payload:
+                    expected_due = (datetime.strptime(str(payload["due_date"]), "%Y-%m-%d").strftime("%Y-%m-%d")
+                                    if payload.get("due_date") else None)
+                    if remote_document.get("due_date") != expected_due or remote_document.get("due_date_kind") != payload.get("due_date_kind", "manual" if expected_due else "absent"):
+                        raise ValueError("ACK не подтвердил сохранение срока оплаты и его источника; очередь сохранена.")
                 ack_conn = get_db_connection()
                 try:
                     ack_conn.execute("BEGIN IMMEDIATE")
@@ -2538,9 +2575,13 @@ class SmartReportApp(QMainWindow):
                     raise
                 finally:
                     ack_conn.close()
-                for path in paths_to_remove:
-                    Path(path).unlink(missing_ok=True)
                 synced += 1
+                for path in paths_to_remove:
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except OSError as error:
+                        cleanup_warnings += 1
+                        logging.warning("Документ %s подтверждён сервером; временный оригинал не удалён: %s", client_id, error)
             except (requests.RequestException, OSError, ValueError) as error:
                 error_conn = get_db_connection()
                 try:
@@ -2557,7 +2598,10 @@ class SmartReportApp(QMainWindow):
             finally:
                 for stream in opened_files:
                     stream.close()
-        return {"synced": synced, "conflicts": conflicts}
+        result = {"synced": synced, "conflicts": conflicts}
+        if cleanup_warnings:
+            result["cleanup_warnings"] = cleanup_warnings
+        return result
 
     def perform_sync_logic(self):
         headers = {"X-Sync-Key": SYNC_API_KEY}
@@ -7624,6 +7668,10 @@ class SmartReportApp(QMainWindow):
 
     def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None):
         fields = {**parsed_fields, **document}
+        source_text = str(fields.get("raw_text") or fields.get("recognized_text") or "")
+        context = invoice_context(source_text)
+        context["prepaid"] = context["prepaid"] or fields.get("prepaid") is True
+        context["reverse_charge"] = context["reverse_charge"] or fields.get("reverse_charge") is True
         server_document = server_document or document
         client_id = str(fields.get("client_id") or uuid.uuid4())
         preview_paths = list(source_paths or fields.get("local_attachment_paths") or [])
@@ -7652,17 +7700,46 @@ class SmartReportApp(QMainWindow):
         inputs = {}
         for key, label in (
             ("supplier_name", "Поставщик"), ("invoice_number", "Номер фактуры"),
-            ("document_date", "Дата (ГГГГ-ММ-ДД)"), ("currency_code", "Валюта"),
+            ("document_date", "Дата (ГГГГ-ММ-ДД)"), ("due_date", "Срок оплаты (ГГГГ-ММ-ДД)"), ("currency_code", "Валюта"),
             ("net_amount", "Сумма без НДС"), ("vat_amount", "НДС фактуры"),
             ("rounding_amount", "Округление"), ("amount_due", "К оплате"),
         ):
             value = fields.get(key)
-            if key == "rounding_amount" and value is None:
-                value = "0.00"
+            if key == "currency_code" and value == "UNKNOWN":
+                value = None
             widget = QLineEdit(str(value) if value is not None else "")
+            if key == "rounding_amount":
+                widget.setPlaceholderText("Не указано в документе")
+            elif key == "currency_code":
+                widget.setPlaceholderText("Не указана: выберите валюту")
+            elif key == "due_date":
+                widget.setPlaceholderText("Не указан или требует проверки")
             widget.setObjectName("invoice_" + key)
             inputs[key] = widget
-            form.addRow(label + ":", widget)
+            form.addRow(("Остаток к оплате" if key == "amount_due" and context["prepaid"] else label) + ":", widget)
+        original_due_text = inputs["due_date"].text().strip()
+        due_origin = fields.get("due_date_kind") or ("manual" if original_due_text else "absent")
+        due_origin_note = QLabel()
+        due_origin_note.setObjectName("invoiceDueDateOrigin")
+        due_origin_note.setWordWrap(True)
+        form.addRow("Источник срока:", due_origin_note)
+        due_reviewed = QCheckBox("Срок оплаты и его источник сверены")
+        due_reviewed.setObjectName("invoiceDueDateReviewed")
+        due_reviewed.setChecked(fields.get("due_date_reviewed") is True)
+        due_reviewed.setVisible(bool(fields.get("due_date_review_required") or due_origin in {"calculated", "ambiguous"}))
+        form.addRow(due_reviewed)
+        document_total = QLabel()
+        document_total.setObjectName("invoiceDocumentTotal")
+        if context["prepaid"]:
+            form.addRow("Сумма документа с НДС:", document_total)
+            prepaid_note = QLabel("Предоплаченный документ: общий итог не равен остатку к оплате. Пока доступен только черновик.")
+            prepaid_note.setWordWrap(True)
+            form.addRow(prepaid_note)
+        tax_reviewed = QCheckBox("Обратное начисление проверено по оригиналу")
+        tax_reviewed.setObjectName("invoiceTaxReviewed")
+        tax_reviewed.setChecked(fields.get("tax_reviewed") is True)
+        if context["reverse_charge"]:
+            form.addRow(tax_reviewed)
         top.addWidget(details)
         top.setSizes([500, 500])
         layout.addWidget(top, 3)
@@ -7720,6 +7797,8 @@ class SmartReportApp(QMainWindow):
 
         def values():
             current = {key: widget.text().strip() for key, widget in inputs.items()}
+            current.update({**context, "tax_reviewed": tax_reviewed.isChecked(), "recognized_text": source_text})
+            current.update(due_date_edit(fields, current["due_date"], due_reviewed.isChecked()))
             rows = []
             for index, original in enumerate(source_rows):
                 destination = table.cellWidget(index, 2).currentData()
@@ -7738,7 +7817,17 @@ class SmartReportApp(QMainWindow):
 
         def refresh(*_):
             current, rows = values()
-            allocated = sum((parse_invoice_money(row["net_amount"]) or Decimal(0) for row in rows), Decimal(0))
+            origin_names = {"explicit": "Явно указан в документе", "calculated": "Рассчитан по условиям оплаты — требуется сверка",
+                            "manual": "Изменён вручную", "ambiguous": "Неоднозначный срок — укажите проверенную дату",
+                            "absent": "Срок в документе не найден"}
+            due_origin_note.setText(origin_names.get(current["due_date_kind"], "Источник требует проверки"))
+            due_reviewed.setVisible(current["due_date_review_required"])
+            net_value = parse_invoice_money(current["net_amount"])
+            vat_value = parse_invoice_money(current["vat_amount"])
+            document_total.setText(decimal_text(net_value + vat_value) if net_value is not None and vat_value is not None else "Неизвестно")
+            allocated = sum((parse_invoice_money(row["net_amount"]) or Decimal(0) for row in rows
+                             if row.get("destination") == "company"
+                             or row.get("destination") == "object" and row.get("object_id") is not None), Decimal(0))
             total = parse_invoice_money(current["net_amount"])
             remaining = decimal_text(total - allocated) if total is not None else "неизвестно"
             distribution.setText(f"Без НДС: распределено {decimal_text(allocated)} / осталось {remaining}")
@@ -7820,11 +7909,18 @@ class SmartReportApp(QMainWindow):
         for widget in inputs.values():
             widget.textChanged.connect(refresh)
         ambiguity_reviewed.toggled.connect(refresh)
+        tax_reviewed.toggled.connect(refresh)
+        due_reviewed.toggled.connect(refresh)
         add_row_button.clicked.connect(lambda: append_row())
         remove_row_button.clicked.connect(remove_row)
 
         def save(status):
             current, rows = values()
+            if current["due_date"]:
+                date_errors = due_date_issues({"due_date": current["due_date"], "due_date_kind": "manual"})
+                if date_errors:
+                    QMessageBox.warning(dialog, "Срок оплаты", " ".join(date_errors))
+                    return
             for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due"):
                 if current[key] and parse_invoice_money(current[key]) is None:
                     QMessageBox.warning(dialog, "Формат суммы", "Исправьте формат денежной суммы перед сохранением.")
@@ -7837,11 +7933,15 @@ class SmartReportApp(QMainWindow):
             net = parse_invoice_money(current["net_amount"])
             vat = parse_invoice_money(current["vat_amount"])
             payload = {**current, "client_id": client_id, "allocation_basis": "net",
+                       "currency_code": current["currency_code"].upper() or "UNKNOWN",
                        "gross_amount": decimal_text(net + vat) if net is not None and vat is not None else None,
                        "verification_status": status, "allocations": rows, "order_proposals": rows,
                        "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
                        "document_comment": fields.get("document_comment") or "",
                        "expense_category": fields.get("expense_category") or "Прочие расходы"}
+            known_hashes = [item["sha256"] for item in fields.get("attachments") or [] if item.get("sha256")]
+            if known_hashes:
+                payload["required_attachment_sha256"] = known_hashes
             staged = []
             try:
                 if source_paths:
@@ -7899,6 +7999,13 @@ class SmartReportApp(QMainWindow):
         date_value = document.get("document_date") or parsed_fields.get("document_date") or QDate.currentDate().toString("yyyy-MM-dd")
         document_date = create_date_field(str(date_value))
         document_date.setObjectName("expenseDocumentDate")
+        due_fields = {**parsed_fields, **document}
+        due_date_input = QLineEdit(str(due_fields.get("due_date") or ""))
+        due_date_input.setObjectName("expenseDueDate")
+        due_date_input.setPlaceholderText("ГГГГ-ММ-ДД; не указан — оставить пустым")
+        due_date_reviewed = QCheckBox("Срок оплаты и источник сверены")
+        due_date_reviewed.setChecked(due_fields.get("due_date_reviewed") is True)
+        due_date_reviewed.setVisible(bool(due_fields.get("due_date_review_required") or due_fields.get("due_date_kind") in {"calculated", "ambiguous"}))
         gross_value = document.get("gross_amount") if document else parsed_fields.get("gross_amount")
         vat_value = document.get("vat_amount") if document else parsed_fields.get("vat_amount")
         gross_amount = QLineEdit(str(gross_value) if gross_value is not None else "")
@@ -7938,6 +8045,8 @@ class SmartReportApp(QMainWindow):
 
         form.addRow("Поставщик:", supplier)
         form.addRow("Дата:", document_date)
+        form.addRow("Срок оплаты:", due_date_input)
+        form.addRow(due_date_reviewed)
         amount_row = QHBoxLayout()
         amount_row.addWidget(QLabel("Сумма с НДС:"))
         amount_row.addWidget(gross_amount)
@@ -8053,12 +8162,31 @@ class SmartReportApp(QMainWindow):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить документ")
-        buttons.accepted.connect(dialog.accept)
+        def accept_due_date():
+            candidate = due_date_edit(due_fields, due_date_input.text(), due_date_reviewed.isChecked())
+            if candidate["due_date"]:
+                format_errors = due_date_issues({"due_date": candidate["due_date"], "due_date_kind": "manual"})
+                if format_errors:
+                    QMessageBox.warning(dialog, "Срок оплаты", " ".join(format_errors))
+                    return
+            date_errors = due_date_issues(candidate)
+            if status.currentData() == "confirmed" and date_errors:
+                QMessageBox.warning(dialog, "Срок оплаты", " ".join(date_errors))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(accept_due_date)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return False
 
+        due_values = due_date_edit(due_fields, due_date_input.text(), due_date_reviewed.isChecked())
+        date_errors = due_date_issues(due_values)
+        format_errors = due_date_issues({"due_date": due_values["due_date"], "due_date_kind": "manual"})
+        if format_errors or status.currentData() == "confirmed" and date_errors:
+            QMessageBox.warning(self, "Срок оплаты", " ".join(date_errors))
+            return False
         gross = parse_decimal(gross_amount.text())
         vat = parse_decimal(vat_amount.text())
         if gross_amount.text().strip() and gross is None:
@@ -8099,6 +8227,7 @@ class SmartReportApp(QMainWindow):
 
         payload = {
             "client_id": client_id,
+            **due_values,
             "supplier_name": supplier.text().strip(),
             "document_date": document_date.text(),
             "currency_code": currency.currentText().strip().upper() or "SEK",
@@ -8112,6 +8241,9 @@ class SmartReportApp(QMainWindow):
             "verification_status": status.currentData(),
             "allocations": allocations,
         }
+        known_hashes = [item["sha256"] for item in document.get("attachments") or [] if item.get("sha256")]
+        if known_hashes:
+            payload["required_attachment_sha256"] = known_hashes
         if "raw_text" in parsed_fields:
             payload["recognized_text"] = str(parsed_fields.get("raw_text") or "")
         elif "recognized_text" in document:
@@ -8155,6 +8287,27 @@ class SmartReportApp(QMainWindow):
             "Документы и фотографии (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
         )
         if not paths:
+            return
+        try:
+            incoming_hashes = [sha256_file(path) for path in paths]
+            if len(set(incoming_hashes)) != len(incoming_hashes):
+                QMessageBox.warning(self, "Повторный оригинал", "Один и тот же файл выбран несколько раз. Уберите повторные копии.")
+                return
+            documents, _online = self._expense_document_snapshot()
+            for document in documents:
+                known_hashes = {item.get("sha256") for item in document.get("attachments") or [] if item.get("sha256")}
+                for local_path in document.get("local_attachment_paths") or []:
+                    if Path(local_path).is_file():
+                        known_hashes.add(sha256_file(local_path))
+                if known_hashes.intersection(incoming_hashes):
+                    QMessageBox.information(
+                        self, "Документ уже загружен",
+                        "Этот оригинал уже есть в реестре или очереди синхронизации. "
+                        "Откройте существующий документ для исправления; второй расход не создан.",
+                    )
+                    return
+        except OSError as error:
+            QMessageBox.warning(self, "Оригинал недоступен", str(error))
             return
         from expense_documents import extract_local_document
 

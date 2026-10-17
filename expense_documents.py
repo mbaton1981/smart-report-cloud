@@ -6,7 +6,7 @@ import shutil
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -276,6 +276,7 @@ def parse_document_text(text: str) -> dict[str, Any]:
 
 def parse_invoice_money(value):
     text = str(value or "").strip().replace("−", "-").replace("\u00a0", " ")
+    text = re.sub(r"^(?:SEK|EUR|NOK|DKK|kr)\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*(?:SEK|EUR|NOK|DKK|kr)\s*$", "", text, flags=re.IGNORECASE)
     pattern = (
         r"-?(?:\d+(?:[,.]\d{1,2})?|\d{1,3}(?:[ ']\d{3})+(?:[,.]\d{1,2})?"
@@ -284,7 +285,11 @@ def parse_invoice_money(value):
     return parse_decimal(text) if re.fullmatch(pattern, text) else None
 
 
-def invoice_layout_rows(elements):
+def invoice_layout_rows(elements, caption_patterns=()):
+    def separate_captions(left, right):
+        return (any(re.fullmatch(rf"(?:{pattern})\s*:?", left, re.IGNORECASE) for pattern in caption_patterns)
+                and any(re.fullmatch(rf"(?:{pattern})\s*:?", right, re.IGNORECASE) for pattern in caption_patterns))
+
     rows = []
     for element in sorted(elements, key=lambda item: (item["y0"], item["x0"])):
         center = (element["y0"] + element["y1"]) / 2
@@ -297,7 +302,9 @@ def invoice_layout_rows(elements):
     for _, words in rows:
         runs = []
         for word in sorted(words, key=lambda item: item["x0"]):
-            if runs and word["x0"] - runs[-1]["x1"] < 18:
+            word_height = max(1, word["y1"] - word["y0"])
+            if (runs and word["x0"] - runs[-1]["x1"] < max(6, word_height * 1.2)
+                    and not separate_captions(runs[-1]["text"], word["text"])):
                 run = runs[-1]
                 run["text"] += " " + word["text"]
                 run["x1"] = max(run["x1"], word["x1"])
@@ -305,38 +312,152 @@ def invoice_layout_rows(elements):
             else:
                 runs.append(dict(word))
         result.append(runs)
+    for row in result:
+        for cell in list(row):
+            if cell not in row:
+                continue
+            adjacent = []
+            for other_row in result:
+                if other_row is row:
+                    continue
+                for other in other_row:
+                    overlap = min(cell["y1"], other["y1"]) - max(cell["y0"], other["y0"])
+                    height = max(1, min(cell["y1"] - cell["y0"], other["y1"] - other["y0"]))
+                    gap = other["x0"] - cell["x1"]
+                    if (0 <= gap < max(6, height * 1.2) and overlap / height > 0.6
+                            and not separate_captions(cell["text"], other["text"])):
+                        adjacent.append((gap, other_row, other))
+            if adjacent:
+                _, other_row, other = min(adjacent, key=lambda item: item[0])
+                cell["text"] += " " + other["text"]
+                cell["x1"] = other["x1"]
+                cell["y0"] = min(cell["y0"], other["y0"])
+                cell["y1"] = max(cell["y1"], other["y1"])
+                other_row.remove(other)
+    result = [sorted(row, key=lambda item: item["x0"]) for row in result if row]
+    result.sort(key=lambda row: min(item["y0"] for item in row))
     return result
+
+
+def invoice_order_lines(rows):
+    captions = (
+        r"Proj\s*\.\s*nr\s*\.?|Märkning|Ert\s+ordernr", r"Sälj\s*\.\s*ordnr\s*\.?",
+        r"Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer|Order\b", r"Summa\s+order(?:\s+exkl\.?\s*moms)?",
+        r"Moms\s+order(?:\s+\d+(?:[,.]\d+)?\s*%)?",
+    )
+    lines = []
+    sources = []
+    for row in rows:
+        for index, cell in enumerate(row):
+            for caption in captions:
+                match = re.fullmatch(rf"({caption})(?:\s*:\s*|\s+)?(.*?)", cell["text"].strip(), re.IGNORECASE)
+                if not match:
+                    continue
+                label, value = match.groups()
+                value_cell = cell
+                if not value:
+                    if not cell["text"].rstrip().endswith(":") and not re.match(r"Summa\s+order|Märkning|Ert\s+ordernr", label, re.IGNORECASE):
+                        continue
+                    candidates = row[index + 1:]
+                    if re.match(r"Summa\s+order", label, re.IGNORECASE):
+                        candidates = [item for item in candidates if parse_invoice_money(item["text"]) is not None]
+                        if len(candidates) != 1:
+                            continue
+                    if not candidates:
+                        continue
+                    value_cell = candidates[0]
+                    value = value_cell["text"]
+                if re.fullmatch(r"Märkning|Ert\s+ordernr", label, re.IGNORECASE):
+                    label = "Proj.nr."
+                elif label.casefold() == "order":
+                    label = "Order nr"
+                lines.append(f"{label}: {value}")
+                sources.append({"box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                                "kind": "order_total" if re.match(r"Summa\s+order", label, re.IGNORECASE) else "order_header"})
+                break
+    return lines, sources
+
+
+def invoice_seller_blocks(cells, page):
+    candidates = []
+    width = max((cell["x1"] for cell in cells), default=1)
+    height = max((cell["y1"] for cell in cells), default=1)
+    for cell in cells:
+        value = cell["text"].strip()
+        if any(re.match(r"^(?:Faktura(?:mottagare|adress)|Fakturerat\s+till|Faktureringsadress|Betalningsavsändare|Köparens\s+adress|Köpare|Buyer|Leveransadress)\b", other["text"], re.IGNORECASE)
+               and abs(other["x0"] - cell["x0"]) < 24 and 0 <= cell["y0"] - other["y0"] < 100
+               for other in cells):
+            continue
+        if re.fullmatch(r"(?:Post|Besöks)?adress\s*:?", value, re.IGNORECASE):
+            below = [other for other in cells if abs(other["x0"] - cell["x0"]) < 12
+                     and 4 < other["y0"] - cell["y0"] < 28
+                     and re.fullmatch(r"[^\d@:/]{3,160}", other["text"].strip())]
+            if below:
+                nearest = min(below, key=lambda other: other["y0"])
+                candidates.append((90, nearest["text"].strip(), page, nearest))
+        company = re.match(r"^(.+?\b(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS)(?:\s+Servicecenter)?)(?=\s*[,|]|$)", value, re.IGNORECASE)
+        if not company:
+            continue
+        name = company.group(1)
+        if ":" in name:
+            continue
+        address_lines = [other["text"] for other in cells
+                         if abs(other["x0"] - cell["x0"]) < 16 and 5 < other["y0"] - cell["y0"] < 42]
+        has_address = any(re.search(r"\b(?:Box\s*\d+|\d{3}\s?\d{2}\b)|[A-Za-zÅÄÖåäö]+(?:väg|gatan|vägen)\s*\d", line, re.IGNORECASE)
+                          for line in [value[len(name):], *address_lines])
+        if not has_address:
+            continue
+        own_registration = any(
+            re.match(r"^(?:Org\.?\s*nr|Organisationsn(?:ummer|r)|Momsreg|VAT\s*/)", other["text"], re.IGNORECASE)
+            and abs(other["x0"] - cell["x0"]) < 24 and 0 <= other["y0"] - cell["y0"] < 80
+            for other in cells
+        )
+        if cell["y0"] < height * 0.3:
+            candidates.append((90 if own_registration else 80, name, page, cell))
+        elif cell["y0"] > height * 0.65:
+            candidates.append((85, name, page, cell))
+    return candidates
+
+
+def invoice_context(text):
+    return {
+        "reverse_charge": bool(re.search(r"omvänd\s+(?:moms|skattskyldighet|betalningsskyldighet)|reverse\s+charge", text or "", re.IGNORECASE)),
+        "prepaid": bool(re.search(r"förskottsbetald|betalt\s+med\s+kort|kvar\s+att\s+betala", text or "", re.IGNORECASE)),
+    }
 
 
 def parse_invoice_pages(pages):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     fields = parse_document_text(text)
     labels = {
-        "supplier_name": r"Leverantör|Supplier|Seller",
-        "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Invoice\s*(?:number|no\.?)",
-        "document_date": r"Fakturadatum|Invoice\s*date",
+        "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
+        "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
+        "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date",
+        "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda\s+senast|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
-        "net_amount": r"Netto|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|Summa\s+exkl\.?\s*moms",
-        "vat_amount": r"Moms|Momsbelopp|Moms\s+totalt|Total\s+moms|Total\s+VAT",
-        "rounding_amount": r"Öresavrundning|Öresutjämning|Avrundning|Rounding",
-        "amount_due": r"Att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due",
-        "gross_amount": r"Total\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp",
+        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
+        "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s*SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
+        "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
+        "amount_due": r"Att\s+betala|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms",
+        "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp",
     }
     candidates = {key: [] for key in labels}
     companies = []
     field_sources = {}
-    layout_texts = []
+    order_pages = []
+    due_caption_seen = False
 
     def checked_value(key, raw):
         value = str(raw).strip().strip(":")
         if key.endswith("amount") or key == "amount_due":
             return decimal_text(parse_invoice_money(value))
-        if key == "document_date":
+        if key in {"document_date", "due_date"}:
             return _date_value(value) if re.fullmatch(r"[\d./-]+", value) else None
         if key == "currency_code":
             return value.upper() if re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", value, re.IGNORECASE) else None
         if key == "invoice_number":
-            return value if re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{3,120}", value) else None
+            return value if re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{1,120}", value) else None
+        value = re.sub(r"^(?:Returadress|Return\s+address)\s*:\s*", "", value, flags=re.IGNORECASE)
         if re.fullmatch(r".+\s(?:AB|Aktiebolag|Ltd\.?|GmbH|AS)", value, re.IGNORECASE):
             return value
         return None
@@ -344,36 +465,68 @@ def parse_invoice_pages(pages):
     for page in pages:
         elements = page.get("elements") or []
         if elements:
-            rows = invoice_layout_rows(elements)
+            rows = invoice_layout_rows(elements, labels.values())
         else:
             rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
                     for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
         cells = [cell for row in rows for cell in row]
-        layout_texts.append("\n".join("\n".join(cell["text"] for cell in row) for row in rows))
+        companies.extend(invoice_seller_blocks(cells, page))
+        order_lines, order_sources = invoice_order_lines(rows)
+        order_pages.append({**page, "text": "\n".join(order_lines), "line_sources": order_sources})
         for cell in cells:
             cell_text = cell["text"].strip()
-            company = checked_value("supplier_name", cell_text)
-            buyer_nearby = any(
-                re.match(r"^(?:Köpare|Kund|Buyer|Fakturaadress|Fakturamottagare)\b", other["text"], re.IGNORECASE)
-                and abs(other["x0"] - cell["x0"]) < 50 and 0 <= cell["y0"] - other["y0"] < 65
-                for other in cells
-            )
-            if company and not buyer_nearby:
-                companies.append((company, page, cell))
+            if fields.get("currency_code") == "UNKNOWN":
+                currency_codes = set(re.findall(r"\b(SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\b", "\n".join(item["text"] for item in cells), re.IGNORECASE))
+                if len(currency_codes) == 1:
+                    fields["currency_code"] = currency_codes.pop().upper()
             for key, label in labels.items():
+                if key == "due_date" and re.match(rf"^(?:{label})(?:\s|:|$)", cell_text, re.IGNORECASE):
+                    due_caption_seen = True
                 inline = re.fullmatch(rf"(?:{label})(?:\s*:\s*|\s+)(.+)", cell_text, re.IGNORECASE)
                 raw_value = inline.group(1) if inline else None
                 value_cell = cell
                 if re.fullmatch(rf"(?:{label})\s*:?", cell_text, re.IGNORECASE):
+                    def is_caption(other):
+                        return any(re.fullmatch(rf"(?:{caption})\s*:?", other["text"].strip(), re.IGNORECASE)
+                                   for caption in labels.values())
+
+                    same_row_values = [other for other in cells if other["x0"] >= cell["x1"]
+                                       and abs(other["y0"] - cell["y0"]) < 4
+                                       and checked_value(key, other["text"]) is not None
+                                       and not any((is_caption(between) or (
+                                                       checked_value(key, between["text"]) is None
+                                                       and re.search(r"[A-Za-zÅÄÖåäö]", between["text"])
+                                                       and not re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", between["text"], re.IGNORECASE)))
+                                                   and cell["x1"] <= between["x0"] < other["x0"]
+                                                   and abs(between["y0"] - cell["y0"]) < 4 for between in cells)]
                     right_headers = [other["x0"] for other in cells
                                      if abs(other["y0"] - cell["y0"]) < 4 and other["x0"] > cell["x0"]]
                     right_edge = min(right_headers) if right_headers else cell["x1"] + 100
+                    aggregate_values = []
+                    if key == "vat_amount" and re.fullmatch(r"Moms\s*belopp(?:\s*SEK)?", cell_text, re.IGNORECASE):
+                        total_rows = [row for row in rows if 4 < row[0]["y0"] - cell["y0"] < 120
+                                      and re.fullmatch(r"Totalt?", row[0]["text"].strip(), re.IGNORECASE)]
+                        if total_rows:
+                            aggregate_values = [item for item in total_rows[0]
+                                                if cell["x0"] - 5 <= item["x0"] < right_edge - 5
+                                                and checked_value(key, item["text"]) is not None]
                     neighbors = [other for other in cells if other is not cell and (
-                        abs(other["y0"] - cell["y0"]) < 4 and 0 <= other["x0"] - cell["x1"] <= 45
-                        or 4 < other["y0"] - cell["y0"] < 42
-                        and cell["x0"] - 5 <= other["x0"] < right_edge - 5
+                        4 < other["y0"] - cell["y0"] < 42
+                            and (cell["x0"] - 5 <= other["x0"] < right_edge - 5
+                                or abs(other["x1"] - cell["x1"]) < 6)
+                        and not any(is_caption(between) and cell["y0"] + 4 < between["y0"] <= other["y0"] + 2
+                                    and abs(between["x0"] - cell["x0"]) < 25 for between in cells)
                     ) and checked_value(key, other["text"]) is not None]
-                    if neighbors:
+                    if key == "vat_amount" and re.fullmatch(r"Moms\s*belopp(?:\s*SEK)?", cell_text, re.IGNORECASE):
+                        neighbors = [other for other in neighbors if abs(other["x1"] - cell["x1"]) < 8
+                                     or cell["x0"] <= other["x0"] and other["x1"] <= cell["x1"] + 8]
+                    if len(aggregate_values) == 1:
+                        value_cell = aggregate_values[0]
+                        raw_value = value_cell["text"]
+                    elif len(same_row_values) == 1:
+                        value_cell = same_row_values[0]
+                        raw_value = value_cell["text"]
+                    elif not same_row_values and neighbors:
                         distance = min(abs(other["y0"] - cell["y0"]) for other in neighbors)
                         nearest = [other for other in neighbors if abs(other["y0"] - cell["y0"]) == distance]
                         if len(nearest) == 1:
@@ -385,12 +538,23 @@ def parse_invoice_pages(pages):
                               "attachment_index": page.get("attachment_index", 0),
                               "box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
                               "text": value_cell["text"], "kind": "invoice_total" if "amount" in key else "header"}
+                    if key == "vat_amount":
+                        row_with_total = any(value_cell in row and re.fullmatch(r"Totalt?", row[0]["text"].strip(), re.IGNORECASE) for row in rows)
+                        ledger_row = any(cell in row and any(other is not cell and is_caption(other) for other in row) for row in rows) if re.fullmatch(rf"(?:{label})\s*:?", cell_text, re.IGNORECASE) else False
+                        source["priority"] = 3 if row_with_total or ledger_row or re.search(r"\d.*%", cell_text) else 2 if re.search(r"belopp", cell_text, re.IGNORECASE) else 1
                     candidates[key].append((value, source))
-    if not candidates["supplier_name"] and len({item[0].casefold() for item in companies}) == 1:
-        company, page, cell = companies[0]
-        candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"]}))
+    if not candidates["supplier_name"] and companies:
+        priority = max(item[0] for item in companies)
+        best = [item for item in companies if item[0] == priority]
+        if len({item[1].casefold() for item in best}) == 1:
+            _, company, page, cell = best[0]
+            candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"],
+                                                       "kind": "seller_address_block"}))
     diagnostics = []
     for key, matches in candidates.items():
+        if key == "vat_amount" and matches:
+            priority = max(source.get("priority", 1) for _, source in matches)
+            matches = [(value, source) for value, source in matches if source.get("priority", 1) == priority]
         values = {value for value, _ in matches}
         if len(values) == 1:
             fields[key] = matches[0][0]
@@ -400,12 +564,36 @@ def parse_invoice_pages(pages):
             diagnostics.append(f"Несколько различных значений поля {key}; требуется сверка по оригиналу.")
         elif key not in ("currency_code",):
             fields[key] = None
-    fields["rounding_amount"] = fields.get("rounding_amount") or "0.00"
+    fields["rounding_amount"] = fields.get("rounding_amount")
     if fields.get("net_amount") is not None and fields.get("vat_amount") is not None:
         fields["gross_amount"] = decimal_text(Decimal(fields["net_amount"]) + Decimal(fields["vat_amount"]))
     fields["field_sources"] = field_sources
+    due_matches = candidates["due_date"]
+    explicit_due_caption = due_caption_seen or any(re.search(rf"(?:{labels['due_date']})", str(page.get("text") or ""), re.IGNORECASE)
+                               for page in pages)
+    if due_matches:
+        fields["due_date_kind"] = "explicit" if fields.get("due_date") else "ambiguous"
+    elif explicit_due_caption:
+        fields["due_date_kind"] = "ambiguous"
+    else:
+        fields["due_date_kind"] = "absent"
+        terms = re.findall(r"Betalningsvillkor\s*:?\s*(\d{1,3})\s*(?:dagar|days)(?:\s+netto)?\b", text, re.IGNORECASE)
+        if len(set(terms)) == 1 and fields.get("document_date") and 0 <= int(terms[0]) <= 365:
+            fields["due_date"] = (datetime.strptime(fields["document_date"], "%Y-%m-%d") + timedelta(days=int(terms[0]))).strftime("%Y-%m-%d")
+            fields["due_date_kind"] = "calculated"
+            field_sources["due_date"] = [{"kind": "payment_terms", "days": int(terms[0]),
+                                          "base_date": fields["document_date"], "text": "Betalningsvillkor: " + terms[0] + " dagar"}]
+        elif terms:
+            fields["due_date_kind"] = "ambiguous"
+    fields["due_date_review_required"] = fields["due_date_kind"] in {"ambiguous", "calculated"}
+    fields["due_date_reviewed"] = False
+    fields["due_date_evidence"] = field_sources.get("due_date", [source for _, source in due_matches])
+    if fields["due_date_review_required"]:
+        diagnostics.append("Срок оплаты рассчитан по условиям или неоднозначен; требуется явная сверка, это не распознанная дата документа.")
     fields["allocation_basis"] = "net"
     fields["raw_text"] = text
+    fields.update(invoice_context(text))
+    fields["document_total"] = fields.get("gross_amount")
     fields["review_reasons"] = diagnostics
     for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due"):
         if not fields.get(key):
@@ -413,14 +601,62 @@ def parse_invoice_pages(pages):
     net = parse_decimal(fields.get("net_amount"))
     vat = parse_decimal(fields.get("vat_amount"))
     due = parse_decimal(fields.get("amount_due"))
-    rounding = parse_decimal(fields.get("rounding_amount"))
+    rounding = parse_decimal(fields.get("rounding_amount")) if fields.get("rounding_amount") is not None else Decimal(0)
     if None not in (net, vat, due, rounding) and net + vat + rounding != due:
         fields["review_reasons"].append("Сумма без НДС + НДС + округление не совпадает с суммой к оплате.")
-    order_pages = [{**page, "text": layout_texts[index]} for index, page in enumerate(pages)]
     proposal = parse_project_order_allocations(order_pages)
+    if not proposal["orders"] and fields.get("net_amount") is not None:
+        markers = []
+        order_ids = set()
+        for page in order_pages:
+            for index, line in enumerate(page["text"].splitlines()):
+                marker = re.fullmatch(r"Proj\.nr\.:\s*(.+)", line, re.IGNORECASE)
+                order = re.fullmatch(r"Order nr:\s*(\S+)", line, re.IGNORECASE)
+                if marker:
+                    markers.append((marker.group(1), page, page["line_sources"][index]))
+                if order:
+                    order_ids.add(order.group(1))
+        if len({marker[0] for marker in markers}) == 1 and len(order_ids) == 1:
+            marker, page, source = markers[0]
+            proposal["orders"].append({
+                "project_code": marker if re.fullmatch(r"[A-Za-z]*\d[\w./-]*", marker) else None,
+                "original_marker": marker, "order_id": next(iter(order_ids)),
+                "net_amount": fields["net_amount"], "vat_amount": None, "ambiguous": False,
+                "sources": [{**source, "source": page.get("source"), "page": page.get("page", 1),
+                             "attachment_index": page.get("attachment_index", 0)}],
+            })
     fields["order_proposals"] = proposal["orders"]
     fields["suggested_verification_status"] = "requires_review"
     return fields
+
+
+def due_date_edit(fields, value, reviewed):
+    original = str(fields.get("due_date") or "").strip()
+    raw = str(value or "").strip()
+    origin = fields.get("due_date_kind") or ("manual" if original else "absent")
+    changed = raw != original
+    kind = ("manual" if raw else "ambiguous") if changed else origin
+    evidence = list(fields.get("due_date_evidence") or [])
+    if changed:
+        evidence.append({"kind": "manual", "previous_due_date": original or None, "previous_kind": origin})
+    return {"due_date": raw or None, "due_date_kind": kind,
+            "due_date_review_required": kind in {"calculated", "ambiguous"} or not changed and fields.get("due_date_review_required") is True,
+            "due_date_reviewed": bool(raw) if changed else reviewed is True, "due_date_evidence": evidence}
+
+
+def due_date_issues(fields):
+    raw = str(fields.get("due_date") or "").strip()
+    if raw:
+        try:
+            datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            return ["Срок оплаты должен быть корректной датой ГГГГ-ММ-ДД."]
+    kind = fields.get("due_date_kind") or ("manual" if raw else "absent")
+    if kind == "ambiguous" and not raw:
+        return ["Неоднозначный срок оплаты: выберите и укажите проверенную дату, не оставляйте догадку."]
+    if (fields.get("due_date_review_required") or kind in {"calculated", "ambiguous"}) and fields.get("due_date_reviewed") is not True:
+        return ["Сверьте срок оплаты и подтвердите его источник: рассчитанная дата не является явно указанной."]
+    return []
 
 
 def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -437,11 +673,11 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
         return parse_decimal(raw) if re.fullmatch(valid_formats, raw) else None
 
     project_pattern = re.compile(
-        r"^\s*Proj\s*\.\s*nr\s*\.?\s*[:#]?\s*(.+?)\s*$",
+        r"^\s*Proj\s*\.\s*nr\s*\.?(?:\s*[:#]\s*|\s+)(\S.*?)\s*$",
         re.IGNORECASE,
     )
     order_pattern = re.compile(
-        r"^\s*(?:Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer)\s*[:#]?\s*([\w./-]+)",
+        r"^\s*(?:Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer|Sälj\s*\.\s*ordnr\s*\.?)\s*[:#]?\s*([\w./-]+)",
         re.IGNORECASE,
     )
     total_pattern = re.compile(
@@ -461,6 +697,7 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
     last_order_key = None
     orders_by_key = {}
     warnings = []
+    project_since_total = False
     for page in pages:
         source_name = str(page.get("source") or page.get("name") or "PDF")
         page_number = int(page.get("page") or 1)
@@ -469,13 +706,17 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
             if project_match:
                 new_project = project_match.group(1).strip()
                 if current_project and new_project.casefold() != current_project.casefold():
-                    current_order = None
+                    if last_order_key is not None:
+                        current_order = None
                     last_order_key = None
                 current_project = new_project
+                project_since_total = True
             order_match = order_pattern.search(line)
             if order_match:
                 new_order = order_match.group(1).strip()
                 if current_order is None or new_order.casefold() != current_order.casefold():
+                    if not project_since_total:
+                        current_project = None
                     last_order_key = None
                 current_order = new_order
             vat_match = vat_pattern.search(line)
@@ -521,6 +762,9 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
                 "text": line.strip(),
                 "attachment_index": int(page.get("attachment_index") or 0),
             }
+            if page.get("line_sources"):
+                source.update(page["line_sources"][line_number - 1])
+            project_since_total = False
             if current_order:
                 key = ("order", current_order.casefold(), (current_project or "").casefold())
             else:
@@ -684,14 +928,23 @@ def migrate_invoice_net_schema(connection):
 
 
 def net_invoice_issues(fields, allocations):
-    issues = []
+    issues = due_date_issues(fields)
+    context = invoice_context(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
+    context["prepaid"] = context["prepaid"] or fields.get("prepaid") is True
+    context["reverse_charge"] = context["reverse_charge"] or fields.get("reverse_charge") is True
+    if context["prepaid"]:
+        issues.append("Предоплаченный чек или остаток после оплаты: подтверждение этого сценария пока не поддерживается; сохраните черновик. Итог документа и остаток к оплате не взаимозаменяемы.")
+    if context["reverse_charge"] and fields.get("tax_reviewed") is not True:
+        issues.append("Обратное начисление НДС: сверьте налоговый режим с оригиналом и отметьте проверку; неизвестный НДС не вычисляется.")
     values = {key: parse_invoice_money(fields.get(key)) for key in
               ("net_amount", "vat_amount", "rounding_amount", "amount_due")}
+    if fields.get("rounding_amount") in (None, ""):
+        values["rounding_amount"] = Decimal(0)
     for key, label in (("net_amount", "сумму без НДС"), ("vat_amount", "НДС фактуры"),
                        ("rounding_amount", "округление"), ("amount_due", "сумму к оплате")):
         if values[key] is None:
             issues.append(f"Укажите {label}.")
-    if all(value is not None for value in values.values()):
+    if all(value is not None for value in values.values()) and not context["prepaid"]:
         if values["net_amount"] + values["vat_amount"] + values["rounding_amount"] != values["amount_due"]:
             issues.append("Сумма без НДС + НДС + округление не равна сумме к оплате.")
     allocated = Decimal(0)
@@ -1268,8 +1521,23 @@ def get_object_expense_summary(
     }
 
 
+def pdf_display_box(bounds, crop, rotation):
+    left, bottom, right, top = bounds
+    crop_left, crop_bottom, crop_right, crop_top = crop
+    if rotation == 90:
+        coordinates = (bottom - crop_bottom, left - crop_left, top - crop_bottom, right - crop_left)
+    elif rotation == 180:
+        coordinates = (crop_right - right, bottom - crop_bottom, crop_right - left, top - crop_bottom)
+    elif rotation == 270:
+        coordinates = (crop_top - top, crop_right - right, crop_top - bottom, crop_right - left)
+    else:
+        coordinates = (left - crop_left, crop_top - top, right - crop_left, crop_top - bottom)
+    return dict(zip(("x0", "y0", "x1", "y1"), coordinates))
+
+
 def pdf_page_elements(page):
-    height = page.get_height()
+    crop = page.get_cropbox()
+    rotation = page.get_rotation()
     text_page = page.get_textpage()
     elements = []
     word = None
@@ -1281,8 +1549,7 @@ def pdf_page_elements(page):
                     elements.append(word)
                     word = None
                 continue
-            left, bottom, right, top = text_page.get_charbox(index)
-            box = {"x0": left, "y0": height - top, "x1": right, "y1": height - bottom}
+            box = pdf_display_box(text_page.get_charbox(index), crop, rotation)
             if word and (box["y0"] > word["y1"] + 4 or box["y1"] < word["y0"] - 4
                          or box["x0"] - word["x1"] > 12):
                 elements.append(word)
@@ -1292,7 +1559,7 @@ def pdf_page_elements(page):
             else:
                 word["text"] += character
                 word["y0"] = min(word["y0"], box["y0"])
-                word["x1"] = max(word["x1"], right)
+                word["x1"] = max(word["x1"], box["x1"])
                 word["y1"] = max(word["y1"], box["y1"])
         if word:
             elements.append(word)

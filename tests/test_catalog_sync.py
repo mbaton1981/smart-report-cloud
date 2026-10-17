@@ -206,6 +206,39 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 1)
         server_conn.close()
 
+    def test_expense_api_duplicate_original_with_new_client_id_is_rejected(self):
+        import hashlib
+
+        original = b"isolated repeated original PDF content"
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        client_id = str(uuid.uuid4())
+        payload = {"client_id": client_id, "supplier_name": "Hash supplier",
+                   "document_date": "2026-10-17", "currency_code": "SEK",
+                   "gross_amount": "125.00", "vat_amount": "25.00", "verification_status": "confirmed",
+                   "allocations": [{"object_id": None, "gross_amount": "125.00", "vat_amount": "25.00"}]}
+
+        def upload(identifier, name):
+            return self.server_client.post("/api/expense-documents", headers=headers, data={
+                "payload": json.dumps({**payload, "client_id": identifier}),
+                "original": (BytesIO(original), name),
+            })
+
+        first = upload(client_id, "original.pdf")
+        self.assertEqual(first.status_code, 201, first.get_json())
+        document = first.get_json()["document"]
+        self.assertEqual(document["attachments"][0]["sha256"], hashlib.sha256(original).hexdigest())
+        retry = upload(client_id, "retry.pdf")
+        self.assertEqual(retry.status_code, 200, retry.get_json())
+        self.assertTrue(retry.get_json()["duplicate_request"])
+        for copy in ("original (1).pdf", "original (2).pdf"):
+            duplicate = upload(str(uuid.uuid4()), copy)
+            self.assertEqual(duplicate.status_code, 409, duplicate.get_json())
+            self.assertEqual(duplicate.get_json()["existing_document_id"], document["id"])
+        connection = self.server.get_db_connection()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_documents WHERE verification_status='confirmed'").fetchone()[0], 1)
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_attachments").fetchone()[0], 1)
+        connection.close()
+
     def test_expense_document_allocates_full_invoice_to_one_object(self):
         server_conn = self.server.get_db_connection()
         object_row = server_conn.execute(
@@ -909,6 +942,96 @@ class CatalogSyncTests(unittest.TestCase):
             "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"}
         )
         self.assertEqual(listed.get_json()["documents"], [])
+
+    def test_expense_ack_closes_upload_before_cleanup_and_counts_saved_document(self):
+        source = Path(self._case.name) / "windows-upload.pdf"
+        source.write_bytes(b"isolated original")
+        client_id = str(uuid.uuid4())
+        payload = {"client_id": client_id, "supplier_name": "Test", "gross_amount": "125.00",
+                   "currency_code": "SEK", "verification_status": "draft", "allocations": []}
+        harness = SimpleNamespace()
+        streams = []
+
+        def request(method, url, **kwargs):
+            if method == "GET":
+                return SimpleNamespace(status_code=200, json=lambda: {"ok": True, "api_version": 2,
+                    "features": ["client_id", "soft_delete", "attachments", "nullable_company_allocations", "versioned_updates"]})
+            streams.extend(value[1] for _name, value in kwargs.get("files") or [])
+            return SimpleNamespace(status_code=201, json=lambda: {"ok": True,
+                "document": {"id": 1, "client_id": client_id, "sync_version": 1, "has_original": True,
+                             "attachments": [{"sha256": self.desktop.sha256_file(source), "has_original": True}]}})
+
+        original_unlink = Path.unlink
+
+        def checked_unlink(path, **kwargs):
+            self.assertTrue(streams)
+            self.assertTrue(all(stream.closed for stream in streams))
+            return original_unlink(path, **kwargs)
+
+        self.desktop.SmartReportApp.queue_expense_document_operation(harness, client_id, "upsert", payload,
+                                                                   attachment_paths=[str(source)])
+        with patch.object(self.desktop.requests, "request", side_effect=request), patch.object(Path, "unlink", new=checked_unlink):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+        self.assertEqual(result["synced"], 1)
+        self.assertFalse(source.exists())
+
+        source.write_bytes(b"retained but uploaded original")
+        self.desktop.SmartReportApp.queue_expense_document_operation(harness, client_id, "upsert", payload,
+                                                                   attachment_paths=[str(source)])
+        with patch.object(self.desktop.requests, "request", side_effect=request), \
+             patch.object(Path, "unlink", side_effect=PermissionError("external lock")):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+        self.assertEqual(result, {"synced": 1, "conflicts": 0, "cleanup_warnings": 1})
+        self.assertTrue(source.is_file())
+        connection = self.desktop.get_db_connection()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox").fetchone()[0], 0)
+        connection.close()
+
+    def test_expense_ack_requires_correct_document_and_all_attachment_hashes(self):
+        source = Path(self._case.name) / "mandatory.pdf"
+        source.write_bytes(b"isolated mandatory attachment")
+        extra = Path(self._case.name) / "second-mandatory.pdf"
+        extra.write_bytes(b"isolated second attachment")
+        digest = self.desktop.sha256_file(source)
+        extra_digest = self.desktop.sha256_file(extra)
+        identifier = str(uuid.uuid4())
+        payload = {"client_id": identifier, "supplier_name": "Isolated", "gross_amount": "125.00",
+                   "currency_code": "SEK", "verification_status": "draft", "allocations": []}
+        harness = SimpleNamespace()
+        self.desktop.SmartReportApp.queue_expense_document_operation(harness, identifier, "upsert", payload,
+                 server_document_id=7, server_version=1, attachment_paths=[str(source), str(extra)])
+        correct = {"id": 7, "client_id": identifier, "sync_version": 2, "has_original": True,
+                     "attachments": [{"sha256": digest, "has_original": True}, {"sha256": extra_digest, "has_original": True}]}
+        responses = [[], {"ok": True, "document": "wrong"}]
+        for change in ({"id": 8}, {"client_id": "another"}, {"sync_version": 0}, {"sync_version": 1},
+                       {"attachments": []}, {"attachments": None}, {"attachments": {}}, {"has_original": False},
+                       {"attachments": [{"sha256": digest, "has_original": True}]},
+                       {"attachments": [{"sha256": "wrong", "has_original": True}]}):
+            responses.append({"ok": True, "document": {**correct, **change}})
+
+        def request(body):
+            def answer(method, _url, **_kwargs):
+                if method == "GET":
+                    return SimpleNamespace(status_code=200, json=lambda: {"ok": True, "api_version": 2,
+                        "features": ["client_id", "soft_delete", "attachments", "nullable_company_allocations", "versioned_updates"]})
+                return SimpleNamespace(status_code=200, json=lambda: body)
+            return answer
+
+        for body in responses:
+            with patch.object(self.desktop.requests, "request", side_effect=request(body)):
+                result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual(result["synced"], 0)
+            self.assertTrue(source.is_file())
+            self.assertTrue(extra.is_file())
+            self.assertEqual(self.desktop.sha256_file(source), digest)
+            connection = self.desktop.get_db_connection()
+            self.assertEqual(connection.execute("SELECT state FROM expense_document_outbox").fetchone()[0], "pending")
+            connection.close()
+        with patch.object(self.desktop.requests, "request", side_effect=request({"ok": True, "document": correct})):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+        self.assertEqual(result["synced"], 1)
+        self.assertFalse(source.exists())
+        self.assertFalse(extra.exists())
 
     def test_expense_outbox_runs_through_existing_sync_worker(self):
         client_id = str(uuid.uuid4())
@@ -1694,6 +1817,45 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_expense_upload_same_content_never_creates_second_confirmed_expense(self):
+        source = Path(self._case.name) / "invoice.pdf"
+        renamed = Path(self._case.name) / "invoice (2).pdf"
+        source.write_bytes(b"same isolated original content")
+        renamed.write_bytes(source.read_bytes())
+        client_id = str(uuid.uuid4())
+        payload = {"client_id": client_id, "verification_status": "confirmed", "supplier_name": "Isolated supplier",
+                   "gross_amount": "125.00", "vat_amount": "25.00", "allocations": []}
+        self.desktop.SmartReportApp.queue_expense_document_operation(SimpleNamespace(), client_id, "upsert", payload,
+                                                                   attachment_paths=[str(source)])
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        local_document = {**payload, "local_attachment_paths": [str(source)]}
+        try:
+            with patch.object(window, "_expense_document_snapshot", return_value=([local_document], False)), \
+                 patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(renamed)], "")), \
+                 patch.object(self.desktop.QMessageBox, "information") as duplicate_message, \
+                 patch("expense_documents.extract_local_document") as extract:
+                window.upload_expense_document()
+                window.upload_expense_document()
+            self.assertEqual(duplicate_message.call_count, 2)
+            extract.assert_not_called()
+            connection = self.desktop.get_db_connection()
+            records = connection.execute("SELECT payload_json FROM expense_document_outbox").fetchall()
+            connection.close()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(json.loads(records[0][0])["verification_status"], "confirmed")
+            remote_document = {**payload, "attachments": [{"sha256": self.desktop.sha256_file(source)}]}
+            with patch.object(window, "_expense_document_snapshot", return_value=([remote_document], True)), \
+                 patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(renamed)], "")), \
+                 patch.object(self.desktop.QMessageBox, "information") as remote_duplicate, \
+                 patch("expense_documents.extract_local_document") as extract:
+                window.upload_expense_document()
+            remote_duplicate.assert_called_once()
+            extract.assert_not_called()
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_expense_form_queues_manual_company_document(self):
         class Response:
             def __init__(self, response):
@@ -2312,6 +2474,512 @@ class CatalogSyncTests(unittest.TestCase):
         old_client_response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=old_client_update)
         self.assertEqual(old_client_response.status_code, 409, old_client_response.get_json())
 
+    def test_invoice_vertical_totals_do_not_steal_next_row_amount(self):
+        from expense_documents import parse_invoice_pages, net_invoice_issues
+
+        elements = []
+        for index, (caption, value) in enumerate((
+            ("Totalt exkl. moms", "1 795,00 SEK"), ("Momsbelopp", "448,75 SEK"),
+            ("Totalt inkl. moms", "2 244,00 SEK"), ("Öresavrundning", "0,25 SEK"),
+            ("Att betala", "2 244,00 SEK"),
+        )):
+            elements.extend([
+                {"text": caption, "x0": 300, "x1": 420, "y0": 100 + 25 * index, "y1": 110 + 25 * index},
+                {"text": value, "x0": 520, "x1": 590, "y0": 100 + 25 * index, "y1": 110 + 25 * index},
+            ])
+        fields = parse_invoice_pages([{"page": 2, "elements": elements}])
+        self.assertEqual(fields["net_amount"], "1795.00")
+        self.assertEqual(fields["vat_amount"], "448.75")
+        self.assertEqual(fields["rounding_amount"], "0.25")
+        self.assertEqual(fields["amount_due"], "2244.00")
+        self.assertTrue(net_invoice_issues({**fields, "rounding_amount": "2244.00"},
+                                          [{"destination": "company", "net_amount": "1795.00"}]))
+
+    def test_invoice_explicit_tax_rate_and_buyer_block_never_use_item_price(self):
+        from expense_documents import parse_invoice_pages
+
+        def cell(text, left, top, right):
+            return {"text": text, "x0": left, "x1": right, "y0": top, "y1": top + 8}
+
+        elements = [cell("Fakturamottagare:", 20, 30, 120), cell("Buyer AB", 20, 45, 110),
+                    cell("Street 1", 20, 60, 100), cell("123 45 City", 20, 75, 110),
+                    cell("SELLER & Co KB Servicecenter", 320, 45, 560), cell("Box 12", 320, 60, 370),
+                    cell("123 45 City", 320, 75, 400), cell("Fakturanummer", 320, 100, 430), cell("54", 490, 100, 510),
+                    cell("Omvänd", 400, 210, 460), cell("moms", 400, 222, 450), cell("1800.00", 490, 235, 560),
+                    cell("Exkl. moms", 40, 400, 130), cell("44550.00", 220, 400, 280),
+                    cell("Bankkontonr", 350, 397, 430), cell("001328722710", 490, 397, 580),
+                    cell("Moms (0 %)", 40, 420, 140), cell("0.00", 250, 420, 280),
+                    cell("Att betala", 320, 445, 430), cell("44550.00", 490, 445, 560)]
+        fields = parse_invoice_pages([{"elements": elements}])
+        self.assertEqual(fields["supplier_name"], "SELLER & Co KB Servicecenter")
+        self.assertEqual(fields["invoice_number"], "54")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["net_amount"], "44550.00")
+
+    def test_api_blocks_unsupported_payment_and_unreviewed_reverse_charge(self):
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        payload = {"client_id": str(uuid.uuid4()), "supplier_name": "Isolated seller", "document_date": "2026-10-17",
+                   "currency_code": "SEK", "gross_amount": "125.00", "vat_amount": "25.00",
+                   "verification_status": "confirmed", "recognized_text": "Förskottsbetald; Kvar att betala 0.00"}
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("Предоплаченный", response.get_json()["error"])
+        payload.update({"recognized_text": "Omvänd betalningsskyldighet", "gross_amount": "100.00", "vat_amount": "0.00"})
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("сверки", response.get_json()["error"])
+        connection = self.server.get_db_connection()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_documents").fetchone()[0], 0)
+        connection.close()
+        payload["tax_reviewed"] = True
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 201, response.get_json())
+
+    def test_reverse_charge_and_prepaid_confirmation_are_explicit(self):
+        from expense_documents import net_invoice_issues, parse_invoice_pages
+
+        allocations = [{"destination": "company", "net_amount": "100.00"}]
+        reverse = {"net_amount": "100.00", "vat_amount": "0.00", "amount_due": "100.00",
+                   "recognized_text": "Omvänd betalningsskyldighet"}
+        self.assertTrue(any("Обратное начисление" in issue for issue in net_invoice_issues(reverse, allocations)))
+        self.assertEqual(net_invoice_issues({**reverse, "tax_reviewed": True}, allocations), [])
+        self.assertTrue(net_invoice_issues({**reverse, "tax_reviewed": True, "vat_amount": None}, allocations))
+        prepaid = {"net_amount": "100.00", "vat_amount": "25.00", "amount_due": "0.00",
+                   "recognized_text": "Förskottsbetald. Kvar att betala 0.00"}
+        issues = net_invoice_issues(prepaid, allocations)
+        self.assertTrue(any("пока не поддерживается" in issue for issue in issues))
+        self.assertFalse(any("не равна" in issue for issue in issues))
+        parsed = parse_invoice_pages([{"text": "Totalt exkl moms: 100.00\nMoms 25%: 25.00\nTotalt inkl moms: 125.00\nKvar att betala: 0.00\nFörskottsbetald"}])
+        self.assertEqual(parsed["amount_due"], "0.00")
+        self.assertEqual(parsed["document_total"], "125.00")
+        self.assertTrue(parsed["prepaid"])
+
+    def test_invoice_split_caption_money_and_adjacent_total_headers(self):
+        from expense_documents import parse_invoice_pages
+
+        def cell(text, left, top, right, bottom):
+            return {"text": text, "x0": left, "x1": right, "y0": top, "y1": bottom}
+
+        fields = parse_invoice_pages([{"elements": [
+            cell("Bankkontonr", 366, 709, 423, 715), cell("832798446960489", 472, 709, 547, 715),
+            cell("Exkl.", 53.3, 711.9, 73.6, 718.1), cell("moms", 77.7, 713.5, 103.9, 718.2),
+            cell("42", 198.5, 712.1, 207.9, 718.1), cell("750,00", 211.8, 712.1, 239, 719.5),
+            cell("Moms (0 %)", 53.3, 722, 108, 729.4), cell("0,00", 222, 722, 239, 729.4),
+            cell("Att betala", 365, 735, 420, 742), cell("42 750,00", 490, 735, 547, 744),
+        ]}])
+        self.assertEqual(fields["net_amount"], "42750.00")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["amount_due"], "42750.00")
+        fields = parse_invoice_pages([{"elements": [
+            cell("Avrundningsdifferens", 350, 100, 450, 108),
+            cell("Fakturabelopp:", 458, 100, 550, 108),
+            cell("0,00 SEK", 350, 120, 405, 128), cell("125,13 SEK", 490, 120, 550, 128),
+        ]}])
+        self.assertEqual(fields["rounding_amount"], "0.00")
+        self.assertEqual(fields["amount_due"], "125.13")
+
+    def test_net_invoice_unknown_currency_stays_empty_in_form_and_unknown_in_draft(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._expense_objects = []
+
+        def save_draft(dialog):
+            currency = dialog.findChild(self.desktop.QLineEdit, "invoice_currency_code")
+            self.assertEqual(currency.text(), "")
+            table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+            table.cellWidget(0, 2).setCurrentIndex(table.cellWidget(0, 2).findData("company"))
+            self.assertFalse(dialog.findChild(self.desktop.QPushButton, "invoiceConfirm").isEnabled())
+            dialog.findChild(self.desktop.QPushButton, "invoiceSaveDraft").click()
+            return dialog.result()
+
+        try:
+            with patch.object(self.desktop.QDialog, "exec", new=save_draft), \
+                 patch.object(window, "load_expense_documents"), patch.object(window, "background_sync_with_cloud"):
+                window._review_net_invoice({}, [], {"supplier_name": "Test", "invoice_number": "54", "document_date": "2026-10-17",
+                    "allocation_basis": "net", "currency_code": "UNKNOWN", "net_amount": "100.00", "vat_amount": "0.00", "amount_due": "100.00"})
+            connection = self.desktop.get_db_connection()
+            payload = json.loads(connection.execute("SELECT payload_json FROM expense_document_outbox").fetchone()[0])
+            connection.close()
+            self.assertEqual(payload["currency_code"], "UNKNOWN")
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_due_date_explicit_calculated_and_ambiguous_sources(self):
+        from expense_documents import parse_invoice_pages, due_date_issues
+
+        explicit = parse_invoice_pages([{"page": 1, "text":
+            "Fakturadatum: 2026-10-15\nFörfallodag: 2026-11-14\nBetalningsvillkor 10 dagar"}])
+        self.assertEqual(explicit["due_date"], "2026-11-14")
+        self.assertEqual(explicit["due_date_kind"], "explicit")
+        self.assertEqual(due_date_issues(explicit), [])
+        calculated = parse_invoice_pages([{"text": "Fakturadatum: 2026-10-15\nBetalningsvillkor: 30 dagar netto"}])
+        self.assertEqual(calculated["due_date"], "2026-11-14")
+        self.assertEqual(calculated["due_date_kind"], "calculated")
+        self.assertTrue(due_date_issues(calculated))
+        self.assertEqual(due_date_issues({**calculated, "due_date_reviewed": True}), [])
+        ambiguous = parse_invoice_pages([{"text": "Förfallodatum: 2026-11-14\nOss tillhanda senast: 2026-11-15"}])
+        self.assertIsNone(ambiguous["due_date"])
+        self.assertEqual(ambiguous["due_date_kind"], "ambiguous")
+        self.assertTrue(due_date_issues({**ambiguous, "due_date_reviewed": True}))
+        conflict_terms = parse_invoice_pages([{"text": "Fakturadatum: 2026-10-15\nBetalningsvillkor 30 dagar\nBetalningsvillkor 10 dagar"}])
+        self.assertIsNone(conflict_terms["due_date"])
+        self.assertEqual(conflict_terms["due_date_kind"], "ambiguous")
+
+    def test_due_date_api_roundtrip_manual_correction_and_legacy_update_preserves_date(self):
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        payload = {"client_id": str(uuid.uuid4()), "supplier_name": "Date test", "document_date": "2026-10-15",
+                   "currency_code": "SEK", "gross_amount": "125.00", "vat_amount": "25.00", "verification_status": "draft",
+                   "due_date": "2026-11-14", "due_date_kind": "explicit", "due_date_evidence": [{"page": 2, "text": "2026-11-14"}]}
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 201, response.get_json())
+        document = response.get_json()["document"]
+        self.assertEqual(document["due_date"], "2026-11-14")
+        self.assertEqual(document["due_date_kind"], "explicit")
+        payload.update({"due_date": "2026-11-16", "due_date_kind": "manual", "due_date_reviewed": True,
+                        "expected_version": document["sync_version"], "verification_status": "confirmed"})
+        response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        corrected = response.get_json()["document"]
+        self.assertEqual(corrected["due_date"], "2026-11-16")
+        self.assertTrue(corrected["due_date_reviewed"])
+        legacy = {key: value for key, value in payload.items() if not key.startswith("due_date")}
+        legacy["expected_version"] = corrected["sync_version"]
+        response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=legacy)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["document"]["due_date"], "2026-11-16")
+        calculated = {**payload, "client_id": str(uuid.uuid4()), "due_date_kind": "calculated", "due_date_reviewed": False}
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=calculated)
+        self.assertEqual(response.status_code, 400)
+        calculated["verification_status"] = "draft"
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=calculated)
+        self.assertEqual(response.status_code, 201, response.get_json())
+
+    def test_invoice_distribution_destination_counter_and_draft_roundtrip(self):
+        connection = self.server.get_db_connection()
+        object_id = int(connection.execute("SELECT id FROM meta_objects WHERE is_active=1 ORDER BY id LIMIT 1").fetchone()[0])
+        connection.close()
+
+        for destination in ("object", "company"):
+            with self.subTest(destination=destination):
+                identifier = str(uuid.uuid4())
+                window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+                self.desktop.QMainWindow.__init__(window)
+                window._expense_objects = [{"id": object_id, "name": "Isolated catalog object", "markning": "TEST-1"}]
+                fields = {"client_id": identifier, "allocation_basis": "net", "supplier_name": "Isolated supplier",
+                          "invoice_number": "UI-" + destination, "document_date": "2026-10-17", "currency_code": "SEK",
+                          "net_amount": "100.00", "vat_amount": "25.00", "rounding_amount": "0.00", "amount_due": "125.00"}
+
+                def choose_and_save(dialog):
+                    table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+                    counter = dialog.findChild(self.desktop.QLabel, "invoiceDistribution")
+                    confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+                    self.assertEqual(table.cellWidget(0, 2).currentData(), "unselected")
+                    self.assertEqual(counter.text(), "Без НДС: распределено 0.00 / осталось 100.00")
+                    self.assertFalse(confirm.isEnabled())
+                    confirm.click()
+                    connection = self.desktop.get_db_connection()
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox WHERE client_id=?", (identifier,)).fetchone()[0], 0)
+                    connection.close()
+                    choice = table.cellWidget(0, 2)
+                    choice.setCurrentIndex(choice.findData(destination))
+                    if destination == "object":
+                        self.assertIsNone(table.cellWidget(0, 3).currentData())
+                        self.assertFalse(confirm.isEnabled())
+                        self.assertEqual(counter.text(), "Без НДС: распределено 0.00 / осталось 100.00")
+                        objects = table.cellWidget(0, 3)
+                        objects.setCurrentIndex(objects.findData(object_id))
+                    else:
+                        self.assertFalse(table.cellWidget(0, 3).isEnabled())
+                        table.cellWidget(0, 4).setText("Isolated company category")
+                    self.assertEqual(counter.text(), "Без НДС: распределено 100.00 / осталось 0.00")
+                    self.assertTrue(confirm.isEnabled())
+                    dialog.findChild(self.desktop.QPushButton, "invoiceSaveDraft").click()
+                    return dialog.result()
+
+                def verify_reopened(dialog):
+                    table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+                    self.assertEqual(table.rowCount(), 1)
+                    self.assertEqual(table.cellWidget(0, 2).currentData(), destination)
+                    self.assertEqual(table.item(0, 1).text(), "100.00")
+                    self.assertEqual(table.cellWidget(0, 3).currentData(), object_id if destination == "object" else None)
+                    if destination == "company":
+                        self.assertEqual(table.cellWidget(0, 4).text(), "Isolated company category")
+                    for key, expected in (("net_amount", "100.00"), ("vat_amount", "25.00"),
+                                          ("rounding_amount", "0.00"), ("amount_due", "125.00")):
+                        self.assertEqual(dialog.findChild(self.desktop.QLineEdit, "invoice_" + key).text(), expected)
+                    self.assertEqual(dialog.findChild(self.desktop.QLabel, "invoiceDistribution").text(),
+                                     "Без НДС: распределено 100.00 / осталось 0.00")
+                    self.assertTrue(dialog.findChild(self.desktop.QPushButton, "invoiceConfirm").isEnabled())
+                    dialog.reject()
+                    return dialog.result()
+
+                try:
+                    with patch.object(window, "load_expense_documents"), patch.object(window, "background_sync_with_cloud"), \
+                         patch.object(self.desktop.QDialog, "exec", new=choose_and_save):
+                        self.assertTrue(window._review_net_invoice({}, [], fields))
+                    connection = self.desktop.get_db_connection()
+                    queued = connection.execute("SELECT payload_json,revision FROM expense_document_outbox WHERE client_id=?", (identifier,)).fetchone()
+                    connection.close()
+                    payload = json.loads(queued["payload_json"])
+                    self.assertEqual(payload["verification_status"], "draft")
+                    self.assertEqual(payload["allocations"][0]["destination"], destination)
+                    self.assertEqual(payload["allocations"][0]["object_id"], object_id if destination == "object" else None)
+                    self.assertEqual(payload["allocations"][0]["net_amount"], "100.00")
+                    with patch.object(window, "load_expense_documents"), patch.object(window, "background_sync_with_cloud"), \
+                         patch.object(self.desktop.QDialog, "exec", new=verify_reopened):
+                        self.assertFalse(window._review_net_invoice(payload, [], {}))
+                    connection = self.desktop.get_db_connection()
+                    saved = connection.execute("SELECT payload_json,revision FROM expense_document_outbox WHERE client_id=?", (identifier,)).fetchall()
+                    connection.close()
+                    self.assertEqual(len(saved), 1)
+                    self.assertEqual(saved[0]["payload_json"], queued["payload_json"])
+                    self.assertEqual(saved[0]["revision"], queued["revision"])
+                finally:
+                    window.close()
+                    window.deleteLater()
+
+    def test_due_date_qt_draft_manual_edit_reopen_and_confirm(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._expense_objects = []
+        fields = {"allocation_basis": "net", "supplier_name": "Date test", "invoice_number": "D54", "document_date": "2026-10-15",
+                  "currency_code": "SEK", "net_amount": "100.00", "vat_amount": "25.00", "amount_due": "125.00",
+                  "due_date": "2026-11-14", "due_date_kind": "calculated", "due_date_review_required": True,
+                  "due_date_evidence": [{"kind": "payment_terms", "days": 30}]}
+
+        def first(dialog):
+            date_input = dialog.findChild(self.desktop.QLineEdit, "invoice_due_date")
+            self.assertEqual(date_input.text(), "2026-11-14")
+            self.assertIn("Рассчитан", dialog.findChild(self.desktop.QLabel, "invoiceDueDateOrigin").text())
+            self.assertIn("распределено 0.00 / осталось 100.00", dialog.findChild(self.desktop.QLabel, "invoiceDistribution").text())
+            table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+            table.cellWidget(0, 2).setCurrentIndex(table.cellWidget(0, 2).findData("company"))
+            self.assertIn("распределено 100.00 / осталось 0.00", dialog.findChild(self.desktop.QLabel, "invoiceDistribution").text())
+            confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+            self.assertFalse(confirm.isEnabled())
+            dialog.findChild(self.desktop.QCheckBox, "invoiceDueDateReviewed").setChecked(True)
+            self.assertTrue(confirm.isEnabled())
+            date_input.setText("2026-11-16")
+            self.assertIn("вручную", dialog.findChild(self.desktop.QLabel, "invoiceDueDateOrigin").text())
+            dialog.findChild(self.desktop.QPushButton, "invoiceSaveDraft").click()
+            return dialog.result()
+
+        def reopened(dialog):
+            self.assertEqual(dialog.findChild(self.desktop.QLineEdit, "invoice_due_date").text(), "2026-11-16")
+            self.assertIn("вручную", dialog.findChild(self.desktop.QLabel, "invoiceDueDateOrigin").text())
+            button = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+            self.assertTrue(button.isEnabled())
+            button.click()
+            return dialog.result()
+
+        try:
+            with patch.object(window, "load_expense_documents"), patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QDialog, "exec", new=first):
+                self.assertTrue(window._review_net_invoice({}, [], fields))
+            connection = self.desktop.get_db_connection()
+            payload = json.loads(connection.execute("SELECT payload_json FROM expense_document_outbox").fetchone()[0])
+            connection.close()
+            self.assertEqual(payload["verification_status"], "draft")
+            self.assertEqual(payload["due_date_kind"], "manual")
+            with patch.object(window, "load_expense_documents"), patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QDialog, "exec", new=reopened):
+                self.assertTrue(window._review_net_invoice(payload, [], {}))
+            connection = self.desktop.get_db_connection()
+            rows = connection.execute("SELECT payload_json FROM expense_document_outbox").fetchall()
+            connection.close()
+            self.assertEqual(len(rows), 1)
+            confirmed = json.loads(rows[0][0])
+            self.assertEqual(confirmed["due_date"], "2026-11-16")
+            self.assertEqual(confirmed["verification_status"], "confirmed")
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_due_date_schema_is_added_additively_to_existing_database(self):
+        import sqlite3
+        legacy = Path(self._case.name) / "legacy-no-due.db"
+        connection = sqlite3.connect(legacy)
+        try:
+            connection.execute("""CREATE TABLE expense_documents (
+                id INTEGER PRIMARY KEY, client_id TEXT UNIQUE, supplier_name TEXT DEFAULT '', invoice_number TEXT DEFAULT '',
+                document_date TEXT, currency_code TEXT DEFAULT 'SEK', net_amount TEXT, vat_amount TEXT, gross_amount TEXT,
+                expense_category TEXT DEFAULT '', document_comment TEXT DEFAULT '', order_proposals_json TEXT DEFAULT '[]',
+                verification_status TEXT DEFAULT 'draft', recognized_text TEXT DEFAULT '', original_name TEXT, stored_name TEXT,
+                file_sha256 TEXT, is_deleted INTEGER DEFAULT 0, deleted_at TEXT, sync_version INTEGER DEFAULT 1,
+                created_at TEXT, updated_at TEXT)""")
+            connection.execute("INSERT INTO expense_documents (id, client_id, supplier_name, gross_amount, created_at, updated_at) VALUES (7, 'old', 'Old AB', '125.00', 'x', 'x')")
+            connection.commit()
+        finally:
+            connection.close()
+        with patch.object(self.server, "DB_FILE", str(legacy)):
+            self.server.init_cloud_db()
+            connection = self.server.get_db_connection()
+            try:
+                self.assertTrue(self.server.expense_due_date_schema_ready(connection))
+                row = connection.execute("SELECT supplier_name, gross_amount, due_date, due_date_kind FROM expense_documents WHERE id=7").fetchone()
+                self.assertEqual(tuple(row), ("Old AB", "125.00", None, "absent"))
+            finally:
+                connection.close()
+    def test_due_date_ack_must_echo_saved_date_and_origin(self):
+        identifier = str(uuid.uuid4())
+        payload = {"client_id": identifier, "supplier_name": "Date ACK", "currency_code": "SEK",
+                   "gross_amount": "125.00", "verification_status": "draft", "allocations": [],
+                   "due_date": "2026-11-14", "due_date_kind": "manual"}
+        harness = SimpleNamespace()
+        self.desktop.SmartReportApp.queue_expense_document_operation(harness, identifier, "upsert", payload)
+        correct = {"id": 9, "client_id": identifier, "sync_version": 1, "due_date": "2026-11-14", "due_date_kind": "manual"}
+        capabilities = {"ok": True, "api_version": 2, "features": ["client_id", "soft_delete", "attachments",
+                         "nullable_company_allocations", "versioned_updates", "due_date_v1"]}
+        for document in ({**correct, "due_date": None}, {**correct, "due_date_kind": "explicit"}, correct):
+            def request(method, _url, **_kwargs):
+                return SimpleNamespace(status_code=200, json=lambda: capabilities if method == "GET" else {"ok": True, "document": document})
+            with patch.object(self.desktop.requests, "request", side_effect=request):
+                result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual(result["synced"], int(document == correct))
+        connection = self.desktop.get_db_connection()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox").fetchone()[0], 0)
+        connection.close()
+
+    def test_invoice_unstated_rounding_is_not_invented(self):
+        from expense_documents import parse_invoice_pages, net_invoice_issues
+
+        fields = parse_invoice_pages([{"page": 1, "text":
+            "Supplier: SELLER AB\nSumma exkl. moms: 100.00\nMomsbelopp: 25.00\nAtt betala: 125.00"}])
+        self.assertIsNone(fields["rounding_amount"])
+        allocations = [{"destination": "company", "net_amount": "100.00"}]
+        self.assertEqual(net_invoice_issues(fields, allocations), [])
+        self.assertTrue(net_invoice_issues({**fields, "amount_due": "125.25"}, allocations))
+        self.assertIsNone(fields["rounding_amount"])
+
+    def test_invoice_supplier_roles_and_rotated_coordinates(self):
+        from expense_documents import parse_invoice_pages, pdf_display_box
+
+        def cell(text, left, top, right=220):
+            return {"text": text, "x0": left, "x1": right, "y0": top, "y1": top + 9}
+
+        buyer = cell("BUYER RENOVATION AB", 330, 130, 550)
+        payment_service = cell("PAYMENT SERVICE AB", 330, 740, 550)
+        fields = parse_invoice_pages([{"elements": [buyer, payment_service,
+            cell("Bank: BANK Swift: ABC Adress: PROCESSOR AB, Box 1, 123 45 City", 230, 700, 550),
+            cell("Customer street 2", 330, 145, 550), cell("123 45 Buyer City", 330, 160, 550),
+            cell("Org.nr: 123456-7890", 40, 80),
+            cell("ISSUER AB, Box 12, 123 45 City", 40, 50), cell("Vår referens", 40, 150)]}])
+        self.assertEqual(fields["supplier_name"], "ISSUER AB")
+        fields = parse_invoice_pages([{"elements": [buyer, payment_service,
+            cell("Adress", 40, 700), cell("Independent Seller", 40, 715),
+            cell("Street 10", 40, 730), cell("123 45 City", 40, 745)]}])
+        self.assertEqual(fields["supplier_name"], "Independent Seller")
+        fields = parse_invoice_pages([{"elements": [buyer, payment_service]}])
+        self.assertIsNone(fields["supplier_name"])
+        bounds = (10, 20, 30, 40)
+        crop = (0, 0, 100, 200)
+        self.assertEqual(list(pdf_display_box(bounds, crop, 90).values()), [20, 10, 40, 30])
+        self.assertEqual(list(pdf_display_box(bounds, crop, 180).values()), [70, 20, 90, 40])
+        self.assertEqual(list(pdf_display_box(bounds, crop, 270).values()), [160, 70, 180, 90])
+
+    def test_invoice_tax_column_uses_total_and_single_order_marker(self):
+        from expense_documents import parse_invoice_pages
+
+        def cell(text, left, top, right):
+            return {"text": text, "x0": left, "x1": right, "y0": top, "y1": top + 8}
+
+        fields = parse_invoice_pages([{"page": 1, "elements": [
+            cell("Moms belopp SEK", 300, 100, 370), cell("Moms %", 400, 100, 440),
+            cell("10,00", 310, 120, 350), cell("Totalt", 40, 140, 80), cell("25,00", 310, 140, 350),
+            cell("Totalt fakturerat belopp exkl moms", 40, 200, 250), cell("SEK 100,00", 400, 200, 490),
+            cell("Totalt fakturerat belopp inkl moms", 40, 225, 250), cell("SEK 125,00", 400, 225, 490),
+            cell("Order O9876", 40, 260, 140), cell("Märkning P422", 40, 280, 140),
+        ]}])
+        self.assertEqual(fields["vat_amount"], "25.00")
+        self.assertEqual(fields["currency_code"], "SEK")
+        self.assertEqual(fields["amount_due"], "125.00")
+        self.assertEqual(len(fields["order_proposals"]), 1)
+        self.assertEqual(fields["order_proposals"][0]["project_code"], "P422")
+        self.assertEqual(fields["order_proposals"][0]["order_id"], "O9876")
+        self.assertEqual(fields["order_proposals"][0]["net_amount"], "100.00")
+
+    def test_invoice_original_format_separated_cells_and_repeated_order(self):
+        from expense_documents import parse_invoice_pages
+
+        def cell(text, left, top, right, bottom):
+            return {"text": text, "x0": left, "y0": top, "x1": right, "y1": bottom}
+
+        header = [
+            cell("Fakturanummer", 369.17, 40.4, 436.63, 46.94),
+            cell("Fakturans valuta", 454.21, 40.4, 524.76, 46.94),
+            cell("260406399329", 368.76, 51.17, 428.16, 57.75),
+            cell("SEK", 453.95, 51.09, 471.53, 57.74),
+            cell("Returadress: BEIJER BYGGMATERIAL AB", 48.82, 66.31, 202.04, 72.13),
+            cell("Fakturadatum", 369.17, 67.67, 427.43, 74.21),
+            cell("2026-10-15", 368.76, 78.44, 414.17, 85.01),
+        ]
+        first_order = [
+            cell("Sälj.ordnr.:", 65.56, 401.12, 103.17, 408.61),
+            cell("8776341-01", 122.22, 401.19, 163.12, 407.04),
+            cell("Er ref.:", 337.95, 412.21, 360.62, 418.03),
+            cell("ROMAN BASHCHUK", 394.64, 412.11, 470.44, 418.03),
+            cell("Proj.nr.:", 337.94, 434.21, 364.62, 441.61),
+            cell("P1035", 394.63, 434.19, 416.82, 440.04),
+            cell("Summa order", 43.51, 634.62, 94.89, 640.54),
+            cell("2 340,99", 538.12, 634.69, 568.69, 641.71),
+        ]
+        repeated_order = [{**item, "y0": item["y0"] - 300, "y1": item["y1"] - 300} for item in first_order]
+        second_order = [
+            cell("Sälj.ordnr.:", 65.56, 350, 103.17, 357),
+            cell("8776342-01", 122.22, 350, 163.12, 357),
+            cell("Proj.nr.:", 337.94, 380, 364.62, 387),
+            cell("ROMAN BASHCHUK", 394.64, 380, 470.44, 387),
+            cell("Artikel Verktyg", 100, 410, 200, 417),
+            cell("280,96", 381, 410, 411, 417),
+            cell("25,00", 432, 410, 462, 417),
+            cell("Summa order", 43.51, 450, 94.89, 457),
+            cell("708,96", 544.93, 450, 568.78, 457),
+        ]
+        totals = [
+            cell("Summa rader", 42.88, 730.86, 106.56, 738.26),
+            cell("Exkl. moms", 156.63, 730.98, 211, 738.25),
+            cell("Moms", 270, 730.98, 297.7, 738.25),
+            cell("Öresavr.", 354.76, 729.39, 394.22, 738.25),
+            cell("Fakturatotal", 513.27, 730.98, 569.07, 738.25),
+            cell("3 049,95", 42.94, 742.95, 81.04, 751.55),
+            cell("3 049,95", 156.32, 742.95, 194.42, 751.55),
+            cell("762,49", 269.76, 742.95, 299.43, 751.55),
+            cell("-0,44", 354.65, 742.95, 376.64, 751.55),
+            cell("SEK", 439.73, 742.86, 459.91, 750.26),
+            cell("3 812,00", 531.26, 742.95, 569.28, 751.55),
+        ]
+        pages = [{"page": 1, "source": "layout.pdf", "elements": header + first_order},
+                 {"page": 2, "source": "layout.pdf", "elements": header + repeated_order + second_order + totals}]
+        fields = parse_invoice_pages(pages)
+        expected = {"supplier_name": "BEIJER BYGGMATERIAL AB", "invoice_number": "260406399329",
+                    "document_date": "2026-10-15", "currency_code": "SEK", "net_amount": "3049.95",
+                    "vat_amount": "762.49", "rounding_amount": "-0.44", "amount_due": "3812.00"}
+        for key, value in expected.items():
+            self.assertEqual(fields[key], value, key)
+        orders = fields["order_proposals"]
+        self.assertEqual(len(orders), 2)
+        self.assertEqual([row["net_amount"] for row in orders], ["2340.99", "708.96"])
+        self.assertEqual([source["page"] for source in orders[0]["sources"]], [1, 2])
+        self.assertEqual(orders[0]["project_code"], "P1035")
+        self.assertIsNone(orders[1]["project_code"])
+        self.assertEqual(orders[1]["original_marker"], "ROMAN BASHCHUK")
+        self.assertTrue(all(source.get("box") for row in orders for source in row["sources"]))
+
+        replacements = {"260406399329": "INV-987654", "2026-10-15": "2026-11-01",
+                        "Returadress: BEIJER BYGGMATERIAL AB": "Returadress: OTHER MATERIAL AB",
+                        "2 340,99": "20,00", "708,96": "30,00", "3 049,95": "50,00",
+                        "762,49": "12,50", "-0,44": "-0,50", "3 812,00": "62,00"}
+        changed = [{**page, "elements": [{**item, "text": replacements.get(item["text"], item["text"])}
+                                         for item in page["elements"]]} for page in pages]
+        fields = parse_invoice_pages(changed)
+        self.assertEqual(fields["supplier_name"], "OTHER MATERIAL AB")
+        self.assertEqual(fields["invoice_number"], "INV-987654")
+        self.assertEqual(fields["net_amount"], "50.00")
+        self.assertEqual(fields["vat_amount"], "12.50")
+        self.assertEqual(fields["amount_due"], "62.00")
+        self.assertEqual([row["net_amount"] for row in fields["order_proposals"]], ["20.00", "30.00"])
+
     def test_invoice_synthetic_beijer_layout_last_page_totals(self):
         from reportlab.pdfgen import canvas
         from expense_documents import extract_local_document, parse_invoice_pages
@@ -2319,7 +2987,7 @@ class CatalogSyncTests(unittest.TestCase):
         path = Path(self._case.name) / "synthetic-beijer-layout.pdf"
         pdf = canvas.Canvas(str(path))
         pdf.setFont("Helvetica", 10)
-        pdf.drawString(40, 790, "BEIJER BYGGMATERIAL AB")
+        pdf.drawString(40, 790, "Returadress: BEIJER BYGGMATERIAL AB")
         for x, label, value in ((40, "Fakturanummer", "260406399329"),
                                 (210, "Fakturadatum", "15.10.2026"),
                                 (370, "Fakturans valuta", "SEK")):

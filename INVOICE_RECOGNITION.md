@@ -1,15 +1,16 @@
 # Invoice Recognition and Net Allocations
 
-## Deployment Is Not Authorized Yet
+## Release Status
 
-This change has only been exercised against temporary databases and local test
-clients. Do not push, deploy, run the working desktop client, or migrate working
-databases without the owner's separate approval.
+On 2026-10-17 the owner authorized completing, pushing and deploying the current
+**test** system only (no important data). Real email and any future production
+environment are NOT covered. See `WORK_LOG.md` for the actual state. The text below
+that says "do not push/deploy" is a historical record of earlier local stages.
 
-`migrate_invoice_net_schema(connection)` is deliberately NOT called by
-`init_cloud_db()` or desktop initialization. It requires an explicitly selected
-connection, no active transaction, a verified backup, and an approved maintenance
-window before any production use.
+`migrate_invoice_net_schema(connection)` is not run by desktop initialization. The
+server runs it at startup only when `SMARTREPORT_UPGRADE_NET_SCHEMA=1` is set, after
+`create_database_backup()`. Due-date columns are added additively by `init_cloud_db()`.
+For any future production use it still needs a verified backup and maintenance window.
 
 The migration adds document rounding, amount due, and allocation basis. It rebuilds
 the allocation table so a net allocation can have unknown gross/VAT, and adds an
@@ -25,8 +26,19 @@ does not silently convert net amounts to gross or apply a migration remotely.
 ## Financial Contract
 
 - Invoice gross before rounding = net + stated invoice VAT.
-- Amount due = net + stated invoice VAT + separately stated rounding.
+- Document total after rounding = net + stated invoice VAT + separately stated rounding.
+- Paid amount and remaining amount due are separate values, not substitutes for
+  the document total. A missing paid amount is unknown, not zero and not inferred
+  from a zero balance.
+- For an ordinary unpaid invoice, remaining amount due equals the document
+  total. For payment workflows, balance = document total - confirmed paid amount
+  only when those values and the treatment of partial/advance payments are known.
+- Current `gross_amount` is before rounding and `amount_due` is the balance field;
+  a separate persisted paid-amount model is NOT implemented. Prepaid receipts
+  therefore remain draft-only until separate implementation and acceptance.
 - Allocation totals are checked against invoice net, not amount due.
+- The UI distribution counter counts only rows with a selected object or explicit
+  company destination. An amount proposed without a destination stays unallocated.
 - Unknown per-order VAT stays unknown; there is no proportional tax allocation.
 - Company expenses use a null object ID, never a synthetic company object.
 - Buyer/order markers are not object codes. Company designation is per document;
@@ -36,8 +48,153 @@ does not silently convert net amounts to gross or apply a migration remotely.
 
 ## Verification Limits
 
-The Beijer regression fixture is generated synthetic PDF data using the owner's
-control values. It is NOT the original PDF. The original attachment/path was not
-available during implementation, so original-file acceptance and real-device
-synchronization remain separate checks. Mocked OCR verifies routing and parsing,
-not the accuracy of an OCR engine on the owner's scan.
+On 2026-10-17 the original two-page Beijer PDF was tested through the actual
+desktop upload handler, local extraction, parser and Qt review form. Both pages
+had embedded text; OCR was not used. The original SHA-256 was
+`755ee1b95409571121c87468f61065a60f4e167a02834bf3d4781ff5417c5755`.
+
+The isolated run checked extracted field values, two order rows, source-page
+buttons, draft reopening, user-selected company destination/category, and local
+confirmation persistence without duplicating the queued document. Object
+matching used a temporary catalog, not the working catalog. The real PDF is not
+committed; the portable regression records its relevant label/coordinate format
+and also tests changed identifiers/amounts and repeated order totals.
+
+Real-server synchronization, another device, and working-database migration
+remain unverified and unauthorized. Local confirmation in the outbox does not
+mean the server accepted it. Mocked OCR tests verify routing and parsing, not
+the accuracy of an OCR engine on a real scan.
+
+## Twelve-File Batch Follow-up
+
+The complete `C:\invoices` batch (12 PDFs, 27 pages, 10 unique documents) was
+retested through upload and Qt after correcting seller-role detection, PDF
+rotation, right-aligned values, tax-total columns, currency and order markers.
+All 96 expected fields matched the forms. Every invoice arithmetic check and
+allocation sum matched; injected invalid rounding disabled confirmation in all
+12 forms. The temporary test destinations were restored before saving drafts.
+
+Three copies of Beijer 260407197227 are byte-identical. In one temporary desktop
+database the first upload was confirmed locally; two other filenames and a retry
+were blocked before a new form, leaving one queued confirmed document. API
+regressions separately reject a repeated original with a new client ID and keep
+same-client retries idempotent. No files were removed from the source folder.
+
+Byggbox P422 is offered only for an exact unique match in the test catalog.
+Absent rounding is left empty; it is not inferred from a difference between
+totals. Per-order VAT is still unknown unless stated. This batch contains only
+embedded-text PDFs and does not certify real scanned-document OCR.
+
+Detailed local artifacts are under `reports/invoice_batch_20261017_174725/`.
+These results do not authorize push, deployment, production migrations or use of
+working databases.
+
+## Corrections After the Frozen Holdout
+
+The original `reports/review_stage_20261017/` and
+`reports/holdout_baseline_20261017_180120/` are preserved as historical evidence.
+The eight text PDFs have now been used for fixes and are no longer an unseen
+acceptance sample. Their original visual expectations were kept separate from
+the parser, and before/after comparisons are in
+`reports/correction_stage_20261017/index.html`.
+
+The Windows upload streams are closed before local file deletion. A confirmed
+ACK increments `synced` independently of optional cleanup; cleanup failures are
+reported separately. Missing/incomplete document identity in an ACK retains the
+durable queue and original. Real loopback HTTP tests cover pre-send failure,
+lost response after server commit, incomplete ACK, process termination before
+local ACK, and retries in new processes. The receiving client downloaded every
+original, checked SHA-256 and opened the PDF. See
+`reports/sync_reliability_20261017/`.
+
+Parsing fixes include buyer-role exclusion, legal forms beyond AB, fragmented
+captions/money across close baselines, column boundaries and explicit VAT-rate
+summary priority. Short invoice numbers are supported. Reverse-charge evidence
+does not manufacture VAT: explicit zero is read, absent numeric VAT stays
+unknown and requires review. Unstated currency is blank in the form and remains
+UNKNOWN in a draft, never silently SEK.
+
+Prepaid receipts and remaining balances are recognized as a distinct context.
+The document total and remaining amount due are displayed separately. This
+payment workflow is not fully supported yet: only draft saving is allowed, and
+the API also rejects confirmation. It must not be bypassed by replacing a zero
+remaining balance with the full document total.
+
+The final original-file run processed 20 text PDFs / 36 pages: the original 12
+and eight later text PDFs. It preserved all drafts/originals and manual mixed
+allocations. A separate scanned receipt was excluded from OCR testing. These
+process-level tests are NOT tests of two physical devices. Two real devices and
+an approved isolated test server remain a separate prerequisite, and no
+production launch, push, deployment or working-database migration is authorized.
+
+## Final ACK Evidence and Reporting Limits
+
+The final ACK audit also checks the complete mandatory attachment manifest.
+For document saves, success requires a 2xx response, matching client/document
+identity, a valid newer version for updates, and every required SHA-256 with
+`has_original=true`. Missing, partial, foreign, stale or malformed ACKs retain
+the queue and local originals with `synced=0`. Known original hashes are retained
+when editing an existing uploaded document in either current form. This uses JSON metadata only;
+no database migration is introduced.
+
+The consolidated table and sanitized synthetic synchronization results are in
+`reports/final_acceptance_20261017/`. The 96+64 comparisons cover eight invoice
+fields, including invoice date but NOT payment due date. Supplemental due dates
+were reported separately at that frozen stage: Qt did not expose/persist them as a
+dedicated field, and raw parser extraction was incomplete. They must not be
+represented as covered by the prior field metric.
+
+AJ remains draft-only because its payment workflow is not fully supported, not
+because zero remaining balance is an invalid document. Lifting the block needs
+an agreed paid/partial-paid model, separate document total/payment/balance,
+appropriate UI/API/isolated exchange tests and a separate user acceptance.
+Two physical devices and then a genuinely new independent text corpus remain
+future stages; the scanned receipt is a separate OCR stage. No test operations
+are to be imported into working accounts.
+
+## Local Stage Handoff
+
+The reproducible local-stage evidence is preserved under
+`reports/local_stage_handoff_20261017/`; the original baseline remains separate.
+At that handoff all 20 text PDFs contained an explicit payment due date: 9 were extracted by the
+parser, 11 were missed, and none lacked the date in the original. Due-date support
+in Qt was unfinished and was not covered by 96+64 field checks.
+The audit is AI-assisted original-document review, not independent human signoff.
+
+The physical-device test plan is marked BLOCKED, not passed. The next unseen
+text corpus requires human-confirmed expected values before its first run; any
+post-fix repeat is regression evidence. AJ remains draft-only until a separately
+implemented and accepted payment data model. No handoff artifact authorizes
+production operations, migration, mail access, push or deployment.
+
+## Payment Due Date Stage
+
+Current local due-date evidence is in `reports/due_date_stage_20261017/`.
+The original handoff archives and nine-of-twenty baseline were not overwritten.
+Coordinate extraction now supports due-date columns, separate value rows,
+alternative captions and rotated-page coordinates. All 20 original dates match
+the prior manual original-PDF audit, and the other 160 field values remain equal.
+
+Both current Qt expense forms have a separate due-date input. Provenance is
+explicit, calculated, manual, ambiguous or absent. Calculation from unambiguous
+payment terms is labelled calculated and requires review; conflicting/invalid
+explicit dates are not replaced by payment-term guesses. Manual edits preserve
+original evidence through draft reopening and local confirmation.
+
+Fresh server schemas contain dedicated due-date/provenance/evidence columns.
+There is NO automatic ALTER of existing document tables for this feature.
+`due_date_v1` is advertised only when those columns exist. Unsupported servers
+leave the outbox pending. Older clients omitting due fields preserve them, but
+cannot bypass a stored unresolved review requirement. The ACK must echo the saved
+date and provenance before the client clears its queue.
+
+Actual loopback HTTP testing used fresh test schemas, two client processes and
+separate databases: upload, manual correction, draft reopening, confirmation,
+lost response, new-process retry, receiving-client download, a second date edit
+and stale-version rejection. One document and one original remained. This is NOT
+a test of two physical devices. The original PDF was unchanged.
+
+No separate paid-amount storage was introduced; AJ is still draft-only in Qt/API.
+Production schemas, existing user databases, mail, push and deployment remain
+unauthorized. Physical-device testing stays BLOCKED; independent unseen text
+invoices and real scanned-document OCR remain separate stages.
