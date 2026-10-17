@@ -28,7 +28,7 @@ from PyQt6.QtCore import QUrl
 
 # Импорты для генерации PDF
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, LongTable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, LongTable, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
@@ -1181,6 +1181,68 @@ def collect_invoice_ob_details(cursor, company, object_name, date_from, date_to)
         }
         for employee, details in details_by_employee.items()
     }
+
+
+INVOICE_OB_CATEGORY_LABELS = {
+    "weekday_early_evening": "OB1",
+    "weekday_late_evening_night": "OB2",
+    "saturday": "Lördag",
+    "sunday": "Söndag",
+}
+
+
+def _invoice_segment_interval(segment):
+    day = datetime.strptime(segment["segment_date"], "%Y-%m-%d").date()
+    start_hour, start_minute = (int(value) for value in segment["start_time"].split(":"))
+    end_hour, end_minute = (int(value) for value in segment["end_time"].split(":"))
+    start = day.toordinal() * 1440 + start_hour * 60 + start_minute
+    end = day.toordinal() * 1440 + end_hour * 60 + end_minute
+    if end <= start:
+        end += 1440
+    return start, end
+
+
+def _invoice_union_hours(intervals):
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    start, end = ordered[0]
+    total_minutes = 0
+    for next_start, next_end in ordered[1:]:
+        if next_start <= end:
+            end = max(end, next_end)
+        else:
+            total_minutes += end - start
+            start, end = next_start, next_end
+    total_minutes += end - start
+    return round(total_minutes / 60, 6)
+
+
+def collect_invoice_ob_category_hours(cursor, company, object_names, date_from, date_to):
+    if not object_names:
+        return {}
+    placeholders = ",".join("?" for _name in object_names)
+    rows = cursor.execute(f"""
+        SELECT shifts.employee, ob_segments.segment_date, ob_segments.start_time,
+               ob_segments.end_time, ob_segments.category, ob_segments.premium_percent
+        FROM shifts
+        JOIN ob_segments ON ob_segments.shift_id = shifts.sync_id
+        WHERE shifts.company = ? AND shifts.object_name IN ({placeholders})
+          AND shifts.date >= ? AND shifts.date <= ? AND shifts.entry_type = 'ob'
+        ORDER BY shifts.employee, ob_segments.segment_date, ob_segments.start_time
+    """, (company, *object_names, date_from, date_to)).fetchall()
+
+    category_intervals = {}
+    for row in rows:
+        if float(row[5] or 0) <= 0:
+            continue
+        interval = _invoice_segment_interval(row)
+        category_intervals.setdefault((row[0], row[4]), []).append(interval)
+
+    result = {}
+    for (employee, category), intervals in category_intervals.items():
+        result.setdefault(employee, {})[category] = _invoice_union_hours(intervals)
+    return result
 
 
 def calculate_payroll_components(
@@ -5316,29 +5378,36 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>Результат по объекту за период (зеленые строки уже закрыты):</b>"))
         
         self.table_invoice = QTableWidget()
-        self.table_invoice.setColumnCount(9)
-        self.table_invoice.setHorizontalHeaderLabels(["Сотрудник", "Рабочие часы", "Ставка", "Сумма (работа)", "Resa (SEK)", "Итого (SEK)", "Статус", "OB часы / спецификация", "OB сумма отдельно"])
+        self.table_invoice.setColumnCount(10)
+        self.table_invoice.setHorizontalHeaderLabels([
+            "Сотрудник", "Arbetade h", "Pris/h", "Arbete (SEK)", "Resa (SEK)",
+            "Totalt (SEK)", "OB1 h", "OB2 h", "Övrig OB (h)", "Статус",
+        ])
         invoice_header = self.table_invoice.horizontalHeader()
         invoice_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in {
-            0: 145, 1: 95, 2: 80, 3: 110, 4: 90,
-            5: 95, 6: 105, 8: 125,
+            0: 145, 1: 85, 2: 75, 3: 100, 4: 85,
+            5: 95, 6: 65, 7: 65, 9: 100,
         }.items():
             self.table_invoice.setColumnWidth(column, width)
-        invoice_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        invoice_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         self.table_invoice.setWordWrap(True)
         self.table_invoice.setAlternatingRowColors(True)
         layout.addWidget(self.table_invoice)
 
-        summary_box = QHBoxLayout()
-        self.inv_total_hours_lbl = QLabel("<b>Всего часов: 0</b>")
-        self.inv_total_ob_lbl = QLabel("<b>OB отдельно: 0 ч / 0.00 kr</b>")
-        self.inv_total_sum_lbl = QLabel("<b>Общая сумма: 0.00 kr</b>")
-        summary_box.addWidget(self.inv_total_hours_lbl)
-        summary_box.addWidget(self.inv_total_ob_lbl)
-        summary_box.addStretch()
-        summary_box.addWidget(self.inv_total_sum_lbl)
-        layout.addLayout(summary_box)
+        self.invoice_summary_table = QTableWidget(8, 2)
+        self.invoice_summary_table.setHorizontalHeaderLabels(["Sammanfattning", "Värde"])
+        self.invoice_summary_table.verticalHeader().setVisible(False)
+        self.invoice_summary_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.invoice_summary_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.invoice_summary_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.invoice_summary_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        layout.addWidget(self.invoice_summary_table)
+        self.invoice_summary_note = QLabel(
+            "OB-timmar ingår i arbetade timmar och läggs inte till utöver dessa."
+        )
+        self.invoice_summary_note.setWordWrap(True)
+        layout.addWidget(self.invoice_summary_note)
 
     def load_invoice_objects(self, company):
         selected_id = self.inv_obj_cb.currentData()
@@ -5383,13 +5452,10 @@ class SmartReportApp(QMainWindow):
             object_names = invoice_object_names(cursor, obj_row)
             object_placeholders = ','.join('?' for _name in object_names)
             has_ob_schema = ob_schema_ready(cursor)
-            ob_details = {}
-            if has_ob_schema:
-                for object_name in object_names:
-                    for employee, details in collect_invoice_ob_details(cursor, comp, object_name, d_from, d_to).items():
-                        previous = ob_details.setdefault(employee, {'display': '', 'tooltip': ''})
-                        for key in previous:
-                            previous[key] = '\n'.join(filter(None, (previous[key], details[key])))
+            ob_category_hours = (
+                collect_invoice_ob_category_hours(cursor, comp, object_names, d_from, d_to)
+                if has_ob_schema else {}
+            )
             ob_join = """
                 LEFT JOIN (SELECT shift_id, SUM(amount) AS segment_amount
                            FROM ob_segments GROUP BY shift_id) ob_segment
@@ -5414,7 +5480,8 @@ class SmartReportApp(QMainWindow):
             return {
                 'object_id': object_id, 'sync_id': obj_row['sync_id'], 'company': comp, 'object': obj,
                 'object_names': object_names,
-                'date_from': d_from, 'date_to': d_to, 'rows': rows, 'ob_details': ob_details,
+                'date_from': d_from, 'date_to': d_to, 'rows': rows,
+                'ob_category_hours': ob_category_hours,
                 'rate': float(obj_row['rate'] or 0), 'transport_rate': float(obj_row['transport_rate'] or 0),
                 'is_fast_pris': is_fast_pris,
                 'fast_pris_amount': parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0,
@@ -5422,77 +5489,138 @@ class SmartReportApp(QMainWindow):
         finally:
             conn.close()
 
+    def _prepare_invoice_view(self, report):
+        prepared_rows = []
+        totals = {
+            "hours": 0.0, "ob_categories": {},
+            "work_amount": 0.0, "transport_amount": 0.0, "ob_amount": 0.0,
+            "invoice_total": 0.0,
+        }
+        for row in report["rows"]:
+            employee = row[0]
+            hours = float(row[1] or 0.0)
+            trips = float(row[2] or 0.0)
+            status_code = row[3]
+            ob_amount = float(row[5] or 0.0)
+            categories = report["ob_category_hours"].get(employee, {})
+            other_categories = {
+                category: category_hours for category, category_hours in categories.items()
+                if category not in {"weekday_early_evening", "weekday_late_evening_night"}
+            }
+            rate = 0.0 if report["is_fast_pris"] else report["rate"]
+            work_amount = 0.0 if report["is_fast_pris"] else hours * rate
+            transport_amount = trips * report["transport_rate"]
+            row_total = work_amount + transport_amount
+            status = (
+                "Частично закрыт" if status_code == 2
+                else "✅ Выставлен" if status_code == 1
+                else "⏳ В работе"
+            )
+            prepared_rows.append({
+                "employee": employee, "hours": hours, "rate": rate,
+                "work_amount": work_amount, "transport_amount": transport_amount,
+                "row_total": row_total, "status": status,
+                "ob1_hours": float(categories.get("weekday_early_evening", 0.0)),
+                "ob2_hours": float(categories.get("weekday_late_evening_night", 0.0)),
+                "other_ob_categories": other_categories,
+                "ob_amount": ob_amount,
+            })
+            totals["hours"] += hours
+            totals["work_amount"] += work_amount
+            totals["transport_amount"] += transport_amount
+            totals["ob_amount"] += ob_amount
+            for category, category_hours in categories.items():
+                totals["ob_categories"][category] = (
+                    totals["ob_categories"].get(category, 0.0) + category_hours
+                )
+
+        if report["is_fast_pris"]:
+            totals["work_amount"] = report["fast_pris_amount"]
+            totals["transport_amount"] = 0.0
+            totals["invoice_total"] = report["fast_pris_amount"]
+        else:
+            totals["invoice_total"] = totals["work_amount"] + totals["transport_amount"]
+        report["prepared_rows"] = prepared_rows
+        report["totals"] = totals
+        return report
+
+    @staticmethod
+    def _invoice_summary_items(report):
+        totals = report["totals"]
+        items = [
+            ("Arbetade timmar totalt", f"{totals['hours']:.1f} tim"),
+            ("Varav utan OB", "Ej fastställbart"),
+            ("Varav OB1", f"{totals['ob_categories'].get('weekday_early_evening', 0.0):.1f} tim"),
+            ("Varav OB2", f"{totals['ob_categories'].get('weekday_late_evening_night', 0.0):.1f} tim"),
+        ]
+        for category in sorted(totals["ob_categories"]):
+            if category in {"weekday_early_evening", "weekday_late_evening_night"}:
+                continue
+            label = INVOICE_OB_CATEGORY_LABELS.get(category, category)
+            items.append((f"Varav {label}", f"{totals['ob_categories'][category]:.1f} tim"))
+        items.extend([
+            ("Arbete", f"{totals['work_amount']:,.2f} kr"),
+            ("Resa", f"{totals['transport_amount']:,.2f} kr"),
+            ("OB-tillägg", f"{totals['ob_amount']:,.2f} kr (segmentbelopp)"),
+            ("Totalt att fakturera exkl. moms", f"{totals['invoice_total']:,.2f} kr"),
+        ])
+        return items
+
+    def _render_invoice_summary(self, report):
+        items = self._invoice_summary_items(report)
+        self.invoice_summary_table.setRowCount(len(items))
+        for row_index, (label, value) in enumerate(items):
+            self.invoice_summary_table.setItem(row_index, 0, QTableWidgetItem(label))
+            self.invoice_summary_table.setItem(row_index, 1, QTableWidgetItem(value))
+        if report["is_fast_pris"]:
+            self.invoice_summary_note.setText(
+                "OB-poster lagras separat från work; möjlig överlappning kan inte fastställas. "
+                "Visad OB-summa är summan av sparade segment, inte en verifierad premie. "
+                "Fast pris ersätter Resa och OB i faktureringssumman."
+            )
+        else:
+            self.invoice_summary_note.setText(
+                "OB-poster lagras separat från work; möjlig överlappning kan inte fastställas. "
+                "Visad OB-summa är summan av sparade segment, inte en verifierad premie, "
+                "och ingår inte i totalsumman."
+            )
+
     def generate_invoice(self):
         try:
             report = self.collect_invoice_report()
         except ValueError as error:
             self.table_invoice.setRowCount(0)
+            empty_report = {
+                "is_fast_pris": False,
+                "totals": {
+                    "hours": 0.0, "ob_categories": {},
+                    "work_amount": 0.0, "transport_amount": 0.0,
+                    "ob_amount": 0.0, "invoice_total": 0.0,
+                },
+            }
+            self._render_invoice_summary(empty_report)
             self._invoice_report = None
-            self.inv_total_hours_lbl.setText("<b>Рабочие часы: 0.0</b>")
-            self.inv_total_ob_lbl.setText("<b>OB: 0 tim / 0.00 kr</b>")
-            self.inv_total_sum_lbl.setText("<b>Общая сумма: 0.00 kr</b>")
             QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return None
-        rows = report['rows']
-        object_default_rate = report['rate']
-        object_transport_rate = report['transport_rate']
-        is_fast_pris = report['is_fast_pris']
-        fast_pris_amount = report['fast_pris_amount']
-        ob_details_by_employee = report['ob_details']
-
-        self.table_invoice.setRowCount(len(rows))
-        total_hours_all = 0.0
-        total_ob_hours_all = 0.0
-        total_ob_amount_all = 0.0
-        total_sum_all = 0.0
-        total_transport_sum_all = 0.0
-        total_work_sum_all = 0.0
-
-        for row_idx, row in enumerate(rows):
-            emp = row[0]
-            hrs = row[1] or 0.0
-            trans_count = row[2] or 0.0
-            is_inv = row[3] == 1
-            ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
-            status_str = "Частично закрыт" if row[3] == 2 else "✅ Выставлен" if is_inv else "⏳ В работе"
-            
-            total_hours_all += hrs
-            total_ob_hours_all += ob_hours
-            total_ob_amount_all += ob_amount
-            transport_total_sum = trans_count * object_transport_rate
-            
-            if is_fast_pris:
-                rate = 0.0
-                work_sum = 0.0
-                row_total = transport_total_sum
-            else:
-                rate = object_default_rate
-                work_sum = hrs * rate
-                row_total = work_sum + transport_total_sum
-
-            total_sum_all += row_total
-            total_transport_sum_all += transport_total_sum
-            total_work_sum_all += work_sum
-
-            ob_details = ob_details_by_employee.get(emp, {})
-            ob_cell_text = f"{ob_hours:g} tim" + (" · intervaller" if ob_details else "")
-            row_values = [emp, f"{hrs:.1f}", f"{rate:.2f}", f"{work_sum:.2f}", f"{transport_total_sum:.2f}", f"{row_total:.2f}", status_str, ob_cell_text, f"{ob_amount:.2f}"]
+        report = self._prepare_invoice_view(report)
+        self.table_invoice.setRowCount(len(report["prepared_rows"]))
+        for row_idx, row in enumerate(report["prepared_rows"]):
+            other_ob = ", ".join(
+                f"{INVOICE_OB_CATEGORY_LABELS.get(category, category)} {hours:g}"
+                for category, hours in sorted(row["other_ob_categories"].items())
+            )
+            row_values = [
+                row["employee"], f"{row['hours']:.1f}", f"{row['rate']:.2f}",
+                f"{row['work_amount']:.2f}", f"{row['transport_amount']:.2f}",
+                f"{row['row_total']:.2f}", f"{row['ob1_hours']:.1f}",
+                f"{row['ob2_hours']:.1f}", other_ob, row["status"],
+            ]
             for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
-                if col_idx == 7 and ob_details:
-                    it.setToolTip(ob_details["tooltip"])
-                if is_inv:
+                if row["status"] == "✅ Выставлен":
                     it.setBackground(QColor("#1c4532"))
                 self.table_invoice.setItem(row_idx, col_idx, it)
-
-        if is_fast_pris:
-            total_sum_all = fast_pris_amount
-            self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f} (Fast pris)</b>")
-            self.inv_total_sum_lbl.setText(f"<b>Общая сумма по договору: {fast_pris_amount:,.2f} kr</b>")
-        else:
-            self.inv_total_hours_lbl.setText(f"<b>Рабочие часы: {total_hours_all:.1f}</b>")
-            self.inv_total_sum_lbl.setText(f"<b>Общая сумма: {total_sum_all:,.2f} kr</b>")
-        self.inv_total_ob_lbl.setText(f"<b>OB: {total_ob_hours_all:g} tim / {total_ob_amount_all:,.2f} kr</b>")
+        self._render_invoice_summary(report)
         self._invoice_report = report
         return report
 
@@ -5502,10 +5630,8 @@ class SmartReportApp(QMainWindow):
             return
         d_from, d_to = report['date_from'], report['date_to']
         comp, obj = report['company'], report['object']
-        rows = report['rows']
-        object_default_rate, object_transport_rate = report['rate'], report['transport_rate']
-        is_fast_pris, fast_pris_amount = report['is_fast_pris'], report['fast_pris_amount']
-        ob_details_by_employee = report['ob_details']
+        rows = report['prepared_rows']
+        is_fast_pris = report['is_fast_pris']
 
         if not rows and not is_fast_pris:
             QMessageBox.warning(
@@ -5535,100 +5661,85 @@ class SmartReportApp(QMainWindow):
 
             pdf_header_style = ParagraphStyle(
                 "InvoiceHeader", parent=styles['Normal'], fontName=DEFAULT_FONT_BOLD,
-                fontSize=7, leading=8, wordWrap='CJK'
+                fontSize=7, leading=8, wordWrap='CJK', alignment=1,
             )
             table_data = [[
                 Paragraph(escape(label), pdf_header_style)
                 for label in (
-                    "Anställd", "Arbete h", "Pris/tim", "Arbete (SEK)",
-                    "Resa (SEK)", "Totalt (SEK)", "OB h / specifikation",
-                    "OB separat (SEK)",
+                    "Anställd", "Arbetade h", "Pris/h", "Arbete (SEK)",
+                    "Resa (SEK)", "Totalt (SEK)", "OB1 h", "OB2 h",
+                    "Övrig OB (h)", "Status",
                 )
             ]]
-            total_hours_all = 0.0
-            total_ob_hours_all = 0.0
-            total_ob_amount_all = 0.0
-            total_sum_all = 0.0
-            total_work_sum_all = 0.0
-            total_transport_sum_all = 0.0
-
             for row in rows:
-                emp = row[0]
-                hrs = row[1] or 0.0
-                trans_count = row[2] or 0.0
-                ob_hours, ob_amount = row[4] or 0.0, row[5] or 0.0
-                total_hours_all += hrs
-                total_ob_hours_all += ob_hours
-                total_ob_amount_all += ob_amount
-
-                transport_total_sum = trans_count * object_transport_rate
-
-                if is_fast_pris:
-                    rate = 0.0
-                    work_sum = 0.0
-                    row_total = transport_total_sum
-                else:
-                    rate = object_default_rate
-                    work_sum = hrs * rate
-                    row_total = work_sum + transport_total_sum
-
-                total_sum_all += row_total
-                total_work_sum_all += work_sum
-                total_transport_sum_all += transport_total_sum
-                ob_details = ob_details_by_employee.get(emp, {}).get("display", "")
-                ob_spec = Paragraph(
-                    f"{ob_hours:g} tim<br/>{escape(ob_details).replace(chr(10), '<br/>')}",
-                    ParagraphStyle(
-                        f"InvoiceObCell{len(table_data)}",
-                        parent=styles['Normal'],
-                        fontName=DEFAULT_FONT,
-                        fontSize=7,
-                        leading=9,
-                        wordWrap='CJK',
-                    ),
+                other_ob = ", ".join(
+                    f"{INVOICE_OB_CATEGORY_LABELS.get(category, category)} {hours:g}"
+                    for category, hours in sorted(row["other_ob_categories"].items())
+                )
+                employee_style = ParagraphStyle(
+                    f"InvoiceEmployee{len(table_data)}", parent=styles['Normal'],
+                    fontName=DEFAULT_FONT, fontSize=7, leading=9, wordWrap='CJK',
                 )
                 table_data.append([
-                    Paragraph(escape(str(emp)), ParagraphStyle(
-                        f"InvoiceEmployee{len(table_data)}", parent=styles['Normal'],
-                        fontName=DEFAULT_FONT, fontSize=8, leading=10, wordWrap='CJK'
-                    )),
-                    f"{hrs:.1f}", f"{rate:.2f}", f"{work_sum:.2f}",
-                    f"{transport_total_sum:.2f}", f"{row_total:.2f}", ob_spec,
-                    f"{ob_amount:.2f}"
+                    Paragraph(escape(str(row["employee"])), employee_style),
+                    f"{row['hours']:.1f}", f"{row['rate']:.2f}",
+                    f"{row['work_amount']:.2f}", f"{row['transport_amount']:.2f}",
+                    f"{row['row_total']:.2f}", f"{row['ob1_hours']:.1f}",
+                    f"{row['ob2_hours']:.1f}", Paragraph(escape(other_ob), employee_style),
+                    Paragraph(escape(row["status"]), employee_style),
                 ])
 
-            if is_fast_pris:
-                total_sum_all = fast_pris_amount
-                table_data.append([
-                    "Fast pris (Enligt avtal)", "", "", "", "",
-                    f"{fast_pris_amount:.2f}", f"{total_ob_hours_all:g} tim",
-                    f"{total_ob_amount_all:.2f}",
-                ])
-
-            table_data.append([
-                "Totalt:", f"{total_hours_all:.1f}", "",
-                f"{total_work_sum_all:,.2f}", f"{total_transport_sum_all:,.2f}",
-                f"{total_sum_all:,.2f}", f"{total_ob_hours_all:g} tim",
-                f"{total_ob_amount_all:,.2f}",
-            ])
-
-            t = Table(table_data, colWidths=[78, 35, 34, 55, 48, 55, 170, 60])
+            t = LongTable(
+                table_data,
+                colWidths=[78, 43, 45, 58, 48, 54, 40, 40, 76, 53],
+                repeatRows=1,
+                splitByRow=1,
+            )
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
                 ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('FONTSIZE', (0, 0), (-1, -1), 7),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
                 ('TOPPADDING', (0, 0), (-1, 0), 6),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.HexColor('#f9f9f9'), colors.white]),
-                ('GRID', (0, 0), (-1, -2), 0.5, colors.HexColor('#dddddd')),
-                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#eeeeee')),
-                ('FONTNAME', (0, -1), (-1, -1), DEFAULT_FONT_BOLD),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#f9f9f9'), colors.white]),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
             ]))
 
             story.append(t)
+            summary_style = ParagraphStyle(
+                "InvoiceSummary", parent=styles['Normal'], fontName=DEFAULT_FONT,
+                fontSize=8, leading=10, wordWrap='CJK',
+            )
+            summary_data = [
+                [Paragraph(escape(label), summary_style), Paragraph(escape(value), summary_style)]
+                for label, value in self._invoice_summary_items(report)
+            ]
+            summary_table = Table(summary_data, colWidths=[420, 115], hAlign='LEFT')
+            summary_table.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cccccc')),
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f7f7f7')),
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (0, -1), (-1, -1), DEFAULT_FONT_BOLD),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ]))
+            summary_note = (
+                "OB-poster lagras separat från work; möjlig överlappning kan inte fastställas. "
+                "Visad OB-summa är summan av sparade segment, inte en verifierad premie, "
+                "och ingår inte i totalsumman."
+            )
+            if is_fast_pris:
+                summary_note += " Fast pris ersätter Resa och OB i faktureringssumman."
+            story.append(Spacer(1, 10))
+            story.append(KeepTogether([
+                Paragraph("<b>Sammanfattning</b>", summary_style),
+                summary_table,
+                Paragraph(escape(summary_note), summary_style),
+            ]))
             doc.build(story)
             QMessageBox.information(self, "Успех", f"PDF-отчет для счета сохранен:\n{base_filename}")
             

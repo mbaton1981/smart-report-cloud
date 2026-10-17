@@ -398,7 +398,14 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual([row[3] for row in report['rows']], [2, 1])
             self.assertEqual(report['rows'][0][4], 1)
             self.assertAlmostEqual(report['rows'][0][5], result['total_amount'])
-            self.assertIn('3,450.00', window.inv_total_sum_lbl.text())
+            summary = {
+                window.invoice_summary_table.item(index, 0).text():
+                window.invoice_summary_table.item(index, 1).text()
+                for index in range(window.invoice_summary_table.rowCount())
+            }
+            self.assertEqual(summary['Totalt att fakturera exkl. moms'], '3,450.00 kr')
+            self.assertEqual(summary['OB-tillägg'], '800.00 kr (segmentbelopp)')
+            self.assertEqual(report['totals']['invoice_total'], 3450)
 
             def check_pdf(build, object_name):
                 story = build.call_args.args[0]
@@ -406,12 +413,29 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertIn(object_name, heading)
                 self.assertIn('Renatur', heading)
                 self.assertIn(window.inv_date_to.text(), heading)
-                pdf_table = next(flow for flow in story if isinstance(flow, self.desktop.Table))
+                pdf_table = next(flow for flow in story if isinstance(flow, self.desktop.LongTable))
+                self.assertEqual(sum(pdf_table._colWidths), 535)
                 for row_index in range(window.table_invoice.rowCount()):
                     pdf_row = pdf_table._cellvalues[row_index + 1]
                     self.assertEqual(pdf_row[0].getPlainText(), window.table_invoice.item(row_index, 0).text())
                     self.assertEqual(pdf_row[1:6], [window.table_invoice.item(row_index, column).text() for column in range(1, 6)])
-                    self.assertEqual(pdf_row[7], window.table_invoice.item(row_index, 8).text())
+                    self.assertEqual(pdf_row[6:8], [window.table_invoice.item(row_index, column).text() for column in (6, 7)])
+                    self.assertEqual(pdf_row[8].getPlainText(), window.table_invoice.item(row_index, 8).text())
+                    self.assertEqual(pdf_row[9].getPlainText(), window.table_invoice.item(row_index, 9).text())
+                summary_group = story[-1]
+                pdf_summary = next(
+                    flow for flow in summary_group._content
+                    if isinstance(flow, self.desktop.Table)
+                )
+                screen_summary = [
+                    [window.invoice_summary_table.item(row, column).text() for column in range(2)]
+                    for row in range(window.invoice_summary_table.rowCount())
+                ]
+                pdf_summary_text = [
+                    [cell.getPlainText() for cell in row]
+                    for row in pdf_summary._cellvalues
+                ]
+                self.assertEqual(pdf_summary_text, screen_summary)
 
             with patch.object(self.desktop, 'REPORTS_DIR', str(Path(self._case.name) / 'reports')), \
                  patch.object(self.desktop.SimpleDocTemplate, 'build') as build, \
@@ -426,7 +450,9 @@ class CatalogSyncTests(unittest.TestCase):
                 check_pdf(build, 'Invoice hotel')
                 self.assertEqual(window.table_invoice.rowCount(), 1)
                 self.assertEqual(window.table_invoice.item(0, 0).text(), 'Carol')
-                self.assertIn('2,530.00', window.inv_total_sum_lbl.text())
+                self.assertEqual(
+                    window._invoice_report['totals']['invoice_total'], 2530
+                )
                 window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identities['Invoice work']))
                 window.inv_date_from.setDate(self.desktop.QDate(2026, 10, 31))
                 window.export_invoice_to_pdf()
@@ -445,7 +471,92 @@ class CatalogSyncTests(unittest.TestCase):
                 critical.assert_not_called()
             desktop_conn = self.desktop.get_db_connection()
             self.assertEqual([tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')], original_shifts)
+            desktop_conn.executemany("""
+                INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+                VALUES ('2026-10-15',?,'Renatur','Invoice work',8,400,0,0,'work')
+            """, ((f'Pagination worker {index:02}',) for index in range(45)))
+            desktop_conn.commit()
             desktop_conn.close()
+            window.inv_date_from.setDate(self.desktop.QDate(2026, 10, 1))
+            window.inv_date_to.setDate(self.desktop.QDate(2026, 10, 31))
+            reports_dir = Path(self._case.name) / 'actual-pdf'
+            with patch.object(self.desktop, 'REPORTS_DIR', str(reports_dir)), \
+                 patch.object(self.desktop.os, 'startfile', create=True), \
+                 patch.object(self.desktop.QMessageBox, 'information'), \
+                 patch.object(self.desktop.QMessageBox, 'critical') as critical:
+                window.export_invoice_to_pdf()
+                generated_pdfs = list(reports_dir.glob('*.pdf'))
+                self.assertEqual(len(generated_pdfs), 1)
+                pdf_bytes = generated_pdfs[0].read_bytes()
+                self.assertTrue(pdf_bytes.startswith(b'%PDF-'))
+                self.assertGreater(len(pdf_bytes), 1000)
+                critical.assert_not_called()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_ob_categories_are_compact_and_not_added_twice(self):
+        desktop_conn = self.desktop.get_db_connection()
+        object_id = desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Renatur','Compact OB test','p1038',200,50,?,1)
+        """, (str(uuid.uuid4()),)).lastrowid
+        desktop_conn.executemany("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+            VALUES ('2026-10-05',?,'Renatur','Compact OB test',?,200,?,0,'work')
+        """, (('Alice', 8, 2), ('Bob', 6, 1), ('Carol', 3, 0)))
+        for employee, start_time, end_time in (
+            ('Alice', '18:00', '20:00'),
+            ('Alice', '19:00', '20:00'),
+            ('Bob', '18:00', '21:00'),
+        ):
+            sync_id = str(uuid.uuid4())
+            result = self.desktop.calculate_work_interval(
+                '2026-10-05', start_time, end_time, 100
+            )
+            desktop_conn.execute("""
+                INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                                    entry_type,sync_id,start_time,end_time,ob_base_rate)
+                VALUES ('2026-10-05',?,'Renatur','Compact OB test',?,0,0,0,'ob',?,?,?,100)
+            """, (employee, result['total_hours'], sync_id, start_time, end_time))
+            self.desktop.replace_ob_segments(desktop_conn.cursor(), sync_id, result['segments'])
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            window.inv_comp_cb.setCurrentText('Renatur')
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_id))
+            report = window.generate_invoice()
+            self.assertEqual(report['totals']['hours'], 17)
+            self.assertEqual(report['totals']['ob_categories']['weekday_early_evening'], 4)
+            self.assertEqual(report['totals']['ob_categories']['weekday_late_evening_night'], 1)
+            self.assertEqual(report['totals']['work_amount'], 3400)
+            self.assertEqual(report['totals']['transport_amount'], 150)
+            self.assertEqual(report['totals']['invoice_total'], 3550)
+            self.assertEqual(report['totals']['ob_amount'], 920)
+            self.assertNotEqual(report['totals']['invoice_total'], 3550 + 770)
+            self.assertEqual(window.table_invoice.columnCount(), 10)
+            self.assertNotIn('18:00', '\n'.join(
+                window.table_invoice.item(row, column).text()
+                for row in range(window.table_invoice.rowCount())
+                for column in range(window.table_invoice.columnCount())
+            ))
+            summary = {
+                window.invoice_summary_table.item(row, 0).text():
+                window.invoice_summary_table.item(row, 1).text()
+                for row in range(window.invoice_summary_table.rowCount())
+            }
+            self.assertEqual(summary['Arbetade timmar totalt'], '17.0 tim')
+            self.assertEqual(summary['Varav utan OB'], 'Ej fastställbart')
+            self.assertEqual(summary['Varav OB1'], '4.0 tim')
+            self.assertEqual(summary['Varav OB2'], '1.0 tim')
+            self.assertIn('möjlig överlappning kan inte fastställas', window.invoice_summary_note.text())
+            self.assertIn('inte en verifierad premie', window.invoice_summary_note.text())
+            self.assertIn('ingår inte i totalsumman', window.invoice_summary_note.text())
         finally:
             window.close()
             window.deleteLater()
