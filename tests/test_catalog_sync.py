@@ -199,6 +199,47 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 1)
         server_conn.close()
 
+    def test_expense_document_allocates_full_invoice_to_one_object(self):
+        server_conn = self.server.get_db_connection()
+        object_row = server_conn.execute(
+            "SELECT id, sync_id FROM meta_objects WHERE is_active = 1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        server_conn.close()
+        object_id = int(object_row["id"])
+        client_id = str(uuid.uuid4())
+        response = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            json={
+                "client_id": client_id, "supplier_name": "Single object supplier",
+                "document_date": "2026-10-17", "currency_code": "SEK",
+                "gross_amount": "125.00", "vat_amount": "25.00",
+                "verification_status": "confirmed",
+                "allocations": [{
+                    "object_id": object_id,
+                    "gross_amount": "125.00",
+                    "vat_amount": "25.00",
+                }],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.get_json())
+        document = response.get_json()["document"]
+        self.assertEqual(len(document["allocations"]), 1)
+        self.assertEqual(document["allocations"][0]["object_id"], object_id)
+        self.assertEqual(document["allocated_gross"], "125.00")
+        self.assertEqual(document["unallocated_gross"], "0.00")
+        summary = self.server_client.get(
+            f"/api/expense-objects/{object_id}/expenses",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()
+        self.assertEqual(summary["summary"]["SEK"]["gross"], "125.00")
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(server_conn.execute(
+            "SELECT COUNT(*) FROM expense_allocations WHERE document_id = ? AND object_id = ?",
+            (document["id"], object_id),
+        ).fetchone()[0], 1)
+        server_conn.close()
+
     def test_expense_update_rejects_stale_server_version(self):
         client_id = str(uuid.uuid4())
         headers = {"X-Sync-Key": "isolated-sync-test-key"}
