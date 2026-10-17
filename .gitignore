@@ -27,3 +27,4 @@ venv/
 *.ico
 *.lnk
 clear_db.py
+installer/

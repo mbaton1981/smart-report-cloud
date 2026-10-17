@@ -1,5 +1,7 @@
-# Local-only document extraction for the PyQt Desktop application.
-# Install with: python -m pip install -r desktop_requirements.txt
+﻿# Desktop client dependencies. Install with: python -m pip install -r desktop_requirements.txt
+PyQt6>=6.6,<7
+requests
+reportlab
 pypdf>=5.0,<7
 pypdfium2>=4.30,<6
 numpy>=1.26,<3

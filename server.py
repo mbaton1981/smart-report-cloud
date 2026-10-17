@@ -1,6 +1,7 @@
 import sqlite3
-import time
 import ast
+import shutil
+import tempfile
 import os
 import json
 import hashlib
@@ -17,10 +18,11 @@ from xml.sax.saxutils import escape
 from flask import Flask, render_template, request, jsonify, session, make_response, send_file, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from expense_documents import allocation_breakdown, build_project_order_allocations, decimal_text, parse_decimal
+from expense_documents import build_project_order_allocations, decimal_text, parse_decimal
 from expense_documents import migrate_invoice_net_schema, invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations, parse_invoice_money, invoice_context
 from expense_documents import due_date_issues
 from ob_calculator import calculate_work_interval
+from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
 import reportlab
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -708,6 +710,8 @@ def init_cloud_db():
         else:
             cursor.execute("UPDATE users SET employee_id = COALESCE(employee_id, ?) WHERE username = ?", (emp['id'], emp['name']))
 
+    ensure_token_table(cursor)
+
     conn.commit()
     conn.close()
 
@@ -760,12 +764,72 @@ def enforce_active_session():
         conn.close()
     return None
 
+def bearer_admin_user():
+    header = request.headers.get('Authorization', '')
+    if not header.startswith('Bearer '):
+        return None
+    conn = get_db_connection()
+    try:
+        user = lookup_token(conn, header[7:].strip())
+    finally:
+        conn.close()
+    return user if user and user['role'] == 'admin' else None
+
 def verify_sync_key():
     sync_key = request.headers.get('X-Sync-Key') or request.headers.get('X-API-Key')
-    if not sync_key or sync_key != SYNC_API_KEY:
-        logger.warning(f"Несанкционированная попытка доступа с IP: {request.remote_addr}")
-        return False
-    return True
+    if sync_key and hmac.compare_digest(sync_key, SYNC_API_KEY):
+        return True
+    if not sync_key and bearer_admin_user() is not None:
+        return True
+    logger.warning(f"Несанкционированная попытка доступа с IP: {request.remote_addr}")
+    return False
+
+auth_throttle = LoginThrottle()
+
+@app.route('/api/auth/token', methods=['POST'])
+def api_auth_token():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
+    password = str(data.get('password', ''))
+    if not username or not password or len(username) > 100 or len(password) > 200:
+        return jsonify({"ok": False, "error": "Укажите логин и пароль."}), 400
+    throttle_key = username.lower()
+    if auth_throttle.blocked(throttle_key):
+        return jsonify({"ok": False, "error": "Слишком много неудачных попыток. Повторите через несколько минут."}), 429
+    conn = get_db_connection()
+    try:
+        user = conn.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (username,)).fetchone()
+        stored_hash = (user['password_hash'] if user else None) or generate_password_hash('invalid-user-placeholder')
+        password_ok = check_password_hash(stored_hash, password)
+        if not user or not user['password_hash'] or not password_ok or user['role'] != 'admin':
+            auth_throttle.record_failure(throttle_key)
+            return jsonify({"ok": False, "error": "Неверный логин или пароль."}), 401
+        auth_throttle.reset(throttle_key)
+        token, expires_at = issue_token(conn, user['id'], data.get('device_name', ''))
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), user['id']))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "token": token, "expires_at": expires_at,
+                    "user": {"username": user['username'], "role": user['role']}})
+
+@app.route('/api/auth/me', methods=['GET'])
+def api_auth_me():
+    user = bearer_admin_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "Не авторизован"}), 401
+    return jsonify({"ok": True, "user": {"username": user['username'], "role": user['role']}})
+
+@app.route('/api/auth/logout', methods=['POST'])
+def api_auth_logout():
+    header = request.headers.get('Authorization', '')
+    token = header[7:].strip() if header.startswith('Bearer ') else ''
+    conn = get_db_connection()
+    try:
+        revoked = revoke_token(conn, token)
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "revoked": revoked})
 
 
 EXPENSE_DOCUMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -1776,6 +1840,82 @@ def expense_document_attachment_original_api(document_id, attachment_id):
         download_name=attachment["original_name"] or original.name,
         conditional=True,
     )
+
+
+def admin_api_authorized():
+    return session.get("role") == "admin" or bearer_admin_user() is not None
+
+
+@app.route("/api/admin/storage-status", methods=["GET"])
+def admin_storage_status():
+    if not admin_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    database = Path(DB_FILE).resolve()
+    status = {"ok": True, "database_path": str(database), "database_bytes": database.stat().st_size if database.exists() else 0}
+    usage = shutil.disk_usage(database.parent)
+    status["disk"] = {"total_bytes": usage.total, "free_bytes": usage.free}
+    backup_dir = database.parent / "backups"
+    backups = sorted(backup_dir.glob("backup_*.db")) if backup_dir.is_dir() else []
+    status["backups"] = {"directory": str(backup_dir), "count": len(backups),
+                         "newest": [{"name": item.name, "bytes": item.stat().st_size} for item in backups[-3:]]}
+    try:
+        root = expense_documents_root()
+    except (RuntimeError, ValueError) as error:
+        status["documents"] = {"error": str(error)}
+        return jsonify(status)
+    verify_hashes = request.args.get("verify_hashes") == "1"
+    conn = get_db_connection()
+    try:
+        rows = conn.execute("""
+            SELECT a.stored_name, a.file_sha256 FROM expense_document_attachments a
+            JOIN expense_documents d ON d.id = a.document_id WHERE d.is_deleted = 0
+        """).fetchall()
+        documents = conn.execute("SELECT COUNT(*) FROM expense_documents WHERE is_deleted = 0").fetchone()[0]
+    finally:
+        conn.close()
+    missing, corrupted = [], []
+    for row in rows:
+        path = (root / row["stored_name"]).resolve()
+        if path.parent != root or not path.is_file():
+            missing.append(row["stored_name"])
+        elif verify_hashes and hashlib.sha256(path.read_bytes()).hexdigest() != row["file_sha256"]:
+            corrupted.append(row["stored_name"])
+    status["documents"] = {
+        "directory": str(root), "same_filesystem_as_database": root.exists() and os.stat(root).st_dev == os.stat(database.parent).st_dev,
+        "active_documents": documents, "attachments": len(rows), "missing_files": len(missing), "missing_examples": missing[:5],
+        "hashes_verified": verify_hashes, "hash_mismatches": len(corrupted) if verify_hashes else None,
+    }
+    return jsonify(status)
+
+
+@app.route("/api/admin/backup/database", methods=["GET"])
+def admin_backup_database():
+    if not admin_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    handle, snapshot_path = tempfile.mkstemp(suffix=".db", dir=str(Path(DB_FILE).resolve().parent))
+    os.close(handle)
+    source = sqlite3.connect(f"file:{Path(DB_FILE).resolve()}?mode=ro", uri=True, timeout=30.0)
+    destination = sqlite3.connect(snapshot_path)
+    try:
+        source.backup(destination)
+        if destination.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise sqlite3.DatabaseError("Снимок базы не прошёл проверку целостности.")
+    except Exception:
+        os.unlink(snapshot_path)
+        raise
+    finally:
+        destination.close()
+        source.close()
+    response = send_file(snapshot_path, as_attachment=True, download_name="smartreport_server_snapshot.db")
+
+    def remove_snapshot():
+        try:
+            os.unlink(snapshot_path)
+        except OSError:
+            pass
+
+    response.call_on_close(remove_snapshot)
+    return response
 
 
 @app.route("/api/expense-objects/<int:object_id>/expenses", methods=["GET"])
