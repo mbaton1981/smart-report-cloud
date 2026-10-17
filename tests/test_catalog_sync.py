@@ -1,9 +1,12 @@
 import os
+import json
 import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
+from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -92,6 +95,7 @@ class CatalogSyncTests(unittest.TestCase):
             def __init__(self, response):
                 self.response = response
                 self.status_code = response.status_code
+                self.ok = response.status_code < 400
 
             def json(self):
                 return self.response.get_json()
@@ -126,9 +130,592 @@ class CatalogSyncTests(unittest.TestCase):
                 raise requests.ConnectionError("simulated lost ACK after commit")
             return response
 
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path,
+                method=method,
+                query_string=kwargs.get("params"),
+                headers=kwargs.get("headers", {}),
+                json=kwargs.get("json"),
+                data=kwargs.get("data"),
+            )
+            return Response(response)
+
         with patch.object(self.desktop.requests, "get", side_effect=fake_get), \
-             patch.object(self.desktop.requests, "post", side_effect=fake_post):
-            return self.desktop.SmartReportApp.perform_sync_logic(SimpleNamespace())
+             patch.object(self.desktop.requests, "post", side_effect=fake_post), \
+             patch.object(self.desktop.requests, "request", side_effect=fake_request):
+            harness = SimpleNamespace(_manual_sync_requested=False)
+            harness.apply_remote_shift = lambda cursor, shift: self.desktop.SmartReportApp.apply_remote_shift(
+                harness, cursor, shift
+            )
+            harness._sync_expense_document_outbox = lambda: self.desktop.SmartReportApp._sync_expense_document_outbox(
+                harness
+            )
+            return self.desktop.SmartReportApp.perform_sync_logic(harness)
+
+    def test_expense_create_is_idempotent_by_client_id(self):
+        desktop_conn = self.desktop.get_db_connection()
+        outbox_columns = {
+            row["name"] for row in desktop_conn.execute(
+                "PRAGMA table_info(expense_document_outbox)"
+            )
+        }
+        desktop_conn.close()
+        self.assertTrue({
+            "client_id", "operation", "server_document_id", "revision",
+            "payload_json", "attachment_paths_json", "state", "last_error",
+        }.issubset(outbox_columns))
+
+        client_id = str(uuid.uuid4())
+        payload = {
+            "client_id": client_id,
+            "supplier_name": "Isolated test supplier",
+            "document_date": "2026-10-17",
+            "currency_code": "SEK",
+            "gross_amount": "125.00",
+            "verification_status": "draft",
+            "allocations": [],
+        }
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        first = self.server_client.post(
+            "/api/expense-documents", headers=headers, json=payload
+        )
+        second = self.server_client.post(
+            "/api/expense-documents", headers=headers, json=payload
+        )
+        self.assertEqual(first.status_code, 201, first.get_json())
+        self.assertEqual(second.status_code, 200, second.get_json())
+        self.assertTrue(second.get_json()["duplicate_request"])
+        self.assertIsNone(first.get_json()["document"]["vat_amount"])
+        self.assertIsNone(first.get_json()["document"]["net_amount"])
+        self.assertEqual(
+            first.get_json()["document"]["id"],
+            second.get_json()["document"]["id"],
+        )
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(server_conn.execute(
+            "SELECT COUNT(*) FROM expense_documents WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()[0], 1)
+        server_conn.close()
+
+    def test_expense_update_rejects_stale_server_version(self):
+        client_id = str(uuid.uuid4())
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        payload = {
+            "client_id": client_id, "supplier_name": "Version supplier",
+            "document_date": "2026-10-17", "currency_code": "SEK",
+            "gross_amount": "125.00", "vat_amount": "25.00",
+            "verification_status": "requires_review", "allocations": [],
+        }
+        created = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(created.status_code, 201, created.get_json())
+        document = created.get_json()["document"]
+        self.assertEqual(document["sync_version"], 1)
+
+        newer = {**payload, "document_comment": "edited on another client", "expected_version": 1}
+        updated = self.server_client.put(
+            f"/api/expense-documents/{document['id']}", headers=headers, json=newer
+        )
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        self.assertEqual(updated.get_json()["document"]["sync_version"], 2)
+
+        stale = {**payload, "document_comment": "stale local edit", "expected_version": 1}
+        rejected = self.server_client.put(
+            f"/api/expense-documents/{document['id']}", headers=headers, json=stale
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.get_json()["current_version"], 2)
+        stale_delete = self.server_client.delete(
+            f"/api/expense-documents/by-client/{client_id}",
+            headers=headers, json={"expected_version": 1},
+        )
+        self.assertEqual(stale_delete.status_code, 409)
+        self.assertEqual(stale_delete.get_json()["current_version"], 2)
+        current = self.server_client.get(
+            f"/api/expense-documents/{document['id']}", headers=headers
+        ).get_json()["document"]
+        self.assertEqual(current["document_comment"], "edited on another client")
+        self.assertEqual(current["sync_version"], 2)
+
+        harness = SimpleNamespace()
+        self.desktop.SmartReportApp.queue_expense_document_operation(
+            harness, client_id, "upsert",
+            {**payload, "document_comment": "stale local edit"},
+            server_document_id=int(document["id"]), server_version=1,
+        )
+
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path, method=method,
+                headers=kwargs.get("headers", {}), json=kwargs.get("json"),
+                data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+            sync_result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual(sync_result["conflicts"], 1)
+            view = SimpleNamespace(exp_api_status_lbl=self.desktop.QLabel(), _expense_objects=[])
+            documents, online = self.desktop.SmartReportApp._expense_document_snapshot(view)
+        self.assertTrue(online)
+        self.assertEqual(documents[0]["sync_state"], "conflict")
+        self.assertEqual(documents[0]["document_comment"], "edited on another client")
+        self.assertEqual(
+            documents[0]["local_conflict_payload"]["document_comment"],
+            "stale local edit",
+        )
+
+    def test_expense_parser_keeps_document_vat_total_across_repeated_pages(self):
+        parsed = self.desktop.parse_document_text("""
+            Leverantör: Test Supplier
+            Fakturadatum: 2026-10-17
+            Netto: 100.00
+            Moms totalt: 25.00
+            Total inkl moms: 125.00
+
+            Page 2 repeated footer
+            Moms 25%: 25.00
+            Moms totalt: 25.00
+            Total inkl moms: 125.00
+        """)
+        self.assertEqual(parsed["vat_amount"], "25.00")
+        self.assertEqual(parsed["gross_amount"], "125.00")
+
+    def test_expense_company_allocation_attachments_and_delete_tombstone(self):
+        client_id = str(uuid.uuid4())
+        server_conn = self.server.get_db_connection()
+        object_row = server_conn.execute(
+            "SELECT id, sync_id, name FROM meta_objects WHERE is_active = 1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(object_row)
+        stable_object_id = int(object_row["id"])
+        stable_sync_id = object_row["sync_id"]
+        payload = {
+            "client_id": client_id,
+            "supplier_name": "Shared expense supplier",
+            "document_date": "2026-10-17",
+            "currency_code": "SEK",
+            "gross_amount": "125.00",
+            "vat_amount": "25.00",
+            "verification_status": "requires_review",
+            "allocations": [{
+                "object_id": None,
+                "gross_amount": "25.00",
+                "vat_amount": "5.00",
+            }, {
+                "object_id": stable_object_id,
+                "gross_amount": "75.00",
+                "vat_amount": "15.00",
+            }],
+        }
+        server_conn.close()
+
+        response = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            data={
+                "payload": json.dumps(payload),
+                "originals": [
+                    (BytesIO(b"first synthetic image"), "page-1.png"),
+                    (BytesIO(b"second synthetic image"), "page-2.png"),
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.get_json())
+        document = response.get_json()["document"]
+        self.assertEqual(document["net_amount"], "100.00")
+        self.assertEqual(document["allocated_gross"], "100.00")
+        self.assertEqual(document["unallocated_gross"], "25.00")
+        self.assertEqual(document["allocated_vat"], "20.00")
+        self.assertEqual(document["unallocated_vat"], "5.00")
+        self.assertEqual(len(document["attachments"]), 2)
+        self.assertTrue(document["allocations"][0]["company_expense"])
+        self.assertIsNone(document["allocations"][0]["object_id"])
+        self.assertEqual(document["allocations"][1]["object_id"], stable_object_id)
+        server_conn = self.server.get_db_connection()
+        server_conn.execute(
+            "UPDATE meta_objects SET name = ? WHERE id = ? AND sync_id IS ?",
+            ("Expense object renamed", stable_object_id, stable_sync_id),
+        )
+        server_conn.commit()
+        server_conn.close()
+        renamed = self.server_client.get(
+            f"/api/expense-documents/{document['id']}",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["document"]
+        self.assertEqual(renamed["allocations"][1]["object_id"], stable_object_id)
+        self.assertEqual(renamed["allocations"][1]["object_name"], "Expense object renamed")
+        object_summary = self.server_client.get(
+            f"/api/expense-objects/{stable_object_id}/expenses",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()
+        self.assertEqual(
+            object_summary["documents"][0]["object_gross"], "75.00"
+        )
+        self.assertNotEqual(
+            object_summary["documents"][0]["object_gross"],
+            object_summary["documents"][0]["gross_amount"],
+        )
+
+        attachment = document["attachments"][1]
+        original = self.server_client.get(
+            f"/api/expense-documents/{document['id']}/attachments/{attachment['id']}/original",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        )
+        self.assertEqual(original.status_code, 200)
+        self.assertEqual(original.data, b"second synthetic image")
+        original.close()
+
+        deleted = self.server_client.delete(
+            f"/api/expense-documents/by-client/{client_id}",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.server_client.delete(
+            f"/api/expense-documents/by-client/{client_id}",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).status_code, 200)
+        listed = self.server_client.get(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        )
+        self.assertEqual(listed.get_json()["documents"], [])
+        self.assertEqual(self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            json=payload,
+        ).status_code, 410)
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(server_conn.execute(
+            "SELECT is_deleted FROM expense_documents WHERE client_id = ?", (client_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(server_conn.execute(
+            "SELECT COUNT(*) FROM expense_document_attachments WHERE document_id = ?",
+            (document["id"],),
+        ).fetchone()[0], 2)
+        server_conn.close()
+
+    def test_expense_schema_upgrade_preserves_allocations_and_original_metadata(self):
+        conn = self.server.get_db_connection()
+        object_id = conn.execute("""
+            INSERT INTO meta_objects (company,name,markning,rate,transport_rate,is_active)
+            VALUES ('Renatur','Migration expense object','p-migration',0,0,1)
+        """).lastrowid
+        document_id = conn.execute("""
+            INSERT INTO expense_documents (
+                client_id,supplier_name,document_date,currency_code,gross_amount,
+                verification_status,original_name,stored_name,file_sha256,created_at,updated_at
+            ) VALUES ('migration-client','Legacy supplier','2026-10-17','SEK','100.00',
+                      'draft','legacy.pdf','legacy-stored.pdf',?, 'created','updated')
+        """, ("a" * 64,)).lastrowid
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DROP INDEX IF EXISTS idx_expense_allocations_object")
+        conn.execute("ALTER TABLE expense_allocations RENAME TO expense_allocations_before_company_costs")
+        conn.execute("""
+            CREATE TABLE expense_allocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+                object_id INTEGER NOT NULL REFERENCES meta_objects(id) ON DELETE RESTRICT,
+                allocated_gross TEXT NOT NULL,
+                allocated_net TEXT,
+                allocated_vat TEXT,
+                allocation_note TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            INSERT INTO expense_allocations (id,document_id,object_id,allocated_gross,allocated_net,allocated_vat)
+            VALUES (77,?,?, '100.00','80.00','20.00')
+        """, (document_id, object_id))
+        conn.execute("DROP TABLE expense_allocations_before_company_costs")
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.close()
+
+        with patch.object(self.server, "create_database_backup", return_value=None):
+            self.server.init_cloud_db()
+
+        conn = self.server.get_db_connection()
+        allocation_columns = {
+            row["name"]: row["notnull"]
+            for row in conn.execute("PRAGMA table_info(expense_allocations)")
+        }
+        self.assertEqual(allocation_columns["object_id"], 0)
+        self.assertEqual(tuple(conn.execute(
+            "SELECT id,document_id,object_id,allocated_gross,allocated_net,allocated_vat "
+            "FROM expense_allocations WHERE id=77"
+        ).fetchone()), (77, document_id, object_id, "100.00", "80.00", "20.00"))
+        self.assertEqual(tuple(conn.execute(
+            "SELECT original_name,stored_name,file_sha256 FROM expense_document_attachments "
+            "WHERE document_id=?", (document_id,)
+        ).fetchone()), ("legacy.pdf", "legacy-stored.pdf", "a" * 64))
+        self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        conn.close()
+
+    def test_expense_outbox_offline_lost_ack_attachment_and_delete(self):
+        from reportlab.pdfgen import canvas
+
+        client_id = str(uuid.uuid4())
+        attachment_path = Path(self._case.name) / "expense-original.pdf"
+        pdf = canvas.Canvas(str(attachment_path))
+        for page_number in range(3):
+            pdf.drawString(40, 760, f"Expense original page {page_number + 1}")
+            pdf.showPage()
+        pdf.save()
+        expected_attachment = attachment_path.read_bytes()
+        payload = {
+            "client_id": client_id,
+            "supplier_name": "Offline supplier",
+            "document_date": "2026-10-17",
+            "currency_code": "SEK",
+            "gross_amount": "125.00",
+            "vat_amount": "25.00",
+            "verification_status": "requires_review",
+            "allocations": [{
+                "object_id": None, "gross_amount": "50.00", "vat_amount": "10.00",
+            }],
+        }
+        harness = SimpleNamespace()
+        self.desktop.SmartReportApp.queue_expense_document_operation(
+            harness, client_id, "upsert", payload, attachment_paths=[attachment_path]
+        )
+        restart_code = (
+            "import app,sys; app.DB_FILE=sys.argv[1]; "
+            "conn=app.get_db_connection(); "
+            "print(conn.execute('SELECT COUNT(*) FROM expense_document_outbox').fetchone()[0]); "
+            "conn.close()"
+        )
+        self.assertEqual(subprocess.check_output(
+            [sys.executable, "-c", restart_code, self.desktop.DB_FILE], text=True
+        ).strip(), "1")
+        mode = {"value": "offline"}
+
+        def fake_request(method, url, headers=None, timeout=None, **kwargs):
+            path = urlsplit(url).path
+            if mode["value"] == "offline":
+                mode["value"] = "lost_ack"
+                raise self.desktop.requests.ConnectionError("simulated offline")
+            data = dict(kwargs.get("data") or {})
+            files = kwargs.get("files") or []
+            if files:
+                data["originals"] = [
+                    (stream, filename, content_type)
+                    for _field_name, (filename, stream, content_type) in files
+                ]
+                response = self.server_client.open(
+                    path, method=method, headers=headers, data=data,
+                )
+            else:
+                response = self.server_client.open(
+                    path, method=method, headers=headers, json=kwargs.get("json"),
+                )
+            if mode["value"] == "lost_ack" and method == "POST":
+                mode["value"] = None
+                raise self.desktop.requests.ConnectionError("simulated lost ACK")
+            return SimpleNamespace(
+                status_code=response.status_code,
+                json=response.get_json,
+            )
+
+        with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual(result["synced"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(desktop_conn.execute(
+                "SELECT state FROM expense_document_outbox WHERE client_id = ?", (client_id,)
+            ).fetchone()[0], "pending")
+            desktop_conn.close()
+
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual(result["synced"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(desktop_conn.execute(
+                "SELECT state FROM expense_document_outbox WHERE client_id = ?", (client_id,)
+            ).fetchone()[0], "pending")
+            desktop_conn.close()
+
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            if result["synced"] != 1:
+                desktop_conn = self.desktop.get_db_connection()
+                pending = dict(desktop_conn.execute(
+                    "SELECT state, last_error, server_document_id FROM expense_document_outbox WHERE client_id = ?",
+                    (client_id,),
+                ).fetchone())
+                desktop_conn.close()
+                self.fail(f"Upsert sync was not acknowledged: {pending}")
+
+            server_conn = self.server.get_db_connection()
+            document = server_conn.execute(
+                "SELECT id, is_deleted, sync_version FROM expense_documents WHERE client_id = ?",
+                (client_id,),
+            ).fetchone()
+            self.assertEqual(tuple(document)[1], 0)
+            self.assertEqual(server_conn.execute(
+                "SELECT COUNT(*) FROM expense_documents WHERE client_id = ?", (client_id,)
+            ).fetchone()[0], 1)
+            attachment_id = server_conn.execute(
+                "SELECT id FROM expense_document_attachments WHERE document_id = ?",
+                (document["id"],),
+            ).fetchone()[0]
+            server_conn.close()
+            original = self.server_client.get(
+                f"/api/expense-documents/{document['id']}/attachments/{attachment_id}/original",
+                headers={"X-Sync-Key": "isolated-sync-test-key"},
+            )
+            self.assertEqual(original.data, expected_attachment)
+            original.close()
+
+            updated_payload = {**payload, "document_comment": "corrected manually"}
+            self.desktop.SmartReportApp.queue_expense_document_operation(
+                harness, client_id, "upsert", updated_payload,
+                server_document_id=int(document["id"]),
+                server_version=int(document["sync_version"]), attachment_paths=[],
+            )
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual(result["synced"], 1)
+            server_conn = self.server.get_db_connection()
+            self.assertEqual(server_conn.execute(
+                "SELECT COUNT(*) FROM expense_documents WHERE client_id = ?", (client_id,)
+            ).fetchone()[0], 1)
+            self.assertEqual(server_conn.execute(
+                "SELECT document_comment FROM expense_documents WHERE client_id = ?", (client_id,)
+            ).fetchone()[0], "corrected manually")
+            self.assertEqual(server_conn.execute(
+                "SELECT COUNT(*) FROM expense_document_attachments WHERE document_id = ?",
+                (document["id"],),
+            ).fetchone()[0], 1)
+            delete_version = server_conn.execute(
+                "SELECT sync_version FROM expense_documents WHERE id = ?", (document["id"],)
+            ).fetchone()[0]
+            server_conn.close()
+
+            self.desktop.SmartReportApp.queue_expense_document_operation(
+                harness, client_id, "delete", {"client_id": client_id},
+                server_document_id=int(document["id"]),
+                server_version=int(delete_version), attachment_paths=[],
+            )
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            if result["synced"] != 1:
+                desktop_conn = self.desktop.get_db_connection()
+                pending = dict(desktop_conn.execute(
+                    "SELECT state, last_error, server_document_id FROM expense_document_outbox WHERE client_id = ?",
+                    (client_id,),
+                ).fetchone())
+                desktop_conn.close()
+                self.fail(f"Delete sync was not acknowledged: {pending}")
+            self.assertEqual(self.desktop.SmartReportApp._sync_expense_document_outbox(harness)["synced"], 0)
+
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(tuple(server_conn.execute(
+            "SELECT is_deleted, COUNT(*) FROM expense_documents WHERE client_id = ?", (client_id,)
+        ).fetchone()), (1, 1))
+        server_conn.close()
+        listed = self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"}
+        )
+        self.assertEqual(listed.get_json()["documents"], [])
+
+    def test_expense_outbox_runs_through_existing_sync_worker(self):
+        client_id = str(uuid.uuid4())
+        payload = {
+            "client_id": client_id, "supplier_name": "Worker supplier",
+            "document_date": "2026-10-17", "currency_code": "SEK",
+            "gross_amount": "50.00", "vat_amount": None,
+            "verification_status": "requires_review", "allocations": [],
+        }
+        conn = self.desktop.get_db_connection()
+        self.desktop.SmartReportApp.queue_expense_document_operation(
+            SimpleNamespace(), client_id, "upsert", payload,
+        )
+        conn.close()
+        result = self._worker()
+        self.assertEqual(result["conflicts"], 0)
+        conn = self.desktop.get_db_connection()
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM expense_document_outbox WHERE client_id = ?", (client_id,)
+        ).fetchone())
+        conn.close()
+        server_conn = self.server.get_db_connection()
+        document = server_conn.execute(
+            "SELECT client_id, gross_amount, vat_amount, net_amount FROM expense_documents WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        server_conn.close()
+        self.assertEqual(tuple(document), (client_id, "50.00", None, None))
+
+    def test_expense_ui_has_one_section_with_two_views(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path,
+                method=method,
+                headers=kwargs.get("headers", {}),
+                query_string=kwargs.get("params"),
+                json=kwargs.get("json"),
+                data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        window = None
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window = self.desktop.SmartReportApp()
+            window.auto_sync_timer.stop()
+            self.assertEqual(window.exp_document_tabs.count(), 2)
+            self.assertEqual(
+                [window.exp_document_tabs.tabText(index) for index in range(2)],
+                ["Все документы", "По объектам"],
+            )
+            main_titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+            self.assertEqual(main_titles.count("Расходы"), 1)
+            self.assertNotIn("Материалы и расходы по объектам", main_titles)
+            self.assertEqual(window.table_supplier_documents.columnCount(), 7)
+            self.assertEqual(window.object_expenses_table.columnCount(), 7)
+            self.assertEqual(window.object_expenses_object.currentIndex(), 0)
+            server_conn = self.server.get_db_connection()
+            stable_object = server_conn.execute(
+                "SELECT id, sync_id FROM meta_objects WHERE is_active = 1 ORDER BY id LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(stable_object)
+            object_id = int(stable_object["id"])
+            window.exp_filter_object.setCurrentIndex(window.exp_filter_object.findData(object_id))
+            window.object_expenses_object.setCurrentIndex(
+                window.object_expenses_object.findData(object_id)
+            )
+            server_conn.execute(
+                "UPDATE meta_objects SET name = 'Stable expense object renamed' WHERE id = ?",
+                (object_id,),
+            )
+            server_conn.commit()
+            server_conn.close()
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.load_expense_document_filters()
+            self.assertEqual(window.exp_filter_object.currentData(), object_id)
+            self.assertEqual(window.object_expenses_object.currentData(), object_id)
+            self.assertIn("Stable expense object renamed", window.object_expenses_object.currentText())
+        finally:
+            if window is not None:
+                window.auto_sync_timer.stop()
+                window.close()
+                window.deleteLater()
+                window._expense_temp_directory.cleanup()
 
     def test_markning_editor_survives_background_table_refresh(self):
         from PyQt6.QtTest import QTest
@@ -664,6 +1251,371 @@ class CatalogSyncTests(unittest.TestCase):
             'OB1 (19:00–21:00) — Helgdag 2026-10-19 19:00–21:00',
         )
 
+    def test_expense_form_queues_manual_company_document(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path,
+                method=method,
+                headers=kwargs.get("headers", {}),
+                query_string=kwargs.get("params"),
+                json=kwargs.get("json"),
+                data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+
+            def fill_and_accept(dialog):
+                dialog.findChild(self.desktop.QLineEdit, "expenseSupplier").setText("Manual supplier")
+                dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").setText("125.00")
+                dialog.findChild(self.desktop.QLineEdit, "expenseVatInput").setText("25.00")
+                object_combo = dialog.findChild(self.desktop.QComboBox, "expenseObject")
+                object_combo.setCurrentIndex(object_combo.findData("company"))
+                window.load_expense_document_filters()
+                self.assertEqual(
+                    dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").text(),
+                    "125.00",
+                )
+                self.assertEqual(
+                    dialog.findChild(self.desktop.QLineEdit, "expenseSupplier").text(),
+                    "Manual supplier",
+                )
+                dialog.accept()
+                return self.desktop.QDialog.DialogCode.Accepted
+
+            with patch.object(self.desktop.QDialog, "exec", new=fill_and_accept), \
+                 patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                self.assertTrue(window._expense_document_review_dialog(
+                    parsed_fields={"currency_code": "SEK", "document_type": "manual"},
+                    recognition_message="Распознавание не запускалось; заполните поля вручную.",
+                ))
+
+            desktop_conn = self.desktop.get_db_connection()
+            outbox = desktop_conn.execute(
+                "SELECT client_id, operation, payload_json FROM expense_document_outbox"
+            ).fetchone()
+            self.assertEqual(outbox["operation"], "upsert")
+            payload = __import__("json").loads(outbox["payload_json"])
+            self.assertEqual(payload["supplier_name"], "Manual supplier")
+            self.assertEqual(payload["gross_amount"], "125.00")
+            self.assertEqual(payload["vat_amount"], "25.00")
+            self.assertEqual(payload["net_amount"], "100.00")
+            self.assertEqual(payload["allocations"], [{
+                "object_id": None, "gross_amount": "125.00", "vat_amount": "25.00",
+            }])
+            desktop_conn.close()
+            self.assertEqual(window.table_supplier_documents.rowCount(), 1)
+            self.assertIn("Общие расходы фирмы", window.table_supplier_documents.item(0, 3).text())
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_expense_ocr_failure_still_saves_manual_correction_and_original(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path, method=method,
+                headers=kwargs.get("headers", {}),
+                query_string=kwargs.get("params"),
+                json=kwargs.get("json"), data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        source = Path(self._case.name) / "unreadable.png"
+        source.write_bytes(b"synthetic unreadable image")
+        expected_original = source.read_bytes()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+
+            def fill_manual_values(dialog):
+                dialog.findChild(self.desktop.QLineEdit, "expenseSupplier").setText("Corrected supplier")
+                dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").setText("50.00")
+                dialog.findChild(self.desktop.QLineEdit, "expenseVatInput").setText("10.00")
+                dialog.findChild(self.desktop.QComboBox, "expenseObject").setCurrentIndex(
+                    dialog.findChild(self.desktop.QComboBox, "expenseObject").findData("company")
+                )
+                dialog.accept()
+                return self.desktop.QDialog.DialogCode.Accepted
+
+            with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(source)], "")), \
+                 patch("expense_documents.extract_local_document", side_effect=ValueError("simulated OCR failure")), \
+                 patch.object(self.desktop.QDialog, "exec", new=fill_manual_values), \
+                 patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.upload_expense_document()
+
+            desktop_conn = self.desktop.get_db_connection()
+            outbox = desktop_conn.execute(
+                "SELECT payload_json, attachment_paths_json FROM expense_document_outbox"
+            ).fetchone()
+            payload = json.loads(outbox["payload_json"])
+            attachment_paths = json.loads(outbox["attachment_paths_json"])
+            desktop_conn.close()
+            self.assertEqual(payload["supplier_name"], "Corrected supplier")
+            self.assertEqual(payload["gross_amount"], "50.00")
+            self.assertEqual(payload["vat_amount"], "10.00")
+            self.assertEqual(payload["verification_status"], "requires_review")
+            self.assertEqual(len(attachment_paths), 1)
+            self.assertEqual(Path(attachment_paths[0]).read_bytes(), expected_original)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_expense_multiple_photos_are_one_editable_document(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path, method=method,
+                headers=kwargs.get("headers", {}), query_string=kwargs.get("params"),
+                json=kwargs.get("json"), data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        sources = []
+        for index in range(2):
+            path = Path(self._case.name) / f"page-{index + 1}.jpg"
+            path.write_bytes(f"synthetic image {index + 1}".encode())
+            sources.append(path)
+        from expense_documents import ExtractionResult
+
+        extraction_results = [
+            ExtractionResult(
+                text="Leverantör: OCR Supplier\nFakturadatum: 2026-10-17\nTotal inkl moms: 125.00",
+                method="test OCR", confidence=0.9,
+            ),
+            ExtractionResult(
+                text="Moms totalt: 25.00\nTotal inkl moms: 125.00",
+                method="test OCR", confidence=0.9,
+            ),
+        ]
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+
+            def correct_and_accept(dialog):
+                dialog.findChild(self.desktop.QLineEdit, "expenseSupplier").setText("Corrected supplier")
+                dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").setText("125.00")
+                dialog.findChild(self.desktop.QLineEdit, "expenseVatInput").setText("25.00")
+                dialog.accept()
+                return self.desktop.QDialog.DialogCode.Accepted
+
+            with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=(list(map(str, sources)), "")), \
+                 patch("expense_documents.extract_local_document", side_effect=extraction_results), \
+                 patch.object(self.desktop.QDialog, "exec", new=correct_and_accept), \
+                 patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.upload_expense_document()
+
+            desktop_conn = self.desktop.get_db_connection()
+            outbox = desktop_conn.execute(
+                "SELECT payload_json, attachment_paths_json FROM expense_document_outbox"
+            ).fetchone()
+            payload = json.loads(outbox["payload_json"])
+            stored_paths = json.loads(outbox["attachment_paths_json"])
+            desktop_conn.close()
+            self.assertEqual(payload["supplier_name"], "Corrected supplier")
+            self.assertEqual(payload["gross_amount"], "125.00")
+            self.assertEqual(payload["vat_amount"], "25.00")
+            self.assertIn("page-1.jpg", payload["recognized_text"])
+            self.assertIn("page-2.jpg", payload["recognized_text"])
+            self.assertEqual(len(stored_paths), 2)
+            self.assertEqual(
+                [Path(path).read_bytes() for path in stored_paths],
+                [path.read_bytes() for path in sources],
+            )
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_document_gallery_shows_all_pdf_pages_and_multiple_photos(self):
+        from reportlab.pdfgen import canvas
+
+        for page_count in (1, 3, 4):
+            pdf_path = Path(self._case.name) / f"pages-{page_count}.pdf"
+            document = canvas.Canvas(str(pdf_path))
+            for page in range(page_count):
+                document.drawString(40, 760, f"Invoice page {page + 1}")
+                document.showPage()
+            document.save()
+
+            gallery = self.desktop.DocumentGalleryDialog([pdf_path], pdf_path.name)
+            try:
+                self.assertEqual(len(gallery._pages), page_count)
+                for page in range(page_count):
+                    gallery.show_page(page)
+                    self.assertIn(f"{page + 1} / {page_count}", gallery.page_label.text())
+                    self.assertFalse(gallery.preview._image.pixmap().isNull())
+            finally:
+                gallery.close()
+
+        photo_paths = []
+        for index in range(2):
+            path = Path(self._case.name) / f"photo-{index + 1}.png"
+            pixmap = self.desktop.QPixmap(24, 24)
+            pixmap.fill(self.desktop.QColor("#2b6cb0" if index == 0 else "#2f855a"))
+            self.assertTrue(pixmap.save(str(path), "PNG"))
+            photo_paths.append(path)
+        gallery = self.desktop.DocumentGalleryDialog(photo_paths, "Photo bundle")
+        try:
+            self.assertEqual(len(gallery._pages), 2)
+            gallery.show_page(1)
+            self.assertIn("2 / 2", gallery.page_label.text())
+            self.assertFalse(gallery.preview._image.pixmap().isNull())
+        finally:
+            gallery.close()
+
+    def test_expense_form_splits_one_document_by_stable_object_ids(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path, method=method,
+                headers=kwargs.get("headers", {}),
+                query_string=kwargs.get("params"),
+                json=kwargs.get("json"), data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        server_conn = self.server.get_db_connection()
+        object_ids = [server_conn.execute("""
+            INSERT INTO meta_objects (sync_id,company,name,markning,rate,transport_rate,is_active,sync_version)
+            VALUES (?, 'Renatur', ?, ?, 0, 0, 1, 0)
+        """, (str(uuid.uuid4()), name, marking)).lastrowid
+            for name, marking in (("Split object A", "p-split-a"), ("Split object B", "p-split-b"))
+        ]
+        server_conn.commit()
+        server_conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+
+            def fill_split_and_accept(dialog):
+                dialog.findChild(self.desktop.QLineEdit, "expenseSupplier").setText("Split supplier")
+                dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").setText("125.00")
+                dialog.findChild(self.desktop.QLineEdit, "expenseVatInput").setText("25.00")
+                dialog.findChild(self.desktop.QComboBox, "expenseObject").setCurrentIndex(
+                    dialog.findChild(self.desktop.QComboBox, "expenseObject").findData(object_ids[0])
+                )
+                dialog.findChild(self.desktop.QCheckBox, "expenseSplitByObjects").setChecked(True)
+                table = dialog.findChild(self.desktop.QTableWidget, "expenseAllocations")
+                table.item(0, 1).setText("60.00")
+                table.item(0, 2).setText("12.00")
+                dialog.findChild(self.desktop.QPushButton, "expenseAddAllocation").click()
+                second_object = table.cellWidget(1, 0)
+                second_object.setCurrentIndex(second_object.findData(object_ids[1]))
+                table.item(1, 1).setText("65.00")
+                table.item(1, 2).setText("13.00")
+                dialog.accept()
+                return self.desktop.QDialog.DialogCode.Accepted
+
+            with patch.object(self.desktop.QDialog, "exec", new=fill_split_and_accept), \
+                 patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                self.assertTrue(window._expense_document_review_dialog(
+                    parsed_fields={"currency_code": "SEK", "document_type": "invoice"},
+                    recognition_message="Распознавание выполнено; поля проверены вручную.",
+                ))
+
+            desktop_conn = self.desktop.get_db_connection()
+            payload = self.desktop.json.loads(desktop_conn.execute(
+                "SELECT payload_json FROM expense_document_outbox"
+            ).fetchone()[0])
+            desktop_conn.close()
+            self.assertEqual(payload["allocations"], [
+                {"object_id": object_ids[0], "gross_amount": "60.00", "vat_amount": "12.00"},
+                {"object_id": object_ids[1], "gross_amount": "65.00", "vat_amount": "13.00"},
+            ])
+            self.assertEqual(
+                sum(Decimal(item["gross_amount"]) for item in payload["allocations"]),
+                Decimal("125.00"),
+            )
+            self.assertEqual(
+                sum(Decimal(item["vat_amount"]) for item in payload["allocations"]),
+                Decimal("25.00"),
+            )
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_expense_pdf_extraction_reads_every_page(self):
+        from reportlab.pdfgen import canvas
+        from expense_documents import extract_local_document
+
+        for page_count in (1, 3, 4):
+            pdf_path = Path(self._case.name) / f"ocr-pages-{page_count}.pdf"
+            document = canvas.Canvas(str(pdf_path))
+            expected_pages = []
+            for page in range(page_count):
+                text = f"Unique invoice page marker {page + 1} of {page_count}"
+                expected_pages.append(text)
+                document.drawString(40, 760, text)
+                document.showPage()
+            document.save()
+            extracted = extract_local_document(pdf_path)
+            for text in expected_pages:
+                self.assertIn(text, extracted.text)
+
     def test_catalog_pull_links_exact_legacy_rows_and_preserves_history_and_allocations(self):
         server_objects = (
             ("***", "Tomteboda arbetsledning"),
@@ -802,12 +1754,13 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.close()
 
         result = self._worker()
-        self.assertEqual(result, {
-            "conflicts": 0, "linked_legacy": 1, "unresolved_legacy": 1,
-            "imported_employees": 0, "unresolved_employees": 0,
-            "conflict_details": "",
-            "unresolved_legacy_details": "ненулевые локальные и серверные ставки различаются: 1",
-        })
+        self.assertEqual(result["conflicts"], 0)
+        self.assertEqual(result["linked_legacy"], 1)
+        self.assertEqual(result["unresolved_legacy"], 1)
+        self.assertEqual(result["imported_employees"], 0)
+        self.assertEqual(result["unresolved_employees"], 0)
+        self.assertEqual(result["conflict_details"], "")
+        self.assertTrue(result["unresolved_legacy_details"])
         desktop_conn = self.desktop.get_db_connection()
         local = desktop_conn.execute(
             "SELECT sync_id, server_id, rate, transport_rate FROM objects WHERE id = ?", (local_id,)

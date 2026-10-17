@@ -566,24 +566,77 @@ def init_cloud_db():
             original_name TEXT,
             stored_name TEXT,
             file_sha256 TEXT,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT,
+            sync_version INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     ''')
+    cursor.execute("PRAGMA table_info(expense_documents)")
+    expense_document_columns = {column[1] for column in cursor.fetchall()}
+    for column_name, column_sql in (
+        ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("deleted_at", "TEXT"),
+        ("sync_version", "INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if column_name not in expense_document_columns:
+            cursor.execute(f"ALTER TABLE expense_documents ADD COLUMN {column_name} {column_sql}")
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS expense_allocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
-            object_id INTEGER NOT NULL REFERENCES meta_objects(id) ON DELETE RESTRICT,
+            object_id INTEGER REFERENCES meta_objects(id) ON DELETE RESTRICT,
             allocated_gross TEXT NOT NULL,
             allocated_net TEXT,
             allocated_vat TEXT,
             allocation_note TEXT NOT NULL DEFAULT ''
         )
     ''')
+    cursor.execute("PRAGMA table_info(expense_allocations)")
+    allocation_columns = {column[1]: column for column in cursor.fetchall()}
+    if allocation_columns and allocation_columns["object_id"][3]:
+        cursor.execute("ALTER TABLE expense_allocations RENAME TO expense_allocations_before_company_costs")
+        cursor.execute('''
+            CREATE TABLE expense_allocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+                object_id INTEGER REFERENCES meta_objects(id) ON DELETE RESTRICT,
+                allocated_gross TEXT NOT NULL,
+                allocated_net TEXT,
+                allocated_vat TEXT,
+                allocation_note TEXT NOT NULL DEFAULT ''
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO expense_allocations
+                (id, document_id, object_id, allocated_gross, allocated_net, allocated_vat, allocation_note)
+            SELECT id, document_id, object_id, allocated_gross, allocated_net, allocated_vat, allocation_note
+            FROM expense_allocations_before_company_costs
+        ''')
+        cursor.execute("DROP TABLE expense_allocations_before_company_costs")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_expense_allocations_object ON expense_allocations(object_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_expense_documents_date ON expense_documents(document_date)")
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_documents_file_hash ON expense_documents(file_sha256) WHERE file_sha256 IS NOT NULL")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expense_document_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+            original_name TEXT NOT NULL,
+            stored_name TEXT NOT NULL UNIQUE,
+            file_sha256 TEXT NOT NULL UNIQUE,
+            ordinal INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        INSERT OR IGNORE INTO expense_document_attachments
+            (document_id, original_name, stored_name, file_sha256, ordinal, created_at)
+        SELECT id, COALESCE(original_name, stored_name), stored_name, file_sha256, 0, created_at
+        FROM expense_documents
+        WHERE stored_name IS NOT NULL AND file_sha256 IS NOT NULL
+    ''')
 
     cursor.execute("SELECT COUNT(*) FROM meta_employees")
     if cursor.fetchone()[0] == 0:
@@ -729,12 +782,17 @@ def validate_expense_fields(payload):
             raise ValueError("Дата документа должна быть в формате YYYY-MM-DD.") from error
 
     amount_values = {}
-    for key in ("net_amount", "vat_amount", "gross_amount"):
+    for key in ("vat_amount", "gross_amount"):
         raw_value = payload.get(key)
         value = parse_decimal(raw_value)
         if raw_value not in (None, "") and value is None:
             raise ValueError(f"Некорректная сумма: {key}.")
         amount_values[key] = Decimal(decimal_text(value)) if value is not None else None
+    amount_values["net_amount"] = (
+        amount_values["gross_amount"] - amount_values["vat_amount"]
+        if amount_values["gross_amount"] is not None and amount_values["vat_amount"] is not None
+        else None
+    )
 
     supplier_name = str(payload.get("supplier_name") or "").strip()
     invoice_number = str(payload.get("invoice_number") or "").strip()
@@ -747,12 +805,10 @@ def validate_expense_fields(payload):
         raise ValueError("Комментарий документа слишком длинный.")
 
     if status == "confirmed":
-        if not supplier_name or not document_date or any(amount_values[key] is None for key in amount_values):
-            raise ValueError("Для подтверждения заполните поставщика, дату, нетто, НДС и итог.")
+        if not supplier_name or not document_date or amount_values["gross_amount"] is None:
+            raise ValueError("Для подтверждения заполните поставщика, дату и сумму с НДС.")
         if currency_code == "UNKNOWN":
             raise ValueError("Для подтверждения выберите валюту документа.")
-        if amount_values["net_amount"] + amount_values["vat_amount"] != amount_values["gross_amount"]:
-            raise ValueError("Нетто и НДС не совпадают с общей суммой документа.")
 
     expense_category = str(payload.get("expense_category") or "Прочие расходы").strip()[:100]
     is_transfer_receipt = expense_category.casefold() == "квитанция перевода"
@@ -789,31 +845,53 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         if not isinstance(item, dict):
             raise ValueError("Некорректная строка распределения.")
         object_id = item.get("object_id")
-        if object_id is None:
-            raise ValueError("Для каждой распределённой суммы выберите объект.")
-        try:
-            object_id = int(object_id)
-        except (TypeError, ValueError) as error:
-            raise ValueError("Некорректный объект распределения.") from error
-        cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
-        if cursor.fetchone() is None:
-            raise ValueError("Активный объект не найден в серверном справочнике.")
+        if object_id is not None:
+            try:
+                object_id = int(object_id)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Некорректный объект распределения.") from error
+            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
+            if cursor.fetchone() is None:
+                raise ValueError("Активный объект не найден в серверном справочнике.")
+        allocated_gross = parse_decimal(item.get("gross_amount"))
+        if allocated_gross is None:
+            raise ValueError("Для каждой части укажите сумму с НДС.")
+        allocated_gross = Decimal(decimal_text(allocated_gross))
+        vat_amount = parse_decimal(item.get("vat_amount"))
+        vat_amount = Decimal(decimal_text(vat_amount)) if vat_amount is not None else None
+        if fields["vat_amount"] is None:
+            if vat_amount is not None:
+                raise ValueError("НДС документа неизвестен; суммы НДС распределений тоже оставьте неизвестными.")
+        elif vat_amount is None:
+            if len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"]):
+                vat_amount = Decimal(fields["vat_amount"])
+            else:
+                raise ValueError("Укажите сумму НДС для каждой части; распределять её пропорционально нельзя.")
+        if vat_amount is not None and allocated_gross and (vat_amount > allocated_gross if allocated_gross > 0 else vat_amount < allocated_gross):
+            raise ValueError("НДС части не может превышать её сумму с НДС.")
         normalized.append({
             "object_id": object_id,
-            "gross_amount": item.get("gross_amount"),
+            "gross_amount": decimal_text(allocated_gross),
+            "vat_amount": decimal_text(vat_amount),
+            "net_amount": decimal_text(allocated_gross - vat_amount) if vat_amount is not None else None,
             "note": str(item.get("note") or "")[:500],
         })
 
-    breakdown = allocation_breakdown(
-        fields["gross_amount"], fields["net_amount"], fields["vat_amount"], normalized
-    )
-    return [{
-        "object_id": int(item["object_id"]),
-        "gross_amount": decimal_text(item["gross_amount"]),
-        "net_amount": decimal_text(item["net_amount"]),
-        "vat_amount": decimal_text(item["vat_amount"]),
-        "note": item["note"],
-    } for item in breakdown["allocations"]]
+    total_gross = Decimal(fields["gross_amount"])
+    allocated_gross = sum((Decimal(item["gross_amount"]) for item in normalized), Decimal(0))
+    if allocated_gross and (total_gross == 0 or (allocated_gross > 0) != (total_gross > 0)):
+        raise ValueError("Распределение должно иметь тот же знак, что и сумма фактуры.")
+    if abs(allocated_gross) > abs(total_gross):
+        raise ValueError("Распределённая сумма не может превышать сумму фактуры.")
+    total_vat = fields["vat_amount"]
+    known_allocation_vat = [Decimal(item["vat_amount"]) for item in normalized if item["vat_amount"] is not None]
+    if total_vat is not None:
+        allocated_vat = sum(known_allocation_vat, Decimal(0))
+        if abs(allocated_vat) > abs(Decimal(total_vat)):
+            raise ValueError("Распределённый НДС не может превышать НДС документа.")
+        if allocated_gross == total_gross and allocated_vat != Decimal(total_vat):
+            raise ValueError("При полном распределении суммы частей должны покрыть весь НДС документа.")
+    return normalized
 
 
 def serialize_expense_document(cursor, document, include_text=False):
@@ -822,25 +900,50 @@ def serialize_expense_document(cursor, document, include_text=False):
                a.allocated_gross AS gross_amount, a.allocated_net AS net_amount,
                a.allocated_vat AS vat_amount, a.allocation_note AS note
         FROM expense_allocations a
-        JOIN meta_objects o ON o.id = a.object_id
+        LEFT JOIN meta_objects o ON o.id = a.object_id
         WHERE a.document_id = ? ORDER BY a.id
     """, (document["id"],))
-    allocations = [dict(row) for row in cursor.fetchall()]
-    gross = document["gross_amount"]
-    if gross is None:
-        breakdown = {"allocations": [], "allocated_gross": None, "unallocated_gross": None,
-                     "allocated_net": None, "unallocated_net": None,
-                     "allocated_vat": None, "unallocated_vat": None, "fully_allocated": False}
-    else:
-        breakdown = allocation_breakdown(
-            gross, document["net_amount"], document["vat_amount"], allocations
-        )
-    serialized_allocations = [{
-        **item,
-        "gross_amount": decimal_text(item["gross_amount"]),
-        "net_amount": decimal_text(item["net_amount"]),
-        "vat_amount": decimal_text(item["vat_amount"]),
-    } for item in breakdown["allocations"]]
+    serialized_allocations = []
+    for row in cursor.fetchall():
+        item = dict(row)
+        item["object_id"] = int(item["object_id"]) if item["object_id"] is not None else None
+        item["object_name"] = item["object_name"] or "Общие расходы фирмы"
+        item["company_expense"] = item["object_id"] is None
+        for field in ("gross_amount", "net_amount", "vat_amount"):
+            item[field] = decimal_text(item[field])
+        serialized_allocations.append(item)
+
+    document_gross = parse_decimal(document["gross_amount"])
+    allocated_gross = sum(
+        (parse_decimal(item["gross_amount"]) or Decimal(0) for item in serialized_allocations),
+        Decimal(0),
+    )
+    unallocated_gross = document_gross - allocated_gross if document_gross is not None else None
+    document_vat = parse_decimal(document["vat_amount"])
+    allocated_vat_values = [parse_decimal(item["vat_amount"]) for item in serialized_allocations]
+    allocated_vat = (
+        sum(allocated_vat_values, Decimal(0))
+        if document_vat is not None and all(value is not None for value in allocated_vat_values)
+        else None
+    )
+    unallocated_vat = document_vat - allocated_vat if document_vat is not None and allocated_vat is not None else None
+    document_net = parse_decimal(document["net_amount"])
+    allocated_net_values = [parse_decimal(item["net_amount"]) for item in serialized_allocations]
+    allocated_net = (
+        sum(allocated_net_values, Decimal(0))
+        if document_net is not None and all(value is not None for value in allocated_net_values)
+        else None
+    )
+    unallocated_net = document_net - allocated_net if document_net is not None and allocated_net is not None else None
+    cursor.execute("""
+        SELECT id, original_name FROM expense_document_attachments
+        WHERE document_id = ? ORDER BY ordinal, id
+    """, (document["id"],))
+    attachments = [dict(row) | {"has_original": True} for row in cursor.fetchall()]
+    if not attachments and document["stored_name"]:
+        attachments = [{
+            "id": None, "original_name": document["original_name"], "has_original": True,
+        }]
     serialized = {
         "id": int(document["id"]),
         "client_id": document["client_id"],
@@ -855,15 +958,18 @@ def serialize_expense_document(cursor, document, include_text=False):
         "document_comment": document["document_comment"],
         "verification_status": document["verification_status"],
         "original_name": document["original_name"],
-        "has_original": bool(document["stored_name"]),
+        "has_original": bool(attachments),
+        "attachments": attachments,
         "allocations": serialized_allocations,
-        "allocated_gross": decimal_text(breakdown["allocated_gross"]),
-        "unallocated_gross": decimal_text(breakdown["unallocated_gross"]),
-        "allocated_net": decimal_text(breakdown["allocated_net"]),
-        "unallocated_net": decimal_text(breakdown["unallocated_net"]),
-        "allocated_vat": decimal_text(breakdown["allocated_vat"]),
-        "unallocated_vat": decimal_text(breakdown["unallocated_vat"]),
-        "fully_allocated": breakdown["fully_allocated"],
+        "allocated_gross": decimal_text(allocated_gross),
+        "unallocated_gross": decimal_text(unallocated_gross),
+        "allocated_net": decimal_text(allocated_net),
+        "unallocated_net": decimal_text(unallocated_net),
+        "allocated_vat": decimal_text(allocated_vat),
+        "unallocated_vat": decimal_text(unallocated_vat),
+        "fully_allocated": document_gross is not None and unallocated_gross == 0,
+        "is_deleted": bool(document["is_deleted"]),
+        "sync_version": int(document["sync_version"] or 1),
         "created_at": document["created_at"],
         "updated_at": document["updated_at"],
     }
@@ -934,7 +1040,7 @@ def expense_documents_list_api():
     date_to = request.args.get("date_to", "").strip()
     object_id = request.args.get("object_id", "").strip()
     query = "SELECT * FROM expense_documents"
-    conditions = []
+    conditions = ["is_deleted = 0"]
     params = []
     if date_from:
         conditions.append("document_date >= ?")
@@ -977,11 +1083,73 @@ def expense_document_get_api(document_id):
     try:
         cursor = conn.cursor()
         document = cursor.execute(
-            "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
+            "SELECT * FROM expense_documents WHERE id = ? AND is_deleted = 0", (document_id,)
         ).fetchone()
         if document is None:
             return jsonify({"ok": False, "error": "Документ не найден."}), 404
         return jsonify({"ok": True, "document": serialize_expense_document(cursor, document, include_text=True)})
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/by-client/<string:client_id>", methods=["DELETE"])
+def expense_document_delete_by_client_api(client_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        payload = expense_request_payload() if request.get_data(cache=True) else {}
+        now = datetime.now(timezone.utc).isoformat()
+        existing = conn.execute(
+            "SELECT id, is_deleted, sync_version FROM expense_documents WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+        if existing is None or existing["is_deleted"]:
+            return jsonify({"ok": True, "deleted": True})
+        expected_version = payload.get("expected_version")
+        if expected_version is not None and int(expected_version) != int(existing["sync_version"]):
+            return jsonify({
+                "ok": False, "conflict": True, "error": "Документ изменился на сервере; обновите данные перед удалением.",
+                "current_version": int(existing["sync_version"]),
+            }), 409
+        conn.execute("""
+            UPDATE expense_documents
+            SET is_deleted = 1, deleted_at = ?, updated_at = ?, sync_version = sync_version + 1
+            WHERE id = ? AND is_deleted = 0 AND sync_version = ?
+        """, (now, now, int(existing["id"]), int(existing["sync_version"])))
+        conn.commit()
+        return jsonify({"ok": True, "deleted": True})
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/<int:document_id>", methods=["DELETE"])
+def expense_document_delete_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        payload = expense_request_payload() if request.get_data(cache=True) else {}
+        now = datetime.now(timezone.utc).isoformat()
+        existing = conn.execute(
+            "SELECT is_deleted, sync_version FROM expense_documents WHERE id = ?",
+            (int(document_id),),
+        ).fetchone()
+        if existing is None or existing["is_deleted"]:
+            return jsonify({"ok": True, "deleted": True})
+        expected_version = payload.get("expected_version")
+        if expected_version is not None and int(expected_version) != int(existing["sync_version"]):
+            return jsonify({
+                "ok": False, "conflict": True, "error": "Документ изменился на сервере; обновите данные перед удалением.",
+                "current_version": int(existing["sync_version"]),
+            }), 409
+        conn.execute("""
+            UPDATE expense_documents
+            SET is_deleted = 1, deleted_at = ?, updated_at = ?, sync_version = sync_version + 1
+            WHERE id = ? AND is_deleted = 0 AND sync_version = ?
+        """, (now, now, int(document_id), int(existing["sync_version"])))
+        conn.commit()
+        return jsonify({"ok": True, "deleted": True})
     finally:
         conn.close()
 
@@ -991,7 +1159,8 @@ def expense_document_create_api():
     if not expense_api_authorized():
         return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
     conn = None
-    temporary = target = None
+    staged_files = []
+    targets = []
     committed = False
     try:
         payload = expense_request_payload()
@@ -1007,6 +1176,8 @@ def expense_document_create_api():
             "SELECT * FROM expense_documents WHERE client_id = ?", (client_id,)
         ).fetchone()
         if existing is not None:
+            if existing["is_deleted"]:
+                return jsonify({"ok": False, "error": "Документ с этим client_id уже удалён."}), 410
             document = serialize_expense_document(cursor, existing)
             return jsonify({"ok": True, "duplicate_request": True, "document": document}), 200
 
@@ -1027,22 +1198,48 @@ def expense_document_create_api():
                 }), 409
 
         allocations = resolve_expense_allocations(cursor, payload.get("allocations", []), fields)
-        upload = request.files.get("original")
-        staged = stage_expense_original(upload) if upload and upload.filename else None
-        stored_name = original_name = file_sha256 = None
-        if staged:
+        uploads = [upload for upload in request.files.getlist("originals") if upload and upload.filename]
+        if not uploads:
+            upload = request.files.get("original")
+            uploads = [upload] if upload and upload.filename else []
+        if len(uploads) > 20:
+            raise ValueError("К одному документу можно прикрепить не более 20 файлов.")
+        total_upload_size = 0
+        seen_hashes = set()
+        for ordinal, upload in enumerate(uploads):
+            staged = stage_expense_original(upload)
+            if staged is None:
+                continue
             root, temporary, stored_name, original_name, file_sha256 = staged
-            duplicate = cursor.execute(
-                "SELECT id FROM expense_documents WHERE file_sha256 = ?", (file_sha256,)
-            ).fetchone()
+            total_upload_size += temporary.stat().st_size
+            if total_upload_size > app.config["MAX_CONTENT_LENGTH"]:
+                temporary.unlink(missing_ok=True)
+                raise ValueError("Общий размер оригиналов превышает 25 МБ.")
+            if file_sha256 in seen_hashes:
+                temporary.unlink(missing_ok=True)
+                raise ValueError("Один и тот же файл добавлен к документу несколько раз.")
+            seen_hashes.add(file_sha256)
+            duplicate = cursor.execute("""
+                SELECT d.id FROM expense_documents d
+                LEFT JOIN expense_document_attachments a ON a.document_id = d.id
+                WHERE d.is_deleted = 0 AND (d.file_sha256 = ? OR a.file_sha256 = ?)
+                ORDER BY d.id LIMIT 1
+            """, (file_sha256, file_sha256)).fetchone()
             if duplicate:
+                temporary.unlink(missing_ok=True)
                 return jsonify({
                     "ok": False, "error": "Этот оригинал уже находится в архиве.",
                     "existing_document_id": int(duplicate["id"]),
                 }), 409
             target = root / stored_name
             temporary.replace(target)
-            temporary = None
+            staged_files.append({
+                "temporary": None, "target": target, "stored_name": stored_name,
+                "original_name": original_name, "file_sha256": file_sha256,
+                "ordinal": ordinal,
+            })
+
+        primary = staged_files[0] if staged_files else None
 
         now = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
@@ -1056,8 +1253,10 @@ def expense_document_create_api():
             client_id, fields["supplier_name"], fields["invoice_number"], fields["document_date"],
             fields["currency_code"], fields["net_amount"], fields["vat_amount"],
             fields["gross_amount"], fields["expense_category"], fields["document_comment"],
-            fields["verification_status"], fields["recognized_text"], original_name,
-            stored_name, file_sha256, now, now,
+            fields["verification_status"], fields["recognized_text"],
+            primary["original_name"] if primary else None,
+            primary["stored_name"] if primary else None,
+            primary["file_sha256"] if primary else None, now, now,
         ))
         document_id = int(cursor.lastrowid)
         cursor.executemany("""
@@ -1068,6 +1267,14 @@ def expense_document_create_api():
             document_id, item["object_id"], item["gross_amount"], item["net_amount"],
             item["vat_amount"], item["note"],
         ) for item in allocations])
+        cursor.executemany("""
+            INSERT INTO expense_document_attachments (
+                document_id, original_name, stored_name, file_sha256, ordinal, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, [(
+            document_id, item["original_name"], item["stored_name"],
+            item["file_sha256"], item["ordinal"], now,
+        ) for item in staged_files])
         conn.commit()
         committed = True
         document = cursor.execute(
@@ -1084,10 +1291,12 @@ def expense_document_create_api():
     finally:
         if conn is not None:
             conn.close()
-        if temporary:
-            temporary.unlink(missing_ok=True)
-        if target and not committed:
-            target.unlink(missing_ok=True)
+        for item in staged_files:
+            temporary_path = item.get("temporary")
+            if temporary_path:
+                temporary_path.unlink(missing_ok=True)
+            if item.get("target") and not committed:
+                item["target"].unlink(missing_ok=True)
 
 
 @app.route("/api/expense-documents/<int:document_id>", methods=["PUT"])
@@ -1101,11 +1310,21 @@ def expense_document_update_api(document_id):
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         existing = cursor.execute(
-            "SELECT id FROM expense_documents WHERE id = ?", (document_id,)
+            "SELECT * FROM expense_documents WHERE id = ? AND is_deleted = 0", (document_id,)
         ).fetchone()
         if existing is None:
             conn.rollback()
             return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        expected_version = payload.get("expected_version")
+        if expected_version is not None and int(expected_version) != int(existing["sync_version"]):
+            conn.rollback()
+            return jsonify({
+                "ok": False, "conflict": True,
+                "error": "Документ изменился на сервере; обновите данные перед сохранением.",
+                "current_version": int(existing["sync_version"]),
+            }), 409
+        if "recognized_text" not in payload:
+            fields["recognized_text"] = existing["recognized_text"]
         if fields["supplier_name"] and fields["invoice_number"] and fields["document_date"] and fields["gross_amount"]:
             matching_document = cursor.execute("""
                 SELECT id FROM expense_documents
@@ -1128,14 +1347,19 @@ def expense_document_update_api(document_id):
         cursor.execute("""
             UPDATE expense_documents SET supplier_name=?, invoice_number=?, document_date=?,
                 currency_code=?, net_amount=?, vat_amount=?, gross_amount=?, expense_category=?,
-                document_comment=?, verification_status=?, recognized_text=?, updated_at=?
-            WHERE id=?
+                document_comment=?, verification_status=?, recognized_text=?, updated_at=?,
+                sync_version=sync_version+1
+            WHERE id=? AND sync_version=?
         """, (
             fields["supplier_name"], fields["invoice_number"], fields["document_date"],
             fields["currency_code"], fields["net_amount"], fields["vat_amount"],
             fields["gross_amount"], fields["expense_category"], fields["document_comment"],
             fields["verification_status"], fields["recognized_text"], now, document_id,
+            int(existing["sync_version"]),
         ))
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return jsonify({"ok": False, "conflict": True, "error": "Документ изменился на сервере."}), 409
         cursor.execute("DELETE FROM expense_allocations WHERE document_id = ?", (document_id,))
         cursor.executemany("""
             INSERT INTO expense_allocations (
@@ -1167,23 +1391,62 @@ def expense_document_original_api(document_id):
         return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
     conn = get_db_connection()
     try:
-        document = conn.execute(
-            "SELECT original_name, stored_name FROM expense_documents WHERE id = ?", (document_id,)
-        ).fetchone()
+        document = conn.execute("""
+            SELECT original_name, stored_name FROM expense_documents
+            WHERE id = ? AND is_deleted = 0
+        """, (document_id,)).fetchone()
+        attachment = conn.execute("""
+            SELECT original_name, stored_name FROM expense_document_attachments
+            WHERE document_id = ? ORDER BY ordinal, id LIMIT 1
+        """, (document_id,)).fetchone()
     finally:
         conn.close()
-    if document is None or not document["stored_name"]:
+    if document is None:
+        return jsonify({"ok": False, "error": "Оригинал не найден."}), 404
+    selected_original_name = attachment["original_name"] if attachment else document["original_name"]
+    selected_stored_name = attachment["stored_name"] if attachment else document["stored_name"]
+    if not selected_stored_name:
         return jsonify({"ok": False, "error": "Оригинал не найден."}), 404
     try:
         root = expense_documents_root()
     except (RuntimeError, ValueError) as error:
         return jsonify({"ok": False, "error": str(error)}), 503
-    original = (root / document["stored_name"]).resolve()
+    original = (root / selected_stored_name).resolve()
     if original.parent != root or not original.is_file():
         return jsonify({"ok": False, "error": "Файл оригинала недоступен."}), 404
     return send_file(
         original, as_attachment=True,
-        download_name=document["original_name"] or original.name,
+        download_name=selected_original_name or original.name,
+        conditional=True,
+    )
+
+
+@app.route("/api/expense-documents/<int:document_id>/attachments/<int:attachment_id>/original", methods=["GET"])
+def expense_document_attachment_original_api(document_id, attachment_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        attachment = conn.execute("""
+            SELECT a.original_name, a.stored_name
+            FROM expense_document_attachments a
+            JOIN expense_documents d ON d.id = a.document_id
+            WHERE a.id = ? AND a.document_id = ? AND d.is_deleted = 0
+        """, (int(attachment_id), int(document_id))).fetchone()
+    finally:
+        conn.close()
+    if attachment is None:
+        return jsonify({"ok": False, "error": "Оригинал не найден."}), 404
+    try:
+        root = expense_documents_root()
+    except (RuntimeError, ValueError) as error:
+        return jsonify({"ok": False, "error": str(error)}), 503
+    original = (root / attachment["stored_name"]).resolve()
+    if original.parent != root or not original.is_file():
+        return jsonify({"ok": False, "error": "Файл оригинала недоступен."}), 404
+    return send_file(
+        original, as_attachment=True,
+        download_name=attachment["original_name"] or original.name,
         conditional=True,
     )
 
@@ -1211,7 +1474,7 @@ def expense_object_summary_api(object_id):
         ).fetchone()
         if object_row is None:
             return jsonify({"ok": False, "error": "Объект не найден."}), 404
-        conditions = ["a.object_id = ?"]
+        conditions = ["a.object_id = ?", "d.is_deleted = 0"]
         params = [object_id]
         if date_from:
             conditions.append("d.document_date >= ?")

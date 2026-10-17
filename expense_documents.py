@@ -150,8 +150,14 @@ def parse_document_text(text: str) -> dict[str, Any]:
                 vat_lines.append({"rate": rate, "amount": decimal_text(amount) or "0.00"})
 
     vat_total = parse_decimal(vat_total_raw)
-    if vat_lines:
-        vat_total = sum((parse_decimal(item["amount"]) or Decimal(0) for item in vat_lines), Decimal(0))
+    if vat_lines and vat_total is None:
+        unique_vat_lines = list({
+            (item["rate"], item["amount"]): item for item in vat_lines
+        }.values())
+        vat_total = sum(
+            (parse_decimal(item["amount"]) or Decimal(0) for item in unique_vat_lines),
+            Decimal(0),
+        )
     elif vat_total is None and re.search(r"\bingen moms\b|\bno vat\b|\bvat exempt\b", lower_text):
         vat_total = Decimal(0)
 
