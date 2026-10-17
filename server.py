@@ -18,6 +18,7 @@ from flask import Flask, render_template, request, jsonify, session, make_respon
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from expense_documents import allocation_breakdown, build_project_order_allocations, decimal_text, parse_decimal
+from expense_documents import invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations, parse_invoice_money
 from ob_calculator import calculate_work_interval
 import reportlab
 from reportlab.lib import colors
@@ -795,17 +796,24 @@ def validate_expense_fields(payload):
             raise ValueError("Дата документа должна быть в формате YYYY-MM-DD.") from error
 
     amount_values = {}
-    for key in ("vat_amount", "gross_amount"):
+    net_basis = payload.get("allocation_basis") == "net"
+    for key in (("net_amount", "vat_amount", "gross_amount", "rounding_amount", "amount_due") if net_basis else ("vat_amount", "gross_amount")):
         raw_value = payload.get(key)
-        value = parse_decimal(raw_value)
+        value = parse_invoice_money(raw_value) if net_basis else parse_decimal(raw_value)
         if raw_value not in (None, "") and value is None:
             raise ValueError(f"Некорректная сумма: {key}.")
         amount_values[key] = Decimal(decimal_text(value)) if value is not None else None
-    amount_values["net_amount"] = (
+    if not net_basis:
+        amount_values["net_amount"] = (
         amount_values["gross_amount"] - amount_values["vat_amount"]
         if amount_values["gross_amount"] is not None and amount_values["vat_amount"] is not None
         else None
-    )
+        )
+    elif amount_values["net_amount"] is not None and amount_values["vat_amount"] is not None:
+        expected_gross = amount_values["net_amount"] + amount_values["vat_amount"]
+        if amount_values["gross_amount"] is not None and amount_values["gross_amount"] != expected_gross:
+            raise ValueError("Сумма с НДС до округления не равна сумме без НДС плюс НДС.")
+        amount_values["gross_amount"] = expected_gross
 
     supplier_name = str(payload.get("supplier_name") or "").strip()
     invoice_number = str(payload.get("invoice_number") or "").strip()
@@ -842,12 +850,34 @@ def validate_expense_fields(payload):
         "document_comment": str(payload.get("document_comment") or "").strip(),
         "verification_status": status,
         "recognized_text": str(payload.get("recognized_text") or "")[:100000],
+        "allocation_basis": "net" if net_basis else "gross",
+        "rounding_amount": decimal_text(amount_values.get("rounding_amount")),
+        "amount_due": decimal_text(amount_values.get("amount_due")),
     }
 
 
 def resolve_expense_allocations(cursor, raw_allocations, fields):
     if not isinstance(raw_allocations, list) or len(raw_allocations) > 100:
         raise ValueError("Распределение должно быть списком не более чем из 100 строк.")
+    if fields.get("allocation_basis") == "net":
+        if not invoice_net_schema_ready(cursor):
+            raise ValueError("Схема распределения без НДС ещё не согласована и не применена; очередь сохранена.")
+        for item in raw_allocations:
+            if not isinstance(item, dict):
+                raise ValueError("Некорректная строка распределения.")
+            destination = item.get("destination") or "unselected"
+            if destination not in {"object", "company", "unselected"}:
+                raise ValueError("Некорректное назначение расходов.")
+            for key in ("net_amount", "vat_amount"):
+                if item.get(key) not in (None, "") and parse_invoice_money(item[key]) is None:
+                    raise ValueError("Некорректная сумма распределения.")
+            if destination == "object" and item.get("object_id") is not None:
+                if cursor.execute("SELECT 1 FROM meta_objects WHERE id = ? AND is_active = 1", (item["object_id"],)).fetchone() is None:
+                    raise ValueError("Активный объект не найден в серверном справочнике.")
+        issues = net_invoice_issues(fields, raw_allocations)
+        if fields["verification_status"] == "confirmed" and issues:
+            raise ValueError(" ".join(issues))
+        return normalize_net_allocations(raw_allocations)
     if fields["gross_amount"] is None:
         if raw_allocations:
             raise ValueError("Сначала укажите итоговую сумму документа.")
@@ -977,12 +1007,20 @@ def validate_expense_order_proposals(cursor, raw_proposals):
             "sources": normalized_sources,
             "ambiguous": bool(item.get("ambiguous")),
         })
+        if "destination" in item or "original_marker" in item:
+            proposals[-1].update({
+                "original_marker": str(item.get("original_marker") or "")[:250],
+                "destination": str(item.get("destination") or "unselected"),
+                "expense_category": str(item.get("expense_category") or "")[:100],
+            })
     return proposals
 
 
 def save_expense_project_code_links(cursor, supplier_name, proposals, now):
     supplier_key = normalize_project_code_link_part(supplier_name)
     for proposal in proposals:
+        if not proposal.get("project_code") or proposal.get("object_id") is None or proposal.get("destination") == "company":
+            continue
         cursor.execute("""
             INSERT INTO expense_project_code_links (
                 supplier_key, supplier_name, project_code_key, project_code, object_id, updated_at
@@ -998,11 +1036,33 @@ def save_expense_project_code_links(cursor, supplier_name, proposals, now):
         ))
 
 
+def store_expense_allocation_rows(cursor, document_id, allocations, fields):
+    columns = ["document_id", "object_id", "allocated_gross", "allocated_net", "allocated_vat", "allocation_note"]
+    net_basis = fields.get("allocation_basis") == "net"
+    net_schema = invoice_net_schema_ready(cursor)
+    if net_schema:
+        columns.extend(["destination", "expense_category"])
+    if net_basis:
+        cursor.execute("UPDATE expense_documents SET allocation_basis='net', rounding_amount=?, amount_due=? WHERE id=?",
+                       (fields.get("rounding_amount"), fields.get("amount_due"), document_id))
+    elif invoice_net_schema_ready(cursor):
+        cursor.execute("UPDATE expense_documents SET allocation_basis='gross' WHERE id=?", (document_id,))
+    rows = []
+    for item in allocations:
+        row = [document_id, item["object_id"], item["gross_amount"], item["net_amount"], item["vat_amount"], item["note"]]
+        if net_schema:
+            row.extend([item.get("destination") or ("company" if item["object_id"] is None else "object"), item.get("expense_category") or ""])
+        rows.append(row)
+    cursor.executemany(f"INSERT INTO expense_allocations ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})", rows)
+
+
 def serialize_expense_document(cursor, document, include_text=False):
-    cursor.execute("""
+    net_schema = invoice_net_schema_ready(cursor)
+    allocation_extras = ", a.destination, a.expense_category" if net_schema else ""
+    cursor.execute(f"""
         SELECT a.object_id, o.name AS object_name, o.company, o.markning,
                a.allocated_gross AS gross_amount, a.allocated_net AS net_amount,
-               a.allocated_vat AS vat_amount, a.allocation_note AS note
+               a.allocated_vat AS vat_amount, a.allocation_note AS note {allocation_extras}
         FROM expense_allocations a
         LEFT JOIN meta_objects o ON o.id = a.object_id
         WHERE a.document_id = ? ORDER BY a.id
@@ -1011,8 +1071,8 @@ def serialize_expense_document(cursor, document, include_text=False):
     for row in cursor.fetchall():
         item = dict(row)
         item["object_id"] = int(item["object_id"]) if item["object_id"] is not None else None
-        item["object_name"] = item["object_name"] or "Общие расходы фирмы"
-        item["company_expense"] = item["object_id"] is None
+        item["object_name"] = item["object_name"] or ("Общие расходы фирмы" if item.get("destination", "company") == "company" else "Не выбрано")
+        item["company_expense"] = item.get("destination", "company" if item["object_id"] is None else "object") == "company"
         for field in ("gross_amount", "net_amount", "vat_amount"):
             item[field] = decimal_text(item[field])
         serialized_allocations.append(item)
@@ -1021,8 +1081,8 @@ def serialize_expense_document(cursor, document, include_text=False):
     allocated_gross = sum(
         (parse_decimal(item["gross_amount"]) or Decimal(0) for item in serialized_allocations),
         Decimal(0),
-    )
-    unallocated_gross = document_gross - allocated_gross if document_gross is not None else None
+    ) if all(item["gross_amount"] is not None for item in serialized_allocations) else None
+    unallocated_gross = document_gross - allocated_gross if document_gross is not None and allocated_gross is not None else None
     document_vat = parse_decimal(document["vat_amount"])
     allocated_vat_values = [parse_decimal(item["vat_amount"]) for item in serialized_allocations]
     allocated_vat = (
@@ -1072,7 +1132,10 @@ def serialize_expense_document(cursor, document, include_text=False):
         "unallocated_net": decimal_text(unallocated_net),
         "allocated_vat": decimal_text(allocated_vat),
         "unallocated_vat": decimal_text(unallocated_vat),
-        "fully_allocated": document_gross is not None and unallocated_gross == 0,
+        "fully_allocated": (document_net is not None and unallocated_net == 0) if net_schema and document["allocation_basis"] == "net" else document_gross is not None and unallocated_gross == 0,
+        "allocation_basis": document["allocation_basis"] if net_schema else "gross",
+        "rounding_amount": document["rounding_amount"] if net_schema else None,
+        "amount_due": document["amount_due"] if net_schema else None,
         "is_deleted": bool(document["is_deleted"]),
         "sync_version": int(document["sync_version"] or 1),
         "created_at": document["created_at"],
@@ -1141,6 +1204,11 @@ def expense_objects_api():
 def expense_document_capabilities_api():
     if not expense_api_authorized():
         return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    connection = get_db_connection()
+    try:
+        net_features = ["net_allocations_v1"] if invoice_net_schema_ready(connection) else []
+    finally:
+        connection.close()
     return jsonify({
         "ok": True,
         "api_version": 2,
@@ -1148,7 +1216,7 @@ def expense_document_capabilities_api():
             "client_id", "soft_delete", "attachments",
             "nullable_company_allocations", "versioned_updates",
             "order_proposals", "supplier_project_code_links",
-        ],
+        ] + net_features,
     })
 
 
@@ -1368,7 +1436,7 @@ def expense_document_create_api():
 
         order_proposals = validate_expense_order_proposals(cursor, payload.get("order_proposals", []))
         raw_allocations = payload.get("allocations", [])
-        if order_proposals and fields["verification_status"] == "confirmed":
+        if order_proposals and fields["verification_status"] == "confirmed" and fields["allocation_basis"] != "net":
             raw_allocations = build_project_order_allocations(
                 order_proposals, fields["net_amount"], fields["vat_amount"], fields["gross_amount"],
             )
@@ -1435,14 +1503,7 @@ def expense_document_create_api():
             primary["file_sha256"] if primary else None, now, now,
         ))
         document_id = int(cursor.lastrowid)
-        cursor.executemany("""
-            INSERT INTO expense_allocations (
-                document_id, object_id, allocated_gross, allocated_net, allocated_vat, allocation_note
-            ) VALUES (?, ?, ?, ?, ?, ?)
-        """, [(
-            document_id, item["object_id"], item["gross_amount"], item["net_amount"],
-            item["vat_amount"], item["note"],
-        ) for item in allocations])
+        store_expense_allocation_rows(cursor, document_id, allocations, fields)
         cursor.executemany("""
             INSERT INTO expense_document_attachments (
                 document_id, original_name, stored_name, file_sha256, ordinal, created_at
@@ -1493,6 +1554,9 @@ def expense_document_update_api(document_id):
         if existing is None:
             conn.rollback()
             return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        if "allocation_basis" in existing.keys() and existing["allocation_basis"] == "net" and fields["allocation_basis"] != "net":
+            conn.rollback()
+            return jsonify({"ok": False, "conflict": True, "error": "Для изменения распределения без НДС обновите клиент."}), 409
         expected_version = payload.get("expected_version")
         if expected_version is not None and int(expected_version) != int(existing["sync_version"]):
             conn.rollback()
@@ -1525,7 +1589,7 @@ def expense_document_update_api(document_id):
                     "existing_document_id": int(matching_document["id"]),
                 }), 409
         raw_allocations = payload.get("allocations", [])
-        if order_proposals and fields["verification_status"] == "confirmed":
+        if order_proposals and fields["verification_status"] == "confirmed" and fields["allocation_basis"] != "net":
             raw_allocations = build_project_order_allocations(
                 order_proposals, fields["net_amount"], fields["vat_amount"], fields["gross_amount"],
             )
@@ -1549,14 +1613,7 @@ def expense_document_update_api(document_id):
             conn.rollback()
             return jsonify({"ok": False, "conflict": True, "error": "Документ изменился на сервере."}), 409
         cursor.execute("DELETE FROM expense_allocations WHERE document_id = ?", (document_id,))
-        cursor.executemany("""
-            INSERT INTO expense_allocations (
-                document_id, object_id, allocated_gross, allocated_net, allocated_vat, allocation_note
-            ) VALUES (?, ?, ?, ?, ?, ?)
-        """, [(
-            document_id, item["object_id"], item["gross_amount"], item["net_amount"],
-            item["vat_amount"], item["note"],
-        ) for item in allocations])
+        store_expense_allocation_rows(cursor, document_id, allocations, fields)
         if order_proposals and fields["verification_status"] == "confirmed":
             save_expense_project_code_links(cursor, fields["supplier_name"], order_proposals, now)
         conn.commit()
@@ -1688,7 +1745,8 @@ def expense_object_summary_api(object_id):
             object_allocations = [
                 item for item in document["allocations"] if item["object_id"] == object_id
             ]
-            object_gross = sum((parse_decimal(item["gross_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
+            object_gross_values = [parse_decimal(item["gross_amount"]) for item in object_allocations]
+            object_gross = sum(object_gross_values, Decimal(0)) if all(value is not None for value in object_gross_values) else None
             object_net_values = [parse_decimal(item["net_amount"]) for item in object_allocations]
             object_vat_values = [parse_decimal(item["vat_amount"]) for item in object_allocations]
             object_net = (
@@ -1709,14 +1767,20 @@ def expense_object_summary_api(object_id):
                 bucket = totals.setdefault(currency, {
                     "gross": Decimal(0), "net": Decimal(0), "vat": Decimal(0),
                     "materials": Decimal(0), "other": Decimal(0),
+                    "gross_known": True, "vat_known": True,
                 })
-                bucket["gross"] += object_gross
+                if object_gross is not None:
+                    bucket["gross"] += object_gross
+                else:
+                    bucket["gross_known"] = False
                 if object_net is not None:
                     bucket["net"] += object_net
                 if object_vat is not None:
                     bucket["vat"] += object_vat
+                else:
+                    bucket["vat_known"] = False
                 category = document["expense_category"].casefold()
-                bucket["materials" if "материал" in category or "material" in category else "other"] += object_gross
+                bucket["materials" if "материал" in category or "material" in category else "other"] += object_gross or Decimal(0)
             elif document["verification_status"] == "draft":
                 draft_count += 1
             else:
@@ -1724,7 +1788,10 @@ def expense_object_summary_api(object_id):
             documents.append(document)
 
         summary = {
-            currency: {key: decimal_text(value) for key, value in amounts.items()}
+              currency: {key: (decimal_text(value) if
+                           (key not in {"gross", "materials", "other"} or amounts["gross_known"])
+                           and (key != "vat" or amounts["vat_known"]) else None)
+                       for key, value in amounts.items() if key not in {"gross_known", "vat_known"}}
             for currency, amounts in totals.items()
         }
         return jsonify({

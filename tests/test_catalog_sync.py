@@ -48,6 +48,13 @@ class CatalogSyncTests(unittest.TestCase):
         cls.server = server
         cls.desktop = desktop
         cls.qt_app = QApplication.instance() or QApplication([])
+        from PyQt6.QtGui import QFont, QFontDatabase
+        font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeui.ttf"
+        if font_path.is_file():
+            font_id = QFontDatabase.addApplicationFont(str(font_path))
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                cls.qt_app.setFont(QFont(families[0], 9))
 
     @classmethod
     def tearDownClass(cls):
@@ -364,6 +371,19 @@ class CatalogSyncTests(unittest.TestCase):
         """)
         self.assertEqual(parsed["vat_amount"], "25.00")
         self.assertEqual(parsed["gross_amount"], "125.00")
+
+    def test_invoice_headers_and_product_prices_are_not_field_values(self):
+        from expense_documents import parse_document_text
+
+        result = parse_document_text(
+            "Leverantör företagsinfo\nFakturanummer Fakturans valuta\n"
+            "Artikel 123 Verktyg 25 % 280,96\n25 % 280,96\n"
+        )
+        self.assertIsNone(result["supplier_name"])
+        self.assertIsNone(result["invoice_number"])
+        self.assertIsNone(result["vat_amount"])
+        self.assertIsNone(result["net_amount"])
+        self.assertTrue(result["review_reasons"])
 
     def test_project_order_parser_carries_page_state_deduplicates_and_keeps_code_prefix(self):
         from expense_documents import parse_project_order_allocations
@@ -1619,38 +1639,35 @@ class CatalogSyncTests(unittest.TestCase):
                 window.setup_object_expenses_tab()
 
             def review_and_confirm(dialog):
-                table = dialog.findChild(self.desktop.QTableWidget, "expenseOrderProposals")
+                table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
                 self.assertIsNotNone(table)
                 self.assertEqual(table.rowCount(), 3)
-                dialog.findChild(self.desktop.QPushButton, "expenseAddOrder").click()
+                dialog.findChild(self.desktop.QPushButton, "invoiceAddAllocation").click()
                 self.assertEqual(table.rowCount(), 4)
                 table.setCurrentCell(3, 0)
-                dialog.findChild(self.desktop.QPushButton, "expenseRemoveOrder").click()
+                dialog.findChild(self.desktop.QPushButton, "invoiceRemoveAllocation").click()
                 self.assertEqual(table.rowCount(), 3)
-                self.assertEqual(table.cellWidget(0, 2).currentData(), object_id)
-                self.assertIsNone(table.cellWidget(2, 2).currentData())
-                self.assertEqual(table.item(2, 4).text(), "")
-                self.assertEqual(table.item(2, 5).text(), "")
-                reviewed = dialog.findChild(self.desktop.QCheckBox, "expenseOrdersReviewed")
-                reviewed.setChecked(True)
-                confirm = dialog.findChild(self.desktop.QPushButton, "expenseOrdersConfirm")
+                self.assertEqual(table.cellWidget(0, 3).currentData(), object_id)
+                self.assertEqual(table.cellWidget(2, 2).currentData(), "unselected")
+                confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+                self.assertFalse(confirm.isEnabled())
                 confirm.click()
-                self.assertEqual(warnings.call_count, 1)
                 connection = self.desktop.get_db_connection()
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox").fetchone()[0], 0)
                 connection.close()
-                table.cellWidget(2, 2).setCurrentIndex(table.cellWidget(2, 2).findData(object_id))
-                table.item(2, 4).setText("0.00")
-                self.assertEqual(table.item(2, 5).text(), "20.00")
+                table.cellWidget(2, 2).setCurrentIndex(table.cellWidget(2, 2).findData("company"))
+                table.cellWidget(2, 4).setText("Инструмент")
+                self.assertTrue(confirm.isEnabled())
                 confirm.click()
                 return dialog.result()
 
             with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(source)], "")), \
                  patch("expense_documents.extract_local_document", return_value=extraction), \
-                 patch.object(self.desktop, "parse_document_text", return_value={
+                 patch.object(self.desktop, "parse_invoice_pages", return_value={
                      "supplier_name": "UI order supplier", "document_date": "2026-10-17",
                      "currency_code": "SEK", "net_amount": "170.00", "vat_amount": "31.00",
-                     "gross_amount": "201.00", "review_reasons": [],
+                     "gross_amount": "201.00", "review_reasons": [], "allocation_basis": "net",
+                     "rounding_amount": "0.00", "amount_due": "201.00", "invoice_number": "UI-123",
                  }), \
                  patch.object(self.desktop, "load_document_preview_pixmap", return_value=self.desktop.QPixmap()), \
                  patch.object(self.desktop.QDialog, "exec", new=review_and_confirm), \
@@ -1666,9 +1683,10 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertIsNotNone(queued)
             payload = json.loads(queued["payload_json"])
             self.assertEqual(payload["verification_status"], "confirmed")
-            self.assertEqual(len(payload["allocations"]), 1)
-            self.assertEqual(payload["allocations"][0]["gross_amount"], "201.00")
-            self.assertEqual(payload["allocations"][0]["vat_amount"], "31.00")
+            self.assertEqual(len(payload["allocations"]), 3)
+            self.assertEqual(payload["allocations"][0]["net_amount"], "100.00")
+            self.assertIsNone(payload["allocations"][2]["vat_amount"])
+            self.assertEqual(payload["allocations"][2]["destination"], "company")
             self.assertEqual([item["sources"][0]["page"] for item in payload["order_proposals"]], [1, 2, 3])
             self.assertEqual(payload["order_proposals"][2]["project_code"], "1022")
             self.assertEqual(len(json.loads(queued["attachment_paths_json"])), 1)
@@ -1864,11 +1882,15 @@ class CatalogSyncTests(unittest.TestCase):
                 window.setup_object_expenses_tab()
 
             def correct_and_accept(dialog):
-                dialog.findChild(self.desktop.QLineEdit, "expenseSupplier").setText("Corrected supplier")
-                dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").setText("125.00")
-                dialog.findChild(self.desktop.QLineEdit, "expenseVatInput").setText("25.00")
-                dialog.accept()
-                return self.desktop.QDialog.DialogCode.Accepted
+                dialog.findChild(self.desktop.QLineEdit, "invoice_supplier_name").setText("Corrected supplier")
+                dialog.findChild(self.desktop.QLineEdit, "invoice_net_amount").setText("100.00")
+                dialog.findChild(self.desktop.QLineEdit, "invoice_vat_amount").setText("25.00")
+                dialog.findChild(self.desktop.QLineEdit, "invoice_amount_due").setText("125.00")
+                table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+                table.item(0, 1).setText("100.00")
+                table.cellWidget(0, 2).setCurrentIndex(table.cellWidget(0, 2).findData("company"))
+                dialog.findChild(self.desktop.QPushButton, "invoiceSaveDraft").click()
+                return dialog.result()
 
             with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=(list(map(str, sources)), "")), \
                  patch("expense_documents.extract_local_document", side_effect=extraction_results), \
@@ -2023,6 +2045,320 @@ class CatalogSyncTests(unittest.TestCase):
         finally:
             window.close()
             window.deleteLater()
+
+    def test_net_invoice_rounding_company_and_unknown_per_order_vat(self):
+        from expense_documents import net_invoice_issues, normalize_net_allocations, migrate_invoice_net_schema, invoice_net_schema_ready
+
+        fields = {"net_amount": "3049.95", "vat_amount": "762.49", "rounding_amount": "-0.44", "amount_due": "3812.00"}
+        rows = [
+            {"original_marker": "P1035", "destination": "object", "object_id": 1, "net_amount": "2000.00"},
+            {"original_marker": "P1035", "destination": "object", "object_id": 1, "net_amount": "340.99"},
+            {"original_marker": "ROMAN BASHCHUK", "destination": "company", "object_id": None,
+             "net_amount": "708.96", "expense_category": "Инструмент"},
+        ]
+        self.assertEqual(net_invoice_issues(fields, rows), [])
+        allocations = normalize_net_allocations(rows)
+        self.assertEqual([item["net_amount"] for item in allocations], ["2340.99", "708.96"])
+        self.assertTrue(all(item["vat_amount"] is None and item["gross_amount"] is None for item in allocations))
+        self.assertIsNone(allocations[1]["object_id"])
+        self.assertEqual(allocations[1]["expense_category"], "Инструмент")
+        self.assertTrue(net_invoice_issues({**fields, "rounding_amount": "0.00"}, rows))
+        self.assertTrue(net_invoice_issues({**fields, "vat_amount": None}, rows))
+        self.assertTrue(net_invoice_issues(fields, [{**rows[0], "destination": "unselected"}]))
+        connection = self.server.get_db_connection()
+        try:
+            self.assertFalse(invoice_net_schema_ready(connection))
+            object_id = int(connection.execute("SELECT id FROM meta_objects LIMIT 1").fetchone()[0])
+            connection.execute("""
+                INSERT INTO expense_documents (client_id, supplier_name, gross_amount, net_amount, vat_amount, created_at, updated_at)
+                VALUES ('preserve-before-net', 'Legacy', '125.00', '100.00', '25.00', 'test', 'test')
+            """)
+            document_id = connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            connection.execute("INSERT INTO expense_allocations (document_id,object_id,allocated_gross,allocated_net,allocated_vat) VALUES (?,?, '125.00','100.00','25.00')",
+                               (document_id, object_id))
+            before = tuple(connection.execute("SELECT id,document_id,object_id,allocated_gross,allocated_net,allocated_vat,allocation_note FROM expense_allocations").fetchone())
+            connection.commit()
+            migrate_invoice_net_schema(connection)
+            self.assertTrue(invoice_net_schema_ready(connection))
+            after = tuple(connection.execute("SELECT id,document_id,object_id,allocated_gross,allocated_net,allocated_vat,allocation_note FROM expense_allocations").fetchone())
+            self.assertEqual(before, after)
+            migrate_invoice_net_schema(connection)
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            connection.close()
+
+    def test_net_invoice_without_explicit_schema_stays_in_outbox(self):
+        from expense_documents import invoice_net_schema_ready
+
+        connection = self.server.get_db_connection()
+        self.assertFalse(invoice_net_schema_ready(connection))
+        connection.close()
+        client_id = str(uuid.uuid4())
+        self.desktop.SmartReportApp.queue_expense_document_operation(SimpleNamespace(), client_id, "upsert", {
+            "client_id": client_id, "allocation_basis": "net", "supplier_name": "Schema test AB",
+            "net_amount": "100.00", "vat_amount": "25.00", "rounding_amount": "0.00", "amount_due": "125.00",
+            "verification_status": "draft", "allocations": [{"destination": "company", "net_amount": "100.00"}],
+        })
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append(method)
+            response = self.server_client.open(urlsplit(url).path, method=method, headers=kwargs.get("headers", {}))
+            return SimpleNamespace(status_code=response.status_code, json=response.get_json)
+
+        with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(SimpleNamespace())
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(calls, ["GET"])
+        connection = self.desktop.get_db_connection()
+        self.assertEqual(connection.execute("SELECT state FROM expense_document_outbox WHERE client_id=?", (client_id,)).fetchone()[0], "pending")
+        connection.close()
+        connection = self.server.get_db_connection()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_documents").fetchone()[0], 0)
+        self.assertFalse(invoice_net_schema_ready(connection))
+        connection.close()
+
+    def test_invoice_scanned_pdf_uses_local_ocr_for_all_missing_pages(self):
+        from reportlab.pdfgen import canvas
+        from expense_documents import extract_local_document, parse_invoice_pages
+        from unittest.mock import Mock
+
+        image = Path(self._case.name) / "scan.png"
+        pixmap = self.desktop.QPixmap(100, 100)
+        pixmap.fill(self.desktop.QColor("white"))
+        pixmap.save(str(image))
+        path = Path(self._case.name) / "scanned.pdf"
+        pdf = canvas.Canvas(str(path))
+        for _index in range(2):
+            pdf.drawImage(str(image), 40, 400, 300, 300)
+            pdf.showPage()
+        pdf.save()
+
+        def detections(lines):
+            return [([[20, index * 30], [450, index * 30], [450, index * 30 + 15], [20, index * 30 + 15]], line, 0.96)
+                    for index, line in enumerate(lines)]
+
+        engine = Mock(side_effect=[
+            (detections(["Supplier: SCAN MATERIAL AB", "Fakturanummer: SCAN-123", "Fakturadatum: 15.10.2026",
+                         "Valuta: SEK", "Proj.nr.: P1022", "Order nr: S-1", "Summa order: 100.00"]), None),
+            (detections(["Summa exkl. moms: 100.00", "Moms: 25.00", "Avrundning: 0.00", "Att betala: 125.00"]), None),
+        ])
+        extraction = extract_local_document(path, ocr_engine=engine)
+        self.assertEqual(engine.call_count, 2)
+        self.assertEqual(extraction.method, "локальный OCR")
+        fields = parse_invoice_pages([{"page": index + 1, "text": text, "elements": extraction.page_elements[index]}
+                                      for index, text in enumerate(extraction.pages)])
+        self.assertEqual(fields["net_amount"], "100.00")
+        self.assertEqual(fields["vat_amount"], "25.00")
+        self.assertEqual(fields["amount_due"], "125.00")
+        self.assertEqual(fields["field_sources"]["vat_amount"][0]["page"], 2)
+
+    def test_invoice_unknown_format_and_missing_tax_remain_review_only(self):
+        from expense_documents import parse_invoice_pages, net_invoice_issues
+
+        unknown = parse_invoice_pages([{"page": 1, "text": "Customer ROMAN BASHCHUK\n280,96 25 %\nAccount summary"}])
+        self.assertIsNone(unknown["supplier_name"])
+        self.assertIsNone(unknown["vat_amount"])
+        self.assertIsNone(unknown["net_amount"])
+        self.assertTrue(unknown["review_reasons"])
+        missing_tax = parse_invoice_pages([{"page": 1, "text":
+            "Supplier: SUPPLIER AB\nFakturanummer: A123\nFakturadatum: 15.10.2026\nValuta: SEK\n"
+            "Summa exkl. moms: 100.00\nAtt betala: 125.00"}])
+        self.assertIsNone(missing_tax["vat_amount"])
+        self.assertTrue(net_invoice_issues(missing_tax, [{"destination": "company", "net_amount": "100.00"}]))
+
+    def test_net_invoice_ui_normal_window_preserves_edits_and_sources(self):
+        from PyQt6.QtGui import QPainter, QFont
+
+        photos = []
+        for index in range(2):
+            path = Path(self._case.name) / f"invoice-view-{index}.png"
+            pixmap = self.desktop.QPixmap(240, 320)
+            pixmap.fill(self.desktop.QColor("#ffffff" if index == 0 else "#f0f0f0"))
+            painter = QPainter(pixmap)
+            painter.setFont(QFont("Segoe UI", 10))
+            painter.setPen(self.desktop.QColor("#202020"))
+            painter.drawText(16, 30, f"Synthetic invoice / page {index + 1}")
+            painter.drawText(16, 60, "BEIJER BYGGMATERIAL AB")
+            painter.drawText(16, 90, "260406399329")
+            painter.end()
+            pixmap.save(str(path))
+            photos.append(str(path))
+        connection = self.server.get_db_connection()
+        connection.execute("INSERT INTO meta_objects (company,name,markning,is_active) VALUES ('Renatur','Invoice P1035','P1035',1)")
+        object_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        connection.commit()
+        connection.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._expense_objects = [{"id": object_id, "name": "Invoice P1035", "markning": "P1035"}]
+        fields = {"allocation_basis": "net", "supplier_name": "BEIJER BYGGMATERIAL AB",
+                  "invoice_number": "260406399329", "document_date": "2026-10-15", "currency_code": "SEK",
+                  "net_amount": "3049.95", "vat_amount": "762.49", "rounding_amount": "-0.44", "amount_due": "3812.00",
+                  "order_proposals": [
+                      {"project_code": "P1035", "original_marker": "P1035", "net_amount": "2340.99",
+                       "sources": [{"page": 1, "attachment_index": 0}]},
+                      {"project_code": None, "original_marker": "ROMAN BASHCHUK", "net_amount": "708.96",
+                       "sources": [{"page": 1, "attachment_index": 1}]},
+                  ]}
+
+        def review(dialog):
+            dialog.resize(1000, 740)
+            dialog.show()
+            self.qt_app.processEvents()
+            table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+            confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+            self.assertFalse(confirm.isEnabled())
+            self.assertEqual(table.cellWidget(1, 2).currentData(), "unselected")
+            self.assertEqual(table.cellWidget(0, 3).currentData(), object_id)
+            table.cellWidget(1, 2).setCurrentIndex(table.cellWidget(1, 2).findData("company"))
+            table.cellWidget(1, 4).setText("Инструмент")
+            supplier = dialog.findChild(self.desktop.QLineEdit, "invoice_supplier_name")
+            supplier.setText("BEIJER BYGGMATERIAL AB / проверено")
+            table.cellWidget(1, 5).click()
+            gallery = dialog.findChild(self.desktop.DocumentGalleryDialog)
+            self.assertEqual(gallery._page_index, 1)
+            self.assertTrue(supplier.text().endswith("проверено"))
+            self.assertTrue(confirm.isEnabled())
+            self.assertLessEqual(dialog.height(), 760)
+            self.assertTrue(confirm.isVisible())
+            self.assertTrue(table.isVisible())
+            self.assertTrue(dialog.rect().contains(confirm.mapTo(dialog, confirm.rect().bottomRight())))
+            self.assertIn("осталось 0.00", dialog.findChild(self.desktop.QLabel, "invoiceDistribution").text())
+            screenshot = os.environ.get("SMARTREPORT_TEST_SCREENSHOT")
+            if screenshot:
+                self.assertTrue(dialog.grab().save(screenshot))
+            confirm.click()
+            return dialog.result()
+
+        try:
+            with patch.object(self.desktop.QDialog, "exec", new=review), \
+                 patch.object(window, "load_expense_documents"), \
+                 patch.object(window, "background_sync_with_cloud"):
+                self.assertTrue(window._review_net_invoice({}, photos, fields))
+            connection = self.desktop.get_db_connection()
+            payload = json.loads(connection.execute("SELECT payload_json FROM expense_document_outbox").fetchone()[0])
+            connection.close()
+            self.assertEqual(payload["allocations"][1]["expense_category"], "Инструмент")
+            self.assertIsNone(payload["allocations"][1]["object_id"])
+            self.assertEqual(payload["rounding_amount"], "-0.44")
+            self.assertIsNone(payload["allocations"][1]["vat_amount"])
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_net_invoice_api_sync_company_separation_and_rounding(self):
+        from expense_documents import migrate_invoice_net_schema
+
+        connection = self.server.get_db_connection()
+        migrate_invoice_net_schema(connection)
+        object_id = int(connection.execute("SELECT id FROM meta_objects WHERE is_active=1 LIMIT 1").fetchone()[0])
+        connection.close()
+        allocations = [
+            {"original_marker": "P1035", "project_code": "P1035", "order_id": "A",
+             "destination": "object", "object_id": object_id, "net_amount": "2340.99", "sources": []},
+            {"original_marker": "ROMAN BASHCHUK", "project_code": None, "order_id": "B",
+             "destination": "company", "object_id": None, "net_amount": "708.96",
+             "expense_category": "Инструмент", "sources": []},
+        ]
+        payload = {
+            "client_id": str(uuid.uuid4()), "supplier_name": "BEIJER BYGGMATERIAL AB",
+            "invoice_number": "260406399329", "document_date": "2026-10-15", "currency_code": "SEK",
+            "allocation_basis": "net", "net_amount": "3049.95", "vat_amount": "762.49",
+            "rounding_amount": "-0.44", "amount_due": "3812.00", "gross_amount": "3812.44",
+            "verification_status": "confirmed", "allocations": allocations, "order_proposals": allocations,
+        }
+        self.desktop.SmartReportApp.queue_expense_document_operation(SimpleNamespace(), payload["client_id"], "upsert", payload)
+        self._worker()
+        self._worker()
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        documents = self.server_client.get("/api/expense-documents", headers=headers).get_json()["documents"]
+        self.assertEqual(len(documents), 1)
+        document = documents[0]
+        self.assertEqual(document["allocation_basis"], "net")
+        self.assertEqual(document["net_amount"], "3049.95")
+        self.assertEqual(document["amount_due"], "3812.00")
+        self.assertEqual(document["rounding_amount"], "-0.44")
+        self.assertEqual(document["vat_amount"], "762.49")
+        self.assertTrue(document["fully_allocated"])
+        self.assertTrue(all(row["vat_amount"] is None for row in document["allocations"]))
+        self.assertIsNone(document["allocations"][1]["object_id"])
+        self.assertEqual(document["allocations"][1]["expense_category"], "Инструмент")
+        self.assertEqual(document["order_proposals"][1]["original_marker"], "ROMAN BASHCHUK")
+        summary = self.server_client.get(f"/api/expense-objects/{object_id}/expenses", headers=headers).get_json()["summary"]["SEK"]
+        self.assertEqual(summary["net"], "2340.99")
+        self.assertIsNone(summary["vat"])
+        self.assertIsNone(summary["gross"])
+        connection = self.server.get_db_connection()
+        self.assertIsNone(connection.execute("SELECT 1 FROM meta_objects WHERE name LIKE '%ROMAN%'").fetchone())
+        connection.close()
+        response = self.server_client.post("/api/expense-documents", headers=headers, json=payload)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertTrue(response.get_json()["duplicate_request"])
+        invalid = {**payload, "expected_version": document["sync_version"], "rounding_amount": "0.00"}
+        response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=invalid)
+        self.assertEqual(response.status_code, 400, response.get_json())
+        invalid["verification_status"] = "draft"
+        response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=invalid)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        legacy_company = self.server_client.post("/api/expense-documents", headers=headers, json={
+            "client_id": str(uuid.uuid4()), "supplier_name": "Legacy company", "document_date": "2026-10-15",
+            "currency_code": "SEK", "gross_amount": "125.00", "vat_amount": "25.00", "verification_status": "confirmed",
+            "allocations": [{"object_id": None, "gross_amount": "125.00", "vat_amount": "25.00"}],
+        })
+        self.assertEqual(legacy_company.status_code, 201, legacy_company.get_json())
+        self.assertTrue(legacy_company.get_json()["document"]["allocations"][0]["company_expense"])
+        old_client_update = {**payload, "allocation_basis": "gross"}
+        old_client_response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=old_client_update)
+        self.assertEqual(old_client_response.status_code, 409, old_client_response.get_json())
+
+    def test_invoice_synthetic_beijer_layout_last_page_totals(self):
+        from reportlab.pdfgen import canvas
+        from expense_documents import extract_local_document, parse_invoice_pages
+
+        path = Path(self._case.name) / "synthetic-beijer-layout.pdf"
+        pdf = canvas.Canvas(str(path))
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(40, 790, "BEIJER BYGGMATERIAL AB")
+        for x, label, value in ((40, "Fakturanummer", "260406399329"),
+                                (210, "Fakturadatum", "15.10.2026"),
+                                (370, "Fakturans valuta", "SEK")):
+            pdf.drawString(x, 740, label)
+            pdf.drawString(x, 722, value)
+        for y, text in ((650, "Proj.nr.: P1035"), (630, "Order nr: A-1"),
+                        (610, "Artikel 1 25 % 280,96"), (590, "Summa order: 2 340,99")):
+            pdf.drawString(40, y, text)
+        pdf.showPage()
+        pdf.setFont("Helvetica", 10)
+        for y, text in ((740, "Proj.nr.: ROMAN BASHCHUK"), (720, "Order nr: B-2"),
+                        (700, "Artikel Verktyg 25 % 280,96"), (680, "Summa order: 708,96")):
+            pdf.drawString(40, y, text)
+        for x, label, value in ((40, "Summa exkl. moms", "3 049,95"),
+                                (210, "Moms", "762,49"), (340, "Avrundning", "-0,44"),
+                                (470, "Att betala", "3 812,00")):
+            pdf.drawString(x, 100, label)
+            pdf.drawString(x, 80, value)
+        pdf.save()
+        extraction = extract_local_document(path)
+        self.assertEqual(len(extraction.page_elements), 2)
+        fields = parse_invoice_pages([
+            {"source": path.name, "page": index + 1, "text": text,
+             "elements": extraction.page_elements[index]}
+            for index, text in enumerate(extraction.pages)
+        ])
+        self.assertEqual(fields["supplier_name"], "BEIJER BYGGMATERIAL AB")
+        self.assertEqual(fields["invoice_number"], "260406399329")
+        self.assertEqual(fields["document_date"], "2026-10-15")
+        self.assertEqual(fields["currency_code"], "SEK")
+        self.assertEqual(fields["net_amount"], "3049.95")
+        self.assertEqual(fields["vat_amount"], "762.49")
+        self.assertEqual(fields["rounding_amount"], "-0.44")
+        self.assertEqual(fields["amount_due"], "3812.00")
+        self.assertEqual(fields["gross_amount"], "3812.44")
+        self.assertEqual(fields["field_sources"]["net_amount"][0]["page"], 2)
+        self.assertEqual([item["net_amount"] for item in fields["order_proposals"]], ["2340.99", "708.96"])
+        self.assertEqual(fields["order_proposals"][1]["original_marker"], "ROMAN BASHCHUK")
+        self.assertIsNone(fields["order_proposals"][1]["project_code"])
 
     def test_expense_pdf_extraction_reads_every_page(self):
         from reportlab.pdfgen import canvas

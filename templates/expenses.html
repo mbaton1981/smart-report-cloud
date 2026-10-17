@@ -169,8 +169,9 @@
     let clientId = newClientId();
     const $ = (id) => document.getElementById(id);
     const money = (value) => {
-        const number = Number(value || 0);
-        return Number.isFinite(number) ? number.toFixed(2) : "0.00";
+        if (value == null || value === "") return "Неизвестно";
+        const number = Number(value);
+        return Number.isFinite(number) ? number.toFixed(2) : "Неизвестно";
     };
     function newClientId() {
         return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;

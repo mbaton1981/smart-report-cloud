@@ -47,6 +47,7 @@ from expense_documents import (
     store_original_file,
     validate_allocations,
 )
+from expense_documents import parse_invoice_pages, parse_invoice_money, net_invoice_issues
 
 # Локальная база данных SQLite и папки
 DB_FILE = os.environ.get("SMARTREPORT_DB_FILE", "smart_report.db")
@@ -1726,15 +1727,23 @@ class DocumentGalleryDialog(QDialog):
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="smartreport_document_gallery_")
         self._pdf_documents = []
         self._pages = []
+        self._attachment_offsets = []
         self._page_index = 0
         starting_page = 0
         for attachment_index, path in enumerate(paths):
+            self._attachment_offsets.append(len(self._pages))
             if attachment_index == initial_attachment:
                 starting_page = len(self._pages) + initial_page
             source = Path(path)
             if source.suffix.casefold() == ".pdf":
                 import pypdfium2 as pdfium
-                document = pdfium.PdfDocument(str(source))
+                try:
+                    document = pdfium.PdfDocument(str(source))
+                except Exception:
+                    for opened_document in self._pdf_documents:
+                        opened_document.close()
+                    self._temporary_directory.cleanup()
+                    raise
                 self._pdf_documents.append(document)
                 self._pages.extend(("pdf", document, page, source.name) for page in range(len(document)))
             else:
@@ -1794,6 +1803,13 @@ class DocumentGalleryDialog(QDialog):
         self.page_label.setText(f"{self._page_index + 1} / {len(self._pages)} · {name}")
         self.previous_button.setEnabled(self._page_index > 0)
         self.next_button.setEnabled(self._page_index + 1 < len(self._pages))
+
+    def show_source(self, attachment_index, page):
+        if 0 <= attachment_index < len(self._attachment_offsets):
+            end = self._attachment_offsets[attachment_index + 1] if attachment_index + 1 < len(self._attachment_offsets) else len(self._pages)
+            index = self._attachment_offsets[attachment_index] + max(0, page - 1)
+            if index < end:
+                self.show_page(index)
 
     def closeEvent(self, event):
         for document in self._pdf_documents:
@@ -2384,6 +2400,8 @@ class SmartReportApp(QMainWindow):
             }
             if any(json.loads(row["payload_json"]).get("order_proposals") for row in rows):
                 required_features.update({"order_proposals", "supplier_project_code_links"})
+            if any(json.loads(row["payload_json"]).get("allocation_basis") == "net" for row in rows):
+                required_features.add("net_allocations_v1")
             try:
                 capability_response = requests.request(
                     "GET",
@@ -7318,14 +7336,19 @@ class SmartReportApp(QMainWindow):
                 allocations.append({
                     **allocation,
                     "object_id": int(object_id) if object_id is not None else None,
-                    "object_name": object_names.get(int(object_id)) if object_id is not None else "Общие расходы фирмы",
-                    "company_expense": object_id is None,
+                    "object_name": object_names.get(int(object_id)) if object_id is not None else
+                        ("Общие расходы фирмы" if allocation.get("destination", "company") == "company" else "Не выбрано"),
+                    "company_expense": object_id is None and allocation.get("destination", "company") == "company",
                 })
             gross = parse_decimal(payload.get("gross_amount"))
             vat = parse_decimal(payload.get("vat_amount"))
             allocated_gross = sum(
                 (parse_decimal(item.get("gross_amount")) or Decimal(0) for item in allocations), Decimal(0)
-            )
+            ) if all(item.get("gross_amount") is not None for item in allocations) else None
+            net_basis = payload.get("allocation_basis") == "net"
+            net = parse_decimal(payload.get("net_amount")) if net_basis else (gross - vat if gross is not None and vat is not None else None)
+            allocated_net_values = [parse_decimal(item.get("net_amount")) for item in allocations]
+            allocated_net = sum(allocated_net_values, Decimal(0)) if all(value is not None for value in allocated_net_values) else None
             allocated_vat_values = [parse_decimal(item.get("vat_amount")) for item in allocations]
             allocated_vat = (
                 sum(allocated_vat_values, Decimal(0))
@@ -7339,12 +7362,14 @@ class SmartReportApp(QMainWindow):
                 "server_document_id": row["server_document_id"],
                 "server_version": row["server_version"],
                 "allocations": allocations,
-                "net_amount": decimal_text(gross - vat) if gross is not None and vat is not None else None,
+                "net_amount": decimal_text(net),
+                "allocated_net": decimal_text(allocated_net),
+                "unallocated_net": decimal_text(net - allocated_net) if net is not None and allocated_net is not None else None,
                 "allocated_gross": decimal_text(allocated_gross),
-                "unallocated_gross": decimal_text(gross - allocated_gross) if gross is not None else None,
+                "unallocated_gross": decimal_text(gross - allocated_gross) if gross is not None and allocated_gross is not None else None,
                 "allocated_vat": decimal_text(allocated_vat),
                 "unallocated_vat": decimal_text(vat - allocated_vat) if vat is not None and allocated_vat is not None else None,
-                "fully_allocated": gross is not None and gross == allocated_gross,
+                "fully_allocated": (net is not None and net == allocated_net) if net_basis else gross is not None and gross == allocated_gross,
                 "sync_state": row["state"],
                 "sync_error": row["last_error"],
                 "local_attachment_paths": json.loads(row["attachment_paths_json"] or "[]"),
@@ -7385,12 +7410,13 @@ class SmartReportApp(QMainWindow):
     @staticmethod
     def _expense_distribution_label(document):
         gross = parse_decimal(document.get("gross_amount"))
-        remaining = parse_decimal(document.get("unallocated_gross"))
+        net_basis = document.get("allocation_basis") == "net"
+        remaining = parse_decimal(document.get("unallocated_net" if net_basis else "unallocated_gross"))
         allocations = document.get("allocations") or []
         if not allocations:
             return "Не распределено"
         if remaining is not None and remaining != 0:
-            return f"Частично; осталось {document['currency_code']} {remaining:,.2f}"
+            return f"Частично; осталось {document['currency_code']} {remaining:,.2f}" + (" без НДС" if net_basis else " с НДС")
         if document.get("sync_state") == "conflict":
             return "Конфликт синхронизации"
         if document.get("sync_state") == "pending":
@@ -7412,11 +7438,11 @@ class SmartReportApp(QMainWindow):
         filtered = []
         for document in documents:
             allocations = document.get("allocations") or []
-            if selected_filter == "company" and not any(item.get("object_id") is None for item in allocations):
+            if selected_filter == "company" and not any(item.get("object_id") is None and item.get("destination", "company") == "company" for item in allocations):
                 continue
             if isinstance(selected_filter, int) and not any(item.get("object_id") == selected_filter for item in allocations):
                 continue
-            remaining = parse_decimal(document.get("unallocated_gross"))
+            remaining = parse_decimal(document.get("unallocated_net" if document.get("allocation_basis") == "net" else "unallocated_gross"))
             if only_unallocated and (remaining is None or remaining == 0):
                 continue
             filtered.append(document)
@@ -7497,10 +7523,11 @@ class SmartReportApp(QMainWindow):
         selected_id = None if is_company else int(object_id)
         rows = []
         totals = {"gross": {}, "vat": {}, "net": {}, "unallocated": {}}
+        unknown = {"gross": False, "vat": False, "net": False}
         for document in documents:
             allocations = [
                 item for item in (document.get("allocations") or [])
-                if (item.get("object_id") is None if is_company else item.get("object_id") == selected_id)
+                if (item.get("object_id") is None and item.get("destination", "company") == "company" if is_company else item.get("object_id") == selected_id)
             ]
             if not allocations:
                 continue
@@ -7511,12 +7538,14 @@ class SmartReportApp(QMainWindow):
                         amount = parse_decimal(allocation.get(field))
                         if amount is not None:
                             totals[key][currency] = totals[key].get(currency, Decimal(0)) + amount
+                        else:
+                            unknown[key] = True
             remaining = parse_decimal(document.get("unallocated_gross"))
             if remaining is not None and remaining:
                 totals["unallocated"][currency] = totals["unallocated"].get(currency, Decimal(0)) + remaining
             rows.append((document, allocations))
-        self.object_expenses_total_lbl.setText(f"Сумма с НДС: {self._expense_money_label(totals['gross'])}")
-        self.object_expenses_vat_lbl.setText(f"Известный НДС: {self._expense_money_label(totals['vat'])}")
+        self.object_expenses_total_lbl.setText("Сумма с НДС: " + ("Неизвестно (не все части указаны)" if unknown["gross"] else self._expense_money_label(totals["gross"])))
+        self.object_expenses_vat_lbl.setText("НДС частей: " + ("Неизвестно (не все части указаны)" if unknown["vat"] else self._expense_money_label(totals["vat"])))
         self.object_expenses_net_lbl.setText(f"Сумма без НДС: {self._expense_money_label(totals['net'])}")
         self.object_expenses_unallocated_lbl.setText(
             f"Не распределено (отдельно): {self._expense_money_label(totals['unallocated'])}"
@@ -7527,14 +7556,19 @@ class SmartReportApp(QMainWindow):
         self.object_expenses_table.setRowCount(len(rows))
         for row_index, (document, allocations) in enumerate(rows):
             currency = str(document.get("currency_code") or "SEK")
-            allocated_gross = sum((parse_decimal(item.get("gross_amount")) or Decimal(0) for item in allocations), Decimal(0))
+            allocated_gross_values = [parse_decimal(item.get("gross_amount")) for item in allocations]
+            allocated_gross = sum(allocated_gross_values, Decimal(0)) if all(value is not None for value in allocated_gross_values) else None
+            allocated_net_values = [parse_decimal(item.get("net_amount")) for item in allocations]
+            allocated_net = sum(allocated_net_values, Decimal(0)) if all(value is not None for value in allocated_net_values) else None
+            amount_label = f"{allocated_gross:,.2f} {currency} с НДС" if allocated_gross is not None else (
+                f"{allocated_net:,.2f} {currency} без НДС" if allocated_net is not None else "Неизвестно")
             allocated_vat_values = [parse_decimal(item.get("vat_amount")) for item in allocations]
             allocated_vat = sum(allocated_vat_values, Decimal(0)) if all(value is not None for value in allocated_vat_values) else None
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "—", document.get("supplier_name") or "Не указан",
                 document.get("invoice_number") or "Документ расходов",
-                f"{allocated_gross:,.2f} {currency}",
+                amount_label,
                 f"{allocated_vat:,.2f} {currency}" if allocated_vat is not None else "Неизвестно",
                 self._expense_distribution_label(document),
             )
@@ -7588,6 +7622,253 @@ class SmartReportApp(QMainWindow):
             combo.setCurrentIndex(2)
         combo.blockSignals(False)
 
+    def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None):
+        fields = {**parsed_fields, **document}
+        server_document = server_document or document
+        client_id = str(fields.get("client_id") or uuid.uuid4())
+        preview_paths = list(source_paths or fields.get("local_attachment_paths") or [])
+        if not preview_paths and fields.get("has_original"):
+            preview_paths = self._expense_document_original_paths(server_document)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Проверка фактуры и распределение расходов")
+        dialog.resize(1040, 760)
+        dialog.setMinimumSize(860, 650)
+        layout = QVBoxLayout(dialog)
+        top = QSplitter(Qt.Orientation.Horizontal)
+        top.setChildrenCollapsible(False)
+        gallery = None
+        if preview_paths:
+            try:
+                gallery = DocumentGalleryDialog(preview_paths, "Оригинал", dialog)
+                gallery.setWindowFlags(Qt.WindowType.Widget)
+                top.addWidget(gallery)
+                dialog.finished.connect(lambda _result: gallery.close())
+            except Exception as error:
+                top.addWidget(QLabel(f"Оригинал недоступен: {error}"))
+        else:
+            top.addWidget(QLabel("Оригинал не прикреплён"))
+        details = QWidget()
+        form = QFormLayout(details)
+        inputs = {}
+        for key, label in (
+            ("supplier_name", "Поставщик"), ("invoice_number", "Номер фактуры"),
+            ("document_date", "Дата (ГГГГ-ММ-ДД)"), ("currency_code", "Валюта"),
+            ("net_amount", "Сумма без НДС"), ("vat_amount", "НДС фактуры"),
+            ("rounding_amount", "Округление"), ("amount_due", "К оплате"),
+        ):
+            value = fields.get(key)
+            if key == "rounding_amount" and value is None:
+                value = "0.00"
+            widget = QLineEdit(str(value) if value is not None else "")
+            widget.setObjectName("invoice_" + key)
+            inputs[key] = widget
+            form.addRow(label + ":", widget)
+        top.addWidget(details)
+        top.setSizes([500, 500])
+        layout.addWidget(top, 3)
+        table = QTableWidget(0, 6)
+        table.setObjectName("invoiceAllocations")
+        table.setHorizontalHeaderLabels(["Заказ / пометка", "Без НДС", "Назначение", "Объект", "Категория", "Источник"])
+        table.setMinimumHeight(155)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(table, 2)
+        source_rows = []
+        objects = list(getattr(self, "_expense_objects", []))
+        distribution = QLabel()
+        distribution.setObjectName("invoiceDistribution")
+        issues_label = QLabel()
+        issues_label.setObjectName("invoiceIssues")
+        issues_label.setWordWrap(True)
+        row_actions = QHBoxLayout()
+        add_row_button = QPushButton("Добавить строку")
+        add_row_button.setObjectName("invoiceAddAllocation")
+        remove_row_button = QPushButton("Удалить строку")
+        remove_row_button.setObjectName("invoiceRemoveAllocation")
+        row_actions.addWidget(add_row_button)
+        row_actions.addWidget(remove_row_button)
+        row_actions.addWidget(distribution, 1)
+        layout.addLayout(row_actions)
+        layout.addWidget(issues_label)
+        ambiguity_reviewed = QCheckBox("Неоднозначные строки исправлены и сверены с оригиналом")
+        ambiguity_reviewed.setObjectName("invoiceAmbiguityReviewed")
+        ambiguity_reviewed.setVisible(any(item.get("ambiguous") for item in fields.get("order_proposals") or []))
+        layout.addWidget(ambiguity_reviewed)
+        extra_toggle = QPushButton("Дополнительно")
+        extra_toggle.setCheckable(True)
+        extra = QTextEdit()
+        extra.setReadOnly(True)
+        extra.setMaximumHeight(90)
+        extra.setPlainText(str(fields.get("raw_text") or fields.get("recognized_text") or "")
+                           + "\n\n" + "\n".join(fields.get("review_reasons") or []))
+        extra.hide()
+        extra_toggle.toggled.connect(extra.setVisible)
+        layout.addWidget(extra_toggle)
+        layout.addWidget(extra)
+        actions = QHBoxLayout()
+        draft = QPushButton("Сохранить черновик")
+        draft.setObjectName("invoiceSaveDraft")
+        confirm = QPushButton("Подтвердить распределение")
+        confirm.setObjectName("invoiceConfirm")
+        cancel = QPushButton("Отмена")
+        actions.addWidget(draft)
+        actions.addStretch()
+        actions.addWidget(confirm)
+        actions.addWidget(cancel)
+        layout.addLayout(actions)
+
+        def values():
+            current = {key: widget.text().strip() for key, widget in inputs.items()}
+            rows = []
+            for index, original in enumerate(source_rows):
+                destination = table.cellWidget(index, 2).currentData()
+                object_id = table.cellWidget(index, 3).currentData() if destination == "object" else None
+                amount = table.item(index, 1).text().strip()
+                unchanged = parse_invoice_money(amount) == parse_invoice_money(original.get("net_amount"))
+                rows.append({
+                    **original, "original_marker": table.item(index, 0).text().strip(),
+                    "net_amount": amount or None, "destination": destination,
+                    "object_id": object_id, "expense_category": table.cellWidget(index, 4).text().strip(),
+                    "vat_amount": original.get("vat_amount") if unchanged else None,
+                    "gross_amount": None,
+                    "ambiguous": bool(original.get("ambiguous")) and not ambiguity_reviewed.isChecked(),
+                })
+            return current, rows
+
+        def refresh(*_):
+            current, rows = values()
+            allocated = sum((parse_invoice_money(row["net_amount"]) or Decimal(0) for row in rows), Decimal(0))
+            total = parse_invoice_money(current["net_amount"])
+            remaining = decimal_text(total - allocated) if total is not None else "неизвестно"
+            distribution.setText(f"Без НДС: распределено {decimal_text(allocated)} / осталось {remaining}")
+            issues = net_invoice_issues(current, rows)
+            if not current["supplier_name"]:
+                issues.append("Укажите поставщика.")
+            if not current["invoice_number"]:
+                issues.append("Укажите номер фактуры.")
+            try:
+                datetime.strptime(current["document_date"], "%Y-%m-%d")
+            except ValueError:
+                issues.append("Укажите корректную дату фактуры.")
+            if current["currency_code"].upper() not in {"SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"}:
+                issues.append("Выберите валюту.")
+            issues_label.setText("Для подтверждения: " + " ".join(issues[:3]) if issues else "Суммы согласованы. Назначения выбраны.")
+            confirm.setEnabled(not issues)
+
+        def append_row(original=None):
+            original = dict(original or {})
+            row = table.rowCount()
+            table.blockSignals(True)
+            table.insertRow(row)
+            marker = str(original.get("original_marker") or original.get("project_code") or "")
+            table.setItem(row, 0, QTableWidgetItem(marker))
+            table.item(row, 0).setToolTip("Заказ: " + str(original.get("order_id") or "не указан"))
+            table.setItem(row, 1, QTableWidgetItem(str(original.get("net_amount") or "")))
+            destination = QComboBox()
+            for label, value in (("Выберите назначение", "unselected"), ("На объект", "object"), ("Общие расходы фирмы", "company")):
+                destination.addItem(label, value)
+            object_combo = QComboBox()
+            object_combo.addItem("Выберите объект", None)
+            for item in objects:
+                object_combo.addItem(f"{item['name']} ({item.get('markning') or ''})", int(item["id"]))
+            selected = original.get("object_id")
+            if selected is None and original.get("project_code"):
+                matches = [int(item["id"]) for item in objects if str(item.get("markning") or "").casefold()
+                           == str(original["project_code"]).casefold()]
+                selected = matches[0] if len(matches) == 1 else None
+            if selected is not None:
+                object_combo.setCurrentIndex(max(0, object_combo.findData(selected)))
+            selected_destination = original.get("destination") or ("object" if selected is not None else "unselected")
+            destination.setCurrentIndex(max(0, destination.findData(selected_destination)))
+            category = QLineEdit(str(original.get("expense_category") or ""))
+            category.setPlaceholderText("Необязательно")
+            table.setCellWidget(row, 2, destination)
+            table.setCellWidget(row, 3, object_combo)
+            table.setCellWidget(row, 4, category)
+            sources = original.get("sources") or []
+            source_button = QPushButton("Стр. " + str(sources[0]["page"]) if sources else "Нет страницы")
+            source_button.setEnabled(bool(gallery and sources))
+            if gallery and sources:
+                source_button.clicked.connect(lambda _checked=False, source=sources[0]: gallery.show_source(
+                    int(source.get("attachment_index") or 0), int(source["page"])))
+            table.setCellWidget(row, 5, source_button)
+            source_rows.append(original)
+            table.blockSignals(False)
+
+            def destination_changed(*_):
+                object_combo.setEnabled(destination.currentData() == "object")
+                category.setEnabled(destination.currentData() == "company")
+                refresh()
+
+            destination.currentIndexChanged.connect(destination_changed)
+            object_combo.currentIndexChanged.connect(refresh)
+            category.textChanged.connect(refresh)
+            destination_changed()
+
+        def remove_row():
+            index = table.currentRow()
+            if index >= 0:
+                table.removeRow(index)
+                source_rows.pop(index)
+                refresh()
+
+        initial_rows = fields.get("order_proposals") or fields.get("allocations") or [{"net_amount": fields.get("net_amount")}]
+        for row in initial_rows:
+            append_row(row)
+        table.itemChanged.connect(refresh)
+        for widget in inputs.values():
+            widget.textChanged.connect(refresh)
+        ambiguity_reviewed.toggled.connect(refresh)
+        add_row_button.clicked.connect(lambda: append_row())
+        remove_row_button.clicked.connect(remove_row)
+
+        def save(status):
+            current, rows = values()
+            for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due"):
+                if current[key] and parse_invoice_money(current[key]) is None:
+                    QMessageBox.warning(dialog, "Формат суммы", "Исправьте формат денежной суммы перед сохранением.")
+                    return
+            if any(row.get("net_amount") and parse_invoice_money(row["net_amount"]) is None for row in rows):
+                QMessageBox.warning(dialog, "Распределение", "Исправьте формат суммы без НДС в строках.")
+                return
+            if status == "confirmed" and (net_invoice_issues(current, rows) or not confirm.isEnabled()):
+                return
+            net = parse_invoice_money(current["net_amount"])
+            vat = parse_invoice_money(current["vat_amount"])
+            payload = {**current, "client_id": client_id, "allocation_basis": "net",
+                       "gross_amount": decimal_text(net + vat) if net is not None and vat is not None else None,
+                       "verification_status": status, "allocations": rows, "order_proposals": rows,
+                       "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
+                       "document_comment": fields.get("document_comment") or "",
+                       "expense_category": fields.get("expense_category") or "Прочие расходы"}
+            staged = []
+            try:
+                if source_paths:
+                    staged = self._store_expense_originals(source_paths, client_id)
+                server_id = server_document.get("server_document_id")
+                if server_id is None and isinstance(server_document.get("id"), int):
+                    server_id = server_document["id"]
+                self.queue_expense_document_operation(
+                    client_id, "upsert", payload, server_document_id=server_id,
+                    server_version=server_document.get("server_version") or server_document.get("sync_version"),
+                    attachment_paths=staged if source_paths else fields.get("local_attachment_paths"),
+                )
+            except Exception as error:
+                for path in staged:
+                    Path(path).unlink(missing_ok=True)
+                QMessageBox.warning(dialog, "Не сохранено", str(error))
+                return
+            dialog.accept()
+            self.load_expense_documents()
+            self.background_sync_with_cloud()
+
+        draft.clicked.connect(lambda: save("draft"))
+        confirm.clicked.connect(lambda: save("confirmed"))
+        cancel.clicked.connect(dialog.reject)
+        refresh()
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
     def _expense_document_review_dialog(
         self, document=None, source_paths=None, parsed_fields=None, recognition_message=""
     ):
@@ -7600,21 +7881,12 @@ class SmartReportApp(QMainWindow):
         parsed_fields = dict(parsed_fields or {})
         source_paths = list(source_paths or [])
         self.load_expense_document_filters()
-        if document.get("order_proposals") or parsed_fields.get("order_proposals"):
-            fields = {**parsed_fields, **document}
-            fields["client_id"] = fields.get("client_id") or str(uuid.uuid4())
-            fields["sync_version"] = server_document.get("server_version") or server_document.get("sync_version")
-            preview_paths = source_paths or document.get("local_attachment_paths") or []
-            if not preview_paths and document.get("has_original"):
-                preview_paths = self._expense_document_original_paths(server_document)
-            server_id = server_document.get("server_document_id")
-            if server_id is None and isinstance(server_document.get("id"), int):
-                server_id = server_document["id"]
-            return self._api_expense_document_review_dialog(
-                server_id, str(preview_paths[0]) if preview_paths else None,
-                fields, [], document.get("allocations") or [],
-                source_paths=source_paths, preview_paths=preview_paths,
-            )
+        if (document.get("allocation_basis") == "net" or parsed_fields.get("allocation_basis") == "net"
+                or document.get("order_proposals") or parsed_fields.get("order_proposals")):
+            if document and document.get("allocation_basis") != "net":
+                document = {**document, "allocation_basis": "net", "rounding_amount": "0.00",
+                            "amount_due": document.get("gross_amount")}
+            return self._review_net_invoice(document, source_paths, parsed_fields, server_document)
         client_id = str(document.get("client_id") or parsed_fields.get("client_id") or uuid.uuid4())
         existing_allocations = list(document.get("allocations") or [])
         dialog = QDialog(self)
@@ -7905,7 +8177,14 @@ class SmartReportApp(QMainWindow):
             for path, extraction in extractions
             for page, page_text in enumerate(extraction.pages or (extraction.text,))
         ])
-        parsed = parse_document_text(combined_text) if combined_text else {
+        structured_pages = [
+            {"source": Path(path).name, "page": page + 1, "text": page_text,
+             "attachment_index": source_indices[str(path)],
+             "elements": extraction.page_elements[page] if extraction.page_elements else []}
+            for path, extraction in extractions
+            for page, page_text in enumerate(extraction.pages or (extraction.text,))
+        ]
+        parsed = parse_invoice_pages(structured_pages) if combined_text else {
             "supplier_name": "", "document_date": None, "gross_amount": None,
             "vat_amount": None, "currency_code": "SEK", "document_type": "manual",
             "document_comment": "", "raw_text": "",
@@ -7919,7 +8198,8 @@ class SmartReportApp(QMainWindow):
         else:
             recognition_message = "Распознавание не выполнено; оригинал будет сохранён, заполните поля вручную."
         parsed["raw_text"] = combined_text
-        parsed["order_proposals"] = order_proposal["orders"]
+        if "order_proposals" not in parsed:
+            parsed["order_proposals"] = order_proposal["orders"]
         parsed["order_proposal_warnings"] = order_proposal["warnings"]
         if order_proposal["warnings"]:
             recognition_message += " " + "; ".join(order_proposal["warnings"])

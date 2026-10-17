@@ -40,6 +40,7 @@ class ExtractionResult:
     method: str
     confidence: float | None
     pages: tuple[str, ...] = ()
+    page_elements: tuple[tuple[dict[str, Any], ...], ...] = ()
 
 
 def parse_decimal(value: Any) -> Decimal | None:
@@ -80,11 +81,14 @@ def decimal_text(value: Decimal | str | int | float | None) -> str | None:
 
 
 def _label_value(lines: list[str], labels: str) -> str | None:
-    pattern = re.compile(rf"^\s*(?:{labels})\s*(?:[:#№])?\s*(.*?)\s*$", re.IGNORECASE)
+    pattern = re.compile(rf"^\s*(?:{labels})(?:\s*[:#№]\s*|\s+)(.*?)\s*$", re.IGNORECASE)
     for line in lines:
         match = pattern.match(line)
         if match and match.group(1):
-            return match.group(1).strip(" :#") or None
+            value = match.group(1).strip(" :#")
+            if re.match(r"^(?:Fakturans|Faktura(?:nummer|datum)?|företagsinfo|Leverantör|Moms|Netto|Summa|Valuta)\b", value, re.IGNORECASE):
+                continue
+            return value or None
     return None
 
 
@@ -138,8 +142,8 @@ def parse_document_text(text: str) -> dict[str, Any]:
 
     vat_lines: list[dict[str, str]] = []
     for line in lines:
-        rate_first = re.search(r"(?:Moms|VAT)?\s*(25|12|6|0)\s*%\s*[:\s]+(-?[\d][\d\s.,']*)", line, re.IGNORECASE)
-        amount_first = re.search(r"(-?[\d][\d\s.,']*)\s+(25|12|6|0)\s*%\s*(?:Moms|VAT)", line, re.IGNORECASE)
+        rate_first = re.fullmatch(r"(?:Moms|VAT)\s+(25|12|6|0)\s*%\s*:?\s+(-?[\d][\d\s.,']*)(?:\s+(?:SEK|kr))?", line, re.IGNORECASE)
+        amount_first = re.fullmatch(r"(-?[\d][\d\s.,']*)\s+(25|12|6|0)\s*%\s+(?:Moms|VAT)", line, re.IGNORECASE)
         match = rate_first or amount_first
         if match:
             if rate_first:
@@ -270,6 +274,155 @@ def parse_document_text(text: str) -> dict[str, Any]:
     }
 
 
+def parse_invoice_money(value):
+    text = str(value or "").strip().replace("−", "-").replace("\u00a0", " ")
+    text = re.sub(r"\s*(?:SEK|EUR|NOK|DKK|kr)\s*$", "", text, flags=re.IGNORECASE)
+    pattern = (
+        r"-?(?:\d+(?:[,.]\d{1,2})?|\d{1,3}(?:[ ']\d{3})+(?:[,.]\d{1,2})?"
+        r"|\d{1,3}(?:\.\d{3})+,\d{1,2}|\d{1,3}(?:,\d{3})+\.\d{1,2})"
+    )
+    return parse_decimal(text) if re.fullmatch(pattern, text) else None
+
+
+def invoice_layout_rows(elements):
+    rows = []
+    for element in sorted(elements, key=lambda item: (item["y0"], item["x0"])):
+        center = (element["y0"] + element["y1"]) / 2
+        row = next((item for item in reversed(rows[-3:]) if abs(item[0] - center) <= 3), None)
+        if row is None:
+            row = [center, []]
+            rows.append(row)
+        row[1].append(element)
+    result = []
+    for _, words in rows:
+        runs = []
+        for word in sorted(words, key=lambda item: item["x0"]):
+            if runs and word["x0"] - runs[-1]["x1"] < 18:
+                run = runs[-1]
+                run["text"] += " " + word["text"]
+                run["x1"] = max(run["x1"], word["x1"])
+                run["y1"] = max(run["y1"], word["y1"])
+            else:
+                runs.append(dict(word))
+        result.append(runs)
+    return result
+
+
+def parse_invoice_pages(pages):
+    text = "\n\n".join(str(page.get("text") or "") for page in pages)
+    fields = parse_document_text(text)
+    labels = {
+        "supplier_name": r"Leverantör|Supplier|Seller",
+        "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Invoice\s*(?:number|no\.?)",
+        "document_date": r"Fakturadatum|Invoice\s*date",
+        "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
+        "net_amount": r"Netto|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|Summa\s+exkl\.?\s*moms",
+        "vat_amount": r"Moms|Momsbelopp|Moms\s+totalt|Total\s+moms|Total\s+VAT",
+        "rounding_amount": r"Öresavrundning|Öresutjämning|Avrundning|Rounding",
+        "amount_due": r"Att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due",
+        "gross_amount": r"Total\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp",
+    }
+    candidates = {key: [] for key in labels}
+    companies = []
+    field_sources = {}
+    layout_texts = []
+
+    def checked_value(key, raw):
+        value = str(raw).strip().strip(":")
+        if key.endswith("amount") or key == "amount_due":
+            return decimal_text(parse_invoice_money(value))
+        if key == "document_date":
+            return _date_value(value) if re.fullmatch(r"[\d./-]+", value) else None
+        if key == "currency_code":
+            return value.upper() if re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", value, re.IGNORECASE) else None
+        if key == "invoice_number":
+            return value if re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{3,120}", value) else None
+        if re.fullmatch(r".+\s(?:AB|Aktiebolag|Ltd\.?|GmbH|AS)", value, re.IGNORECASE):
+            return value
+        return None
+
+    for page in pages:
+        elements = page.get("elements") or []
+        if elements:
+            rows = invoice_layout_rows(elements)
+        else:
+            rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
+                    for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
+        cells = [cell for row in rows for cell in row]
+        layout_texts.append("\n".join("\n".join(cell["text"] for cell in row) for row in rows))
+        for cell in cells:
+            cell_text = cell["text"].strip()
+            company = checked_value("supplier_name", cell_text)
+            buyer_nearby = any(
+                re.match(r"^(?:Köpare|Kund|Buyer|Fakturaadress|Fakturamottagare)\b", other["text"], re.IGNORECASE)
+                and abs(other["x0"] - cell["x0"]) < 50 and 0 <= cell["y0"] - other["y0"] < 65
+                for other in cells
+            )
+            if company and not buyer_nearby:
+                companies.append((company, page, cell))
+            for key, label in labels.items():
+                inline = re.fullmatch(rf"(?:{label})(?:\s*:\s*|\s+)(.+)", cell_text, re.IGNORECASE)
+                raw_value = inline.group(1) if inline else None
+                value_cell = cell
+                if re.fullmatch(rf"(?:{label})\s*:?", cell_text, re.IGNORECASE):
+                    right_headers = [other["x0"] for other in cells
+                                     if abs(other["y0"] - cell["y0"]) < 4 and other["x0"] > cell["x0"]]
+                    right_edge = min(right_headers) if right_headers else cell["x1"] + 100
+                    neighbors = [other for other in cells if other is not cell and (
+                        abs(other["y0"] - cell["y0"]) < 4 and 0 <= other["x0"] - cell["x1"] <= 45
+                        or 4 < other["y0"] - cell["y0"] < 42
+                        and cell["x0"] - 5 <= other["x0"] < right_edge - 5
+                    ) and checked_value(key, other["text"]) is not None]
+                    if neighbors:
+                        distance = min(abs(other["y0"] - cell["y0"]) for other in neighbors)
+                        nearest = [other for other in neighbors if abs(other["y0"] - cell["y0"]) == distance]
+                        if len(nearest) == 1:
+                            value_cell = nearest[0]
+                            raw_value = value_cell["text"]
+                value = checked_value(key, raw_value) if raw_value is not None else None
+                if value is not None:
+                    source = {"source": page.get("source"), "page": page.get("page", 1),
+                              "attachment_index": page.get("attachment_index", 0),
+                              "box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                              "text": value_cell["text"], "kind": "invoice_total" if "amount" in key else "header"}
+                    candidates[key].append((value, source))
+    if not candidates["supplier_name"] and len({item[0].casefold() for item in companies}) == 1:
+        company, page, cell = companies[0]
+        candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"]}))
+    diagnostics = []
+    for key, matches in candidates.items():
+        values = {value for value, _ in matches}
+        if len(values) == 1:
+            fields[key] = matches[0][0]
+            field_sources[key] = [source for _, source in matches]
+        elif len(values) > 1:
+            fields[key] = None
+            diagnostics.append(f"Несколько различных значений поля {key}; требуется сверка по оригиналу.")
+        elif key not in ("currency_code",):
+            fields[key] = None
+    fields["rounding_amount"] = fields.get("rounding_amount") or "0.00"
+    if fields.get("net_amount") is not None and fields.get("vat_amount") is not None:
+        fields["gross_amount"] = decimal_text(Decimal(fields["net_amount"]) + Decimal(fields["vat_amount"]))
+    fields["field_sources"] = field_sources
+    fields["allocation_basis"] = "net"
+    fields["raw_text"] = text
+    fields["review_reasons"] = diagnostics
+    for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due"):
+        if not fields.get(key):
+            fields["review_reasons"].append(f"Не подтверждено поле {key}; проверьте оригинал.")
+    net = parse_decimal(fields.get("net_amount"))
+    vat = parse_decimal(fields.get("vat_amount"))
+    due = parse_decimal(fields.get("amount_due"))
+    rounding = parse_decimal(fields.get("rounding_amount"))
+    if None not in (net, vat, due, rounding) and net + vat + rounding != due:
+        fields["review_reasons"].append("Сумма без НДС + НДС + округление не совпадает с суммой к оплате.")
+    order_pages = [{**page, "text": layout_texts[index]} for index, page in enumerate(pages)]
+    proposal = parse_project_order_allocations(order_pages)
+    fields["order_proposals"] = proposal["orders"]
+    fields["suggested_verification_status"] = "requires_review"
+    return fields
+
+
 def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, Any]:
     money_token = r"-?\d[\d.,' \u00a0]*"
 
@@ -284,7 +437,7 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
         return parse_decimal(raw) if re.fullmatch(valid_formats, raw) else None
 
     project_pattern = re.compile(
-        r"^\s*Proj\s*\.\s*nr\s*\.?\s*[:#]?\s*([\w][\w./-]*)\b",
+        r"^\s*Proj\s*\.\s*nr\s*\.?\s*[:#]?\s*(.+?)\s*$",
         re.IGNORECASE,
     )
     order_pattern = re.compile(
@@ -390,7 +543,8 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
                 continue
             orders_by_key[key] = {
                 "order_id": current_order,
-                "project_code": current_project,
+                "project_code": current_project if current_project and re.fullmatch(r"[A-Za-z]*\d[\w./-]*", current_project) else None,
+                "original_marker": current_project,
                 "net_amount": decimal_text(amount),
                 "vat_amount": None,
                 "sources": [source],
@@ -473,6 +627,120 @@ def build_project_order_allocations(orders, net_amount, vat_amount, gross_amount
         "gross_amount": decimal_text(item["gross_amount"]),
         "note": "; ".join(item["notes"])[:500],
     } for item in grouped.values()]
+
+
+def invoice_net_schema_ready(connection):
+    document_columns = {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}
+    allocation_columns = {row[1]: row for row in connection.execute("PRAGMA table_info(expense_allocations)")}
+    return (
+        {"rounding_amount", "amount_due", "allocation_basis"}.issubset(document_columns)
+        and {"destination", "expense_category"}.issubset(allocation_columns)
+        and not allocation_columns["allocated_gross"][3]
+    )
+
+
+def migrate_invoice_net_schema(connection):
+    if invoice_net_schema_ready(connection):
+        return
+    if connection.in_transaction:
+        raise ValueError("Миграция требует отдельной транзакции и предварительной резервной копии.")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}
+        for name, definition in (("rounding_amount", "TEXT"), ("amount_due", "TEXT"),
+                                 ("allocation_basis", "TEXT NOT NULL DEFAULT 'gross'")):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE expense_documents ADD COLUMN {name} {definition}")
+        connection.execute("ALTER TABLE expense_allocations RENAME TO expense_allocations_before_net")
+        connection.execute("""
+            CREATE TABLE expense_allocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+                object_id INTEGER REFERENCES meta_objects(id) ON DELETE RESTRICT,
+                allocated_gross TEXT,
+                allocated_net TEXT,
+                allocated_vat TEXT,
+                allocation_note TEXT NOT NULL DEFAULT '',
+                destination TEXT NOT NULL DEFAULT 'object',
+                expense_category TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        connection.execute("""
+            INSERT INTO expense_allocations (
+                id, document_id, object_id, allocated_gross, allocated_net, allocated_vat,
+                allocation_note, destination
+            ) SELECT id, document_id, object_id, allocated_gross, allocated_net, allocated_vat,
+                     allocation_note, CASE WHEN object_id IS NULL THEN 'company' ELSE 'object' END
+              FROM expense_allocations_before_net
+        """)
+        connection.execute("DROP TABLE expense_allocations_before_net")
+        connection.execute("CREATE INDEX idx_expense_allocations_object ON expense_allocations(object_id)")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.IntegrityError("Нарушены внешние ключи после миграции распределений.")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def net_invoice_issues(fields, allocations):
+    issues = []
+    values = {key: parse_invoice_money(fields.get(key)) for key in
+              ("net_amount", "vat_amount", "rounding_amount", "amount_due")}
+    for key, label in (("net_amount", "сумму без НДС"), ("vat_amount", "НДС фактуры"),
+                       ("rounding_amount", "округление"), ("amount_due", "сумму к оплате")):
+        if values[key] is None:
+            issues.append(f"Укажите {label}.")
+    if all(value is not None for value in values.values()):
+        if values["net_amount"] + values["vat_amount"] + values["rounding_amount"] != values["amount_due"]:
+            issues.append("Сумма без НДС + НДС + округление не равна сумме к оплате.")
+    allocated = Decimal(0)
+    for index, row in enumerate(allocations, 1):
+        amount = parse_invoice_money(row.get("net_amount"))
+        if amount is None:
+            issues.append(f"Строка {index}: укажите сумму без НДС.")
+        else:
+            allocated += amount
+            total = values["net_amount"]
+            if total is not None and amount and total and (amount > 0) != (total > 0):
+                issues.append(f"Строка {index}: знак суммы не соответствует фактуре.")
+        destination = row.get("destination")
+        if destination not in {"object", "company"} or destination == "object" and row.get("object_id") is None:
+            issues.append(f"Строка {index}: выберите назначение расходов.")
+        if row.get("ambiguous"):
+            issues.append(f"Строка {index}: сверьте неоднозначный итог заказа с оригиналом.")
+    if values["net_amount"] is not None and allocated != values["net_amount"]:
+        issues.append("Распределено без НДС не совпадает с суммой без НДС фактуры.")
+    return issues
+
+
+def normalize_net_allocations(allocations):
+    grouped = {}
+    for row in allocations:
+        destination = row.get("destination") or "unselected"
+        object_id = row.get("object_id") if destination == "object" else None
+        category = str(row.get("expense_category") or "").strip()[:100]
+        key = (destination, object_id, category)
+        net = parse_invoice_money(row.get("net_amount"))
+        vat = parse_invoice_money(row.get("vat_amount"))
+        if key not in grouped:
+            grouped[key] = {"object_id": object_id, "destination": destination, "expense_category": category,
+                            "net_amount": Decimal(0), "vat_amount": Decimal(0), "note": "",
+                            "net_known": True, "vat_known": True}
+        item = grouped[key]
+        item["net_known"] &= net is not None
+        item["vat_known"] &= vat is not None
+        item["net_amount"] += net or Decimal(0)
+        item["vat_amount"] += vat or Decimal(0)
+        marker = str(row.get("original_marker") or row.get("project_code") or row.get("order_id") or "")
+        item["note"] = (item["note"] + "; " + marker).strip("; ")[:500]
+    result = []
+    for item in grouped.values():
+        net = item.pop("net_amount") if item.pop("net_known") else None
+        vat = item.pop("vat_amount") if item.pop("vat_known") else None
+        result.append({**item, "net_amount": decimal_text(net), "vat_amount": decimal_text(vat),
+                       "gross_amount": decimal_text(net + vat) if net is not None and vat is not None else None})
+    return result
 
 
 def find_document_duplicates(
@@ -1000,6 +1268,49 @@ def get_object_expense_summary(
     }
 
 
+def pdf_page_elements(page):
+    height = page.get_height()
+    text_page = page.get_textpage()
+    elements = []
+    word = None
+    try:
+        for index in range(text_page.count_chars()):
+            character = text_page.get_text_range(index, 1)
+            if not character or character.isspace():
+                if word:
+                    elements.append(word)
+                    word = None
+                continue
+            left, bottom, right, top = text_page.get_charbox(index)
+            box = {"x0": left, "y0": height - top, "x1": right, "y1": height - bottom}
+            if word and (box["y0"] > word["y1"] + 4 or box["y1"] < word["y0"] - 4
+                         or box["x0"] - word["x1"] > 12):
+                elements.append(word)
+                word = None
+            if word is None:
+                word = {"text": character, **box}
+            else:
+                word["text"] += character
+                word["y0"] = min(word["y0"], box["y0"])
+                word["x1"] = max(word["x1"], right)
+                word["y1"] = max(word["y1"], box["y1"])
+        if word:
+            elements.append(word)
+    finally:
+        text_page.close()
+    return tuple(elements)
+
+
+def ocr_page_elements(detections):
+    return tuple({
+        "text": str(detection[1]),
+        "x0": min(point[0] for point in detection[0]),
+        "y0": min(point[1] for point in detection[0]),
+        "x1": max(point[0] for point in detection[0]),
+        "y1": max(point[1] for point in detection[0]),
+    } for detection in detections or [] if detection[0])
+
+
 def extract_local_document(path: str | Path, ocr_engine: Any = None) -> ExtractionResult:
     source = Path(path)
     suffix = source.suffix.casefold()
@@ -1012,37 +1323,51 @@ def extract_local_document(path: str | Path, ocr_engine: Any = None) -> Extracti
         if reader.is_encrypted:
             raise DocumentExtractionError("Зашифрованный PDF нельзя прочитать без пароля.")
         pages = [(page.extract_text() or "").strip() for page in reader.pages]
-        missing_page_indexes = [index for index, text in enumerate(pages) if len(text) < 12]
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(str(source))
+        try:
+            page_elements = [pdf_page_elements(pdf[index]) for index in range(len(pdf))]
+        finally:
+            pdf.close()
+        missing_page_indexes = [index for index, text in enumerate(pages)
+                    if len(re.findall(r"\w", text)) < 12 or len(re.findall(r"\w+", text)) < 3
+                    or text.count("\ufffd") > len(text) / 10]
         confidence_values = []
         if missing_page_indexes:
             try:
                 import numpy as np
                 import pypdfium2 as pdfium
-                from rapidocr_onnxruntime import RapidOCR
+                if ocr_engine is None:
+                    from rapidocr_onnxruntime import RapidOCR
             except ImportError as error:
                 raise DocumentExtractionError(f"Локальный OCR недоступен: {error.name}.") from error
             engine = ocr_engine or RapidOCR()
             pdf = pdfium.PdfDocument(str(source))
-            for index in missing_page_indexes:
-                image = pdf[index].render(scale=2).to_pil().convert("RGB")
-                result, _ = engine(np.asarray(image))
-                lines = []
-                for detection in result or []:
-                    lines.append(str(detection[1]))
-                    if len(detection) > 2:
-                        confidence_values.append(float(detection[2]))
-                pages[index] = "\n".join(lines)
-            method = "PDF-текст + локальный OCR" if any(text.strip() for text in pages) else "локальный OCR"
+            try:
+                for index in missing_page_indexes:
+                    image = pdf[index].render(scale=2).to_pil().convert("RGB")
+                    result, _ = engine(np.asarray(image))
+                    lines = []
+                    for detection in result or []:
+                        lines.append(str(detection[1]))
+                        if len(detection) > 2:
+                            confidence_values.append(float(detection[2]))
+                    pages[index] = "\n".join(lines)
+                    page_elements[index] = ocr_page_elements(result)
+            finally:
+                pdf.close()
+            method = "PDF-текст + локальный OCR" if len(missing_page_indexes) < len(pages) else "локальный OCR"
         else:
             method = "текст PDF"
         text = "\n\n".join(page for page in pages if page)
         confidence = sum(confidence_values) / len(confidence_values) if confidence_values else (1.0 if text else 0.0)
-        return ExtractionResult(text=text, method=method, confidence=confidence, pages=tuple(pages))
+        return ExtractionResult(text=text, method=method, confidence=confidence, pages=tuple(pages), page_elements=tuple(page_elements))
 
     try:
         import numpy as np
         from PIL import Image
-        from rapidocr_onnxruntime import RapidOCR
+        if ocr_engine is None:
+            from rapidocr_onnxruntime import RapidOCR
     except ImportError as error:
         raise DocumentExtractionError(f"Локальный OCR недоступен: {error.name}.") from error
     engine = ocr_engine or RapidOCR()
@@ -1056,7 +1381,7 @@ def extract_local_document(path: str | Path, ocr_engine: Any = None) -> Extracti
             confidences.append(float(detection[2]))
     text = "\n".join(lines)
     confidence = sum(confidences) / len(confidences) if confidences else (0.0 if not text else None)
-    return ExtractionResult(text=text, method="локальный OCR", confidence=confidence, pages=(text,))
+    return ExtractionResult(text=text, method="локальный OCR", confidence=confidence, pages=(text,), page_elements=(ocr_page_elements(result),))
 
 
 def create_migration_backup(database_path: str | Path, backup_dir: str | Path) -> Path:
