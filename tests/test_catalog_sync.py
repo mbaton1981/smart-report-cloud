@@ -406,6 +406,18 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual(summary['Totalt att fakturera exkl. moms'], '3,450.00 kr')
             self.assertEqual(summary['OB-tillägg'], '800.00 kr (segmentbelopp)')
             self.assertEqual(report['totals']['invoice_total'], 3450)
+            self.assertEqual(
+                report['ob_rule_descriptions'],
+                {
+                    'OB1': 'Måndag–Fredag 18:00–20:00',
+                    'OB2': 'Måndag–Fredag 20:00–24:00',
+                },
+            )
+            self.assertEqual(
+                window.invoice_ob_rules_lbl.text(),
+                'OB1 (18:00–20:00) — Måndag–Fredag 18:00–20:00; '
+                'OB2 (20:00–24:00) — Måndag–Fredag 20:00–24:00',
+            )
 
             def check_pdf(build, object_name):
                 story = build.call_args.args[0]
@@ -436,6 +448,10 @@ class CatalogSyncTests(unittest.TestCase):
                     for row in pdf_summary._cellvalues
                 ]
                 self.assertEqual(pdf_summary_text, screen_summary)
+                self.assertEqual(
+                    summary_group._content[-1].getPlainText(),
+                    window.invoice_ob_rules_lbl.text(),
+                )
 
             with patch.object(self.desktop, 'REPORTS_DIR', str(Path(self._case.name) / 'reports')), \
                  patch.object(self.desktop.SimpleDocTemplate, 'build') as build, \
@@ -490,6 +506,11 @@ class CatalogSyncTests(unittest.TestCase):
                 pdf_bytes = generated_pdfs[0].read_bytes()
                 self.assertTrue(pdf_bytes.startswith(b'%PDF-'))
                 self.assertGreater(len(pdf_bytes), 1000)
+                from pypdf import PdfReader
+
+                pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(str(generated_pdfs[0])).pages)
+                self.assertIn('Varav OB1 (18:00–20:00)', pdf_text)
+                self.assertIn('Varav OB2 (20:00–24:00)', pdf_text)
                 critical.assert_not_called()
         finally:
             window.close()
@@ -552,8 +573,8 @@ class CatalogSyncTests(unittest.TestCase):
             }
             self.assertEqual(summary['Arbetade timmar totalt'], '17.0 tim')
             self.assertEqual(summary['Varav utan OB'], 'Ej fastställbart')
-            self.assertEqual(summary['Varav OB1'], '4.0 tim')
-            self.assertEqual(summary['Varav OB2'], '1.0 tim')
+            self.assertEqual(summary['Varav OB1 (18:00–20:00)'], '4.0 tim')
+            self.assertEqual(summary['Varav OB2 (20:00–24:00)'], '1.0 tim')
             self.assertIn('möjlig överlappning kan inte fastställas', window.invoice_summary_note.text())
             self.assertIn('inte en verifierad premie', window.invoice_summary_note.text())
             self.assertIn('ingår inte i totalsumman', window.invoice_summary_note.text())
@@ -598,6 +619,50 @@ class CatalogSyncTests(unittest.TestCase):
             desktop_conn.close()
             window.close()
             window.deleteLater()
+
+    def test_invoice_ob_rule_description_uses_period_and_holiday_rules(self):
+        categories = {
+            'weekday_early_evening': 'OB1',
+            'weekday_late_evening_night': 'OB2',
+        }
+        weekday_description = self.desktop.describe_category_time_ranges(
+            '2026-10-19', '2026-10-19', categories
+        )
+        self.assertEqual(weekday_description['OB1'], 'Måndag 18:00–20:00')
+        self.assertEqual(weekday_description['OB2'], 'Måndag 20:00–24:00')
+
+        saturday_description = self.desktop.describe_category_time_ranges(
+            '2026-10-24', '2026-10-24', categories
+        )
+        self.assertEqual(
+            saturday_description['OB1'],
+            'Ej tillämpligt enligt reglerna för vald period',
+        )
+        self.assertEqual(
+            saturday_description['OB2'],
+            'Ej tillämpligt enligt reglerna för vald period',
+        )
+
+        from ob_calculator import load_ob_rules
+
+        holiday_rules = load_ob_rules()
+        holiday_rules['holidays']['2026-10-19'] = [
+            {'start': '00:00', 'end': '19:00', 'category': 'weekday_day',
+             'premium_percent': 0, 'multiplier': 1.0},
+            {'start': '19:00', 'end': '21:00', 'category': 'weekday_early_evening',
+             'premium_percent': 50, 'multiplier': 1.5},
+            {'start': '21:00', 'end': '24:00', 'category': 'weekday_late_evening_night',
+             'premium_percent': 70, 'multiplier': 1.7},
+        ]
+        holiday_description = self.desktop.describe_category_time_ranges(
+            '2026-10-19', '2026-10-19', categories, rules=holiday_rules
+        )
+        self.assertEqual(holiday_description['OB1'], 'Helgdag 2026-10-19 19:00–21:00')
+        self.assertEqual(holiday_description['OB2'], 'Helgdag 2026-10-19 21:00–24:00')
+        self.assertEqual(
+            self.desktop.SmartReportApp._invoice_ob_rule_caption('OB1', holiday_description['OB1']),
+            'OB1 (19:00–21:00) — Helgdag 2026-10-19 19:00–21:00',
+        )
 
     def test_catalog_pull_links_exact_legacy_rows_and_preserves_history_and_allocations(self):
         server_objects = (

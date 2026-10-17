@@ -754,6 +754,13 @@ def validate_expense_fields(payload):
         if amount_values["net_amount"] + amount_values["vat_amount"] != amount_values["gross_amount"]:
             raise ValueError("Нетто и НДС не совпадают с общей суммой документа.")
 
+    expense_category = str(payload.get("expense_category") or "Прочие расходы").strip()[:100]
+    is_transfer_receipt = expense_category.casefold() == "квитанция перевода"
+    if is_transfer_receipt and status == "confirmed":
+        raise ValueError("Квитанцию перевода нельзя подтвердить как фактуру; сохраните её с проверкой.")
+    if is_transfer_receipt and status == "draft":
+        status = "requires_review"
+
     return {
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
@@ -762,7 +769,7 @@ def validate_expense_fields(payload):
         "net_amount": decimal_text(amount_values["net_amount"]),
         "vat_amount": decimal_text(amount_values["vat_amount"]),
         "gross_amount": decimal_text(amount_values["gross_amount"]),
-        "expense_category": str(payload.get("expense_category") or "Прочие расходы").strip()[:100],
+        "expense_category": expense_category,
         "document_comment": str(payload.get("document_comment") or "").strip(),
         "verification_status": status,
         "recognized_text": str(payload.get("recognized_text") or "")[:100000],
@@ -1229,8 +1236,12 @@ def expense_object_summary_api(object_id):
                 item for item in document["allocations"] if item["object_id"] == object_id
             ]
             object_gross = sum((parse_decimal(item["gross_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
-            object_net = sum((parse_decimal(item["net_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
-            object_vat = sum((parse_decimal(item["vat_amount"]) or Decimal(0) for item in object_allocations), Decimal(0))
+            object_net = None if document["net_amount"] is None else sum(
+                (parse_decimal(item["net_amount"]) or Decimal(0) for item in object_allocations), Decimal(0)
+            )
+            object_vat = None if document["vat_amount"] is None else sum(
+                (parse_decimal(item["vat_amount"]) or Decimal(0) for item in object_allocations), Decimal(0)
+            )
             document["object_gross"] = decimal_text(object_gross)
             document["object_net"] = decimal_text(object_net)
             document["object_vat"] = decimal_text(object_vat)
@@ -1241,8 +1252,10 @@ def expense_object_summary_api(object_id):
                     "materials": Decimal(0), "other": Decimal(0),
                 })
                 bucket["gross"] += object_gross
-                bucket["net"] += object_net
-                bucket["vat"] += object_vat
+                if object_net is not None:
+                    bucket["net"] += object_net
+                if object_vat is not None:
+                    bucket["vat"] += object_vat
                 category = document["expense_category"].casefold()
                 bucket["materials" if "материал" in category or "material" in category else "other"] += object_gross
             elif document["verification_status"] == "draft":

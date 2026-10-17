@@ -120,6 +120,93 @@ def _validated_periods(day, config):
     return validated
 
 
+def describe_category_time_ranges(date_from, date_to, category_labels, rules=None):
+    start_day = _parse_date(date_from)
+    end_day = _parse_date(date_to)
+    if start_day > end_day:
+        raise ValueError("Начало периода должно быть не позже окончания")
+    config = rules if rules is not None else load_ob_rules()
+    weekday_labels = (
+        "Måndag", "Tisdag", "Onsdag", "Torsdag", "Fredag", "Lördag", "Söndag"
+    )
+    holidays = config.get("holidays", {})
+    holiday_days = {}
+    for holiday_text in holidays:
+        try:
+            holiday_day = date.fromisoformat(str(holiday_text))
+        except (TypeError, ValueError):
+            continue
+        if start_day <= holiday_day <= end_day:
+            holiday_days[holiday_day] = str(holiday_text)
+
+    matches = {category: {} for category in category_labels}
+
+    def add_day_rules(day, day_label):
+        for _period_start, _period_end, period, premium, _multiplier, paid in _validated_periods(day, config):
+            category = str(period.get("category", ""))
+            if category not in matches or not paid or premium <= 0:
+                continue
+            key = (day_label, str(period["start"]), str(period["end"]))
+            matches[category][key] = True
+
+    for weekday in range(7):
+        first_day = start_day + timedelta(days=(weekday - start_day.weekday()) % 7)
+        if first_day > end_day:
+            continue
+        occurrence_count = (end_day - first_day).days // 7 + 1
+        holiday_occurrences = sum(day.weekday() == weekday for day in holiday_days)
+        if occurrence_count <= holiday_occurrences:
+            continue
+        candidate = first_day
+        while candidate in holiday_days:
+            candidate += timedelta(days=7)
+        add_day_rules(candidate, weekday_labels[weekday])
+
+    for holiday_day, holiday_text in sorted(holiday_days.items()):
+        add_day_rules(holiday_day, f"Helgdag {holiday_text}")
+
+    descriptions = {}
+    for category, label in category_labels.items():
+        ranges = matches[category]
+        if not ranges:
+            descriptions[label] = "Ej tillämpligt enligt reglerna för vald period"
+            continue
+        ranges_by_time = {}
+        for day_label, start, end in ranges:
+            ranges_by_time.setdefault((start, end), set()).add(day_label)
+
+        formatted_ranges = []
+        for (start, end), day_labels in sorted(ranges_by_time.items()):
+            weekday_numbers = sorted(
+                weekday_labels.index(day_label)
+                for day_label in day_labels if day_label in weekday_labels
+            )
+            day_groups = []
+            if weekday_numbers:
+                run_start = previous = weekday_numbers[0]
+                for weekday in weekday_numbers[1:]:
+                    if weekday == previous + 1:
+                        previous = weekday
+                        continue
+                    day_groups.append(
+                        weekday_labels[run_start]
+                        if run_start == previous
+                        else f"{weekday_labels[run_start]}–{weekday_labels[previous]}"
+                    )
+                    run_start = previous = weekday
+                day_groups.append(
+                    weekday_labels[run_start]
+                    if run_start == previous
+                    else f"{weekday_labels[run_start]}–{weekday_labels[previous]}"
+                )
+            day_groups.extend(sorted(
+                day_label for day_label in day_labels if day_label not in weekday_labels
+            ))
+            formatted_ranges.append(f"{', '.join(day_groups)} {start}–{end}")
+        descriptions[label] = "; ".join(formatted_ranges)
+    return descriptions
+
+
 def calculate_work_interval(work_date, start_time, end_time, base_rate, rules=None):
     """Split a Stockholm local-time interval into configured rate segments."""
     config = rules if rules is not None else load_ob_rules()

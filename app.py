@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
     QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
-    QTextEdit, QSplitter
+    QTextEdit, QSplitter, QGraphicsView, QGraphicsScene
 )
 from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal, QEvent
 from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QImage, QPixmap
@@ -33,7 +33,11 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from ob_calculator import calculate_work_interval, round_time_to_half_hour
+from ob_calculator import (
+    calculate_work_interval,
+    describe_category_time_ranges,
+    round_time_to_half_hour,
+)
 from expense_documents import (
     apply_expense_documents_migration,
     decimal_text,
@@ -1612,6 +1616,87 @@ def create_date_field(default_date_str=""):
     date_edit.text = lambda: date_edit.date().toString("yyyy-MM-dd")
     date_edit.setText = lambda val: date_edit.setDate(QDate.fromString(val, "yyyy-MM-dd"))
     return date_edit
+
+
+def load_document_preview_pixmap(source_path):
+    suffix = Path(source_path).suffix.casefold()
+    if suffix == ".pdf":
+        import pypdfium2 as pdfium
+        image = pdfium.PdfDocument(str(source_path))[0].render(scale=1.5).to_pil().convert("RGB")
+        image = QImage(image.tobytes(), image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
+        return QPixmap.fromImage(image)
+    return QPixmap(str(source_path))
+
+
+class ZoomableDocumentView(QGraphicsView):
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self._image = self._scene.addPixmap(pixmap)
+        self.setScene(self._scene)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setMinimumSize(280, 320)
+        QTimer.singleShot(0, self.fit_width)
+
+    def zoom(self, factor):
+        current = self.transform().m11()
+        target = min(8.0, max(0.1, current * factor))
+        self.scale(target / current, target / current)
+
+    def fit_width(self):
+        pixmap = self._image.pixmap()
+        if pixmap.isNull() or pixmap.width() <= 0:
+            return
+        self.resetTransform()
+        factor = max(0.1, (self.viewport().width() - 24) / pixmap.width())
+        self.scale(factor, factor)
+        self.centerOn(self._image)
+
+    def show_original_size(self):
+        self.resetTransform()
+        self.centerOn(self._image)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.zoom(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
+class DocumentPreviewDialog(QDialog):
+    def __init__(self, pixmap, title, parent=None, source_path=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1180, 900)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
+        self.setSizeGripEnabled(True)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.preview = ZoomableDocumentView(pixmap, self)
+        for label, callback in (
+            ("−", lambda: self.preview.zoom(1 / 1.2)),
+            ("По ширине", self.preview.fit_width),
+            ("100%", self.preview.show_original_size),
+            ("+", lambda: self.preview.zoom(1.2)),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            controls.addWidget(button)
+        if source_path:
+            source_button = QPushButton("Открыть файл целиком")
+            source_button.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(source_path)))
+            )
+            controls.addWidget(source_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+        layout.addWidget(self.preview, 1)
 
 
 def create_half_hour_time_field(default_time):
@@ -3574,7 +3659,7 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Документ не прочитан", str(error))
             return
         fields["raw_text"] = extraction.text
-        fields["expense_category"] = "Прочие накладные расходы"
+        fields["expense_category"] = fields.get("expense_category") or "Прочие накладные расходы"
         fields["ocr_method"] = extraction.method
         fields["ocr_confidence"] = extraction.confidence
         fields["client_id"] = str(uuid.uuid4())
@@ -3612,6 +3697,9 @@ class SmartReportApp(QMainWindow):
             return
         fields = dict(document)
         fields["raw_text"] = document.get("recognized_text") or ""
+        if str(fields.get("expense_category") or "").strip().casefold() == "квитанция перевода":
+            fields["document_type"] = "transfer_receipt"
+            fields["suggested_verification_status"] = "requires_review"
         suggestions = match_objects(fields["raw_text"], self._expense_object_candidates())
         self._expense_document_review_dialog(
             document_id, source_path, fields, suggestions, fields["allocations"]
@@ -3638,29 +3726,65 @@ class SmartReportApp(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Фактура и распределение" if document_id is None else f"Фактура #{document_id}")
         dialog.resize(1120, 760)
+        dialog.setWindowFlags(
+            dialog.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
+        dialog.setSizeGripEnabled(True)
         layout = QVBoxLayout(dialog)
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        preview = QLabel("Оригинал не загружен" if not source_path else "Предпросмотр недоступен")
-        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setMinimumWidth(350)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        is_transfer_receipt = (
+            fields.get("document_type") == "transfer_receipt"
+            or str(fields.get("expense_category") or "").strip().casefold() == "квитанция перевода"
+        )
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 4, 0)
+        preview_controls = QHBoxLayout()
+        preview_view = None
+        preview_pixmap = QPixmap()
         if source_path:
             try:
-                suffix = Path(source_path).suffix.casefold()
-                if suffix == ".pdf":
-                    import pypdfium2 as pdfium
-                    image = pdfium.PdfDocument(str(source_path))[0].render(scale=1.2).to_pil().convert("RGB")
-                    qimage = QImage(image.tobytes(), image.width, image.height, image.width * 3, QImage.Format.Format_RGB888).copy()
-                    pixmap = QPixmap.fromImage(qimage)
-                else:
-                    pixmap = QPixmap(str(source_path))
-                if not pixmap.isNull():
-                    preview.setPixmap(pixmap.scaled(500, 680, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                preview_pixmap = load_document_preview_pixmap(source_path)
             except Exception as error:
-                preview.setText(f"Предпросмотр недоступен: {error}")
-        preview_scroll = QScrollArea()
-        preview_scroll.setWidgetResizable(True)
-        preview_scroll.setWidget(preview)
-        splitter.addWidget(preview_scroll)
+                preview_error = str(error)
+            else:
+                preview_error = "Предпросмотр оригинала недоступен."
+        else:
+            preview_error = "Оригинал не загружен."
+
+        if not preview_pixmap.isNull():
+            preview_view = ZoomableDocumentView(preview_pixmap, preview_panel)
+            preview_view.setMinimumWidth(280)
+            preview_layout.addWidget(preview_view, 1)
+            for label, callback in (
+                ("−", lambda: preview_view.zoom(1 / 1.2)),
+                ("По ширине", preview_view.fit_width),
+                ("100%", preview_view.show_original_size),
+                ("+", lambda: preview_view.zoom(1.2)),
+            ):
+                button = QPushButton(label)
+                button.clicked.connect(callback)
+                preview_controls.addWidget(button)
+
+            def open_large_preview():
+                DocumentPreviewDialog(preview_pixmap, Path(source_path).name, dialog, source_path).exec()
+
+            open_large_button = QPushButton("Открыть отдельно")
+            open_large_button.setToolTip("Открыть оригинал в отдельном изменяемом окне")
+            open_large_button.clicked.connect(open_large_preview)
+            preview_controls.addWidget(open_large_button)
+            preview_controls.addStretch()
+            preview_layout.insertLayout(0, preview_controls)
+        else:
+            preview_message = QLabel(preview_error)
+            preview_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview_message.setWordWrap(True)
+            preview_layout.addWidget(preview_message, 1)
+        splitter.addWidget(preview_panel)
 
         form_widget = QWidget()
         form_scroll = QScrollArea()
@@ -3683,7 +3807,7 @@ class SmartReportApp(QMainWindow):
         gross_amount = QLineEdit(str(fields.get("gross_amount") or ""))
         category = QComboBox()
         category.setEditable(True)
-        category.addItems(["Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты", "Прочие расходы"])
+        category.addItems(["Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты", "Прочие расходы", "Квитанция перевода"])
         category.setCurrentText(str(fields.get("expense_category") or "Прочие расходы"))
         document_comment = QTextEdit(str(fields.get("document_comment") or ""))
         document_comment.setMaximumHeight(80)
@@ -3696,6 +3820,13 @@ class SmartReportApp(QMainWindow):
         form.addRow("Сумма с НДС:", gross_amount)
         form.addRow("Категория:", category)
         form.addRow("Комментарий:", document_comment)
+        if is_transfer_receipt:
+            transfer_note = QLabel(
+                "Распознана квитанция перевода. Дата и сумма взяты из текста; "
+                "Lunar не подставлен как поставщик, НДС не рассчитывался. Запись требует проверки."
+            )
+            transfer_note.setWordWrap(True)
+            form.addRow("Проверка документа:", transfer_note)
 
         recognized_text = QTextEdit(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
         recognized_text.setReadOnly(True)
@@ -3780,11 +3911,28 @@ class SmartReportApp(QMainWindow):
         save_review = QPushButton("Сохранить: требует проверки")
         confirm = QPushButton("Подтвердить")
         cancel = QPushButton("Отмена")
+        if is_transfer_receipt:
+            save_draft.setEnabled(False)
+            save_draft.setToolTip("Квитанцию перевода следует сохранить со статусом «Требует проверки».")
+            save_review.setText("Сохранить квитанцию: требует проверки")
+            confirm.setEnabled(False)
+            confirm.setToolTip("Квитанцию перевода нельзя подтверждать как фактуру.")
+        maximize_button = QPushButton("На весь экран")
+        maximize_button.clicked.connect(
+            lambda: dialog.showNormal() if dialog.isMaximized() else dialog.showMaximized()
+        )
+        actions.insertWidget(0, maximize_button)
         for button in (save_draft, save_review, confirm, cancel):
             actions.addWidget(button)
         layout.addLayout(actions)
 
         def save_document(status):
+            if is_transfer_receipt and status != "requires_review":
+                QMessageBox.warning(
+                    dialog, "Требуется проверка",
+                    "Квитанция перевода не является фактурой и сохраняется только со статусом «Требует проверки».",
+                )
+                return
             net_value = parse_decimal(net_amount.text())
             vat_value = parse_decimal(vat_amount.text())
             gross_value = parse_decimal(gross_amount.text())
@@ -5289,8 +5437,8 @@ class SmartReportApp(QMainWindow):
                 document["id"], document["document_date"] or "—",
                 document["supplier_name"] or "Не указан", document["invoice_number"] or "—",
                 document["expense_category"],
-                f"{currency} {document['object_net'] or '0.00'}",
-                f"{currency} {document['object_vat'] or '0.00'}",
+                f"{currency} {document['object_net']}" if document["object_net"] is not None else "—",
+                f"{currency} {document['object_vat']}" if document["object_vat"] is not None else "—",
                 f"{currency} {document['object_gross'] or '0.00'}",
                 f"{currency} {document['gross_amount']}" if document["gross_amount"] else "—",
                 f"{currency} {document['unallocated_gross']}" if document["unallocated_gross"] else "0.00",
@@ -5408,6 +5556,9 @@ class SmartReportApp(QMainWindow):
         )
         self.invoice_summary_note.setWordWrap(True)
         layout.addWidget(self.invoice_summary_note)
+        self.invoice_ob_rules_lbl = QLabel()
+        self.invoice_ob_rules_lbl.setWordWrap(True)
+        layout.addWidget(self.invoice_ob_rules_lbl)
 
     def load_invoice_objects(self, company):
         selected_id = self.inv_obj_cb.currentData()
@@ -5456,6 +5607,14 @@ class SmartReportApp(QMainWindow):
                 collect_invoice_ob_category_hours(cursor, comp, object_names, d_from, d_to)
                 if has_ob_schema else {}
             )
+            ob_rule_descriptions = describe_category_time_ranges(
+                d_from,
+                d_to,
+                {
+                    "weekday_early_evening": "OB1",
+                    "weekday_late_evening_night": "OB2",
+                },
+            )
             ob_join = """
                 LEFT JOIN (SELECT shift_id, SUM(amount) AS segment_amount
                            FROM ob_segments GROUP BY shift_id) ob_segment
@@ -5482,6 +5641,7 @@ class SmartReportApp(QMainWindow):
                 'object_names': object_names,
                 'date_from': d_from, 'date_to': d_to, 'rows': rows,
                 'ob_category_hours': ob_category_hours,
+                'ob_rule_descriptions': ob_rule_descriptions,
                 'rate': float(obj_row['rate'] or 0), 'transport_rate': float(obj_row['transport_rate'] or 0),
                 'is_fast_pris': is_fast_pris,
                 'fast_pris_amount': parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0,
@@ -5544,14 +5704,21 @@ class SmartReportApp(QMainWindow):
         report["totals"] = totals
         return report
 
-    @staticmethod
-    def _invoice_summary_items(report):
+    @classmethod
+    def _invoice_summary_items(cls, report):
         totals = report["totals"]
+        rule_descriptions = report.get("ob_rule_descriptions", {})
         items = [
             ("Arbetade timmar totalt", f"{totals['hours']:.1f} tim"),
             ("Varav utan OB", "Ej fastställbart"),
-            ("Varav OB1", f"{totals['ob_categories'].get('weekday_early_evening', 0.0):.1f} tim"),
-            ("Varav OB2", f"{totals['ob_categories'].get('weekday_late_evening_night', 0.0):.1f} tim"),
+            (
+                f"Varav {cls._invoice_ob_rule_short_caption('OB1', rule_descriptions.get('OB1', ''))}",
+                f"{totals['ob_categories'].get('weekday_early_evening', 0.0):.1f} tim",
+            ),
+            (
+                f"Varav {cls._invoice_ob_rule_short_caption('OB2', rule_descriptions.get('OB2', ''))}",
+                f"{totals['ob_categories'].get('weekday_late_evening_night', 0.0):.1f} tim",
+            ),
         ]
         for category in sorted(totals["ob_categories"]):
             if category in {"weekday_early_evening", "weekday_late_evening_night"}:
@@ -5584,6 +5751,33 @@ class SmartReportApp(QMainWindow):
                 "Visad OB-summa är summan av sparade segment, inte en verifierad premie, "
                 "och ingår inte i totalsumman."
             )
+        rule_descriptions = report.get("ob_rule_descriptions", {})
+        self.invoice_ob_rules_lbl.setText(
+            f"{self._invoice_ob_rule_caption('OB1', rule_descriptions.get('OB1', ''))}; "
+            f"{self._invoice_ob_rule_caption('OB2', rule_descriptions.get('OB2', ''))}"
+        )
+
+    @staticmethod
+    def _invoice_ob_rule_short_caption(label, description):
+        if not description:
+            return f"{label} (kan inte fastställas)"
+        if description.startswith("Ej tillämpligt"):
+            return f"{label} (ej tillämpligt)"
+        intervals = list(dict.fromkeys(
+            part.rsplit(" ", 1)[-1]
+            for part in description.split("; ")
+            if "–" in part.rsplit(" ", 1)[-1]
+        ))
+        if not intervals:
+            return f"{label} (kan inte fastställas)"
+        return f"{label} ({', '.join(intervals)})"
+
+    @staticmethod
+    def _invoice_ob_rule_caption(label, description):
+        caption = SmartReportApp._invoice_ob_rule_short_caption(label, description)
+        if not description or description.startswith("Ej tillämpligt"):
+            return caption
+        return f"{caption} — {description}"
 
     def generate_invoice(self):
         try:
@@ -5597,6 +5791,7 @@ class SmartReportApp(QMainWindow):
                     "work_amount": 0.0, "transport_amount": 0.0,
                     "ob_amount": 0.0, "invoice_total": 0.0,
                 },
+                "ob_rule_descriptions": {},
             }
             self._render_invoice_summary(empty_report)
             self._invoice_report = None
@@ -5739,6 +5934,7 @@ class SmartReportApp(QMainWindow):
                 Paragraph("<b>Sammanfattning</b>", summary_style),
                 summary_table,
                 Paragraph(escape(summary_note), summary_style),
+                Paragraph(escape(self.invoice_ob_rules_lbl.text()), summary_style),
             ]))
             doc.build(story)
             QMessageBox.information(self, "Успех", f"PDF-отчет для счета сохранен:\n{base_filename}")

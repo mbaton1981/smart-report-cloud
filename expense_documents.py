@@ -14,7 +14,7 @@ from typing import Any
 
 MIGRATION_ID = "supplier_documents_v1"
 CENT = Decimal("0.01")
-VALID_DOCUMENT_TYPES = {"invoice", "receipt", "credit_note", "manual"}
+VALID_DOCUMENT_TYPES = {"invoice", "receipt", "credit_note", "transfer_receipt", "manual"}
 VALID_REVIEW_STATUSES = {"draft", "requires_review", "confirmed"}
 VALID_PAYMENT_STATUSES = {"unknown", "unpaid", "partially_paid", "paid"}
 DOCUMENT_SOURCES = {
@@ -108,13 +108,26 @@ def parse_document_text(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in (text or "").replace("\r", "\n").split("\n") if line.strip()]
     full_text = "\n".join(lines)
     lower_text = full_text.casefold()
+    is_transfer_receipt = bool(re.search(
+        r"payment\s+(?:confirmation|receipt|proof)|transfer\s+(?:confirmation|receipt|proof|date|amount)|"
+        r"transaction\s+(?:confirmation|receipt|date|amount)|betalningsbekräftelse|betalningsbekraftelse|"
+        r"överföringsbekräftelse|overforingsbekraftelse|banköverföring|bankoverforing|bank\s+transfer",
+        lower_text,
+    ))
 
     supplier_name = _label_value(lines, r"Leverantör|Leverantor|Supplier|Seller|Säljare|Saljare")
+    if is_transfer_receipt and supplier_name and re.sub(r"[^a-z0-9]+", "", supplier_name.casefold()) in {"lunar", "lunarbank"}:
+        supplier_name = None
     supplier_org_number = _label_value(lines, r"Leverantörens\s+Org\.?\s*nr|Leverantorens\s+Org\.?\s*nr|Org\.?\s*nr|Organisationsnummer")
     supplier_vat_number = _label_value(lines, r"VAT(?:\s*(?:no\.?|number|nr))?|Momsreg\.?\s*nr")
     invoice_number = _label_value(lines, r"Fakturanummer|Faktura\s*nr|Invoice\s*(?:number|no\.?)")
     payment_reference = _label_value(lines, r"OCR(?:-nummer)?|Betalningsreferens|Payment\s*reference")
     document_date = _date_value(_label_value(lines, r"Fakturadatum|Invoice\s*date|Kvitto(?:datum)?|Document\s*date"))
+    if is_transfer_receipt:
+        transfer_date = _date_value(_label_value(
+            lines, r"Transfer\s+date|Transaction\s+date|Överföringsdatum|Overforingsdatum|Transaktionsdatum|Datum|Date"
+        ))
+        document_date = transfer_date or document_date
     due_date = _date_value(_label_value(lines, r"Förfallodatum|Forfallodatum|Due\s*date|Payment\s*due"))
 
     net_raw = _label_value(lines, r"Netto|Belopp\s+exkl\.?\s*moms|Summa\s+exkl\.?\s*moms|Amount\s+excl\.?\s*VAT")
@@ -145,6 +158,34 @@ def parse_document_text(text: str) -> dict[str, Any]:
     net_amount = parse_decimal(net_raw)
     gross_amount = parse_decimal(gross_raw)
     amount_due = parse_decimal(due_raw)
+    transfer_amount = None
+    if is_transfer_receipt:
+        transfer_amount_raw = _label_value(
+            lines,
+            r"Transfer\s+amount|Amount\s+transferred|Transaction\s+amount|"
+            r"Överfört\s+belopp|Overfort\s+belopp|Belopp|Amount",
+        )
+        transfer_amount = parse_decimal(transfer_amount_raw)
+        if transfer_amount is None:
+            currency_amounts = []
+            for line in lines:
+                match = re.search(
+                    r"(?<!\d)(-?(?:\d{1,3}(?:[ \u00a0']\d{3})+|\d+)(?:[,.]\d{2})?)\s*(?:SEK|kr)\b",
+                    line,
+                    re.IGNORECASE,
+                )
+                if match:
+                    amount = parse_decimal(match.group(1))
+                    if amount is not None:
+                        currency_amounts.append(amount)
+            if len(currency_amounts) == 1:
+                transfer_amount = currency_amounts[0]
+
+        gross_amount = transfer_amount
+        net_amount = None
+        vat_total = None
+        amount_due = None
+        vat_lines = []
 
     currency_match = re.search(r"\b(SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\b", full_text, re.IGNORECASE)
     if currency_match:
@@ -158,41 +199,53 @@ def parse_document_text(text: str) -> dict[str, Any]:
     is_receipt = bool(re.search(r"kvitto|receipt|kassakvitto", lower_text))
     reverse_charge = bool(re.search(r"omvänd\s+skattskyldighet|omvand\s+skattskyldighet|reverse\s+charge", lower_text))
     reasons = []
-    if not supplier_name:
-        reasons.append("leverantör kunde inte identifieras säkert")
-    if re.search(r"köpare|kopare|buyer", lower_text) and not supplier_name:
-        reasons.append("köparuppgifter hittades men kan inte användas som leverantör")
-    if not full_text:
-        reasons.append("dokumentet gav ingen läsbar text; fyll i fälten manuellt")
-    if not document_date:
-        reasons.append("fakturadatum saknas eller kunde inte läsas")
-    if not invoice_number and not is_credit_note:
-        reasons.append("fakturanummer saknas eller kunde inte läsas")
-    if currency == "UNKNOWN":
-        reasons.append("valuta saknas; välj valuta manuellt")
-    if net_amount is None:
-        reasons.append("netto saknas; läs inte in ett uppskattat värde")
-    if gross_amount is None:
-        reasons.append("totalbelopp saknas")
-    if reverse_charge:
-        reasons.append("omvänd skattskyldighet upptäckt; kontrollera moms manuellt")
+    if is_transfer_receipt:
+        reasons.append("Распознана квитанция банковского перевода, а не фактура; проверьте получателя и связь с расходом.")
+        if not supplier_name:
+            reasons.append("Поставщик не определён. Lunar распознан как банк/логотип и не подставлен как поставщик.")
+        if not document_date:
+            reasons.append("Дата перевода не найдена; проверьте её по оригиналу.")
+        if transfer_amount is None:
+            reasons.append("Сумма перевода не найдена; проверьте её по оригиналу.")
+        reasons.append("Нетто и НДС не вычислялись: квитанция перевода не даёт основания для расчёта НДС.")
+    else:
+        if not supplier_name:
+            reasons.append("Поставщик не удалось надёжно определить; проверьте и заполните поле вручную.")
+        if re.search(r"köpare|kopare|buyer", lower_text) and not supplier_name:
+            reasons.append("Найдены данные покупателя, но они не подтверждают имя поставщика.")
+        if not full_text:
+            reasons.append("В документе не распознан текст; заполните поля вручную по оригиналу.")
+        if not document_date:
+            reasons.append("Дата фактуры/чека не распознана; проверьте её по оригиналу.")
+        if not invoice_number and not is_credit_note:
+            reasons.append("Номер фактуры не распознан; проверьте его по оригиналу.")
+        if currency == "UNKNOWN":
+            reasons.append("Валюта не распознана; выберите её вручную.")
+        if net_amount is None:
+            reasons.append("Сумма без НДС не найдена; проверьте её по оригиналу. Оценочное значение не подставлялось.")
+        if gross_amount is None:
+            reasons.append("Итоговая сумма не распознана; проверьте её по оригиналу.")
+        if reverse_charge:
+            reasons.append("Обнаружено указание на обратное начисление НДС; проверьте его по оригиналу.")
 
-    if net_amount is not None and vat_total is not None and gross_amount is not None:
+    if not is_transfer_receipt and net_amount is not None and vat_total is not None and gross_amount is not None:
         difference = (net_amount + vat_total - gross_amount).copy_abs()
         if difference > Decimal("0.02"):
-            reasons.append(f"netto + moms skiljer sig från totalbeloppet med {decimal_text(difference)}")
-    elif net_amount is not None and gross_amount is not None and vat_total is None and abs(net_amount - gross_amount) > Decimal("0.02"):
-        reasons.append("moms kunde inte fastställas för att verifiera totalbeloppet")
-    if vat_total_raw and vat_lines:
+            reasons.append(f"Нетто + НДС отличаются от итога на {decimal_text(difference)}.")
+    elif not is_transfer_receipt and net_amount is not None and gross_amount is not None and vat_total is None and abs(net_amount - gross_amount) > Decimal("0.02"):
+        reasons.append("НДС не удалось установить для проверки общей суммы.")
+    if not is_transfer_receipt and vat_total_raw and vat_lines:
         stated_vat = parse_decimal(vat_total_raw)
         if stated_vat is not None and abs(stated_vat - vat_total) > Decimal("0.02"):
-            reasons.append("summa moms skiljer sig från fördelningen per momssats")
+            reasons.append("Общая сумма НДС не совпадает с суммой строк по ставкам.")
 
     return {
         "supplier_name": supplier_name,
         "supplier_org_number": supplier_org_number,
         "supplier_vat_number": supplier_vat_number,
-        "document_type": "credit_note" if is_credit_note else "receipt" if is_receipt else "invoice",
+        "document_type": "transfer_receipt" if is_transfer_receipt else "credit_note" if is_credit_note else "receipt" if is_receipt else "invoice",
+        "expense_category": "Квитанция перевода" if is_transfer_receipt else None,
+        "suggested_verification_status": "requires_review" if is_transfer_receipt else None,
         "document_date": document_date,
         "due_date": due_date,
         "invoice_number": invoice_number,
@@ -201,6 +254,7 @@ def parse_document_text(text: str) -> dict[str, Any]:
         "net_amount": decimal_text(net_amount),
         "vat_amount": decimal_text(vat_total),
         "gross_amount": decimal_text(gross_amount),
+        "transfer_amount": decimal_text(transfer_amount),
         "amount_due": decimal_text(amount_due),
         "vat_lines": vat_lines,
         "reverse_charge": reverse_charge,
