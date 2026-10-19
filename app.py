@@ -8,6 +8,7 @@ import math
 import requests
 import json
 import logging
+import time
 import uuid
 import tempfile
 import mimetypes
@@ -24,7 +25,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
     QTextEdit, QSplitter, QGraphicsView, QGraphicsScene
 )
-from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal, QEvent
+from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool
 from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QImage, QPixmap
 from PyQt6.QtCore import QUrl
 
@@ -1390,6 +1391,26 @@ def enqueue_matching_shifts(cursor, where_clause, params):
             cursor.execute("UPDATE shifts SET sync_id = ? WHERE id = ?", (sync_id, row['id']))
         enqueue_shift_operation(cursor, sync_id, 'upsert', row['sync_version'], shift_payload(row))
 
+class ExpenseReadSignals(QObject):
+    completed = pyqtSignal(object, object, object, str)
+
+
+class ExpenseReadTask(QRunnable):
+    def __init__(self, key):
+        super().__init__()
+        self.key = key
+        self.signals = ExpenseReadSignals()
+
+    def run(self):
+        try:
+            objects = request_expense_api("GET", "/api/expense-objects").get("objects", [])
+            params = {name: value for name, value in zip(("date_from", "date_to"), self.key) if value}
+            documents = request_expense_api("GET", "/api/expense-documents", params=params).get("documents", [])
+            self.signals.completed.emit(self.key, objects, documents, "")
+        except Exception as error:
+            self.signals.completed.emit(self.key, [], [], str(error))
+
+
 class SyncWorker(QThread):
     completed = pyqtSignal(bool, int, int, int, int, int, str, str, str)
 
@@ -1872,6 +1893,12 @@ class SmartReportApp(QMainWindow):
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         self.resize(1240, 880)
         self.setStyleSheet(DARK_THEME_QSS)
+        self._async_expense_reads = True
+        self._expense_read_cache = {}
+        self._expense_read_attempts = {}
+        self._expense_read_busy = False
+        self._expense_read_task = None
+        self._expense_online = False
 
         init_db_once()
         self.init_ui()
@@ -1941,7 +1968,7 @@ class SmartReportApp(QMainWindow):
         self.tabs.setCurrentIndex(current_tab)
 
     def on_tab_changed(self, index):
-        self.load_dropdowns()
+        self.load_dropdowns(refresh_tables=False)
         if index == 1:
             self.load_salary_table_template()
         elif index == 2:
@@ -3030,6 +3057,7 @@ class SmartReportApp(QMainWindow):
         finally:
             conn.close()
         expense_sync_result = self._sync_expense_document_outbox()
+        self._expense_read_dirty = getattr(self, "_expense_read_dirty", False) or bool(expense_sync_result.get("synced") or expense_sync_result.get("conflicts"))
         conflicts += expense_sync_result["conflicts"]
         if expense_sync_result["conflicts"]:
             sync_conflict_reasons["конфликт расходных документов"] = expense_sync_result["conflicts"]
@@ -3059,9 +3087,15 @@ class SmartReportApp(QMainWindow):
         if success:
             self.load_shifts_history()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3 and hasattr(self, "table_supplier_documents"):
-            self.load_expense_documents()
-            if self.exp_document_tabs.currentIndex() == 1:
-                self.load_object_expense_overview()
+            if getattr(self, "_async_expense_reads", False) and (getattr(self, "_expense_read_dirty", False) or self._manual_sync_requested):
+                self._expense_read_dirty = False
+                self._invalidate_expense_reads()
+                self._schedule_expense_read((self.exp_date_from.text().strip(), self.exp_date_to.text().strip()))
+                self.exp_api_status_lbl.setText("Изменения синхронизированы; обновление реестра в фоне.")
+            else:
+                self.load_expense_documents()
+                if self.exp_document_tabs.currentIndex() == 1:
+                    self.load_object_expense_overview()
         if getattr(self, "_object_edit_sync_pending", False):
             if not success or conflicts:
                 self._object_edit_sync_pending = False
@@ -5990,7 +6024,7 @@ class SmartReportApp(QMainWindow):
         self.object_expenses_selected_label.setWordWrap(True)
         layout.addWidget(self.object_expenses_selected_label)
         summary = QHBoxLayout()
-        self.object_expenses_total_lbl = QLabel("Сумма с НДС: —")
+        self.object_expenses_total_lbl = QLabel("Итого с НДС: —")
         self.object_expenses_vat_lbl = QLabel("Известный НДС: —")
         self.object_expenses_net_lbl = QLabel("Сумма без НДС: —")
         self.object_expenses_unallocated_lbl = QLabel("Не распределено: —")
@@ -6004,7 +6038,7 @@ class SmartReportApp(QMainWindow):
 
         self.object_expenses_table = QTableWidget(0, 7)
         self.object_expenses_table.setHorizontalHeaderLabels([
-            "ID", "Дата", "Поставщик", "Документ", "Сумма части",
+            "ID", "Дата", "Поставщик", "Документ", "Итого с НДС",
             "НДС", "Статус распределения",
         ])
         self.object_expenses_table.setColumnHidden(0, True)
@@ -6037,7 +6071,56 @@ class SmartReportApp(QMainWindow):
         self.object_expenses_date_to.dateChanged.connect(self.load_object_expense_overview)
         self.load_expense_document_filters()
 
+    def _invalidate_expense_reads(self):
+        if getattr(self, "_async_expense_reads", False):
+            self._expense_read_attempts.clear()
+            self._expense_refresh_again = self._expense_read_busy
+
+    def _schedule_expense_read(self, key):
+        self._expense_requested_key = key
+        if self._expense_read_busy or time.monotonic() - self._expense_read_attempts.get(key, -1000) < 30:
+            return
+        self._expense_read_busy = True
+        self._expense_read_attempts[key] = time.monotonic()
+        task = ExpenseReadTask(key)
+        self._expense_read_task = task
+        task.signals.completed.connect(self._on_expense_read_completed)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_expense_read_completed(self, key, objects, documents, error):
+        refresh_again = getattr(self, "_expense_refresh_again", False)
+        self._expense_refresh_again = False
+        self._expense_read_busy = False
+        self._expense_read_task = None
+        self._expense_online = not error
+        self._expense_read_error = error
+        self._expense_read_attempts[key] = time.monotonic()
+        if not error:
+            self._expense_read_cache[key] = list(documents)
+            self._expense_objects = list(objects)
+        if refresh_again:
+            self._expense_read_attempts.clear()
+        if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3:
+            self.load_expense_document_filters()
+            self.load_expense_documents()
+            if self.exp_document_tabs.currentIndex() == 1:
+                self.load_object_expense_overview()
+        requested = getattr(self, "_expense_requested_key", key)
+        if requested != key or refresh_again:
+            self._schedule_expense_read(requested)
+
     def _expense_server_objects(self):
+        if getattr(self, "_async_expense_reads", False):
+            if not hasattr(self, "_expense_objects"):
+                conn = get_db_connection()
+                try:
+                    self._expense_objects = [dict(row) for row in conn.execute("""
+                        SELECT server_id AS id,sync_id,name,markning,company,is_active FROM objects
+                        WHERE server_id IS NOT NULL AND is_active=1 ORDER BY company,name,id
+                    """)]
+                finally:
+                    conn.close()
+            return list(getattr(self, "_expense_objects", [])), self._expense_online
         try:
             result = request_expense_api("GET", "/api/expense-objects")
             objects = result.get("objects", [])
@@ -6092,22 +6175,28 @@ class SmartReportApp(QMainWindow):
         if online:
             self.exp_api_status_lbl.setText("Общий реестр доступен.")
 
-    def _expense_document_snapshot(self, date_from=None, date_to=None):
+    def _expense_document_snapshot(self, date_from=None, date_to=None, fresh=False):
         params = {}
         if date_from:
             params["date_from"] = date_from
         if date_to:
             params["date_to"] = date_to
         online = True
-        try:
-            result = request_expense_api("GET", "/api/expense-documents", params=params)
-            documents = list(result.get("documents", []))
-        except Exception as error:
-            documents = []
-            online = False
-            self.exp_api_status_lbl.setText(
-                f"Нет связи с общим реестром; показана локальная очередь. {error}"
-            )
+        if getattr(self, "_async_expense_reads", False) and not fresh:
+            key = (date_from, date_to)
+            documents = list(self._expense_read_cache.get(key, []))
+            online = self._expense_online
+            self._schedule_expense_read(key)
+        else:
+            try:
+                result = request_expense_api("GET", "/api/expense-documents", params=params)
+                documents = list(result.get("documents", []))
+            except Exception as error:
+                documents = []
+                online = False
+                self.exp_api_status_lbl.setText(
+                    f"Нет связи с общим реестром; показана локальная очередь. {error}"
+                )
 
         conn = get_db_connection()
         try:
@@ -6192,7 +6281,14 @@ class SmartReportApp(QMainWindow):
                     merged[positions[client_id]] = pending
             else:
                 merged.append(pending)
-        if online:
+        if getattr(self, "_async_expense_reads", False):
+            if self._expense_read_busy:
+                self.exp_api_status_lbl.setText(f"Показаны доступные данные; обновление в фоне. В очереди: {len(queued)}.")
+            elif getattr(self, "_expense_read_error", ""):
+                self.exp_api_status_lbl.setText(f"Показаны сохранённые данные и очередь; обновление недоступно: {self._expense_read_error}")
+            else:
+                self.exp_api_status_lbl.setText(f"Общий реестр обновлён. В очереди: {len(queued)}.")
+        elif online:
             self.exp_api_status_lbl.setText(
                 f"Общий реестр доступен. В очереди: {len(queued)}."
             )
@@ -6347,7 +6443,7 @@ class SmartReportApp(QMainWindow):
             if remaining is not None and remaining:
                 totals["unallocated"][currency] = totals["unallocated"].get(currency, Decimal(0)) + remaining
             rows.append((document, allocations))
-        self.object_expenses_total_lbl.setText("Сумма с НДС: " + ("Неизвестно (не все части указаны)" if unknown["gross"] else self._expense_money_label(totals["gross"])))
+        self.object_expenses_total_lbl.setText("Итого с НДС: " + ("Неизвестно (не все части указаны)" if unknown["gross"] else self._expense_money_label(totals["gross"])))
         self.object_expenses_vat_lbl.setText("НДС частей: " + ("Неизвестно (не все части указаны)" if unknown["vat"] else self._expense_money_label(totals["vat"])))
         self.object_expenses_net_lbl.setText(f"Сумма без НДС: {self._expense_money_label(totals['net'])}")
         self.object_expenses_unallocated_lbl.setText(
@@ -6363,8 +6459,7 @@ class SmartReportApp(QMainWindow):
             allocated_gross = sum(allocated_gross_values, Decimal(0)) if all(value is not None for value in allocated_gross_values) else None
             allocated_net_values = [parse_decimal(item.get("net_amount")) for item in allocations]
             allocated_net = sum(allocated_net_values, Decimal(0)) if all(value is not None for value in allocated_net_values) else None
-            amount_label = f"{allocated_gross:,.2f} {currency} с НДС" if allocated_gross is not None else (
-                f"{allocated_net:,.2f} {currency} без НДС" if allocated_net is not None else "Неизвестно")
+            amount_label = f"{allocated_gross:,.2f} {currency}" if allocated_gross is not None else "Неизвестно"
             allocated_vat_values = [parse_decimal(item.get("vat_amount")) for item in allocations]
             allocated_vat = sum(allocated_vat_values, Decimal(0)) if all(value is not None for value in allocated_vat_values) else None
             values = (
@@ -6377,6 +6472,8 @@ class SmartReportApp(QMainWindow):
             )
             for column, value in enumerate(values):
                 self.object_expenses_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+            self.object_expenses_table.item(row_index, 4).setToolTip(
+                f"Без НДС: {allocated_net:,.2f} {currency}" if allocated_net is not None else "Сумма без НДС неизвестна")
             self.object_expenses_table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
 
     def _store_expense_originals(self, paths, client_id):
@@ -7066,7 +7163,7 @@ class SmartReportApp(QMainWindow):
             if len(set(incoming_hashes)) != len(incoming_hashes):
                 QMessageBox.warning(self, "Повторный оригинал", "Один и тот же файл выбран несколько раз. Уберите повторные копии.")
                 return
-            documents, _online = self._expense_document_snapshot()
+            documents, _online = self._expense_document_snapshot(fresh=True)
             for document in documents:
                 known_hashes = {item.get("sha256") for item in document.get("attachments") or [] if item.get("sha256")}
                 for local_path in document.get("local_attachment_paths") or []:
@@ -7148,6 +7245,7 @@ class SmartReportApp(QMainWindow):
         try:
             request_expense_api("POST", f"/api/expense-documents/{identifier}/allocation-vat",
                                 json={"expected_version": document.get("server_version") or document.get("sync_version")})
+            self._invalidate_expense_reads()
             self.load_expense_documents()
             self.load_object_expense_overview()
             QMessageBox.information(self, "НДС частей", "НДС и суммы с НДС сохранены; сумма НДС частей совпадает с фактурой.")
@@ -7176,6 +7274,7 @@ class SmartReportApp(QMainWindow):
                 current = request_expense_api("GET", f"/api/expense-documents/{selected_id}")["document"]
                 request_expense_api("POST", f"/api/expense-documents/{selected_id}/recognize",
                                     json={"expected_version": current["sync_version"], "replace_fields": True})
+            self._invalidate_expense_reads()
             self.load_expense_documents()
         except Exception as error:
             QMessageBox.warning(self, "Распознавание", str(error))
@@ -8635,7 +8734,7 @@ class SmartReportApp(QMainWindow):
         self.load_dropdowns()
         self.background_sync_with_cloud()
 
-    def load_dropdowns(self):
+    def load_dropdowns(self, refresh_tables=True):
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -8705,11 +8804,11 @@ class SmartReportApp(QMainWindow):
 
         conn.close()
 
-        if hasattr(self, 'table_employees'):
+        if refresh_tables and hasattr(self, 'table_employees'):
             self.load_employees_table()
-        if hasattr(self, 'table_objects'):
+        if refresh_tables and hasattr(self, 'table_objects'):
             self.load_objects_table()
-        if hasattr(self, 'table_companies'):
+        if refresh_tables and hasattr(self, 'table_companies'):
             self.load_companies_table()
 
     def load_objects_table(self):

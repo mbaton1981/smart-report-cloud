@@ -1140,6 +1140,8 @@ class CatalogSyncTests(unittest.TestCase):
             return Response(response)
 
         window = None
+        scheduler = patch.object(self.desktop.SmartReportApp, "_schedule_expense_read")
+        scheduler.start()
         try:
             with patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 window = self.desktop.SmartReportApp()
@@ -1161,6 +1163,9 @@ class CatalogSyncTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(stable_object)
             object_id = int(stable_object["id"])
+            objects = self.server_client.get("/api/expense-objects", headers={"X-Sync-Key": "isolated-sync-test-key"}).get_json()["objects"]
+            window._on_expense_read_completed((None, None), objects, [], "")
+            window.load_expense_document_filters()
             window.exp_filter_object.setCurrentIndex(window.exp_filter_object.findData(object_id))
             window.object_expenses_object.setCurrentIndex(
                 window.object_expenses_object.findData(object_id)
@@ -1172,11 +1177,14 @@ class CatalogSyncTests(unittest.TestCase):
             server_conn.commit()
             server_conn.close()
             with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                objects = self.server_client.get("/api/expense-objects", headers={"X-Sync-Key": "isolated-sync-test-key"}).get_json()["objects"]
+                window._on_expense_read_completed((None, None), objects, [], "")
                 window.load_expense_document_filters()
             self.assertEqual(window.exp_filter_object.currentData(), object_id)
             self.assertEqual(window.object_expenses_object.currentData(), object_id)
             self.assertIn("Stable expense object renamed", window.object_expenses_object.currentText())
         finally:
+            scheduler.stop()
             if window is not None:
                 window.auto_sync_timer.stop()
                 window.close()
@@ -1817,6 +1825,98 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_background_expense_read_is_nonblocking_cached_and_keeps_offline_data(self):
+        import threading
+        from PyQt6.QtCore import QEventLoop, QThread, QThreadPool, QTimer
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._async_expense_reads = True
+        window._expense_read_cache = {}
+        window._expense_read_attempts = {}
+        window._expense_read_busy = False
+        window._expense_read_task = None
+        window._expense_online = False
+        window.exp_api_status_lbl = self.desktop.QLabel()
+        gate = threading.Event()
+        calls = []
+        document = {"id": 9, "client_id": "cached-doc", "supplier_name": "Cached Supplier", "allocations": []}
+
+        def request(method, path, **kwargs):
+            self.assertNotEqual(QThread.currentThread(), self.qt_app.thread())
+            calls.append(path)
+            if path == "/api/expense-objects":
+                self.assertTrue(gate.wait(1))
+                return {"objects": []}
+            return {"documents": [document]}
+
+        try:
+            with patch.object(self.desktop, "request_expense_api", side_effect=request):
+                first, online = window._expense_document_snapshot("2026-10-01", "2026-10-31")
+                self.assertEqual(first, [])
+                self.assertFalse(online)
+                self.assertTrue(window._expense_read_busy)
+                loop = QEventLoop()
+                window._expense_read_task.signals.completed.connect(loop.quit)
+                heartbeat = []
+                QTimer.singleShot(0, lambda: (heartbeat.append(True), gate.set()))
+                QTimer.singleShot(2000, loop.quit)
+                loop.exec()
+                self.qt_app.processEvents()
+                self.assertTrue(heartbeat)
+                self.assertFalse(window._expense_read_busy)
+                second, online = window._expense_document_snapshot("2026-10-01", "2026-10-31")
+                self.assertEqual(second[0]["id"], 9)
+                self.assertTrue(online)
+                self.assertEqual(calls, ["/api/expense-objects", "/api/expense-documents"])
+                window._on_expense_read_completed(("2026-10-01", "2026-10-31"), [], [], "test offline")
+                cached, online = window._expense_document_snapshot("2026-10-01", "2026-10-31")
+                self.assertEqual(cached[0]["id"], 9)
+                self.assertFalse(online)
+                self.assertIn("test offline", window.exp_api_status_lbl.text())
+                with patch.object(self.desktop.QThreadPool, "globalInstance") as pool:
+                    window._invalidate_expense_reads()
+                    window._schedule_expense_read(("2026-10-01", "2026-10-31"))
+                    pool.return_value.start.assert_called_once()
+                    window._invalidate_expense_reads()
+                    self.assertTrue(window._expense_refresh_again)
+                    window._on_expense_read_completed(("2026-10-01", "2026-10-31"), [], [document], "")
+                    self.assertEqual(pool.return_value.start.call_count, 2)
+        finally:
+            gate.set()
+            QThreadPool.globalInstance().waitForDone(2000)
+            window.close()
+            window.deleteLater()
+
+    def test_table_bulk_fill_does_not_remeasure_each_insert(self):
+        from PyQt6.QtWidgets import QHeaderView
+        from desktop_ui import TableDelegate
+        table = self.desktop.QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Объект", "Сумма (SEK)"])
+        try:
+            table.show()
+            self.qt_app.processEvents()
+            original = TableDelegate.sizeHint
+            calls = []
+
+            def measured(delegate, option, index):
+                calls.append(index.row())
+                return original(delegate, option, index)
+
+            with patch.object(TableDelegate, "sizeHint", new=measured):
+                table.setRowCount(80)
+                for row in range(80):
+                    table.setItem(row, 0, self.desktop.QTableWidgetItem("Synthetic object"))
+                    table.setItem(row, 1, self.desktop.QTableWidgetItem("1234.50"))
+                self.assertEqual(calls, [])
+                self.qt_app.processEvents()
+                self.assertEqual(table.horizontalHeader().sectionResizeMode(0), QHeaderView.ResizeMode.Stretch)
+                self.assertEqual(table.horizontalHeader().sectionResizeMode(1), QHeaderView.ResizeMode.ResizeToContents)
+                self.assertLess(len(calls), 3000)
+        finally:
+            table.close()
+            table.deleteLater()
+
     def test_object_report_labels_net_and_reads_known_part_vat(self):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
@@ -1836,16 +1936,25 @@ class CatalogSyncTests(unittest.TestCase):
                 combo = window.object_expenses_object
                 combo.setCurrentIndex(combo.findData(5))
                 window.load_object_expense_overview()
-                self.assertEqual(window.object_expenses_table.horizontalHeaderItem(4).text(), "Сумма части")
-                self.assertIn("без НДС", window.object_expenses_table.item(0, 4).text())
+                self.assertEqual(window.object_expenses_table.horizontalHeaderItem(4).text(), "Итого с НДС")
+                self.assertEqual(window.object_expenses_table.item(0, 4).text(), "Неизвестно")
+                self.assertIn("72,495.92", window.object_expenses_table.item(0, 4).toolTip())
                 self.assertEqual(window.object_expenses_table.item(0, 5).text(), "Неизвестно")
                 document["allocations"][0].update(vat_amount="18124.00", gross_amount="90619.92")
                 window.load_object_expense_overview()
                 self.assertIn("90,619.92", window.object_expenses_table.item(0, 4).text())
-                self.assertIn("с НДС", window.object_expenses_table.item(0, 4).text())
+                self.assertNotIn("без НДС", window.object_expenses_table.item(0, 4).text())
                 self.assertIn("18,124.00", window.object_expenses_table.item(0, 5).text())
                 self.assertIn("18,124.00", window.object_expenses_vat_lbl.text())
                 self.assertIn("90,619.92", window.object_expenses_total_lbl.text())
+                document["allocations"].append({"object_id": 13, "destination": "object", "net_amount": "685.22",
+                                                "vat_amount": "171.31", "gross_amount": "856.53"})
+                combo.addItem("Object 13", 13)
+                combo.setCurrentIndex(combo.findData(13))
+                window.load_object_expense_overview()
+                self.assertIn("856.53", window.object_expenses_table.item(0, 4).text())
+                self.assertIn("171.31", window.object_expenses_table.item(0, 5).text())
+                self.assertIn("685.22", window.object_expenses_net_lbl.text())
         finally:
             window.close()
             window.deleteLater()

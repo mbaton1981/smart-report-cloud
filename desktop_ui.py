@@ -79,6 +79,20 @@ class ReportTable(QTableWidget):
         item = self.horizontalHeaderItem(column)
         return column_role(item.text() if item else "")
 
+    def suspend_content_measurement(self):
+        if not getattr(self, "_refreshing", False):
+            self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+
+    def setRowCount(self, count):
+        self.suspend_content_measurement()
+        super().setRowCount(count)
+        self.schedule_layout()
+
+    def insertRow(self, row):
+        self.suspend_content_measurement()
+        super().insertRow(row)
+        self.schedule_layout()
+
     def schedule_layout(self, *_):
         if not self._refresh_pending and not self._refreshing:
             self._refresh_pending = True
