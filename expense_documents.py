@@ -444,6 +444,14 @@ def parse_invoice_pages(pages):
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
     }
+    is_receipt = fields.get("document_type") == "receipt"
+    if is_receipt:
+        labels["document_date"] += r"|Kvitto(?:datum)?|Köpdatum"
+        labels["invoice_number"] += r"|Kvittonummer|Kvitto\s*nr\.?"
+        labels["gross_amount"] += r"|Totalt"
+        labels["vat_amount"] += r"|Varav\s+moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?"
+    if fields.get("document_type") == "credit_note":
+        labels["amount_due"] += r"|Summa\s+er\s+tillgodo|Belopp\s+att\s+återfå"
     candidates = {key: [] for key in labels}
     companies = []
     field_sources = {}
@@ -493,15 +501,16 @@ def parse_invoice_pages(pages):
                         return any(re.fullmatch(rf"(?:{caption})\s*:?", other["text"].strip(), re.IGNORECASE)
                                    for caption in labels.values())
 
+                    row_tolerance = 6 if is_receipt and key == "vat_amount" and re.match(r"Varav\s+moms", cell_text, re.IGNORECASE) else 4
                     same_row_values = [other for other in cells if other["x0"] >= cell["x1"]
-                                       and abs(other["y0"] - cell["y0"]) < 4
+                                       and abs(other["y0"] - cell["y0"]) < row_tolerance
                                        and checked_value(key, other["text"]) is not None
                                        and not any((is_caption(between) or (
                                                        checked_value(key, between["text"]) is None
                                                        and re.search(r"[A-Za-zÅÄÖåäö]", between["text"])
                                                        and not re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", between["text"], re.IGNORECASE)))
                                                    and cell["x1"] <= between["x0"] < other["x0"]
-                                                   and abs(between["y0"] - cell["y0"]) < 4 for between in cells)]
+                                                   and abs(between["y0"] - cell["y0"]) < row_tolerance for between in cells)]
                     right_headers = [other["x0"] for other in cells
                                      if abs(other["y0"] - cell["y0"]) < 4 and other["x0"] > cell["x0"]]
                     right_edge = min(right_headers) if right_headers else cell["x1"] + 100
@@ -585,6 +594,12 @@ def parse_invoice_pages(pages):
         if explicit_net + Decimal(fields["vat_amount"]) == Decimal(fields["gross_amount"]):
             fields["net_amount"] = decimal_text(explicit_net)
             field_sources["net_amount"] = field_sources.get("taxable_net_amount", []) + field_sources.get("exempt_net_amount", [])
+    if (is_receipt and fields.get("net_amount") is None
+            and fields.get("gross_amount") is not None and fields.get("vat_amount") is not None
+            and field_sources.get("gross_amount") and field_sources.get("vat_amount")):
+        fields["net_amount"] = decimal_text(Decimal(fields["gross_amount"]) - Decimal(fields["vat_amount"]))
+        field_sources["net_amount"] = [{"kind": "derived_from_stated_totals", "operation": "gross_minus_vat",
+                                        "sources": field_sources["gross_amount"] + field_sources["vat_amount"]}]
     fields["rounding_amount"] = fields.get("rounding_amount")
     if fields.get("net_amount") is not None and fields.get("vat_amount") is not None:
         fields["gross_amount"] = decimal_text(Decimal(fields["net_amount"]) + Decimal(fields["vat_amount"]))

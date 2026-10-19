@@ -1817,6 +1817,43 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_existing_receipt_parser_reads_stated_totals_without_inventing_vat_or_debt(self):
+        from expense_documents import parse_invoice_pages
+
+        def cell(text, left, top):
+            return {"text": text, "x0": left, "x1": left + len(text) * 4, "y0": top, "y1": top + 8}
+
+        for gross, vat, net, rate in (("12761.25", "2552.25", "10209.00", "25"), ("112.00", "12.00", "100.00", "12")):
+            with self.subTest(gross=gross):
+                page = {"page": 1, "text": "Kvitto", "elements": [
+                    cell("Kvitto", 250, 60), cell("2026-10-16", 510, 60),
+                    cell("Totalt", 30, 670), cell("SEK " + gross, 470, 671),
+                    cell(f"Varav moms ({rate}%)", 30, 690), cell("SEK " + vat, 490, 694),
+                ]}
+                fields = parse_invoice_pages([page])
+                self.assertEqual(fields["document_type"], "receipt")
+                self.assertEqual(fields["document_date"], "2026-10-16")
+                self.assertEqual(fields["gross_amount"], gross)
+                self.assertEqual(fields["vat_amount"], vat)
+                self.assertEqual(fields["net_amount"], net)
+                self.assertIsNone(fields["amount_due"])
+                self.assertIsNone(fields["invoice_number"])
+                self.assertEqual(fields["field_sources"]["net_amount"][0]["operation"], "gross_minus_vat")
+                page["elements"] = page["elements"][:-2]
+                missing = parse_invoice_pages([page])
+                self.assertEqual(missing["gross_amount"], gross)
+                self.assertIsNone(missing["vat_amount"])
+                self.assertIsNone(missing["net_amount"])
+
+    def test_credit_note_reads_negative_credit_and_explicit_zero_vat(self):
+        from expense_documents import parse_invoice_pages
+
+        fields = parse_invoice_pages([{"page": 1, "text": "Kreditfaktura\nSumma exklusive moms: -68,80 kr\nMoms: 0,00 kr\nSumma er tillgodo: -68,80 kr"}])
+        self.assertEqual(fields["document_type"], "credit_note")
+        self.assertEqual(fields["net_amount"], "-68.80")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["amount_due"], "-68.80")
+
     def test_currency_summary_totals_and_seller_registration_ignore_operator_details(self):
         from expense_documents import parse_invoice_pages
 
