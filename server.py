@@ -1860,8 +1860,13 @@ def expense_document_split_api(document_id):
             return jsonify({"ok": False, "error": "Документ не найден."}), 404
         if payload.get("expected_version") != parent["sync_version"]:
             return jsonify({"ok": False, "error": "Документ изменился; обновите карточку."}), 409
+        if not invoice_net_schema_ready(conn):
+            return jsonify({"ok": False, "error": "Для разделения пакета требуется обновление схемы расходов."}), 503
         if parent["verification_status"] == "confirmed" or conn.execute(
-                "SELECT 1 FROM expense_allocations WHERE document_id=?", (document_id,)).fetchone():
+                """SELECT 1 FROM expense_allocations WHERE document_id=? AND (
+                    object_id IS NOT NULL OR allocated_gross IS NOT NULL OR allocated_net IS NOT NULL
+                    OR allocated_vat IS NOT NULL OR destination='company'
+                    OR allocation_note<>'' OR expense_category<>'')""", (document_id,)).fetchone():
             return jsonify({"ok": False, "error": "Нельзя автоматически разделить подтверждённый или распределённый документ."}), 409
         attachments = conn.execute("SELECT * FROM expense_document_attachments WHERE document_id=? ORDER BY ordinal,id", (document_id,)).fetchall()
         if len(attachments) < 2:

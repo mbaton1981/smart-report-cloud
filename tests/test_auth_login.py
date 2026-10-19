@@ -149,6 +149,12 @@ class AuthLoginTests(unittest.TestCase):
     def test_split_legacy_eleven_file_package_is_idempotent_and_keeps_originals(self):
         from io import BytesIO
         import uuid
+        from expense_documents import migrate_invoice_net_schema
+        connection = sqlite3.connect(self.server.DB_FILE)
+        try:
+            migrate_invoice_net_schema(connection)
+        finally:
+            connection.close()
         headers = self._bearer(self._token())
         saved = self.client.post("/api/expense-documents", headers=headers, data={
             "payload": json.dumps({"client_id": str(uuid.uuid4()), "verification_status": "draft"}),
@@ -156,7 +162,23 @@ class AuthLoginTests(unittest.TestCase):
         })
         self.assertEqual(saved.status_code, 201)
         identifier = saved.get_json()["document"]["id"]
+        connection = sqlite3.connect(self.server.DB_FILE)
+        try:
+            connection.execute("INSERT INTO expense_allocations (document_id,object_id,allocated_gross) VALUES (?,NULL,NULL)", (identifier,))
+            connection.commit()
+        finally:
+            connection.close()
         before = self._query("SELECT id,stored_name,file_sha256 FROM expense_document_attachments ORDER BY id")
+        connection = sqlite3.connect(self.server.DB_FILE)
+        try:
+            connection.execute("UPDATE expense_allocations SET allocated_net='1.00' WHERE document_id=?", (identifier,))
+            connection.commit()
+            blocked = self.client.post(f"/api/expense-documents/{identifier}/split", headers=headers, json={"expected_version": 1})
+            self.assertEqual(blocked.status_code, 409)
+            connection.execute("UPDATE expense_allocations SET allocated_net=NULL WHERE document_id=?", (identifier,))
+            connection.commit()
+        finally:
+            connection.close()
         response = self.client.post(f"/api/expense-documents/{identifier}/split", headers=headers, json={"expected_version": 1})
         self.assertEqual(response.status_code, 200)
         children = response.get_json()["children"]
@@ -164,6 +186,7 @@ class AuthLoginTests(unittest.TestCase):
         retry = self.client.post(f"/api/expense-documents/{identifier}/split", headers=headers, json={"expected_version": 1})
         self.assertEqual(retry.get_json()["children"], children)
         self.assertEqual(before, self._query("SELECT id,stored_name,file_sha256 FROM expense_document_attachments ORDER BY id"))
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_allocations WHERE document_id=?", (identifier,))[0][0], 1)
         for child in children:
             result = self.client.post(f"/api/expense-documents/{child}/recognize", headers=headers, json={"expected_version": 1})
             self.assertEqual(result.status_code, 200)
