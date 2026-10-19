@@ -407,15 +407,16 @@ def invoice_seller_blocks(cells, page):
                           for line in [value[len(name):], *address_lines])
         if not has_address:
             continue
+        company_stem = re.sub(r"\s+(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS)$", "", name, flags=re.IGNORECASE)
         own_registration = any(
-            re.match(r"^(?:Org\.?\s*nr|Organisationsn(?:ummer|r)|Momsreg|VAT\s*/)", other["text"], re.IGNORECASE)
+            re.match(rf"^(?:{re.escape(company_stem)}\s+)?(?:Org\.?\s*(?:nr|nummer)|Organisationsn(?:ummer|r)|Momsreg|VAT\s*/)", other["text"], re.IGNORECASE)
             and abs(other["x0"] - cell["x0"]) < 24 and 0 <= other["y0"] - cell["y0"] < 80
             for other in cells
         )
         if cell["y0"] < height * 0.3:
-            candidates.append((90 if own_registration else 80, name, page, cell))
+            candidates.append((95 if own_registration else 82 if cell["x0"] < width * 0.45 else 80, name, page, cell))
         elif cell["y0"] > height * 0.65:
-            candidates.append((85, name, page, cell))
+            candidates.append((95 if own_registration else 85, name, page, cell))
     return candidates
 
 
@@ -436,10 +437,12 @@ def parse_invoice_pages(pages):
         "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda\s+senast|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
         "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
-        "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s*SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
+        "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
-        "amount_due": r"Att\s+betala|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms",
-        "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp",
+        "amount_due": r"Att\s+betala|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
+        "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?",
+        "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
+        "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
     }
     candidates = {key: [] for key in labels}
     companies = []
@@ -537,11 +540,14 @@ def parse_invoice_pages(pages):
                     source = {"source": page.get("source"), "page": page.get("page", 1),
                               "attachment_index": page.get("attachment_index", 0),
                               "box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
-                              "text": value_cell["text"], "kind": "invoice_total" if "amount" in key else "header"}
+                              "text": value_cell["text"], "caption": cell_text,
+                              "kind": "invoice_total" if "amount" in key else "header"}
                     if key == "vat_amount":
                         row_with_total = any(value_cell in row and re.fullmatch(r"Totalt?", row[0]["text"].strip(), re.IGNORECASE) for row in rows)
                         ledger_row = any(cell in row and any(other is not cell and is_caption(other) for other in row) for row in rows) if re.fullmatch(rf"(?:{label})\s*:?", cell_text, re.IGNORECASE) else False
-                        source["priority"] = 3 if row_with_total or ledger_row or re.search(r"\d.*%", cell_text) else 2 if re.search(r"belopp", cell_text, re.IGNORECASE) else 1
+                        source["priority"] = (4 if re.fullmatch(r"Moms\s*belopp\s+i\s+SEK", cell_text, re.IGNORECASE)
+                                              else 3 if row_with_total or ledger_row or re.search(r"\d.*%", cell_text)
+                                              else 2 if re.search(r"belopp", cell_text, re.IGNORECASE) else 1)
                     candidates[key].append((value, source))
     if not candidates["supplier_name"] and companies:
         priority = max(item[0] for item in companies)
@@ -550,8 +556,18 @@ def parse_invoice_pages(pages):
             _, company, page, cell = best[0]
             candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"],
                                                        "kind": "seller_address_block"}))
+    fiscal_summary_pages = {
+        (source.get("attachment_index", 0), source["page"])
+        for _, source in candidates["taxable_net_amount"]
+        if any((other.get("attachment_index", 0), other["page"]) ==
+               (source.get("attachment_index", 0), source["page"])
+               for _, other in candidates["exempt_net_amount"])
+    }
     diagnostics = []
     for key, matches in candidates.items():
+        if key == "vat_amount" and fiscal_summary_pages:
+            matches = [(value, source) for value, source in matches
+                       if (source.get("attachment_index", 0), source["page"]) in fiscal_summary_pages]
         if key == "vat_amount" and matches:
             priority = max(source.get("priority", 1) for _, source in matches)
             matches = [(value, source) for value, source in matches if source.get("priority", 1) == priority]
@@ -564,6 +580,11 @@ def parse_invoice_pages(pages):
             diagnostics.append(f"Несколько различных значений поля {key}; требуется сверка по оригиналу.")
         elif key not in ("currency_code",):
             fields[key] = None
+    if fields.get("net_amount") is None and all(fields.get(key) is not None for key in ("taxable_net_amount", "exempt_net_amount", "vat_amount", "gross_amount")):
+        explicit_net = Decimal(fields["taxable_net_amount"]) + Decimal(fields["exempt_net_amount"])
+        if explicit_net + Decimal(fields["vat_amount"]) == Decimal(fields["gross_amount"]):
+            fields["net_amount"] = decimal_text(explicit_net)
+            field_sources["net_amount"] = field_sources.get("taxable_net_amount", []) + field_sources.get("exempt_net_amount", [])
     fields["rounding_amount"] = fields.get("rounding_amount")
     if fields.get("net_amount") is not None and fields.get("vat_amount") is not None:
         fields["gross_amount"] = decimal_text(Decimal(fields["net_amount"]) + Decimal(fields["vat_amount"]))

@@ -1817,6 +1817,41 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_currency_summary_totals_and_seller_registration_ignore_operator_details(self):
+        from expense_documents import parse_invoice_pages
+
+        def cell(text, left, top):
+            return {"text": text, "x0": left, "x1": left + len(text) * 4, "y0": top, "y1": top + 8}
+
+        def pages(vat):
+            summary = [
+                cell("Buyer Builds AB", 350, 130), cell("Buyer Road 4, 123 45 City", 350, 142),
+                cell("Fakturanummer", 45, 170), cell("9042", 220, 170),
+                cell("Totalbelopp momspliktigt", 45, 400), cell("701,23", 330, 400),
+                cell("Totalbelopp ej momspliktigt", 45, 415), cell("40,10", 330, 415),
+                cell("Totalbelopp inkl. moms i SEK", 45, 460), cell("818,93", 330, 460),
+                cell("Totalbelopp i SEK", 45, 305), cell("818,93", 230, 305),
+                cell("Ledger Services AB", 45, 710), cell("Examplegatan 9, 123 45 City", 45, 723),
+                cell("Ledger Services org. nummer", 45, 741), cell("556000-1111", 45, 752),
+            ]
+            if vat is not None:
+                summary += [cell("Momsbelopp i SEK", 45, 435), cell(vat, 330, 435)]
+            details = [cell("Other Parking AB", 45, 570), cell("Box 18, 123 45 City", 45, 583),
+                       cell("Moms", 45, 400), cell("9,99", 200, 400)]
+            return [{"page": 1, "attachment_index": 0, "text": "", "elements": summary},
+                    {"page": 2, "attachment_index": 0, "text": "", "elements": details}]
+
+        result = parse_invoice_pages(pages("77,60"))
+        self.assertEqual(result["supplier_name"], "Ledger Services AB")
+        self.assertEqual(result["net_amount"], "741.33")
+        self.assertEqual(result["vat_amount"], "77.60")
+        self.assertEqual(result["amount_due"], "818.93")
+        self.assertEqual(result["currency_code"], "SEK")
+        self.assertEqual(result["field_sources"]["vat_amount"][0]["caption"], "Momsbelopp i SEK")
+        result = parse_invoice_pages(pages(None))
+        self.assertIsNone(result["vat_amount"])
+        self.assertTrue(any("vat_amount" in issue for issue in result["review_reasons"]))
+
     def test_desktop_eleven_files_dispatches_one_invoice_per_file(self):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)

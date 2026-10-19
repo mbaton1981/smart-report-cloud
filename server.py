@@ -1816,6 +1816,8 @@ def expense_document_recognize_api(document_id):
         result = recognize_invoice([path])
         now = datetime.now(timezone.utc).isoformat()
         details = {key: result[key] for key in ("methods", "errors", "missing_fields")}
+        details["field_sources"] = result["fields"].get("field_sources", {})
+        details["review_reasons"] = result["fields"].get("review_reasons", [])
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute("SELECT sync_version,is_deleted FROM expense_documents WHERE id=?", (document_id,)).fetchone()
         if current["is_deleted"] or current["sync_version"] != version:

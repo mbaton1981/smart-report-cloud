@@ -134,6 +134,7 @@ class AuthLoginTests(unittest.TestCase):
             self.assertEqual(document["net_amount"], "100.00")
             self.assertTrue(document["recognized_text"])
             self.assertEqual(document["processing"]["state"], "requires_review")
+            self.assertTrue(document["processing"]["field_sources"]["vat_amount"])
             self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/recognize", headers=headers,
                                              json={"expected_version": 1}).status_code, 409)
             duplicate = self.client.post("/api/expense-documents", headers=headers, data={
