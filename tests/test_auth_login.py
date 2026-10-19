@@ -80,6 +80,113 @@ class AuthLoginTests(unittest.TestCase):
         me = self.client.get("/api/auth/me", headers=self._bearer(token))
         self.assertEqual(me.get_json()["user"], {"username": "admin", "role": "admin"})
 
+    def test_invoice_date_filter_keeps_undated_documents_visible(self):
+        connection = sqlite3.connect(self.server.DB_FILE)
+        try:
+            for identifier, date in (("undated", None), ("empty-date", ""),
+                                     ("in-period", "2026-10-19"), ("outside", "2026-09-01")):
+                connection.execute(
+                    "INSERT INTO expense_documents (client_id, document_date, created_at, updated_at) VALUES (?, ?, 'x', 'x')",
+                    (identifier, date),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        response = self.client.get(
+            "/api/expense-documents?date_from=2026-10-01&date_to=2026-10-31",
+            headers=self._bearer(self._token()),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({row["client_id"] for row in response.get_json()["documents"]},
+                         {"undated", "empty-date", "in-period"})
+
+    def _invoice_pdf(self, number):
+        from io import BytesIO
+        from reportlab.pdfgen import canvas
+        output = BytesIO()
+        pdf = canvas.Canvas(output)
+        for index, text in enumerate([
+            "Test Supplier AB", "Org.nr. 556012-5220", f"Fakturanummer: {number}",
+            "Fakturadatum: 2026-10-19", "Valuta: SEK", "Exkl. moms: 100,00",
+            "Moms: 25,00", "Att betala: 125,00",
+        ]):
+            pdf.drawString(40, 780 - index * 24, text)
+        pdf.save()
+        return output.getvalue()
+
+    def test_eleven_invoice_uploads_recognize_persist_and_duplicate_points_to_existing(self):
+        from io import BytesIO
+        import uuid
+        headers = self._bearer(self._token())
+        for index in range(11):
+            content = self._invoice_pdf(3000 + index)
+            saved = self.client.post("/api/expense-documents", headers=headers, data={
+                "payload": json.dumps({"client_id": str(uuid.uuid4()), "verification_status": "draft"}),
+                "original": (BytesIO(content), f"invoice-{index}.pdf"),
+            })
+            self.assertEqual(saved.status_code, 201)
+            identifier = saved.get_json()["document"]["id"]
+            recognized = self.client.post(f"/api/expense-documents/{identifier}/recognize", headers=headers,
+                                          json={"expected_version": 1})
+            self.assertEqual(recognized.status_code, 200, recognized.get_json())
+            document = recognized.get_json()["document"]
+            self.assertEqual(document["invoice_number"], str(3000 + index))
+            self.assertEqual(document["net_amount"], "100.00")
+            self.assertTrue(document["recognized_text"])
+            self.assertEqual(document["processing"]["state"], "requires_review")
+            self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/recognize", headers=headers,
+                                             json={"expected_version": 1}).status_code, 409)
+            duplicate = self.client.post("/api/expense-documents", headers=headers, data={
+                "payload": json.dumps({"client_id": str(uuid.uuid4()), "verification_status": "draft"}),
+                "original": (BytesIO(content), "renamed.pdf"),
+            })
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(duplicate.get_json()["existing_document_id"], identifier)
+        listing = self.client.get("/api/expense-documents?date_from=2026-10-01&date_to=2026-10-31", headers=headers).get_json()
+        self.assertEqual(len(listing["documents"]), 11)
+        self.assertTrue(all(row["invoice_number"] and row["processing"] for row in listing["documents"]))
+
+    def test_split_legacy_eleven_file_package_is_idempotent_and_keeps_originals(self):
+        from io import BytesIO
+        import uuid
+        headers = self._bearer(self._token())
+        saved = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps({"client_id": str(uuid.uuid4()), "verification_status": "draft"}),
+            "originals": [(BytesIO(self._invoice_pdf(4000 + index)), f"old-{index}.pdf") for index in range(11)],
+        })
+        self.assertEqual(saved.status_code, 201)
+        identifier = saved.get_json()["document"]["id"]
+        before = self._query("SELECT id,stored_name,file_sha256 FROM expense_document_attachments ORDER BY id")
+        response = self.client.post(f"/api/expense-documents/{identifier}/split", headers=headers, json={"expected_version": 1})
+        self.assertEqual(response.status_code, 200)
+        children = response.get_json()["children"]
+        self.assertEqual(len(children), 11)
+        retry = self.client.post(f"/api/expense-documents/{identifier}/split", headers=headers, json={"expected_version": 1})
+        self.assertEqual(retry.get_json()["children"], children)
+        self.assertEqual(before, self._query("SELECT id,stored_name,file_sha256 FROM expense_document_attachments ORDER BY id"))
+        for child in children:
+            result = self.client.post(f"/api/expense-documents/{child}/recognize", headers=headers, json={"expected_version": 1})
+            self.assertEqual(result.status_code, 200)
+            self.assertTrue(result.get_json()["document"]["invoice_number"])
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 12)
+
+    def test_failed_recognition_is_visible_and_retry_preserves_one_record(self):
+        from io import BytesIO
+        import uuid
+        headers = self._bearer(self._token())
+        saved = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps({"client_id": str(uuid.uuid4()), "verification_status": "draft"}),
+            "original": (BytesIO(self._invoice_pdf(5000)), "retry.pdf"),
+        })
+        identifier = saved.get_json()["document"]["id"]
+        failed = {"state": "failed", "fields": {}, "methods": [], "errors": ["test extraction failure"], "missing_fields": ["net_amount"]}
+        with patch("invoice_processing.recognize_invoice", return_value=failed):
+            result = self.client.post(f"/api/expense-documents/{identifier}/recognize", headers=headers, json={"expected_version": 1})
+        self.assertEqual(result.get_json()["document"]["processing"]["errors"], failed["errors"])
+        result = self.client.post(f"/api/expense-documents/{identifier}/recognize", headers=headers, json={"expected_version": 2})
+        self.assertEqual(result.get_json()["document"]["invoice_number"], "5000")
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 1)
+
     def test_wrong_password_and_unknown_user_share_one_error(self):
         wrong = self._login(password="wrong-password")
         unknown = self._login(username="nobody")

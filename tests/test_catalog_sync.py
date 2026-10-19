@@ -1817,6 +1817,20 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_desktop_eleven_files_dispatches_one_invoice_per_file(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        paths = [str(Path(self._case.name) / f"invoice-{index}.pdf") for index in range(11)]
+        try:
+            with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=(paths, "")), \
+                 patch.object(self.desktop.QInputDialog, "getItem", return_value=("Отдельная фактура для каждого файла", True)), \
+                 patch.object(window, "_upload_expense_document_paths") as upload:
+                window.upload_expense_document()
+            self.assertEqual([call.args[0] for call in upload.call_args_list], [[path] for path in paths])
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_expense_upload_same_content_never_creates_second_confirmed_expense(self):
         source = Path(self._case.name) / "invoice.pdf"
         renamed = Path(self._case.name) / "invoice (2).pdf"
@@ -1834,9 +1848,11 @@ class CatalogSyncTests(unittest.TestCase):
             with patch.object(window, "_expense_document_snapshot", return_value=([local_document], False)), \
                  patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(renamed)], "")), \
                  patch.object(self.desktop.QMessageBox, "information") as duplicate_message, \
+                 patch.object(window, "_expense_document_review_dialog") as existing_review, \
                  patch("expense_documents.extract_local_document") as extract:
                 window.upload_expense_document()
                 window.upload_expense_document()
+                self.assertEqual(existing_review.call_count, 2)
             self.assertEqual(duplicate_message.call_count, 2)
             extract.assert_not_called()
             connection = self.desktop.get_db_connection()
@@ -1848,8 +1864,10 @@ class CatalogSyncTests(unittest.TestCase):
             with patch.object(window, "_expense_document_snapshot", return_value=([remote_document], True)), \
                  patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(renamed)], "")), \
                  patch.object(self.desktop.QMessageBox, "information") as remote_duplicate, \
+                 patch.object(window, "_expense_document_review_dialog") as existing_review, \
                  patch("expense_documents.extract_local_document") as extract:
                 window.upload_expense_document()
+                existing_review.assert_called_once_with(document=remote_document)
             remote_duplicate.assert_called_once()
             extract.assert_not_called()
         finally:
@@ -2055,6 +2073,7 @@ class CatalogSyncTests(unittest.TestCase):
                 return dialog.result()
 
             with patch.object(self.desktop.QFileDialog, "getOpenFileNames", return_value=(list(map(str, sources)), "")), \
+                  patch.object(self.desktop.QInputDialog, "getItem", return_value=("Страницы одной фактуры", True)), \
                  patch("expense_documents.extract_local_document", side_effect=extraction_results), \
                  patch.object(self.desktop.QDialog, "exec", new=correct_and_accept), \
                  patch.object(window, "background_sync_with_cloud"), \

@@ -108,13 +108,16 @@
                 <label>Поставщик<input id="supplier" maxlength="250"></label>
                 <label>Номер документа<input id="invoice-number" maxlength="120"></label>
                 <label>Дата документа<input id="document-date" type="date"></label>
+                <label>Срок оплаты<input id="due-date" type="date"></label>
                 <label>Валюта<select id="currency"><option>SEK</option><option>EUR</option><option>NOK</option><option>DKK</option><option>USD</option><option>GBP</option><option>CHF</option><option>PLN</option><option>UNKNOWN</option></select></label>
                 <label>Сумма без НДС<input id="net-amount" inputmode="decimal"></label>
                 <label>НДС<input id="vat-amount" inputmode="decimal"></label>
                 <label>Сумма с НДС<input id="gross-amount" inputmode="decimal"></label>
+                <label>Округление<input id="rounding-amount" inputmode="decimal"></label>
+                <label>К оплате<input id="amount-due" inputmode="decimal"></label>
                 <label>Категория<select id="category"><option>Материалы</option><option>Услуги</option><option>Аренда</option><option>Транспорт</option><option>Инструменты</option><option>Прочие расходы</option></select></label>
                 <label class="wide">Комментарий<textarea id="comment" rows="2" maxlength="4000"></textarea></label>
-                <label class="wide">Оригинал<input id="original" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp"></label>
+                <label class="wide">Оригиналы<input id="original" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp"></label>
             </div>
             <h3>Распределение</h3>
             <div class="allocation-head"><span>Объект</span><span>Сумма с НДС</span><span></span></div>
@@ -131,6 +134,7 @@
                 <button type="button" data-save-status="requires_review">Требует проверки</button>
                 <button type="button" data-save-status="confirmed">Подтвердить</button>
                 <button id="cancel-edit" class="secondary" type="button">Отмена</button>
+                <button id="recognize-existing" class="secondary" type="button">Распознать сохранённый оригинал</button>
             </div>
             <div id="editor-status" class="status" role="status"></div>
         </form>
@@ -181,7 +185,7 @@
         if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", csrfToken);
         const response = await fetch(url, { credentials: "same-origin", ...options, headers });
         const payload = response.headers.get("content-type")?.includes("application/json") ? await response.json() : {};
-        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        if (!response.ok) throw Object.assign(new Error(payload.error || `HTTP ${response.status}`), { payload });
         return payload;
     }
     function setStatus(message, target = "page-status") { $(target).textContent = message || ""; }
@@ -189,20 +193,20 @@
         const row = document.createElement("div");
         row.className = "allocation-row";
         const select = document.createElement("select");
-        select.innerHTML = '<option value="">Выберите объект</option>';
+        select.innerHTML = '<option value="">Выберите объект</option><option value="company">Общие расходы фирмы</option>';
         for (const item of objects) {
             const option = document.createElement("option");
             option.value = item.id;
             option.textContent = `${item.name}${item.markning ? ` (${item.markning})` : ""}${item.company ? ` · ${item.company}` : ""}`;
             select.appendChild(option);
         }
-        select.value = allocation.object_id || "";
+        select.value = allocation.object_id || (allocation.destination === "company" ? "company" : "");
         select.title = select.selectedOptions[0]?.textContent || "Выберите объект";
         select.addEventListener("change", () => { select.title = select.selectedOptions[0]?.textContent || "Выберите объект"; });
         const amount = document.createElement("input");
         amount.inputMode = "decimal";
         amount.placeholder = "0.00";
-        amount.value = allocation.gross_amount || "";
+        amount.value = allocation.net_amount ?? allocation.gross_amount ?? "";
         amount.addEventListener("input", updateAllocationTotals);
         const remove = document.createElement("button");
         remove.type = "button";
@@ -213,9 +217,12 @@
         updateAllocationTotals();
     }
     function updateAllocationTotals() {
-        const total = Number($("gross-amount").value.replace(",", ".") || 0);
-        const allocated = [...$("allocation-rows").querySelectorAll(".allocation-row input")]
-            .reduce((sum, input) => sum + Number(input.value.replace(",", ".") || 0), 0);
+        const netBasis = editingSnapshot?.allocation_basis === "net";
+        const total = Number($(netBasis ? "net-amount" : "gross-amount").value.replace(",", ".") || 0);
+        document.querySelector(".allocation-head span:nth-child(2)").textContent = netBasis ? "Сумма без НДС" : "Сумма с НДС";
+        const allocated = [...$("allocation-rows").querySelectorAll(".allocation-row")]
+            .filter(row => row.querySelector("select").value)
+            .reduce((sum, row) => sum + Number(row.querySelector("input").value.replace(",", ".") || 0), 0);
         $("allocation-document-total").textContent = money(total);
         $("allocation-allocated").textContent = money(allocated);
         $("allocation-unallocated").textContent = money(total - allocated);
@@ -294,6 +301,7 @@
     }
     function clearEditor() {
         editingDocument = null;
+        editingSnapshot = null;
         clientId = newClientId();
         $("document-form").reset();
         $("editor-title").textContent = "Новая фактура";
@@ -308,6 +316,7 @@
         try {
             const result = await api(`/api/expense-documents/${id}`);
             const doc = result.document;
+            editingSnapshot = doc;
             editingDocument = doc.id;
             clientId = doc.client_id;
             $("document-form").reset();
@@ -315,6 +324,9 @@
             $("supplier").value = doc.supplier_name || "";
             $("invoice-number").value = doc.invoice_number || "";
             $("document-date").value = doc.document_date || "";
+            $("due-date").value = doc.due_date || "";
+            $("rounding-amount").value = doc.rounding_amount ?? "";
+            $("amount-due").value = doc.amount_due ?? "";
             const currency = $("currency");
             if (![...currency.options].some((option) => option.value === doc.currency_code)) currency.add(new Option(doc.currency_code, doc.currency_code));
             currency.value = doc.currency_code || "SEK";
@@ -328,6 +340,8 @@
             $("allocation-rows").replaceChildren();
             for (const allocation of doc.allocations) addAllocationRow(allocation);
             $("document-form").hidden = false;
+            const processing = doc.processing;
+            setStatus(processing ? `Обработка: ${processing.state}. ${(processing.errors || []).join("; ")} Не определено: ${(processing.missing_fields || []).join(", ")}` : "", "editor-status");
             updateAllocationTotals();
             $("document-form").scrollIntoView({ behavior: "smooth", block: "start" });
         } catch (error) { setStatus(error.message); }
@@ -340,7 +354,10 @@
             if (!amount && !objectId) continue;
             if (!amount) { setStatus("Укажите сумму для выбранного объекта. Чтобы оставить её нераспределённой, удалите эту строку.", "editor-status"); return; }
             if (!objectId) { setStatus("Выберите объект для каждой распределённой суммы.", "editor-status"); return; }
-            allocations.push({ object_id: Number(objectId), gross_amount: amount });
+            allocations.push({ object_id: objectId === "company" ? null : Number(objectId),
+                destination: objectId === "company" ? "company" : "object",
+                expense_category: $("category").value,
+                [editingSnapshot?.allocation_basis === "net" ? "net_amount" : "gross_amount"]: amount });
         }
         const payload = {
             client_id: clientId,
@@ -356,6 +373,17 @@
             verification_status: status,
             allocations,
         };
+        if (editingSnapshot) {
+            payload.expected_version = editingSnapshot.sync_version;
+            payload.allocation_basis = editingSnapshot.allocation_basis;
+            payload.rounding_amount = $("rounding-amount").value || null;
+            payload.amount_due = $("amount-due").value || null;
+            payload.due_date = $("due-date").value || null;
+            payload.due_date_kind = payload.due_date === editingSnapshot.due_date ? editingSnapshot.due_date_kind : (payload.due_date ? "manual" : "absent");
+            payload.due_date_review_required = editingSnapshot.due_date_review_required;
+            payload.due_date_reviewed = editingSnapshot.due_date_reviewed;
+            payload.due_date_evidence = editingSnapshot.due_date_evidence;
+        }
         const file = $("original").files[0];
         try {
             let result;
@@ -375,6 +403,42 @@
             await loadArchive();
             await loadObjectSummary();
         } catch (error) { setStatus(error.message, "editor-status"); }
+    }
+    let editingSnapshot = null;
+    async function recognizeSaved(id) {
+        const doc = (await api(`/api/expense-documents/${id}`)).document;
+        if ((doc.attachments || []).length > 1) {
+            const split = await api(`/api/expense-documents/${id}/split`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({expected_version: doc.sync_version})});
+            for (const child of split.children) await recognizeSaved(child);
+            return;
+        }
+        const result = await api(`/api/expense-documents/${id}/recognize`, {method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({expected_version: doc.sync_version, replace_fields: true})});
+        return result.document;
+    }
+    async function uploadInvoices() {
+        const files = [...$("original").files];
+        const outcomes = [];
+        let lastId = null;
+        for (const file of files) {
+            try {
+                const form = new FormData();
+                form.append("payload", JSON.stringify({client_id: newClientId(), verification_status: "draft"}));
+                form.append("original", file);
+                const saved = await api("/api/expense-documents", {method: "POST", body: form});
+                lastId = saved.document.id;
+                const processed = await recognizeSaved(lastId);
+                outcomes.push(`${file.name}: ${processed.processing.state}${processed.processing.errors.length ? "; " + processed.processing.errors.join("; ") : ""}`);
+            } catch (error) {
+                const existing = error.payload?.existing_document_id;
+                if (existing) lastId = existing;
+                outcomes.push(`${file.name}: ${error.message}${existing ? " — открыта существующая карточка" : ""}`);
+            }
+            setStatus(outcomes.join("\n"));
+        }
+        await loadArchive();
+        setStatus(outcomes.join("\n"));
+        if (lastId) await editDocument(lastId);
     }
     async function loadObjectSummary() {
         const id = $("object-select").value;
@@ -442,8 +506,15 @@
     $("filter-supplier").addEventListener("change", loadArchive);
     $("filter-object").addEventListener("change", loadArchive);
     $("new-document").addEventListener("click", clearEditor);
+    $("original").addEventListener("change", uploadInvoices);
+    $("recognize-existing").addEventListener("click", async () => {
+        if (!editingDocument || !confirm("Повторно определить поля из сохранённого оригинала?")) return;
+        try { await recognizeSaved(editingDocument); await loadArchive(); await editDocument(editingDocument); }
+        catch (error) { setStatus(error.message, "editor-status"); }
+    });
     $("add-allocation").addEventListener("click", () => addAllocationRow());
     $("gross-amount").addEventListener("input", updateAllocationTotals);
+    $("net-amount").addEventListener("input", updateAllocationTotals);
     $("cancel-edit").addEventListener("click", () => { $("document-form").hidden = true; });
     document.querySelectorAll("[data-save-status]").forEach((button) => button.addEventListener("click", () => saveDocument(button.dataset.saveStatus)));
     $("load-object-summary").addEventListener("click", loadObjectSummary);

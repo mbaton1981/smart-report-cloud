@@ -711,6 +711,10 @@ def init_cloud_db():
             cursor.execute("UPDATE users SET employee_id = COALESCE(employee_id, ?) WHERE username = ?", (emp['id'], emp['name']))
 
     ensure_token_table(cursor)
+    cursor.execute("""CREATE TABLE IF NOT EXISTS expense_processing (
+        document_id INTEGER PRIMARY KEY REFERENCES expense_documents(id),
+        state TEXT NOT NULL, details_json TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
 
     conn.commit()
     conn.close()
@@ -1277,6 +1281,9 @@ def serialize_expense_document(cursor, document, include_text=False):
         "created_at": document["created_at"],
         "updated_at": document["updated_at"],
     }
+    processing = cursor.execute("SELECT state, details_json FROM expense_processing WHERE document_id=?", (document["id"],)).fetchone()
+    serialized["processing"] = ({"state": processing["state"], **json.loads(processing["details_json"])}
+                                if processing else None)
     if include_text:
         serialized["recognized_text"] = document["recognized_text"]
     return serialized
@@ -1418,10 +1425,10 @@ def expense_documents_list_api():
     conditions = ["is_deleted = 0"]
     params = []
     if date_from:
-        conditions.append("document_date >= ?")
+        conditions.append("(document_date IS NULL OR document_date = '' OR document_date >= ?)")
         params.append(date_from)
     if date_to:
-        conditions.append("document_date <= ?")
+        conditions.append("(document_date IS NULL OR document_date = '' OR document_date <= ?)")
         params.append(date_to)
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -1772,6 +1779,108 @@ def expense_document_update_api(document_id):
         conn.rollback()
         logger.exception("Не удалось обновить документ расхода.")
         return jsonify({"ok": False, "error": "Не удалось обновить документ."}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/<int:document_id>/recognize", methods=["POST"])
+def expense_document_recognize_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    from invoice_processing import recognize_invoice
+
+    payload = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    try:
+        document = conn.execute("SELECT * FROM expense_documents WHERE id=? AND is_deleted=0", (document_id,)).fetchone()
+        if document is None:
+            return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        version = int(document["sync_version"] or 1)
+        if payload.get("expected_version") != version:
+            return jsonify({"ok": False, "error": "Документ изменился; обновите карточку."}), 409
+        if document["verification_status"] == "confirmed" or conn.execute(
+                "SELECT 1 FROM expense_allocations WHERE document_id=?", (document_id,)).fetchone():
+            return jsonify({"ok": False, "error": "Подтверждённые суммы и распределения не перезаписываются автоматически."}), 409
+        attachments = conn.execute("SELECT stored_name FROM expense_document_attachments WHERE document_id=? ORDER BY ordinal,id", (document_id,)).fetchall()
+        if len(attachments) != 1:
+            return jsonify({"ok": False, "error": "Выберите разделение пакета: обработка нескольких независимых фактур как одной запрещена."}), 409
+        if not payload.get("replace_fields") and any(document[key] not in (None, "") for key in (
+                "supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "gross_amount")):
+            return jsonify({"ok": False, "error": "Поля уже заполнены. Подтвердите повторное распознавание."}), 409
+        root = expense_documents_root()
+        path = (root / attachments[0]["stored_name"]).resolve()
+        if path.parent != root:
+            raise ValueError("Некорректный путь оригинала.")
+        result = recognize_invoice([path])
+        now = datetime.now(timezone.utc).isoformat()
+        details = {key: result[key] for key in ("methods", "errors", "missing_fields")}
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute("SELECT sync_version,is_deleted FROM expense_documents WHERE id=?", (document_id,)).fetchone()
+        if current["is_deleted"] or current["sync_version"] != version:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Документ изменился во время распознавания."}), 409
+        if result["state"] != "failed":
+            fields_payload = {**result["fields"], "verification_status": "requires_review", "allocations": [],
+                              "recognized_text": result["fields"]["raw_text"]}
+            if not invoice_net_schema_ready(conn):
+                fields_payload.pop("allocation_basis", None)
+            fields = validate_expense_fields(fields_payload)
+            conn.execute("""UPDATE expense_documents SET supplier_name=?,invoice_number=?,document_date=?,
+                            currency_code=?,net_amount=?,vat_amount=?,gross_amount=?,recognized_text=?,
+                            verification_status='requires_review' WHERE id=?""", (
+                fields["supplier_name"], fields["invoice_number"], fields["document_date"], fields["currency_code"],
+                fields["net_amount"], fields["vat_amount"], fields["gross_amount"], fields_payload["recognized_text"], document_id))
+            store_expense_allocation_rows(conn.cursor(), document_id, [], fields)
+        conn.execute("UPDATE expense_documents SET sync_version=sync_version+1,updated_at=? WHERE id=?", (now, document_id))
+        conn.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
+                     (document_id, result["state"], json.dumps(details, ensure_ascii=False), now))
+        conn.commit()
+        saved = conn.execute("SELECT * FROM expense_documents WHERE id=?", (document_id,)).fetchone()
+        return jsonify({"ok": True, "document": serialize_expense_document(conn.cursor(), saved, include_text=True)})
+    except (ValueError, RuntimeError) as error:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 400
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/<int:document_id>/split", methods=["POST"])
+def expense_document_split_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    payload = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute("SELECT details_json FROM expense_processing WHERE document_id=? AND state='split'", (document_id,)).fetchone()
+        if previous:
+            return jsonify({"ok": True, **json.loads(previous[0])})
+        parent = conn.execute("SELECT * FROM expense_documents WHERE id=? AND is_deleted=0", (document_id,)).fetchone()
+        if parent is None:
+            return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        if payload.get("expected_version") != parent["sync_version"]:
+            return jsonify({"ok": False, "error": "Документ изменился; обновите карточку."}), 409
+        if parent["verification_status"] == "confirmed" or conn.execute(
+                "SELECT 1 FROM expense_allocations WHERE document_id=?", (document_id,)).fetchone():
+            return jsonify({"ok": False, "error": "Нельзя автоматически разделить подтверждённый или распределённый документ."}), 409
+        attachments = conn.execute("SELECT * FROM expense_document_attachments WHERE document_id=? ORDER BY ordinal,id", (document_id,)).fetchall()
+        if len(attachments) < 2:
+            return jsonify({"ok": False, "error": "В карточке нет пакета файлов."}), 400
+        now = datetime.now(timezone.utc).isoformat()
+        children = []
+        for attachment in attachments:
+            cursor = conn.execute("""INSERT INTO expense_documents
+                (client_id,verification_status,original_name,stored_name,currency_code,created_at,updated_at)
+                VALUES (?,'requires_review',?,?,'UNKNOWN',?,?)""", (
+                    str(uuid.uuid4()), attachment["original_name"], attachment["stored_name"], now, now))
+            child_id = cursor.lastrowid
+            conn.execute("UPDATE expense_document_attachments SET document_id=?,ordinal=0 WHERE id=?", (child_id, attachment["id"]))
+            children.append(child_id)
+        conn.execute("UPDATE expense_documents SET original_name=NULL,stored_name=NULL,file_sha256=NULL,sync_version=sync_version+1,updated_at=? WHERE id=?", (now, document_id))
+        conn.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
+                     (document_id, "split", json.dumps({"children": children}), now))
+        conn.commit()
+        return jsonify({"ok": True, "children": children})
     finally:
         conn.close()
 

@@ -5938,12 +5938,14 @@ class SmartReportApp(QMainWindow):
         manual_button.clicked.connect(self.open_manual_document_dialog)
         edit_button = QPushButton("Изменить")
         edit_button.clicked.connect(self.review_selected_document)
+        reprocess_button = QPushButton("Распознать сохранённый оригинал")
+        reprocess_button.clicked.connect(self.reprocess_selected_document)
         delete_button = QPushButton("Удалить")
         delete_button.setObjectName("danger")
         delete_button.clicked.connect(self.delete_selected_expense_document)
         open_button = QPushButton("Открыть оригинал")
         open_button.clicked.connect(self.open_selected_document_original)
-        for button in (upload_button, manual_button, edit_button, delete_button, open_button):
+        for button in (upload_button, manual_button, edit_button, reprocess_button, delete_button, open_button):
             actions.addWidget(button)
         page_layout.addLayout(actions)
 
@@ -6276,6 +6278,11 @@ class SmartReportApp(QMainWindow):
             status = self._expense_distribution_label(document)
             if document.get("sync_error"):
                 status += f"; {document['sync_error']}"
+            processing = document.get("processing") or {}
+            if processing:
+                status += f"; обработка: {processing.get('state')}"
+                if processing.get("errors"):
+                    status += "; " + "; ".join(processing["errors"])
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "—",
@@ -7033,6 +7040,20 @@ class SmartReportApp(QMainWindow):
         )
         if not paths:
             return
+        groups = [[path] for path in paths]
+        if len(paths) > 1:
+            mode, accepted = QInputDialog.getItem(
+                self, "Загрузка фактур", "Как обработать выбранные файлы?",
+                ["Отдельная фактура для каждого файла", "Страницы одной фактуры"], 0, False,
+            )
+            if not accepted:
+                return
+            if mode == "Страницы одной фактуры":
+                groups = [paths]
+        for group in groups:
+            self._upload_expense_document_paths(group)
+
+    def _upload_expense_document_paths(self, paths):
         try:
             incoming_hashes = [sha256_file(path) for path in paths]
             if len(set(incoming_hashes)) != len(incoming_hashes):
@@ -7048,8 +7069,9 @@ class SmartReportApp(QMainWindow):
                     QMessageBox.information(
                         self, "Документ уже загружен",
                         "Этот оригинал уже есть в реестре или очереди синхронизации. "
-                        "Откройте существующий документ для исправления; второй расход не создан.",
+                        "Открыта существующая карточка; второй расход не создан.",
                     )
+                    self._expense_document_review_dialog(document=document)
                     return
         except OSError as error:
             QMessageBox.warning(self, "Оригинал недоступен", str(error))
@@ -7105,6 +7127,32 @@ class SmartReportApp(QMainWindow):
             document=None, source_paths=paths, parsed_fields=parsed,
             recognition_message=recognition_message,
         )
+
+    def reprocess_selected_document(self, *_):
+        document = self._selected_expense_document(self.table_supplier_documents)
+        if not document:
+            return
+        identifier = document.get("server_document_id") or document.get("id")
+        if not isinstance(identifier, int):
+            QMessageBox.information(self, "Распознавание", "Сначала синхронизируйте локальный черновик.")
+            return
+        if QMessageBox.question(self, "Распознавание", "Повторно определить поля из сохранённого оригинала? Проверьте результат перед подтверждением.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            version = document.get("server_version") or document.get("sync_version")
+            if len(document.get("attachments") or []) > 1:
+                result = request_expense_api("POST", f"/api/expense-documents/{identifier}/split",
+                                             json={"expected_version": version})
+                identifiers = result["children"]
+            else:
+                identifiers = [identifier]
+            for selected_id in identifiers:
+                current = request_expense_api("GET", f"/api/expense-documents/{selected_id}")["document"]
+                request_expense_api("POST", f"/api/expense-documents/{selected_id}/recognize",
+                                    json={"expected_version": current["sync_version"], "replace_fields": True})
+            self.load_expense_documents()
+        except Exception as error:
+            QMessageBox.warning(self, "Распознавание", str(error))
 
     def _selected_expense_document(self, table):
         row = table.currentRow()
