@@ -1817,6 +1817,132 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_object_report_labels_net_and_reads_known_part_vat(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        document = {"id": 12, "client_id": "vat-report", "document_date": "2026-10-19", "supplier_name": "Beijer",
+                    "invoice_number": "260993714021", "currency_code": "SEK", "verification_status": "confirmed",
+                    "allocation_basis": "net", "net_amount": "73181.14", "vat_amount": "18295.31", "gross_amount": "91476.45",
+                    "unallocated_gross": None, "allocations": [{"object_id": 5, "destination": "object",
+                    "net_amount": "72495.92", "vat_amount": None, "gross_amount": None}]}
+        objects = [{"id": 5, "name": "Object 5", "markning": "p1022", "company": "Privat"}]
+        try:
+            with patch.object(window, "_expense_server_objects", return_value=(objects, True)):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+            with patch.object(window, "_expense_document_snapshot", return_value=([document], True)):
+                combo = window.object_expenses_object
+                combo.setCurrentIndex(combo.findData(5))
+                window.load_object_expense_overview()
+                self.assertEqual(window.object_expenses_table.horizontalHeaderItem(4).text(), "Сумма части")
+                self.assertIn("без НДС", window.object_expenses_table.item(0, 4).text())
+                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "Неизвестно")
+                document["allocations"][0].update(vat_amount="18124.00", gross_amount="90619.92")
+                window.load_object_expense_overview()
+                self.assertIn("90,619.92", window.object_expenses_table.item(0, 4).text())
+                self.assertIn("с НДС", window.object_expenses_table.item(0, 4).text())
+                self.assertIn("18,124.00", window.object_expenses_table.item(0, 5).text())
+                self.assertIn("18,124.00", window.object_expenses_vat_lbl.text())
+                self.assertIn("90,619.92", window.object_expenses_total_lbl.text())
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_allocation_vat_uses_each_item_rate_and_reconciles_invoice(self):
+        from expense_documents import allocation_vat_from_items, normalize_net_allocations, net_invoice_issues
+
+        def cell(text, left, top):
+            return {"text": text, "x0": left, "x1": left + len(text) * 4, "y0": top, "y1": top + 8}
+
+        rows = [cell("Rad", 10, 20), cell("Pris", 130, 20), cell("Moms %", 220, 20), cell("Summa", 320, 20),
+                cell("Order nr: A-1", 10, 50)]
+        for top, number, net, rate in ((80, "10", "100.00", "25.00"), (100, "20", "50.00", "12.00")):
+            rows.extend([cell(number, 10, top), cell("999.00", 130, top), cell(rate, 220, top), cell(net, 320, top)])
+        rows += [cell("Summa order", 10, 120), cell("150.00", 320, 120), cell("Order nr: B-1", 10, 140)]
+        for top, number, net, rate in ((160, "10", "100.00", "0.00"), (180, "20", "33.33", "6.00")):
+            rows.extend([cell(number, 10, top), cell("999.00", 130, top), cell(rate, 220, top), cell(net, 320, top)])
+        rows += [cell("Summa order", 10, 200), cell("133.33", 320, 200)]
+        orders = [{"order_id": "A-1", "net_amount": "150.00", "destination": "object", "object_id": 1},
+                  {"order_id": "B-1", "net_amount": "133.33", "destination": "company", "object_id": None}]
+        pages = [{"page": 1, "elements": rows}]
+        result = allocation_vat_from_items(pages, orders, "283.33", "33.00")
+        self.assertEqual([row["vat_amount"] for row in result], ["31.00", "2.00"])
+        self.assertEqual([row["gross_amount"] for row in result], ["181.00", "135.33"])
+        self.assertEqual(result[1]["vat_items"][0]["vat_amount"], "0.00")
+        self.assertEqual(len(normalize_net_allocations(result)), 2)
+        with self.assertRaisesRegex(ValueError, "не совпадает"):
+            allocation_vat_from_items(pages, orders, "283.33", "33.01")
+        rows[:] = [value for value in rows if not (value["x0"] == 220 and value["y0"] == 180)]
+        with self.assertRaises(ValueError):
+            allocation_vat_from_items(pages, orders, "283.33", "33.00")
+        issues = net_invoice_issues({"net_amount": "283.33", "vat_amount": "33.01", "amount_due": "316.34"}, result)
+        self.assertTrue(any("НДС распределённых частей" in issue for issue in issues))
+
+    def test_table_presentation_keeps_model_signals_and_active_editor(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QColor
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QHeaderView, QStyleOptionViewItem
+
+        table = self.desktop.QTableWidget(1, 4)
+        table.setStyleSheet(self.desktop.DARK_THEME_QSS)
+        table.setHorizontalHeaderLabels(["Дата", "Объект", "Сумма (SEK)", "Статус"])
+        changes = []
+        table.cellChanged.connect(lambda row, column: changes.append((row, column)))
+        values = ["2026-10-19", "Очень длинное название объекта и примечание для проверки переноса текста " * 2,
+                  "1234567890.12", "Требует проверки"]
+        for column, value in enumerate(values):
+            item = self.desktop.QTableWidgetItem(value)
+            item.setData(Qt.ItemDataRole.UserRole, "stable-record-id")
+            table.setItem(0, column, item)
+        table.item(0, 3).setBackground(QColor("#276749"))
+        baseline = len(changes)
+        try:
+            table.resize(900, 360)
+            table.show()
+            self.qt_app.processEvents()
+            self.assertEqual(len(changes), baseline)
+            self.assertTrue(table.alternatingRowColors())
+            self.assertGreaterEqual(table.rowHeight(0), 32)
+            self.assertEqual(table.horizontalScrollBar().maximum(), 0)
+            self.assertEqual(table.horizontalHeader().sectionResizeMode(1), QHeaderView.ResizeMode.Stretch)
+            self.assertEqual(table.horizontalHeader().sectionResizeMode(2), QHeaderView.ResizeMode.ResizeToContents)
+            table.resize(300, 360)
+            self.qt_app.processEvents()
+            table.refresh_layout()
+            self.assertEqual(table.horizontalHeader().sectionResizeMode(1), QHeaderView.ResizeMode.ResizeToContents)
+            self.assertGreaterEqual(table.columnWidth(1), 120)
+            self.assertGreater(table.horizontalScrollBar().maximum(), 0)
+            table.resize(900, 360)
+            self.qt_app.processEvents()
+            self.assertEqual(table.horizontalHeader().sectionResizeMode(1), QHeaderView.ResizeMode.Stretch)
+            for column, flag in ((0, Qt.AlignmentFlag.AlignHCenter), (1, Qt.AlignmentFlag.AlignLeft),
+                                 (2, Qt.AlignmentFlag.AlignRight), (3, Qt.AlignmentFlag.AlignHCenter)):
+                option = QStyleOptionViewItem()
+                table.itemDelegate().initStyleOption(option, table.model().index(0, column))
+                self.assertTrue(option.displayAlignment & flag)
+            table.setCurrentCell(0, 2)
+            table.editItem(table.item(0, 2))
+            self.qt_app.processEvents()
+            editor = table.findChild(self.desktop.QLineEdit)
+            self.assertIsNotNone(editor)
+            table.resize(760, 360)
+            self.qt_app.processEvents()
+            self.assertTrue(editor.isVisible())
+            editor.setText("88.90")
+            QTest.keyClick(editor, Qt.Key.Key_Return)
+            self.qt_app.processEvents()
+            self.assertEqual(table.item(0, 2).text(), "88.90")
+            self.assertEqual(len(changes), baseline + 1)
+            self.assertEqual(table.item(0, 2).data(Qt.ItemDataRole.UserRole), "stable-record-id")
+            self.assertEqual(table.item(0, 3).background().color(), QColor("#276749"))
+            self.assertEqual(table.item(0, 1).text(), values[1])
+        finally:
+            table.close()
+            table.deleteLater()
+
     def test_existing_receipt_parser_reads_stated_totals_without_inventing_vat_or_debt(self):
         from expense_documents import parse_invoice_pages
 

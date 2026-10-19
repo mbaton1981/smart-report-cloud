@@ -1785,6 +1785,81 @@ def expense_document_update_api(document_id):
         conn.close()
 
 
+@app.route("/api/expense-documents/<int:document_id>/allocation-vat", methods=["POST"])
+def expense_allocation_vat_api(document_id):
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    from expense_documents import allocation_vat_from_items, extract_local_document
+
+    payload = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    try:
+        document = conn.execute("SELECT * FROM expense_documents WHERE id=? AND is_deleted=0", (document_id,)).fetchone()
+        if document is None:
+            return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        version = int(document["sync_version"] or 1)
+        if payload.get("expected_version") != version:
+            return jsonify({"ok": False, "error": "Документ изменился; обновите карточку."}), 409
+        if not invoice_net_schema_ready(conn) or document["allocation_basis"] != "net":
+            raise ValueError("Расчёт по позициям поддерживается для распределения без НДС.")
+        root = expense_documents_root()
+        originals = conn.execute("SELECT stored_name,file_sha256 FROM expense_document_attachments WHERE document_id=? ORDER BY ordinal,id", (document_id,)).fetchall()
+        if not originals:
+            raise ValueError("Нет сохранённого оригинала для проверки ставок позиций.")
+        pages = []
+        for attachment_index, original in enumerate(originals):
+            path = (root / original["stored_name"]).resolve()
+            if path.parent != root or not path.is_file():
+                raise ValueError("Оригинал недоступен; НДС частей не изменён.")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != original["file_sha256"]:
+                raise ValueError("Контрольная сумма оригинала не совпадает; НДС частей не изменён.")
+            extraction = extract_local_document(path)
+            pages.extend({"page": index + 1, "attachment_index": attachment_index, "elements": elements}
+                         for index, elements in enumerate(extraction.page_elements))
+        orders = allocation_vat_from_items(pages, json.loads(document["order_proposals_json"] or "[]"),
+                                          document["net_amount"], document["vat_amount"])
+        computed = normalize_net_allocations(orders)
+        existing = conn.execute("SELECT * FROM expense_allocations WHERE document_id=? ORDER BY id", (document_id,)).fetchall()
+
+        def allocation_key(row):
+            return row["destination"], row["object_id"], row["expense_category"]
+
+        by_key = {allocation_key(row): row for row in computed}
+        if (len(existing) != len(computed) or len(by_key) != len(computed)
+                or any(allocation_key(row) not in by_key or parse_invoice_money(row["allocated_net"]) !=
+                       parse_invoice_money(by_key[allocation_key(row)]["net_amount"]) for row in existing)):
+            raise ValueError("Распределения изменены относительно заказов. Сначала согласуйте net и назначения; НДС не перезаписан.")
+        if any(row["allocated_vat"] is not None or row["allocated_gross"] is not None for row in existing):
+            if not payload.get("replace_existing"):
+                raise ValueError("НДС частей уже заполнен; автоматическая перезапись запрещена.")
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute("SELECT sync_version,is_deleted FROM expense_documents WHERE id=?", (document_id,)).fetchone()
+        if current["is_deleted"] or current["sync_version"] != version:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Документ изменился во время расчёта."}), 409
+        for row in existing:
+            amounts = by_key[allocation_key(row)]
+            conn.execute("UPDATE expense_allocations SET allocated_vat=?,allocated_gross=? WHERE id=?",
+                         (amounts["vat_amount"], amounts["gross_amount"], row["id"]))
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE expense_documents SET order_proposals_json=?,sync_version=sync_version+1,updated_at=? WHERE id=?",
+                     (json.dumps(orders, ensure_ascii=False), now, document_id))
+        previous = conn.execute("SELECT state,details_json FROM expense_processing WHERE document_id=?", (document_id,)).fetchone()
+        details = json.loads(previous["details_json"]) if previous else {}
+        details["vat_allocation"] = {"basis": "item_rates", "rounding": "ROUND_HALF_UP_per_item",
+                                     "version": version + 1, "orders": orders}
+        conn.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
+                     (document_id, previous["state"] if previous else "allocated", json.dumps(details, ensure_ascii=False), now))
+        conn.commit()
+        saved = conn.execute("SELECT * FROM expense_documents WHERE id=?", (document_id,)).fetchone()
+        return jsonify({"ok": True, "document": serialize_expense_document(conn.cursor(), saved)})
+    except (ValueError, RuntimeError) as error:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 400
+    finally:
+        conn.close()
+
+
 @app.route("/api/expense-documents/<int:document_id>/recognize", methods=["POST"])
 def expense_document_recognize_api(document_id):
     if not expense_api_authorized():

@@ -49,6 +49,7 @@ from expense_documents import (
     validate_allocations,
 )
 from expense_documents import parse_invoice_pages, parse_invoice_money, net_invoice_issues, invoice_context, due_date_issues, due_date_edit
+from desktop_ui import ReportTable as QTableWidget
 
 import desktop_auth
 
@@ -1493,6 +1494,10 @@ DARK_THEME_QSS = """
         border-radius: 8px;
         top: -1px;
     }
+    QLabel, QCheckBox {
+        background-color: transparent;
+        border: none;
+    }
     QTabBar::tab {
         background-color: #2a313d;
         color: #a0aec0;
@@ -1518,7 +1523,8 @@ DARK_THEME_QSS = """
         color: #ffffff;
         border: 1px solid #4a5568;
         padding: 7px 14px;
-        border-radius: 6px;
+        border-radius: 7px;
+        min-height: 20px;
         font-weight: 600;
     }
     QPushButton:hover {
@@ -1526,10 +1532,8 @@ DARK_THEME_QSS = """
         border-color: #4299e1;
     }
     QPushButton:pressed {
-        background-color: #4299e1;
+        background-color: #2b6cb0;
         border-color: #3182ce;
-        padding-top: 8px;
-        padding-bottom: 6px;
     }
     QPushButton:disabled {
         background-color: #252b35;
@@ -1537,7 +1541,7 @@ DARK_THEME_QSS = """
         border-color: #323946;
     }
     QPushButton:focus {
-        border: 2px solid #90cdf4;
+        border-color: #90cdf4;
     }
     QPushButton#primaryAction {
         background-color: #2b6cb0;
@@ -1576,7 +1580,7 @@ DARK_THEME_QSS = """
         background-color: #7a3434;
         border-color: #c53030;
     }
-    QLineEdit, QComboBox, QDateEdit {
+    QLineEdit, QComboBox, QDateEdit, QSpinBox, QDoubleSpinBox, QTextEdit {
         background-color: #28303d;
         color: #f7fafc;
         border: 1px solid #3f4c60;
@@ -1585,7 +1589,7 @@ DARK_THEME_QSS = """
         selection-background-color: #3182ce;
         selection-color: #ffffff;
     }
-    QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
+    QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
         border: 1px solid #63b3ed;
         background-color: #2d3748;
     }
@@ -1612,17 +1616,33 @@ DARK_THEME_QSS = """
     }
     QTableWidget, QTableView {
         background-color: #1a1f26;
-        alternate-background-color: #212832;
+        alternate-background-color: #252d38;
         color: #e2e8f0;
         gridline-color: #2d3748;
         border: 1px solid #323946;
-        border-radius: 6px;
+        border-radius: 8px;
         selection-background-color: #2b6cb0;
         selection-color: #ffffff;
     }
-    QTableWidget::item:selected {
+    QTableWidget::item, QTableView::item {
+        padding: 4px 6px;
+    }
+    QTableWidget::item:hover:!selected, QTableView::item:hover:!selected {
+        background-color: #303c4b;
+    }
+    QTableWidget::item:selected, QTableView::item:selected {
         background-color: #3182ce;
         color: #ffffff;
+    }
+    QTableWidget::item:selected:!active, QTableView::item:selected:!active {
+        background-color: #2d567c;
+    }
+    QToolTip {
+        background-color: #303c4b;
+        color: #f7fafc;
+        border: 1px solid #64748b;
+        padding: 6px;
+        border-radius: 6px;
     }
     QHeaderView::section {
         background-color: #28303d;
@@ -1636,12 +1656,13 @@ DARK_THEME_QSS = """
         background-color: #242933;
         border: 1px solid #323946;
         border-radius: 8px;
-        padding: 12px;
+        padding: 6px;
     }
 """
 
 def create_date_field(default_date_str=""):
     date_edit = QDateEdit()
+    date_edit.setMinimumWidth(144)
     date_edit.setCalendarPopup(True)
     date_edit.setDisplayFormat("yyyy-MM-dd")
     if default_date_str:
@@ -1868,6 +1889,8 @@ class SmartReportApp(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
 
         self.tabs = QTabWidget()
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.tabs.currentChanged.connect(self.on_tab_changed)
         main_layout.addWidget(self.tabs)
 
@@ -2003,7 +2026,7 @@ class SmartReportApp(QMainWindow):
         
         control_card = QFrame()
         control_card.setObjectName("card")
-        control_card.setStyleSheet("background-color: #242933; border: 2px solid #3182ce; border-radius: 8px; margin-top: 5px;")
+        control_card.setStyleSheet("QFrame#card { background-color: #242933; border: 1px solid #3182ce; border-radius: 8px; margin-top: 5px; }")
         c_layout = QVBoxLayout(control_card)
         c_layout.setSpacing(8)
 
@@ -2077,6 +2100,7 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(QLabel("<b>История смен в базе данных (зеленые — уже выставлены в счёт):</b>"))
         
         self.table_shifts = QTableWidget()
+        self.table_shifts.setMinimumHeight(220)
         self.table_shifts.setColumnCount(13)
         self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры", "OB сумма (SEK)"])
         self.table_shifts.setColumnHidden(0, True)
@@ -3098,7 +3122,7 @@ class SmartReportApp(QMainWindow):
         layout = QVBoxLayout(self.tab_salary)
         total_card = QFrame()
         total_card.setObjectName("card")
-        total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 8px; margin-bottom: 5px;")
+        total_card.setStyleSheet("QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; margin-bottom: 5px; }")
         t_layout = QHBoxLayout(total_card)
         t_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         
@@ -3223,28 +3247,7 @@ class SmartReportApp(QMainWindow):
     def resize_salary_table_columns(self):
         if not hasattr(self, "table_salary"):
             return
-        minimum_widths = {
-            0: 140, 1: 75, 2: 75, 3: 75, 4: 85, 5: 200,
-            6: 110, 7: 120, 8: 90, 9: 90, 10: 95, 11: 100,
-            12: 120, 13: 110,
-        }
-        available_width = self.table_salary.viewport().width()
-        extra_width = max(0, available_width - sum(minimum_widths.values()))
-        widths = dict(minimum_widths)
-        if extra_width:
-            name_extra = extra_width // 3
-            widths[0] += name_extra
-            finance_extra = extra_width - name_extra
-            finance_columns = (6, 7, 8, 9, 10, 11, 12, 13)
-            finance_weight = sum(minimum_widths[column] for column in finance_columns)
-            distributed = 0
-            for column in finance_columns[:-1]:
-                addition = finance_extra * minimum_widths[column] // finance_weight
-                widths[column] += addition
-                distributed += addition
-            widths[finance_columns[-1]] += finance_extra - distributed
-        for column, width in widths.items():
-            self.table_salary.setColumnWidth(column, width)
+        self.table_salary.schedule_layout()
 
     def load_salary_table_template(self):
         try:
@@ -3592,7 +3595,7 @@ class SmartReportApp(QMainWindow):
 
         total_card = QFrame()
         total_card.setObjectName("card")
-        total_card.setStyleSheet("background-color: #242933; border: 2px solid #4299e1; border-radius: 10px;")
+        total_card.setStyleSheet("QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; }")
         
         total_layout = QVBoxLayout(total_card)
         total_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -5940,12 +5943,14 @@ class SmartReportApp(QMainWindow):
         edit_button.clicked.connect(self.review_selected_document)
         reprocess_button = QPushButton("Распознать сохранённый оригинал")
         reprocess_button.clicked.connect(self.reprocess_selected_document)
+        vat_button = QPushButton("НДС по позициям")
+        vat_button.clicked.connect(lambda: self.calculate_allocation_vat(self.table_supplier_documents))
         delete_button = QPushButton("Удалить")
         delete_button.setObjectName("danger")
         delete_button.clicked.connect(self.delete_selected_expense_document)
         open_button = QPushButton("Открыть оригинал")
         open_button.clicked.connect(self.open_selected_document_original)
-        for button in (upload_button, manual_button, edit_button, reprocess_button, delete_button, open_button):
+        for button in (upload_button, manual_button, edit_button, reprocess_button, vat_button, delete_button, open_button):
             actions.addWidget(button)
         page_layout.addLayout(actions)
 
@@ -5999,7 +6004,7 @@ class SmartReportApp(QMainWindow):
 
         self.object_expenses_table = QTableWidget(0, 7)
         self.object_expenses_table.setHorizontalHeaderLabels([
-            "ID", "Дата", "Поставщик", "Документ", "Сумма с НДС",
+            "ID", "Дата", "Поставщик", "Документ", "Сумма части",
             "НДС", "Статус распределения",
         ])
         self.object_expenses_table.setColumnHidden(0, True)
@@ -6016,12 +6021,14 @@ class SmartReportApp(QMainWindow):
         actions = QHBoxLayout()
         edit_button = QPushButton("Изменить документ")
         edit_button.clicked.connect(self.review_selected_object_expense)
+        vat_button = QPushButton("НДС по позициям")
+        vat_button.clicked.connect(lambda: self.calculate_allocation_vat(self.object_expenses_table))
         delete_button = QPushButton("Удалить документ")
         delete_button.setObjectName("danger")
         delete_button.clicked.connect(self.delete_selected_object_expense)
         open_button = QPushButton("Открыть оригинал")
         open_button.clicked.connect(self.open_selected_object_expense_original)
-        for button in (edit_button, delete_button, open_button):
+        for button in (edit_button, vat_button, delete_button, open_button):
             actions.addWidget(button)
         layout.addLayout(actions)
         self.object_expenses_object.currentIndexChanged.connect(self.load_object_expense_overview)
@@ -7127,6 +7134,25 @@ class SmartReportApp(QMainWindow):
             document=None, source_paths=paths, parsed_fields=parsed,
             recognition_message=recognition_message,
         )
+
+    def calculate_allocation_vat(self, table):
+        document = self._selected_expense_document(table)
+        if not document:
+            return
+        identifier = document.get("server_document_id") or document.get("id")
+        if not isinstance(identifier, int) or document.get("sync_state") in {"pending", "conflict"}:
+            QMessageBox.information(self, "НДС частей", "Сначала завершите синхронизацию документа и разрешите конфликты.")
+            return
+        if QMessageBox.question(self, "НДС частей", "Рассчитать НДС по ставкам исходных позиций? Итоги будут сохранены только при полном совпадении с фактурой.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            request_expense_api("POST", f"/api/expense-documents/{identifier}/allocation-vat",
+                                json={"expected_version": document.get("server_version") or document.get("sync_version")})
+            self.load_expense_documents()
+            self.load_object_expense_overview()
+            QMessageBox.information(self, "НДС частей", "НДС и суммы с НДС сохранены; сумма НДС частей совпадает с фактурой.")
+        except Exception as error:
+            QMessageBox.warning(self, "НДС частей", str(error))
 
     def reprocess_selected_document(self, *_):
         document = self._selected_expense_document(self.table_supplier_documents)
@@ -9602,6 +9628,7 @@ if __name__ == "__main__":
                 sys.exit(1)
             sys.exit(0)
         app = QApplication(sys.argv)
+        app.setStyleSheet(DARK_THEME_QSS)
         resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         icon_path = next((p for p in (resource_dir / "Logo.ico", Path("logo.ico")) if p.exists()), None)
         if icon_path:

@@ -1000,7 +1000,81 @@ def net_invoice_issues(fields, allocations):
             issues.append(f"Строка {index}: сверьте неоднозначный итог заказа с оригиналом.")
     if values["net_amount"] is not None and allocated != values["net_amount"]:
         issues.append("Распределено без НДС не совпадает с суммой без НДС фактуры.")
+    part_vat = [parse_invoice_money(row.get("vat_amount")) for row in allocations]
+    if allocations and values["vat_amount"] is not None and all(value is not None for value in part_vat):
+        if sum(part_vat, Decimal(0)) != values["vat_amount"]:
+            issues.append("НДС распределённых частей не совпадает с НДС фактуры.")
     return issues
+
+
+def allocation_vat_from_items(pages, orders, invoice_net, invoice_vat):
+    expected = {str(row.get("order_id") or ""): row for row in orders}
+    if not orders or "" in expected or len(expected) != len(orders):
+        raise ValueError("Для расчёта НДС нужны однозначные номера исходных заказов.")
+    totals = {key: {"net": Decimal(0), "vat": Decimal(0), "items": []} for key in expected}
+    current_order = None
+    for page in pages:
+        rows = invoice_layout_rows(page.get("elements") or [])
+        lines, sources = invoice_order_lines(rows)
+        events = []
+        for line, source in zip(lines, sources):
+            match = re.match(r"^(?:Sälj\s*\.\s*ordnr\s*\.?|Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer):\s*(\S+)", line, re.IGNORECASE)
+            if match:
+                events.append((source["box"][1], match.group(1)))
+            elif re.match(r"Summa\s+order", line, re.IGNORECASE):
+                events.append((source["box"][1], None))
+        events.sort(key=lambda event: event[0])
+        event_index = 0
+        columns = None
+        for row in rows:
+            top = min(cell["y0"] for cell in row)
+            while event_index < len(events) and events[event_index][0] <= top + 2:
+                current_order = events[event_index][1]
+                event_index += 1
+            vat_headers = [index for index, cell in enumerate(row)
+                           if re.fullmatch(r"(?:Moms|VAT)\s*%", cell["text"], re.IGNORECASE)]
+            sum_headers = [index for index, cell in enumerate(row)
+                           if re.fullmatch(r"Summa|Amount|Belopp", cell["text"], re.IGNORECASE)]
+            if vat_headers and sum_headers and len(row) > 2:
+                vat_column, sum_column = vat_headers[0], sum_headers[-1]
+
+                def bounds(index):
+                    left = (row[index - 1]["x0"] + row[index]["x0"]) / 2 if index else row[index]["x0"] - 20
+                    right = (row[index]["x0"] + row[index + 1]["x0"]) / 2 if index + 1 < len(row) else float("inf")
+                    return left, right
+
+                columns = (bounds(0), bounds(vat_column), bounds(sum_column))
+                continue
+            if columns is None or current_order is None:
+                continue
+            item_cells = [cell for cell in row if columns[0][0] <= cell["x0"] < columns[0][1]
+                          and re.fullmatch(r"\d+", cell["text"])]
+            if not item_cells:
+                continue
+            rates = [cell for cell in row if columns[1][0] <= cell["x0"] < columns[1][1]]
+            amounts = [cell for cell in row if columns[2][0] <= cell["x0"] < columns[2][1]]
+            if current_order not in totals or len(rates) != 1 or len(amounts) != 1:
+                raise ValueError("Не все позиции имеют однозначный заказ, ставку и сумму; НДС частей не вычислен.")
+            rate = parse_invoice_money(re.sub(r"\s*%$", "", rates[0]["text"]))
+            net = parse_invoice_money(amounts[0]["text"])
+            if rate is None or not Decimal(0) <= rate <= Decimal(100) or net is None:
+                raise ValueError("Не удалось достоверно прочитать ставку или net позиции.")
+            vat = (net * rate / Decimal(100)).quantize(CENT, rounding=ROUND_HALF_UP)
+            bucket = totals[current_order]
+            bucket["net"] += net
+            bucket["vat"] += vat
+            bucket["items"].append({"page": page.get("page", 1), "item": item_cells[0]["text"],
+                                    "net_amount": decimal_text(net), "vat_rate": decimal_text(rate),
+                                    "vat_amount": decimal_text(vat)})
+    for identifier, row in expected.items():
+        if not totals[identifier]["items"] or totals[identifier]["net"] != parse_invoice_money(row.get("net_amount")):
+            raise ValueError("Позиции не сходятся с net исходного заказа; требуется проверка НДС частей.")
+    if (sum((row["net"] for row in totals.values()), Decimal(0)) != parse_invoice_money(invoice_net)
+            or sum((row["vat"] for row in totals.values()), Decimal(0)) != parse_invoice_money(invoice_vat)):
+        raise ValueError("Построчный НДС или net не совпадает с итогом фактуры; автоматическое распределение отклонено.")
+    return [{**row, "vat_amount": decimal_text(totals[str(row["order_id"])]["vat"]),
+             "gross_amount": decimal_text(totals[str(row["order_id"])]["net"] + totals[str(row["order_id"])]["vat"]),
+             "vat_items": totals[str(row["order_id"])]["items"]} for row in orders]
 
 
 def normalize_net_allocations(allocations):

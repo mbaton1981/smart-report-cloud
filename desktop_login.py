@@ -21,7 +21,7 @@ class LoginDialog(QDialog):
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.status = QLabel("")
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #b00020;")
+        self.status.setStyleSheet("color: #fca5a5;")
         form = QFormLayout()
         form.addRow("Сервер", self.server_input)
         form.addRow("Логин", self.user_input)
@@ -52,13 +52,13 @@ class LoginDialog(QDialog):
             self.status.setText("Введите логин и пароль.")
             return
         self.login_button.setEnabled(False)
-        self.status.setStyleSheet("color: #444;")
+        self.status.setStyleSheet("color: #cbd5e1;")
         self.status.setText("Подключение к серверу…")
         QApplication.processEvents()
         try:
             self.token = desktop_auth.login(url, username, password)
         except desktop_auth.AuthError as error:
-            self.status.setStyleSheet("color: #b00020;")
+            self.status.setStyleSheet("color: #fca5a5;")
             self.status.setText(str(error))
             self.login_button.setEnabled(True)
             self.password_input.clear()

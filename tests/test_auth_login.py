@@ -80,6 +80,58 @@ class AuthLoginTests(unittest.TestCase):
         me = self.client.get("/api/auth/me", headers=self._bearer(token))
         self.assertEqual(me.get_json()["user"], {"username": "admin", "role": "admin"})
 
+    def test_allocation_vat_saved_and_object_report_uses_mixed_item_rates(self):
+        from io import BytesIO
+        import uuid
+        from reportlab.pdfgen import canvas
+        from expense_documents import migrate_invoice_net_schema
+
+        connection = self.server.get_db_connection()
+        try:
+            migrate_invoice_net_schema(connection)
+        finally:
+            connection.close()
+        source = BytesIO()
+        pdf = canvas.Canvas(source)
+        for text, left, top in [
+            ("Order nr: A-1", 40, 740), ("Rad", 40, 710), ("Moms %", 250, 710), ("Summa", 400, 710),
+            ("10", 40, 690), ("25,00", 250, 690), ("100,00", 400, 690),
+            ("20", 40, 670), ("12,00", 250, 670), ("50,00", 400, 670),
+            ("Summa order", 40, 650), ("150,00", 400, 650), ("Order nr: B-1", 40, 620),
+            ("10", 40, 600), ("0,00", 250, 600), ("100,00", 400, 600),
+            ("20", 40, 580), ("6,00", 250, 580), ("33,33", 400, 580),
+            ("Summa order", 40, 560), ("133,33", 400, 560),
+        ]:
+            pdf.drawString(left, top, text)
+        pdf.save()
+        headers = self._bearer(self._token())
+        parts = [{"order_id": "A-1", "net_amount": "150.00", "destination": "object", "object_id": 1},
+                 {"order_id": "B-1", "net_amount": "133.33", "destination": "company", "object_id": None}]
+        payload = {"client_id": str(uuid.uuid4()), "supplier_name": "Mixed tax fixture AB", "invoice_number": "MIX-1",
+                   "document_date": "2026-10-19", "currency_code": "SEK", "allocation_basis": "net",
+                   "net_amount": "283.33", "vat_amount": "33.00", "amount_due": "316.33",
+                   "verification_status": "confirmed", "allocations": parts, "order_proposals": parts}
+        created = self.client.post("/api/expense-documents", headers=headers,
+                                   data={"payload": json.dumps(payload), "original": (BytesIO(source.getvalue()), "mixed.pdf")})
+        self.assertEqual(created.status_code, 201, created.get_json())
+        identifier = created.get_json()["document"]["id"]
+        response = self.client.post(f"/api/expense-documents/{identifier}/allocation-vat", headers=headers,
+                                    json={"expected_version": 1})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        document = response.get_json()["document"]
+        self.assertEqual(document["allocated_vat"], "33.00")
+        self.assertEqual(document["allocated_gross"], "316.33")
+        self.assertEqual(document["net_amount"], payload["net_amount"])
+        report = self.client.get("/api/expense-objects/1/expenses", headers=headers).get_json()
+        self.assertEqual(report["documents"][0]["object_vat"], "31.00")
+        self.assertEqual(report["documents"][0]["object_gross"], "181.00")
+        self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat", headers=headers,
+                                          json={"expected_version": 1}).status_code, 409)
+        self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat", headers=headers,
+                                          json={"expected_version": 2}).status_code, 400)
+        self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat",
+                                          json={"expected_version": 2}).status_code, 403)
+
     def test_invoice_date_filter_keeps_undated_documents_visible(self):
         connection = sqlite3.connect(self.server.DB_FILE)
         try:
