@@ -192,6 +192,11 @@ class AuthLoginTests(unittest.TestCase):
             self.assertEqual(result.status_code, 200)
             self.assertTrue(result.get_json()["document"]["invoice_number"])
         self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 12)
+        listing = self.client.get("/api/expense-documents", headers=headers).get_json()["documents"]
+        self.assertEqual({row["id"] for row in listing}, set(children))
+        retained = self.client.get(f"/api/expense-documents/{identifier}", headers=headers).get_json()["document"]
+        self.assertFalse(retained["is_deleted"])
+        self.assertEqual(retained["processing"]["children"], children)
 
     def test_failed_recognition_is_visible_and_retry_preserves_one_record(self):
         from io import BytesIO

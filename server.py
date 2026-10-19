@@ -1422,7 +1422,9 @@ def expense_documents_list_api():
     date_to = request.args.get("date_to", "").strip()
     object_id = request.args.get("object_id", "").strip()
     query = "SELECT * FROM expense_documents"
-    conditions = ["is_deleted = 0"]
+    conditions = ["is_deleted = 0", """NOT EXISTS (
+        SELECT 1 FROM expense_processing p
+        WHERE p.document_id=expense_documents.id AND p.state='split')"""]
     params = []
     if date_from:
         conditions.append("(document_date IS NULL OR document_date = '' OR document_date >= ?)")
