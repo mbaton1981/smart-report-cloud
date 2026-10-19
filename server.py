@@ -1621,6 +1621,19 @@ def expense_document_create_api():
                     "ok": False, "error": "Этот оригинал уже находится в архиве.",
                     "existing_document_id": int(duplicate["id"]),
                 }), 409
+            deleted_duplicate = cursor.execute("""
+                SELECT d.id,d.client_id,d.sync_version FROM expense_documents d
+                LEFT JOIN expense_document_attachments a ON a.document_id=d.id
+                WHERE d.is_deleted=1 AND (d.file_sha256=? OR a.file_sha256=?)
+                ORDER BY d.id LIMIT 1
+            """, (file_sha256, file_sha256)).fetchone()
+            if deleted_duplicate:
+                temporary.unlink(missing_ok=True)
+                return jsonify({"ok": False, "code": "deleted_original",
+                                "error": "Оригинал принадлежит ранее удалённому документу; восстановите исходную запись, повторная загрузка не создаётся.",
+                                "existing_document_id": int(deleted_duplicate["id"]),
+                                "existing_client_id": deleted_duplicate["client_id"],
+                                "current_version": int(deleted_duplicate["sync_version"])}), 409
             target = root / stored_name
             temporary.replace(target)
             staged_files.append({
@@ -1696,11 +1709,47 @@ def expense_document_update_api(document_id):
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         existing = cursor.execute(
-            "SELECT * FROM expense_documents WHERE id = ? AND is_deleted = 0", (document_id,)
+            "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
         ).fetchone()
-        if existing is None:
+        restore = payload.get("restore_deleted") is True
+        restore_operation = str(payload.get("restore_operation_id") or "")
+        restore_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                                 separators=(",", ":")).encode("utf-8")).hexdigest() if restore else None
+        processing = cursor.execute("SELECT state,details_json FROM expense_processing WHERE document_id=?", (document_id,)).fetchone() if restore else None
+        details = json.loads(processing["details_json"]) if processing else {}
+        receipt = details.get("restoration") or {}
+        if (existing is not None and not existing["is_deleted"] and restore
+            and receipt.get("operation_id") == restore_operation and receipt.get("payload_sha256") == restore_hash
+            and receipt.get("restored_version") == int(existing["sync_version"])):
+            return jsonify({"ok": True, "restored": True, "duplicate_request": True,
+                            "document": serialize_expense_document(cursor, existing)})
+        if existing is None or existing["is_deleted"] and not restore:
             conn.rollback()
             return jsonify({"ok": False, "error": "Документ не найден."}), 404
+        if restore:
+            if not existing["is_deleted"]:
+                return jsonify({"ok": False, "conflict": True, "error": "Документ уже восстановлен или изменён; обновите данные.",
+                                "current_version": int(existing["sync_version"])}), 409
+            if not restore_operation or len(restore_operation) > 100 or payload.get("client_id") != existing["client_id"]:
+                raise ValueError("Для восстановления нужны исходный client_id и уникальный ID операции.")
+            if payload.get("expected_version") is None:
+                raise ValueError("Для восстановления обязательна версия исходного документа.")
+            if existing["is_deleted"] and existing["verification_status"] == "confirmed":
+                raise ValueError("Удалённый подтверждённый документ требует отдельной проверки перед восстановлением.")
+            originals = cursor.execute("SELECT stored_name,file_sha256 FROM expense_document_attachments WHERE document_id=?", (document_id,)).fetchall()
+            hashes = {row["file_sha256"] for row in originals}
+            uploads = [upload for upload in request.files.getlist("originals") if upload and upload.filename]
+            if not uploads:
+                upload = request.files.get("original")
+                uploads = [upload] if upload and upload.filename else []
+            uploaded_hashes = {hashlib.sha256(upload.stream.read()).hexdigest() for upload in uploads}
+            if not hashes or uploaded_hashes != hashes or len(uploads) != len(hashes):
+                raise ValueError("Восстановление требует тех же оригиналов по SHA-256; запись не изменена.")
+            root = expense_documents_root()
+            for original in originals:
+                path = (root / original["stored_name"]).resolve()
+                if path.parent != root or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != original["file_sha256"]:
+                    raise ValueError("Архивный оригинал недоступен или повреждён; восстановление остановлено.")
         if "allocation_basis" in existing.keys() and existing["allocation_basis"] == "net" and fields["allocation_basis"] != "net":
             conn.rollback()
             return jsonify({"ok": False, "conflict": True, "error": "Для изменения распределения без НДС обновите клиент."}), 409
@@ -1752,7 +1801,7 @@ def expense_document_update_api(document_id):
             UPDATE expense_documents SET supplier_name=?, invoice_number=?, document_date=?,
                 currency_code=?, net_amount=?, vat_amount=?, gross_amount=?, expense_category=?,
                 document_comment=?, verification_status=?, recognized_text=?, order_proposals_json=?, updated_at=?,
-                sync_version=sync_version+1
+                sync_version=sync_version+1, is_deleted=0, deleted_at=NULL
             WHERE id=? AND sync_version=?
         """, (
             fields["supplier_name"], fields["invoice_number"], fields["document_date"],
@@ -1769,6 +1818,12 @@ def expense_document_update_api(document_id):
         store_expense_allocation_rows(cursor, document_id, allocations, fields)
         if order_proposals and fields["verification_status"] == "confirmed":
             save_expense_project_code_links(cursor, fields["supplier_name"], order_proposals, now)
+        if restore:
+            details["restoration"] = {"operation_id": restore_operation, "payload_sha256": restore_hash,
+                                      "previous_version": int(existing["sync_version"]),
+                                      "restored_version": int(existing["sync_version"]) + 1, "restored_at": now}
+            cursor.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
+                           (document_id, "restored", json.dumps(details, ensure_ascii=False), now))
         conn.commit()
         document = cursor.execute(
             "SELECT * FROM expense_documents WHERE id = ?", (document_id,)

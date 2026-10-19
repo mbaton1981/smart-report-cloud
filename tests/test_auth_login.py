@@ -132,6 +132,61 @@ class AuthLoginTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat",
                                           json={"expected_version": 2}).status_code, 403)
 
+    def test_deleted_original_restores_same_record_and_retries_without_duplicate(self):
+        from io import BytesIO
+        import uuid
+        from expense_documents import migrate_invoice_net_schema
+        connection = self.server.get_db_connection()
+        try:
+            migrate_invoice_net_schema(connection)
+        finally:
+            connection.close()
+        headers = self._bearer(self._token())
+        original = self._invoice_pdf(6001)
+        initial = {"client_id": str(uuid.uuid4()), "verification_status": "draft"}
+        created = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps(initial), "original": (BytesIO(original), "receipt.pdf")})
+        identifier = created.get_json()["document"]["id"]
+        self.assertEqual(self.client.delete(f"/api/expense-documents/{identifier}", headers=headers,
+                                           json={"expected_version": 1}).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/expense-documents/{identifier}", headers=headers).status_code, 404)
+        files_before = self._query("SELECT id,document_id,stored_name,file_sha256 FROM expense_document_attachments")
+        pending_id = str(uuid.uuid4())
+        duplicate = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps({"client_id": pending_id, "verification_status": "draft"}),
+            "original": (BytesIO(original), "receipt-again.pdf")})
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.get_json()["code"], "deleted_original")
+        self.assertEqual(duplicate.get_json()["existing_document_id"], identifier)
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 1)
+        payload = {**initial, "restore_deleted": True, "restore_operation_id": pending_id, "expected_version": 2,
+                   "supplier_name": "ELWO Tools AB", "document_date": "2026-10-16", "currency_code": "SEK",
+                   "allocation_basis": "net", "net_amount": "10209.00", "vat_amount": "2552.25", "gross_amount": "12761.25",
+                   "amount_due": None, "due_date": None, "due_date_kind": "absent", "allocations": []}
+
+        def restore(content=original, values=None):
+            return self.client.put(f"/api/expense-documents/{identifier}", headers=headers, data={
+                "payload": json.dumps(payload if values is None else values), "originals": (BytesIO(content), "receipt-again.pdf")})
+
+        self.assertEqual(restore(b"different original").status_code, 400)
+        self.assertEqual(restore(values={**payload, "expected_version": 1}).status_code, 409)
+        self.assertEqual(self.client.get(f"/api/expense-documents/{identifier}", headers=headers).status_code, 404)
+        response = restore()
+        self.assertEqual(response.status_code, 200, response.get_json())
+        saved = response.get_json()["document"]
+        self.assertEqual((saved["id"], saved["client_id"], saved["sync_version"]), (identifier, initial["client_id"], 3))
+        self.assertEqual((saved["document_date"], saved["net_amount"], saved["vat_amount"], saved["gross_amount"]),
+                         ("2026-10-16", "10209.00", "2552.25", "12761.25"))
+        self.assertTrue(saved["has_original"])
+        retry = restore()
+        self.assertEqual(retry.status_code, 200)
+        self.assertTrue(retry.get_json()["duplicate_request"])
+        self.assertEqual(retry.get_json()["document"]["sync_version"], 3)
+        self.assertEqual(files_before, self._query("SELECT id,document_id,stored_name,file_sha256 FROM expense_document_attachments"))
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 1)
+        saved_again = self.client.get(f"/api/expense-documents/{identifier}", headers=headers).get_json()["document"]
+        self.assertEqual(saved_again["gross_amount"], "12761.25")
+
     def test_invoice_date_filter_keeps_undated_documents_visible(self):
         connection = sqlite3.connect(self.server.DB_FILE)
         try:
