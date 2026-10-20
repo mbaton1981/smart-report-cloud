@@ -37,19 +37,29 @@ from reportlab.platypus import LongTable, Paragraph, SimpleDocTemplate, Spacer, 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick", "vacation", "ob"}
+SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick", "vacation", "holiday", "ob"}
 SPECIAL_SUBMISSION_OBJECTS = {
     "atf": ("Arbetstidsförkortning", "p1000"),
     "sick": ("Sjuk", "p1001"),
     "vacation": ("Semestertimmar", "p1002"),
+    "holiday": (None, "p1004"),
 }
+
+
+def matches_special_submission_object(name, marking, reference):
+    expected_name, expected_marking = reference
+    return marking == expected_marking and (
+        expected_name is None or name == expected_name
+    )
+
+
 def resolve_submission_type(data, default="work"):
     provided = [data[key] for key in ("submission_type", "record_type") if key in data]
     if len(provided) == 2 and provided[0] != provided[1]:
         raise ValueError("Поля submission_type и record_type не совпадают.")
     submission_type = str(provided[0] if provided else default).strip()
     if submission_type not in SUPPORTED_SUBMISSION_TYPES:
-        raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick, vacation, ob.")
+        raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick, vacation, holiday, ob.")
     return submission_type
 
 
@@ -178,6 +188,12 @@ def validate_submission_object(cursor, submission_type, company, object_name, al
             "AND (is_active = 1 OR ? = 1)",
             (object_name, company, int(allow_inactive)),
         )
+    elif reference[0] is None:
+        cursor.execute(
+            "SELECT id, name, markning FROM meta_objects WHERE company = ? AND markning = ? "
+            "AND (is_active = 1 OR ? = 1)",
+            (company, reference[1], int(allow_inactive)),
+        )
     else:
         cursor.execute(
             "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ? "
@@ -187,14 +203,22 @@ def validate_submission_object(cursor, submission_type, company, object_name, al
     matches = cursor.fetchall()
     if len(matches) != 1:
         if reference and not matches:
-            raise ValueError(f"Для типа {submission_type} не найдена точная запись справочника {reference[0]} / {reference[1]}.")
+            expected = f"{reference[0]} / {reference[1]}" if reference[0] else reference[1]
+            raise ValueError(f"Для типа {submission_type} не найдена точная запись справочника {expected}.")
         if len(matches) > 1:
             raise ValueError("Запись объекта неоднозначна в справочнике.")
         raise ValueError("Объект не принадлежит выбранной фирме или не существует.")
-    if reference and object_name != reference[0]:
+    if reference and reference[0] is not None and object_name != reference[0]:
         raise ValueError(f"Для типа {submission_type} нужно выбрать объект {reference[0]}.")
-    if not reference and (matches[0]['name'], matches[0]['markning']) in SPECIAL_SUBMISSION_OBJECTS.values():
-        raise ValueError("Справочная запись АТФ/больничного/отпуска требует соответствующий тип.")
+    if reference and object_name != matches[0]["name"]:
+        raise ValueError(f"Для типа {submission_type} нужно выбрать объект {matches[0]['name']}.")
+    if not reference and any(
+        matches_special_submission_object(
+            matches[0]["name"], matches[0]["markning"], special_reference
+        )
+        for special_reference in SPECIAL_SUBMISSION_OBJECTS.values()
+    ):
+        raise ValueError("Справочный объект АТФ/больничного/отпуска/праздничных часов требует соответствующий тип.")
     return matches[0]['id']
 
 
@@ -207,9 +231,10 @@ def infer_submission_type_from_object(cursor, company, object_name):
     if len(matches) > 1:
         raise ValueError("Объект неоднозначен; требуется проверить название и отметку справочника.")
     if matches:
-        object_key = (matches[0]['name'], matches[0]['markning'])
         for submission_type, reference in SPECIAL_SUBMISSION_OBJECTS.items():
-            if object_key == reference:
+            if matches_special_submission_object(
+                matches[0]['name'], matches[0]['markning'], reference
+            ):
                 return submission_type
     return "work"
 
@@ -3227,7 +3252,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         FROM incoming_submissions
         WHERE normalize_employee_name(employee) = ?
           AND date >= ? AND date < ? AND is_deleted = 0
-          AND submission_type IN ('work', 'ob', 'vacation')
+          AND submission_type IN ('work', 'ob', 'vacation', 'holiday')
         ORDER BY date ASC, id ASC
     ''', (
         normalize_employee_name(employee),
@@ -3240,8 +3265,9 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         'work': 'Arbete',
         'ob': 'OB / Övertid',
         'vacation': 'Semester / Semestertimmar',
+        'holiday': 'Röda dagar',
     }
-    totals_by_type = {'work': 0.0, 'ob': 0.0, 'vacation': 0.0}
+    totals_by_type = {'work': 0.0, 'ob': 0.0, 'vacation': 0.0, 'holiday': 0.0}
     totals_by_object = {}
     formatted_shifts = []
 
@@ -3458,9 +3484,11 @@ def download_arbetsdagbok_pdf():
         total_work = totals_by_type.get('work', 0.0)
         total_ob = totals_by_type.get('ob', 0.0)
         total_vacation = totals_by_type.get('vacation', 0.0)
+        total_holiday = totals_by_type.get('holiday', 0.0)
         story.append(Paragraph(f"<b>Totalt arbete: {total_work:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt OB: {total_ob:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt semester: {total_vacation:.2f} tim</b>", meta_style))
+        story.append(Paragraph(f"<b>Totalt röda dagar: {total_holiday:.2f} tim</b>", meta_style))
         document.build(story)
         output.seek(0)
     except Exception:
@@ -4376,6 +4404,9 @@ def sync_push():
                     hours = ob_result["hours"]
                     rate = 0.0
                     transport = 0.0
+                elif submission_type == "holiday":
+                    rate = 0.0
+                    transport = 0.0
                 elif submission_type != 'work':
                     rate = float(existing['rate']) if existing else 0.0
                     transport = float(existing['transport']) if existing else 0.0
@@ -4406,8 +4437,10 @@ def sync_push():
                 if has_type:
                     tombstone_company = str(payload.get('company') or (existing['company'] if existing else '')).strip()
                     tombstone_object = str(payload.get('object_name') or (existing['object_name'] if existing else '')).strip()
-                    if tombstone_company and tombstone_object:
+                    if operation == 'upsert' and tombstone_company and tombstone_object:
                         validate_submission_object(cursor, submission_type, tombstone_company, tombstone_object)
+                    elif existing and existing['submission_type'] and existing['submission_type'] != submission_type:
+                        raise ValueError("Тип удаляемой записи не совпадает с серверной записью.")
                 normalized = {"submission_type": submission_type}
 
             operation_hash = hashlib.sha256(json.dumps(

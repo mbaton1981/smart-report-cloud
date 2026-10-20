@@ -3972,10 +3972,76 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(server_conn.execute("SELECT COUNT(*) FROM incoming_submissions WHERE sync_id = ?", (sync_id,)).fetchone()[0], 1)
         server_conn.close()
 
-    def test_vacation_submission_sync_history_and_report_use_existing_admin_object(self):
+    def test_delete_sync_is_allowed_after_object_is_removed_and_replay_is_idempotent(self):
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("""
+            INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active)
+            VALUES ('Renatur', 'Removed object', '', 520, 450, 1)
+        """)
+        server_conn.commit()
+        server_conn.close()
+        sync_id = str(uuid.uuid4())
+        payload = {
+            "date": "2026-10-16", "employee": "Historical employee", "company": "Renatur",
+            "object_name": "Removed object", "hours": 8, "rate": 520, "transport": 450,
+            "comment": "", "record_type": "work", "invoiced": 0,
+        }
+        operation_id = str(uuid.uuid4())
+        upsert = self.server_client.post("/sync/push", headers={
+            "X-Sync-Key": "isolated-sync-test-key",
+        }, json={"changes": [{
+            "sync_id": sync_id, "operation_id": str(uuid.uuid4()),
+            "operation": "upsert", "base_version": 0, "shift": payload,
+        }]})
+        self.assertEqual(upsert.status_code, 200, upsert.get_json())
+
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("DELETE FROM meta_objects WHERE company = 'Renatur' AND name = 'Removed object'")
+        server_conn.commit()
+        server_conn.close()
+        tombstone = {
+            "sync_id": sync_id, "operation_id": operation_id,
+            "operation": "delete", "base_version": 1, "shift": payload,
+        }
+        response = self.server_client.post("/sync/push", headers={
+            "X-Sync-Key": "isolated-sync-test-key",
+        }, json={"changes": [tombstone]})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["version"], 2)
+
+        replay = self.server_client.post("/sync/push", headers={
+            "X-Sync-Key": "isolated-sync-test-key",
+        }, json={"changes": [tombstone]})
+        self.assertEqual(replay.status_code, 200, replay.get_json())
+        self.assertTrue(replay.get_json()["results"][0]["idempotent"])
+        server_conn = self.server.get_db_connection()
+        rows = server_conn.execute(
+            "SELECT is_deleted, last_operation_id FROM incoming_submissions WHERE sync_id = ?",
+            (sync_id,),
+        ).fetchall()
+        server_conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tuple(rows[0]), (1, operation_id))
+
+    def test_sync_rejection_displays_server_error_body(self):
+        response = self.desktop.requests.Response()
+        response.status_code = 400
+        response._content = '{"ok":false,"error":"Объект не принадлежит выбранной фирме или не существует."}'.encode("utf-8")
+        response.headers["Content-Type"] = "application/json"
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Сервер отклонил синхронизацию \\(HTTP 400\\): Объект не принадлежит",
+        ):
+            self.desktop.raise_for_sync_response(response)
+
+    def test_special_time_submissions_sync_history_reports_and_payroll_use_existing_objects(self):
         company = "Bygger och Renoverar i Sthlm AB"
         employee = "Vacation Test Employee"
         object_name = "Semestertimmar"
+        holiday_employee = "Holiday Test Employee"
+        holiday_object_name = "Internal Red Days"
         self._add_company(company)
 
         server_conn = self.server.get_db_connection()
@@ -3983,10 +4049,18 @@ class CatalogSyncTests(unittest.TestCase):
             "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, 520, 1)",
             (employee,),
         )
+        server_conn.execute(
+            "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, 520, 1)",
+            (holiday_employee,),
+        )
         server_conn.execute("""
             INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active)
             VALUES (?, ?, 'p1002', 0, 0, 1)
         """, (company, object_name))
+        server_conn.execute("""
+            INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active)
+            VALUES (?, ?, 'p1004', 0, 0, 1)
+        """, (company, holiday_object_name))
         server_conn.commit()
         server_conn.close()
 
@@ -3995,10 +4069,18 @@ class CatalogSyncTests(unittest.TestCase):
             "INSERT INTO employees (name, salary_rate) VALUES (?, 520)",
             (employee,),
         )
+        desktop_conn.execute(
+            "INSERT INTO employees (name, salary_rate) VALUES (?, 520)",
+            (holiday_employee,),
+        )
         desktop_conn.execute("""
             INSERT INTO objects (company, name, markning, rate, transport_rate, is_active)
             VALUES (?, ?, 'p1002', 0, 0, 1)
         """, (company, object_name))
+        desktop_conn.execute("""
+            INSERT INTO objects (company, name, markning, rate, transport_rate, is_active)
+            VALUES (?, ?, 'p1004', 0, 0, 1)
+        """, (company, holiday_object_name))
         desktop_conn.commit()
         desktop_conn.close()
 
@@ -4006,7 +4088,42 @@ class CatalogSyncTests(unittest.TestCase):
             web_session["user_id"] = 1
             web_session["role"] = "admin"
 
+        form_response = self.server_client.get("/")
+        self.assertEqual(form_response.status_code, 200)
+        self.assertIn(b"holiday", form_response.data)
+        self.assertIn(b"p1004", form_response.data)
+        self.assertIn(holiday_object_name.encode(), form_response.data)
+
+        work_objects = self.desktop.QComboBox()
+        holiday_objects = self.desktop.QComboBox()
+        self.desktop.SmartReportApp.load_objects_for_company(
+            SimpleNamespace(), company, work_objects, self.desktop.RECORD_TYPE_WORK
+        )
+        self.desktop.SmartReportApp.load_objects_for_company(
+            SimpleNamespace(), company, holiday_objects, self.desktop.RECORD_TYPE_HOLIDAY
+        )
+        self.assertNotIn(holiday_object_name, [
+            work_objects.itemData(index) for index in range(work_objects.count())
+        ])
+        self.assertEqual(
+            [holiday_objects.itemData(index) for index in range(holiday_objects.count())],
+            [holiday_object_name],
+        )
+
         shift_date = date.today().isoformat()
+        invalid_work_submission = self.server_client.post("/submit-shift", json={
+            "request_id": str(uuid.uuid4()),
+            "date": shift_date,
+            "employee": holiday_employee,
+            "company": company,
+            "object_name": holiday_object_name,
+            "hours": 8,
+            "rate": 520,
+            "transport": 0,
+            "submission_type": "work",
+        })
+        self.assertEqual(invalid_work_submission.status_code, 400)
+
         submission = self.server_client.post("/submit-shift", json={
             "request_id": str(uuid.uuid4()),
             "date": shift_date,
@@ -4032,6 +4149,30 @@ class CatalogSyncTests(unittest.TestCase):
             ("vacation", object_name, "p1002", 4.5),
         )
 
+        holiday_submission = self.server_client.post("/submit-shift", json={
+            "request_id": str(uuid.uuid4()),
+            "date": shift_date,
+            "employee": holiday_employee,
+            "company": company,
+            "object_name": holiday_object_name,
+            "hours": 2,
+            "rate": 520,
+            "transport": 10,
+            "submission_type": "holiday",
+        })
+        self.assertEqual(holiday_submission.status_code, 201, holiday_submission.get_json())
+        holiday_history = self.server_client.post("/check-employee-shifts", json={
+            "employee": holiday_employee,
+            "month": shift_date[:7],
+        })
+        self.assertEqual(holiday_history.status_code, 200)
+        holiday_shift = holiday_history.get_json()["recent_shifts"][0]
+        self.assertEqual(
+            (holiday_shift["submission_type"], holiday_shift["object_name"],
+             holiday_shift["marking"], holiday_shift["hours"]),
+            ("holiday", holiday_object_name, "p1004", 2),
+        )
+
         sync_result = self._worker()
         self.assertEqual(sync_result["conflicts"], 0)
         desktop_conn = self.desktop.get_db_connection()
@@ -4048,6 +4189,40 @@ class CatalogSyncTests(unittest.TestCase):
             "FROM shifts WHERE date = ? AND employee = ?",
             (shift_date, employee),
         ).fetchone()[0], 4.5)
+        synced_holiday = desktop_conn.execute("""
+            SELECT date, employee, company, object_name, hours, rate, transport, entry_type
+            FROM shifts WHERE employee = ?
+        """, (holiday_employee,)).fetchone()
+        self.assertEqual(tuple(synced_holiday), (
+            shift_date, holiday_employee, company, holiday_object_name, 2.0, 0.0, 0.0, "holiday",
+        ))
+        self.assertEqual(
+            self.desktop.record_type_short_label(synced_holiday["entry_type"]),
+            "Красные дни",
+        )
+        idle_employee = "No Salary Activity"
+        inactive_employee = "Inactive Salary Activity"
+        desktop_conn.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, 520, 1)",
+            (idle_employee,),
+        )
+        desktop_conn.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES (?, 520, 0)",
+            (inactive_employee,),
+        )
+        for entry_type, hours in (
+            ("work", 10.0), ("atf", 1.0), ("sick", 1.0),
+            ("vacation", 1.5), ("ob", 1.0),
+        ):
+            desktop_conn.execute("""
+                INSERT INTO shifts (
+                    date, employee, company, object_name, hours, rate, transport, comment,
+                    entry_type
+                ) VALUES (?, ?, ?, ?, ?, 0, 0, '', ?)
+            """, (
+                shift_date, inactive_employee, company, object_name, hours, entry_type,
+            ))
+        desktop_conn.commit()
         desktop_conn.close()
 
         from PyQt6.QtWidgets import QDoubleSpinBox, QLabel, QTableWidget
@@ -4065,17 +4240,49 @@ class CatalogSyncTests(unittest.TestCase):
             dag_total_atf_lbl=QLabel(),
             dag_total_sick_lbl=QLabel(),
             dag_total_vacation_lbl=QLabel(),
+            dag_total_holiday_lbl=QLabel(),
             dag_total_ob_lbl=QLabel(),
         )
         self.desktop.SmartReportApp.generate_dagbok(report_ui)
-        self.assertEqual(report_ui.table_dagbok.item(0, 2).text(), "Отпуск")
-        self.assertEqual(report_ui.table_dagbok.item(0, 4).text(), "Отпуск / Semestertimmar (p1002)")
-        self.assertIn("4.5", report_ui.dag_total_vacation_lbl.text())
+        vacation_history_row = next(
+            row for row in range(report_ui.table_dagbok.rowCount())
+            if report_ui.table_dagbok.item(row, 1).text() == employee
+        )
+        self.assertEqual(report_ui.table_dagbok.item(vacation_history_row, 2).text(), "Отпуск")
+        self.assertEqual(
+            report_ui.table_dagbok.item(vacation_history_row, 4).text(),
+            "Отпуск / Semestertimmar (p1002)",
+        )
+        self.assertIn("6.0", report_ui.dag_total_vacation_lbl.text())
+
+        holiday_report_ui = SimpleNamespace(
+            dag_date_from=SimpleNamespace(text=lambda: shift_date),
+            dag_date_to=SimpleNamespace(text=lambda: shift_date),
+            dag_comp_cb=SimpleNamespace(currentText=lambda: company),
+            dag_obj_cb=SimpleNamespace(
+                currentData=lambda: holiday_object_name,
+                currentText=lambda: holiday_object_name,
+            ),
+            table_dagbok=QTableWidget(0, 6),
+            dag_total_hours_lbl=QLabel(),
+            dag_total_atf_lbl=QLabel(),
+            dag_total_sick_lbl=QLabel(),
+            dag_total_vacation_lbl=QLabel(),
+            dag_total_holiday_lbl=QLabel(),
+            dag_total_ob_lbl=QLabel(),
+        )
+        self.desktop.SmartReportApp.generate_dagbok(holiday_report_ui)
+        self.assertEqual(holiday_report_ui.table_dagbok.item(0, 2).text(), "Красные дни")
+        self.assertEqual(
+            holiday_report_ui.table_dagbok.item(0, 4).text(),
+            "Красные дни / Röda dagar (p1004)",
+        )
+        self.assertIn("2.0", holiday_report_ui.dag_total_holiday_lbl.text())
 
         salary_ui = SimpleNamespace(
             sal_date_from=SimpleNamespace(text=lambda: shift_date),
             sal_date_to=SimpleNamespace(text=lambda: shift_date),
-            table_salary=QTableWidget(0, 15),
+            table_salary=QTableWidget(0, 17),
             sal_vacation_percent=QDoubleSpinBox(),
             sal_tax_percent=QDoubleSpinBox(),
             sal_employer_fee_percent=QDoubleSpinBox(),
@@ -4089,18 +4296,75 @@ class CatalogSyncTests(unittest.TestCase):
             on_salary_cell_changed=lambda *_: None,
         )
         salary_ui.sal_vacation_percent.setValue(13)
+        salary_ui.load_salary_table_template = lambda: self.desktop.SmartReportApp.load_salary_table_template(salary_ui)
+        verify_conn = self.desktop.get_db_connection()
+        self.assertEqual(verify_conn.execute(
+            "SELECT COUNT(*) FROM shifts WHERE employee = ?", (inactive_employee,)
+        ).fetchone()[0], 5)
+        verify_conn.close()
         self.desktop.SmartReportApp.load_salary_table_template(salary_ui)
+        displayed_employees = {
+            salary_ui.table_salary.item(row, 0).text()
+            for row in range(salary_ui.table_salary.rowCount())
+        }
+        self.assertEqual(displayed_employees, {employee, holiday_employee, inactive_employee})
         salary_row = next(
             row for row in range(salary_ui.table_salary.rowCount())
             if salary_ui.table_salary.item(row, 0).text() == employee
         )
         self.assertEqual(float(salary_ui.table_salary.item(salary_row, 1).text()), 0)
         self.assertEqual(
-            float(salary_ui.table_salary.item(salary_row, 14).text()), 4.5,
+            float(salary_ui.table_salary.item(salary_row, 15).text()), 4.5,
             salary_ui.sal_summary_vacation_lbl.text(),
         )
         self.assertEqual(salary_ui.table_salary.item(salary_row, 7).text(), "0.00")
-        self.assertEqual(salary_ui.table_salary.item(salary_row, 13).text(), "0.00")
+        self.assertEqual(salary_ui.table_salary.item(salary_row, 14).text(), "0.00")
+        inactive_row = next(
+            row for row in range(salary_ui.table_salary.rowCount())
+            if salary_ui.table_salary.item(row, 0).text() == inactive_employee
+        )
+        self.assertEqual(float(salary_ui.table_salary.item(inactive_row, 1).text()), 10)
+        self.assertEqual(float(salary_ui.table_salary.item(inactive_row, 6).text()), 3)
+        self.assertEqual(float(salary_ui.table_salary.item(inactive_row, 15).text()), 1.5)
+        holiday_salary_row = next(
+            row for row in range(salary_ui.table_salary.rowCount())
+            if salary_ui.table_salary.item(row, 0).text() == holiday_employee
+        )
+        self.assertEqual(float(salary_ui.table_salary.item(holiday_salary_row, 1).text()), 0)
+        self.assertEqual(float(salary_ui.table_salary.item(holiday_salary_row, 6).text()), 0)
+        self.assertEqual(float(salary_ui.table_salary.item(holiday_salary_row, 7).text()), 0)
+        self.assertEqual(float(salary_ui.table_salary.item(holiday_salary_row, 16).text()), 2)
+        self.assertIn("10.0", salary_ui.sal_summary_hours_lbl.text())
+        self.assertIn("6.0", salary_ui.sal_summary_vacation_lbl.text())
+
+        pdf_tables = []
+
+        class CapturePdfDocument:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def build(self, story):
+                table = next(item for item in story if hasattr(item, "_cellvalues"))
+                pdf_tables.append([
+                    [
+                        cell.getPlainText() if hasattr(cell, "getPlainText") else str(cell)
+                        for cell in row
+                    ]
+                    for row in table._cellvalues
+                ])
+
+        with tempfile.TemporaryDirectory(prefix="smartreport-salary-pdf-") as report_dir, \
+             patch.object(self.desktop, "REPORTS_DIR", report_dir), \
+             patch.object(self.desktop, "SimpleDocTemplate", CapturePdfDocument), \
+             patch.object(self.desktop.QMessageBox, "information"), \
+             patch.object(self.desktop.os, "startfile", create=True):
+            self.desktop.SmartReportApp.export_salary_to_pdf(salary_ui)
+        pdf_text = "\n".join(str(row) for table in pdf_tables for row in table)
+        self.assertIn(inactive_employee, pdf_text)
+        self.assertIn(holiday_employee, pdf_text)
+        self.assertIn("Сверх нормы, ч", pdf_text)
+        self.assertIn("Röda dagar", pdf_text)
+        self.assertNotIn(idle_employee, pdf_text)
         report_response = self.server_client.get(
             "/report-preview",
             query_string={"employee": employee, "month": shift_date[:7]},
@@ -4108,7 +4372,13 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(report_response.status_code, 200)
         self.assertIn(b"Semestertimmar", report_response.data)
         self.assertIn(b"4.50 tim", report_response.data)
-
+        holiday_report_response = self.server_client.get(
+            "/report-preview",
+            query_string={"employee": holiday_employee, "month": shift_date[:7]},
+        )
+        self.assertEqual(holiday_report_response.status_code, 200)
+        self.assertIn(b"R\xc3\xb6da dagar", holiday_report_response.data)
+        self.assertIn(b"2.00 tim", holiday_report_response.data)
         server_conn = self.server.get_db_connection()
         self.assertEqual(
             server_conn.execute(
@@ -4117,7 +4387,24 @@ class CatalogSyncTests(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+        self.assertEqual(
+            server_conn.execute(
+                "SELECT COUNT(*) FROM meta_objects WHERE company = ? AND markning = 'p1004'",
+                (company,),
+            ).fetchone()[0],
+            1,
+        )
         server_conn.close()
+
+    def test_swedish_salary_norm_excludes_weekday_public_holidays(self):
+        self.assertEqual(
+            self.desktop.swedish_workday_norm("2026-05-01", "2026-05-31"),
+            152.0,
+        )
+        self.assertEqual(
+            self.desktop.swedish_workday_norm("2026-04-01", "2026-04-30"),
+            160.0,
+        )
 
     def test_stable_id_revision_merge_and_deactivation_preserve_history(self):
         sync_id = str(uuid.uuid4())

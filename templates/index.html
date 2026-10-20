@@ -195,6 +195,7 @@
                         <option value="atf">АТФ</option>
                         <option value="sick">Больничный</option>
                         <option value="vacation">Отпуск / Semestertimmar</option>
+                        <option value="holiday">Красные дни / Röda dagar</option>
                         <option value="ob">OB/сверхурочные</option>
                     </select>
                 </div>
@@ -304,6 +305,7 @@
                 <option value="atf">АТФ</option>
                 <option value="sick">Больничный</option>
                 <option value="vacation">Отпуск / Semestertimmar</option>
+                <option value="holiday">Красные дни / Röda dagar</option>
                 <option value="ob">OB/сверхурочные</option>
             </select>
             <label for="edit-object">Объект</label>
@@ -458,13 +460,16 @@
             const specialRefs = {
                 atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
                 sick: { name: 'Sjuk', marking: 'p1001' },
-                vacation: { name: 'Semestertimmar', marking: 'p1002' }
+                vacation: { name: 'Semestertimmar', marking: 'p1002' },
+                holiday: { marking: 'p1004' }
             };
             const reference = specialRefs[submissionType];
             const filtered = allObjects.filter(obj => obj.company === selectedCompany && (
                 reference
-                    ? obj.name === reference.name && obj.markning === reference.marking
-                    : !Object.values(specialRefs).some(item => obj.name === item.name && obj.markning === item.marking)
+                    ? (!reference.name || obj.name === reference.name) && obj.markning === reference.marking
+                    : !Object.values(specialRefs).some(item =>
+                        obj.markning === item.marking && (!item.name || obj.name === item.name)
+                    )
             ));
 
             if (filtered.length === 0) {
@@ -497,7 +502,9 @@
                     ? 'Часы АТФ:'
                     : (submissionType === 'sick'
                         ? 'Больничные часы:'
-                        : (submissionType === 'vacation' ? 'Отпускные часы:' : 'Отработано часов:')));
+                        : (submissionType === 'vacation'
+                            ? 'Отпускные часы:'
+                            : (submissionType === 'holiday' ? 'Праздничные нерабочие часы:' : 'Отработано часов:'))));
             document.getElementById('hours').readOnly = isOb;
             document.getElementById('ob-fields').style.display = isOb ? 'block' : 'none';
             const transportCheck = document.getElementById('transport_check');
@@ -618,17 +625,19 @@
             const reference = {
                 atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
                 sick: { name: 'Sjuk', marking: 'p1001' },
-                vacation: { name: 'Semestertimmar', marking: 'p1002' }
+                vacation: { name: 'Semestertimmar', marking: 'p1002' },
+                holiday: { marking: 'p1004' }
             }[type];
             const select = document.getElementById('edit-object');
             const options = allObjects.filter(obj => obj.company === company && (
                 reference
-                    ? obj.name === reference.name && obj.markning === reference.marking
+                    ? (!reference.name || obj.name === reference.name) && obj.markning === reference.marking
                     : !Object.values({
                         atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
                         sick: { name: 'Sjuk', marking: 'p1001' },
-                        vacation: { name: 'Semestertimmar', marking: 'p1002' }
-                    }).some(item => obj.name === item.name && obj.markning === item.marking)
+                        vacation: { name: 'Semestertimmar', marking: 'p1002' },
+                        holiday: { marking: 'p1004' }
+                    }).some(item => obj.markning === item.marking && (!item.name || obj.name === item.name))
             ));
             select.replaceChildren();
             for (const object of options) {
@@ -1115,6 +1124,7 @@
                 let totalAtfHours = 0;
                 let totalSickHours = 0;
                 let totalVacationHours = 0;
+                let totalHolidayHours = 0;
                 let totalObHours = 0;
                 let totalsByObject = {};
 
@@ -1126,7 +1136,8 @@
                         const submissionType = shift.submission_type || 'work';
                         const typeLabels = {
                             work: 'Работа', atf: 'АТФ', sick: 'Больничный',
-                            vacation: 'Отпуск / Semestertimmar', ob: 'OB/сверхурочные'
+                            vacation: 'Отпуск / Semestertimmar',
+                            holiday: 'Красные дни / Röda dagar', ob: 'OB/сверхурочные'
                         };
                         const typeLabel = typeLabels[submissionType] || 'Неизвестный тип';
 
@@ -1178,6 +1189,8 @@
                             badgeStyle = "background: #ffebee; color: #c62828; border: 1px solid #ffcdd2;";
                         } else if (shift.marking === 'p1002') {
                             badgeStyle = "background: #fff8e1; color: #8d6e00; border: 1px solid #ffecb3;";
+                        } else if (shift.marking === 'p1004') {
+                            badgeStyle = "background: #f3e5f5; color: #6a1b9a; border: 1px solid #e1bee7;";
                         }
 
                         const spanHours = document.createElement('span');
@@ -1210,6 +1223,7 @@
                         else if (submissionType === 'atf') totalAtfHours += shift.hours;
                         else if (submissionType === 'sick') totalSickHours += shift.hours;
                         else if (submissionType === 'vacation') totalVacationHours += shift.hours;
+                        else if (submissionType === 'holiday') totalHolidayHours += shift.hours;
                         else if (submissionType === 'ob') totalObHours += shift.hours;
 
                         let rawComment = shift.comment || "";
@@ -1273,12 +1287,12 @@
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
                     document.getElementById('print-total-hours').textContent = `Рабочие часы: ${totalWorkHours} ч`;
-                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · OB: ${formatObHours(totalObHours)} ч`;
-                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · Красные дни: ${totalHolidayHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · Красные дни: ${totalHolidayHours} ч · OB: ${formatObHours(totalObHours)} ч`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
-                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · Отпуск: 0 ч · OB: 0 ч';
+                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · Отпуск: 0 ч · Красные дни: 0 ч · OB: 0 ч';
                 }
             } catch (err) {
                 listContainer.innerHTML = '<li style="color: #d63031; justify-content: center;">Ошибка загрузки данных.</li>';
