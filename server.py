@@ -23,6 +23,7 @@ from expense_documents import migrate_invoice_net_schema, invoice_net_schema_rea
 from expense_documents import due_date_issues
 from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
+from object_reports import register_object_reports
 import reportlab
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -297,6 +298,8 @@ app.config.update(
 )
 
 DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
+
+register_object_reports(app, lambda: DB_FILE)
 
 def get_db_connection():
     if os.path.exists(DB_FILE) and os.path.isdir(DB_FILE):
