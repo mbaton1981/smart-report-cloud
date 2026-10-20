@@ -709,19 +709,15 @@ def init_cloud_db():
         logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения ADMIN_PASSWORD обязательна!")
         raise RuntimeError("ADMIN_PASSWORD environment variable is required.")
         
-    hashed_pw = generate_password_hash(admin_pass)
     now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
     cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
     if cursor.fetchone()[0] == 0:
+        hashed_pw = generate_password_hash(admin_pass)
         cursor.execute('''
             INSERT INTO users (username, password_hash, role, employee_id, is_active, created_at)
             VALUES (?, ?, 'admin', NULL, 1, ?)
         ''', (admin_user, hashed_pw, now_str))
-    else:
-        cursor.execute('''
-            UPDATE users SET password_hash = ? WHERE role = 'admin'
-        ''', (hashed_pw,))
 
     cursor.execute("SELECT id, name FROM meta_employees WHERE is_active = 1")
     active_emps = cursor.fetchall()
@@ -755,6 +751,41 @@ def init_cloud_db():
             upgrade_connection.close()
 
 init_cloud_db()
+
+@app.before_request
+def enforce_dataset_boundary():
+    from sync_dataset import HEADER, file_dataset
+    expected = file_dataset(DB_FILE)
+    if not expected:
+        return None
+    guarded = (
+        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/"))
+        or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced"}
+    )
+    if guarded:
+        supplied = request.headers.get(HEADER)
+        # Browser expense operations use a new session in the prepared dataset.
+        if not supplied and session.get("role") == "admin":
+            supplied = session.get("dataset_id")
+        if supplied != expected:
+            return jsonify({
+                "ok": False, "error": "Прежний или другой набор данных. Требуется согласованный переход.",
+                "code": "dataset_mismatch",
+            }), 409
+    if (session.get("user_id") and session.get("dataset_id") != expected
+            and request.path not in {"/login", "/logout"}):
+        session.clear()
+        return jsonify({"ok": False, "error": "После перехода выполните вход заново."}), 401
+    return None
+
+
+@app.after_request
+def advertise_dataset_boundary(response):
+    from sync_dataset import HEADER, file_dataset
+    expected = file_dataset(DB_FILE)
+    if expected:
+        response.headers[HEADER] = expected
+    return response
 
 
 @app.before_request
@@ -2401,6 +2432,8 @@ def login():
     session['username'] = user['username']
     session['role'] = user['role']
     session['employee_id'] = emp_id
+    from sync_dataset import file_dataset
+    session["dataset_id"] = file_dataset(DB_FILE)
 
     return jsonify({
         "ok": True,
