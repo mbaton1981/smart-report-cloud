@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import date
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -3969,6 +3970,153 @@ class CatalogSyncTests(unittest.TestCase):
             (sync_id,),
         ).fetchone()), ("History object", 520, 450, "after"))
         self.assertEqual(server_conn.execute("SELECT COUNT(*) FROM incoming_submissions WHERE sync_id = ?", (sync_id,)).fetchone()[0], 1)
+        server_conn.close()
+
+    def test_vacation_submission_sync_history_and_report_use_existing_admin_object(self):
+        company = "Bygger och Renoverar i Sthlm AB"
+        employee = "Vacation Test Employee"
+        object_name = "Semestertimmar"
+        self._add_company(company)
+
+        server_conn = self.server.get_db_connection()
+        server_conn.execute(
+            "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, 520, 1)",
+            (employee,),
+        )
+        server_conn.execute("""
+            INSERT INTO meta_objects (company, name, markning, rate, transport_rate, is_active)
+            VALUES (?, ?, 'p1002', 0, 0, 1)
+        """, (company, object_name))
+        server_conn.commit()
+        server_conn.close()
+
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute(
+            "INSERT INTO employees (name, salary_rate) VALUES (?, 520)",
+            (employee,),
+        )
+        desktop_conn.execute("""
+            INSERT INTO objects (company, name, markning, rate, transport_rate, is_active)
+            VALUES (?, ?, 'p1002', 0, 0, 1)
+        """, (company, object_name))
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        with self.server_client.session_transaction() as web_session:
+            web_session["user_id"] = 1
+            web_session["role"] = "admin"
+
+        shift_date = date.today().isoformat()
+        submission = self.server_client.post("/submit-shift", json={
+            "request_id": str(uuid.uuid4()),
+            "date": shift_date,
+            "employee": employee,
+            "company": company,
+            "object_name": object_name,
+            "hours": 4.5,
+            "rate": 520,
+            "transport": 1,
+            "submission_type": "vacation",
+        })
+        self.assertEqual(submission.status_code, 201, submission.get_json())
+
+        history_response = self.server_client.post("/check-employee-shifts", json={
+            "employee": employee,
+            "month": shift_date[:7],
+        })
+        self.assertEqual(history_response.status_code, 200)
+        history_shift = history_response.get_json()["recent_shifts"][0]
+        self.assertEqual(
+            (history_shift["submission_type"], history_shift["object_name"],
+             history_shift["marking"], history_shift["hours"]),
+            ("vacation", object_name, "p1002", 4.5),
+        )
+
+        sync_result = self._worker()
+        self.assertEqual(sync_result["conflicts"], 0)
+        desktop_conn = self.desktop.get_db_connection()
+        synced_shift = desktop_conn.execute("""
+            SELECT date, employee, company, object_name, hours, rate, transport, entry_type
+            FROM shifts WHERE employee = ?
+        """, (employee,)).fetchone()
+        self.assertEqual(tuple(synced_shift), (
+            shift_date, employee, company, object_name, 4.5, 0.0, 0.0, "vacation",
+        ))
+        self.assertEqual(self.desktop.record_type_short_label(synced_shift["entry_type"]), "Отпуск")
+        self.assertEqual(desktop_conn.execute(
+            "SELECT SUM(CASE WHEN entry_type = 'vacation' THEN hours ELSE 0 END) "
+            "FROM shifts WHERE date = ? AND employee = ?",
+            (shift_date, employee),
+        ).fetchone()[0], 4.5)
+        desktop_conn.close()
+
+        from PyQt6.QtWidgets import QDoubleSpinBox, QLabel, QTableWidget
+
+        report_ui = SimpleNamespace(
+            dag_date_from=SimpleNamespace(text=lambda: shift_date),
+            dag_date_to=SimpleNamespace(text=lambda: shift_date),
+            dag_comp_cb=SimpleNamespace(currentText=lambda: company),
+            dag_obj_cb=SimpleNamespace(
+                currentData=lambda: object_name,
+                currentText=lambda: object_name,
+            ),
+            table_dagbok=QTableWidget(0, 6),
+            dag_total_hours_lbl=QLabel(),
+            dag_total_atf_lbl=QLabel(),
+            dag_total_sick_lbl=QLabel(),
+            dag_total_vacation_lbl=QLabel(),
+            dag_total_ob_lbl=QLabel(),
+        )
+        self.desktop.SmartReportApp.generate_dagbok(report_ui)
+        self.assertEqual(report_ui.table_dagbok.item(0, 2).text(), "Отпуск")
+        self.assertEqual(report_ui.table_dagbok.item(0, 4).text(), "Отпуск / Semestertimmar (p1002)")
+        self.assertIn("4.5", report_ui.dag_total_vacation_lbl.text())
+
+        salary_ui = SimpleNamespace(
+            sal_date_from=SimpleNamespace(text=lambda: shift_date),
+            sal_date_to=SimpleNamespace(text=lambda: shift_date),
+            table_salary=QTableWidget(0, 15),
+            sal_vacation_percent=QDoubleSpinBox(),
+            sal_tax_percent=QDoubleSpinBox(),
+            sal_employer_fee_percent=QDoubleSpinBox(),
+            sal_atf_percent=QDoubleSpinBox(),
+            sal_sick_percent=QDoubleSpinBox(),
+            sal_summary_hours_lbl=QLabel(),
+            sal_summary_vacation_lbl=QLabel(),
+            sal_summary_ob_lbl=QLabel(),
+            sal_summary_net_lbl=QLabel(),
+            sal_summary_employer_lbl=QLabel(),
+            on_salary_cell_changed=lambda *_: None,
+        )
+        salary_ui.sal_vacation_percent.setValue(13)
+        self.desktop.SmartReportApp.load_salary_table_template(salary_ui)
+        salary_row = next(
+            row for row in range(salary_ui.table_salary.rowCount())
+            if salary_ui.table_salary.item(row, 0).text() == employee
+        )
+        self.assertEqual(float(salary_ui.table_salary.item(salary_row, 1).text()), 0)
+        self.assertEqual(
+            float(salary_ui.table_salary.item(salary_row, 14).text()), 4.5,
+            salary_ui.sal_summary_vacation_lbl.text(),
+        )
+        self.assertEqual(salary_ui.table_salary.item(salary_row, 7).text(), "0.00")
+        self.assertEqual(salary_ui.table_salary.item(salary_row, 13).text(), "0.00")
+        report_response = self.server_client.get(
+            "/report-preview",
+            query_string={"employee": employee, "month": shift_date[:7]},
+        )
+        self.assertEqual(report_response.status_code, 200)
+        self.assertIn(b"Semestertimmar", report_response.data)
+        self.assertIn(b"4.50 tim", report_response.data)
+
+        server_conn = self.server.get_db_connection()
+        self.assertEqual(
+            server_conn.execute(
+                "SELECT COUNT(*) FROM meta_objects WHERE company = ? AND name = ? AND markning = 'p1002'",
+                (company, object_name),
+            ).fetchone()[0],
+            1,
+        )
         server_conn.close()
 
     def test_stable_id_revision_merge_and_deactivation_preserve_history(self):

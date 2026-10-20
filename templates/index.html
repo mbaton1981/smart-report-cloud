@@ -194,6 +194,7 @@
                         <option value="work">Работа</option>
                         <option value="atf">АТФ</option>
                         <option value="sick">Больничный</option>
+                        <option value="vacation">Отпуск / Semestertimmar</option>
                         <option value="ob">OB/сверхурочные</option>
                     </select>
                 </div>
@@ -302,6 +303,7 @@
                 <option value="work">Работа</option>
                 <option value="atf">АТФ</option>
                 <option value="sick">Больничный</option>
+                <option value="vacation">Отпуск / Semestertimmar</option>
                 <option value="ob">OB/сверхурочные</option>
             </select>
             <label for="edit-object">Объект</label>
@@ -455,7 +457,8 @@
 
             const specialRefs = {
                 atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
-                sick: { name: 'Sjuk', marking: 'p1001' }
+                sick: { name: 'Sjuk', marking: 'p1001' },
+                vacation: { name: 'Semestertimmar', marking: 'p1002' }
             };
             const reference = specialRefs[submissionType];
             const filtered = allObjects.filter(obj => obj.company === selectedCompany && (
@@ -492,7 +495,9 @@
                 ? 'Рассчитано часов:'
                 : (submissionType === 'atf'
                     ? 'Часы АТФ:'
-                    : (submissionType === 'sick' ? 'Больничные часы:' : 'Отработано часов:'));
+                    : (submissionType === 'sick'
+                        ? 'Больничные часы:'
+                        : (submissionType === 'vacation' ? 'Отпускные часы:' : 'Отработано часов:')));
             document.getElementById('hours').readOnly = isOb;
             document.getElementById('ob-fields').style.display = isOb ? 'block' : 'none';
             const transportCheck = document.getElementById('transport_check');
@@ -612,7 +617,8 @@
             const company = document.getElementById('edit-company').value;
             const reference = {
                 atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
-                sick: { name: 'Sjuk', marking: 'p1001' }
+                sick: { name: 'Sjuk', marking: 'p1001' },
+                vacation: { name: 'Semestertimmar', marking: 'p1002' }
             }[type];
             const select = document.getElementById('edit-object');
             const options = allObjects.filter(obj => obj.company === company && (
@@ -620,7 +626,8 @@
                     ? obj.name === reference.name && obj.markning === reference.marking
                     : !Object.values({
                         atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
-                        sick: { name: 'Sjuk', marking: 'p1001' }
+                        sick: { name: 'Sjuk', marking: 'p1001' },
+                        vacation: { name: 'Semestertimmar', marking: 'p1002' }
                     }).some(item => obj.name === item.name && obj.markning === item.marking)
             ));
             select.replaceChildren();
@@ -1107,6 +1114,7 @@
                 let totalWorkHours = 0;
                 let totalAtfHours = 0;
                 let totalSickHours = 0;
+                let totalVacationHours = 0;
                 let totalObHours = 0;
                 let totalsByObject = {};
 
@@ -1116,7 +1124,10 @@
                     for (const shift of shiftsData.recent_shifts) {
                         const li = document.createElement('li');
                         const submissionType = shift.submission_type || 'work';
-                        const typeLabels = { work: 'Работа', atf: 'АТФ', sick: 'Больничный', ob: 'OB/сверхурочные' };
+                        const typeLabels = {
+                            work: 'Работа', atf: 'АТФ', sick: 'Больничный',
+                            vacation: 'Отпуск / Semestertimmar', ob: 'OB/сверхурочные'
+                        };
                         const typeLabel = typeLabels[submissionType] || 'Неизвестный тип';
 
                         const spanInfo = document.createElement('span');
@@ -1165,6 +1176,8 @@
                             badgeStyle = "background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9;";
                         } else if (shift.marking === 'p1001') {
                             badgeStyle = "background: #ffebee; color: #c62828; border: 1px solid #ffcdd2;";
+                        } else if (shift.marking === 'p1002') {
+                            badgeStyle = "background: #fff8e1; color: #8d6e00; border: 1px solid #ffecb3;";
                         }
 
                         const spanHours = document.createElement('span');
@@ -1196,6 +1209,7 @@
                         if (submissionType === 'work') totalWorkHours += shift.hours;
                         else if (submissionType === 'atf') totalAtfHours += shift.hours;
                         else if (submissionType === 'sick') totalSickHours += shift.hours;
+                        else if (submissionType === 'vacation') totalVacationHours += shift.hours;
                         else if (submissionType === 'ob') totalObHours += shift.hours;
 
                         let rawComment = shift.comment || "";
@@ -1259,12 +1273,12 @@
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
                     document.getElementById('print-total-hours').textContent = `Рабочие часы: ${totalWorkHours} ч`;
-                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${formatObHours(totalObHours)} ч`;
-                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · OB: ${formatObHours(totalObHours)} ч`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';
-                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · OB: 0 ч';
+                    document.getElementById('history-period-totals').textContent = 'Работа: 0 ч · АТФ: 0 ч · Больничный: 0 ч · Отпуск: 0 ч · OB: 0 ч';
                 }
             } catch (err) {
                 listContainer.innerHTML = '<li style="color: #d63031; justify-content: center;">Ошибка загрузки данных.</li>';

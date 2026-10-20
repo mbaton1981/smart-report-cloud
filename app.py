@@ -98,6 +98,7 @@ def request_expense_api(method, path, **kwargs):
 RECORD_TYPE_WORK = "work"
 RECORD_TYPE_ATF = "atf"
 RECORD_TYPE_SICK = "sick"
+RECORD_TYPE_VACATION = "vacation"
 RECORD_TYPE_OB = "ob"
 RECORD_TYPE_REVIEW = "review"
 RECORD_TYPE_LABELS = {
@@ -105,6 +106,7 @@ RECORD_TYPE_LABELS = {
     RECORD_TYPE_OB: "OB / Сверхурочные",
     RECORD_TYPE_ATF: "АТФ",
     RECORD_TYPE_SICK: "Больничный",
+    RECORD_TYPE_VACATION: "Отпуск / Semestertimmar",
     RECORD_TYPE_REVIEW: "Требует проверки",
 }
 
@@ -114,6 +116,7 @@ def record_type_short_label(record_type):
         RECORD_TYPE_OB: "OB",
         RECORD_TYPE_ATF: "АТФ",
         RECORD_TYPE_SICK: "Больничный",
+        RECORD_TYPE_VACATION: "Отпуск",
         RECORD_TYPE_REVIEW: "Проверка",
     }
     return mapping.get(record_type, "Работа")
@@ -145,6 +148,7 @@ def format_ob_detail(start_time, end_time, total_hours, segments=None):
 SPECIAL_OBJECTS = {
     RECORD_TYPE_ATF: ("Arbetstidsförkortning", "p1000"),
     RECORD_TYPE_SICK: ("Sjuk", "p1001"),
+    RECORD_TYPE_VACATION: ("Semestertimmar", "p1002"),
 }
 
 def get_db_connection():
@@ -414,7 +418,11 @@ def init_db_once():
     entry_type_added = 'entry_type' not in columns
     if entry_type_added:
         cursor.execute("ALTER TABLE shifts ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'work'")
-        cursor.execute("SELECT id, company, object_name FROM shifts WHERE object_name IN (?, ?)", tuple(item[0] for item in SPECIAL_OBJECTS.values()))
+        cursor.execute(
+            f"SELECT id, company, object_name FROM shifts WHERE object_name IN "
+            f"({','.join('?' for _ in SPECIAL_OBJECTS)})",
+            tuple(item[0] for item in SPECIAL_OBJECTS.values()),
+        )
         for old_shift in cursor.fetchall():
             matching_types = []
             for record_type, (object_name, marking) in SPECIAL_OBJECTS.items():
@@ -1319,7 +1327,9 @@ def calculate_payroll_components(
 
 
 def compact_blocked_shift_operations(cursor, allowed_types=None):
-    allowed_types = set(allowed_types or (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK))
+    allowed_types = set(allowed_types or (
+        RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK, RECORD_TYPE_VACATION,
+    ))
     cursor.execute("SELECT DISTINCT sync_id FROM shift_sync_outbox WHERE state = 'blocked'")
     sync_ids = [row['sync_id'] for row in cursor.fetchall()]
     released = 0
@@ -1997,7 +2007,10 @@ class SmartReportApp(QMainWindow):
         self.load_companies_into_combobox(self.comp_cb)
 
         self.record_type_cb = QComboBox()
-        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+        for record_type in (
+            RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF,
+            RECORD_TYPE_SICK, RECORD_TYPE_VACATION,
+        ):
             self.record_type_cb.addItem(record_type_label(record_type), record_type)
         
         self.obj_cb = QComboBox()
@@ -2314,7 +2327,10 @@ class SmartReportApp(QMainWindow):
                 return
 
         record_type = shift.get('record_type') or shift.get('submission_type') or RECORD_TYPE_WORK
-        if record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK, RECORD_TYPE_OB):
+        if record_type not in (
+            RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK,
+            RECORD_TYPE_VACATION, RECORD_TYPE_OB,
+        ):
             record_type = RECORD_TYPE_REVIEW
         if record_type == RECORD_TYPE_WORK:
             work_rate_cache = float(shift.get('rate', 0.0) or 0.0)
@@ -2674,6 +2690,7 @@ class SmartReportApp(QMainWindow):
         headers = sync_headers()
         downloaded_ids = []
         typed_sync_supported = False
+        vacation_sync_supported = False
         ob_sync_supported = False
         schema_conn = get_db_connection()
         local_ob_enabled = ob_schema_ready(schema_conn.cursor())
@@ -2682,10 +2699,14 @@ class SmartReportApp(QMainWindow):
             capabilities = requests.get(f"{CLOUD_URL}/sync/capabilities", headers=headers, timeout=4)
             if getattr(capabilities, 'status_code', None) == 200:
                 capability_data = capabilities.json()
+                submission_types = set(capability_data.get('submission_types', []))
                 typed_sync_supported = (
-                    {RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK}.issubset(
-                        set(capability_data.get('submission_types', []))
-                    ) and capability_data.get('typed_tombstones') is True
+                    {RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK}.issubset(submission_types)
+                    and capability_data.get('typed_tombstones') is True
+                )
+                vacation_sync_supported = (
+                    RECORD_TYPE_VACATION in submission_types
+                    and capability_data.get('typed_tombstones') is True
                 )
                 ob_sync_supported = (
                     "ob" in set(capability_data.get('submission_types', []))
@@ -2693,6 +2714,7 @@ class SmartReportApp(QMainWindow):
                 )
         except Exception:
             typed_sync_supported = False
+            vacation_sync_supported = False
             ob_sync_supported = False
 
         response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=4)
@@ -2766,10 +2788,17 @@ class SmartReportApp(QMainWindow):
             for outbox_row in cursor.fetchall():
                 if json.loads(outbox_row['payload_json']).get('record_type') == RECORD_TYPE_OB:
                     cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE id = ?", (outbox_row['id'],))
-        if typed_sync_supported or ob_sync_supported:
+        if not vacation_sync_supported:
+            cursor.execute("SELECT id, payload_json FROM shift_sync_outbox WHERE state = 'pending'")
+            for outbox_row in cursor.fetchall():
+                if json.loads(outbox_row['payload_json']).get('record_type') == RECORD_TYPE_VACATION:
+                    cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE id = ?", (outbox_row['id'],))
+        if typed_sync_supported or vacation_sync_supported or ob_sync_supported:
             allowed_types = set()
             if typed_sync_supported:
                 allowed_types.update((RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK))
+            if vacation_sync_supported:
+                allowed_types.add(RECORD_TYPE_VACATION)
             if ob_sync_supported:
                 allowed_types.add(RECORD_TYPE_OB)
             compact_blocked_shift_operations(cursor, allowed_types)
@@ -3161,11 +3190,13 @@ class SmartReportApp(QMainWindow):
         t_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         
         self.sal_summary_hours_lbl = QLabel("<b>Рабочие часы: 0.0</b>")
+        self.sal_summary_vacation_lbl = QLabel("<b>Отпуск: 0.0 tim</b>")
         self.sal_summary_ob_lbl = QLabel("<b>OB: 0 tim / 0.00 SEK</b>")
         self.sal_summary_net_lbl = QLabel("<b>Nettolön: 0.00 SEK</b>")
         self.sal_summary_employer_lbl = QLabel("<b>Arbetskostnad: 0.00 SEK</b>")
 
         t_layout.addWidget(self.sal_summary_hours_lbl)
+        t_layout.addWidget(self.sal_summary_vacation_lbl)
         t_layout.addWidget(self.sal_summary_ob_lbl)
         t_layout.addWidget(self.sal_summary_net_lbl)
         t_layout.addWidget(self.sal_summary_employer_lbl)
@@ -3248,12 +3279,12 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(card)
         
         self.table_salary = QTableWidget()
-        self.table_salary.setColumnCount(14)
+        self.table_salary.setColumnCount(15)
         self.table_salary.setHorizontalHeaderLabels([
             "Anställd", "Arbete\ntim", "ATF\ntim", "Sjukfrånvaro\ntim", "Timlön\n(SEK)",
             "OB timmar /\nspecifikation", "Grundlön + OB\n(SEK)", "Semesterersättning\n(SEK)",
             "ATF/KLS\n(SEK)", "Sjuklön\n(SEK)", "Skatt\n(SEK)", "Nettolön\n(SEK)",
-            "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)",
+            "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)", "Semestertimmar\ntim",
         ])
         salary_header = self.table_salary.horizontalHeader()
         salary_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -3261,7 +3292,7 @@ class SmartReportApp(QMainWindow):
         for column, width in {
             0: 140, 1: 75, 2: 75, 3: 75, 4: 85, 5: 200,
             6: 110, 7: 120, 8: 90, 9: 90, 10: 95, 11: 100,
-            12: 120, 13: 110,
+            12: 120, 13: 110, 14: 105,
         }.items():
             self.table_salary.setColumnWidth(column, width)
         self.table_salary.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -3310,6 +3341,7 @@ class SmartReportApp(QMainWindow):
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'vacation' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END),
                     COALESCE((
                         SELECT SUM(segment.amount)
@@ -3329,6 +3361,7 @@ class SmartReportApp(QMainWindow):
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'atf' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'sick' THEN hours ELSE 0 END),
+                    SUM(CASE WHEN entry_type = 'vacation' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END), 0
                 FROM shifts
                 WHERE date >= ? AND date <= ?
@@ -3338,12 +3371,16 @@ class SmartReportApp(QMainWindow):
         conn.close()
 
         sorted_keys = sorted(list(rates_map.keys()))
-        hours_map = {str(row[0]).strip().lower(): (row[1], row[2], row[3], row[4], row[5]) for row in shift_rows}
+        hours_map = {
+            str(row[0]).strip().lower(): (row[1], row[2], row[3], row[4], row[5], row[6])
+            for row in shift_rows
+        }
 
         self.table_salary.setRowCount(len(sorted_keys))
         sum_hrs_all = 0.0
         sum_atf_all = 0.0
         sum_sick_all = 0.0
+        sum_vacation_all = 0.0
         sum_ob_hours_all = 0.0
         sum_ob_amount_all = 0.0
         sum_net_all = 0.0
@@ -3351,11 +3388,14 @@ class SmartReportApp(QMainWindow):
 
         for row_idx, key in enumerate(sorted_keys):
             emp_display_name = orig_names.get(key, key.title())
-            hrs, atf_hours, sick_hours, ob_hours, ob_amount = hours_map.get(key, (0.0, 0.0, 0.0, 0.0, 0.0))
+            hrs, atf_hours, sick_hours, vacation_hours, ob_hours, ob_amount = hours_map.get(
+                key, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            )
             salary_rate = rates_map.get(key, 0.0)
             sum_hrs_all += hrs
             sum_atf_all += atf_hours
             sum_sick_all += sick_hours
+            sum_vacation_all += vacation_hours
             sum_ob_hours_all += ob_hours
             sum_ob_amount_all += ob_amount
 
@@ -3382,6 +3422,10 @@ class SmartReportApp(QMainWindow):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table_salary.setItem(row_idx, column, item)
+            vacation_item = QTableWidgetItem(f"{vacation_hours:.1f}")
+            vacation_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            vacation_item.setFlags(vacation_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_salary.setItem(row_idx, 14, vacation_item)
 
             item_rate = QTableWidgetItem(f"{salary_rate:.2f}")
             item_rate.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -3410,6 +3454,7 @@ class SmartReportApp(QMainWindow):
                 self.table_salary.setItem(row_idx, col_i, item_res)
 
         self.sal_summary_hours_lbl.setText(f"<b>Рабочие часы: {sum_hrs_all:.1f}</b>")
+        self.sal_summary_vacation_lbl.setText(f"<b>Отпуск: {sum_vacation_all:.1f} tim</b>")
         self.sal_summary_ob_lbl.setText(f"<b>OB: {sum_ob_hours_all:g} tim / {sum_ob_amount_all:,.2f} SEK</b>")
         self.sal_summary_net_lbl.setText(f"<b>Nettolön: {sum_net_all:,.2f} SEK</b>")
         self.sal_summary_employer_lbl.setText(f"<b>Arbetskostnad: {sum_employer_cost_all:,.2f} SEK</b>")
@@ -3475,18 +3520,20 @@ class SmartReportApp(QMainWindow):
 
         self.table_salary.cellChanged.connect(self.on_salary_cell_changed)
         
-        sum_hrs = sum_atf = sum_sick = sum_ob_hrs = sum_ob_amount = 0.0
+        sum_hrs = sum_atf = sum_sick = sum_vacation = sum_ob_hrs = sum_ob_amount = 0.0
         sum_net = sum_employer_total = 0.0
         for r in range(self.table_salary.rowCount()):
             h_it = self.table_salary.item(r, 1)
             atf_it = self.table_salary.item(r, 2)
             sick_it = self.table_salary.item(r, 3)
+            vacation_it = self.table_salary.item(r, 14)
             ob_it = self.table_salary.item(r, 5)
             n_it = self.table_salary.item(r, 11)
             employer_it = self.table_salary.item(r, 13)
             if h_it: sum_hrs += parse_float(h_it.text(), 0.0)
             if atf_it: sum_atf += parse_float(atf_it.text(), 0.0)
             if sick_it: sum_sick += parse_float(sick_it.text(), 0.0)
+            if vacation_it: sum_vacation += parse_float(vacation_it.text(), 0.0)
             if n_it: sum_net += parse_float(n_it.text(), 0.0)
             if employer_it: sum_employer_total += parse_float(employer_it.text(), 0.0)
             if ob_it:
@@ -3494,6 +3541,7 @@ class SmartReportApp(QMainWindow):
                 sum_ob_amount += float(ob_it.data(Qt.ItemDataRole.UserRole + 1) or 0.0)
             
         self.sal_summary_hours_lbl.setText(f"<b>Рабочие часы: {sum_hrs:.1f}</b>")
+        self.sal_summary_vacation_lbl.setText(f"<b>Отпуск: {sum_vacation:.1f} tim</b>")
         self.sal_summary_ob_lbl.setText(f"<b>OB: {sum_ob_hrs:g} tim / {sum_ob_amount:,.2f} SEK</b>")
         self.sal_summary_net_lbl.setText(f"<b>Nettolön: {sum_net:,.2f} SEK</b>")
         self.sal_summary_employer_lbl.setText(f"<b>Arbetskostnad: {sum_employer_total:,.2f} SEK</b>")
@@ -3535,10 +3583,10 @@ class SmartReportApp(QMainWindow):
                 "OB timmar / specifikation", "Grundlön + OB (SEK)",
                 "Semesterersättning (SEK)", "ATF/KLS (SEK)", "Sjuklön (SEK)",
                 "Skatt (SEK)", "Nettolön (SEK)", "Arbetsgivaravgifter (SEK)",
-                "Total kostnad (SEK)",
+                "Total kostnad (SEK)", "Semestertimmar",
             ]
             table_data = [[Paragraph(escape(label), header_style) for label in labels]]
-            totals = [0.0] * 14
+            totals = [0.0] * 15
             for row_idx in range(self.table_salary.rowCount()):
                 row_values = []
                 for column in range(self.table_salary.columnCount()):
@@ -3552,7 +3600,7 @@ class SmartReportApp(QMainWindow):
                     else:
                         numeric_value = parse_float(text, 0.0)
                         row_values.append(f"{numeric_value:.2f}" if column >= 4 else f"{numeric_value:g}")
-                        if column in (1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13):
+                        if column in (1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14):
                             totals[column] += numeric_value
                 table_data.append(row_values)
 
@@ -3566,7 +3614,7 @@ class SmartReportApp(QMainWindow):
                 for row in range(self.table_salary.rowCount())
                 if self.table_salary.item(row, 5)
             )
-            totals_row = ["Totalt:"] + [f"{totals[column]:.2f}" for column in range(1, 14)]
+            totals_row = ["Totalt:"] + [f"{totals[column]:.2f}" for column in range(1, 15)]
             totals_row[4] = ""
             totals_row[5] = f"OB totalt: {total_ob_hours:g} tim / {total_ob_amount:,.2f} SEK"
             table_data.append([
@@ -3576,7 +3624,7 @@ class SmartReportApp(QMainWindow):
 
             table = LongTable(
                 table_data,
-                colWidths=[75, 32, 24, 35, 40, 218, 50, 46, 40, 40, 40, 44, 54, 54],
+                colWidths=[75, 32, 24, 35, 40, 218, 50, 46, 40, 40, 40, 44, 54, 54, 35],
                 repeatRows=1,
             )
             table.setStyle(TableStyle([
@@ -8039,10 +8087,12 @@ class SmartReportApp(QMainWindow):
         self.dag_total_hours_lbl = QLabel("<b>Работа: 0.0 ч</b>")
         self.dag_total_atf_lbl = QLabel("<b>АТФ: 0.0 ч</b>")
         self.dag_total_sick_lbl = QLabel("<b>Больничный: 0.0 ч</b>")
+        self.dag_total_vacation_lbl = QLabel("<b>Отпуск: 0.0 ч</b>")
         self.dag_total_ob_lbl = QLabel("<b>OB отдельно: 0.0 ч / 0.00 kr</b>")
         dag_summary_box.addWidget(self.dag_total_hours_lbl)
         dag_summary_box.addWidget(self.dag_total_atf_lbl)
         dag_summary_box.addWidget(self.dag_total_sick_lbl)
+        dag_summary_box.addWidget(self.dag_total_vacation_lbl)
         dag_summary_box.addWidget(self.dag_total_ob_lbl)
         dag_summary_box.addStretch()
         layout.addLayout(dag_summary_box)
@@ -8083,7 +8133,10 @@ class SmartReportApp(QMainWindow):
         conn.close()
 
         self.table_dagbok.setRowCount(len(rows))
-        totals = {RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0, RECORD_TYPE_OB: 0.0}
+        totals = {
+            RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0,
+            RECORD_TYPE_VACATION: 0.0, RECORD_TYPE_OB: 0.0,
+        }
         ob_amount_total = 0.0
 
         for row_idx, row in enumerate(rows):
@@ -8116,6 +8169,8 @@ class SmartReportApp(QMainWindow):
                 detalization = "АТФ (p1000)"
             elif record_type == RECORD_TYPE_SICK:
                 detalization = "Больничный (p1001)"
+            elif record_type == RECORD_TYPE_VACATION:
+                detalization = "Отпуск / Semestertimmar (p1002)"
             
             it_date = QTableWidgetItem(str(date))
             it_date.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
@@ -8140,6 +8195,7 @@ class SmartReportApp(QMainWindow):
         self.dag_total_hours_lbl.setText(f"<b>Работа: {totals[RECORD_TYPE_WORK]:.1f} ч</b>")
         self.dag_total_atf_lbl.setText(f"<b>АТФ: {totals[RECORD_TYPE_ATF]:.1f} ч</b>")
         self.dag_total_sick_lbl.setText(f"<b>Больничный: {totals[RECORD_TYPE_SICK]:.1f} ч</b>")
+        self.dag_total_vacation_lbl.setText(f"<b>Отпуск: {totals[RECORD_TYPE_VACATION]:.1f} ч</b>")
         self.dag_total_ob_lbl.setText(f"<b>OB отдельно: {totals[RECORD_TYPE_OB]:.2f} ч / {ob_amount_total:,.2f} kr</b>")
 
     def export_dagbok_to_pdf(self):
@@ -8160,7 +8216,7 @@ class SmartReportApp(QMainWindow):
             SELECT date, employee, entry_type, hours, comment, sync_id
             FROM shifts
             WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-              AND entry_type IN ('work', 'ob')
+              AND entry_type IN ('work', 'ob', 'vacation')
             ORDER BY date ASC, employee ASC
         ''', (comp, obj, d_from, d_to))
         rows = cursor.fetchall()
@@ -8200,11 +8256,15 @@ class SmartReportApp(QMainWindow):
             story.append(Spacer(1, 5))
 
             table_data = [["Datum", "Anställd", "Typ", "Timmar", "Arbetsbeskrivning"]]
-            totals = {RECORD_TYPE_WORK: 0.0, RECORD_TYPE_OB: 0.0}
+            totals = {
+                RECORD_TYPE_WORK: 0.0, RECORD_TYPE_OB: 0.0,
+                RECORD_TYPE_VACATION: 0.0,
+            }
 
             swedish_type_labels = {
                 RECORD_TYPE_WORK: "Arbete",
                 RECORD_TYPE_OB: "OB / Övertid",
+                RECORD_TYPE_VACATION: "Semester / Semestertimmar",
             }
 
             for row in rows:
@@ -8235,6 +8295,7 @@ class SmartReportApp(QMainWindow):
             table_data.extend([
                 ["Totalt arbete:", "", "", f"{totals[RECORD_TYPE_WORK]:.2f} tim", ""],
                 ["Totalt OB:", "", "", f"{totals[RECORD_TYPE_OB]:.2f} tim", ""],
+                ["Totalt semester:", "", "", f"{totals[RECORD_TYPE_VACATION]:.2f} tim", ""],
             ])
 
             t = Table(table_data, colWidths=[70, 95, 80, 65, 225])
@@ -8247,11 +8308,11 @@ class SmartReportApp(QMainWindow):
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
                 ('TOPPADDING', (0, 0), (-1, 0), 6),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -3), [colors.HexColor('#f9f9f9'), colors.white]),
-                ('GRID', (0, 0), (-1, -3), 0.5, colors.HexColor('#dddddd')),
-                ('BACKGROUND', (0, -2), (-1, -1), colors.HexColor('#eeeeee')),
-                ('FONTNAME', (0, -2), (-1, -1), DEFAULT_FONT_BOLD),
-                ('LINEABOVE', (0, -2), (-1, -2), 1.5, colors.HexColor('#2b6cb0')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -4), [colors.HexColor('#f9f9f9'), colors.white]),
+                ('GRID', (0, 0), (-1, -4), 0.5, colors.HexColor('#dddddd')),
+                ('BACKGROUND', (0, -3), (-1, -1), colors.HexColor('#eeeeee')),
+                ('FONTNAME', (0, -3), (-1, -1), DEFAULT_FONT_BOLD),
+                ('LINEABOVE', (0, -3), (-1, -3), 1.5, colors.HexColor('#2b6cb0')),
             ]))
 
             story.append(t)
@@ -9181,14 +9242,14 @@ class SmartReportApp(QMainWindow):
                 return
         elif record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
             conn.close()
-            QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
+            QMessageBox.warning(self, "Тип записи", "Необходимо выбрать известный тип записи.")
             return
         else:
             cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (comp, obj_name))
             object_row = cursor.fetchone()
             if object_row and (obj_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
                 conn.close()
-                QMessageBox.warning(self, "Тип записи", "Справочные объекты АТФ и больничного нельзя сохранить как обычную работу.")
+                QMessageBox.warning(self, "Тип записи", "Справочные объекты АТФ, больничного и отпуска нельзя сохранить как обычную работу.")
                 return
         
         hours_val = ob_result["total_hours"] if ob_result else parse_float(self.hours_input.text(), -1)
@@ -9206,6 +9267,9 @@ class SmartReportApp(QMainWindow):
         trans_val = parse_float(self.trans_input.text(), 0.0)
         comment = self.comment_input.text().strip()
         if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+            rate_val = 0.0
+            trans_val = 0.0
+        elif record_type == RECORD_TYPE_VACATION:
             rate_val = 0.0
             trans_val = 0.0
 
@@ -9247,7 +9311,7 @@ class SmartReportApp(QMainWindow):
         conn.commit()
         conn.close()
         
-        if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+        if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_VACATION):
             self.background_sync_with_cloud()
             QMessageBox.information(self, "Успех", "OB-интервал сохранён и рассчитан." if record_type == RECORD_TYPE_OB else "Смена успешно сохранена!")
         else:
@@ -9314,6 +9378,8 @@ class SmartReportApp(QMainWindow):
                     detalization = "АТФ (p1000)"
                 elif entry_type == RECORD_TYPE_SICK:
                     detalization = "Больничный (p1001)"
+                elif entry_type == RECORD_TYPE_VACATION:
+                    detalization = "Отпуск / Semestertimmar (p1002)"
 
                 values = [
                     row["id"],                                       # 0: ID
@@ -9394,7 +9460,10 @@ class SmartReportApp(QMainWindow):
         company_field.addItems(companies)
         company_field.setCurrentText(shift['company'])
         record_type_field = QComboBox()
-        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF, RECORD_TYPE_SICK):
+        for record_type in (
+            RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF,
+            RECORD_TYPE_SICK, RECORD_TYPE_VACATION,
+        ):
             record_type_field.addItem(record_type_label(record_type), record_type)
         current_type = shift['entry_type'] or RECORD_TYPE_REVIEW
         work_values = [
@@ -9545,14 +9614,14 @@ class SmartReportApp(QMainWindow):
                 return
         elif record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
             check_conn.close()
-            QMessageBox.warning(self, "Тип записи", "Необходимо выбрать Работа, АТФ или Больничный.")
+            QMessageBox.warning(self, "Тип записи", "Необходимо выбрать известный тип записи.")
             return
         else:
             check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (company_field.currentText().strip(), object_name))
             object_row = check_cursor.fetchone()
             if object_row and (object_name, object_row[0]) in set(SPECIAL_OBJECTS.values()):
                 check_conn.close()
-                QMessageBox.warning(self, "Тип записи", "Справочные объекты АТФ и больничного нельзя сохранить как обычную работу.")
+                QMessageBox.warning(self, "Тип записи", "Справочные объекты АТФ, больничного и отпуска нельзя сохранить как обычную работу.")
                 return
         check_conn.close()
 
@@ -9656,6 +9725,9 @@ class SmartReportApp(QMainWindow):
         if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
             self.background_sync_with_cloud()
             QMessageBox.information(self, "Изменение сохранено", "Запись сохранена.")
+        elif record_type == RECORD_TYPE_VACATION:
+            self.background_sync_with_cloud()
+            QMessageBox.information(self, "Изменение сохранено", "Запись сохранена и поставлена в очередь синхронизации.")
         else:
             self.record_type_status_lbl.setText("Изменение сохранено локально. Сервер не поддерживает типы АТФ/больничного; ранее отправленная версия работы на сервере автоматически не изменена.")
             QMessageBox.information(self, "Сохранено локально", "Запись изменена локально. Для согласования её типа на сервере потребуется отдельное обновление серверного кода.")
@@ -9691,7 +9763,7 @@ class SmartReportApp(QMainWindow):
             conn.close()
 
         self.load_shifts_history()
-        if shift and shift['entry_type'] in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+        if shift and shift['entry_type'] in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_VACATION):
             self.background_sync_with_cloud()
         elif shift:
             QMessageBox.information(self, "Удалено локально", "Запись удалена из десктопной базы. Сервер не поддерживает синхронизацию удаления АТФ/больничного.")

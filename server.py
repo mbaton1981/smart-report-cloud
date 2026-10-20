@@ -37,10 +37,11 @@ from reportlab.platypus import LongTable, Paragraph, SimpleDocTemplate, Spacer, 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick", "ob"}
+SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick", "vacation", "ob"}
 SPECIAL_SUBMISSION_OBJECTS = {
     "atf": ("Arbetstidsförkortning", "p1000"),
     "sick": ("Sjuk", "p1001"),
+    "vacation": ("Semestertimmar", "p1002"),
 }
 def resolve_submission_type(data, default="work"):
     provided = [data[key] for key in ("submission_type", "record_type") if key in data]
@@ -48,7 +49,7 @@ def resolve_submission_type(data, default="work"):
         raise ValueError("Поля submission_type и record_type не совпадают.")
     submission_type = str(provided[0] if provided else default).strip()
     if submission_type not in SUPPORTED_SUBMISSION_TYPES:
-        raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick.")
+        raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick, vacation, ob.")
     return submission_type
 
 
@@ -193,7 +194,7 @@ def validate_submission_object(cursor, submission_type, company, object_name, al
     if reference and object_name != reference[0]:
         raise ValueError(f"Для типа {submission_type} нужно выбрать объект {reference[0]}.")
     if not reference and (matches[0]['name'], matches[0]['markning']) in SPECIAL_SUBMISSION_OBJECTS.values():
-        raise ValueError("Справочная запись АТФ/больничного требует соответствующий тип.")
+        raise ValueError("Справочная запись АТФ/больничного/отпуска требует соответствующий тип.")
     return matches[0]['id']
 
 
@@ -3226,7 +3227,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         FROM incoming_submissions
         WHERE normalize_employee_name(employee) = ?
           AND date >= ? AND date < ? AND is_deleted = 0
-          AND submission_type IN ('work', 'ob')
+          AND submission_type IN ('work', 'ob', 'vacation')
         ORDER BY date ASC, id ASC
     ''', (
         normalize_employee_name(employee),
@@ -3238,8 +3239,9 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
     type_labels = {
         'work': 'Arbete',
         'ob': 'OB / Övertid',
+        'vacation': 'Semester / Semestertimmar',
     }
-    totals_by_type = {'work': 0.0, 'ob': 0.0}
+    totals_by_type = {'work': 0.0, 'ob': 0.0, 'vacation': 0.0}
     totals_by_object = {}
     formatted_shifts = []
 
@@ -3455,8 +3457,10 @@ def download_arbetsdagbok_pdf():
         story.append(Spacer(1, 8 * mm))
         total_work = totals_by_type.get('work', 0.0)
         total_ob = totals_by_type.get('ob', 0.0)
+        total_vacation = totals_by_type.get('vacation', 0.0)
         story.append(Paragraph(f"<b>Totalt arbete: {total_work:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt OB: {total_ob:.2f} tim</b>", meta_style))
+        story.append(Paragraph(f"<b>Totalt semester: {total_vacation:.2f} tim</b>", meta_style))
         document.build(story)
         output.seek(0)
     except Exception:
