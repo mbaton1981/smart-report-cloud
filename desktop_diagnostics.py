@@ -56,7 +56,27 @@ def run(app_module, action, work_dir, case="case", out_path=None):
             finally:
                 connection.close()
 
-        if action in ("send", "duplicate"):
+        if action == "sync":
+            harness._manual_sync_requested = True
+            harness.apply_remote_shift = lambda cursor, shift: app_module.SmartReportApp.apply_remote_shift(
+                harness, cursor, shift
+            )
+            harness._sync_expense_document_outbox = lambda: app_module.SmartReportApp._sync_expense_document_outbox(
+                harness
+            )
+            result["exchange"] = app_module.SmartReportApp.perform_sync_logic(harness)
+            connection = app_module.get_db_connection()
+            try:
+                result["queues"] = {
+                    table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "shift_sync_outbox", "object_sync_outbox", "employee_sync_outbox",
+                        "employee_restore_outbox", "expense_document_outbox",
+                    )
+                }
+            finally:
+                connection.close()
+        elif action in ("send", "duplicate"):
             from reportlab.pdfgen import canvas
             source = work / f"{case}.pdf"
             if action == "send":
