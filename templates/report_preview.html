@@ -276,6 +276,9 @@
                                 <b>Totalt: {{ "%.2f"|format(shift.hours) }} tim</b>
                             </div>
                             {% endif %}
+                            {% if shift.transport %}
+                            <div class="shift-desc-line">Resa: {{ "%g"|format(shift.transport) }} (denna post)</div>
+                            {% endif %}
                         </td>
                         <td>{{ shift.type_label }}</td>
                         <td class="hours-col">{{ "%.2f"|format(shift.hours) }} tim</td>

@@ -2017,7 +2017,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.12-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.13-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -2169,7 +2169,7 @@ class SmartReportApp(QMainWindow):
         self._ob_form_widgets = (
             self.ob_start_time, self.ob_end_time, self.ob_preview_lbl,
         )
-        self._standard_hour_widgets = (self.hours_input, self.rate_input, self.trans_input)
+        self._standard_hour_widgets = (self.hours_input, self.rate_input)
         self.record_type_cb.currentIndexChanged.connect(self.update_ob_form_visibility)
         self.date_input.dateChanged.connect(self.refresh_ob_preview)
         self.ob_start_time.currentTextChanged.connect(self.refresh_ob_preview)
@@ -2466,7 +2466,7 @@ class SmartReportApp(QMainWindow):
             work_rate_cache = float(shift.get('rate', 0.0) or 0.0)
             work_transport_cache = float(shift.get('transport', 0.0) or 0.0)
         stored_rate = float(shift.get('rate', 0.0) or 0.0) if record_type == RECORD_TYPE_WORK else 0.0
-        stored_transport = float(shift.get('transport', 0.0) or 0.0) if record_type == RECORD_TYPE_WORK else 0.0
+        stored_transport = float(shift.get('transport', 0.0) or 0.0) if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0.0
         values = (
             shift['date'], shift['employee'], shift['company'], shift['object_name'], shift['hours'],
             stored_rate, stored_transport, shift.get('comment', ''),
@@ -7996,7 +7996,7 @@ class SmartReportApp(QMainWindow):
             rows = cursor.execute(f'''
                 SELECT employee,
                     SUM(CASE WHEN entry_type = 'work' THEN hours ELSE 0 END),
-                    SUM(CASE WHEN entry_type = 'work' THEN transport ELSE 0 END),
+                    SUM(CASE WHEN entry_type IN ('work', 'ob') THEN transport ELSE 0 END),
                     MAX(CASE WHEN entry_type = 'work' THEN invoiced ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'ob' THEN hours ELSE 0 END),
                     SUM(CASE WHEN entry_type = 'ob' THEN {ob_amount_sql} ELSE 0 END),
@@ -9697,14 +9697,13 @@ class SmartReportApp(QMainWindow):
         comment = self.comment_input.text().strip()
         if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
             rate_val = 0.0
-            trans_val = 0.0
         elif record_type in SPECIAL_OBJECTS:
             rate_val = 0.0
             trans_val = 0.0
 
-        if hours_val < 0 or rate_val < 0:
+        if hours_val < 0 or rate_val < 0 or not math.isfinite(trans_val) or not 0 <= trans_val <= 10000:
             conn.close()
-            QMessageBox.warning(self, "Ошибка", "Проверьте правильность часов и ставки!")
+            QMessageBox.warning(self, "Ошибка", "Проверьте часы, ставку и транспорт (от 0 до 10000)!")
             return
 
         sync_id = str(uuid.uuid4())
@@ -9942,6 +9941,7 @@ class SmartReportApp(QMainWindow):
         transport_field.setRange(0, 10000)
         transport_field.setDecimals(2)
         transport_field.setValue(shift['transport'] or 0)
+        transport_value = [transport_field.value()]
         comment_field = QLineEdit(shift['comment'] or '')
         ob_start_field = create_half_hour_time_field((shift["start_time"] if has_ob_schema else None) or "07:00")
         ob_end_field = create_half_hour_time_field((shift["end_time"] if has_ob_schema else None) or "18:00")
@@ -9954,13 +9954,16 @@ class SmartReportApp(QMainWindow):
                 work_values[0] = rate_field.value()
                 work_values[1] = transport_field.value()
                 rate_field.setValue(0.0)
-                transport_field.setValue(0.0)
             elif previous_type[0] != RECORD_TYPE_WORK and new_type == RECORD_TYPE_WORK:
                 rate_field.setValue(work_values[0])
-                transport_field.setValue(work_values[1])
             elif new_type != RECORD_TYPE_WORK:
                 rate_field.setValue(0.0)
+            if new_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+                if previous_type[0] in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+                    transport_value[0] = transport_field.value()
                 transport_field.setValue(0.0)
+            elif previous_type[0] not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+                transport_field.setValue(transport_value[0])
             previous_type[0] = new_type
 
         def refresh_dialog_ob_preview(*_):
@@ -9995,7 +9998,7 @@ class SmartReportApp(QMainWindow):
 
         def update_dialog_ob_visibility(*_):
             is_ob = record_type_field.currentData() == RECORD_TYPE_OB
-            for widget in (hours_field, rate_field, transport_field):
+            for widget in (hours_field, rate_field):
                 widget.setVisible(not is_ob)
                 label = form.labelForField(widget)
                 if label:
@@ -10096,7 +10099,7 @@ class SmartReportApp(QMainWindow):
             "company": company_field.currentText().strip(), "object_name": object_name,
             "hours": ob_result["total_hours"] if ob_result else hours_field.value(),
             "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,
-            "transport": transport_field.value() if record_type == RECORD_TYPE_WORK else 0.0,
+            "transport": transport_field.value() if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0.0,
             "comment": comment_field.text().strip(),
             "invoiced": shift['invoiced'] or 0, "record_type": record_type
         }

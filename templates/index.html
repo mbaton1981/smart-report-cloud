@@ -241,6 +241,8 @@
                     <label for="transport_check" style="margin-bottom: 0; cursor: pointer; color: #2d3436; font-size: 15px;">Транспорт (учитывать поездку)</label>
                     <input type="hidden" id="transport" name="transport" value="0.0">
                 </div>
+                <small>Поездка относится только к этой записи и выбранному объекту, в том числе для OB.
+                    Разбиение OB на интервалы не добавляет поездок. Объект обязателен.</small>
 
                 <div class="form-group">
                     <label for="comment">Описание выполненных работ:</label>
@@ -331,7 +333,7 @@
                 </div>
                 <div id="edit-ob-preview" class="ob-preview-panel" role="status" aria-live="polite"></div>
             </div>
-            <label for="edit-transport-check">Транспорт (только для работы)</label>
+            <label for="edit-transport-check">Транспорт (поездка для этой записи и объекта, работа / OB)</label>
             <input id="edit-transport-check" type="checkbox">
             <label for="edit-comment">Комментарий</label>
             <textarea id="edit-comment" rows="3"></textarea>
@@ -498,7 +500,7 @@
 
         function updateSubmissionTypeForm() {
             const submissionType = document.getElementById('submission_type').value;
-            const special = submissionType !== 'work';
+            const special = !['work', 'ob'].includes(submissionType);
             const isOb = submissionType === 'ob';
             document.getElementById('hours-label').textContent = isOb
                 ? 'Рассчитано часов:'
@@ -661,7 +663,7 @@
         }
 
         function updateEditTypeForm() {
-            const special = document.getElementById('edit-type').value !== 'work';
+            const special = !['work', 'ob'].includes(document.getElementById('edit-type').value);
             const isOb = document.getElementById('edit-type').value === 'ob';
             const transport = document.getElementById('edit-transport-check');
             transport.disabled = special;
@@ -733,8 +735,9 @@
                 payload.start_time = getHalfHourTime('edit-ob-start');
                 payload.end_time = getHalfHourTime('edit-ob-end');
             }
-            if (submissionType === 'work') {
-                payload.transport = document.getElementById('edit-transport-check').checked ? 1 : 0;
+            if (['work', 'ob'].includes(submissionType)) {
+                payload.transport = document.getElementById('edit-transport-check').checked
+                    ? (editOriginalTransport > 0 ? editOriginalTransport : 1) : 0;
             }
             try {
                 const response = await fetch('/edit-shift', {
@@ -1018,6 +1021,8 @@
                 comment: document.getElementById('comment').value,
                 submission_type: submissionType
             };
+            formData.transport = ['work', 'ob'].includes(submissionType)
+                ? parseFloat(document.getElementById('transport').value || 0) : 0;
             if (obPreview) {
                 formData.start_time = getHalfHourTime('ob-start');
                 formData.end_time = getHalfHourTime('ob-end');
@@ -1171,6 +1176,12 @@
                         spanInfo.appendChild(typeLine);
                         spanInfo.appendChild(document.createElement('br'));
                         spanInfo.appendChild(small);
+                        if (Number(shift.transport || 0) > 0) {
+                            const transportLine = document.createElement('small');
+                            transportLine.style.display = 'block';
+                            transportLine.textContent = `Транспорт: ${Number(shift.transport)} — для этой записи`;
+                            spanInfo.appendChild(transportLine);
+                        }
                         if (submissionType === 'ob') {
                             for (const segment of (shift.ob_segments || [])) {
                                 const segmentLine = document.createElement('small');
@@ -1250,6 +1261,7 @@
                             description: objDisplay,
                             type: typeLabel,
                             hours: shift.hours,
+                            transport: Number(shift.transport || 0),
                             obIntervals: submissionType === 'ob'
                                 ? (shift.ob_segments || []).map(segment => ({
                                     startTime: segment.start_time || '',
@@ -1274,7 +1286,7 @@
                             : '';
                         printTableHtml += `<tr style="border-bottom: 1px solid #ddd;">
                             <td style="padding: 8px;">${escapePrintText(row.date)}</td>
-                            <td style="padding: 8px;">${escapePrintText(row.description)}${obIntervalsHtml}</td>
+                            <td style="padding: 8px;">${escapePrintText(row.description)}${row.transport ? `<br>Resa: ${escapePrintText(row.transport)}` : ''}${obIntervalsHtml}</td>
                             <td style="padding: 8px;">${escapePrintText(row.type)}</td>
                             <td style="padding: 8px; text-align: right; font-weight: bold;">${escapePrintText(row.hours)} ч</td>
                         </tr>`;

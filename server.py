@@ -141,6 +141,16 @@ def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
         "base_rate_configured": base_rate > 0,
     }
 
+
+def submission_transport(value, submission_type):
+    try:
+        transport = round(float(value), 2)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Некорректное значение транспорта.") from error
+    if not math.isfinite(transport) or not 0 <= transport <= 10000:
+        raise ValueError("Транспорт должен быть конечным числом от 0 до 10000.")
+    return transport if submission_type in ("work", "ob") else 0.0
+
 def public_ob_result(result):
     public_segments = [
         {key: segment[key] for key in ("start_time", "end_time", "hours")}
@@ -2718,7 +2728,7 @@ def submit_shift():
             date_str = ob_result["date"]
             hours = ob_result["hours"]
             rate = 0.0
-            transport = 0.0
+            transport = submission_transport(data.get("transport", 0), submission_type)
         except (TypeError, ValueError) as error:
             conn.close()
             return jsonify({"ok": False, "error": str(error)}), 400
@@ -2941,7 +2951,7 @@ def edit_shift():
                 raise ValueError("Не удалось пересчитать OB-смену. Обратитесь к администратору.")
             date_val = ob_result["date"]
             hours = ob_result["hours"]
-            transport = 0.0
+            transport = submission_transport(data.get("transport", existing["transport"]), submission_type)
         else:
             hours = float(data.get('hours', existing['hours']))
             transport = round(float(data.get('transport', existing['transport'])), 2)
@@ -3251,6 +3261,7 @@ def check_employee_shifts():
             "object_name": obj_name, 
             "marking": marking,
             "hours": r['hours'],
+            "transport": r['transport'],
             "company": r['company'],
             "comment": r['comment'] or "",
             "invoiced": r['invoiced'],
@@ -3348,7 +3359,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         month_end = datetime(month_start.year, month_start.month + 1, 1)
 
     cursor.execute('''
-        SELECT date, company, object_name, hours, comment, submission_type, sync_id
+        SELECT date, company, object_name, hours, transport, comment, submission_type, sync_id
         FROM incoming_submissions
         WHERE normalize_employee_name(employee) = ?
           AND date >= ? AND date < ? AND is_deleted = 0
@@ -3405,6 +3416,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
             'object_name': obj_display,
             'comment': shift['comment'] or '',
             'hours': hours,
+            'transport': float(shift['transport'] or 0),
             'type_key': sub_type,
             'type_label': type_labels.get(sub_type, 'Arbete'),
             'ob_segments': ob_segments,
@@ -3418,6 +3430,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         'totals_by_type': totals_by_type,
         'totals_by_object': totals_by_object,
         'total_hours': total_hours,
+        'total_transport': sum(shift['transport'] for shift in formatted_shifts),
         'type_labels': type_labels,
     }, None
 
@@ -3535,6 +3548,8 @@ def download_arbetsdagbok_pdf():
             if shift['comment']:
                 comment = escape(str(shift['comment'])).replace('\n', '<br/>')
                 description_parts.append(f"Arbetsbeskrivning: {comment}")
+            if shift['transport']:
+                description_parts.append(f"Resa: {shift['transport']:g}")
 
             if shift['ob_segments']:
                 interval_lines = [
@@ -4503,7 +4518,7 @@ def sync_push():
                     date_val = ob_result["date"]
                     hours = ob_result["hours"]
                     rate = 0.0
-                    transport = 0.0
+                    transport = submission_transport(transport, submission_type)
                 elif submission_type == "holiday":
                     rate = 0.0
                     transport = 0.0
