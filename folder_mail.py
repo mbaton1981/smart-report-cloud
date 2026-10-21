@@ -1,12 +1,14 @@
-"""Manual read-only import of every message in the primary inbox."""
+"""Date-scoped manual read-only intake, with durable completion and safe retry."""
 from __future__ import annotations
 
 import hashlib
 import imaplib
 import re
 import ssl
+from datetime import date, timedelta
 from email import policy
 from email.parser import BytesParser
+from threading import Event
 
 from invoice_processing import recognize_invoice
 from mail_import import HOST, ADDRESS, MAX_MESSAGE_BYTES
@@ -25,11 +27,46 @@ def checked(response, stage):
     return response[1]
 
 
-def import_folder(store, password, *, client_factory=imaplib.IMAP4_SSL, recognizer=recognize_invoice):
+def recent_period(today=None):
+    end = today or date.today()
+    return end - timedelta(days=29), end
+
+
+def checked_period(start, end):
+    if not isinstance(start, date) or not isinstance(end, date) or start > end or end > date.today():
+        raise FolderError("period")
+    return start, end
+
+
+def imap_date(value):
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return f"{value.day:02d}-{months[value.month - 1]}-{value.year}"
+
+
+def import_folder(store, password, *, start=None, end=None, should_stop=None, progress=None,
+                  client_factory=imaplib.IMAP4_SSL, recognizer=recognize_invoice):
+    start, end = checked_period(*(recent_period() if start is None and end is None else (start, end)))
     report = {"messages": 0, "new_drafts": 0, "duplicates": 0, "without_pdf": 0,
-              "recognition_failed": 0}
+              "recognition_failed": 0, "skipped": 0, "total": 0, "completed": 0,
+              "stopped": False, "phase": "connecting",
+              "start": start.isoformat(), "end": end.isoformat()}
+    def notify(phase):
+        report["phase"] = phase
+        if progress:
+            progress(dict(report))
+
+    def stopping():
+        if should_stop and should_stop():
+            report["stopped"] = True
+            notify("stopped")
+            return True
+        return False
+
     client = None
     try:
+        notify("connecting")
+        if stopping():
+            return report
         client = client_factory(HOST, 993, ssl_context=ssl.create_default_context(), timeout=30)
         checked(client.login(ADDRESS, password), "auth")
         checked(client.select('"' + FOLDER + '"', readonly=True), "folder")
@@ -42,23 +79,39 @@ def import_folder(store, password, *, client_factory=imaplib.IMAP4_SSL, recogniz
             raise FolderError("epoch_changed")
         with store.conn:
             store.conn.execute("INSERT OR IGNORE INTO mail_epoch VALUES (?,?)", (FOLDER, epoch))
-        found = checked(client.uid("SEARCH", None, "ALL"), "search")
+        notify("searching")
+        found = checked(client.uid("SEARCH", None, "SINCE", imap_date(start),
+                                   "BEFORE", imap_date(end + timedelta(days=1))), "search")
         if len(found) != 1 or not isinstance(found[0], bytes):
             raise FolderError("search")
         try:
             uids = sorted(set(int(item) for item in found[0].split()))
         except ValueError:
             raise FolderError("search") from None
+        if any(not 1 <= uid <= 4294967295 for uid in uids):
+            raise FolderError("search")
+        report["total"] = len(uids)
+        notify("processing")
         for uid in uids:
-            if not 1 <= uid <= 4294967295:
-                raise FolderError("search")
+            if stopping():
+                return report
+            old = store.conn.execute(
+                "SELECT 1 FROM mail_messages WHERE folder=? AND epoch=? AND uid=?",
+                (FOLDER, epoch, uid)).fetchone()
+            if old:
+                report["skipped"] += 1
+                report["completed"] += 1
+                notify("processing")
+                continue
             report["messages"] += 1
-            # Re-fetching with PEEK verifies earlier message identity as well as SHA deduplication.
+            notify("downloading")
             metadata = checked(client.uid("FETCH", str(uid), "(UID RFC822.SIZE)"), "size")
             headers = [item for item in metadata if isinstance(item, bytes) and b"RFC822.SIZE" in item]
             size = re.search(rb"\bRFC822.SIZE\s+(\d+)", headers[0]) if len(headers) == 1 else None
             if not size or int(size[1]) > MAX_MESSAGE_BYTES:
                 raise FolderError("size")
+            if stopping():
+                return report
             body = checked(client.uid("FETCH", str(uid), "(UID BODY.PEEK[])"), "fetch")
             parts = [item for item in body if isinstance(item, tuple) and len(item) == 2]
             if (len(parts) != 1 or not all(isinstance(item, bytes) for item in parts[0])
@@ -68,19 +121,17 @@ def import_folder(store, password, *, client_factory=imaplib.IMAP4_SSL, recogniz
             if not raw or len(raw) > MAX_MESSAGE_BYTES:
                 raise FolderError("size")
             sha = hashlib.sha256(raw).hexdigest()
-            old = store.conn.execute(
-                "SELECT sha256 FROM mail_messages WHERE folder=? AND epoch=? AND uid=?",
-                (FOLDER, epoch, uid)).fetchone()
-            if old and old[0] != sha:
-                raise FolderError("message_changed")
             message = BytesParser(policy=policy.default).parsebytes(raw)
             pdf_count = 0
+            failed = False
             for part in message.walk():
                 if part.is_multipart():
                     continue
                 filename = part.get_filename() or ""
                 if part.get_content_type() != "application/pdf" and not filename.lower().endswith(".pdf"):
                     continue
+                if stopping():
+                    return report
                 content = part.get_payload(decode=True)
                 if not content or len(content) > MAX_MESSAGE_BYTES:
                     raise FolderError("pdf_invalid")
@@ -89,23 +140,37 @@ def import_folder(store, password, *, client_factory=imaplib.IMAP4_SSL, recogniz
                 existing = store.conn.execute("SELECT id FROM documents WHERE sha256=?", (digest,)).fetchone()
                 if existing:
                     document_id = existing[0]
-                    if (store.base(document_id).get("_recognition_state") == "pending"
+                    if (store.base(document_id).get("_recognition_state") in ("pending", "failed")
                             and store.latest(document_id)[0] == 0 and not store.card(document_id)):
-                        store.recognize_document(document_id, recognizer)
+                        notify("recognizing")
+                        result = store.recognize_document(document_id, recognizer)
+                        if result.get("state") == "failed":
+                            failed = True
+                            report["recognition_failed"] += 1
                     report["duplicates"] += 1
                     continue
                 # Persist a recoverable draft before OCR; failure never discards the original.
                 store.add_pdf(content, filename or digest + ".pdf", {"fields": {}, "state": "pending"})
                 document_id = store.conn.execute("SELECT id FROM documents WHERE sha256=?", (digest,)).fetchone()[0]
-                result = store.recognize_document(document_id, recognizer)
                 report["new_drafts"] += 1
+                if stopping():
+                    return report
+                notify("recognizing")
+                result = store.recognize_document(document_id, recognizer)
                 if result.get("state") == "failed":
+                    failed = True
                     report["recognition_failed"] += 1
             if not pdf_count:
                 report["without_pdf"] += 1
-            with store.conn:
-                store.conn.execute("INSERT OR IGNORE INTO mail_messages VALUES (?,?,?,?)",
-                                   (FOLDER, epoch, uid, sha))
+            if stopping():
+                return report
+            if not failed:
+                with store.conn:
+                    store.conn.execute("INSERT OR IGNORE INTO mail_messages VALUES (?,?,?,?)",
+                                       (FOLDER, epoch, uid, sha))
+            report["completed"] += 1
+            notify("processing")
+        notify("finished")
         return report
     finally:
         password = ""
@@ -127,45 +192,172 @@ ERRORS = {
     "fetch": "Не удалось безопасно получить выбранный UID через BODY.PEEK[].",
     "message_changed": "Содержимое ранее полученного UID изменилось. Импорт остановлен для ручной сверки.",
     "pdf_invalid": "PDF-вложение пустое или превышает 30 МБ. Письмо не изменено.",
+    "period": "Укажите корректный период: начало не позже конца, конец не позже сегодняшнего дня.",
 }
 
 
-def open_import_dialog(window):
-    from limited_mail_ui import PasswordDialog, ERROR_MESSAGES
+def report_text(report):
+    return (
+        f"INBOX · {report['start']} — {report['end']}. "
+        f"Проверено: {report['completed']}/{report['total']}; "
+        f"пропущено обработанных: {report['skipped']}; "
+        f"новых черновиков: {report['new_drafts']}; повторов PDF: {report['duplicates']}; "
+        f"без PDF: {report['without_pdf']}; ошибок OCR: {report['recognition_failed']}. "
+        "Расходы не создавались.")
+
+
+def archive_period(parent):
+    from PyQt6.QtCore import QDate
+    from PyQt6.QtWidgets import QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QMessageBox
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Загрузить архив — период INBOX")
+    layout = QFormLayout(dialog)
+    start, end = QDateEdit(), QDateEdit()
+    start.setObjectName("archive_start")
+    end.setObjectName("archive_end")
+    for field in (start, end):
+        field.setCalendarPopup(True)
+        field.setDisplayFormat("yyyy-MM-dd")
+        field.setMaximumDate(QDate.currentDate())
+    end.setDate(QDate.currentDate().addDays(-30))
+    start.setDate(end.date().addMonths(-1))
+    layout.addRow("Дата получения письма, с:", start)
+    layout.addRow("По (включительно):", end)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addRow(buttons)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    try:
+        period = checked_period(start.date().toPyDate(), end.date().toPyDate())
+    except FolderError:
+        QMessageBox.warning(parent, "Архив не запущен", ERRORS["period"])
+        return None
+    if QMessageBox.question(
+            parent, "Подтверждение загрузки архива",
+            f"Загрузить ранее не обработанные письма INBOX за {period[0]} — {period[1]}?\n"
+            "Обработанные письма будут пропущены. Существующие документы не изменяются.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+        return None
+    return period
+
+
+def create_import_dialog(window, start, end, *, archive=False):
+    from PyQt6.QtCore import QObject, pyqtSignal
+    from PyQt6.QtWidgets import QProgressBar, QPushButton
     from incoming_documents import IncomingStore
+    from limited_mail_ui import PasswordDialog, ERROR_MESSAGES
 
-    def operation(password):
-        store = IncomingStore(window.store.root, window.store.host)
-        try:
-            window.mail_report = import_folder(store, password)
-        finally:
-            store.close()
-
-    # PasswordOperation emits only fixed codes; never provider exception text.
+    checked_period(start, end)
     ERROR_MESSAGES.update(ERRORS)
+
+    class Progress(QObject):
+        updated = pyqtSignal(dict)
+
     class FolderDialog(PasswordDialog):
+        def __init__(self):
+            self.stop_event = Event()
+            self.report = None
+            self.successful = False
+            super().__init__(self.operation, offline=False, parent=window)
+            self.progress_signal = Progress(self)
+            self.progress_signal.updated.connect(self.show_progress)
+            self.setWindowTitle("SmartReport — загрузить архив INBOX" if archive
+                                else "SmartReport — получить документы из INBOX")
+            self.notice.setText(
+                f"Ящик: {ADDRESS}\nINBOX · {start} — {end} (включительно, по дате получения).\n"
+                + ("Архив: выбранный период.\n" if archive else "Только последние 30 дней.\n")
+                + "Обработанные письма пропускаются без скачивания и OCR.\n"
+                "EXAMINE + BODY.PEEK: письма не меняются. Расписание выключено.")
+            self.buttons.button(self.buttons.StandardButton.Ok).setText(
+                "Загрузить архив" if archive else "Получить документы")
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setRange(0, 1)
+            self.layout().insertWidget(self.layout().count() - 1, self.progress_bar)
+            self.stop_button = QPushButton("Остановить импорт")
+            self.stop_button.setEnabled(False)
+            self.stop_button.clicked.connect(self.request_stop)
+            self.layout().insertWidget(self.layout().count() - 1, self.stop_button)
+
+        def operation(self, password):
+            store = IncomingStore(window.store.root, window.store.host)
+            try:
+                report = import_folder(store, password, start=start, end=end,
+                                       should_stop=self.stop_event.is_set,
+                                       progress=self.progress_signal.updated.emit)
+                self.progress_signal.updated.emit(report)
+            finally:
+                store.close()
+
+        def accept(self):
+            if self.worker is not None:
+                return
+            self.stop_event.clear()
+            self.successful = False
+            self.report = None
+            super().accept()
+            self.stop_button.setEnabled(self.worker is not None)
+
+        def show_progress(self, report):
+            self.report = report
+            self.progress_bar.setRange(0, max(1, report["total"]))
+            self.progress_bar.setValue(report["completed"])
+            phases = {"connecting": "Соединение", "searching": "Поиск писем выбранного периода",
+                      "downloading": "Получение письма", "recognizing": "Распознавание PDF",
+                      "processing": "Обработка", "stopped": "Остановлено", "finished": "Завершено"}
+            prefix = ("Остановка запрошена — ожидается завершение текущего запроса или OCR"
+                      if self.stop_event.is_set() else phases[report["phase"]])
+            self.status.setText(prefix + ". " + report_text(report))
+
+        def request_stop(self):
+            self.stop_event.set()
+            self.stop_button.setEnabled(False)
+            self.status.setText(
+                "Остановка запрошена. Дождитесь завершения текущего запроса или OCR; "
+                "сохранённые PDF останутся, незавершённое письмо можно повторить.")
+
+        def show_outcome(self, code):
+            self.successful = code == "success"
+            super().show_outcome(code)
+            if self.report:
+                prefix = ("Остановлено безопасно" if self.report["stopped"] else
+                          "Завершено; письма с ошибками OCR будут повторены" if self.successful
+                          and self.report["recognition_failed"] else "Готово" if self.successful
+                          else self.status.text() + " Незавершённое письмо будет повторено")
+                self.status.setText(prefix + ". " + report_text(self.report))
+
         def operation_finished(self):
             super().operation_finished()
-            if hasattr(window, "mail_report"):
-                report = window.mail_report
-                self.status.setText(
-                    f"Готово. Проверено писем: {report['messages']}; новых черновиков: {report['new_drafts']}; "
-                    f"повторов PDF: {report['duplicates']}. Расходы не создавались. Можно закрыть окно.")
+            self.stop_button.setEnabled(False)
+            window.reload_documents()
+            if self.report:
+                window.status.setText(self.status.text())
 
-    dialog = FolderDialog(operation, offline=False, parent=window)
-    dialog.setWindowTitle("SmartReport — получить документы из INBOX")
-    dialog.notice.setText(
-        "Ручной импорт всех писем из основной папки INBOX подключённого ящика.\n"
-        "EXAMINE + BODY.PEEK: письма не меняются, расходы автоматически не создаются.\n"
-        "Пароль используется только в памяти этого сеанса и не сохраняется.")
-    dialog.buttons.button(dialog.buttons.StandardButton.Ok).setText("Получить документы")
+        def reject(self):
+            if self.worker is not None:
+                self.clear_password()
+                self.request_stop()
+                return
+            super().reject()
 
+        def closeEvent(self, event):
+            if self.worker is not None:
+                self.clear_password()
+                self.request_stop()
+                event.ignore()
+                return
+            super().closeEvent(event)
+
+    return FolderDialog()
+
+
+def open_import_dialog(window, *, archive=False):
+    if not window.keep_unsaved():
+        return
+    period = archive_period(window) if archive else recent_period()
+    if period is None:
+        return
+    dialog = create_import_dialog(window, *period, archive=archive)
     dialog.exec()
-    if hasattr(window, "mail_report"):
-        result = window.mail_report
-        window.reload_documents()
-        window.status.setText(
-            f"Проверено писем: {result['messages']}; новых черновиков: {result['new_drafts']}; "
-            f"повторов PDF: {result['duplicates']}; без PDF: {result['without_pdf']}; "
-            f"ошибок распознавания: {result['recognition_failed']}. Расходы не создавались.")
-        del window.mail_report

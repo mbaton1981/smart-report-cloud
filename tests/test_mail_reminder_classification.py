@@ -5,7 +5,9 @@ from mail_import import classify_mail_document, recognition_status
 
 class ReminderClassificationTests(unittest.TestCase):
     def test_reminder_header_overrides_default_invoice_without_inventing_fields(self):
-        for title in ("Påminnelse", "Paminnelse", "Betalningspåminnelse", "Payment reminder"):
+        for title in ("Påminnelse", "Paminnelse", "Betalningspåminnelse", "Payment reminder",
+                      "Andra påminnelse", "Sista betalningspåminnelse", "Påminnelse nr. 2",
+                      "Inkassokrav", "Betalningskrav", "Kravbrev", "Final payment demand"):
             with self.subTest(title=title):
                 fields = {
                     "document_type": "invoice", "raw_text": (
@@ -42,3 +44,11 @@ class ReminderClassificationTests(unittest.TestCase):
         self.assertIsNone(fields["invoice_number"])
         self.assertIsNone(fields["amount_due"])
         self.assertIsNone(fields["rounding_amount"])
+
+    def test_invoice_terms_about_debt_collection_are_not_a_payment_demand(self):
+        fields = {"document_type": "invoice", "raw_text":
+                  "Faktura\nVid utebliven betalning kan inkassokrav skickas.\n"
+                  "Betalningspåminnelseavgift 60 SEK", "invoice_number": "A-42"}
+        classify_mail_document(fields)
+        self.assertEqual(fields["document_type"], "invoice")
+        self.assertNotIn("suggested_document_type", fields)

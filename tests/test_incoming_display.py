@@ -79,6 +79,22 @@ class IncomingDisplayTests(unittest.TestCase):
         for value in ("Поставщик не распознан", "Дата не распознана", "Сумма не распознана"):
             self.assertIn(value, label)
 
+    def test_old_invoice_label_with_collection_demand_is_blocked_without_rewriting_draft(self):
+        from offline_review import packed
+        fields = dict(self.fields, raw_text="Inkassokrav\nFakturanummer TEST-123")
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1", (packed(fields),))
+        before = self.store.conn.execute("SELECT source_json,base_json FROM documents WHERE id=1").fetchone()
+        history = self.store.history(1)
+        window = self.open_window()
+        window.expense_button.click()
+        self.assertFalse(window.transfer_button.isEnabled())
+        self.assertIn("не новая покупка", window.selector.currentText())
+        self.assertTrue(any("Напоминание" in issue for issue in self.store.issues(1, window.payload())))
+        self.assertEqual(self.store.history(1), history)
+        self.assertEqual(self.store.conn.execute("SELECT source_json,base_json FROM documents WHERE id=1").fetchone(),
+                         before)
+
     def test_background_refresh_preserves_page_zoom_and_both_scrollbars(self):
         from reportlab.pdfgen.canvas import Canvas
         content = BytesIO()

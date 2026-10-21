@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from document_preview import DocumentGalleryDialog
-from offline_review import EDITABLE, OfflineReviewStore, ReviewError
+from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
 
 
 LABELS = {
@@ -45,7 +45,8 @@ class OfflineReviewWindow(QDialog):
         layout = QVBoxLayout(self)
         banner = QLabel(
             ("PDF распознаётся автоматически. Проверьте поля и распределите общую сумму по объектам.\n"
-             "Получение почты — только по кнопке из основной папки INBOX. Расписания нет.\n"
+             "INBOX: «Получить документы» — последние 30 дней; «Загрузить архив» — выбранный период.\n"
+             "Только по кнопке, без расписания. Все ранее сохранённые документы остаются в очереди.\n"
              if integrated else
              "ОТДЕЛЬНЫЙ ТЕСТОВЫЙ ПРОФИЛЬ. Почта, рабочая база и синхронизация отключены.\n")
             + f"Профиль: {store.root}")
@@ -289,7 +290,8 @@ class OfflineReviewWindow(QDialog):
             button.setEnabled(card is None)
         self.transfer_button.setEnabled(
             card is None and self.original_available and action == "expense"
-            and self.store.base(self.document_id).get("suggested_document_type") != "payment_reminder")
+            and current_classification(self.store.base(self.document_id)).get(
+                "suggested_document_type") != "payment_reminder")
 
     def document_label(self, document_id):
         _, fields = (self.store.current_review(document_id) if self.integrated
@@ -378,7 +380,7 @@ class OfflineReviewWindow(QDialog):
         self.revision, payload = (self.store.current_review(self.document_id) if self.integrated
                                   else self.store.latest(self.document_id))
         self.server_version = payload.get("server_version")
-        base = self.store.base(self.document_id)
+        base = current_classification(self.store.base(self.document_id))
         for key, field in self.inputs.items():
             field.blockSignals(True)
             field.setText(str(payload[key]) if payload.get(key) not in (None, "UNKNOWN") else "")

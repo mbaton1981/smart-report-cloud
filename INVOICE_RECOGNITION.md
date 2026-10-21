@@ -1,5 +1,40 @@
 # Invoice Recognition and Net Allocations
 
+## Date-scoped incremental INBOX — 1.0.16-rc1
+
+This supersedes the ALL-UID intake described for 1.0.15 below. The ordinary
+manual button searches received dates from today minus 29 days through today
+inclusive (IMAP INTERNALDATE, not the sender's Date header). Its label and
+password dialog show the dates and INBOX. There is no count cap or fixed UID
+list. **Загрузить архив** selects inclusive received dates and requires a
+separate explicit confirmation before opening the password dialog.
+
+The existing `mail_messages` table remains the durable success checkpoint,
+keyed by folder / UIDVALIDITY / UID. Completed UIDs are skipped before any
+FETCH or OCR. Legacy checkpoints remain valid without migration. PDF SHA-256
+still prevents duplicates across folders and different messages. Each unique
+PDF is one draft; a PDF may contain multiple pages, and one email may create
+several drafts. The recent-date rule never filters the saved document list.
+
+A message is checkpointed only after all its attachments finish without
+recognition failure. Stop or interruption retains original drafts but leaves
+the current UID retryable; retry reuses existing PDF identities and only
+recognizes pending/failed, never manually corrected, drafts. The progress
+dialog provides cooperative stop: the current network request/OCR may finish
+first. Closing a running dialog requests stop rather than destroying its
+worker. Partial results and fixed, sanitized errors remain visible.
+
+Fresh confirmation-time classification also rejects repeated reminder and
+collection-demand headings even when an old draft says invoice; no saved
+recognition is rewritten. Exact original hashes and existing supplier/invoice
+number (or supplier/date/total) matching guard against repeat expenses.
+These are safeguards, not universal semantic matching: inconsistent/missing
+supplier or invoice identity still requires human review of the original.
+
+Validation uses mocks or local retained PDFs, never a second whole-mailbox
+import. Mail access remains EXAMINE + BODY.PEEK only, manual, without schedule,
+mailbox mutation, payments or debts. No schema or server API migration is needed.
+
 ## Incoming list, stable PDF preview and primary inbox — 1.0.15-rc1
 
 The incoming selector reads the current reviewed fields (including manual

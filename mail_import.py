@@ -97,12 +97,14 @@ class ImportSummary:
 def classify_mail_document(fields: dict) -> None:
     text = fields.get("raw_text") or ""
     detected_type = non_invoice_document_type(text)
-    if re.search(r"^\s*(?:p[åa]minnelse|betalningsp[åa]minnelse|payment\s+reminder)\s*$",
+    if re.search(r"^\s*(?:(?:(?:första|andra|sista)\s+)?(?:p[åa]minnelse|betalningsp[åa]minnelse)"
+                 r"|payment\s+reminder|(?:inkasso|betalnings)[ -]?krav|kravbrev|final\s+(?:payment\s+)?(?:notice|demand))"
+                 r"(?:\s*(?:nr\.?|nummer|no\.?|#|:|-)?\s*\d+)?\s*$",
                  text, re.IGNORECASE | re.MULTILINE):
         fields["document_type"] = "unclassified"
         fields["suggested_document_type"] = "payment_reminder"
         reason = ("Напоминание об оплате — не подтверждённая новая фактура. "
-                  "Нужна сверка с исходной фактурой и уже учтённым долгом; "
+                  "Нужна сверка с исходной фактурой и уже учтённым расходом; "
                   "номер исходного счёта и дату печати не переносить в поля новой фактуры.")
     elif detected_type == "tax_decision":
         fields["document_type"] = "tax_decision"

@@ -345,6 +345,9 @@ class IncomingStore(OfflineReviewStore):
         card = self.card(document_id)
         if card is None:
             action = self.action(document_id)[1]
+            if (action not in ("ignore", "later") and current_classification(
+                    self.base(document_id)).get("suggested_document_type") == "payment_reminder"):
+                return "Напоминание / требование оплаты — не новая покупка; перенос запрещён", False
             return {"ignore": "Не учитывать — PDF сохранён, расход не создан",
                     "later": "Разобрать позже — PDF сохранён, расход не создан",
                     "expense": "Проверьте данные и выберите объект — расход ещё не создан"}.get(
@@ -503,10 +506,17 @@ def open_incoming(host, root):
     load.clicked.connect(import_snapshot)
     window.layout().insertWidget(window.layout().count() - 1, load)
     window.layout().insertWidget(window.layout().count() - 1, retry)
-    mail = QPushButton("Получить документы из INBOX")
-    from folder_mail import open_import_dialog
+    from folder_mail import open_import_dialog, recent_period
+    start, end = recent_period()
+    mail = QPushButton(f"Получить документы · INBOX · последние 30 дней ({start} — {end})")
+    mail.setObjectName("incoming_receive_mail")
+    mail.setToolTip("По дате получения письма. Обработанные UID пропускаются без скачивания и OCR.")
     mail.clicked.connect(lambda: open_import_dialog(window))
     window.layout().insertWidget(1, mail)
+    archive = QPushButton("Загрузить архив")
+    archive.setObjectName("incoming_mail_archive")
+    archive.clicked.connect(lambda: open_import_dialog(window, archive=True))
+    window.layout().insertWidget(2, archive)
     files = QPushButton("Открыть PDF и распознать")
 
     def import_files():
@@ -526,7 +536,7 @@ def open_incoming(host, root):
         window.reload_documents()
 
     files.clicked.connect(import_files)
-    window.layout().insertWidget(2, files)
+    window.layout().insertWidget(3, files)
     try:
         host.refresh_incoming_capabilities()
     except (OSError, ValueError, RuntimeError):
@@ -537,6 +547,8 @@ def open_incoming(host, root):
     window.status_timer = QTimer(window)
 
     def update_status():
+        start, end = recent_period()
+        mail.setText(f"Получить документы · INBOX · последние 30 дней ({start} — {end})")
         if window.document_id is None:
             return
         text, green = store.accounting_status(window.document_id)

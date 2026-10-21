@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ class FolderIMAP:
     commands = []
     epoch = 50
     fail = None
+    dates = {}
 
     def __init__(self, host, port, ssl_context, timeout):
         assert host == HOST and port == 993 and ssl_context.check_hostname
@@ -35,8 +37,12 @@ class FolderIMAP:
         assert action in ("SEARCH", "FETCH")
         self.commands.append((action, *args))
         if action == "SEARCH":
-            assert args == (None, "ALL")
-            return "OK", [b" ".join(str(uid).encode() for uid in self.messages)]
+            assert len(args) == 5 and args[0] is None and args[1] == "SINCE" and args[3] == "BEFORE"
+            from datetime import datetime
+            start = datetime.strptime(args[2], "%d-%b-%Y").date()
+            end = datetime.strptime(args[4], "%d-%b-%Y").date()
+            return "OK", [b" ".join(str(uid).encode() for uid in self.messages
+                                    if start <= self.dates.get(uid, date.today()) < end)]
         uid = int(args[0])
         if self.fail == uid:
             raise OSError("simulated connection loss")
@@ -60,6 +66,7 @@ class FolderMailTests(unittest.TestCase):
         FolderIMAP.commands = []
         FolderIMAP.epoch = 50
         FolderIMAP.fail = None
+        FolderIMAP.dates = {}
 
     def run_import(self):
         return import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognized)
@@ -69,7 +76,8 @@ class FolderMailTests(unittest.TestCase):
         before = self.store.conn.execute("SELECT COUNT(*) FROM revisions").fetchone()[0]
         report = self.run_import()
         self.assertEqual(report["new_drafts"], 0)
-        self.assertEqual(report["duplicates"], 7)
+        self.assertEqual(report["duplicates"], 0)
+        self.assertEqual(report["skipped"], 7)
         self.assertEqual(len(self.store.documents()), 7)
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM revisions").fetchone()[0], before)
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM register").fetchone()[0], 0)
@@ -85,22 +93,29 @@ class FolderMailTests(unittest.TestCase):
         FolderIMAP.fail = None
         report = self.run_import()
         self.assertEqual(report["new_drafts"], 4)
-        self.assertEqual(report["duplicates"], 3)
+        self.assertEqual(report["skipped"], 3)
 
-    def test_uidvalidity_change_and_changed_message_are_explicit(self):
+    def test_uidvalidity_change_is_explicit_and_completed_uid_never_refetched(self):
         self.run_import()
         FolderIMAP.epoch = 51
         with self.assertRaisesRegex(FolderError, "epoch_changed"):
             self.run_import()
         FolderIMAP.epoch = 50
         FolderIMAP.messages[1] = eml(pdf("Changed UID"))
-        with self.assertRaisesRegex(FolderError, "message_changed"):
-            self.run_import()
+        FolderIMAP.commands = []
+        result = self.run_import()
+        self.assertEqual(result["skipped"], 7)
+        self.assertFalse(any(command[0] == "FETCH" for command in FolderIMAP.commands))
 
     def test_failed_recognition_keeps_original_for_manual_fields(self):
         result = import_folder(self.store, "isolated-only", client_factory=FolderIMAP,
                                recognizer=lambda paths: {"fields": {}, "state": "failed"})
         self.assertEqual(result["recognition_failed"], 7)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0], 0)
+        retry = self.run_import()
+        self.assertEqual(retry["new_drafts"], 0)
+        self.assertEqual(retry["recognition_failed"], 0)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0], 7)
         for doc in self.store.documents():
             self.assertTrue(self.store.original(doc["id"]).is_file())
 
@@ -156,3 +171,118 @@ class FolderMailTests(unittest.TestCase):
         self.store.save(1, payload, revision)
         self.assertEqual(self.run_import()["new_drafts"], 6)
         self.assertEqual(self.store.latest(1)[1]["supplier_name"], payload["supplier_name"])
+
+    def test_completed_messages_skip_all_fetch_and_ocr_but_new_uid_checks_attachment_hash(self):
+        from unittest.mock import Mock
+        self.run_import()
+        FolderIMAP.commands = []
+        recognizer = Mock(side_effect=AssertionError("OCR must not run"))
+        result = import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognizer)
+        self.assertEqual(result["skipped"], 7)
+        self.assertEqual(result["messages"], 0)
+        self.assertEqual(result["duplicates"], 0)
+        self.assertFalse(any(command[0] == "FETCH" for command in FolderIMAP.commands))
+        recognizer.assert_not_called()
+        FolderIMAP.messages[2000] = FolderIMAP.messages[1]
+        result = import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognizer)
+        self.assertEqual(result["messages"], 1)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(result["new_drafts"], 0)
+        recognizer.assert_not_called()
+
+    def test_recent_30_days_inclusive_boundaries_and_explicit_archive(self):
+        from folder_mail import recent_period, imap_date
+        today = date.today()
+        start, end = recent_period()
+        self.assertEqual(start, today - timedelta(days=29))
+        self.assertEqual(end, today)
+        FolderIMAP.dates = {1: start - timedelta(days=1), 2: start, 3: today,
+                            4: today + timedelta(days=1), 5: today - timedelta(days=300),
+                            6: today - timedelta(days=400), 7: today - timedelta(days=500)}
+        self.assertEqual(self.run_import()["new_drafts"], 2)
+        self.assertIn(("SEARCH", None, "SINCE", imap_date(start), "BEFORE",
+                       imap_date(end + timedelta(days=1))), FolderIMAP.commands)
+        result = import_folder(self.store, "isolated-only", start=today - timedelta(days=500),
+                               end=start - timedelta(days=1), client_factory=FolderIMAP, recognizer=recognized)
+        self.assertEqual(result["new_drafts"], 4)
+        self.assertEqual(len(self.store.documents()), 6)
+        # Selecting a different period never filters or deletes existing drafts.
+        self.assertEqual(self.run_import()["skipped"], 2)
+        self.assertEqual(len(self.store.documents()), 6)
+
+    def test_invalid_period_never_connects(self):
+        from unittest.mock import Mock
+        factory = Mock(side_effect=AssertionError("No IMAP"))
+        for start, end in ((date.today(), date.today() - timedelta(days=1)),
+                           (date.today(), date.today() + timedelta(days=1)), (None, date.today())):
+            with self.assertRaisesRegex(FolderError, "period"):
+                import_folder(self.store, "isolated-only", start=start, end=end, client_factory=factory)
+        factory.assert_not_called()
+
+    def test_stop_after_first_pdf_of_multi_attachment_message_resumes_without_duplicate(self):
+        from email.message import EmailMessage
+        from threading import Event
+        stop = Event()
+        message = EmailMessage()
+        message.set_content("Synthetic multi-attachment fixture")
+        for index in (1, 2):
+            message.add_attachment(pdf(f"Part {index}"), maintype="application",
+                                   subtype="pdf", filename=f"part-{index}.pdf")
+        FolderIMAP.messages = {1: message.as_bytes()}
+        def recognize(paths):
+            stop.set()
+            return recognized(paths)
+        result = import_folder(self.store, "isolated-only", client_factory=FolderIMAP,
+                               recognizer=recognize, should_stop=stop.is_set)
+        self.assertTrue(result["stopped"])
+        self.assertEqual(len(self.store.documents()), 1)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0], 0)
+        history = self.store.history(1)
+        result = self.run_import()
+        self.assertEqual(result["new_drafts"], 1)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(len(self.store.documents()), 2)
+        self.assertEqual(self.store.history(1), history)
+        self.assertEqual(self.run_import()["skipped"], 1)
+
+    def test_failed_pdf_in_multi_attachment_message_retries_only_failed_ocr(self):
+        from email.message import EmailMessage
+        message = EmailMessage()
+        message.set_content("Synthetic fixture")
+        for index in (1, 2):
+            message.add_attachment(pdf(f"Part {index}"), maintype="application",
+                                   subtype="pdf", filename=f"part-{index}.pdf")
+        FolderIMAP.messages = {1: message.as_bytes()}
+        calls = []
+        def first_recognition(paths):
+            calls.append(paths)
+            return recognized(paths) if len(calls) == 1 else {"state": "failed", "fields": {}}
+        report = import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=first_recognition)
+        self.assertEqual(report["recognition_failed"], 1)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0], 0)
+        calls.clear()
+        def retry_recognition(paths):
+            calls.append(paths)
+            return recognized(paths)
+        report = import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=retry_recognition)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(report["new_drafts"], 0)
+        self.assertEqual(report["duplicates"], 2)
+        self.assertEqual(self.run_import()["skipped"], 1)
+
+    def test_stop_before_connect_and_progress_are_safe_and_do_not_include_credentials(self):
+        from unittest.mock import Mock
+        factory = Mock(side_effect=AssertionError("No IMAP"))
+        reports = []
+        result = import_folder(self.store, "isolated-only", client_factory=factory,
+                               should_stop=lambda: True, progress=reports.append)
+        self.assertTrue(result["stopped"])
+        factory.assert_not_called()
+        self.assertNotIn("isolated-only", json.dumps(reports))
+        reports.clear()
+        import_folder(self.store, "isolated-only", client_factory=FolderIMAP,
+                      recognizer=recognized, progress=reports.append)
+        self.assertEqual(reports[-1]["completed"], 7)
+        self.assertEqual(reports[-1]["total"], 7)
+        self.assertEqual(reports[-1]["phase"], "finished")
+        self.assertIn("recognizing", [report["phase"] for report in reports])
