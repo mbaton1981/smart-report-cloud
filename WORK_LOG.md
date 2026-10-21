@@ -481,6 +481,28 @@ SHA релизного коммита и статус deployment — в разд
 - Render (`smart-report-server`, https://smart-report-server.onrender.com): deploy `dep-db9rl15g1s2s73ao9q60` на `5427bd0` — Live; старт-копия БД `/data/backups/backup_20261017_181301_834849.db`.
 - В Render добавлена переменная `SMARTREPORT_UPGRADE_NET_SCHEMA=1`; deploy `dep-db9rltnavr4c73f67j30` Succeeded, старт-копия `/data/backups/backup_20261017_181454_214233.db`, ошибок миграции в логе нет. Миграция идемпотентна; флаг можно оставить или удалить.
 - Проверено после deploy: `/` отвечает 200, API без ключа даёт 403, сервис стартует без ошибок. Функциональные проверки API/клиента с ключом на Render НЕ выполнялись (ключ в модель не передавался). Capability `net_allocations_v1`/`due_date_v1` по HTTP не подтверждены.
+# Restricted local folder/UID trial — 2026-10-21
+
+- Added `limited_mail.run_limited`, independent of the unchanged scheduled INBOX
+  worker. It only accepts a loopback intake API, one explicit non-INBOX ASCII
+  folder and a fixed durable allowlist of 1–5 UIDs.
+- EXAMINE count outside 1–5 stops before SEARCH/FETCH. Initial UID enumeration
+  stays inside that folder; all subsequent runs use only the saved UID list.
+  New messages are never added. UIDVALIDITY change stops without reset/rescan.
+  No LIST, writable SELECT, STORE, COPY, MOVE, DELETE, CLOSE or EXPUNGE.
+- Added folder-copy instructions and an honest authorization boundary:
+  TLS IMAP LOGIN/app password is supported, OAuth is not implemented; application
+  restrictions are not provider-side ACLs. Real-mail masked-input launcher
+  remains unwired and no real account/secret was requested or connected.
+- **20/20 new restricted-mode tests pass** (12.447 s): strict IMAP simulation,
+  local HTTP, real synthetic PDF recognition/persisted fields/repeat, five-limit,
+  frozen identity, partial failure/lost ACK recovery, new/missing messages,
+  wrong UID rejection, corrupt selection, read-only command translation and
+  unchanged simulated flags. Python compilation and whitespace validation pass.
+  Temporary HTTP servers and databases cleaned by tests.
+- No working database, profile, installed app or Render changes. No mailbox
+  connection, paid resources, Cron, notifications, push or deployment.
+
 # Isolated draft-only automation — 2026-10-21
 
 - Branch `feature/isolated-mail-automation`, based on unified release `38bf30d`.

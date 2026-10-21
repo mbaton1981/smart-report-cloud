@@ -1,5 +1,100 @@
 # Invoice Recognition and Net Allocations
 
+## Restricted local folder trial — implementation only, no mailbox connection
+
+`limited_mail.run_limited` is a separate **local-only** entry point, not an option
+that silently changes the background INBOX worker. The latter remains unchanged.
+The restricted entry point requires:
+
+- one explicit ASCII non-INBOX folder, recommended `SmartReport-Test`;
+- a loopback HTTP intake API, a new isolated queue and original directory;
+- an absolute selection-file path in an existing isolated directory;
+- explicit IMAPS host/account and an in-memory password.
+
+It logs in with IMAPS/TLS on port 993 with certificate/hostname verification and
+opens **only** the quoted explicit folder using `EXAMINE`
+(`imaplib.select(..., readonly=True)`). It does not list folders, open INBOX,
+search all mailbox folders or read their message headers/bodies.
+EXAMINE necessarily exposes the selected folder's message count and UIDVALIDITY.
+If that count is outside 1–5, the pass stops **before SEARCH or FETCH**.
+On the first pass only, UID SEARCH ALL enumerates UIDs **inside this folder**;
+its result must exactly match the checked count and contain 1–5 unique UIDs.
+No subjects, senders or message bodies are read during that enumeration.
+
+The mailbox/folder hash, epoch and exact sorted UID allowlist are durably saved
+to an exclusive-created JSON file **before the first message fetch**. No password,
+token, sender or subject is in this file. Every retry uses this same list, never
+searches for additional UIDs, and never replaces a missing message with a new one.
+A changed UIDVALIDITY stops the pass before FETCH, without automatic epoch reset.
+Missing/corrupt selection state is not silently rebuilt over an existing queue.
+A race changing the first enumeration/count stops before body reads. Additional
+messages arriving after selection are not fetched; if folder count is over five
+at a later EXAMINE, that retry also stops before any FETCH.
+
+Only exact allowed UIDs are fetched, first `(UID RFC822.SIZE)`, then
+`(UID BODY.PEEK[])`. Response UID and message size are validated before receipt
+storage; no sequence-number FETCH or wildcard UID range is used. A UIDVALIDITY
+reset cannot safely reuse a selected session; a server disconnect/next EXAMINE
+must stop or detect it. Neither COPY, STORE, MOVE, DELETE, CLOSE nor EXPUNGE is
+issued. End of session is LOGOUT. Recognition is restricted to drafts referenced
+by those receipts; unrelated pending drafts are not processed.
+All supported attachments of the selected messages may be received; unsupported
+attachments are recorded without becoming drafts. Choose messages with PDF
+attachments, not links to externally hosted documents.
+
+### Preparing the folder (user action, not performed by the worker)
+
+1. In your normal mail program/webmail, create an **ordinary server-side IMAP
+   folder** named `SmartReport-Test`. Do not use a local-only folder, saved search,
+   virtual folder or automatic rule.
+2. Select 1–5 messages containing PDF attachments, without opening their bodies
+   if you want their unread flags unchanged.
+3. Use **Copy to folder → SmartReport-Test**, not Move/drag-and-drop. If your
+   client only offers Move, stop; choose a client with explicit Copy support
+   rather than risk moving the originals.
+4. Check the folder's **total message count**, including read mail, is at most
+   five; keep the originals in their existing folders. Do not add a filter that
+   forwards more messages into the test folder.
+5. Leave the folder unchanged during first receipt, repeat and interruption/
+   recovery checks. No new real connection is authorized by preparing it.
+6. At the separately agreed real trial, provide only the address, IMAP hostname
+   and exact server-side folder path. A nested folder may use a provider-specific
+   prefix such as `INBOX/SmartReport-Test`; do not guess it or auto-enumerate
+   unrelated folders. Use ASCII spelling for this deliberately restricted mode.
+
+The worker cannot create/copy messages into that folder and does not claim that
+user-side mail software will leave flags unchanged when the user opens a message.
+The worker itself requests no flag changes. The provider can still record login/
+access logs and update service metadata.
+
+### Authorization and its limits
+
+Current implemented authentication is `LOGIN` inside certificate-verified IMAPS,
+not OAuth or arbitrary bearer-token authentication. Prefer a revocable app
+password if the provider supports it. A future local masked-input launcher will
+pass it directly in memory; do not put passwords in command arguments, source,
+chat, selection JSON or log files. That interactive launcher is **not yet wired**;
+the current restricted implementation is a callable verified by synthetic tests.
+Do not connect a real mailbox until that launcher and the explicit parameters
+have been agreed and tested locally.
+
+EXAMINE/BODY.PEEK and the UID allowlist are **application-enforced restrictions**.
+A normal mailbox/app password may still grant wider account access; this does
+not become a provider-enforced folder-only/read-only credential. If true
+server-enforced scope is required, the provider must supply an account/ACL with
+read-only access to this folder, or use a separate mailbox. Without provider ACL
+support we cannot truthfully promise credential-level restriction to five messages.
+The separate local intake bearer token authorizes only drafts and is not the
+mailbox credential or the production expense API key.
+
+Tests: `python -m unittest discover -s tests -p "test_limited_mail.py"`.
+The strict IMAP fixture refuses unexpected folders/commands and non-allowlisted
+UID fetches. Tests cover fixed-repeat identity, exactly five, over-five/empty
+folders, new messages excluded, missing message, UIDVALIDITY change, partial
+failure/lost ACK recovery, mismatched response UID, durable selection before
+FETCH, corrupt/missing manifest and loopback-only isolation. Existing 19
+automation tests are separate; no new live mailbox evidence is claimed.
+
 ## Draft-only automation implementation — LOCAL, NOT DEPLOYED (2026-10-21)
 
 The isolated implementation in `feature/isolated-mail-automation` supersedes the
