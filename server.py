@@ -24,6 +24,7 @@ from expense_documents import due_date_issues
 from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
 from object_reports import register_object_reports
+from mail_intake import register_mail_intake
 import reportlab
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -300,6 +301,8 @@ app.config.update(
 DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
 
 register_object_reports(app, lambda: DB_FILE)
+
+mail_intake_store = register_mail_intake(app, review_authorized=lambda: session.get("role") == "admin")
 
 def get_db_connection():
     if os.path.exists(DB_FILE) and os.path.isdir(DB_FILE):
@@ -1396,7 +1399,8 @@ def expenses_page():
     if session.get("role") != "admin":
         return redirect("/")
     csrf_token = session.setdefault("expense_csrf_token", uuid.uuid4().hex)
-    return render_template("expenses.html", csrf_token=csrf_token)
+    return render_template("expenses.html", csrf_token=csrf_token,
+                           mail_intake_enabled=mail_intake_store is not None)
 
 
 @app.route("/api/expense-objects", methods=["GET"])

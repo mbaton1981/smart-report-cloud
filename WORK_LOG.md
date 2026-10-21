@@ -481,3 +481,29 @@ SHA релизного коммита и статус deployment — в разд
 - Render (`smart-report-server`, https://smart-report-server.onrender.com): deploy `dep-db9rl15g1s2s73ao9q60` на `5427bd0` — Live; старт-копия БД `/data/backups/backup_20261017_181301_834849.db`.
 - В Render добавлена переменная `SMARTREPORT_UPGRADE_NET_SCHEMA=1`; deploy `dep-db9rltnavr4c73f67j30` Succeeded, старт-копия `/data/backups/backup_20261017_181454_214233.db`, ошибок миграции в логе нет. Миграция идемпотентна; флаг можно оставить или удалить.
 - Проверено после deploy: `/` отвечает 200, API без ключа даёт 403, сервис стартует без ошибок. Функциональные проверки API/клиента с ключом на Render НЕ выполнялись (ключ в модель не передавался). Capability `net_allocations_v1`/`due_date_v1` по HTTP не подтверждены.
+# Isolated draft-only automation — 2026-10-21
+
+- Branch `feature/isolated-mail-automation`, based on unified release `38bf30d`.
+  The release worktree's uncommitted launcher hotfix/logs were not copied,
+  overwritten or published. No installer, profile, old version or backup changed.
+- Added default-off, separately authenticated mail intake with its own queue,
+  immutable originals, receipt history, mailbox binding, renewable fenced lease,
+  durable UID/UIDVALIDITY checkpoints and read-only admin preview.
+- Added a headless read-only IMAP worker and structured health monitor.
+  Receipt ACK and bounded subprocess recognition are separate resumable stages.
+  Same bytes share a draft but retain sources; different PDFs matching invoice
+  candidates remain separate and both require manual review. No expense writes.
+- Prepared an inert Cron/monitor example and a staged first-launch/rollback
+  runbook in `INVOICE_RECOGNITION.md`. Nothing applied to Render, no live mailbox,
+  production import, working app/server restart, push or deploy.
+- Validation uses new generated fixtures, temporary DBs and loopback HTTP only.
+  Existing manual Balance/four-invoice acceptance is not repeated.
+- Final result: **19/19 new tests pass** (10.527 s), including real PDF parsing,
+  raster-image OCR with `rapidocr_onnxruntime 1.4.4`, actual local HTTP, actual
+  server registration with temporary databases, simultaneous lease acquisition,
+  stale-write rejection, lost ACK, UIDVALIDITY recovery and monitoring distinction
+  between transport health and review attention. Test servers shut down and
+  temporary databases/originals are removed by test cleanup.
+- Python compilation and parsing of the inert two-job YAML template pass.
+  Existing CRLF line endings are preserved; whitespace validation uses Git's
+  `cr-at-eol` setting for this check only, without changing repository config.

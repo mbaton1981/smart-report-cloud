@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Входящая почта — только черновики</title>
+    <style>
+        body { font: 16px/1.5 "Segoe UI", sans-serif; margin: 24px; color: #24323a; background: #eef2f3; }
+        article { background: white; padding: 18px; margin: 18px 0; border: 1px solid #ccd5da; }
+        .document { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); gap: 20px; }
+        iframe { width: 100%; height: 650px; border: 1px solid #ccd5da; }
+        th, td { text-align: left; padding: 6px; vertical-align: top; overflow-wrap: anywhere; }
+        .warning { color: #8c3200; font-weight: bold; }
+        a { color: #086b91; }
+        @media (max-width: 800px) { .document { display: block; } }
+    </style>
+</head>
+<body>
+    <h1>Входящая почта — только черновики</h1>
+    <p><a href="/expenses">К реестру расходов</a></p>
+    <p class="warning">Это отдельная очередь. Расходы не созданы. Подтверждение и перенос в учёт на этой странице отключены.</p>
+    <p>Получено писем: {{ status.counts.messages }}. Черновиков: {{ status.counts.drafts }}.
+       Ожидают распознавания: {{ status.pending_recognition }}.
+       Неполное / неудачное распознавание: {{ status.recognition_attention }}.
+       Спорные совпадения: {{ status.conflicts }}.
+       Ошибка проверки почты: {{ status.last_error or 'нет' }}.</p>
+    <details><summary>Последние 50 полученных писем — получение отдельно от распознавания</summary>
+        {% for mail in received %}
+        <p>{{ mail.metadata.sender }} — {{ mail.metadata.subject }};
+           UIDVALIDITY {{ mail.epoch }}, UID {{ mail.uid }}; получение: {{ mail.report.receipt }}.
+           {% for attachment in mail.report.attachments %}
+           <br>{{ attachment.filename }}: {{ attachment.outcome }}
+           {% if attachment.draft_id %} → черновик №{{ attachment.draft_id }}{% endif %}
+           {% else %}<br>Поддерживаемых вложений нет — расход не создаётся.{% endfor %}</p>
+        {% endfor %}
+    </details>
+    {% for draft in drafts %}
+    <article>
+        <h2>Черновик №{{ draft.id }} — {{ draft.recognition.document_type }}</h2>
+        <p class="warning">{{ draft.recognition.label }}</p>
+        {% if draft.conflict %}
+        <p class="warning">Возможна та же фактура в другом PDF. Оригиналы не объединены. Требуется ручная сверка обоих документов.</p>
+        {% endif %}
+        <div class="document">
+            <div>
+                <a href="{{ url_for('mail_intake.original', draft_id=draft.id) }}">Скачать исходный файл</a>
+                <iframe title="Оригинал черновика {{ draft.id }}" src="{{ url_for('mail_intake.original', draft_id=draft.id, view=1) }}"></iframe>
+            </div>
+            <div>
+                <h3>Распознанные поля</h3>
+                <table>
+                {% for key, label in [('supplier_name','Поставщик'), ('invoice_number','Номер фактуры'),
+                    ('document_date','Дата фактуры'), ('due_date','Срок оплаты'), ('net_amount','Нетто'),
+                    ('vat_amount','НДС'), ('rounding_amount','Округление'), ('amount_due','К оплате'),
+                    ('currency_code','Валюта'), ('payment_reference','OCR/reference')] %}
+                    {% set value = draft.result.fields.get(key) %}
+                    <tr><th>{{ label }}</th><td>{{ value if value is not none and value != '' else 'Не распознано / не указано' }}</td></tr>
+                {% endfor %}
+                </table>
+                <h3>История получения</h3>
+                {% for source in draft.sources %}
+                <p>{{ source.metadata.sender }} — {{ source.metadata.subject }}<br>
+                   {{ source.filename }}; UIDVALIDITY {{ source.epoch }}, UID {{ source.uid }}</p>
+                {% endfor %}
+                <details><summary>Текст и предупреждения распознавания</summary>
+                    <pre style="white-space: pre-wrap">{{ draft.result.fields.get('raw_text', '') }}</pre>
+                    <p>{{ draft.result.errors | join('; ') }}</p>
+                    <p>{{ draft.result.fields.get('review_reasons', []) | join('; ') }}</p>
+                </details>
+            </div>
+        </div>
+    </article>
+    {% else %}<p>Черновиков пока нет.</p>{% endfor %}
+    {% if drafts | length == 50 %}
+    <a href="{{ url_for('mail_intake.review', after=drafts[-1].id) }}">Следующие черновики</a>
+    {% endif %}
+</body>
+</html>

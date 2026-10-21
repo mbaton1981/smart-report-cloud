@@ -76,6 +76,7 @@
 <header>
     <a href="/">К сменам</a>
     <h1>Фактуры и расходы по объектам</h1>
+    {% if mail_intake_enabled %}<a href="{{ url_for('mail_intake.review') }}">Почта — черновики</a>{% endif %}
     <button class="secondary" type="button" onclick="logout()">Выйти</button>
 </header>
 <main>

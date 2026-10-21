@@ -1,5 +1,198 @@
 # Invoice Recognition and Net Allocations
 
+## Draft-only automation implementation — LOCAL, NOT DEPLOYED (2026-10-21)
+
+The isolated implementation in `feature/isolated-mail-automation` supersedes the
+historical automation proposal below. No installed desktop, live mailbox,
+working profile, Render configuration or existing queue is changed. The API
+is absent unless explicitly enabled. The backup patch is not included.
+
+### Components and boundaries
+
+- `mail_intake.py`: separately authenticated `/api/mail-intake` Blueprint,
+  disabled by default. A dedicated random bearer token (at least 32 characters,
+  recommended `secrets.token_urlsafe(48)`) must differ from the expense API key.
+  It does not authorize any expense endpoint. Browser review is read-only and
+  additionally available to the existing authenticated admin session.
+- The explicit absolute `SMARTREPORT_MAIL_INTAKE_DIR` owns `intake.sqlite3` and
+  `originals/<sha256>.<extension>`. No expense database migration is needed.
+  The queue has its own application ID/schema version; unrelated databases and
+  mailbox identity changes are rejected, not overwritten.
+  This is an intentional refinement of the old `/data/documents` proposal:
+  intake originals stay under `/data/mail_import/originals`, entirely separate
+  from confirmed expense originals. Both are on the web service's existing disk,
+  never on Cron's ephemeral filesystem.
+- `mail_worker.py`: one-pass IMAPS/TLS worker, explicit credentials from environment,
+  read-only INBOX and `BODY.PEEK[]`. No Qt, desktop imports, flags, movement,
+  deletion, CLOSE or EXPUNGE. HTTP redirects are rejected; HTTPS is mandatory
+  except explicit `--allow-local` for loopback-only tests.
+- Receiver validates message size (20 MiB), SHA-256, MIME/extension/file magic.
+  Supported originals: PDF, PNG, JPEG, TIFF and BMP. Unknown or invalid attachments
+  remain visible in receipt history without becoming drafts or expenses.
+- Receipt, attachment/source rows and pending drafts commit atomically, after
+  original file fsync/atomic replacement (directory fsync on POSIX). Recognition
+  is a separate resumable operation. A killed recognition request leaves the
+  draft pending; later passes resume it without refetching the message.
+- Default recognition runs in a separate process with a 90-second timeout,
+  a 20-page PDF limit and a 20-million-pixel page/image limit. Extraction uses
+  the existing invoice parser, including payable/rounding/string reference and
+  non-invoice safeguards. Missing OCR dependencies, corrupt/encrypted PDFs,
+  limits and extraction failures are visible as failed recognition with the
+  original retained. They are **not** successful invoices.
+  The receiving web service uses `requirements-mail.txt`, which includes the
+  existing optional `rapidocr_onnxruntime` engine in addition to normal server
+  requirements. The headless forwarding worker does not need OCR.
+  Verify that receiving build command/model resources in staging; never
+  interpret a received scan as recognized when OCR is unavailable.
+- Recognition only processes pending drafts, at most ten per pass. Already
+  recognized/failed results are never automatically overwritten. Operator-driven
+  correction/reprocessing of this new server queue is not provided by this API.
+- Same SHA-256 reuses a draft while every distinct
+  mailbox/UIDVALIDITY/UID/part retains its source. Message-ID is history, not a
+  uniqueness key. Different PDFs with the same normalized supplier and invoice
+  number stay separate; **both** receive a manual-review conflict flag even if
+  dates/totals differ. Missing identity fields require manual inspection;
+  this is candidate detection, not proof of invoice uniqueness.
+- `/api/mail-intake/review` displays receipt history separately from recognition,
+  original next to fields, missing values, OCR/reference and conflicts.
+  An enabled server adds **Почта — черновики** to the web expense header.
+  This page has **no confirmation, allocation or expense-writing controls**.
+  It is not an automatic desktop-queue bridge: editing/object selection/manual
+  handoff from these server drafts into the expense workflow remains a separate,
+  explicitly approved integration. Existing manual desktop intake is unchanged.
+
+### API and recovery contract
+
+All worker calls require `Authorization: Bearer <dedicated token>`; no token in
+URLs, logs or source. Successful responses use `Cache-Control: no-store`.
+
+| Endpoint below `/api/mail-intake` | Purpose |
+| --- | --- |
+| `POST /lease`, JSON `mailbox` | Acquire exclusive 180-second lease with monotonic fence |
+| `POST /control` | Renew, set UIDVALIDITY epoch, advance a fully scanned UID window, finish or report failure |
+| `POST /messages` | Raw `message/rfc822`, receipt identity/lease query parameters, `X-Content-SHA256`; durable receipt ACK |
+| `GET /messages?after=<id>` | Receipt metadata and attachment outcomes, pages of 50 |
+| `GET /pending`, `POST /recognize` | Resume up to ten pending drafts; fenced result commit |
+| `GET /drafts?after=<id>` | Persisted fields, recognition state, conflict flags, source history; pages of 50 |
+| `GET /drafts/<id>/original` | Authenticated, checksum-verified original |
+| `GET /review?after=<id>` | Read-only browser review, pages of 50 drafts |
+| `GET /status` | Cursor, epoch, last attempt/success/error, backlog span, pending/failed/incomplete/conflict counts |
+
+`SMARTREPORT_MAILBOX_ID` is the SHA-256 returned by
+`mail_intake.mailbox_key(host, username, "INBOX")`, computed from the approved
+mailbox configuration. The receiver pins this value in its queue; a worker
+for another account cannot reuse its cursor. No credentials enter the hash.
+
+The worker renews its lease every 30 seconds, including during recognition.
+Every durable write checks owner, fence and expiry. A simultaneous worker gets
+423; an expired/stale writer gets 409 and cannot commit. After a hard kill,
+wait for lease expiry (at most 180 seconds), then run again.
+
+The authoritative cursor lives on the receiver, not on Cron. The worker snapshots
+UIDNEXT, searches bounded numeric UID windows (500 by default), processes ascending
+UIDs and checkpoints each received message. Only fully scanned windows advance
+over missing/deleted UIDs. Defaults: at most 100 messages/100 windows per pass.
+There is **no seven-day cutoff**: later runs catch up every still-present missed
+message. Mail deleted from the mailbox before receipt cannot be recovered by IMAP.
+`backlog` is a remaining UID *span*, not a count of existing messages.
+
+UIDVALIDITY changes reset the scan to UID 1 in a new epoch. Prior receipt history,
+drafts and originals remain. Matching bytes reuse the draft with new sources;
+different bytes never merge automatically. Regressing UIDNEXT in the same epoch
+stops visibly rather than silently skipping data.
+
+Oversized messages stop the pass with
+`message_too_large_manual_review_required`; their cursor is **not** advanced.
+Manual intervention is required before later messages can proceed. This deliberate
+failure is preferable to hiding a skipped invoice. Corrupt originals similarly
+fail explicitly, never acknowledge a false success or replace working data.
+
+### Cron and monitoring preparation (inert)
+
+`packaging/render-mail.yaml.example` is deliberately **not** `render.yaml`.
+It has not been applied and creates nothing. It describes a five-minute UTC
+worker and a five-minute monitor offset by two minutes. Both must be pinned to
+the same separately approved commit as the API before provisioning.
+
+Worker command: `python -m mail_worker`.
+Monitor command: `python -m mail_worker --monitor --max-age 900`.
+The monitor emits a privacy-safe JSON status and exits 1 for no completed pass,
+last failure, age over 15 minutes, UID backlog, pending recognition, recognition
+attention, conflicting PDFs or invalid attachments. `operational_healthy` and
+`review_attention` explicitly distinguish intake failures from documents needing
+review; either prevents an overall green `healthy` result. Configure and test Render failed-job
+notifications during an approved staging launch; no notification channel is
+currently connected. A monitor that itself stops needs Render's job-failure/
+missing-run monitoring, not merely its own stdout.
+
+Web-only environment, after approval:
+
+```text
+SMARTREPORT_MAIL_INTAKE_ENABLED=1
+SMARTREPORT_MAIL_INTAKE_DIR=/data/mail_import
+SMARTREPORT_MAIL_INTAKE_TOKEN=<new dedicated secret>
+SMARTREPORT_MAILBOX_ID=<approved mailbox identity SHA-256>
+```
+
+Worker-only environment:
+`SMARTREPORT_MAIL_API_URL` (HTTPS service base URL, no API suffix),
+`SMARTREPORT_MAIL_INTAKE_TOKEN`, `SMARTREPORT_IMAP_HOST`,
+`SMARTREPORT_IMAP_USERNAME`, `SMARTREPORT_IMAP_PASSWORD`.
+The monitor needs only URL/token, never IMAP credentials. Cron needs no disk
+access, expense API key, desktop profile or cloud database credentials.
+Recognition requests can take 90 seconds; the approved receiving web process
+needs `pip install -r requirements-mail.txt`, a Gunicorn timeout above this limit
+(e.g. 120 seconds), and staging resource
+checks. The worker HTTP read timeout is 150 seconds. These server settings have
+**not** been changed.
+
+### Isolated acceptance and first controlled launch
+
+New focused suite:
+`python -m unittest discover -s tests -p "test_mail_automation.py"`.
+It uses generated emails/PDFs, a strict in-memory IMAP fixture and a real
+loopback HTTP server; a separate subprocess also imports the actual server
+against temporary cloud/intake databases. No live IMAP connection is made.
+
+Coverage includes actual PDF extraction through the worker/API to reopened
+fields and source original, a rasterized invoice through actual local OCR,
+order blocking, corrupt documents, receipt-vs-blob
+identity, different-PDF conflicts, lost ACK after commit, restart/catch-up across
+UID gaps and limits, UIDVALIDITY, simultaneous lease acquisition, renewal/expiry/
+stale result rejection, recognition resumption, checksum/auth/size/MIME limits,
+read-only escaped browser review, monitor healthy/stale states, and zero expenses.
+Existing accepted invoice examples/Balance/manual user tests are not repeated.
+
+First controlled launch, **only after new explicit permission**:
+
+1. Approve the exact local commit, hosting cost/resource/timeout settings and
+   a dedicated **test mailbox**, containing generated/copied test documents only.
+   Keep the working desktop/profile/old version untouched.
+2. Deploy the API to a separate staging web service with its own disk/database,
+   unique intake secret and mailbox identity. Verify default-off/unauthorized
+   responses first, then enable only in staging. Production stays disabled.
+3. Run once manually, **no Cron yet**:
+   `python -m mail_worker --max-messages 5 --max-windows 1`.
+   Inspect receipt history, original/fields and conflicts in the admin review.
+   Verify zero expenses and unchanged message flags.
+4. Repeat the pass, interrupt one pass, wait out the lease and resume. Verify no
+   duplicate draft for identical bytes, separate conflicting PDFs, retained
+   sources/original hashes and a green monitor with honest recognition counters.
+5. Only after acceptance enable the staging Cron/monitor, test one failed run and
+   actual notification delivery, and observe several scheduled/recovery runs.
+6. A **separate production decision** must approve the live mailbox and initial
+   history scope: a fresh queue scans from UID 1, not just recent mail. Agree that
+   scope and backlog budget before enabling production; do not silently seed a
+   cursor or skip historical messages. Production deployment, secrets, restart,
+   API activation and Cron remain separate permission gates.
+
+Rollback: stop/disable the worker and monitor jobs first; set the feature flag
+off and restart only with permission, or deploy the previous server revision.
+Retain `/data/mail_import` and all originals; do not restore an old working
+database over current data. Re-enabling the same code/mailbox resumes from the
+persisted cursor. Local code is isolated in its own branch/worktree; reverting
+its implementation commit does not require deleting any data.
+
 ## Unified local desktop candidate 1.0.10-rc1 (2026-10-21)
 
 This candidate combines the accepted Balance fix, document classification,
@@ -56,7 +249,7 @@ reuses the approved existing profile, documents and connection/token directory,
 checks the dataset and refuses a simultaneous SmartReport process. Installation
 and running that launcher still require separate permission.
 
-**Automatic Render mail is not implemented.** The next concrete implementation
+**At this desktop release, automatic Render mail was not implemented.** The next concrete implementation
 is an authenticated, draft-only intake API with durable original/source/checkpoint
 storage, idempotent receipt keys, a renewable mailbox lease with fencing and
 UIDVALIDITY-epoch reconciliation. Then implement a headless one-pass worker and
@@ -66,9 +259,10 @@ separate user action. SHA-256 deduplicates bytes, not invoice identity; separate
 receipt history and manual handling of different PDFs of one invoice are required.
 No API, Cron, production import or deployment is enabled by this desktop release.
 
-## Proposed Render mail schedule — NOT implemented or authorized (2026-10-21)
+## Historical Render mail proposal — before isolated implementation (2026-10-21)
 
-This is a design proposal only. No Render service, secret, schedule, deployment or
+This historical section records the original design; the local implementation
+and refinements are described above. No Render service, secret, schedule, deployment or
 production intake has been created or enabled.
 
 - **Schedule:** a separate Render Cron Job every five minutes, `*/5 * * * *`

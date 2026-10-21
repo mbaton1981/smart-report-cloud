@@ -1,0 +1,32 @@
+# INERT EXAMPLE ONLY. Do not rename/apply before separate deployment approval.
+# The disk-owning web API must be enabled and verified before creating these jobs.
+# Fill secret values in Render, never in this file. Pin both jobs to the approved commit.
+services:
+  - type: cron
+    name: smartreport-mail-drafts
+    runtime: python
+    schedule: "*/5 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m mail_worker --max-messages 100 --max-windows 100
+    envVars:
+      - key: SMARTREPORT_MAIL_API_URL
+        sync: false
+      - key: SMARTREPORT_MAIL_INTAKE_TOKEN
+        sync: false
+      - key: SMARTREPORT_IMAP_HOST
+        sync: false
+      - key: SMARTREPORT_IMAP_USERNAME
+        sync: false
+      - key: SMARTREPORT_IMAP_PASSWORD
+        sync: false
+  - type: cron
+    name: smartreport-mail-monitor
+    runtime: python
+    schedule: "2-59/5 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m mail_worker --monitor --max-age 900
+    envVars:
+      - key: SMARTREPORT_MAIL_API_URL
+        sync: false
+      - key: SMARTREPORT_MAIL_INTAKE_TOKEN
+        sync: false
