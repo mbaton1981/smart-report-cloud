@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчёт по объекту за период — SmartReport</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 24px; background: #f1f2f6; color: #253544; font: 15px "Segoe UI", Arial, sans-serif; }
+        main { max-width: 1200px; margin: auto; }
+        h1 { font-size: 25px; }
+        h2 { font-size: 20px; }
+        a { color: #135b91; }
+        .panel { background: white; padding: 24px; border-radius: 10px; margin: 20px 0; border: 1px solid #dce3ea; }
+        form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 16px; align-items: end; }
+        label { display: block; font-weight: 600; margin-bottom: 7px; }
+        select, input { width: 100%; padding: 10px; border: 1px solid #aebdca; border-radius: 5px; background: white; font: inherit; }
+        button, .button { display: inline-block; padding: 11px 18px; background: #24527a; color: white; border: 0; border-radius: 5px; text-decoration: none; font: inherit; cursor: pointer; }
+        .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
+        .note { color: #536573; font-size: 13px; line-height: 1.6; }
+        .source { background: #edf5fc; border-left: 4px solid #327ab3; padding: 12px 16px; }
+        .error { background: #fff0ed; color: #9c2614; padding: 15px; border: 1px solid #d58b7e; border-radius: 5px; }
+        .warning { background: #fff3cd; color: #694c00; padding: 15px; border-left: 4px solid #d6a000; margin: 12px 0; }
+        .totals { display: flex; gap: 40px; flex-wrap: wrap; padding: 15px 0; }
+        .totals strong { display: block; font-size: 28px; color: #24527a; }
+        .scroll { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+        th, td { padding: 10px; border-bottom: 1px solid #dce3ea; text-align: right; white-space: nowrap; }
+        th { background: #edf2f6; font-size: 13px; }
+        th:first-child, td:first-child, .text { text-align: left; white-space: normal; min-width: 140px; }
+        tfoot { font-weight: bold; background: #edf2f6; }
+        @media (max-width: 800px) { form { grid-template-columns: 1fr; } body { padding: 12px; } .panel { padding: 16px; } }
+        @media print { .controls, .actions, .navigation { display: none; } body { padding: 0; background: white; } .panel { border: 0; } }
+    </style>
+</head>
+<body>
+<main>
+    <a class="navigation" href="/">← SmartReport</a>
+    <h1>Отчёт по объекту за период</h1>
+    <p>Только часы. Без зарплат, выплат, внутренних ставок и свободных комментариев.</p>
+    <section class="panel controls">
+        <form method="get" action="{{ url_for('object_reports.object_report') }}">
+            <div>
+                <label for="project">Объект</label>
+                <select id="project" name="project" required>
+                    <option value="">Выберите объект</option>
+                    {% for project in projects %}
+                    <option value="{{ project.key }}" {% if values.project == project.key %}selected{% endif %}>{{ project.label }}{% if project.state %} — {{ project.state }}{% endif %}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label for="preset">Период</label>
+                <select id="preset" name="preset">
+                    <option value="week" {% if values.preset == 'week' %}selected{% endif %}>Неделя (пн–вс)</option>
+                    <option value="fortnight" {% if values.preset == 'fortnight' %}selected{% endif %}>Две недели (с пн)</option>
+                    <option value="month" {% if values.preset == 'month' %}selected{% endif %}>Календарный месяц</option>
+                    <option value="custom" {% if values.preset == 'custom' %}selected{% endif %}>Произвольные даты</option>
+                </select>
+            </div>
+            <div>
+                <label for="start">Дата / начало</label>
+                <input id="start" name="start" type="date" value="{{ values.start }}" required>
+            </div>
+            <div>
+                <label for="end">Конец (включительно)</label>
+                <input id="end" name="end" type="date" value="{{ values.end }}">
+            </div>
+            <button type="submit">Показать отчёт</button>
+        </form>
+        <p class="note">Для недели и месяца выберите любую дату внутри периода. Две недели начинаются с понедельника выбранной недели. Для произвольного периода обе даты включены.</p>
+        <p class="note">{{ history_note }}</p>
+    </section>
+    {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+    {% if report %}
+    <section class="panel" id="report">
+        <h2>{{ report.project.label }}</h2>
+        {% if report.project.state %}<p class="note">{{ report.project.state }}</p>{% endif %}
+        <p><b>Период:</b> {{ report.start.isoformat() }} — {{ report.end.isoformat() }} включительно</p>
+        <p class="note">Сформировано: {{ report.generated_at }}</p>
+        <p class="source">Только данные сервера. Неотправленные с рабочего компьютера записи в отчёт не входят. Данные могут измениться между просмотром и скачиваниями.</p>
+        <p class="note">Часы округлены до 0,01 по дате, сотруднику и типу; итоги — сумма показанных записей. Коэффициенты OB к количеству часов не применяются.</p>
+        <p class="note">{{ accounting_note }}</p>
+        {% for warning in report.warnings_ru %}<div class="warning" role="alert">{{ warning }}</div>{% endfor %}
+        <div class="actions">
+            <a class="button" href="{{ pdf_url }}">Скачать PDF</a>
+            <a class="button" href="{{ xlsx_url }}">Скачать Excel (.xlsx)</a>
+        </div>
+        <div class="totals">
+            <div>Обычные часы<strong id="work-total">{{ '%.2f'|format(report.totals.hours.work) }}</strong></div>
+            <div>OB, ч<strong id="ob-total">{{ '%.2f'|format(report.totals.hours.ob) }}</strong></div>
+            <div>Всего учтено часов по записям<strong id="all-total">{{ '%.2f'|format(report.totals.total) }}</strong></div>
+        </div>
+        <h2>Итоги по сотрудникам, ч</h2>
+        <div class="scroll">
+            <table id="employee-totals">
+                <thead><tr><th>Сотрудник</th>{% for label in type_labels.values() %}<th>{{ label }}</th>{% endfor %}<th>Всего учтено часов по записям</th></tr></thead>
+                <tbody>
+                {% for employee in report.employees %}
+                <tr><td>{{ employee.employee }}</td>{% for kind in type_labels %}<td>{{ '%.2f'|format(employee.hours[kind]) }}</td>{% endfor %}<td>{{ '%.2f'|format(employee.total) }}</td></tr>
+                {% endfor %}
+                </tbody>
+                <tfoot><tr><td>Итого по объекту</td>{% for kind in type_labels %}<td>{{ '%.2f'|format(report.totals.hours[kind]) }}</td>{% endfor %}<td>{{ '%.2f'|format(report.totals.total) }}</td></tr></tfoot>
+            </table>
+        </div>
+        <h2>Часы по датам и сотрудникам</h2>
+        {% if report.rows %}
+        <div class="scroll">
+            <table id="hours-detail">
+                <thead><tr><th>Дата</th><th class="text">Сотрудник</th><th class="text">Тип часов</th><th>Часы</th></tr></thead>
+                <tbody>{% for row in report.rows %}<tr><td>{{ row.day }}</td><td class="text">{{ row.employee }}</td><td class="text">{{ type_labels[row.kind] }}</td><td>{{ '%.2f'|format(row.hours) }}</td></tr>{% endfor %}</tbody>
+            </table>
+        </div>
+        {% else %}<p>За выбранный период записей нет.</p>{% endif %}
+    </section>
+    {% endif %}
+</main>
+<script>
+    const preset = document.getElementById('preset');
+    const end = document.getElementById('end');
+    function updateEnd() {
+        end.disabled = preset.value !== 'custom';
+        end.required = preset.value === 'custom';
+    }
+    preset.addEventListener('change', updateEnd);
+    updateEnd();
+</script>
+</body>
+</html>
