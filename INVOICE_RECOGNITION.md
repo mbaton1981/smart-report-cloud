@@ -65,6 +65,47 @@ Sources verified read-only:
 [Render Cron Jobs](https://render.com/docs/cronjobs),
 [Persistent disks and single-service access](https://render.com/docs/disks).
 
+### Cost, API boundaries and crash recovery — proposal clarification
+
+- Official Starter Cron rate: **USD 0.00016 per active minute**, billed per second,
+  **USD 1 minimum per cron service/month**, not USD 1 in addition to compute.
+  Every five minutes means 8,640 scheduled passes per 30-day month. At 10 or 30
+  seconds/pass compute is USD 0.23/0.69, so the minimum is USD 1; at 60 seconds it
+  is about USD 1.38; at five minutes about USD 6.91. Startup and retries count.
+  These are estimates, not a quote: memory/CPU must be measured for PDF/OCR before
+  choosing Starter. Existing web compute, disk/object storage, outbound traffic,
+  workspace charges/tax and any plan upgrade are outside this cron estimate.
+  Sources: [official pricing](https://render.com/pricing) and cron docs above.
+- Intake API authorization must be server-enforced, before body processing:
+  TLS-only, separate rotatable secret scoped to one mailbox and draft ingestion;
+  no admin, expense confirmation, deletion or arbitrary file access. Keep secrets
+  in Render secret environment settings and redact authorization/mail responses.
+  Enforce request/attachment size, per-pass count/time quotas, MIME/signature
+  allowlist, server-generated storage paths, SHA-256/length verification and JSON
+  schema validation; never trust uploaded paths, hashes or recognition as approval.
+  Recognized values remain untrusted draft data for manual review. Rate-limit and
+  audit runs using non-sensitive IDs. Do not expose an unauthenticated "run import"
+  URL. A lost response must allow identity-based acknowledgement lookup/retry.
+- Render's one-active-run guarantee covers a single cron service only. API must
+  also acquire an atomic lease per mailbox/folder with owner run ID, expiry,
+  renewal and a monotonically increasing fencing token. Another cron/manual
+  invocation sees "already running". A crashed/expired owner cannot advance
+  checkpoints: all writes check lease ownership, fencing token and UIDVALIDITY.
+  Combine this with DB uniqueness constraints for source identity and SHA-256.
+  Manual Trigger Run cancels an existing Render run, so it must not be treated
+  as a harmless extra concurrent pass.
+- On UIDVALIDITY change, reject the old epoch's writes, retain its history and
+  originals, and open a new epoch starting with no UID cursor. Under the lease,
+  capture the new upper UID and enumerate currently present messages in bounded
+  batches (do not match messages solely by UID or Message-ID). Link exact-byte
+  duplicates by SHA-256, flag business-key matches with different bytes for review,
+  preserve approved cards and existing draft edits. Commit reconciliation progress
+  transactionally and resume it after another crash. Advance the new checkpoint
+  only for durably handled messages; gaps in UIDs from expunged messages are valid.
+  Until reconciliation finishes, display a changed-mailbox/backlog warning.
+  UIDVALIDITY reset alone must never create expenses, discard the old queue or
+  mass-replace saved recognition.
+
 ## Current local mail acceptance (2026-10-21; not published)
 
 The current owner instruction overrides historical release notes below: **no push,
@@ -104,6 +145,13 @@ preserved as text when saving drafts and confirmations, including leading zeros.
 Older drafts without this key display the saved recognition value on reopening;
 an explicitly cleared reference remains empty. No existing draft is migrated or
 saved automatically. The offline review field comparison includes this reference.
+The parser recognizes `Att betala (SEK)`, `OCR/Meddelande` and the explicit
+`Vänligen ange referens … vid betalning` instruction. Reference remains a string;
+conflicting candidates require review. Amount due comes from labeled source text
+and retains page/box evidence, never from net + VAT + rounding. Missing/ambiguous
+payable amounts remain empty with warnings; inconsistent explicit amounts are
+retained with a reconciliation warning. Previously queued recognition and draft
+revisions are not automatically refreshed by these parser changes.
 
 Storage within that directory:
 

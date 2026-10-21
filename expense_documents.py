@@ -459,13 +459,14 @@ def parse_invoice_pages(pages):
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
         "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
+        "payment_reference": r"OCR(?:-nummer|/Meddelande)?|Betalningsreferens|Payment\s*reference|Vänligen\s+ange\s+referens",
         "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date",
         "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda\s+senast|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
         "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
-        "amount_due": r"Att\s+betala|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
+        "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
         "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?",
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
@@ -494,6 +495,9 @@ def parse_invoice_pages(pages):
             return value.upper() if re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", value, re.IGNORECASE) else None
         if key == "invoice_number":
             return value if re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{1,120}", value) else None
+        if key == "payment_reference":
+            value = re.sub(r"\s+vid\s+betalning\.?$", "", value, flags=re.IGNORECASE)
+            return value if re.fullmatch(r"(?=[\w /-]*\d)[\w /-]{1,120}", value) else None
         value = re.sub(r"^(?:Returadress|Return\s+address)\s*:\s*", "", value, flags=re.IGNORECASE)
         if re.fullmatch(r".+\s(?:AB|Aktiebolag|Ltd\.?|GmbH|AS)", value, re.IGNORECASE):
             return value
