@@ -12,6 +12,19 @@ server runs it at startup only when `SMARTREPORT_UPGRADE_NET_SCHEMA=1` is set, a
 `create_database_backup()`. Due-date columns are added additively by `init_cloud_db()`.
 For any future production use it still needs a verified backup and maintenance window.
 
+## Selective rollback of the document safeguards patch
+
+From a clean working tree at the repository root, revert only commit
+`3a0bf18f9fc2cf777052d3372d2e385b7f966dd2` with:
+
+```powershell
+git revert --no-edit 3a0bf18f9fc2cf777052d3372d2e385b7f966dd2
+```
+
+This does not revert the parent Beijer rounding-test commit
+`4ce094d2045d2e8e6452fcca0eaf353ecc89d58c`. It changes repository history only;
+it does not publish or deploy the result.
+
 The migration adds document rounding, amount due, and allocation basis. It rebuilds
 the allocation table so a net allocation can have unknown gross/VAT, and adds an
 explicit destination and optional category. Existing IDs, monetary values and
