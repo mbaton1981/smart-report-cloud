@@ -67,6 +67,17 @@ Sources verified read-only:
 
 ### Cost, API boundaries and crash recovery — proposal clarification
 
+**Content identity is not invoice identity.** SHA-256 only identifies identical
+file bytes: multiple receiving events may reference one stored blob. Retain each
+mail source/attachment occurrence separately (mailbox, folder, UIDVALIDITY, UID,
+part, receive timestamp and original filename), even when content is deduplicated.
+One invoice may also arrive as different PDF bytes: supplier/invoice identifiers
+are review signals, not proof that files should be discarded or records merged.
+Use separate blob, receipt-event, draft and confirmed-invoice identities. Preserve
+all receipt history; uncertain business matches enter manual review before any
+additional expense is allowed. Reconciliation after a mailbox epoch change must
+retain the new source occurrence even when it links to an existing hash.
+
 - Official Starter Cron rate: **USD 0.00016 per active minute**, billed per second,
   **USD 1 minimum per cron service/month**, not USD 1 in addition to compute.
   Every five minutes means 8,640 scheduled passes per 30-day month. At 10 or 30
