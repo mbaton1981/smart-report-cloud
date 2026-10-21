@@ -17,7 +17,7 @@ from desktop_ui import ReportTable
 from PyQt6.QtWidgets import QAbstractItemView, QTableWidgetItem
 from invoice_processing import recognize_invoice
 from invoice_review import InvoiceReviewMixin
-from mail_import import classify_mail_document
+from mail_import import classify_mail_document, recognition_status
 from mail_review import export_review
 from mail_trial import TrialStore
 
@@ -33,8 +33,12 @@ class MailViewer(InvoiceReviewMixin, QWidget):
                       "Подтверждение, перенос в учёт и синхронизация отключены.")
         note.setWordWrap(True)
         layout.addWidget(note)
-        self.table = ReportTable(0, 5)
-        self.table.setHorizontalHeaderLabels(["№", "Поставщик", "Номер документа", "Дата", "Тестовый черновик"])
+        self.table = ReportTable(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "№", "Поставщик", "Номер документа", "Дата", "Тестовый черновик",
+            "Тип документа", "Результат распознавания",
+        ])
+        self.table.horizontalHeader().moveSection(5, 1)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.doubleClicked.connect(lambda _index: self.edit_selected())
@@ -57,16 +61,21 @@ class MailViewer(InvoiceReviewMixin, QWidget):
         self.documents = [dict(row) for row in self.store.conn.execute("SELECT * FROM documents ORDER BY id")]
         self.table.setRowCount(len(self.documents))
         for index, document in enumerate(self.documents):
-            initial = json.loads(document["result_json"]).get("fields", {})
+            result = json.loads(document["result_json"])
+            initial = result.get("fields", {})
+            recognition = recognition_status(result, document["state"])
             reviewed = self.audit.get(document["id"], {})
             draft = self.store.latest(document["id"])
             fields = draft["payload"] if draft else (reviewed.get("checked") or reviewed.get("current") or initial)
             values = (document["id"], fields.get("supplier_name") or "Не определён",
                       fields.get("invoice_number") or "Не указан",
                       fields.get("document_date") or "Не указана",
-                      f"Ревизия {draft['revision']}" if draft else "Не сохранён")
+                      f"Ревизия {draft['revision']}" if draft else "Не сохранён",
+                      recognition["document_type"], recognition["label"])
             for column, value in enumerate(values):
-                self.table.setItem(index, column, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                item.setToolTip("\n".join([recognition["label"], *initial.get("review_reasons", [])]))
+                self.table.setItem(index, column, item)
         self.table.resizeColumnsToContents()
 
     def open_document(self, document_id: int):

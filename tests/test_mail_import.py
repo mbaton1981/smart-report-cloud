@@ -179,6 +179,9 @@ class MailImportTests(unittest.TestCase):
         attachment = first.messages[2]["attachments"][0]
         self.assertEqual(attachment["fields"]["supplier_name"], FIELDS["supplier_name"])
         self.assertEqual(attachment["status"], "added")
+        self.assertEqual(first.messages[2]["receipt_status"], "received")
+        self.assertEqual(attachment["receipt_status"], "saved")
+        self.assertEqual(attachment["recognition"]["outcome"], "unclassified")
         self.assertEqual(first.documents_added, 1)
         self.assertEqual(first.attachments_found, 2)
         self.assertEqual(first.supported_attachments, 1)
@@ -209,6 +212,23 @@ class MailImportTests(unittest.TestCase):
         self.assertEqual(summary.errors, 1)
         self.assertEqual(summary.messages[0]["status"], "error")
         self.assertNotIn("private server error", json.dumps(summary.messages))
+
+    def test_receipt_success_does_not_hide_incomplete_or_failed_recognition(self):
+        client = FakeIMAP({"1": message(("partial.pdf", b"partial"), ("failed.pdf", b"failed"))})
+        def recognize(paths):
+            if Path(paths[0]).read_bytes() == b"failed":
+                raise ValueError("private details")
+            return {"fields": {"document_type": "invoice", "raw_text": "Invoice INV-1",
+                               "invoice_number": "INV-1"}, "state": "requires_review", "errors": []}
+        summary = import_inbox(self.queue, "local-only", now=NOW, client_factory=Mock(return_value=client),
+                               recognizer=recognize, latest_count=5)
+        self.assertEqual(summary.messages[0]["receipt_status"], "received")
+        attachments = summary.messages[0]["attachments"]
+        self.assertEqual([a["receipt_status"] for a in attachments], ["saved", "saved"])
+        self.assertEqual([a["recognition"]["outcome"] for a in attachments], ["incomplete", "failed"])
+        self.assertIn("supplier_name", attachments[0]["recognition"]["missing_fields"])
+        self.assertEqual(summary.documents_added, 2)
+        self.assertEqual(summary.errors, 1)
 
     def test_different_files_same_fields_warn_both_without_merging(self):
         result = self.run_import(FakeIMAP({"1": message(

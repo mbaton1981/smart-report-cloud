@@ -40,6 +40,38 @@ class MailImportError(RuntimeError):
     pass
 
 
+TYPE_LABELS = {
+    "invoice": "Фактура", "receipt": "Чек", "credit_note": "Кредитная фактура",
+    "transfer_receipt": "Подтверждение перевода", "proforma": "Проформа",
+    "tax_decision": "Решение о транспортном налоге — не фактура",
+    "order_confirmation": "Подтверждение заказа — не фактура",
+    "non_document": "Логотип, не финансовый документ", "unclassified": "Тип не установлен",
+}
+
+
+def recognition_status(result: dict, state: str) -> dict:
+    fields = result.get("fields") or {}
+    kind = fields.get("document_type")
+    missing = [key for key in ("supplier_name", "invoice_number", "document_date",
+                               "net_amount", "vat_amount", "amount_due", "currency_code")
+               if fields.get(key) in (None, "", "UNKNOWN")]
+    if state in ("failed", "pending") or result.get("state") == "failed":
+        outcome, label = "failed", "Распознавание не завершено — требуется явный повтор"
+    elif kind == "order_confirmation":
+        outcome, label = "not_invoice", TYPE_LABELS[kind]
+    elif kind in ("tax_decision", "proforma", "non_document", "transfer_receipt"):
+        outcome, label = "not_invoice", TYPE_LABELS[kind]
+    elif kind not in ("invoice", "receipt", "credit_note"):
+        outcome, label = "unclassified", "Тип не установлен — требуется ручная проверка"
+    elif missing:
+        outcome, label = "incomplete", "Неполное распознавание — проверьте незаполненные поля"
+    else:
+        outcome, label = "requires_review", "Поля извлечены — требуется ручная проверка"
+    return {"outcome": outcome, "label": label,
+            "document_type": TYPE_LABELS.get(kind, "Тип не установлен"),
+            "missing_fields": missing if outcome in ("incomplete", "failed", "unclassified") else []}
+
+
 @dataclass
 class ImportSummary:
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -396,6 +428,7 @@ def _import_inbox(queue, password, now, client_factory, recognizer, summary: Imp
                 report.update(
                     sender=str(message.get("From", "")), subject=str(message.get("Subject", "")),
                     message_id=str(message.get("Message-ID", "")), status="processed",
+                    receipt_status="received",
                 )
                 for part_index, part in enumerate(message.walk()):
                     if part.is_multipart():
@@ -439,10 +472,13 @@ def _import_inbox(queue, password, now, client_factory, recognizer, summary: Imp
                             "SELECT id,state,result_json FROM documents WHERE sha256=?",
                             (hashlib.sha256(payload).hexdigest(),),
                         ).fetchone()
-                        fields = json.loads(saved["result_json"]).get("fields", {})
+                        saved_result = json.loads(saved["result_json"])
+                        fields = saved_result.get("fields", {})
                         attachment.update(
                             status="added" if created else "duplicate",
+                            receipt_status="saved" if created else "duplicate",
                             document_id=saved["id"], recognition_state=saved["state"],
+                            recognition=recognition_status(saved_result, saved["state"]),
                             fields={key: fields.get(key) for key in (
                                 "document_type", "supplier_name", "invoice_number", "document_date",
                                 "due_date", "net_amount", "vat_amount", "gross_amount",

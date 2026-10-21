@@ -17,7 +17,10 @@ from urllib.request import url2pathname
 
 from expense_documents import decimal_text, net_invoice_issues, parse_invoice_money, sha256_file
 from invoice_processing import recognize_invoice
-from mail_import import APPLICATION_ID, MailImportError, classify_mail_document, mail_review_warnings
+from mail_import import (
+    APPLICATION_ID, TYPE_LABELS, MailImportError, classify_mail_document,
+    mail_review_warnings, recognition_status,
+)
 
 
 FIELD_LABELS = {
@@ -32,12 +35,6 @@ FIELD_LABELS = {
     "amount_due": "К оплате (не сумма уже оплаченного чека)",
     "currency_code": "Валюта",
     "document_type": "Тип",
-}
-TYPE_LABELS = {
-    "invoice": "Фактура", "receipt": "Чек", "credit_note": "Кредитная фактура",
-    "transfer_receipt": "Подтверждение перевода", "proforma": "Проформа",
-    "tax_decision": "Решение о транспортном налоге", "order_confirmation": "Подтверждение заказа",
-    "non_document": "Логотип, не финансовый документ", "unclassified": "Тип не установлен",
 }
 STATUSES = {
     "checked": "Сверено с оригиналом",
@@ -124,7 +121,8 @@ def collect_review(root: Path, assessments: dict | None = None, recognitions: di
                 raise MailImportError("Unknown reviewed field.")
             if assessment.get("status", "not_checked") not in STATUSES:
                 raise MailImportError("Unknown review status.")
-            fields = json.loads(row["result_json"]).get("fields", {})
+            saved_result = json.loads(row["result_json"])
+            fields = saved_result.get("fields", {})
             extracted = {key: fields.get(key) for key in FIELD_LABELS}
             current_result = (recognitions or {}).get(digest)
             current = current_result["fields"] if current_result else fields
@@ -163,6 +161,8 @@ def collect_review(root: Path, assessments: dict | None = None, recognitions: di
                 )},
                 "page_count": current_result.get("page_count") if current_result else None,
                 "recognition_state": current_result.get("state") if current_result else row["state"],
+                "receipt_status": "Оригинал получен и сохранён; SHA-256 проверен",
+                "recognition": recognition_status(saved_result, row["state"]),
                 "allocation": draft["allocation"] if draft else allocation_review(current),
                 "draft": draft, "draft_history": draft_history,
                 "warnings": mail_review_warnings(current),
@@ -346,6 +346,10 @@ def render_review(report: dict) -> str:
             f'{escape(STATUSES[item["status"]])}</h2>'
             f'<p>Оригинал цел, SHA-256 совпадает. Источников: {item["sources_count"]}. '
             f'<a href="{escape(item["original_uri"], quote=True)}">Открыть оригинал на компьютере</a></p>'
+            f'<p><strong>Получение:</strong> {escape(item.get("receipt_status", "Оригинал сохранён"))}.<br>'
+            f'<strong>Распознавание сохранённого результата:</strong> '
+            f'{escape(item.get("recognition", {}).get("label", "Требуется ручная проверка"))}. '
+            f'{escape(", ".join(item.get("recognition", {}).get("missing_fields", [])))}</p>'
             f'<p>{escape(item["evidence"])}</p><ul>{notes}</ul><div class="comparison"><section>'
             f'{draft_note}'
             f'<ul>{warnings}</ul>'
@@ -404,8 +408,10 @@ def render_review(report: dict) -> str:
         'История сохраняется отдельными снимками; исходная очередь не перезаписывается.</p>'
         '<details><summary>Результаты запусков импорта (время UTC)</summary><table><thead><tr>'
         '<th>Запуск</th><th>Проверено писем</th><th>В периоде</th><th>Вложений</th>'
-        '<th>Добавлено</th><th>Дубли</th><th>Ошибки</th><th>Завершён</th>'
+        '<th>Добавлено</th><th>Дубли</th><th>Ошибки обработки</th><th>Запуск завершён</th>'
         f'</tr></thead><tbody>{run_rows}</tbody></table></details></header>'
+        '<p><strong>Завершённое получение и отсутствие технических ошибок не означают полного '
+        'распознавания или разрешения учёта. Результат распознавания указан отдельно у каждого документа.</strong></p>'
         + "".join(cards) + "</body></html>"
     )
 

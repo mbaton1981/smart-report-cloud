@@ -304,6 +304,26 @@ class LocalMailTests(unittest.TestCase):
             viewer.close()
             viewer.deleteLater()
 
+    def test_queue_explicitly_labels_order_without_reprocessing_or_expense(self):
+        def order(paths):
+            fields = invoice_fields()
+            fields.update(document_type="order_confirmation", raw_text="ORDERBEKRÄFTELSE")
+            return {"fields": fields, "state": "requires_review", "errors": []}
+        self.receive(order)
+        before = self.store.queue.review()
+        viewer = LocalMailViewer(self.root, self.url, self.headers)
+        try:
+            with patch("mail_viewer.recognize_invoice") as recognize:
+                viewer.reload()
+                recognize.assert_not_called()
+            self.assertEqual(viewer.table.item(0, 5).text(), "Подтверждение заказа — не фактура")
+            self.assertEqual(viewer.table.item(0, 6).text(), "Подтверждение заказа — не фактура")
+            self.assertEqual(self.store.queue.review(), before)
+            self.assertEqual(self.count(), 0)
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+
     def test_ui_reopen_does_not_reextract_or_rewrite_saved_result(self):
         self.receive()
         viewer = LocalMailViewer(self.root, self.url, self.headers)

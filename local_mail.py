@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QTextEdit,
 )
@@ -215,9 +215,21 @@ class LocalMailViewer(MailViewer):
 
     def fetched(self, summary):
         self.reload()
-        self.status.setText(f"Писем проверено: {summary.messages_checked}; добавлено: "
+        outcomes = {}
+        for message in summary.messages:
+            for attachment in message["attachments"]:
+                recognition = attachment.get("recognition")
+                if recognition:
+                    outcome = recognition["outcome"]
+                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        self.status.setText(f"Получение: писем проверено {summary.messages_checked}; добавлено: "
                             f"{summary.documents_added}; повторов: {summary.duplicates_skipped}; "
-                            f"ошибок: {summary.errors}. Расходы не создавались.")
+                            f"ошибок обработки: {summary.errors}.\nРаспознавание: "
+                            f"на ручную проверку {outcomes.get('requires_review', 0)}; "
+                            f"неполное {outcomes.get('incomplete', 0)}; "
+                            f"тип не установлен {outcomes.get('unclassified', 0)}; "
+                            f"не фактуры {outcomes.get('not_invoice', 0)}; "
+                            f"сбой {outcomes.get('failed', 0)}. Расходы не создавались.")
         self.mail_report.setPlainText(json.dumps(summary.messages, ensure_ascii=False, indent=2))
 
     def fetch_failed(self, message):
@@ -326,6 +338,7 @@ class LocalMailViewer(MailViewer):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--document", type=int, help="Open this saved queue document without reprocessing.")
     options = parser.parse_args()
     root = options.data_dir.resolve()
     marker = root / "local-test.json"
@@ -368,6 +381,13 @@ def main():
     viewer = LocalMailViewer(root, f"http://127.0.0.1:{http.server_port}",
                              {"X-Sync-Key": os.environ["SYNC_API_KEY"]})
     viewer.show()
+    if options.document is not None:
+        matches = [index for index, row in enumerate(viewer.documents) if row["id"] == options.document]
+        if matches:
+            viewer.table.selectRow(matches[0])
+            QTimer.singleShot(0, viewer.edit_selected)
+        else:
+            QMessageBox.warning(viewer, "Документ не найден", "В локальной очереди нет указанного документа.")
     print(f"LOCAL MAIL TEST READY http://127.0.0.1:{http.server_port} root={root}", flush=True)
     try:
         return application.exec()

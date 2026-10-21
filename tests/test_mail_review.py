@@ -6,12 +6,28 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 
-from mail_import import MailImportError, MailQueue, classify_mail_document
+from mail_import import MailImportError, MailQueue, classify_mail_document, recognition_status
 from mail_review import FIELD_LABELS, allocation_review, collect_review, export_review, render_review
 from expense_documents import parse_invoice_pages
 
 
 class MailClassificationTests(unittest.TestCase):
+    def test_recognition_status_separates_non_invoice_missing_fields_and_failure(self):
+        order = recognition_status({"fields": {
+            "document_type": "order_confirmation", "raw_text": "ORDERBEKRÄFTELSE",
+        }}, "requires_review")
+        self.assertEqual(order["label"], "Подтверждение заказа — не фактура")
+        self.assertEqual(order["outcome"], "not_invoice")
+        self.assertEqual(order["missing_fields"], [])
+        invoice = recognition_status({"fields": {
+            "document_type": "invoice", "supplier_name": "Supplier AB",
+        }}, "requires_review")
+        self.assertEqual(invoice["outcome"], "incomplete")
+        self.assertIn("invoice_number", invoice["missing_fields"])
+        self.assertEqual(recognition_status({"error_code": "ValueError"}, "failed")["outcome"], "failed")
+        self.assertEqual(recognition_status({"fields": {"document_type": "unclassified"}},
+                                            "requires_review")["outcome"], "unclassified")
+
     def test_tax_receiver_is_not_supplier_and_no_vat_is_invented(self):
         fields = {"raw_text": "Beslut om trängselskatt\nDatum\n2026-10-12",
                   "document_type": "invoice", "supplier_name": "Receiver AB",
@@ -147,6 +163,10 @@ class MailReviewTests(unittest.TestCase):
         self.assertTrue(preview.is_file())
         self.assertTrue((preview.parent / "page-1.png").is_file())
         self.assertIn('id="page-1"', preview.read_text(encoding="utf-8"))
+        self.assertIn("<strong>Получение:</strong>", html)
+        self.assertIn("<strong>Распознавание сохранённого результата:</strong>", html)
+        self.assertIn("не означают полного распознавания", html)
+        self.assertIn("recognition", document)
 
     def test_unassessed_document_is_explicit_not_claimed_verified(self):
         report = collect_review(self.root)

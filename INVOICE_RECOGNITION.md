@@ -26,6 +26,14 @@ The read-only report lists each selected message (including those without attach
 attachment names/types, unsupported files, recognized fields, duplicates and failures.
 It is displayed as plain text and saved locally in `runs/`; bodies and passwords are
 not included. Repeated receipt does not rerun saved recognition or create expenses.
+Receipt and recognition have independent outcomes: a received/stored attachment can
+still be unclassified, incompletely recognized, or failed. Zero processing errors
+does not mean all invoice fields are available. The queue and offline review report
+show explicit document types, including **«Подтверждение заказа — не фактура»**;
+missing invoice fields on an order confirmation are not an OCR failure. Order number
+and order date must not be relabeled as invoice number/date. `--document <id>` opens
+one saved local document for review without reprocessing it. Recognition replacement
+still requires the selected-document action and default-No confirmation.
 
 Storage within that directory:
 
