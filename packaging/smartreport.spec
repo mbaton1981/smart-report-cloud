@@ -9,7 +9,7 @@ if manifest:
     datas.append((manifest, "."))
 binaries = []
 hiddenimports = []
-for package in ("rapidocr_onnxruntime", "onnxruntime"):
+for package in ("rapidocr_onnxruntime", "onnxruntime", "tzdata"):
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas
     binaries += package_binaries

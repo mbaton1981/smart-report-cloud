@@ -124,7 +124,19 @@ def get_employee_ob_base_rate(cursor, employee):
     return salary_rate
 
 
-def calculate_ob_payload(cursor, work_date, start_time, end_time, employee):
+def calculate_ob_payload(cursor, work_date, start_time, end_time, employee, existing=None):
+    if (existing and not existing["is_deleted"] and existing["submission_type"] == "ob"
+            and (work_date, start_time, end_time, employee) == (
+                existing["date"], existing["start_time"], existing["end_time"], existing["employee"])):
+        segments = get_ob_segments(cursor, existing["sync_id"])
+        if segments:
+            return {
+                "date": existing["date"], "start_time": existing["start_time"], "end_time": existing["end_time"],
+                "ob_base_rate": existing["ob_base_rate"], "hours": existing["hours"],
+                "rate": existing["rate"], "transport": existing["transport"], "segments": segments,
+                "total_amount": round(sum(segment["amount"] for segment in segments), 2),
+                "base_rate_configured": True, "preserved": True,
+            }
     base_rate = get_employee_ob_base_rate(cursor, employee)
     result = calculate_work_interval(work_date, start_time, end_time, base_rate)
     return {
@@ -2962,6 +2974,7 @@ def edit_shift():
                 data.get("start_time", existing["start_time"]),
                 data.get("end_time", existing["end_time"]),
                 employee,
+                existing=existing,
             )
             if not ob_result["base_rate_configured"]:
                 raise ValueError("Не удалось пересчитать OB-смену. Обратитесь к администратору.")
@@ -3034,9 +3047,9 @@ def edit_shift():
                 invoiced, submission_type, new_version, change_seq, operation_id,
                 operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
             ))
-        if ob_result:
+        if ob_result and not ob_result.get("preserved"):
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
-        elif ob_schema_ready(cursor) and existing['submission_type'] == "ob":
+        elif not ob_result and ob_schema_ready(cursor) and existing['submission_type'] == "ob":
             cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
         conn.commit()
         response = {"ok": True, "sync_id": sync_id, "version": new_version, "change_seq": change_seq}
@@ -4378,6 +4391,7 @@ def serialize_submission(row, cursor=None):
         "sync_id": row['sync_id'],
         "version": row['version'],
         "change_seq": row['change_seq'],
+        "last_operation_id": row["last_operation_id"],
         "deleted": bool(row['is_deleted']),
         "source": row['source'],
         "date": row['date'],
@@ -4527,7 +4541,8 @@ def sync_push():
                     if not ob_schema_ready(cursor):
                         raise ValueError("OB-схема не подготовлена; выполните миграцию с backup")
                     ob_result = calculate_ob_payload(
-                        cursor, date_val, payload.get("start_time"), payload.get("end_time"), employee
+                        cursor, date_val, payload.get("start_time"), payload.get("end_time"), employee,
+                        existing=existing,
                     )
                     if not ob_result["base_rate_configured"]:
                         raise ValueError("В профиле сотрудника не настроена базовая ставка.")
@@ -4683,7 +4698,7 @@ def sync_push():
             if ob_schema_ready(cursor):
                 if operation == "delete" and existing and existing["submission_type"] == "ob":
                     cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
-                elif ob_result:
+                elif ob_result and not ob_result.get("preserved"):
                     replace_ob_segments(cursor, sync_id, ob_result["segments"])
             results.append({"operation_id": operation_id, "ok": True, "version": version, "change_seq": change_seq})
 

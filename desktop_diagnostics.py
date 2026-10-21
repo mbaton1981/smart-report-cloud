@@ -27,7 +27,15 @@ def run(app_module, action, work_dir, case="case", out_path=None):
     result = {"action": action, "case": case, "frozen": bool(getattr(sys, "frozen", False)), "server": url}
     state_path = work / f"{case}_state.json"
 
-    if action == "mail-release":
+    if action == "shift-edit":
+        from shift_edit_acceptance import verify_shift_edit
+        harness = SimpleNamespace(_manual_sync_requested=False)
+        harness.apply_remote_shift = lambda cursor, shift: app_module.SmartReportApp.apply_remote_shift(
+            harness, cursor, shift)
+        harness._sync_expense_document_outbox = lambda: app_module.SmartReportApp._sync_expense_document_outbox(harness)
+        result.update(verify_shift_edit(app_module, work,
+                      sync=lambda: app_module.SmartReportApp.perform_sync_logic(harness)))
+    elif action == "mail-release":
         from release_acceptance import verify_mail_release
         result.update(verify_mail_release(app_module, work))
     elif action == "incoming-selftest":

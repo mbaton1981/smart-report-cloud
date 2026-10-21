@@ -132,6 +132,10 @@ class CatalogSyncTests(unittest.TestCase):
                 json=kwargs.get("json"),
                 headers=kwargs.get("headers", {}),
             ))
+            if path == "/sync/push" and mode["value"] == "lost_shift_ack":
+                mode["value"] = None
+                import requests
+                raise requests.ConnectionError("simulated lost shift ACK after commit")
             if path == "/sync-desktop-data" and mode["value"] == "lost_ack":
                 mode["value"] = None
                 import requests

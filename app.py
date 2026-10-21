@@ -1760,6 +1760,50 @@ DARK_THEME_QSS = """
     QComboBox::down-arrow:hover, QDateEdit::down-arrow:hover {
         border-top: 6px solid #63b3ed;
     }
+    QSpinBox, QDoubleSpinBox {
+        padding-right: 30px;
+        min-height: 22px;
+    }
+    QSpinBox::up-button, QDoubleSpinBox::up-button,
+    QSpinBox::down-button, QDoubleSpinBox::down-button {
+        subcontrol-origin: border;
+        width: 26px;
+        background-color: #3f4c60;
+        border-left: 1px solid #64748b;
+    }
+    QSpinBox::up-button, QDoubleSpinBox::up-button {
+        subcontrol-position: top right;
+        border-bottom: 1px solid #64748b;
+    }
+    QSpinBox::down-button, QDoubleSpinBox::down-button {
+        subcontrol-position: bottom right;
+    }
+    QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+    QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+        background-color: #2b6cb0;
+    }
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+        image: none;
+        width: 0px;
+        height: 0px;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-bottom: 6px solid #f7fafc;
+    }
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+        image: none;
+        width: 0px;
+        height: 0px;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-top: 6px solid #f7fafc;
+    }
+    QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {
+        border-bottom-color: #64748b;
+    }
+    QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
+        border-top-color: #64748b;
+    }
     QTableWidget, QTableView {
         background-color: #1a1f26;
         alternate-background-color: #252d38;
@@ -2017,7 +2061,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.17-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.18-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -2437,9 +2481,20 @@ class SmartReportApp(QMainWindow):
             if cursor.fetchone():
                 return
 
+        remote_version = int(shift.get('version', 1))
+        if local and remote_version > local["sync_version"] and shift.get("last_operation_id"):
+            cursor.execute("""DELETE FROM shift_sync_outbox
+                WHERE sync_id=? AND operation_id=? AND state='pending'""",
+                (sync_id, shift["last_operation_id"]))
+            if cursor.rowcount:
+                cursor.execute("""UPDATE shift_sync_outbox SET base_version=?
+                    WHERE id=(SELECT MIN(id) FROM shift_sync_outbox WHERE sync_id=? AND state='pending')""",
+                    (remote_version, sync_id))
+                cursor.execute("UPDATE shifts SET sync_version=? WHERE sync_id=?", (remote_version, sync_id))
+                cursor.execute("SELECT * FROM shifts WHERE sync_id=?", (sync_id,))
+                local = cursor.fetchone()
         cursor.execute("SELECT 1 FROM shift_sync_outbox WHERE sync_id = ? AND state = 'pending' LIMIT 1", (sync_id,))
         has_pending = cursor.fetchone() is not None
-        remote_version = int(shift.get('version', 1))
         if local and has_pending:
             if remote_version > local['sync_version']:
                 cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE sync_id = ? AND state = 'pending'", (sync_id,))
@@ -2515,9 +2570,9 @@ class SmartReportApp(QMainWindow):
             ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache))
         if record_type == RECORD_TYPE_OB:
             segments = shift.get("ob_segments")
-            if segments:
+            if segments and segments != get_ob_segments(cursor, sync_id):
                 replace_ob_segments(cursor, sync_id, segments)
-            elif shift.get("start_time") and shift.get("end_time"):
+            elif not segments and shift.get("start_time") and shift.get("end_time"):
                 base_rate = float(shift.get("ob_base_rate") or 0.0)
                 if base_rate <= 0:
                     try:
@@ -9872,6 +9927,8 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT * FROM shifts WHERE id = ?", (local_id,))
         shift = cursor.fetchone()
         has_ob_schema = ob_schema_ready(cursor)
+        stored_ob_segments = (get_ob_segments(cursor, shift["sync_id"])
+                              if shift and has_ob_schema and shift["entry_type"] == RECORD_TYPE_OB else [])
         cursor.execute("SELECT name, is_active FROM employees ORDER BY name")
         employees = cursor.fetchall()
         cursor.execute("SELECT name FROM companies ORDER BY name")
@@ -9952,22 +10009,45 @@ class SmartReportApp(QMainWindow):
         rate_field.setRange(0, 100000)
         rate_field.setDecimals(2)
         rate_field.setValue(shift['rate'])
-        transport_field = QDoubleSpinBox()
-        transport_field.setRange(0, 10000)
-        transport_field.setDecimals(2)
-        transport_field.setValue(shift['transport'] or 0)
-        transport_value = [transport_field.value()]
+        original_transport = float(shift["transport"] or 0)
+        if original_transport in (0, 1):
+            transport_field = QCheckBox("Учитывать поездку")
+            transport_field.setChecked(bool(original_transport))
+            def transport_amount():
+                return float(transport_field.isChecked())
+            def set_transport_amount(value):
+                transport_field.setChecked(bool(value))
+        else:
+            transport_field = QDoubleSpinBox()
+            transport_field.setRange(0, 10000)
+            transport_field.setDecimals(2)
+            transport_field.setValue(original_transport)
+            transport_field.setToolTip("Прежнее числовое значение сохранено; новые поездки отмечаются галочкой.")
+            transport_amount = transport_field.value
+            set_transport_amount = transport_field.setValue
+        transport_field.setObjectName("edit_shift_transport")
+        hours_field.setObjectName("edit_shift_hours")
+        rate_field.setObjectName("edit_shift_rate")
+        transport_value = [transport_amount()]
         comment_field = QLineEdit(shift['comment'] or '')
         ob_start_field = create_half_hour_time_field((shift["start_time"] if has_ob_schema else None) or "07:00")
         ob_end_field = create_half_hour_time_field((shift["end_time"] if has_ob_schema else None) or "18:00")
         ob_preview_field = QLabel("")
         ob_preview_field.setWordWrap(True)
 
+        def unchanged_ob_interval():
+            return (current_type == RECORD_TYPE_OB and record_type_field.currentData() == RECORD_TYPE_OB
+                    and date_field.text() == shift["date"]
+                    and selected_employee_name() == shift["employee"]
+                    and ob_start_field.currentText() == shift["start_time"]
+                    and ob_end_field.currentText() == shift["end_time"]
+                    and bool(stored_ob_segments))
+
         def update_type_values():
             new_type = record_type_field.currentData()
             if previous_type[0] == RECORD_TYPE_WORK and new_type != RECORD_TYPE_WORK:
                 work_values[0] = rate_field.value()
-                work_values[1] = transport_field.value()
+                work_values[1] = transport_amount()
                 rate_field.setValue(0.0)
             elif previous_type[0] != RECORD_TYPE_WORK and new_type == RECORD_TYPE_WORK:
                 rate_field.setValue(work_values[0])
@@ -9975,15 +10055,23 @@ class SmartReportApp(QMainWindow):
                 rate_field.setValue(0.0)
             if new_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
                 if previous_type[0] in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
-                    transport_value[0] = transport_field.value()
-                transport_field.setValue(0.0)
+                    transport_value[0] = transport_amount()
+                set_transport_amount(0.0)
             elif previous_type[0] not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
-                transport_field.setValue(transport_value[0])
+                set_transport_amount(transport_value[0])
             previous_type[0] = new_type
 
         def refresh_dialog_ob_preview(*_):
             if record_type_field.currentData() != RECORD_TYPE_OB:
                 ob_preview_field.setText("")
+                return
+            if unchanged_ob_interval():
+                ob_preview_field.setText(
+                    "<br>".join(
+                        f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']}: "
+                        f"{segment['hours']:.2f} ч, сумма {segment['amount']:.2f} kr"
+                        for segment in stored_ob_segments)
+                    + "<br><small>Сохранённый расчёт ОВ. Без изменения даты, сотрудника и интервала не пересчитывается.</small>")
                 return
             preview_conn = get_db_connection()
             try:
@@ -10079,7 +10167,8 @@ class SmartReportApp(QMainWindow):
                 return
         check_conn.close()
 
-        if record_type == RECORD_TYPE_OB:
+        preserve_ob = unchanged_ob_interval()
+        if record_type == RECORD_TYPE_OB and not preserve_ob:
             schema_conn = get_db_connection()
             schema_ready = ob_schema_ready(schema_conn.cursor())
             rate_cursor = schema_conn.cursor()
@@ -10112,9 +10201,9 @@ class SmartReportApp(QMainWindow):
         payload = {
             "date": payload_date, "employee": selected_employee_name(),
             "company": company_field.currentText().strip(), "object_name": object_name,
-            "hours": ob_result["total_hours"] if ob_result else hours_field.value(),
+            "hours": shift["hours"] if preserve_ob else ob_result["total_hours"] if ob_result else hours_field.value(),
             "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,
-            "transport": transport_field.value() if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0.0,
+            "transport": transport_amount() if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0.0,
             "comment": comment_field.text().strip(),
             "invoiced": shift['invoiced'] or 0, "record_type": record_type
         }
@@ -10122,6 +10211,8 @@ class SmartReportApp(QMainWindow):
             payload.update({
                 "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
             })
+        elif preserve_ob:
+            payload.update(start_time=shift["start_time"], end_time=shift["end_time"])
         if not payload['employee'] or not payload['company'] or not payload['object_name']:
             QMessageBox.warning(self, "Ошибка", "Заполните сотрудника, фирму и объект.")
             return
@@ -10145,10 +10236,10 @@ class SmartReportApp(QMainWindow):
                     payload['date'], payload['employee'], payload['company'], payload['object_name'],
                     payload['hours'], payload['rate'], payload['transport'], payload['comment'], sync_id, record_type,
                     rate_field.value() if record_type == RECORD_TYPE_WORK else work_values[0],
-                    transport_field.value() if record_type == RECORD_TYPE_WORK else work_values[1],
-                    ob_result["start_time"] if ob_result else None,
-                    ob_result["end_time"] if ob_result else None,
-                    ob_result["segments"][0]["base_rate"] if ob_result else None,
+                    transport_amount() if record_type == RECORD_TYPE_WORK else work_values[1],
+                    shift["start_time"] if preserve_ob else ob_result["start_time"] if ob_result else None,
+                    shift["end_time"] if preserve_ob else ob_result["end_time"] if ob_result else None,
+                    shift["ob_base_rate"] if preserve_ob else ob_result["segments"][0]["base_rate"] if ob_result else None,
                     local_id
                 ))
             else:
@@ -10161,12 +10252,12 @@ class SmartReportApp(QMainWindow):
                     payload['date'], payload['employee'], payload['company'], payload['object_name'],
                     payload['hours'], payload['rate'], payload['transport'], payload['comment'], sync_id, record_type,
                     rate_field.value() if record_type == RECORD_TYPE_WORK else work_values[0],
-                    transport_field.value() if record_type == RECORD_TYPE_WORK else work_values[1],
+                    transport_amount() if record_type == RECORD_TYPE_WORK else work_values[1],
                     local_id
                 ))
             if ob_result:
                 replace_ob_segments(cursor, sync_id, ob_result["segments"])
-            elif ob_schema_ready(cursor) and shift['entry_type'] == RECORD_TYPE_OB:
+            elif not preserve_ob and ob_schema_ready(cursor) and shift['entry_type'] == RECORD_TYPE_OB:
                 cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
             enqueue_shift_operation(cursor, sync_id, 'upsert', shift['sync_version'], payload)
             conn.commit()

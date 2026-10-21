@@ -7,3 +7,4 @@ pypdfium2>=4.30,<6
 numpy>=1.26,<3
 Pillow>=10,<14
 rapidocr-onnxruntime>=1.4,<2
+tzdata>=2025.2

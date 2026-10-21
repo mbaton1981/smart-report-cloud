@@ -1,5 +1,29 @@
 # OB intervals: migration and rules
 
+## Windows editing fix (1.0.18-rc1)
+
+The Windows distribution includes `tzdata` and its IANA resources. The configured
+`Europe/Stockholm` zone is unchanged; Windows must not substitute a fixed offset
+because summer/winter transitions affect actual interval length.
+
+Editing an existing OB shift without changing its date, employee or interval
+retains its stored hours, base rate and segment rows on both client and server.
+Changing the interval still calculates it using the current rules. Transport is
+one checkbox per shift (work and OB), never per calculated segment. Existing
+nonbinary transport values retain their numeric editor and value. Numeric
+editors have explicit visible up/down arrows in the dark theme.
+
+No additional database migration is required for this fix. Shift pull responses
+include the last accepted operation ID so a lost push acknowledgment can be
+recognized on retry without a duplicate or false conflict; unrelated remote
+operations still cause a version conflict.
+
+`tests/test_shift_edit.py` exercises the actual Qt editor, retained segment rows,
+server edits, sync roundtrips, lost acknowledgments and genuine conflicts.
+The packaged local-only `--diagnostic shift-edit` action also verifies the
+installed timezone database and spring/autumn transitions against an isolated
+local server. It must never use the working profile or cloud server.
+
 The OB schema migration is intentionally not called by `app.py` or `server.py` at startup. Existing work, ATF, sick, salary, and report paths continue to work before migration. OB create/edit/sync endpoints return an explicit error until the target database has been migrated.
 
 ## Desktop SQLite
