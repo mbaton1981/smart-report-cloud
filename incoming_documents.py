@@ -39,6 +39,90 @@ class IncomingStore(OfflineReviewStore):
     def objects(self):
         return list(self.host._expense_objects)
 
+    @staticmethod
+    def allocations(payload):
+        if "allocations" in payload:
+            return payload["allocations"]
+        return ([{"object_id": payload["object_id"], "gross_amount": payload.get("gross_amount")}]
+                if payload.get("object_id") is not None else [])
+
+    def clean_payload(self, payload):
+        cleaned = super().clean_payload({key: value for key, value in payload.items()
+                                         if key not in ("allocations", "server_version")})
+        parts = self.allocations(payload)
+        if not isinstance(parts, list) or len(parts) > 100:
+            raise ReviewError("Распределение: не более 100 строк.")
+        cleaned["allocations"] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                raise ReviewError("Некорректная строка распределения.")
+            raw = part.get("gross_amount")
+            amount = parse_invoice_money(raw)
+            if raw not in (None, "") and (amount is None or not amount.is_finite()):
+                raise ReviewError("Некорректная сумма распределения.")
+            cleaned["allocations"].append({"object_id": part.get("object_id"),
+                                           "gross_amount": decimal_text(amount)})
+        cleaned["object_id"] = (parts[0].get("object_id") if len(parts) == 1 else None)
+        if payload.get("server_version") is not None:
+            cleaned["server_version"] = payload["server_version"]
+        return cleaned
+
+    def current_review(self, document_id):
+        revision, payload = self.latest(document_id)
+        card = self.card(document_id)
+        if card:
+            payload = dict(payload)
+            payload.pop("server_version", None)
+        delivered = card and self.conn.execute("SELECT 1 FROM deliveries WHERE document_id=?",
+                                               (document_id,)).fetchone()
+        if delivered and not self.host.incoming_delivery_pending(card["client_id"]):
+            try:
+                existing = self._existing(card["client_id"])
+            except ValueError:
+                return revision, payload
+            if existing:
+                payload = dict(payload)
+                for key in EDITABLE:
+                    if key in existing:
+                        payload[key] = existing[key]
+                payload["allocations"] = [{"object_id": row.get("object_id"),
+                                           "gross_amount": row.get("gross_amount")}
+                                          for row in existing.get("allocations", [])]
+                payload["object_id"] = (payload["allocations"][0]["object_id"]
+                                        if len(payload["allocations"]) == 1 else None)
+                payload["server_version"] = existing["sync_version"]
+        return revision, payload
+
+    def save(self, document_id, payload, expected_revision):
+        cleaned = self.clean_payload(payload)
+        card = self.card(document_id)
+        if card is None:
+            return self.save_revision(document_id, cleaned, expected_revision)
+        if self.host.incoming_delivery_pending(card["client_id"]):
+            raise ReviewError("Сначала завершите передачу или разберите конфликт в обычном реестре.")
+        existing = self._existing(card["client_id"], required=True)
+        if (not existing or cleaned.get("server_version") is None
+                or cleaned["server_version"] != existing["sync_version"]):
+            raise ReviewError("Распределение изменилось. Откройте актуальное распределение; правки не отправлены.")
+        problems = self.issues(document_id, cleaned)
+        if problems:
+            raise ReviewError("\n".join(problems))
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            revision, previous = self.latest(document_id)
+            if revision != expected_revision:
+                raise ReviewError("Карточка изменена в другом окне. Обновите распределение.")
+            self.conn.execute("INSERT INTO revisions VALUES (?,?,?,?,?)", (
+                document_id, revision + 1, packed(cleaned),
+                packed({key: {"before": previous.get(key), "after": value}
+                        for key, value in cleaned.items() if previous.get(key) != value}),
+                datetime.now(timezone.utc).isoformat()))
+            self.conn.execute("UPDATE register SET payload_json=?,revision=? WHERE document_id=?",
+                              (packed(cleaned), revision + 1, document_id))
+            self.conn.execute("DELETE FROM deliveries WHERE document_id=?", (document_id,))
+        self.deliver(self.card(document_id))
+        return revision + 1
+
     def action(self, document_id):
         row = self.conn.execute("SELECT revision,action FROM document_actions WHERE document_id=? "
                                 "ORDER BY revision DESC LIMIT 1", (document_id,)).fetchone()
@@ -149,8 +233,17 @@ class IncomingStore(OfflineReviewStore):
             problems.append("Напоминание не является новым расходом: сверьте исходный документ.")
         if payload.get("original_checked") is not True:
             problems.append("Подтвердите сверку оригинала.")
-        if payload.get("object_id") not in {row["id"] for row in self.objects()}:
-            problems.append("Обязательно выберите объект.")
+        parts = self.allocations(payload)
+        ids = {row["id"] for row in self.objects()}
+        if not parts or any(part.get("object_id") not in ids for part in parts):
+            problems.append("Обязательно выберите объект для каждой части.")
+        amounts = [parse_invoice_money(part.get("gross_amount")) for part in parts]
+        if any(amount is None or not amount.is_finite() or amount <= 0 for amount in amounts):
+            problems.append("Укажите положительную сумму каждой части.")
+        elif sum(amounts, Decimal(0)) != parse_invoice_money(payload.get("gross_amount")):
+            problems.append("Сумма частей должна точно совпадать с общей суммой документа.")
+        if len({part.get("object_id") for part in parts}) != len(parts):
+            problems.append("Укажите каждый объект одной строкой.")
         for key in ("supplier_name", "document_date", "gross_amount", "currency_code"):
             if payload.get(key) in (None, "", "UNKNOWN"):
                 problems.append(f"Не заполнено обязательное поле: {key}.")
@@ -214,6 +307,13 @@ class IncomingStore(OfflineReviewStore):
         revision, payload = self.latest(document_id)
         if card is None or revision != expected_revision:
             raise ReviewError("Обновите документ перед сменой объекта.")
+        existing = self._existing(card["client_id"], required=True)
+        if (len(self.allocations(payload)) != 1 or existing and
+                (len(existing.get("allocations", [])) != 1 or
+                 existing["allocations"][0].get("object_id") != payload.get("object_id"))):
+            raise ReviewError("Фактура распределена или изменена на сервере. Откройте актуальное распределение.")
+        if existing and payload.get("server_version") != existing.get("sync_version"):
+            raise ReviewError("Откройте актуальное распределение перед изменением объекта.")
         if object_id not in {row["id"] for row in self.objects()}:
             raise ReviewError("Выберите действующий объект.")
         if payload["object_id"] == object_id:
@@ -221,6 +321,7 @@ class IncomingStore(OfflineReviewStore):
         self._existing(card["client_id"], required=True)
         previous = payload["object_id"]
         payload["object_id"] = object_id
+        payload["allocations"] = [{"object_id": object_id, "gross_amount": payload["gross_amount"]}]
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             if self.latest(document_id)[0] != revision:
@@ -258,8 +359,7 @@ class IncomingStore(OfflineReviewStore):
             existing = self._existing(card["client_id"])
         except ValueError:
             return "Обновите реестр для проверки сохранения", False
-        if existing and any(row.get("object_id") == json.loads(card["payload_json"])["object_id"]
-                            for row in existing.get("allocations", [])):
+        if existing and existing.get("verification_status") == "confirmed":
             return "Учтён на объекте", True
         return "Ожидает проверки в реестре", False
 
@@ -320,8 +420,7 @@ class IncomingStore(OfflineReviewStore):
             verification_status="confirmed",
             recognized_text=base.get("raw_text") or "",
             required_attachment_sha256=[card["sha256"]],
-            allocations=[{"destination": "object", "object_id": payload["object_id"],
-                          "gross_amount": payload["gross_amount"], "vat_amount": payload["vat_amount"]}],
+            allocations=[{"destination": "object", **part} for part in self.allocations(payload)],
         )
         for key in ("amount_due", "settlement_status", "due_date", "rounding_amount"):
             payload.pop(key, None)
@@ -333,7 +432,8 @@ class IncomingStore(OfflineReviewStore):
         self.host.queue_expense_document_operation(
             card["client_id"], "upsert", payload,
             server_document_id=existing.get("id") if existing else None,
-            server_version=existing.get("sync_version") if existing else None,
+            server_version=payload.get("server_version") if payload.get("server_version") is not None
+                           else existing.get("sync_version") if existing else None,
             attachment_paths=staged)
         with self.conn:
             self.conn.execute("INSERT INTO deliveries VALUES (?,'queued',?)",

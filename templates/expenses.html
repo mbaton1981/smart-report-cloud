@@ -207,7 +207,8 @@
         const amount = document.createElement("input");
         amount.inputMode = "decimal";
         amount.placeholder = "0.00";
-        amount.value = allocation.net_amount ?? allocation.gross_amount ?? "";
+        amount.value = (editingSnapshot?.allocation_basis === "net"
+            ? allocation.net_amount : allocation.gross_amount) ?? "";
         amount.addEventListener("input", updateAllocationTotals);
         const remove = document.createElement("button");
         remove.type = "button";
@@ -375,6 +376,10 @@
             allocations,
         };
         if (editingSnapshot) {
+            payload.usage = editingSnapshot.usage;
+            if (editingSnapshot.usage === "object_cost") {
+                payload.cost_operation_id = `${clientId}:web:${editingSnapshot.sync_version}`;
+            }
             payload.expected_version = editingSnapshot.sync_version;
             payload.allocation_basis = editingSnapshot.allocation_basis;
             payload.rounding_amount = $("rounding-amount").value || null;

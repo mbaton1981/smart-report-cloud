@@ -116,6 +116,27 @@ def run(app_module, action, work_dir, case="case", out_path=None):
                 window.grab().save(str(work / "tax-autofill.png"))
                 result.update(tax_amount_autofilled=True, tax_status_only_actions=True,
                               tax_expenses_created=0)
+            from decimal import Decimal
+            host._expense_objects.append({"id": 3, "name": "ISOLATED C"})
+            window.selector.setCurrentIndex(window.selector.findData(1))
+            window.expense_button.click()
+            total = Decimal(window.inputs["gross_amount"].text())
+            window.add_allocation({"object_id": 1, "gross_amount": "1.00"})
+            assert window.save_edits() and store.card(1) is None
+            assert store.issues(1, window.payload())
+            window.add_allocation({"object_id": 2, "gross_amount": "1.00"})
+            window.add_allocation({"object_id": 3, "gross_amount": str(total - Decimal(2))})
+            window.checked.setChecked(True)
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+                window.confirm_transfer()
+            assert store.card(1) and len(queued) == 2
+            parts = queued[-1][0][2]["allocations"]
+            assert len(parts) == 3
+            assert sum(Decimal(part["gross_amount"]) for part in parts) == total
+            assert all("vat_amount" not in part for part in parts)
+            window.grab().save(str(work / "three-object-allocation.png"))
+            result.update(three_object_allocation=True, partial_draft_saved_without_expense=True,
+                          no_per_object_vat_required=True)
         finally:
             window.close()
             store.close()

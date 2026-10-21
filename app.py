@@ -2017,7 +2017,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.13-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.14-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -2612,6 +2612,9 @@ class SmartReportApp(QMainWindow):
                 required_features.add("payment_reference_v1")
             if any(json.loads(row["payload_json"]).get("usage") == "object_cost" for row in rows):
                 required_features.add("object_costs_v1")
+            if any(json.loads(row["payload_json"]).get("usage") == "object_cost"
+                   and len(json.loads(row["payload_json"]).get("allocations") or []) > 1 for row in rows):
+                required_features.add("object_cost_allocations_v1")
             try:
                 capability_response = requests.request(
                     "GET",
@@ -6328,6 +6331,12 @@ class SmartReportApp(QMainWindow):
         finally:
             conn.close()
 
+    def refresh_incoming_register(self):
+        result = request_expense_api("GET", "/api/expense-documents")
+        self._expense_read_cache[(None, None)] = list(result["documents"])
+        self._expense_online = True
+        self._expense_read_dirty = False
+
     def incoming_after_queue(self):
         self._expense_read_dirty = True
         self.load_expense_documents()
@@ -6470,6 +6479,8 @@ class SmartReportApp(QMainWindow):
             incoming = getattr(self, "_incoming_viewer", None)
             if incoming is not None:
                 incoming.refresh_objects()
+                if incoming.payload() == incoming.loaded_payload:
+                    incoming.select_document()
         if refresh_again:
             self._expense_read_attempts.clear()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3:
@@ -7219,14 +7230,16 @@ class SmartReportApp(QMainWindow):
         self, document=None, source_paths=None, parsed_fields=None, recognition_message=""
     ):
         document = dict(document or {})
-        if document.get("usage") == "object_cost":
+        if document.get("usage") == "object_cost" and not document.get("local_conflict_payload"):
             self.open_incoming_documents()
             viewer = getattr(self, "_incoming_viewer", None)
             if viewer is not None:
                 card = viewer.store.conn.execute(
                     "SELECT document_id FROM register WHERE client_id=?", (document.get("client_id"),)).fetchone()
                 if card is not None:
-                    viewer.selector.setCurrentIndex(viewer.selector.findData(card["document_id"]))
+                    if viewer.keep_unsaved():
+                        viewer.selector.setCurrentIndex(viewer.selector.findData(card["document_id"]))
+                        viewer.select_document()
                     return True
         server_document = dict(document)
         local_conflict_payload = document.get("local_conflict_payload")
@@ -7526,6 +7539,8 @@ class SmartReportApp(QMainWindow):
             "verification_status": status.currentData(),
             "allocations": allocations,
         }
+        if object_cost:
+            payload["cost_operation_id"] = uuid.uuid4().hex
         known_hashes = [item["sha256"] for item in document.get("attachments") or [] if item.get("sha256")]
         if known_hashes:
             payload["required_attachment_sha256"] = known_hashes

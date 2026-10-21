@@ -77,7 +77,11 @@ class ObjectCostTests(unittest.TestCase):
             conn.close()
         self.host._expense_objects.append({"id": other, "name": "Other isolated object"})
         self.host.incoming_register_snapshot = self.documents
-        self.store.reassign(2, other, self.store.latest(2)[0])
+        with self.assertRaisesRegex(ReviewError, "актуальное распределение"):
+            self.store.reassign(2, other, self.store.latest(2)[0])
+        revision, current = self.store.current_review(2)
+        current["allocations"] = [{"object_id": other, "gross_amount": current["gross_amount"]}]
+        self.store.save(2, current, revision)
         self.mode = "lost_ack"
         self.assertEqual(self.sync()["synced"], 0)
         self.assertEqual(self.sync()["synced"], 1, self.last_sync)

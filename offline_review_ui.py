@@ -12,7 +12,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSplitter, QTextEdit,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView,
 )
 
 from document_preview import DocumentGalleryDialog
@@ -50,7 +50,7 @@ class OfflineReviewWindow(QDialog):
         self.resize(1450, 940)
         layout = QVBoxLayout(self)
         banner = QLabel(
-            ("PDF распознаётся автоматически. Проверьте поля, выберите объект и добавьте расход.\n"
+            ("PDF распознаётся автоматически. Проверьте поля и распределите общую сумму по объектам.\n"
              "Получение почты — только по кнопке, только INBOX.SmartReport-Test. Расписания нет.\n"
              if integrated else
              "ОТДЕЛЬНЫЙ ТЕСТОВЫЙ ПРОФИЛЬ. Почта, рабочая база и синхронизация отключены.\n")
@@ -128,7 +128,26 @@ class OfflineReviewWindow(QDialog):
         self.object.addItem("Обязательно выберите объект", None)
         for obj in store.objects():
             self.object.addItem(obj["name"], obj["id"])
-        form.addRow("Объект:", self.object)
+        if integrated:
+            self.object.hide()
+            self.allocations = QTableWidget(0, 3)
+            self.allocations.setObjectName("review_allocations")
+            self.allocations.setHorizontalHeaderLabels(["Объект", "Сумма", ""])
+            header = self.allocations.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            self.allocations.setMinimumHeight(160)
+            form.addRow("Распределение по объектам:", self.allocations)
+            self.add_allocation_button = QPushButton("Добавить объект — сумму")
+            self.add_allocation_button.clicked.connect(lambda: self.add_allocation())
+            form.addRow(self.add_allocation_button)
+            self.allocation_total = QLabel()
+            form.addRow(self.allocation_total)
+            self.allocations.itemChanged.connect(self.update_allocation_total)
+            self.inputs["gross_amount"].textChanged.connect(self.update_allocation_total)
+        else:
+            form.addRow("Объект:", self.object)
         self.checked = QCheckBox("Сверил оригинал, реквизиты и отсутствие повтора покупки")
         form.addRow(self.checked)
         self.history = QTextEdit()
@@ -146,8 +165,8 @@ class OfflineReviewWindow(QDialog):
         if integrated:
             self.registry_button.setText("Журнал подтверждённых передач")
             self.transfer_button.setText("Добавить к расходам объекта")
-            self.reassign_button = QPushButton("Сменить объект — без нового расхода")
-            self.reassign_button.clicked.connect(self.reassign_object)
+            self.reassign_button = QPushButton("Открыть актуальное распределение")
+            self.reassign_button.clicked.connect(self.refresh_distribution)
             buttons.addWidget(self.reassign_button)
             actions = QHBoxLayout()
             self.ignore_button = QPushButton("Не учитывать")
@@ -173,12 +192,79 @@ class OfflineReviewWindow(QDialog):
         self.select_document()
 
     def payload(self):
-        return {**{key: widget.text().strip() or None for key, widget in self.inputs.items()},
+        result = {**{key: widget.text().strip() or None for key, widget in self.inputs.items()},
                 "confirmed_type": None if self.integrated else self.kind.currentData(),
                 "object_id": self.object.currentData(),
                 "original_checked": self.checked.isChecked(),
                 "settlement_status": None if self.integrated else
                     "prepaid" if self.receipt_paid.isChecked() else None}
+        if self.integrated:
+            parts = [{"object_id": self.allocations.cellWidget(row, 0).currentData(),
+                      "gross_amount": self.allocations.item(row, 1).text().strip() or None}
+                     for row in range(self.allocations.rowCount())]
+            if parts:
+                result["allocations"] = parts
+            elif self.object.currentData() is None:
+                result["allocations"] = []
+            if getattr(self, "server_version", None) is not None:
+                result["server_version"] = self.server_version
+        return result
+
+    def add_allocation(self, part=None):
+        part = part or {}
+        row = self.allocations.rowCount()
+        self.allocations.insertRow(row)
+        combo = QComboBox()
+        combo.addItem("Выберите объект", None)
+        for obj in self.store.objects():
+            combo.addItem(obj["name"], obj["id"])
+        selected = part.get("object_id")
+        if selected is not None and combo.findData(selected) < 0:
+            combo.addItem(f"Объект #{selected} — недоступен", selected)
+        combo.setCurrentIndex(max(0, combo.findData(selected)))
+        combo.setToolTip(combo.currentText())
+        combo.currentTextChanged.connect(combo.setToolTip)
+        self.allocations.setCellWidget(row, 0, combo)
+        self.allocations.setItem(row, 1, QTableWidgetItem(str(part.get("gross_amount") or "")))
+        remove = QPushButton("Убрать")
+        def remove_row():
+            for index in range(self.allocations.rowCount()):
+                if self.allocations.cellWidget(index, 2) is remove:
+                    self.allocations.removeRow(index)
+                    break
+            self.update_allocation_total()
+        remove.clicked.connect(remove_row)
+        self.allocations.setCellWidget(row, 2, remove)
+        self.update_allocation_total()
+
+    def update_allocation_total(self, *_):
+        if not self.integrated or not hasattr(self, "allocation_total"):
+            return
+        from decimal import Decimal
+        from expense_documents import parse_invoice_money, decimal_text
+        amounts = [parse_invoice_money(self.allocations.item(row, 1).text())
+                   for row in range(self.allocations.rowCount()) if self.allocations.item(row, 1)]
+        total = parse_invoice_money(self.inputs["gross_amount"].text())
+        if any(value is None or not value.is_finite() for value in amounts):
+            self.allocation_total.setText("Проверьте суммы частей. Черновик можно сохранить.")
+            return
+        allocated = sum(amounts, Decimal(0))
+        self.allocation_total.setText(
+            f"Распределено: {decimal_text(allocated)}; общая сумма: {decimal_text(total) or 'не указана'}. "
+            + ("Суммы совпадают." if total == allocated and amounts else
+               "Для учёта распределите всю сумму. Можно сохранить черновик."))
+
+    def refresh_distribution(self):
+        try:
+            if not self.keep_unsaved():
+                return
+            refresh = getattr(self.store.host, "refresh_incoming_register", None)
+            if refresh is None:
+                raise ReviewError("Обновите обычный реестр и откройте карточку заново.")
+            refresh()
+            self.select_document()
+        except (ReviewError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Распределение не обновлено", str(error))
 
     def choose_amount(self):
         value = self.amount_choices.currentData()
@@ -195,7 +281,7 @@ class OfflineReviewWindow(QDialog):
         self.update_action_controls()
         labels = {"ignore": "Не учитывать — PDF сохранён, расход не создан",
                   "later": "Разобрать позже — PDF сохранён, расход не создан",
-                  "expense": "Проверьте считанные данные и выберите объект. Номер и НДС необязательны."}
+                  "expense": "Проверьте данные и распределите сумму по объектам. Номер и НДС необязательны."}
         self.status.setText(labels[action])
         if action in ("ignore", "later") and self.payload() != self.loaded_payload:
             self.status.setText(labels[action] + ". Несохранённые правки полей не применены.")
@@ -278,7 +364,9 @@ class OfflineReviewWindow(QDialog):
                 for button in (self.ignore_button, self.later_button, self.expense_button):
                     button.setEnabled(False)
             return
-        self.revision, payload = self.store.latest(self.document_id)
+        self.revision, payload = (self.store.current_review(self.document_id) if self.integrated
+                                  else self.store.latest(self.document_id))
+        self.server_version = payload.get("server_version")
         base = self.store.base(self.document_id)
         for key, field in self.inputs.items():
             field.blockSignals(True)
@@ -286,6 +374,11 @@ class OfflineReviewWindow(QDialog):
             field.blockSignals(False)
         self.kind.setCurrentIndex(max(0, self.kind.findData(payload.get("confirmed_type"))))
         self.object.setCurrentIndex(max(0, self.object.findData(payload.get("object_id"))))
+        if self.integrated:
+            self.allocations.setRowCount(0)
+            for part in self.store.allocations(payload):
+                self.add_allocation(part)
+            self.update_allocation_total()
         self.checked.setChecked(payload.get("original_checked") is True)
         self.amount_choices.blockSignals(True)
         self.amount_choices.clear()
@@ -338,10 +431,14 @@ class OfflineReviewWindow(QDialog):
         except (ReviewError, OSError, ValueError) as error:
             self.status.setText(f"Оригинал недоступен; перенос запрещён: {error}")
         card = self.store.card(self.document_id)
+        editable = card is None or self.integrated and self.server_version is not None
         for field in self.inputs.values():
-            field.setReadOnly(card is not None)
+            field.setReadOnly(not editable)
+        if self.integrated:
+            self.allocations.setEnabled(editable)
+            self.add_allocation_button.setEnabled(editable)
         self.object.setEnabled(card is None)
-        self.checked.setEnabled(card is None)
+        self.checked.setEnabled(editable)
         self.receipt_paid.setEnabled(card is None)
         self.transfer_button.setEnabled(
             (kind in ("invoice", "receipt") or self.integrated and kind == "unclassified"
@@ -349,7 +446,9 @@ class OfflineReviewWindow(QDialog):
             and self.original_available and card is None)
         if self.integrated:
             self.reassign_button.setEnabled(card is not None)
-        self.save_button.setEnabled(card is None)
+        self.save_button.setEnabled(editable)
+        self.save_button.setText("Сохранить изменения существующего расхода" if card and self.integrated
+                                 else "Сохранить исправления — без расхода")
         self.kind.setEnabled(card is None and (kind in ("invoice", "receipt") or self.integrated))
         history = self.store.history(self.document_id)
         self.history.setPlainText("\n".join(
@@ -403,7 +502,9 @@ class OfflineReviewWindow(QDialog):
             QMessageBox.warning(self, "Исправления не сохранены", str(error))
             return False
         self.select_document()
-        self.status.setText(f"Версия {self.revision} сохранена отдельно. Расход не создан.")
+        self.status.setText("Изменения той же карточки поставлены в очередь; при конфликте требуется сверка."
+                            if self.integrated and self.store.card(self.document_id)
+                            else f"Версия {self.revision} сохранена отдельно. Расход не создан.")
         return True
 
     def confirm_transfer(self):
@@ -413,7 +514,7 @@ class OfflineReviewWindow(QDialog):
             return
         answer = QMessageBox.question(
             self, "Подтверждение передачи" if self.integrated else "Только тестовый реестр",
-            ("Добавить один расход с исходным PDF к выбранному объекту?\n"
+            ("Добавить один расход с исходным PDF и указанным распределением по объектам?\n"
              if self.integrated else "Создать одну тестовую карточку с исходным PDF?\n") +
             "Это отдельное подтверждение переноса, не просто сохранение исправлений.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

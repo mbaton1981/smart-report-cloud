@@ -1,5 +1,38 @@
 # Invoice Recognition and Net Allocations
 
+## Incoming object-cost allocations — 1.0.14-rc1
+
+Incoming review now has an editable list of **object / amount** rows. Recognition
+fills document-level fields only; allocation is manual. Incomplete allocation
+can be saved as a local draft. Confirmation requires positive parts for distinct
+active objects and an exact total, checked both locally and on the server.
+Document-level VAT is optional; per-object VAT is not required for `object_cost`.
+An unknown per-object net/VAT remains unknown, not zero or an invented tax split.
+Nonfinancial actions still bypass financial validation.
+
+One ordinary expense document and original PDF are shared by all allocation
+rows. Existing outbox IDs, attachment hashes and operation receipts handle retry
+after lost acknowledgements. No new registry, payment logic or schema migration
+is introduced; allocations and the reviewed server version are stored in the
+existing JSON revision history.
+
+After delivery, **Открыть актуальное распределение** reads the common registry.
+The incoming editor displays its current amount and allocations, with the
+captured server version. Saving changes updates the same ordinary expense.
+Pending/conflicted operations lock further incoming edits until resolved. Old
+single-object reassignment is not exposed; its store operation rejects split
+or stale cards. A server-side race results in an explicit outbox conflict,
+retaining both the server document and local payload, never an automatic merge.
+Conflict review remains available in the ordinary desktop registry.
+
+The web editor preserves object-cost usage, sends the reviewed version and a
+stable operation ID for retry. The server inherits existing object-cost usage
+even from older clients, requires a version for its updates, and enforces exact
+allocation without requiring per-object VAT. Other ordinary invoice workflows
+retain their existing partial-allocation rules. Multi-object desktop delivery
+requires `object_cost_allocations_v1` server capability; an older server leaves
+the operation queued with an explicit error.
+
 ## Document actions and congestion-tax costs — 1.0.12-rc1
 
 The current incoming-document workflow supersedes the invoice-only candidate

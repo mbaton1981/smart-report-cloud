@@ -1047,6 +1047,7 @@ def validate_expense_fields(payload):
 
     return {
         "document_type": document_type,
+        "usage": "object_cost" if object_cost else None,
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
         "payment_reference": reference or None,
@@ -1154,7 +1155,15 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             raise ValueError("Распределённый НДС не может превышать НДС документа.")
         if allocated_gross == total_gross and not allocation_vat_unknown and allocated_vat != Decimal(total_vat):
             raise ValueError("При полном распределении суммы частей должны покрыть весь НДС документа.")
-    if allocation_vat_unknown and fields["verification_status"] == "confirmed":
+    if fields.get("usage") == "object_cost" and fields["verification_status"] == "confirmed":
+        if not normalized or any(item["object_id"] is None or Decimal(item["gross_amount"]) <= 0
+                                 for item in normalized):
+            raise ValueError("Для расхода выберите объекты и положительные суммы частей.")
+        if allocated_gross != total_gross:
+            raise ValueError("Сумма частей должна точно совпадать с общей суммой документа.")
+        if len({item["object_id"] for item in normalized}) != len(normalized):
+            raise ValueError("Укажите каждый объект одной строкой.")
+    if allocation_vat_unknown and fields["verification_status"] == "confirmed" and fields.get("usage") != "object_cost":
         fields["verification_status"] = "requires_review"
     return normalized
 
@@ -1453,6 +1462,7 @@ def expense_document_capabilities_api():
         if "payment_reference" in {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}:
             net_features.append("payment_reference_v1")
         net_features.append("object_costs_v1")
+        net_features.append("object_cost_allocations_v1")
     finally:
         connection.close()
     return jsonify({
@@ -1819,7 +1829,6 @@ def expense_document_update_api(document_id):
     conn = get_db_connection()
     try:
         payload = expense_request_payload()
-        fields = validate_expense_fields(payload)
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         existing = cursor.execute(
@@ -1831,6 +1840,13 @@ def expense_document_update_api(document_id):
                                                  separators=(",", ":")).encode("utf-8")).hexdigest() if restore else None
         processing = cursor.execute("SELECT state,details_json FROM expense_processing WHERE document_id=?", (document_id,)).fetchone()
         details = json.loads(processing["details_json"]) if processing else {}
+        if details.get("usage") == "object_cost" or payload.get("usage") == "object_cost":
+            payload["usage"] = "object_cost"
+            if payload.get("expected_version") is None:
+                raise ValueError("Для изменения расхода обязательна актуальная версия документа.")
+            if "recognized_text" not in payload and existing is not None:
+                payload["recognized_text"] = existing["recognized_text"]
+        fields = validate_expense_fields(payload)
         cost_operation = str(payload.get("cost_operation_id") or "")
         cost_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
                                              separators=(",", ":")).encode("utf-8")).hexdigest()

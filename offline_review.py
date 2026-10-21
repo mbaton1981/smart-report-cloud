@@ -187,6 +187,10 @@ class OfflineReviewStore:
         return provenance
 
     def save(self, document_id, payload, expected_revision):
+        cleaned = self.clean_payload(payload)
+        return self.save_revision(document_id, cleaned, expected_revision)
+
+    def clean_payload(self, payload):
         if set(payload) - set(EDITABLE):
             raise ReviewError("Неизвестные поля исправления.")
         cleaned = {}
@@ -202,6 +206,9 @@ class OfflineReviewStore:
             elif key not in ("object_id", "original_checked"):
                 value = str(value).strip() if value not in (None, "") else None
             cleaned[key] = value
+        return cleaned
+
+    def save_revision(self, document_id, cleaned, expected_revision):
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             revision, previous = self.latest(document_id)
@@ -210,7 +217,7 @@ class OfflineReviewStore:
             if self.card(document_id):
                 raise ReviewError("Карточка уже перенесена; исходное подтверждение неизменно.")
             changes = {key: {"before": previous.get(key), "after": cleaned[key]}
-                       for key in EDITABLE if previous.get(key) != cleaned[key]}
+                       for key in cleaned if previous.get(key) != cleaned[key]}
             self.conn.execute("INSERT INTO revisions VALUES (?,?,?,?,?)",
                               (document_id, revision + 1, packed(cleaned), packed(changes),
                                datetime.now(timezone.utc).isoformat()))
