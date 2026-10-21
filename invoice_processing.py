@@ -30,5 +30,5 @@ def recognize_invoice(paths, parser=None):
                if fields.get(key) in (None, "")]
     if not any(page["text"].strip() for page in pages):
         errors.append("Не удалось извлечь текст; оригинал сохранён, доступен повтор обработки.")
-    return {"fields": fields, "methods": sorted(methods), "errors": errors,
+    return {"fields": fields, "methods": sorted(methods), "errors": errors, "page_count": len(pages),
             "missing_fields": missing, "state": "failed" if errors else "requires_review"}

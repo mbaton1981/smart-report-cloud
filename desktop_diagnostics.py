@@ -27,7 +27,10 @@ def run(app_module, action, work_dir, case="case", out_path=None):
     result = {"action": action, "case": case, "frozen": bool(getattr(sys, "frozen", False)), "server": url}
     state_path = work / f"{case}_state.json"
 
-    if action == "selftest":
+    if action == "mail-release":
+        from release_acceptance import verify_mail_release
+        result.update(verify_mail_release(app_module, work))
+    elif action == "selftest":
         from ob_calculator import load_ob_rules
         from rapidocr_onnxruntime import RapidOCR
         load_ob_rules()

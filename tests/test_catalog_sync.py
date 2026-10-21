@@ -1362,6 +1362,92 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_balance_employee_popup_preserves_bottom_scroll_during_refresh(self):
+        from PyQt6.QtCore import QTimer, Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QComboBox
+
+        conn = self.desktop.get_db_connection()
+        try:
+            conn.executemany("INSERT INTO employees (name,is_active) VALUES (?,?)",
+                             [(f"ZZ balance employee {i:03d}", i % 2) for i in range(90)])
+            conn.commit()
+        finally:
+            conn.close()
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setMaxVisibleItems(10)
+        combo.resize(300, 30)
+        host = SimpleNamespace(bal_emp_cb=combo)
+        refresh = lambda: self.desktop.SmartReportApp.load_dropdowns(host, refresh_tables=False)
+        refresh()
+        try:
+            combo.show()
+            for name in ("ZZ balance employee 088", "ZZ balance employee 089"):
+                combo.setCurrentIndex(0)
+                combo.showPopup()
+                self.qt_app.processEvents()
+                view = combo.view()
+                target = combo.model().index(combo.findText(name), 0)
+                view.setCurrentIndex(target)
+                view.scrollTo(target, view.ScrollHint.PositionAtBottom)
+                self.qt_app.processEvents()
+                scroll = view.verticalScrollBar().value()
+                self.assertGreater(scroll, 0)
+                timer = QTimer()
+                timer.setInterval(2000)
+                timer.timeout.connect(refresh)
+                timer.start()
+                try:
+                    QTest.qWait(2200)
+                finally:
+                    timer.stop()
+                self.assertTrue(view.isVisible())
+                self.assertEqual(view.verticalScrollBar().value(), scroll)
+                self.assertEqual(view.currentIndex(), target)
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton,
+                                 pos=view.visualRect(target).center())
+                self.assertEqual(combo.currentText(), name)
+                self.assertFalse(view.isVisible())
+        finally:
+            combo.close()
+            combo.deleteLater()
+
+    def test_balance_employee_catalog_changes_wait_until_popup_closes(self):
+        from PyQt6.QtWidgets import QComboBox
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        host = SimpleNamespace(bal_emp_cb=combo)
+        refresh = lambda: self.desktop.SmartReportApp.load_dropdowns(host, refresh_tables=False)
+        refresh()
+        try:
+            combo.setCurrentText("Local editable contact")
+            refresh()
+            self.assertEqual(combo.currentText(), "Local editable contact")
+            combo.show()
+            combo.showPopup()
+            self.qt_app.processEvents()
+            count = combo.count()
+            conn = self.desktop.get_db_connection()
+            try:
+                conn.execute("INSERT INTO employees (name,is_active) VALUES ('ZZ added during selection',0)")
+                conn.commit()
+            finally:
+                conn.close()
+            refresh()
+            self.assertEqual(combo.count(), count)
+            combo.hidePopup()
+            refresh()
+            self.assertGreaterEqual(combo.findText("ZZ added during selection"), 0)
+            self.assertEqual(combo.currentText(), "Local editable contact")
+            combo.blockSignals(True)
+            refresh()
+            self.assertTrue(combo.signalsBlocked())
+        finally:
+            combo.close()
+            combo.deleteLater()
+
     def test_invoice_object_selection_survives_dropdown_refresh(self):
         sync_id = str(uuid.uuid4())
         desktop_conn = self.desktop.get_db_connection()
@@ -2801,6 +2887,49 @@ class CatalogSyncTests(unittest.TestCase):
         old_client_response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=old_client_update)
         self.assertEqual(old_client_response.status_code, 409, old_client_response.get_json())
 
+    def test_desktop_invoice_review_blocks_order_and_tax_decision_confirmation(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._expense_objects = []
+        base_fields = {
+            "allocation_basis": "net",
+            "supplier_name": "Receiver AB",
+            "invoice_number": "DOC-1",
+            "document_date": "2026-10-13",
+            "currency_code": "SEK",
+            "net_amount": "100.00",
+            "vat_amount": "25.00",
+            "rounding_amount": "0.00",
+            "amount_due": "125.00",
+            "order_proposals": [{
+                "net_amount": "100.00", "vat_amount": "25.00",
+                "destination": "company", "object_id": None,
+                "expense_category": "Тест",
+            }],
+        }
+
+        def inspect_dialog(dialog):
+            confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+            self.assertFalse(confirm.isEnabled())
+            dialog.reject()
+            return dialog.result()
+
+        try:
+            for document_type, text in (
+                ("order_confirmation", "ORDERBEKRÄFTELSE"),
+                ("tax_decision", "Beslut om trängselskatt"),
+            ):
+                with self.subTest(document_type=document_type):
+                    fields = {
+                        **base_fields, "document_type": document_type,
+                        "non_invoice_document_type": document_type, "raw_text": text,
+                    }
+                    with patch.object(self.desktop.QDialog, "exec", new=inspect_dialog):
+                        self.assertFalse(window._review_net_invoice({}, [], fields))
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_invoice_vertical_totals_do_not_steal_next_row_amount(self):
         from expense_documents import parse_invoice_pages, net_invoice_issues
 
@@ -2821,6 +2950,33 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(fields["amount_due"], "2244.00")
         self.assertTrue(net_invoice_issues({**fields, "rounding_amount": "2244.00"},
                                           [{"destination": "company", "net_amount": "1795.00"}]))
+
+    def test_beijer_explicit_rounding_reconciles_document_gross_and_amount_due(self):
+        from expense_documents import parse_invoice_pages, net_invoice_issues
+
+        elements = []
+        for index, (caption, value) in enumerate((
+            ("Netto", "6 490,50 SEK"), ("Moms 25,00%", "1 622,63 SEK"),
+            ("Totalt inkl. moms", "8 113,13 SEK"), ("Öresavr.", "-0,13 SEK"),
+            ("Att betala", "8 113,00 SEK"),
+        )):
+            elements.extend([
+                {"text": caption, "x0": 300, "x1": 420, "y0": 100 + 25 * index, "y1": 110 + 25 * index},
+                {"text": value, "x0": 520, "x1": 590, "y0": 100 + 25 * index, "y1": 110 + 25 * index},
+            ])
+
+        fields = parse_invoice_pages([{"page": 2, "elements": elements}])
+        self.assertEqual(fields["gross_amount"], "8113.13")
+        self.assertEqual(fields["rounding_amount"], "-0.13")
+        self.assertEqual(fields["amount_due"], "8113.00")
+        self.assertEqual(fields["field_sources"]["rounding_amount"][0]["caption"], "Öresavr.")
+        self.assertEqual(net_invoice_issues(fields, [{
+            "destination": "company", "net_amount": "6490.50", "vat_amount": "1622.63",
+        }]), [])
+        self.assertTrue(net_invoice_issues(
+            {**fields, "rounding_amount": "0.00"},
+            [{"destination": "company", "net_amount": "6490.50", "vat_amount": "1622.63"}],
+        ))
 
     def test_invoice_explicit_tax_rate_and_buyer_block_never_use_item_price(self):
         from expense_documents import parse_invoice_pages

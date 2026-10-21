@@ -4,6 +4,9 @@ from PyInstaller.utils.hooks import collect_all
 
 root = os.path.abspath(os.path.join(SPECPATH, ".."))
 datas = [(os.path.join(root, "ob_rules.json"), ".")]
+manifest = os.environ.get("SMARTREPORT_BUILD_MANIFEST")
+if manifest:
+    datas.append((manifest, "."))
 binaries = []
 hiddenimports = []
 for package in ("rapidocr_onnxruntime", "onnxruntime"):
@@ -27,5 +30,6 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [], exclude_binaries=True, name="SmartReport",
     console=False, icon=icon if os.path.exists(icon) else None,
+    version=os.path.join(SPECPATH, "version_info.txt"),
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="SmartReport", strip=False, upx=False)

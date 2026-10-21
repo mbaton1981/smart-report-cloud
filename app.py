@@ -12,6 +12,7 @@ import time
 import uuid
 import tempfile
 import mimetypes
+import hashlib
 from decimal import Decimal
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -49,7 +50,10 @@ from expense_documents import (
     store_original_file,
     validate_allocations,
 )
-from expense_documents import parse_invoice_pages, parse_invoice_money, net_invoice_issues, invoice_context, due_date_issues, due_date_edit
+from expense_documents import (
+    non_invoice_document_type, parse_invoice_pages, parse_invoice_money, net_invoice_issues,
+    invoice_context, due_date_issues, due_date_edit,
+)
 from desktop_ui import ReportTable as QTableWidget
 
 import desktop_auth
@@ -4114,6 +4118,9 @@ class SmartReportApp(QMainWindow):
         self, document_id, source_path, fields, suggestions, existing_allocations,
         source_paths=None, preview_paths=None,
     ):
+        non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(
+            str(fields.get("raw_text") or fields.get("recognized_text") or "")
+        )
         new_paths = list(source_paths if source_paths is not None else ([source_path] if source_path else []))
         paths = list(preview_paths or new_paths)
         dialog = QDialog(self)
@@ -4220,6 +4227,14 @@ class SmartReportApp(QMainWindow):
             )
             transfer_note.setWordWrap(True)
             form.addRow("Проверка документа:", transfer_note)
+        if non_invoice_type:
+            note = QLabel(
+                "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                if non_invoice_type == "order_confirmation"
+                else "Решение о транспортном налоге не является фактурой; получатель не считается поставщиком."
+            )
+            note.setWordWrap(True)
+            form.addRow("Тип документа:", note)
 
         recognized_text = QTextEdit(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
         recognized_text.setReadOnly(True)
@@ -4466,6 +4481,13 @@ class SmartReportApp(QMainWindow):
             save_review.setText("Сохранить квитанцию: требует проверки")
             confirm.setEnabled(False)
             confirm.setToolTip("Квитанцию перевода нельзя подтверждать как фактуру.")
+        if non_invoice_type:
+            confirm.setEnabled(False)
+            confirm.setToolTip(
+                "Подтверждение заказа нельзя подтвердить как расход."
+                if non_invoice_type == "order_confirmation"
+                else "Решение о транспортном налоге нельзя подтвердить как фактуру."
+            )
         maximize_button = QPushButton("На весь экран")
         maximize_button.clicked.connect(
             lambda: dialog.showNormal() if dialog.isMaximized() else dialog.showMaximized()
@@ -4480,6 +4502,14 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(
                     dialog, "Требуется проверка",
                     "Квитанция перевода не является фактурой и сохраняется только со статусом «Требует проверки».",
+                )
+                return
+            if status == "confirmed" and non_invoice_type:
+                QMessageBox.warning(
+                    dialog, "Тип документа",
+                    "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                    if non_invoice_type == "order_confirmation"
+                    else "Решение о транспортном налоге нельзя подтвердить как фактуру.",
                 )
                 return
             net_value = parse_decimal(net_amount.text())
@@ -4606,6 +4636,9 @@ class SmartReportApp(QMainWindow):
         return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _legacy_expense_document_review_dialog(self, document_id, source_path, fields, suggestions, existing_allocations):
+        non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(
+            str(fields.get("raw_text") or fields.get("recognized_text") or "")
+        )
         dialog = QDialog(self)
         dialog.setWindowTitle("Проверка документа" if source_path else "Ручная запись расхода")
         dialog.resize(1380, 900)
@@ -4637,6 +4670,14 @@ class SmartReportApp(QMainWindow):
         recognized_text.setReadOnly(True)
         recognized_text.setPlainText(str(fields.get("raw_text") or ""))
         preview_tabs.addTab(recognized_text, "Текст распознавания")
+        if non_invoice_type:
+            classification_note = QLabel(
+                "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                if non_invoice_type == "order_confirmation"
+                else "Решение о транспортном налоге нельзя подтвердить как фактуру."
+            )
+            classification_note.setWordWrap(True)
+            root_layout.addWidget(classification_note)
         splitter.addWidget(preview_tabs)
 
         form_widget = QWidget()
@@ -4829,12 +4870,27 @@ class SmartReportApp(QMainWindow):
         save_draft = QPushButton("Сохранить черновик")
         save_review = QPushButton("Сохранить: требует проверки")
         confirm = QPushButton("Подтвердить документ")
+        if non_invoice_type:
+            confirm.setEnabled(False)
+            confirm.setToolTip(
+                "Подтверждение заказа нельзя подтвердить как расход."
+                if non_invoice_type == "order_confirmation"
+                else "Решение о транспортном налоге нельзя подтвердить как фактуру."
+            )
         cancel = QPushButton("Отмена")
         for button in (save_draft, save_review, confirm, cancel):
             action_row.addWidget(button)
         root_layout.addLayout(action_row)
 
         def save_document(status):
+            if status == "confirmed" and non_invoice_type:
+                QMessageBox.warning(
+                    dialog, "Тип документа",
+                    "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                    if non_invoice_type == "order_confirmation"
+                    else "Решение о транспортном налоге нельзя подтвердить как фактуру.",
+                )
+                return
             net_value = parse_decimal(net_amount.text())
             vat_value = parse_decimal(vat_amount.text())
             gross_value = parse_decimal(gross_amount.text())
@@ -6167,6 +6223,8 @@ class SmartReportApp(QMainWindow):
         upload_button.clicked.connect(self.upload_expense_document)
         manual_button = QPushButton("Добавить вручную")
         manual_button.clicked.connect(self.open_manual_document_dialog)
+        mail_button = QPushButton("Входящие фактуры")
+        mail_button.clicked.connect(self.open_mail_queue)
         edit_button = QPushButton("Изменить")
         edit_button.clicked.connect(self.review_selected_document)
         reprocess_button = QPushButton("Распознать сохранённый оригинал")
@@ -6178,7 +6236,7 @@ class SmartReportApp(QMainWindow):
         delete_button.clicked.connect(self.delete_selected_expense_document)
         open_button = QPushButton("Открыть оригинал")
         open_button.clicked.connect(self.open_selected_document_original)
-        for button in (upload_button, manual_button, edit_button, reprocess_button, vat_button, delete_button, open_button):
+        for button in (upload_button, mail_button, manual_button, edit_button, reprocess_button, vat_button, delete_button, open_button):
             actions.addWidget(button)
         page_layout.addLayout(actions)
 
@@ -6190,6 +6248,31 @@ class SmartReportApp(QMainWindow):
         self.exp_date_to.dateChanged.connect(self.load_expense_documents)
         self.exp_filter_object.currentIndexChanged.connect(self.load_expense_documents)
         self.exp_filter_unallocated.toggled.connect(self.load_expense_documents)
+
+    def open_mail_queue(self):
+        from desktop_mail import DesktopMailViewer
+
+        viewer = getattr(self, "_mail_viewer", None)
+        if viewer is None:
+            try:
+                profile = hashlib.sha256(str(Path(DB_FILE).resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+                viewer = DesktopMailViewer(self, desktop_auth.app_data_dir() / "mail-inbox" / profile)
+            except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
+                logging.exception("Не удалось открыть почтовую очередь")
+                QMessageBox.warning(self, "Входящие фактуры", str(error))
+                return
+            self._mail_viewer = viewer
+            viewer.destroyed.connect(lambda: setattr(self, "_mail_viewer", None))
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+
+    def closeEvent(self, event):
+        viewer = getattr(self, "_mail_viewer", None)
+        if viewer is not None and not viewer.close():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _on_expense_view_changed(self, index):
         self.load_expense_document_filters()
@@ -6719,6 +6802,7 @@ class SmartReportApp(QMainWindow):
     def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None):
         fields = {**parsed_fields, **document}
         source_text = str(fields.get("raw_text") or fields.get("recognized_text") or "")
+        non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(source_text)
         context = invoice_context(source_text)
         context["prepaid"] = context["prepaid"] or fields.get("prepaid") is True
         context["reverse_charge"] = context["reverse_charge"] or fields.get("reverse_charge") is True
@@ -6747,12 +6831,21 @@ class SmartReportApp(QMainWindow):
             top.addWidget(QLabel("Оригинал не прикреплён"))
         details = QWidget()
         form = QFormLayout(details)
+        if non_invoice_type:
+            note = QLabel(
+                "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                if non_invoice_type == "order_confirmation"
+                else "Решение о транспортном налоге нельзя подтвердить как фактуру."
+            )
+            note.setWordWrap(True)
+            form.addRow("Тип документа:", note)
         inputs = {}
         for key, label in (
             ("supplier_name", "Поставщик"), ("invoice_number", "Номер фактуры"),
             ("document_date", "Дата (ГГГГ-ММ-ДД)"), ("due_date", "Срок оплаты (ГГГГ-ММ-ДД)"), ("currency_code", "Валюта"),
             ("net_amount", "Сумма без НДС"), ("vat_amount", "НДС фактуры"),
             ("rounding_amount", "Округление"), ("amount_due", "К оплате"),
+            ("payment_reference", "OCR / reference"),
         ):
             value = fields.get(key)
             if key == "currency_code" and value == "UNKNOWN":
@@ -6893,7 +6986,7 @@ class SmartReportApp(QMainWindow):
             if current["currency_code"].upper() not in {"SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"}:
                 issues.append("Выберите валюту.")
             issues_label.setText("Для подтверждения: " + " ".join(issues[:3]) if issues else "Суммы согласованы. Назначения выбраны.")
-            confirm.setEnabled(not issues)
+            confirm.setEnabled(not issues and non_invoice_type is None)
 
         def append_row(original=None):
             original = dict(original or {})
@@ -6966,6 +7059,14 @@ class SmartReportApp(QMainWindow):
 
         def save(status):
             current, rows = values()
+            if status == "confirmed" and non_invoice_type:
+                QMessageBox.warning(
+                    dialog, "Тип документа",
+                    "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                    if non_invoice_type == "order_confirmation"
+                    else "Решение о транспортном налоге нельзя подтвердить как фактуру.",
+                )
+                return
             if current["due_date"]:
                 date_errors = due_date_issues({"due_date": current["due_date"], "due_date_kind": "manual"})
                 if date_errors:
@@ -7030,6 +7131,14 @@ class SmartReportApp(QMainWindow):
             document["local_attachment_paths"] = server_document.get("local_attachment_paths", [])
         parsed_fields = dict(parsed_fields or {})
         source_paths = list(source_paths or [])
+        non_invoice_type = (
+            document.get("non_invoice_document_type")
+            or parsed_fields.get("non_invoice_document_type")
+            or non_invoice_document_type(str(
+                document.get("raw_text") or document.get("recognized_text")
+                or parsed_fields.get("raw_text") or parsed_fields.get("recognized_text") or ""
+            ))
+        )
         self.load_expense_document_filters()
         if (document.get("allocation_basis") == "net" or parsed_fields.get("allocation_basis") == "net"
                 or document.get("order_proposals") or parsed_fields.get("order_proposals")):
@@ -7043,6 +7152,14 @@ class SmartReportApp(QMainWindow):
         dialog.setWindowTitle("Документ расходов" if document.get("client_id") else "Новый расход")
         dialog.setMinimumWidth(620)
         form = QFormLayout(dialog)
+        if non_invoice_type:
+            note = QLabel(
+                "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                if non_invoice_type == "order_confirmation"
+                else "Решение о транспортном налоге нельзя подтвердить как фактуру."
+            )
+            note.setWordWrap(True)
+            form.addRow("Тип документа:", note)
 
         supplier = QLineEdit(str(document.get("supplier_name") or parsed_fields.get("supplier_name") or ""))
         supplier.setObjectName("expenseSupplier")
@@ -7213,6 +7330,14 @@ class SmartReportApp(QMainWindow):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить документ")
         def accept_due_date():
+            if non_invoice_type and status.currentData() == "confirmed":
+                QMessageBox.warning(
+                    dialog, "Тип документа",
+                    "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
+                    if non_invoice_type == "order_confirmation"
+                    else "Решение о транспортном налоге нельзя подтвердить как фактуру.",
+                )
+                return
             candidate = due_date_edit(due_fields, due_date_input.text(), due_date_reviewed.isChecked())
             if candidate["due_date"]:
                 format_errors = due_date_issues({"due_date": candidate["due_date"], "due_date_kind": "manual"})
@@ -8967,15 +9092,22 @@ class SmartReportApp(QMainWindow):
                 self.emp_cb.addItem(row[0])
 
         if hasattr(self, 'bal_emp_cb'):
-            selected_balance_person = self.bal_emp_cb.currentText()
-            self.bal_emp_cb.blockSignals(True)
-            self.bal_emp_cb.clear()
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            for row in cursor.fetchall():
-                self.bal_emp_cb.addItem(row[0])
-            if selected_balance_person:
-                self.bal_emp_cb.setCurrentText(selected_balance_person)
-            self.bal_emp_cb.blockSignals(False)
+            balance_people = [row[0] for row in cursor.fetchall()]
+            current_people = [
+                self.bal_emp_cb.itemText(index) for index in range(self.bal_emp_cb.count())
+            ]
+            # Rebuilding an open popup resets its scroll and highlighted employee.
+            if not self.bal_emp_cb.view().isVisible() and current_people != balance_people:
+                selected_balance_person = self.bal_emp_cb.currentText()
+                blocked = self.bal_emp_cb.blockSignals(True)
+                try:
+                    self.bal_emp_cb.clear()
+                    self.bal_emp_cb.addItems(balance_people)
+                    if selected_balance_person:
+                        self.bal_emp_cb.setCurrentText(selected_balance_person)
+                finally:
+                    self.bal_emp_cb.blockSignals(blocked)
 
         if hasattr(self, 'filter_emp'):
             curr_emp = self.filter_emp.currentText()
