@@ -37,7 +37,14 @@ class IncomingStore(OfflineReviewStore):
                 created_at TEXT NOT NULL, PRIMARY KEY(document_id,revision))""")
 
     def objects(self):
+        provider = getattr(self.host, "incoming_allocation_objects", None)
+        if provider:
+            return provider()
         return list(self.host._expense_objects)
+
+    def allocation_proposal(self, document_id):
+        from document_costs import propose_object_allocations
+        return propose_object_allocations(self.base(document_id), self.objects())
 
     @staticmethod
     def allocations(payload):
@@ -425,7 +432,7 @@ class IncomingStore(OfflineReviewStore):
             required_attachment_sha256=[card["sha256"]],
             allocations=[{"destination": "object", **part} for part in self.allocations(payload)],
         )
-        for key in ("amount_due", "settlement_status", "due_date", "rounding_amount"):
+        for key in ("amount_due", "settlement_status", "due_date"):
             payload.pop(key, None)
         # Retry the same client_id through the normal outbox. The queue is durable before
         # recording delivery; a lost response cannot change the document's identity.
@@ -486,7 +493,7 @@ def open_incoming(host, root):
         window.status.setText("Запрошен полный снимок обычного реестра. До успешного получения перенос запрещён.")
 
     refresh.clicked.connect(refresh_register)
-    window.layout().insertWidget(window.layout().count() - 1, refresh)
+    window.diagnostics_layout.addWidget(refresh)
     load = QPushButton("Открыть сохранённый локальный снимок очереди — без почты")
 
     def import_snapshot():
@@ -504,8 +511,8 @@ def open_incoming(host, root):
         host.open_incoming_documents()
 
     load.clicked.connect(import_snapshot)
-    window.layout().insertWidget(window.layout().count() - 1, load)
-    window.layout().insertWidget(window.layout().count() - 1, retry)
+    window.diagnostics_layout.addWidget(load)
+    window.diagnostics_layout.addWidget(retry)
     from folder_mail import open_import_dialog, recent_period
     start, end = recent_period()
     mail = QPushButton(f"Получить документы · INBOX · последние 30 дней ({start} — {end})")

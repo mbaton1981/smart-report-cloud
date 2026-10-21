@@ -2068,7 +2068,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.18-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.19-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -6553,6 +6553,19 @@ class SmartReportApp(QMainWindow):
         requested = getattr(self, "_expense_requested_key", key)
         if requested != key or refresh_again:
             self._schedule_expense_read(requested)
+
+    def incoming_allocation_objects(self):
+        objects = list(getattr(self, "_expense_objects", []))
+        known = {item["id"] for item in objects}
+        conn = get_db_connection()
+        try:
+            objects.extend(dict(row) for row in conn.execute("""
+                SELECT server_id AS id,sync_id,name,markning,company,is_active FROM objects
+                WHERE server_id IS NOT NULL AND is_active=0 ORDER BY company,name,id
+            """) if row["id"] not in known)
+        finally:
+            conn.close()
+        return objects
 
     def _expense_server_objects(self):
         if getattr(self, "_async_expense_reads", False):

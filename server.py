@@ -1028,6 +1028,13 @@ def validate_expense_fields(payload):
         if amount_values["gross_amount"] is not None and amount_values["vat_amount"] is not None
         else None
         )
+        if object_cost and payload.get("net_amount") not in (None, "") and payload.get("rounding_amount") not in (None, ""):
+            net = parse_invoice_money(payload["net_amount"])
+            rounding = parse_invoice_money(payload["rounding_amount"])
+            if (net is None or rounding is None or amount_values["vat_amount"] is None
+                    or net + amount_values["vat_amount"] + rounding != amount_values["gross_amount"]):
+                raise ValueError("Нетто + НДС + указанное округление не равны сумме расхода.")
+            amount_values.update(net_amount=net, rounding_amount=rounding)
     elif amount_values["net_amount"] is not None and amount_values["vat_amount"] is not None:
         expected_gross = amount_values["net_amount"] + amount_values["vat_amount"]
         if amount_values["gross_amount"] is not None and amount_values["gross_amount"] != expected_gross:
@@ -1126,7 +1133,8 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
                 object_id = int(object_id)
             except (TypeError, ValueError) as error:
                 raise ValueError("Некорректный объект распределения.") from error
-            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
+            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND (is_active = 1 OR ? = 'object_cost')",
+                           (object_id, fields.get("usage")))
             if cursor.fetchone() is None:
                 raise ValueError("Активный объект не найден в серверном справочнике.")
         allocated_gross = parse_decimal(item.get("gross_amount"))
@@ -1294,7 +1302,8 @@ def store_expense_allocation_rows(cursor, document_id, allocations, fields):
         cursor.execute("UPDATE expense_documents SET allocation_basis='net', rounding_amount=?, amount_due=? WHERE id=?",
                        (fields.get("rounding_amount"), fields.get("amount_due"), document_id))
     elif invoice_net_schema_ready(cursor):
-        cursor.execute("UPDATE expense_documents SET allocation_basis='gross' WHERE id=?", (document_id,))
+        cursor.execute("UPDATE expense_documents SET allocation_basis='gross',rounding_amount=? WHERE id=?",
+                       (fields.get("rounding_amount"), document_id))
     rows = []
     for item in allocations:
         row = [document_id, item["object_id"], item["gross_amount"], item["net_amount"], item["vat_amount"], item["note"]]
@@ -1858,6 +1867,12 @@ def expense_document_update_api(document_id):
                 raise ValueError("Для изменения расхода обязательна актуальная версия документа.")
             if "recognized_text" not in payload and existing is not None:
                 payload["recognized_text"] = existing["recognized_text"]
+            if (existing is not None and "rounding_amount" in existing.keys()
+                    and existing["rounding_amount"] is not None and "rounding_amount" not in payload
+                    and parse_invoice_money(payload.get("gross_amount")) == parse_invoice_money(existing["gross_amount"])
+                    and parse_invoice_money(payload.get("vat_amount")) == parse_invoice_money(existing["vat_amount"])):
+                payload["net_amount"] = existing["net_amount"]
+                payload["rounding_amount"] = existing["rounding_amount"]
         fields = validate_expense_fields(payload)
         cost_operation = str(payload.get("cost_operation_id") or "")
         cost_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,

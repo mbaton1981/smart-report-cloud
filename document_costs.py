@@ -7,6 +7,81 @@ from decimal import Decimal
 from expense_documents import _date_value, decimal_text, non_invoice_document_type, parse_invoice_money
 
 
+def propose_object_allocations(fields, objects):
+    """Build a review-only proposal from verified order/item evidence, never save it."""
+    from decimal import ROUND_DOWN
+    orders = fields.get("order_proposals") or []
+    result = {"parts": [], "warnings": [], "errors": [], "rounding": "0.00", "total": None}
+    result["errors"].extend(fields.get("order_proposal_warnings") or [])
+    if not orders:
+        result["errors"].append("Маркировки и суммы заказов не распознаны. Доступно ручное распределение.")
+        return result
+    grouped, seen = {}, set()
+    for order in orders:
+        marker = str(order.get("project_code") or order.get("original_marker") or "").strip()
+        identifier = order.get("order_id")
+        net, vat = (parse_invoice_money(order.get(key)) for key in ("net_amount", "vat_amount"))
+        if (not marker or not identifier or identifier in seen or order.get("ambiguous")
+                or net is None or vat is None or not net.is_finite() or not vat.is_finite()
+                or net < 0 or vat < 0):
+            result["errors"].append("Есть неоднозначный заказ, маркировка или сумма. Автоприменение запрещено.")
+            continue
+        seen.add(identifier)
+        items = order.get("vat_items") or []
+        values = [[parse_invoice_money(item.get(key)) for item in items]
+                  for key in ("net_amount", "vat_amount")]
+        if (not items or any(value is None or not value.is_finite() for row in values for value in row)
+                or sum(values[0], Decimal(0)) != net or sum(values[1], Decimal(0)) != vat):
+            result["errors"].append(f"{marker}: позиции не подтверждают сумму и НДС заказа.")
+            continue
+        key = marker.casefold()
+        part = grouped.setdefault(key, {"marker": marker, "net": Decimal(0), "vat": Decimal(0),
+                                         "pages": set(), "orders": []})
+        part["net"] += net
+        part["vat"] += vat
+        part["orders"].append(identifier)
+        part["pages"].update(int(item["page"]) for item in items)
+    net, vat = (parse_invoice_money(fields.get(key)) for key in ("net_amount", "vat_amount"))
+    rounding = parse_invoice_money(fields.get("rounding_amount")) if fields.get("rounding_amount") not in (None, "") else Decimal(0)
+    if (net is None or vat is None or rounding is None
+            or any(not value.is_finite() for value in (net, vat, rounding))):
+        result["errors"].append("Итог, НДС или округление документа не определены.")
+        return result
+    gross = net + vat
+    total = gross + rounding
+    if (not grouped or gross <= 0 or total <= 0 or abs(rounding) > Decimal("1.00")
+            or sum((p["net"] for p in grouped.values()), Decimal(0)) != net
+            or sum((p["vat"] for p in grouped.values()), Decimal(0)) != vat):
+        result["errors"].append("Суммы блоков не сходятся с итогом документа или округление требует ручной проверки.")
+        return result
+    # Allocate only the stated rounding, in cents, using largest remainders.
+    count = int(abs(rounding) * 100)
+    shares = {key: Decimal(count) * (part["net"] + part["vat"]) / gross for key, part in grouped.items()}
+    cents = {key: int(value.to_integral_value(rounding=ROUND_DOWN)) for key, value in shares.items()}
+    for key in sorted(shares, key=lambda k: (-(shares[k] - cents[k]), k))[:count - sum(cents.values())]:
+        cents[key] += 1
+    for key, part in grouped.items():
+        matches = [obj for obj in objects if str(obj.get("markning") or "").strip().casefold() == key]
+        selected = matches[0] if len(matches) == 1 else None
+        warning = ("Неизвестная маркировка — выберите объект вручную" if not matches else
+                   "Маркировка соответствует нескольким объектам — выберите вручную" if len(matches) > 1 else
+                   "Объект неактивен" if not selected.get("is_active", 1) else "")
+        adjustment = Decimal(cents[key]) / 100 * (-1 if rounding < 0 else 1)
+        result["parts"].append({
+            "marker": part["marker"], "object_id": selected["id"] if selected else None,
+            "object_name": selected["name"] if selected else "", "warning": warning,
+            "net_amount": decimal_text(part["net"]), "vat_amount": decimal_text(part["vat"]),
+            "before_rounding": decimal_text(part["net"] + part["vat"]),
+            "rounding": decimal_text(adjustment),
+            "gross_amount": decimal_text(part["net"] + part["vat"] + adjustment),
+            "pages": sorted(part["pages"]), "orders": part["orders"],
+        })
+        if warning:
+            result["warnings"].append(f"{part['marker']}: {warning}")
+    result.update(rounding=decimal_text(rounding), total=decimal_text(total))
+    return result
+
+
 def extract_cost_fields(pages, fields):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     tax = non_invoice_document_type(text) == "tax_decision"

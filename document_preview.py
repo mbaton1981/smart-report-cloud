@@ -78,7 +78,7 @@ class DocumentPreviewDialog(QDialog):
         layout.addWidget(self.preview, 1)
 
 class DocumentGalleryDialog(QDialog):
-    def __init__(self, paths, title, parent=None, initial_page=0, initial_attachment=0):
+    def __init__(self, paths, title, parent=None, initial_page=0, initial_attachment=0, compact=False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1180, 900)
@@ -87,6 +87,7 @@ class DocumentGalleryDialog(QDialog):
         self._pages = []
         self._attachment_offsets = []
         self._page_index = 0
+        self.compact = compact
         self.finished.connect(self.release_resources)
         starting_page = 0
         for attachment_index, path in enumerate(paths):
@@ -118,7 +119,7 @@ class DocumentGalleryDialog(QDialog):
         self.next_button.setToolTip("Следующая страница")
         self.next_button.clicked.connect(lambda: self.show_page(self._page_index + 1))
         self.page_label = QLabel("")
-        self.page_label.setMinimumWidth(150)
+        self.page_label.setMinimumWidth(60 if compact else 150)
         self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         controls.addWidget(self.previous_button)
         controls.addWidget(self.page_label)
@@ -159,7 +160,9 @@ class DocumentGalleryDialog(QDialog):
             pixmap = QPixmap(str(source))
         self.preview._image.setPixmap(pixmap)
         self.preview.fit_width()
-        self.page_label.setText(f"{self._page_index + 1} / {len(self._pages)} · {name}")
+        self.page_label.setText(f"{self._page_index + 1} / {len(self._pages)}"
+                               + ("" if self.compact else f" · {name}"))
+        self.page_label.setToolTip(name)
         self.previous_button.setEnabled(self._page_index > 0)
         self.next_button.setEnabled(self._page_index + 1 < len(self._pages))
 

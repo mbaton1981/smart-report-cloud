@@ -27,7 +27,10 @@ def run(app_module, action, work_dir, case="case", out_path=None):
     result = {"action": action, "case": case, "frozen": bool(getattr(sys, "frozen", False)), "server": url}
     state_path = work / f"{case}_state.json"
 
-    if action == "shift-edit":
+    if action == "incoming-proposal":
+        from proposal_acceptance import verify_proposal
+        result.update(verify_proposal(app_module, work))
+    elif action == "shift-edit":
         from shift_edit_acceptance import verify_shift_edit
         harness = SimpleNamespace(_manual_sync_requested=False)
         harness.apply_remote_shift = lambda cursor, shift: app_module.SmartReportApp.apply_remote_shift(

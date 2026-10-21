@@ -5,6 +5,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from html import escape
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
@@ -12,7 +13,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSplitter, QTextEdit,
-    QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
 )
 
 from document_preview import DocumentGalleryDialog
@@ -42,14 +43,12 @@ class OfflineReviewWindow(QDialog):
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
                             else "SmartReport — ЛОКАЛЬНЫЙ ТЕСТ: входящие PDF")
         self.resize(1450, 940)
+        self.setMinimumSize(760, 560)
         layout = QVBoxLayout(self)
         banner = QLabel(
-            ("PDF распознаётся автоматически. Проверьте поля и распределите общую сумму по объектам.\n"
-             "INBOX: «Получить документы» — последние 30 дней; «Загрузить архив» — выбранный период.\n"
-             "Только по кнопке, без расписания. Все ранее сохранённые документы остаются в очереди.\n"
+            ("Проверьте распознанные данные и распределение по объектам."
              if integrated else
-             "ОТДЕЛЬНЫЙ ТЕСТОВЫЙ ПРОФИЛЬ. Почта, рабочая база и синхронизация отключены.\n")
-            + f"Профиль: {store.root}")
+             f"ОТДЕЛЬНЫЙ ТЕСТОВЫЙ ПРОФИЛЬ. Почта, рабочая база и синхронизация отключены.\nПрофиль: {store.root}"))
         banner.setWordWrap(True)
         layout.addWidget(banner)
         self.selector = QComboBox()
@@ -62,14 +61,21 @@ class OfflineReviewWindow(QDialog):
         self.classification.setWordWrap(True)
         layout.addWidget(self.classification)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(9)
         layout.addWidget(self.splitter, 1)
         self.preview_host = QWidget()
+        self.preview_host.setMinimumWidth(220)
         self.preview_layout = QVBoxLayout(self.preview_host)
         self.splitter.addWidget(self.preview_host)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(470)
         details = QWidget()
         form = QFormLayout(details)
+        if integrated:
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.kind = QComboBox()
         self.kind.addItem("Не подтверждён — сверьте оригинал", None)
         self.kind.addItem("Подтверждаю: фактура", "invoice")
@@ -104,6 +110,8 @@ class OfflineReviewWindow(QDialog):
             origin.setWordWrap(True)
             box.addWidget(field)
             box.addWidget(origin)
+            if integrated:
+                origin.hide()
             form.addRow(label + ":", row)
             self.inputs[key], self.origins[key] = field, origin
             field.textChanged.connect(self.update_origins)
@@ -126,14 +134,31 @@ class OfflineReviewWindow(QDialog):
             self.allocations.setHorizontalHeaderLabels(["Объект", "Сумма", ""])
             header = self.allocations.horizontalHeader()
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-            self.allocations.setMinimumHeight(160)
-            form.addRow("Распределение по объектам:", self.allocations)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+            metrics = self.allocations.fontMetrics()
+            self.allocations.setColumnWidth(1, max(135, metrics.horizontalAdvance("9 999 999,99") + 38))
+            self.allocations.setColumnWidth(2, max(100, QPushButton("Убрать").sizeHint().width() + 10))
+            self.allocations.verticalHeader().hide()
+            self.allocations.setMinimumHeight(190)
+            self.allocations.setMinimumWidth(440)
+            self.proposal_label = QLabel()
+            self.proposal_label.setWordWrap(True)
+            self.proposal_label.setTextFormat(Qt.TextFormat.RichText)
+            self.proposal_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            form.addRow(self.proposal_label)
+            self.apply_proposal_button = QPushButton("Применить предложение распределения")
+            self.apply_proposal_button.setObjectName("apply_allocation_proposal")
+            self.apply_proposal_button.clicked.connect(self.apply_proposal)
+            form.addRow(self.apply_proposal_button)
+            form.addRow(QLabel("Распределение по объектам:"))
+            form.addRow(self.allocations)
             self.add_allocation_button = QPushButton("Добавить объект — сумму")
             self.add_allocation_button.clicked.connect(lambda: self.add_allocation())
             form.addRow(self.add_allocation_button)
             self.allocation_total = QLabel()
+            self.allocation_total.setWordWrap(True)
+            self.allocation_total.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             form.addRow(self.allocation_total)
             self.allocations.itemChanged.connect(self.update_allocation_total)
             self.inputs["gross_amount"].textChanged.connect(self.update_allocation_total)
@@ -141,15 +166,28 @@ class OfflineReviewWindow(QDialog):
             form.addRow("Объект:", self.object)
         self.checked = QCheckBox("Сверил оригинал, реквизиты и отсутствие повтора покупки")
         form.addRow(self.checked)
+        self.diagnostics_button = QPushButton("Диагностика")
+        self.diagnostics_button.setCheckable(True)
+        form.addRow(self.diagnostics_button)
+        self.diagnostics = QWidget()
+        self.diagnostics_layout = QVBoxLayout(self.diagnostics)
+        profile_label = QLabel(f"Профиль: {store.root}")
+        profile_label.setWordWrap(True)
+        profile_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.diagnostics_layout.addWidget(profile_label)
         self.history = QTextEdit()
         self.history.setReadOnly(True)
         self.history.setMaximumHeight(120)
-        form.addRow("История правок:", self.history)
+        self.diagnostics_layout.addWidget(QLabel("История правок:"))
+        self.diagnostics_layout.addWidget(self.history)
+        form.addRow(self.diagnostics)
+        self.diagnostics.hide()
+        self.diagnostics_button.toggled.connect(self.diagnostics.setVisible)
         scroll.setWidget(details)
         self.financial_panel = scroll
         self.splitter.addWidget(scroll)
         self.splitter.setSizes([800, 600])
-        buttons = QHBoxLayout()
+        buttons = QVBoxLayout() if integrated else QHBoxLayout()
         self.save_button = QPushButton("Сохранить исправления — без расхода")
         self.transfer_button = QPushButton("Подтвердить и перенести")
         self.registry_button = QPushButton("Тестовый реестр")
@@ -158,7 +196,7 @@ class OfflineReviewWindow(QDialog):
             self.transfer_button.setText("Добавить к расходам объекта")
             self.reassign_button = QPushButton("Открыть актуальное распределение")
             self.reassign_button.clicked.connect(self.refresh_distribution)
-            buttons.addWidget(self.reassign_button)
+            form.addRow(self.reassign_button)
             actions = QHBoxLayout()
             self.ignore_button = QPushButton("Не учитывать")
             self.later_button = QPushButton("Разобрать позже")
@@ -171,7 +209,10 @@ class OfflineReviewWindow(QDialog):
             layout.addLayout(actions)
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.transfer_button)
-        buttons.addWidget(self.registry_button)
+        if integrated:
+            self.diagnostics_layout.addWidget(self.registry_button)
+        else:
+            buttons.addWidget(self.registry_button)
         layout.addLayout(buttons)
         self.status = QLabel()
         self.status.setWordWrap(True)
@@ -190,6 +231,15 @@ class OfflineReviewWindow(QDialog):
                 "settlement_status": None if self.integrated else
                     "prepaid" if self.receipt_paid.isChecked() else None}
         if self.integrated:
+            from expense_documents import parse_invoice_money, decimal_text
+            base = self.store.base(self.document_id)
+            rounding = parse_invoice_money(base.get("rounding_amount"))
+            net = parse_invoice_money(result.get("net_amount"))
+            vat = parse_invoice_money(result.get("vat_amount"))
+            gross = parse_invoice_money(result.get("gross_amount"))
+            if (rounding is not None and net is not None and vat is not None
+                    and net + vat + rounding == gross):
+                result["rounding_amount"] = decimal_text(rounding)
             parts = [{"object_id": self.allocations.cellWidget(row, 0).currentData(),
                       "gross_amount": self.allocations.item(row, 1).text().strip() or None}
                      for row in range(self.allocations.rowCount())]
@@ -206,9 +256,11 @@ class OfflineReviewWindow(QDialog):
         row = self.allocations.rowCount()
         self.allocations.insertRow(row)
         combo = QComboBox()
+        combo.setMinimumWidth(110)
+        combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         combo.addItem("Выберите объект", None)
         for obj in self.store.objects():
-            combo.addItem(obj["name"], obj["id"])
+            combo.addItem(obj["name"] + (" — Объект неактивен" if not obj.get("is_active", 1) else ""), obj["id"])
         selected = part.get("object_id")
         if selected is not None and combo.findData(selected) < 0:
             combo.addItem(f"Объект #{selected} — недоступен", selected)
@@ -226,7 +278,53 @@ class OfflineReviewWindow(QDialog):
             self.update_allocation_total()
         remove.clicked.connect(remove_row)
         self.allocations.setCellWidget(row, 2, remove)
+        self.allocations.setRowHeight(row, max(combo.sizeHint().height(), remove.sizeHint().height(),
+                                               self.allocations.fontMetrics().height() + 18) + 8)
         self.update_allocation_total()
+
+    def show_proposal(self):
+        self.proposal = self.store.allocation_proposal(self.document_id)
+        proposal = self.proposal
+        lines = ["<b>Предложение по маркировкам из всех страниц PDF — проверьте перед применением</b>"]
+        for part in proposal["parts"]:
+            lines.append(
+                f"{escape(part['marker'])} — {escape(part['object_name'] or 'Объект не определён')}: "
+                f"<b>{part['gross_amount']}</b>; до округления {part['before_rounding']}, "
+                f"доля округления {part['rounding']}; стр. {', '.join(map(str, part['pages']))}"
+                + (f" — <b>{escape(part['warning'])}</b>" if part["warning"] else ""))
+        if proposal["total"]:
+            lines.append(f"Округление документа: {proposal['rounding']} SEK. Распределено пропорционально "
+                         "суммам с НДС, остаточные эре — по наибольшим дробным долям. "
+                         f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
+        lines.extend(escape(text) for text in proposal["errors"])
+        self.proposal_label.setText("<br>".join(lines))
+        self.apply_proposal_button.setEnabled(bool(proposal["parts"]) and not proposal["errors"]
+                                              and not self.store.card(self.document_id))
+
+    def apply_proposal(self):
+        from expense_documents import parse_invoice_money
+        proposal = self.store.allocation_proposal(self.document_id)
+        if proposal["errors"] or not proposal["parts"] or self.store.card(self.document_id):
+            QMessageBox.warning(self, "Предложение недоступно", "\n".join(proposal["errors"]) or
+                                "Расход уже создан. Откройте актуальное распределение.")
+            return
+        base = self.store.base(self.document_id)
+        for key in ("net_amount", "vat_amount"):
+            if parse_invoice_money(self.inputs[key].text()) != parse_invoice_money(base.get(key)):
+                QMessageBox.warning(self, "Нужна проверка", "Нетто или НДС изменены вручную. Предложение исходного PDF не применено.")
+                return
+        if self.allocations.rowCount() or parse_invoice_money(self.inputs["gross_amount"].text()) != parse_invoice_money(proposal["total"]):
+            if QMessageBox.question(self, "Применить предложение?",
+                    "Заменить текущие строки распределения предложением и установить итог с указанным "
+                    "округлением? Нетто и НДС не меняются. Сохранение — отдельной кнопкой.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        self.allocations.setRowCount(0)
+        for part in proposal["parts"]:
+            self.add_allocation(part)
+        self.inputs["gross_amount"].setText(proposal["total"])
+        self.status.setText("Предложение применено только к форме. Проверьте объекты и сохраните. Расход не создан.")
 
     def update_allocation_total(self, *_):
         if not self.integrated or not hasattr(self, "allocation_total"):
@@ -429,6 +527,7 @@ class OfflineReviewWindow(QDialog):
             for part in self.store.allocations(payload):
                 self.add_allocation(part)
             self.update_allocation_total()
+            self.show_proposal()
         self.checked.setChecked(payload.get("original_checked") is True)
         self.amount_choices.blockSignals(True)
         self.amount_choices.clear()
@@ -477,7 +576,7 @@ class OfflineReviewWindow(QDialog):
         if self.gallery is None:
             try:
                 path = self.store.original(self.document_id)
-                self.gallery = DocumentGalleryDialog([path], "Исходный PDF", self)
+                self.gallery = DocumentGalleryDialog([path], "Исходный PDF", self, compact=self.integrated)
                 self.gallery.setWindowFlags(Qt.WindowType.Widget)
                 self.preview_layout.addWidget(self.gallery)
                 self.preview_document_id = self.document_id
