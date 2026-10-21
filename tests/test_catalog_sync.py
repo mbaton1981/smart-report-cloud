@@ -1362,6 +1362,92 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_balance_employee_popup_preserves_bottom_scroll_during_refresh(self):
+        from PyQt6.QtCore import QTimer, Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QComboBox
+
+        conn = self.desktop.get_db_connection()
+        try:
+            conn.executemany("INSERT INTO employees (name,is_active) VALUES (?,?)",
+                             [(f"ZZ balance employee {i:03d}", i % 2) for i in range(90)])
+            conn.commit()
+        finally:
+            conn.close()
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setMaxVisibleItems(10)
+        combo.resize(300, 30)
+        host = SimpleNamespace(bal_emp_cb=combo)
+        refresh = lambda: self.desktop.SmartReportApp.load_dropdowns(host, refresh_tables=False)
+        refresh()
+        try:
+            combo.show()
+            for name in ("ZZ balance employee 088", "ZZ balance employee 089"):
+                combo.setCurrentIndex(0)
+                combo.showPopup()
+                self.qt_app.processEvents()
+                view = combo.view()
+                target = combo.model().index(combo.findText(name), 0)
+                view.setCurrentIndex(target)
+                view.scrollTo(target, view.ScrollHint.PositionAtBottom)
+                self.qt_app.processEvents()
+                scroll = view.verticalScrollBar().value()
+                self.assertGreater(scroll, 0)
+                timer = QTimer()
+                timer.setInterval(2000)
+                timer.timeout.connect(refresh)
+                timer.start()
+                try:
+                    QTest.qWait(2200)
+                finally:
+                    timer.stop()
+                self.assertTrue(view.isVisible())
+                self.assertEqual(view.verticalScrollBar().value(), scroll)
+                self.assertEqual(view.currentIndex(), target)
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton,
+                                 pos=view.visualRect(target).center())
+                self.assertEqual(combo.currentText(), name)
+                self.assertFalse(view.isVisible())
+        finally:
+            combo.close()
+            combo.deleteLater()
+
+    def test_balance_employee_catalog_changes_wait_until_popup_closes(self):
+        from PyQt6.QtWidgets import QComboBox
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        host = SimpleNamespace(bal_emp_cb=combo)
+        refresh = lambda: self.desktop.SmartReportApp.load_dropdowns(host, refresh_tables=False)
+        refresh()
+        try:
+            combo.setCurrentText("Local editable contact")
+            refresh()
+            self.assertEqual(combo.currentText(), "Local editable contact")
+            combo.show()
+            combo.showPopup()
+            self.qt_app.processEvents()
+            count = combo.count()
+            conn = self.desktop.get_db_connection()
+            try:
+                conn.execute("INSERT INTO employees (name,is_active) VALUES ('ZZ added during selection',0)")
+                conn.commit()
+            finally:
+                conn.close()
+            refresh()
+            self.assertEqual(combo.count(), count)
+            combo.hidePopup()
+            refresh()
+            self.assertGreaterEqual(combo.findText("ZZ added during selection"), 0)
+            self.assertEqual(combo.currentText(), "Local editable contact")
+            combo.blockSignals(True)
+            refresh()
+            self.assertTrue(combo.signalsBlocked())
+        finally:
+            combo.close()
+            combo.deleteLater()
+
     def test_invoice_object_selection_survives_dropdown_refresh(self):
         sync_id = str(uuid.uuid4())
         desktop_conn = self.desktop.get_db_connection()

@@ -9063,15 +9063,22 @@ class SmartReportApp(QMainWindow):
                 self.emp_cb.addItem(row[0])
 
         if hasattr(self, 'bal_emp_cb'):
-            selected_balance_person = self.bal_emp_cb.currentText()
-            self.bal_emp_cb.blockSignals(True)
-            self.bal_emp_cb.clear()
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            for row in cursor.fetchall():
-                self.bal_emp_cb.addItem(row[0])
-            if selected_balance_person:
-                self.bal_emp_cb.setCurrentText(selected_balance_person)
-            self.bal_emp_cb.blockSignals(False)
+            balance_people = [row[0] for row in cursor.fetchall()]
+            current_people = [
+                self.bal_emp_cb.itemText(index) for index in range(self.bal_emp_cb.count())
+            ]
+            # Rebuilding an open popup resets its scroll and highlighted employee.
+            if not self.bal_emp_cb.view().isVisible() and current_people != balance_people:
+                selected_balance_person = self.bal_emp_cb.currentText()
+                blocked = self.bal_emp_cb.blockSignals(True)
+                try:
+                    self.bal_emp_cb.clear()
+                    self.bal_emp_cb.addItems(balance_people)
+                    if selected_balance_person:
+                        self.bal_emp_cb.setCurrentText(selected_balance_person)
+                finally:
+                    self.bal_emp_cb.blockSignals(blocked)
 
         if hasattr(self, 'filter_emp'):
             curr_emp = self.filter_emp.currentText()
