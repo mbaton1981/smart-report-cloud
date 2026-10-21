@@ -2017,7 +2017,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.11-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.12-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -7219,6 +7219,15 @@ class SmartReportApp(QMainWindow):
         self, document=None, source_paths=None, parsed_fields=None, recognition_message=""
     ):
         document = dict(document or {})
+        if document.get("usage") == "object_cost":
+            self.open_incoming_documents()
+            viewer = getattr(self, "_incoming_viewer", None)
+            if viewer is not None:
+                card = viewer.store.conn.execute(
+                    "SELECT document_id FROM register WHERE client_id=?", (document.get("client_id"),)).fetchone()
+                if card is not None:
+                    viewer.selector.setCurrentIndex(viewer.selector.findData(card["document_id"]))
+                    return True
         server_document = dict(document)
         local_conflict_payload = document.get("local_conflict_payload")
         if isinstance(local_conflict_payload, dict):
@@ -7235,7 +7244,8 @@ class SmartReportApp(QMainWindow):
             ))
         )
         self.load_expense_document_filters()
-        if (document.get("allocation_basis") == "net" or parsed_fields.get("allocation_basis") == "net"
+        object_cost = document.get("usage") == "object_cost"
+        if not object_cost and (document.get("allocation_basis") == "net" or parsed_fields.get("allocation_basis") == "net"
                 or document.get("order_proposals") or parsed_fields.get("order_proposals")):
             if document and document.get("allocation_basis") != "net":
                 document = {**document, "allocation_basis": "net", "rounding_amount": "0.00",
@@ -7247,7 +7257,7 @@ class SmartReportApp(QMainWindow):
         dialog.setWindowTitle("Документ расходов" if document.get("client_id") else "Новый расход")
         dialog.setMinimumWidth(620)
         form = QFormLayout(dialog)
-        if non_invoice_type:
+        if non_invoice_type and not object_cost:
             note = QLabel(
                 "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
                 if non_invoice_type == "order_confirmation"
@@ -7307,8 +7317,9 @@ class SmartReportApp(QMainWindow):
 
         form.addRow("Поставщик:", supplier)
         form.addRow("Дата:", document_date)
-        form.addRow("Срок оплаты:", due_date_input)
-        form.addRow(due_date_reviewed)
+        if not object_cost:
+            form.addRow("Срок оплаты:", due_date_input)
+            form.addRow(due_date_reviewed)
         amount_row = QHBoxLayout()
         amount_row.addWidget(QLabel("Сумма с НДС:"))
         amount_row.addWidget(gross_amount)
@@ -7425,7 +7436,10 @@ class SmartReportApp(QMainWindow):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить документ")
         def accept_due_date():
-            if non_invoice_type and status.currentData() == "confirmed":
+            if object_cost:
+                dialog.accept()
+                return
+            if non_invoice_type and not object_cost and status.currentData() == "confirmed":
                 QMessageBox.warning(
                     dialog, "Тип документа",
                     "Подтверждение заказа нельзя подтвердить как расход. Загрузите фактуру или чек."
@@ -7440,7 +7454,7 @@ class SmartReportApp(QMainWindow):
                     QMessageBox.warning(dialog, "Срок оплаты", " ".join(format_errors))
                     return
             date_errors = due_date_issues(candidate)
-            if status.currentData() == "confirmed" and date_errors:
+            if status.currentData() == "confirmed" and date_errors and not object_cost:
                 QMessageBox.warning(dialog, "Срок оплаты", " ".join(date_errors))
                 return
             dialog.accept()
@@ -7451,10 +7465,10 @@ class SmartReportApp(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return False
 
-        due_values = due_date_edit(due_fields, due_date_input.text(), due_date_reviewed.isChecked())
+        due_values = {} if object_cost else due_date_edit(due_fields, due_date_input.text(), due_date_reviewed.isChecked())
         date_errors = due_date_issues(due_values)
-        format_errors = due_date_issues({"due_date": due_values["due_date"], "due_date_kind": "manual"})
-        if format_errors or status.currentData() == "confirmed" and date_errors:
+        format_errors = due_date_issues({"due_date": due_values.get("due_date"), "due_date_kind": "manual"})
+        if not object_cost and (format_errors or status.currentData() == "confirmed" and date_errors):
             QMessageBox.warning(self, "Срок оплаты", " ".join(date_errors))
             return False
         gross = parse_decimal(gross_amount.text())
@@ -7637,6 +7651,28 @@ class SmartReportApp(QMainWindow):
         else:
             recognition_message = "Распознавание не выполнено; оригинал будет сохранён, заполните поля вручную."
         parsed["raw_text"] = combined_text
+        from incoming_documents import enabled as incoming_enabled
+        if (len(paths) == 1 and Path(paths[0]).suffix.casefold() == ".pdf"
+                and parsed.get("document_type", "invoice") not in ("invoice", "receipt", "credit_note")
+                and incoming_enabled()):
+            self.open_incoming_documents()
+            viewer = getattr(self, "_incoming_viewer", None)
+            if viewer is None:
+                return
+            if not viewer.keep_unsaved():
+                return
+            try:
+                content = Path(paths[0]).read_bytes()
+                viewer.store.add_pdf(content, Path(paths[0]).name, {
+                    "fields": parsed, "state": "requires_review",
+                    "methods": [extraction.method for _, extraction in extractions], "errors": errors})
+                document_id = viewer.store.conn.execute(
+                    "SELECT id FROM documents WHERE sha256=?", (hashlib.sha256(content).hexdigest(),)).fetchone()[0]
+                viewer.reload_documents()
+                viewer.selector.setCurrentIndex(viewer.selector.findData(document_id))
+            except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
+                QMessageBox.warning(self, "Документ не открыт", str(error))
+            return
         if "order_proposals" not in parsed:
             parsed["order_proposals"] = order_proposal["orders"]
         parsed["order_proposal_warnings"] = order_proposal["warnings"]

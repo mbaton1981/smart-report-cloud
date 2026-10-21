@@ -124,6 +124,7 @@ class ObjectCostTests(unittest.TestCase):
             window.show()
             self.qt_app.processEvents()
             window.selector.setCurrentIndex(1)
+            window.expense_button.click()
             self.assertFalse(window.receipt_paid.isVisible())
             self.assertNotIn("amount_due", window.inputs)
             window.inputs["supplier_name"].setText("Manually reviewed seller")

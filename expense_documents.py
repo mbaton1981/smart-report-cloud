@@ -722,6 +722,8 @@ def parse_invoice_pages(pages):
             else "Распознано решение о транспортном налоге, а не фактура; данные получателя не являются данными поставщика."
         )
     fields["review_reasons"] = diagnostics
+    from document_costs import extract_cost_fields
+    fields["object_cost_fields"] = extract_cost_fields(pages, fields)
     for key in required_document_fields(fields.get("document_type")):
         if fields.get(key) in (None, "", "UNKNOWN"):
             fields["review_reasons"].append(f"Не подтверждено поле {key}; проверьте оригинал.")

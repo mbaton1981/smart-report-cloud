@@ -30,11 +30,47 @@ class IncomingStore(OfflineReviewStore):
             self.conn.execute("""CREATE TABLE IF NOT EXISTS mail_messages(
                 folder TEXT NOT NULL, epoch TEXT NOT NULL, uid INTEGER NOT NULL,
                 sha256 TEXT NOT NULL, PRIMARY KEY(folder,epoch,uid))""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS document_actions(
+                document_id INTEGER NOT NULL REFERENCES documents,
+                revision INTEGER NOT NULL, action TEXT NOT NULL
+                CHECK(action IN ('ignore','later','expense')),
+                created_at TEXT NOT NULL, PRIMARY KEY(document_id,revision))""")
 
     def objects(self):
         return list(self.host._expense_objects)
 
+    def action(self, document_id):
+        row = self.conn.execute("SELECT revision,action FROM document_actions WHERE document_id=? "
+                                "ORDER BY revision DESC LIMIT 1", (document_id,)).fetchone()
+        return (row["revision"], row["action"]) if row else (0, None)
+
+    def set_action(self, document_id, action, expected_revision):
+        if action not in ("ignore", "later", "expense"):
+            raise ReviewError("Неизвестное действие документа.")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.base(document_id)
+            revision, previous = self.action(document_id)
+            if revision != expected_revision:
+                raise ReviewError("Статус изменён в другом окне. Откройте документ заново.")
+            if self.card(document_id):
+                raise ReviewError("Расход уже создан: статус не отменяет расход. Измените существующую запись.")
+            if previous == action:
+                return revision
+            self.conn.execute("INSERT INTO document_actions VALUES (?,?,?,?)", (
+                document_id, revision + 1, action, datetime.now(timezone.utc).isoformat()))
+        return revision + 1
+
+    def cost_fields(self, document_id):
+        from document_costs import extract_cost_fields
+        base = self.base(document_id)
+        if base.get("object_cost_fields"):
+            return base["object_cost_fields"]
+        return extract_cost_fields([{"page": 1, "text": base.get("raw_text") or ""}], base)
+
     def transfer(self, document_id, expected_revision):
+        if self.action(document_id)[1] in ("ignore", "later"):
+            raise ReviewError("Сначала выберите «Учесть как расход».")
         revision, reviewed = self.latest(document_id)
         if revision != expected_revision or not revision:
             raise ReviewError("Сохраните актуальные исправления перед добавлением.")
@@ -52,6 +88,8 @@ class IncomingStore(OfflineReviewStore):
                 self.conn.execute("BEGIN IMMEDIATE")
                 if self.latest(document_id)[0] != revision:
                     raise ReviewError("Черновик изменён в другом окне. Откройте его заново.")
+                if self.action(document_id)[1] in ("ignore", "later"):
+                    raise ReviewError("Статус изменён: сначала выберите «Учесть как расход».")
                 if self.card(document_id) is None:
                     self._check_existing_register(document_id, reviewed)
                     self.conn.execute("""INSERT INTO register
@@ -67,15 +105,35 @@ class IncomingStore(OfflineReviewStore):
         revision, payload = super().latest(document_id)
         if revision == 0:
             base = self.base(document_id)
+            costs = self.cost_fields(document_id)
+            for key in EDITABLE:
+                if key in costs:
+                    payload[key] = costs[key]
             amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
             rounding = parse_invoice_money(base.get("rounding_amount")) or Decimal(0)
-            if all(value is not None for value in amounts):
+            if all(value is not None for value in amounts) and base.get("document_type") != "tax_decision":
                 payload["gross_amount"] = decimal_text(sum(amounts) + rounding)
         return revision, payload
 
     def provenance(self, document_id, payload=None):
         result = super().provenance(document_id, payload)
         base = self.base(document_id)
+        if base.get("document_type") == "tax_decision":
+            costs = self.cost_fields(document_id)
+            current = payload or self.latest(document_id)[1]
+            for key, value in costs.items():
+                if key in result and value not in (None, "", "UNKNOWN") and current.get(key) == value:
+                    sources = costs.get("field_sources", {}).get(key) or []
+                    result[key] = "Считано из решения — требуется сверка"
+                    if sources:
+                        result[key] += ": " + "; ".join(source.get("text", "") for source in sources)
+            if costs.get("gross_amount") is None:
+                candidate = next((candidate for candidate in costs.get("amount_candidates", [])
+                                  if candidate["amount"] == current.get("gross_amount")), None)
+                if candidate:
+                    result["gross_amount"] = "Выбрано из считанных сумм — сверьте оригинал: " + "; ".join(
+                        item["text"] for item in candidate["evidence"])
+            return result
         current = payload or self.latest(document_id)[1]
         amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
         if all(value is not None for value in amounts):
@@ -87,11 +145,8 @@ class IncomingStore(OfflineReviewStore):
     def issues(self, document_id, payload):
         base = current_classification(self.base(document_id))
         problems = []
-        if base.get("suggested_document_type") == "payment_reminder" or base.get("document_type") in (
-                "order_confirmation", "tax_decision", "proforma", "transfer_receipt", "non_document"):
-            problems.append("Это не новая покупка: напоминание или иной документ нельзя добавить как новый расход.")
-        if payload.get("confirmed_type") not in ("invoice", "receipt"):
-            problems.append("Укажите тип после сверки оригинала: фактура или чек.")
+        if base.get("suggested_document_type") == "payment_reminder":
+            problems.append("Напоминание не является новым расходом: сверьте исходный документ.")
         if payload.get("original_checked") is not True:
             problems.append("Подтвердите сверку оригинала.")
         if payload.get("object_id") not in {row["id"] for row in self.objects()}:
@@ -188,7 +243,11 @@ class IncomingStore(OfflineReviewStore):
     def accounting_status(self, document_id):
         card = self.card(document_id)
         if card is None:
-            return "Черновик — расход не создан", False
+            action = self.action(document_id)[1]
+            return {"ignore": "Не учитывать — PDF сохранён, расход не создан",
+                    "later": "Разобрать позже — PDF сохранён, расход не создан",
+                    "expense": "Проверьте данные и выберите объект — расход ещё не создан"}.get(
+                        action, "Выберите действие — расход не создан"), False
         pending = self.host.incoming_delivery_pending(card["client_id"])
         if pending:
             return ("Сохранено локально — ожидает синхронизации"

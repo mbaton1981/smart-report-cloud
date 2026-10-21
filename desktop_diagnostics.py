@@ -61,6 +61,7 @@ def run(app_module, action, work_dir, case="case", out_path=None):
                 assert window.gallery.isVisible()
                 assert not window.gallery.preview._image.pixmap().isNull()
             window.selector.setCurrentIndex(window.selector.findData(2))
+            window.expense_button.click()
             window.kind.setCurrentIndex(window.kind.findData("receipt"))
             window.object.setCurrentIndex(window.object.findData(1))
             window.checked.setChecked(True)
@@ -88,6 +89,33 @@ def run(app_module, action, work_dir, case="case", out_path=None):
             result.update({"incoming_imports_loaded": True, "five_pdfs_opened": True,
                            "receipt_edit_confirm_retry": True, "nordea_blocked": True,
                            "masked_password_loaded": True, "queued_count": len(queued)})
+            tax_path = work / "tax-original.pdf"
+            if tax_path.is_file():
+                from invoice_processing import recognize_invoice
+                tax = recognize_invoice([tax_path])
+                assert tax["fields"]["object_cost_fields"]["gross_amount"] == "1208.00"
+                store.add_pdf(tax_path.read_bytes(), tax_path.name, tax)
+                document_id = store.conn.execute("SELECT id FROM documents WHERE sha256=?", (
+                    hashlib.sha256(tax_path.read_bytes()).hexdigest(),)).fetchone()[0]
+                window.reload_documents()
+                window.selector.setCurrentIndex(window.selector.findData(document_id))
+                assert window.inputs["gross_amount"].text() == "1208.00"
+                window.inputs["vat_amount"].setText("not a valid financial field")
+                window.ignore_button.click()
+                window.later_button.click()
+                assert not window.financial_panel.isVisible()
+                assert store.card(document_id) is None and len(queued) == 1
+                window.inputs["vat_amount"].clear()
+                window.expense_button.click()
+                application.processEvents()
+                assert window.financial_panel.isVisible() and window.gallery.isVisible()
+                assert window.inputs["supplier_name"].text() == "Transportstyrelsen"
+                assert window.inputs["document_date"].text() == "2026-10-12"
+                assert not window.inputs["vat_amount"].text()
+                assert not window.inputs["invoice_number"].text()
+                window.grab().save(str(work / "tax-autofill.png"))
+                result.update(tax_amount_autofilled=True, tax_status_only_actions=True,
+                              tax_expenses_created=0)
         finally:
             window.close()
             store.close()

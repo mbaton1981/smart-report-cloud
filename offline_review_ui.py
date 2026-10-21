@@ -26,7 +26,9 @@ LABELS = {
     "net_amount": "Нетто", "vat_amount": "НДС", "gross_amount": "Итог до округления / итог чека",
     "rounding_amount": "Указанное округление", "amount_due": "Долг / к оплате (не для чека)",
 }
-TYPES = {"invoice": "Фактура", "receipt": "Чек", "unclassified": "Тип не установлен"}
+TYPES = {"invoice": "Фактура", "receipt": "Чек", "unclassified": "Тип не установлен",
+         "tax_decision": "Решение о транспортном налоге", "order_confirmation": "Подтверждение заказа",
+         "credit_note": "Кредитная фактура", "proforma": "Проформа"}
 
 
 class EmbeddedOriginal(DocumentGalleryDialog):
@@ -43,7 +45,8 @@ class OfflineReviewWindow(QDialog):
         self.integrated = integrated
         self.gallery = None
         self.inputs, self.origins = {}, {}
-        self.setWindowTitle("SmartReport — ЛОКАЛЬНЫЙ ТЕСТ: входящие PDF")
+        self.setWindowTitle("SmartReport — Входящие документы" if integrated
+                            else "SmartReport — ЛОКАЛЬНЫЙ ТЕСТ: входящие PDF")
         self.resize(1450, 940)
         layout = QVBoxLayout(self)
         banner = QLabel(
@@ -81,7 +84,10 @@ class OfflineReviewWindow(QDialog):
         self.kind.addItem("Не подтверждён — сверьте оригинал", None)
         self.kind.addItem("Подтверждаю: фактура", "invoice")
         self.kind.addItem("Подтверждаю: чек", "receipt")
-        form.addRow("Подтверждённый тип:", self.kind)
+        if not integrated:
+            form.addRow("Подтверждённый тип:", self.kind)
+        else:
+            self.kind.hide()
         self.receipt_paid = QCheckBox("Сверил: чек полностью оплачен; долг поставщику не создаётся.\n"
                                      "Возмещение сотруднику этим действием не оформляется.")
         if not integrated:
@@ -92,7 +98,11 @@ class OfflineReviewWindow(QDialog):
             if integrated and key in ("due_date", "amount_due", "rounding_amount"):
                 continue
             if integrated and key == "gross_amount":
-                label = "Сумма расхода с НДС, включая округление"
+                label = "Сумма расхода по документу"
+            if integrated and key == "supplier_name":
+                label = "Поставщик / организация / получатель сбора"
+            if integrated and key in ("invoice_number", "vat_amount", "net_amount"):
+                label += " (если указан)"
             row = QWidget()
             box = QVBoxLayout(row)
             box.setContentsMargins(0, 0, 0, 0)
@@ -106,6 +116,13 @@ class OfflineReviewWindow(QDialog):
             form.addRow(label + ":", row)
             self.inputs[key], self.origins[key] = field, origin
             field.textChanged.connect(self.update_origins)
+        self.amount_choices = QComboBox()
+        if integrated:
+            self.amount_label = QLabel("Найденные суммы — выберите по оригиналу:")
+            form.addRow(self.amount_label, self.amount_choices)
+        else:
+            self.amount_choices.hide()
+        self.amount_choices.currentIndexChanged.connect(self.choose_amount)
         self.object = QComboBox()
         self.object.setObjectName("review_object")
         self.object.addItem("Обязательно выберите объект", None)
@@ -119,6 +136,7 @@ class OfflineReviewWindow(QDialog):
         self.history.setMaximumHeight(120)
         form.addRow("История правок:", self.history)
         scroll.setWidget(details)
+        self.financial_panel = scroll
         self.splitter.addWidget(scroll)
         self.splitter.setSizes([800, 600])
         buttons = QHBoxLayout()
@@ -131,6 +149,16 @@ class OfflineReviewWindow(QDialog):
             self.reassign_button = QPushButton("Сменить объект — без нового расхода")
             self.reassign_button.clicked.connect(self.reassign_object)
             buttons.addWidget(self.reassign_button)
+            actions = QHBoxLayout()
+            self.ignore_button = QPushButton("Не учитывать")
+            self.later_button = QPushButton("Разобрать позже")
+            self.expense_button = QPushButton("Учесть как расход")
+            self.ignore_button.clicked.connect(lambda: self.set_action("ignore"))
+            self.later_button.clicked.connect(lambda: self.set_action("later"))
+            self.expense_button.clicked.connect(lambda: self.set_action("expense"))
+            for button in (self.ignore_button, self.later_button, self.expense_button):
+                actions.addWidget(button)
+            layout.addLayout(actions)
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.transfer_button)
         buttons.addWidget(self.registry_button)
@@ -146,10 +174,48 @@ class OfflineReviewWindow(QDialog):
 
     def payload(self):
         return {**{key: widget.text().strip() or None for key, widget in self.inputs.items()},
-                "confirmed_type": self.kind.currentData(), "object_id": self.object.currentData(),
+                "confirmed_type": None if self.integrated else self.kind.currentData(),
+                "object_id": self.object.currentData(),
                 "original_checked": self.checked.isChecked(),
                 "settlement_status": None if self.integrated else
                     "prepaid" if self.receipt_paid.isChecked() else None}
+
+    def choose_amount(self):
+        value = self.amount_choices.currentData()
+        if value is not None:
+            self.inputs["gross_amount"].setText(value)
+
+    def set_action(self, action):
+        try:
+            self.action_revision = self.store.set_action(self.document_id, action, self.action_revision)
+        except (ReviewError, OSError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Статус не изменён", str(error))
+            return
+        # Status changes do not parse, save, or discard visible financial edits.
+        self.update_action_controls()
+        labels = {"ignore": "Не учитывать — PDF сохранён, расход не создан",
+                  "later": "Разобрать позже — PDF сохранён, расход не создан",
+                  "expense": "Проверьте считанные данные и выберите объект. Номер и НДС необязательны."}
+        self.status.setText(labels[action])
+        if action in ("ignore", "later") and self.payload() != self.loaded_payload:
+            self.status.setText(labels[action] + ". Несохранённые правки полей не применены.")
+        self.status.setStyleSheet("")
+
+    def update_action_controls(self):
+        if not self.integrated or self.document_id is None:
+            return
+        self.action_revision, action = self.store.action(self.document_id)
+        card = self.store.card(self.document_id)
+        editing = action == "expense" or card is not None
+        self.financial_panel.setVisible(editing)
+        self.save_button.setVisible(editing)
+        self.transfer_button.setVisible(editing)
+        self.reassign_button.setVisible(card is not None)
+        for button in (self.ignore_button, self.later_button, self.expense_button):
+            button.setEnabled(card is None)
+        self.transfer_button.setEnabled(
+            card is None and self.original_available and action == "expense"
+            and self.store.base(self.document_id).get("suggested_document_type") != "payment_reminder")
 
     def reload_documents(self):
         self.selector.blockSignals(True)
@@ -157,8 +223,9 @@ class OfflineReviewWindow(QDialog):
         self.selector.clear()
         for doc in self.store.documents():
             base = self.store.base(doc["id"])
+            costs = self.store.cost_fields(doc["id"]) if self.integrated else base
             self.selector.addItem(
-                f"№{doc['id']} — {base.get('supplier_name') or 'Для ручного заполнения'} — "
+                f"№{doc['id']} — {costs.get('supplier_name') or 'Документ для сверки'} — "
                 f"{base.get('invoice_number') or 'PDF'}", doc["id"])
             if self.integrated:
                 _, green = self.store.accounting_status(doc["id"])
@@ -206,6 +273,10 @@ class OfflineReviewWindow(QDialog):
         if self.document_id is None:
             self.save_button.setEnabled(False)
             self.transfer_button.setEnabled(False)
+            if self.integrated:
+                self.financial_panel.hide()
+                for button in (self.ignore_button, self.later_button, self.expense_button):
+                    button.setEnabled(False)
             return
         self.revision, payload = self.store.latest(self.document_id)
         base = self.store.base(self.document_id)
@@ -216,6 +287,20 @@ class OfflineReviewWindow(QDialog):
         self.kind.setCurrentIndex(max(0, self.kind.findData(payload.get("confirmed_type"))))
         self.object.setCurrentIndex(max(0, self.object.findData(payload.get("object_id"))))
         self.checked.setChecked(payload.get("original_checked") is True)
+        self.amount_choices.blockSignals(True)
+        self.amount_choices.clear()
+        if self.integrated:
+            candidates = self.store.cost_fields(self.document_id).get("amount_candidates") or []
+            self.amount_label.setVisible(bool(candidates))
+            self.amount_choices.setVisible(bool(candidates))
+            self.amount_choices.addItem("Не выбрано — сверьте суммы в оригинале", None)
+            for candidate in candidates:
+                context = "; ".join(f"стр. {item['page']}: {item['text']}"
+                                    for item in candidate["evidence"])
+                self.amount_choices.addItem(f"{candidate['amount']} — {context}", candidate["amount"])
+            self.amount_choices.setCurrentIndex(max(0, self.amount_choices.findData(payload.get("gross_amount"))))
+            self.amount_choices.setEnabled(self.store.card(self.document_id) is None)
+        self.amount_choices.blockSignals(False)
         self.receipt_paid.setChecked(payload.get("settlement_status") == "prepaid")
         kind = base.get("document_type")
         self.receipt_paid.setVisible(kind == "receipt" and not self.integrated)
@@ -227,6 +312,15 @@ class OfflineReviewWindow(QDialog):
              else "Чек: номер фактуры не обязателен; оплата не влияет на учёт расхода."
              if kind == "receipt" else
              "Объект всегда выбирается вручную; коды проектов в PDF не означают выбор объекта."))
+        if self.integrated:
+            self.classification.setText(
+                f"Предполагаемый тип: {TYPES.get(kind, kind)}. Это подсказка распознавания, не подтверждение типа.\n"
+                + ("Напоминание не является новым расходом — выберите статус без финансовых полей."
+                   if base.get("suggested_document_type") == "payment_reminder"
+                   else "Выберите действие. Номер фактуры и НДС не требуются, если их нет в документе."))
+            if len(candidates) > 1 and payload.get("gross_amount") is None:
+                self.classification.setText(self.classification.text()
+                                            + "\nНайдено несколько сумм: выберите подходящую по подписи и странице оригинала.")
         if self.gallery:
             self.gallery.hide()
             self.preview_layout.removeWidget(self.gallery)
@@ -272,8 +366,11 @@ class OfflineReviewWindow(QDialog):
             text, green = self.store.accounting_status(self.document_id)
             self.status.setText(text)
             self.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
+            self.update_action_controls()
 
     def keep_unsaved(self):
+        if self.integrated and getattr(self, "document_id", None) is not None and self.store.action(self.document_id)[1] in ("ignore", "later"):
+            return True
         if not hasattr(self, "loaded_payload") or self.payload() == self.loaded_payload:
             return True
         answer = QMessageBox.question(
@@ -352,7 +449,7 @@ class OfflineReviewWindow(QDialog):
             payload = json.loads(row["payload_json"])
             selection.addItem(f"Карточка №{row['id']} — {payload['supplier_name']}", row["document_id"])
             lines.append(f"Карточка №{row['id']} · {payload['supplier_name']} · "
-                         f"{payload['confirmed_type']} · объект {payload['object_id']}\n"
+                         f"{'Расход по документу' if self.integrated else payload['confirmed_type']} · объект {payload['object_id']}\n"
                          + (f"Сумма расхода: {payload['gross_amount']} · "
                             if self.integrated else f"Долг: {row['debt_amount']} · ")
                          + f"PDF SHA-256: {row['sha256']}\n")

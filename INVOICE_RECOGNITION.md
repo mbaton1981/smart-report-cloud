@@ -1,5 +1,51 @@
 # Invoice Recognition and Net Allocations
 
+## Document actions and congestion-tax costs — 1.0.12-rc1
+
+The current incoming-document workflow supersedes the invoice-only candidate
+restrictions described in the historical sections below:
+
+- Choose **Не учитывать**, **Разобрать позже**, or **Учесть как расход**.
+  The first two save only an append-only document-action history; they do not
+  validate financial fields, create outbox entries, or discard the original PDF.
+  Previously saved financial edits remain separate. Unsaved edits are not applied.
+- Only the expense action opens the financial editor. Invoice number and VAT
+  are optional; object selection and manual review remain required. Recognition
+  suggests a type but does not claim that the user confirmed that type.
+- `object_cost_fields` provides expense suggestions independently of invoice
+  validation. Congestion-tax decisions extract the stated tax or labelled total,
+  decision date, issuing authority and OCR reference. They do not invent VAT,
+  an invoice number, net amount, payment or debt. Possible late-payment fees,
+  passage-by-passage amounts and bare years are not tax totals.
+- Equal totals on multiple pages are supporting evidence for one amount.
+  Conflicting totals remain blank and appear as candidates with source text and
+  page numbers. Selecting a candidate fills the expense amount; manual entry
+  remains available if recognition finds no usable amount.
+- Existing revision-zero drafts can use the new suggestions from their retained
+  text without replacing original recognition. Saved manual revisions are not
+  mass overwritten. The incoming history and original PDF stay intact.
+- Non-invoice single-PDF uploads use the incoming actions instead of the net
+  invoice form. Existing object costs open their linked incoming document when
+  available. Ordinary invoice/project-allocation upload behavior is unchanged.
+- Reminders remain blocked as new expenses after fresh classification. PDF SHA,
+  ordinary-register duplicate checks, stable outbox IDs and object reassignment
+  continue to prevent double counting.
+
+Only the incoming sidecar adds `document_actions`; no main/cloud database
+migration or server deployment is needed. An older EXE ignores that extra table;
+it must not be used to add a tax decision through its invoice-only editor.
+Keep the current database when returning to an earlier EXE after new operations:
+restoring a pre-update database would lose those operations.
+
+The exact retained two-page Transportstyrelsen decision was verified in an
+isolated desktop/server database. Its PDF text already contained **1208**; OCR
+was not necessary. The old invoice parser left totals blank. The new expense
+producer yields **1208.00 SEK**, date **2026-10-12**, issuer **Transportstyrelsen**,
+and the original OCR reference, with no VAT or invoice number. The potential
+**500 kronor** late fee is excluded. Native UI review, status-only actions,
+lost-acknowledgement retry, attachment SHA, duplicate PDF and green delivery
+status were checked without creating any production expense.
+
 ## Main-desktop integration candidate — local only, 2026-10-21
 
 Local branch: `feature/incoming-documents-candidate`. No production installation,
