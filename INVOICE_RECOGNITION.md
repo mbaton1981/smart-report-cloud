@@ -1,5 +1,31 @@
 # Invoice Recognition and Net Allocations
 
+## Incoming list, stable PDF preview and primary inbox — 1.0.15-rc1
+
+The incoming selector reads the current reviewed fields (including manual
+revisions and acknowledged server edits), not the immutable pre-OCR source
+snapshot. Each row includes supplier, document date, document total/currency
+and current status. Missing fields are explicitly marked as unrecognized.
+BAUHAUS was already present in the saved recognition; only the initial list
+incorrectly read the older empty source result. No recognition migration or
+replacement of manual revisions is needed.
+
+Refreshing the same document reuses its PDF gallery: page, zoom and scrollbars
+are retained. A panel resize no longer invokes fit-to-width. Background registry
+updates still refresh untouched fields; unsaved edits remain untouched.
+
+The ordinary manual intake button now reads **INBOX**, not
+`INBOX.SmartReport-Test`. It searches ALL UIDs without a message-count cap or
+fixed UID selection, using read-only EXAMINE and BODY.PEEK. UID identity remains
+folder/UIDVALIDITY-scoped; PDF SHA-256 identity remains shared across the incoming
+queue, so a copy already imported from the test folder is not imported again.
+Manual revisions, status, allocations and original bytes are not replaced on
+repeat, including a draft corrected after interrupted OCR. Legacy restricted
+trial tools retain their original restrictions and are not used by this button.
+Mail intake creates drafts only: no suitable PDF means no document; reminders
+remain blocked from confirmation as new expenses. No mail mutation, scheduler,
+payment/debt logic, database migration or server API change is introduced.
+
 ## Incoming object-cost allocations — 1.0.14-rc1
 
 Incoming review now has an editable list of **object / amount** rows. Recognition

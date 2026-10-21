@@ -503,7 +503,7 @@ def open_incoming(host, root):
     load.clicked.connect(import_snapshot)
     window.layout().insertWidget(window.layout().count() - 1, load)
     window.layout().insertWidget(window.layout().count() - 1, retry)
-    mail = QPushButton("Получить документы из INBOX.SmartReport-Test")
+    mail = QPushButton("Получить документы из INBOX")
     from folder_mail import open_import_dialog
     mail.clicked.connect(lambda: open_import_dialog(window))
     window.layout().insertWidget(1, mail)
@@ -543,11 +543,7 @@ def open_incoming(host, root):
         if store.card(window.document_id):
             window.status.setText(text)
             window.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
-        for index in range(window.selector.count()):
-            from PyQt6.QtGui import QColor
-            _, item_green = store.accounting_status(window.selector.itemData(index))
-            window.selector.setItemData(index, QColor("#b9efc6") if item_green else None,
-                                        Qt.ItemDataRole.BackgroundRole)
+        window.refresh_document_labels()
 
     window.status_timer.timeout.connect(update_status)
     window.status_timer.start(2000)

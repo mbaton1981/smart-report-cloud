@@ -103,3 +103,56 @@ class FolderMailTests(unittest.TestCase):
         self.assertEqual(result["recognition_failed"], 7)
         for doc in self.store.documents():
             self.assertTrue(self.store.original(doc["id"]).is_file())
+
+    def test_primary_inbox_cross_folder_duplicate_preserves_manual_review_and_status(self):
+        from unittest.mock import patch
+        self.assertEqual(FOLDER, "INBOX")
+        with patch("folder_mail.FOLDER", "INBOX.SmartReport-Test"):
+            # The same IMAP protocol mock accepts only the current folder.
+            with patch(__name__ + ".FOLDER", "INBOX.SmartReport-Test"):
+                self.assertEqual(self.run_import()["new_drafts"], 7)
+        revision, fields = self.store.latest(1)
+        fields["supplier_name"] = "Manually verified seller"
+        self.store.save(1, fields, revision)
+        self.store.set_action(1, "later", 0)
+        history = self.store.history(1)
+        originals = list(self.store.conn.execute("SELECT sha256,content FROM originals"))
+        # UIDs and UIDVALIDITY are folder-scoped; PDF identity is global.
+        FolderIMAP.messages = {uid + 10000: raw for uid, raw in FolderIMAP.messages.items()}
+        FolderIMAP.epoch = 900
+        report = self.run_import()
+        self.assertEqual(report["new_drafts"], 0)
+        self.assertEqual(report["duplicates"], 7)
+        self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Manually verified seller")
+        self.assertEqual(self.store.history(1), history)
+        self.assertEqual(self.store.action(1)[1], "later")
+        self.assertEqual(list(self.store.conn.execute("SELECT sha256,content FROM originals")), originals)
+        self.assertEqual(self.run_import()["new_drafts"], 0)
+        self.assertIn(("EXAMINE", '"INBOX"'), FolderIMAP.commands)
+        self.assertTrue(all(cmd[0] in {"EXAMINE", "SEARCH", "FETCH", "LOGOUT"}
+                            for cmd in FolderIMAP.commands))
+
+    def test_all_uids_without_cap_or_pdf_create_no_automatic_expenses(self):
+        from email.message import EmailMessage
+        message = EmailMessage()
+        message.set_content("Message without a document")
+        FolderIMAP.messages = {uid: eml(pdf(f"Invoice {uid}")) for uid in range(1001, 1102)}
+        FolderIMAP.messages[50000] = message.as_bytes()
+        report = self.run_import()
+        self.assertEqual(report["messages"], 102)
+        self.assertEqual(report["new_drafts"], 101)
+        self.assertEqual(report["without_pdf"], 1)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM register").fetchone()[0], 0)
+        self.assertEqual(self.run_import()["new_drafts"], 0)
+
+    def test_pending_document_with_manual_revision_is_not_replaced_on_repeat(self):
+        from email import policy
+        from email.parser import BytesParser
+        message = BytesParser(policy=policy.default).parsebytes(FolderIMAP.messages[1])
+        content = next(message.iter_attachments()).get_payload(decode=True)
+        self.store.add_pdf(content, "pending.pdf", {"fields": {}, "state": "pending"})
+        revision, payload = self.store.latest(1)
+        payload["supplier_name"] = "Manual correction after interrupted OCR"
+        self.store.save(1, payload, revision)
+        self.assertEqual(self.run_import()["new_drafts"], 6)
+        self.assertEqual(self.store.latest(1)[1]["supplier_name"], payload["supplier_name"])

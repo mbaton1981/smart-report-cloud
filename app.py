@@ -2017,7 +2017,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.14-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.15-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -6481,6 +6481,7 @@ class SmartReportApp(QMainWindow):
                 incoming.refresh_objects()
                 if incoming.payload() == incoming.loaded_payload:
                     incoming.select_document()
+                incoming.refresh_document_labels()
         if refresh_again:
             self._expense_read_attempts.clear()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3:

@@ -1,4 +1,4 @@
-"""Manual read-only import from the one explicitly approved folder."""
+"""Manual read-only import of every message in the primary inbox."""
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +12,7 @@ from invoice_processing import recognize_invoice
 from mail_import import HOST, ADDRESS, MAX_MESSAGE_BYTES
 from offline_review import ReviewError
 
-FOLDER = "INBOX.SmartReport-Test"
+FOLDER = "INBOX"
 
 
 class FolderError(ReviewError):
@@ -88,8 +88,10 @@ def import_folder(store, password, *, client_factory=imaplib.IMAP4_SSL, recogniz
                 digest = hashlib.sha256(content).hexdigest()
                 existing = store.conn.execute("SELECT id FROM documents WHERE sha256=?", (digest,)).fetchone()
                 if existing:
-                    if store.base(existing[0]).get("_recognition_state") == "pending":
-                        store.recognize_document(existing[0], recognizer)
+                    document_id = existing[0]
+                    if (store.base(document_id).get("_recognition_state") == "pending"
+                            and store.latest(document_id)[0] == 0 and not store.card(document_id)):
+                        store.recognize_document(document_id, recognizer)
                     report["duplicates"] += 1
                     continue
                 # Persist a recoverable draft before OCR; failure never discards the original.
@@ -117,7 +119,7 @@ def import_folder(store, password, *, client_factory=imaplib.IMAP4_SSL, recogniz
 
 ERRORS = {
     "auth": "Сервер отклонил вход. Проверьте пароль приложения; настройки безопасности не ослабляются.",
-    "folder": "Сервер не открыл INBOX.SmartReport-Test. Проверьте наличие и права этой папки.",
+    "folder": "Сервер не открыл основную папку INBOX. Проверьте доступ к входящим подключённого ящика.",
     "epoch_missing": "Сервер не вернул UIDVALIDITY папки. Импорт остановлен.",
     "epoch_changed": "UIDVALIDITY папки изменился. Автоматический сброс запрещён; нужна сверка очереди.",
     "search": "Сервер не вернул корректный список UID только выбранной папки.",
@@ -151,9 +153,9 @@ def open_import_dialog(window):
                     f"повторов PDF: {report['duplicates']}. Расходы не создавались. Можно закрыть окно.")
 
     dialog = FolderDialog(operation, offline=False, parent=window)
-    dialog.setWindowTitle("SmartReport — получить документы из SmartReport-Test")
+    dialog.setWindowTitle("SmartReport — получить документы из INBOX")
     dialog.notice.setText(
-        "Ручной импорт всех писем только из INBOX.SmartReport-Test.\n"
+        "Ручной импорт всех писем из основной папки INBOX подключённого ящика.\n"
         "EXAMINE + BODY.PEEK: письма не меняются, расходы автоматически не создаются.\n"
         "Пароль используется только в памяти этого сеанса и не сохраняется.")
     dialog.buttons.button(dialog.buttons.StandardButton.Ok).setText("Получить документы")

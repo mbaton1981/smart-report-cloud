@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
@@ -31,19 +31,13 @@ TYPES = {"invoice": "Фактура", "receipt": "Чек", "unclassified": "Ти
          "credit_note": "Кредитная фактура", "proforma": "Проформа"}
 
 
-class EmbeddedOriginal(DocumentGalleryDialog):
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "preview"):
-            QTimer.singleShot(0, self.preview.fit_width)
-
-
 class OfflineReviewWindow(QDialog):
     def __init__(self, store: OfflineReviewStore, *, integrated=False):
         super().__init__()
         self.store = store
         self.integrated = integrated
         self.gallery = None
+        self.preview_document_id = None
         self.inputs, self.origins = {}, {}
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
                             else "SmartReport — ЛОКАЛЬНЫЙ ТЕСТ: входящие PDF")
@@ -51,7 +45,7 @@ class OfflineReviewWindow(QDialog):
         layout = QVBoxLayout(self)
         banner = QLabel(
             ("PDF распознаётся автоматически. Проверьте поля и распределите общую сумму по объектам.\n"
-             "Получение почты — только по кнопке, только INBOX.SmartReport-Test. Расписания нет.\n"
+             "Получение почты — только по кнопке из основной папки INBOX. Расписания нет.\n"
              if integrated else
              "ОТДЕЛЬНЫЙ ТЕСТОВЫЙ ПРОФИЛЬ. Почта, рабочая база и синхронизация отключены.\n")
             + f"Профиль: {store.root}")
@@ -59,14 +53,7 @@ class OfflineReviewWindow(QDialog):
         layout.addWidget(banner)
         self.selector = QComboBox()
         for doc in store.documents():
-            source = json.loads(store.conn.execute(
-                "SELECT source_json FROM documents WHERE id=?", (doc["id"],)).fetchone()[0])
-            filename = next((item["filename"] for item in source.get("sources", [])
-                             if item.get("filename")), source["original"])
-            fields = source["result"]["fields"]
-            self.selector.addItem(
-                f"№{doc['id']} — {fields.get('supplier_name') or 'Документ для сверки'} — "
-                f"{fields.get('invoice_number') or filename[:50]}", doc["id"])
+            self.selector.addItem(self.document_label(doc["id"]), doc["id"])
         layout.addWidget(self.selector)
         self.classification = QLabel()
         self.classification.setWordWrap(True)
@@ -279,6 +266,7 @@ class OfflineReviewWindow(QDialog):
             return
         # Status changes do not parse, save, or discard visible financial edits.
         self.update_action_controls()
+        self.refresh_document_labels()
         labels = {"ignore": "Не учитывать — PDF сохранён, расход не создан",
                   "later": "Разобрать позже — PDF сохранён, расход не создан",
                   "expense": "Проверьте данные и распределите сумму по объектам. Номер и НДС необязательны."}
@@ -303,16 +291,39 @@ class OfflineReviewWindow(QDialog):
             card is None and self.original_available and action == "expense"
             and self.store.base(self.document_id).get("suggested_document_type") != "payment_reminder")
 
+    def document_label(self, document_id):
+        _, fields = (self.store.current_review(document_id) if self.integrated
+                     else self.store.latest(document_id))
+        supplier = fields.get("supplier_name") or "Поставщик не распознан"
+        date = fields.get("document_date") or "Дата не распознана"
+        amount = fields.get("gross_amount")
+        total = (f"{amount} {fields.get('currency_code') or ''}".strip()
+                 if amount not in (None, "") else "Сумма не распознана")
+        status = (self.store.accounting_status(document_id)[0] if self.integrated
+                  else "Требует проверки")
+        return f"№{document_id} — {supplier} — {date} — {total} — {status}"
+
+    def refresh_document_labels(self):
+        self.selector.blockSignals(True)
+        try:
+            for index in range(self.selector.count()):
+                document_id = self.selector.itemData(index)
+                label = self.document_label(document_id)
+                if self.selector.itemText(index) != label:
+                    self.selector.setItemText(index, label)
+                if self.integrated:
+                    _, green = self.store.accounting_status(document_id)
+                    self.selector.setItemData(index, QColor("#b9efc6") if green else None,
+                                              Qt.ItemDataRole.BackgroundRole)
+        finally:
+            self.selector.blockSignals(False)
+
     def reload_documents(self):
         self.selector.blockSignals(True)
         selected = self.selector.currentData()
         self.selector.clear()
         for doc in self.store.documents():
-            base = self.store.base(doc["id"])
-            costs = self.store.cost_fields(doc["id"]) if self.integrated else base
-            self.selector.addItem(
-                f"№{doc['id']} — {costs.get('supplier_name') or 'Документ для сверки'} — "
-                f"{base.get('invoice_number') or 'PDF'}", doc["id"])
+            self.selector.addItem(self.document_label(doc["id"]), doc["id"])
             if self.integrated:
                 _, green = self.store.accounting_status(doc["id"])
                 if green:
@@ -414,22 +425,24 @@ class OfflineReviewWindow(QDialog):
             if len(candidates) > 1 and payload.get("gross_amount") is None:
                 self.classification.setText(self.classification.text()
                                             + "\nНайдено несколько сумм: выберите подходящую по подписи и странице оригинала.")
-        if self.gallery:
+        if self.gallery and self.preview_document_id != self.document_id:
             self.gallery.hide()
             self.preview_layout.removeWidget(self.gallery)
             self.gallery.close()
             self.gallery.deleteLater()
             self.gallery = None
-        self.original_available = False
-        try:
-            path = self.store.original(self.document_id)
-            self.gallery = EmbeddedOriginal([path], "Исходный PDF", self)
-            self.gallery.setWindowFlags(Qt.WindowType.Widget)
-            self.preview_layout.addWidget(self.gallery)
-            self.gallery.show()
-            self.original_available = True
-        except (ReviewError, OSError, ValueError) as error:
-            self.status.setText(f"Оригинал недоступен; перенос запрещён: {error}")
+        self.original_available = self.gallery is not None
+        if self.gallery is None:
+            try:
+                path = self.store.original(self.document_id)
+                self.gallery = DocumentGalleryDialog([path], "Исходный PDF", self)
+                self.gallery.setWindowFlags(Qt.WindowType.Widget)
+                self.preview_layout.addWidget(self.gallery)
+                self.preview_document_id = self.document_id
+                self.gallery.show()
+                self.original_available = True
+            except (ReviewError, OSError, ValueError) as error:
+                self.status.setText(f"Оригинал недоступен; перенос запрещён: {error}")
         card = self.store.card(self.document_id)
         editable = card is None or self.integrated and self.server_version is not None
         for field in self.inputs.values():
@@ -466,6 +479,7 @@ class OfflineReviewWindow(QDialog):
             self.status.setText(text)
             self.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
             self.update_action_controls()
+        self.refresh_document_labels()
 
     def keep_unsaved(self):
         if self.integrated and getattr(self, "document_id", None) is not None and self.store.action(self.document_id)[1] in ("ignore", "later"):
