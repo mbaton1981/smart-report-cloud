@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from expense_documents import parse_invoice_pages, parse_project_order_allocations
+from expense_documents import allocation_vat_from_items, parse_invoice_pages, parse_project_order_allocations
 
 
 def recognize_invoice(paths, parser=None):
@@ -23,7 +23,21 @@ def recognize_invoice(paths, parser=None):
     fields = (parser or parse_invoice_pages)(pages) if pages else {}
     proposals = parse_project_order_allocations(pages)
     fields.setdefault("order_proposals", proposals["orders"])
-    fields["order_proposal_warnings"] = proposals["warnings"]
+    fields["order_proposal_warnings"] = list(dict.fromkeys(
+        [*fields.get("order_proposal_warnings", []), *proposals["warnings"]]
+    ))
+    orders = fields["order_proposals"]
+    if orders and all(order.get("order_id") for order in orders):
+        try:
+            fields["order_proposals"] = allocation_vat_from_items(
+                pages, orders, fields.get("net_amount"), fields.get("vat_amount")
+            )
+            fields["order_proposal_warnings"] = [
+                warning for warning in fields["order_proposal_warnings"]
+                if not (warning.startswith("НДС для заказа ") and "не распознан" in warning)
+            ]
+        except ValueError as error:
+            fields["order_proposal_warnings"].append(str(error))
     fields["raw_text"] = "\n\n".join(text_parts)
     fields["review_reasons"] = [*fields.get("review_reasons", []), *errors]
     missing = [key for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due")

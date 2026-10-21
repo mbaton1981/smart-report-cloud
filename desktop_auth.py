@@ -14,6 +14,25 @@ class AuthError(Exception):
     """Сообщение пригодно для показа пользователю."""
 
 
+def isolated_candidate_mode():
+    marker = os.environ.get("SMARTREPORT_CANDIDATE_PROFILE", "").strip()
+    if not marker:
+        return False
+    path = Path(marker).resolve()
+    profile = json.loads(path.read_text(encoding="utf-8"))
+    database = Path(os.environ.get("SMARTREPORT_DB_FILE", "")).resolve()
+    if (profile.get("isolated_candidate") is not True
+            or database != Path(profile["database"]).resolve()
+            or database.parent != path.parent
+            or database == Path(profile["source_database"]).resolve()
+            or not database.is_file()
+            or os.environ.get("SMARTREPORT_TRIAL_MODE") != "1"
+            or os.environ.get("SMARTREPORT_CLOUD_URL") != "http://127.0.0.1:5999"
+            or Path(os.environ.get("SMARTREPORT_DATA_DIR", "")).resolve() != path.parent / "profile"):
+        raise AuthError("Неверный изолированный профиль кандидата. Рабочая база не открыта.")
+    return True
+
+
 def app_data_dir():
     configured = os.environ.get("SMARTREPORT_DATA_DIR", "").strip()
     if configured:
@@ -28,6 +47,62 @@ def app_data_dir():
 
 def use_data_dir_as_working_directory():
     """Установленная программа хранит базу, отчёты и резервные копии в профиле пользователя."""
+    expected_dataset = os.environ.get("SMARTREPORT_EXPECTED_DATASET")
+    if expected_dataset:
+        from sync_dataset import file_dataset
+        database_path = os.environ.get("SMARTREPORT_DB_FILE")
+        if not database_path or file_dataset(database_path) != expected_dataset:
+            raise AuthError("База не соответствует согласованному рабочему профилю. Запуск остановлен.")
+    if getattr(sys, "frozen", False):
+        install = Path(sys.executable).resolve().parent
+        if (install / "paired_install.json").is_file() and "--diagnostic" not in sys.argv:
+            import sqlite3
+            from contextlib import closing
+            from sync_dataset import dataset_id
+            data = Path(os.environ["LOCALAPPDATA"]) / install.name
+            marker = data / "working_profile.json"
+            if not marker.is_file():
+                raise AuthError("Рабочий профиль обновления не подготовлен. База не открыта.")
+            profile = json.loads(marker.read_text(encoding="utf-8-sig"))
+            database = data / "smart_report.db"
+            if (profile.get("approved_transition") is not True
+                    or profile.get("server_url") != DEFAULT_SERVER_URL
+                    or not database.is_file()):
+                raise AuthError("Неверный согласованный профиль обновления.")
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn:
+                if not profile.get("dataset_id") or dataset_id(conn) != profile["dataset_id"]:
+                    raise AuthError("База не соответствует согласованному переходу.")
+            os.environ.update({
+                "SMARTREPORT_DB_FILE": str(database),
+                "SMARTREPORT_DATA_DIR": str(data / "profile"),
+                "SMARTREPORT_DOCUMENTS_DIR": str(data / "documents"),
+                "SMARTREPORT_MAIL_SETTINGS_FILE": str(data / "mail_settings.json"),
+                "SMARTREPORT_CLOUD_URL": profile["server_url"],
+            })
+            for key in ("SYNC_API_KEY", "SMARTREPORT_TRIAL_MODE", "SMARTREPORT_CANDIDATE_PROFILE"):
+                os.environ.pop(key, None)
+            os.chdir(data)
+            return True
+        if (install / "candidate_install.json").is_file() and "--diagnostic" not in sys.argv:
+            data = Path(os.environ["LOCALAPPDATA"]) / install.name
+            marker = data / "candidate_profile.json"
+            if not marker.is_file():
+                raise AuthError("Тестовый профиль не подготовлен. Рабочая база не открыта.")
+            profile = json.loads(marker.read_text(encoding="utf-8"))
+            os.environ.update({
+                "SMARTREPORT_DB_FILE": str(data / "smart_report.db"),
+                "SMARTREPORT_DATA_DIR": str(data / "profile"),
+                "SMARTREPORT_DOCUMENTS_DIR": str(data / "documents"),
+                "SMARTREPORT_MAIL_SETTINGS_FILE": str(data / "mail_settings.json"),
+                "SMARTREPORT_CLOUD_URL": "http://127.0.0.1:5999",
+                "SMARTREPORT_TRIAL_MODE": "1",
+                "SMARTREPORT_CANDIDATE_PROFILE": str(marker),
+                "SMARTREPORT_CANDIDATE_VERSION": profile.get("release_version") or "1.0.9-rc1",
+            })
+            os.environ.pop("SYNC_API_KEY", None)
+            isolated_candidate_mode()
+            os.chdir(data)
+            return True
     if getattr(sys, "frozen", False) and not os.environ.get("SMARTREPORT_DB_FILE"):
         os.chdir(app_data_dir())
         return True

@@ -29,14 +29,32 @@ The installed 1.0.9 client is not replaced or restarted by building the candidat
   Historical backup sections below describe that separate development branch,
   not capabilities added by this release.
 
-Server code is not changed by this candidate. Manual desktop intake uses the
-existing authenticated expense API v2, including `net_allocations_v1`,
-`due_date_v1`, attachments, idempotent client IDs and versioned updates.
-The capability check keeps unsupported deliveries locally instead of treating
-them as success. A deployed server lacking these capabilities needs a separately
-approved compatible server update/schema migration; do not enable migrations
-blindly. Shared parser changes can later be deployed with the compatible server
-source for server-side recognition, but desktop mail recognition is local.
+The full scenario exposed a previously untested gap: the expense API discarded
+`payment_reference`. This release therefore includes a small compatible server
+change: a nullable TEXT column, string validation, create/update/reprocess storage,
+serialization and `payment_reference_v1` capability. Missing keys on older PUTs
+preserve the existing reference; an explicit empty string clears it. No existing
+records are backfilled. Desktop delivery checks that capability and the returned
+reference/payable/rounding before removing its staged original.
+
+The candidate retains the already accepted server/report baseline `df62930`,
+including object reports and paired-dataset boundaries. It also preserves the
+installed desktop's dataset/candidate-profile/PIN safeguards: corresponding source
+methods were compared against installed bytecode without execution or database
+access. The old stash was read, not applied or removed.
+
+Server installation is required before using the complete roundtrip in production:
+deploy the candidate server source based on that compatible baseline, apply the
+additive reference migration during its existing initialization, and restart only
+after separate approval. Net/due-date schema capabilities must also be present;
+do not enable an unrelated migration blindly. Manual desktop intake uses this
+authenticated expense API v2, not an automatic-mail endpoint.
+
+The installer is side-by-side and does not close applications, replace existing
+shortcuts or start the client. `packaging/launch_existing_profile.ps1` explicitly
+reuses the approved existing profile, documents and connection/token directory,
+checks the dataset and refuses a simultaneous SmartReport process. Installation
+and running that launcher still require separate permission.
 
 **Automatic Render mail is not implemented.** The next concrete implementation
 is an authenticated, draft-only intake API with durable original/source/checkpoint

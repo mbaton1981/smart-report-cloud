@@ -64,6 +64,10 @@ def verify_mail_release(app_module, work):
     expected = json.loads((work / "expected.json").read_text(encoding="utf-8"))
     application = QApplication.instance() or QApplication([])
     app_module.init_db_once()
+    with closing(app_module.get_db_connection()) as conn:
+        conn.execute("CREATE TABLE sync_dataset(id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL)")
+        conn.execute("INSERT INTO sync_dataset VALUES (1,'isolated-unified-release')")
+        conn.commit()
 
     class Host(QWidget):
         _store_expense_originals = app_module.SmartReportApp._store_expense_originals
@@ -205,6 +209,7 @@ def verify_mail_release(app_module, work):
             "original_sha256": digest, "original_opened_from_card": True,
             "desktop_mail_imported": True, "main_desktop_not_started": True,
             "standard_card_reference_visible": True,
+            "paired_dataset_boundary_preserved": True,
             "profile": str(desktop_auth.app_data_dir()),
         }
     finally:

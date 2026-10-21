@@ -68,11 +68,16 @@ SALARIES_DIR = "salaries"
 
 # 🌐 Адрес облачного сервера на Render и ваш секретный ключ синхронизации
 CLOUD_URL = desktop_auth.server_url()
+ISOLATED_CANDIDATE = desktop_auth.isolated_candidate_mode()
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")  # только для тестов; в установщике ключа нет
 
 
 def sync_headers(extra=None):
     headers = dict(extra or {})
+    from sync_dataset import HEADER, file_dataset
+    dataset = file_dataset(DB_FILE)
+    if dataset:
+        headers[HEADER] = dataset
     if SYNC_API_KEY:
         headers["X-Sync-Key"] = SYNC_API_KEY
     elif desktop_auth.current_token():
@@ -81,7 +86,7 @@ def sync_headers(extra=None):
 
 
 def has_sync_credentials():
-    return bool(SYNC_API_KEY or desktop_auth.current_token())
+    return not ISOLATED_CANDIDATE and bool(SYNC_API_KEY or desktop_auth.current_token())
 
 
 def raise_for_sync_response(response):
@@ -99,13 +104,27 @@ def raise_for_sync_response(response):
     response.raise_for_status()
 
 
+def ensure_sync_dataset():
+    from sync_dataset import file_dataset, require_response_dataset
+    dataset = file_dataset(DB_FILE)
+    if dataset:
+        response = requests.get(
+            f"{CLOUD_URL.rstrip('/')}/sync/capabilities", headers=sync_headers(), timeout=4
+        )
+        require_response_dataset(response, dataset)
+        raise_for_sync_response(response)
+
+
 def request_expense_api(method, path, **kwargs):
     if not has_sync_credentials():
         raise RuntimeError("Не задан ключ доступа к общему реестру документов: выполните вход.")
     headers = sync_headers(kwargs.pop("headers", {}))
+    ensure_sync_dataset()
     response = requests.request(
         method, f"{CLOUD_URL.rstrip('/')}{path}", headers=headers, timeout=20, **kwargs
     )
+    from sync_dataset import file_dataset, require_response_dataset
+    require_response_dataset(response, file_dataset(DB_FILE))
     try:
         payload = response.json()
     except ValueError:
@@ -1997,6 +2016,10 @@ class SmartReportApp(QMainWindow):
         super().__init__()
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
+        if ISOLATED_CANDIDATE:
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.10-rc1"
+            self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
+            self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
         self.setStyleSheet(DARK_THEME_QSS)
         self._async_expense_reads = True
@@ -2013,7 +2036,8 @@ class SmartReportApp(QMainWindow):
         self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
         self._sync_worker = None
         self._manual_sync_requested = False
-        self.auto_sync_timer.start(2000)
+        if not ISOLATED_CANDIDATE:
+            self.auto_sync_timer.start(2000)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -2592,6 +2616,8 @@ class SmartReportApp(QMainWindow):
                     f"{CLOUD_URL.rstrip('/')}/api/expense-documents/capabilities",
                     headers=sync_headers(), timeout=5,
                 )
+                from sync_dataset import file_dataset, require_response_dataset
+                require_response_dataset(capability_response, file_dataset(DB_FILE))
                 capability_payload = capability_response.json()
                 supported = (
                     capability_response.status_code == 200
@@ -2793,6 +2819,9 @@ class SmartReportApp(QMainWindow):
         return result
 
     def perform_sync_logic(self):
+        if ISOLATED_CANDIDATE:
+            raise RuntimeError("Синхронизация отключена в изолированном кандидате.")
+        ensure_sync_dataset()
         headers = sync_headers()
         downloaded_ids = []
         typed_sync_supported = False
@@ -3301,6 +3330,10 @@ class SmartReportApp(QMainWindow):
         self.background_sync_with_cloud()
 
     def background_sync_with_cloud(self):
+        if ISOLATED_CANDIDATE:
+            self.statusBar().showMessage("Сохранено локально. Синхронизация в кандидате отключена.")
+            self._manual_sync_requested = False
+            return
         if self._sync_worker and self._sync_worker.isRunning():
             return
         self._sync_worker = SyncWorker(self)
@@ -6262,6 +6295,9 @@ class SmartReportApp(QMainWindow):
     def open_mail_queue(self):
         from desktop_mail import DesktopMailViewer
 
+        if ISOLATED_CANDIDATE:
+            QMessageBox.information(self, "Изолированный кандидат", "Почтовый перенос в этом профиле отключён.")
+            return
         viewer = getattr(self, "_mail_viewer", None)
         if viewer is None:
             try:
@@ -9423,6 +9459,7 @@ class SmartReportApp(QMainWindow):
         
         if ok and new_pin.strip():
             try:
+                ensure_sync_dataset()
                 headers = sync_headers()
                 response = requests.post(
                     f"{CLOUD_URL}/admin/set-user-pin", 
