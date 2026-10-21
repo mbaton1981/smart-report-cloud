@@ -15,7 +15,7 @@ import requests
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QCoreApplication, QEvent, QSize
-from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QLabel, QMessageBox, QPushButton
+from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QLabel, QLineEdit, QMessageBox, QPushButton
 from werkzeug.serving import make_server
 
 from desktop_ui import ReportTable
@@ -300,6 +300,33 @@ class LocalMailTests(unittest.TestCase):
             self.assertFalse(viewer.manual_approval.isChecked())
             worker.return_value.isRunning.return_value = False
             self.assertEqual(self.count(), 0)
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+
+    def test_payment_reference_survives_draft_reopen_edit_and_clear(self):
+        def with_reference(paths):
+            result = recognized(paths)
+            result["fields"]["payment_reference"] = "118869"
+            return result
+        self.receive(with_reference)
+        viewer = LocalMailViewer(self.root, self.url, self.headers)
+        try:
+            for expected, edited in (("118869", "118869"), ("118869", "00118869"),
+                                     ("00118869", ""), ("", "")):
+                def save_draft(dialog):
+                    reference = dialog.findChild(QLineEdit, "invoice_payment_reference")
+                    self.assertIsNotNone(reference)
+                    self.assertEqual(reference.text(), expected)
+                    reference.setText(edited)
+                    self.assertFalse(dialog.findChild(QPushButton, "invoiceConfirm").isEnabled())
+                    dialog.findChild(QPushButton, "invoiceSaveDraft").click()
+                    return QDialog.DialogCode.Accepted
+                with patch.object(QDialog, "exec", save_draft):
+                    self.assertTrue(viewer.open_document(1))
+                self.assertEqual(viewer.store.latest(1)["payload"]["payment_reference"], edited)
+                self.assertEqual(self.count(), 0)
+                self.assertIsNone(viewer.store.delivery(1))
         finally:
             viewer.close()
             viewer.deleteLater()

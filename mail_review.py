@@ -26,6 +26,7 @@ from mail_import import (
 FIELD_LABELS = {
     "supplier_name": "Поставщик / составитель",
     "invoice_number": "Номер фактуры / чека",
+    "payment_reference": "OCR / reference",
     "document_date": "Дата документа",
     "due_date": "Срок оплаты",
     "net_amount": "Без НДС",
@@ -316,7 +317,7 @@ def render_review(report: dict) -> str:
             rows.append(
                 f'<tr class="{"changed" if different else ""}"><th>{escape(label)}</th>'
                 f'<td>{escape(display(key, extracted))}</td>'
-                f'<td>{escape(display(key, item.get("current", item["extracted"])[key]))}</td>'
+                f'<td>{escape(display(key, item.get("current", item["extracted"]).get(key)))}</td>'
                 f'<td>{escape(display(key, reviewed)) if is_checked else "Не сверено"}</td>'
                 + (f'<td>{escape(display(key, draft["fields"].get(key)))}</td>' if draft else "") + '</tr>'
             )

@@ -34,6 +34,11 @@ missing invoice fields on an order confirmation are not an OCR failure. Order nu
 and order date must not be relabeled as invoice number/date. `--document <id>` opens
 one saved local document for review without reprocessing it. Recognition replacement
 still requires the selected-document action and default-No confirmation.
+The shared review form includes editable `payment_reference` (OCR / reference),
+preserved as text when saving drafts and confirmations, including leading zeros.
+Older drafts without this key display the saved recognition value on reopening;
+an explicitly cleared reference remains empty. No existing draft is migrated or
+saved automatically. The offline review field comparison includes this reference.
 
 Storage within that directory:
 

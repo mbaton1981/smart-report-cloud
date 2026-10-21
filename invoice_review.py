@@ -95,6 +95,7 @@ class InvoiceReviewMixin:
         inputs = {}
         for key, label in (
             ("supplier_name", "Поставщик"), ("invoice_number", "Номер фактуры"),
+            ("payment_reference", "OCR / reference"),
             ("document_date", "Дата (ГГГГ-ММ-ДД)"), ("due_date", "Срок оплаты (ГГГГ-ММ-ДД)"), ("currency_code", "Валюта"),
             ("net_amount", "Сумма без НДС"), ("vat_amount", "НДС фактуры"),
             ("rounding_amount", "Округление"), ("amount_due", "К оплате"),
