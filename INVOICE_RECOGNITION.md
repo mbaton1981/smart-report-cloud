@@ -71,12 +71,12 @@ access logs and update service metadata.
 
 Current implemented authentication is `LOGIN` inside certificate-verified IMAPS,
 not OAuth or arbitrary bearer-token authentication. Prefer a revocable app
-password if the provider supports it. A future local masked-input launcher will
-pass it directly in memory; do not put passwords in command arguments, source,
-chat, selection JSON or log files. That interactive launcher is **not yet wired**;
-the current restricted implementation is a callable verified by synthetic tests.
-Do not connect a real mailbox until that launcher and the explicit parameters
-have been agreed and tested locally.
+password if the provider supports it. The local masked-input window described
+below passes it directly in memory; do not put passwords in command arguments,
+source, chat, selection JSON or log files. Its callback integration with
+`run_limited` is tested using a fake IMAP only. A real-mail launch path/configuration
+is **not enabled**. Do not connect a real mailbox until provider support, explicit
+parameters and permission for real login/import have been agreed.
 
 EXAMINE/BODY.PEEK and the UID allowlist are **application-enforced restrictions**.
 A normal mailbox/app password may still grant wider account access; this does
@@ -94,6 +94,49 @@ folders, new messages excluded, missing message, UIDVALIDITY change, partial
 failure/lost ACK recovery, mismatched response UID, durable selection before
 FETCH, corrupt/missing manifest and loopback-only isolation. Existing 19
 automation tests are separate; no new live mailbox evidence is claimed.
+
+### Masked password window — offline preparation only
+
+`limited_mail_ui.py` is independent of the installed desktop, profile and
+`app.py`. Its only executable mode is
+`python -m limited_mail_ui --offline-demo`, which asks for a **dummy password**
+and invokes a no-network callback. It does not load environment credentials,
+mail settings or the working profile. Do not enter a real password in the demo.
+The actual mail account/host/folder and authentication method are deliberately
+not configured yet. There is no real-mail CLI flag.
+
+- `QLineEdit.Password` masks input; there is no reveal/save checkbox or context
+  menu. Sensitive/hidden/no-predictive-text input hints are set.
+- Submission immediately clears the field using `setText("")`, including
+  undo/redo history, before starting a worker thread. The worker passes the
+  credential directly to its callback, clears its own password reference and
+  drops the callback reference when done. Cancel, Escape and closing also clear
+  the field. A running callback cannot be forcibly killed or started twice.
+- No password is written to a file, settings, environment, command line or log.
+  Neither raw operation results nor exception objects are emitted to the UI:
+  only fixed status codes. Authentication/TLS/network/restriction/internal
+  failures have static plain-text messages. Raw exception strings, including
+  provider responses which might echo a password, are not displayed or logged.
+- The password is necessarily present in Qt/Python process memory during use.
+  Clearing references is **not** a guaranteed secure memory wipe. This feature
+  cannot promise exclusion from Windows paging/crash dumps, external debugging,
+  malware or credential storage by a third-party provider. Application-level
+  persistence and error-output handling, not OS-level memory erasure, are tested.
+- A provider rejecting password/app-password LOGIN is a stop condition. Do not
+  enable insecure authentication, disable TLS/certificate checks, turn off MFA
+  or weaken mail security. If OAuth is required, implement/approve that flow
+  separately; it is not supported by this window yet.
+
+`tests/test_limited_mail_ui.py` runs eight real Qt-widget scenarios using the
+offscreen platform and randomly generated dummy secrets: masked input, success,
+cancel/Escape/close, empty input, six failure categories with secret-bearing
+exception text, reference cleanup, duplicate-submit prevention and repeated use.
+One scenario connects the prompt to the real limited runner, local HTTP intake
+and fake IMAP; repeat receipt keeps exactly one draft.
+The isolated filesystem/settings directories and captured stdout/stderr/logs are
+scanned for the dummy secret; a prompt-only success scenario additionally forbids
+Python file access, QSettings writes and socket connections. No real credential
+is used. These checks do not claim proof about unrelated system/OS logs.
 
 ## Draft-only automation implementation — LOCAL, NOT DEPLOYED (2026-10-21)
 

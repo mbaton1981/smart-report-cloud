@@ -481,6 +481,27 @@ SHA релизного коммита и статус deployment — в разд
 - Render (`smart-report-server`, https://smart-report-server.onrender.com): deploy `dep-db9rl15g1s2s73ao9q60` на `5427bd0` — Live; старт-копия БД `/data/backups/backup_20261017_181301_834849.db`.
 - В Render добавлена переменная `SMARTREPORT_UPGRADE_NET_SCHEMA=1`; deploy `dep-db9rltnavr4c73f67j30` Succeeded, старт-копия `/data/backups/backup_20261017_181454_214233.db`, ошибок миграции в логе нет. Миграция идемпотентна; флаг можно оставить или удалить.
 - Проверено после deploy: `/` отвечает 200, API без ключа даёт 403, сервис стартует без ошибок. Функциональные проверки API/клиента с ключом на Render НЕ выполнялись (ключ в модель не передавался). Capability `net_allocations_v1`/`due_date_v1` по HTTP не подтверждены.
+# Offline masked password preparation — 2026-10-21
+
+- Added standalone `limited_mail_ui.py`: masked sensitive input, immediate
+  field/undo clearing on submit/cancel/close, background callback with ephemeral
+  credential references, no saved password or raw exception/result output.
+  CLI only supports `--offline-demo`; real account/host/folder remains unconfigured.
+- UI failure categories use fixed plain-text messages even if provider/library
+  exceptions contain the dummy password. No credential in file/settings/env/argv
+  or logs is intentionally produced. Qt/Python memory cannot be securely wiped;
+  OS paging/crash dumps and external debugging are outside this guarantee.
+- **8/8 new GUI tests pass**; combined limited mode and UI suite:
+  **28/28 pass in 13.337 s**. Generated secrets, offscreen Qt, blocked network/
+  file/settings access for prompt-only success, six secret-bearing exception
+  types, cancellation/undo cleanup, running-operation guard and real limited
+  runner with fake IMAP/local HTTP were exercised. Queue/settings/files and
+  captured stdout/stderr/logs checked for dummy-secret leakage.
+- Compile and whitespace checks pass. No real password or mailbox, working
+  profile/database/application, Render, Cron, paid resource, push or deploy used.
+  Provider/client/exact folder/auth support must be clarified before any real
+  launch. Never weaken TLS/MFA/provider security to make LOGIN succeed.
+
 # Restricted local folder/UID trial — 2026-10-21
 
 - Added `limited_mail.run_limited`, independent of the unchanged scheduled INBOX
