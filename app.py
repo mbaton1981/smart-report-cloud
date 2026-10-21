@@ -45,12 +45,15 @@ from expense_documents import (
     apply_expense_documents_migration, build_project_order_allocations, decimal_text, document_storage_root,
     extract_local_document, find_document_duplicates, get_object_expense_summary,
     match_objects, parse_decimal, parse_document_text, parse_project_order_allocations,
+    non_invoice_document_type,
     safe_folder_name, sha256_file,
     store_original_file,
     validate_allocations,
 )
 from expense_documents import parse_invoice_pages, parse_invoice_money, net_invoice_issues, invoice_context, due_date_issues, due_date_edit
 from desktop_ui import ReportTable as QTableWidget
+from document_preview import DocumentGalleryDialog, DocumentPreviewDialog, ZoomableDocumentView
+from invoice_review import InvoiceReviewMixin
 
 import desktop_auth
 
@@ -64,11 +67,16 @@ SALARIES_DIR = "salaries"
 
 # 🌐 Адрес облачного сервера на Render и ваш секретный ключ синхронизации
 CLOUD_URL = desktop_auth.server_url()
+ISOLATED_CANDIDATE = desktop_auth.isolated_candidate_mode()
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")  # только для тестов; в установщике ключа нет
 
 
 def sync_headers(extra=None):
     headers = dict(extra or {})
+    from sync_dataset import HEADER, file_dataset
+    dataset = file_dataset(DB_FILE)
+    if dataset:
+        headers[HEADER] = dataset
     if SYNC_API_KEY:
         headers["X-Sync-Key"] = SYNC_API_KEY
     elif desktop_auth.current_token():
@@ -77,7 +85,7 @@ def sync_headers(extra=None):
 
 
 def has_sync_credentials():
-    return bool(SYNC_API_KEY or desktop_auth.current_token())
+    return not ISOLATED_CANDIDATE and bool(SYNC_API_KEY or desktop_auth.current_token())
 
 
 def raise_for_sync_response(response):
@@ -95,13 +103,27 @@ def raise_for_sync_response(response):
     response.raise_for_status()
 
 
+def ensure_sync_dataset():
+    from sync_dataset import file_dataset, require_response_dataset
+    dataset = file_dataset(DB_FILE)
+    if dataset:
+        response = requests.get(
+            f"{CLOUD_URL.rstrip('/')}/sync/capabilities", headers=sync_headers(), timeout=4
+        )
+        require_response_dataset(response, dataset)
+        raise_for_sync_response(response)
+
+
 def request_expense_api(method, path, **kwargs):
     if not has_sync_credentials():
         raise RuntimeError("Не задан ключ доступа к общему реестру документов: выполните вход.")
     headers = sync_headers(kwargs.pop("headers", {}))
+    ensure_sync_dataset()
     response = requests.request(
         method, f"{CLOUD_URL.rstrip('/')}{path}", headers=headers, timeout=20, **kwargs
     )
+    from sync_dataset import file_dataset, require_response_dataset
+    require_response_dataset(response, file_dataset(DB_FILE))
     try:
         payload = response.json()
     except ValueError:
@@ -1809,174 +1831,10 @@ def load_document_preview_pixmap(source_path):
     return QPixmap(str(source_path))
 
 
-class ZoomableDocumentView(QGraphicsView):
-    def __init__(self, pixmap, parent=None):
-        super().__init__(parent)
-        self._scene = QGraphicsScene(self)
-        self._image = self._scene.addPixmap(pixmap)
-        self.setScene(self._scene)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setMinimumSize(280, 320)
-        QTimer.singleShot(0, self.fit_width)
-
-    def zoom(self, factor):
-        current = self.transform().m11()
-        target = min(8.0, max(0.1, current * factor))
-        self.scale(target / current, target / current)
-
-    def fit_width(self):
-        pixmap = self._image.pixmap()
-        if pixmap.isNull() or pixmap.width() <= 0:
-            return
-        self.resetTransform()
-        factor = max(0.1, (self.viewport().width() - 24) / pixmap.width())
-        self.scale(factor, factor)
-        self.centerOn(self._image)
-
-    def show_original_size(self):
-        self.resetTransform()
-        self.centerOn(self._image)
-
-    def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.zoom(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
-            event.accept()
-            return
-        super().wheelEvent(event)
 
 
-class DocumentPreviewDialog(QDialog):
-    def __init__(self, pixmap, title, parent=None, source_path=None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(1180, 900)
-        self.setWindowFlags(
-            self.windowFlags()
-            | Qt.WindowType.WindowMaximizeButtonHint
-            | Qt.WindowType.WindowMinimizeButtonHint
-        )
-        self.setSizeGripEnabled(True)
-        layout = QVBoxLayout(self)
-        controls = QHBoxLayout()
-        self.preview = ZoomableDocumentView(pixmap, self)
-        for label, callback in (
-            ("−", lambda: self.preview.zoom(1 / 1.2)),
-            ("По ширине", self.preview.fit_width),
-            ("100%", self.preview.show_original_size),
-            ("+", lambda: self.preview.zoom(1.2)),
-        ):
-            button = QPushButton(label)
-            button.clicked.connect(callback)
-            controls.addWidget(button)
-        if source_path:
-            source_button = QPushButton("Открыть файл целиком")
-            source_button.clicked.connect(
-                lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(source_path)))
-            )
-            controls.addWidget(source_button)
-        controls.addStretch()
-        layout.addLayout(controls)
-        layout.addWidget(self.preview, 1)
 
 
-class DocumentGalleryDialog(QDialog):
-    def __init__(self, paths, title, parent=None, initial_page=0, initial_attachment=0):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(1180, 900)
-        self._temporary_directory = tempfile.TemporaryDirectory(prefix="smartreport_document_gallery_")
-        self._pdf_documents = []
-        self._pages = []
-        self._attachment_offsets = []
-        self._page_index = 0
-        starting_page = 0
-        for attachment_index, path in enumerate(paths):
-            self._attachment_offsets.append(len(self._pages))
-            if attachment_index == initial_attachment:
-                starting_page = len(self._pages) + initial_page
-            source = Path(path)
-            if source.suffix.casefold() == ".pdf":
-                import pypdfium2 as pdfium
-                try:
-                    document = pdfium.PdfDocument(str(source))
-                except Exception:
-                    for opened_document in self._pdf_documents:
-                        opened_document.close()
-                    self._temporary_directory.cleanup()
-                    raise
-                self._pdf_documents.append(document)
-                self._pages.extend(("pdf", document, page, source.name) for page in range(len(document)))
-            else:
-                self._pages.append(("image", source, 0, source.name))
-
-        layout = QVBoxLayout(self)
-        self.preview = ZoomableDocumentView(QPixmap(), self)
-        controls = QHBoxLayout()
-        self.previous_button = QPushButton("‹")
-        self.previous_button.setToolTip("Предыдущая страница")
-        self.previous_button.clicked.connect(lambda: self.show_page(self._page_index - 1))
-        self.next_button = QPushButton("›")
-        self.next_button.setToolTip("Следующая страница")
-        self.next_button.clicked.connect(lambda: self.show_page(self._page_index + 1))
-        self.page_label = QLabel("")
-        self.page_label.setMinimumWidth(150)
-        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        controls.addWidget(self.previous_button)
-        controls.addWidget(self.page_label)
-        controls.addWidget(self.next_button)
-        controls.addStretch()
-        layout.addLayout(controls)
-        zoom_controls = QHBoxLayout()
-        for label, callback in (
-            ("−", lambda: self.preview.zoom(1 / 1.2)),
-            ("По ширине", self.preview.fit_width),
-            ("100%", self.preview.show_original_size),
-            ("+", lambda: self.preview.zoom(1.2)),
-        ):
-            button = QPushButton(label)
-            button.clicked.connect(callback)
-            zoom_controls.addWidget(button)
-        zoom_controls.addStretch()
-        layout.addLayout(zoom_controls)
-        layout.addWidget(self.preview, 1)
-        self.show_page(starting_page)
-
-    def show_page(self, index):
-        if not self._pages:
-            self.page_label.setText("Страниц нет")
-            self.previous_button.setEnabled(False)
-            self.next_button.setEnabled(False)
-            return
-        self._page_index = max(0, min(int(index), len(self._pages) - 1))
-        kind, source, page_index, name = self._pages[self._page_index]
-        if kind == "pdf":
-            image = source[page_index].render(scale=1.5).to_pil().convert("RGB")
-            qimage = QImage(
-                image.tobytes(), image.width, image.height, image.width * 3,
-                QImage.Format.Format_RGB888,
-            ).copy()
-            pixmap = QPixmap.fromImage(qimage)
-        else:
-            pixmap = QPixmap(str(source))
-        self.preview._image.setPixmap(pixmap)
-        self.preview.fit_width()
-        self.page_label.setText(f"{self._page_index + 1} / {len(self._pages)} · {name}")
-        self.previous_button.setEnabled(self._page_index > 0)
-        self.next_button.setEnabled(self._page_index + 1 < len(self._pages))
-
-    def show_source(self, attachment_index, page):
-        if 0 <= attachment_index < len(self._attachment_offsets):
-            end = self._attachment_offsets[attachment_index + 1] if attachment_index + 1 < len(self._attachment_offsets) else len(self._pages)
-            index = self._attachment_offsets[attachment_index] + max(0, page - 1)
-            if index < end:
-                self.show_page(index)
-
-    def closeEvent(self, event):
-        for document in self._pdf_documents:
-            document.close()
-        self._temporary_directory.cleanup()
-        super().closeEvent(event)
 
 
 def create_half_hour_time_field(default_time):
@@ -1988,11 +1846,15 @@ def create_half_hour_time_field(default_time):
     return field
 
 
-class SmartReportApp(QMainWindow):
+class SmartReportApp(InvoiceReviewMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
+        if ISOLATED_CANDIDATE:
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.9-rc1"
+            self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
+            self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
         self.setStyleSheet(DARK_THEME_QSS)
         self._async_expense_reads = True
@@ -2009,7 +1871,8 @@ class SmartReportApp(QMainWindow):
         self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
         self._sync_worker = None
         self._manual_sync_requested = False
-        self.auto_sync_timer.start(2000)
+        if not ISOLATED_CANDIDATE:
+            self.auto_sync_timer.start(2000)
 
     def init_ui(self):
         main_widget = QWidget()
@@ -2586,6 +2449,8 @@ class SmartReportApp(QMainWindow):
                     f"{CLOUD_URL.rstrip('/')}/api/expense-documents/capabilities",
                     headers=sync_headers(), timeout=5,
                 )
+                from sync_dataset import file_dataset, require_response_dataset
+                require_response_dataset(capability_response, file_dataset(DB_FILE))
                 capability_payload = capability_response.json()
                 supported = (
                     capability_response.status_code == 200
@@ -2779,6 +2644,9 @@ class SmartReportApp(QMainWindow):
         return result
 
     def perform_sync_logic(self):
+        if ISOLATED_CANDIDATE:
+            raise RuntimeError("Синхронизация отключена в изолированном кандидате.")
+        ensure_sync_dataset()
         headers = sync_headers()
         downloaded_ids = []
         typed_sync_supported = False
@@ -3287,6 +3155,10 @@ class SmartReportApp(QMainWindow):
         self.background_sync_with_cloud()
 
     def background_sync_with_cloud(self):
+        if ISOLATED_CANDIDATE:
+            self.statusBar().showMessage("Сохранено локально. Синхронизация в кандидате отключена.")
+            self._manual_sync_requested = False
+            return
         if self._sync_worker and self._sync_worker.isRunning():
             return
         self._sync_worker = SyncWorker(self)
@@ -4114,6 +3986,10 @@ class SmartReportApp(QMainWindow):
         self, document_id, source_path, fields, suggestions, existing_allocations,
         source_paths=None, preview_paths=None,
     ):
+        non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(
+            fields.get("raw_text") or fields.get("recognized_text") or ""
+        )
+        order_confirmation_detected = non_invoice_type == "order_confirmation"
         new_paths = list(source_paths if source_paths is not None else ([source_path] if source_path else []))
         paths = list(preview_paths or new_paths)
         dialog = QDialog(self)
@@ -4220,6 +4096,19 @@ class SmartReportApp(QMainWindow):
             )
             transfer_note.setWordWrap(True)
             form.addRow("Проверка документа:", transfer_note)
+        if order_confirmation_detected:
+            order_note = QLabel(
+                "Распознано уведомление о заказе. Для учёта загрузите саму фактуру или чек; "
+                "подтверждение заказа нельзя подтвердить как расход."
+            )
+            order_note.setWordWrap(True)
+            form.addRow("Тип документа:", order_note)
+        elif non_invoice_type == "tax_decision":
+            non_invoice_note = QLabel(
+                "Распознано решение о транспортном налоге. Получатель не считается поставщиком."
+            )
+            non_invoice_note.setWordWrap(True)
+            form.addRow("Тип документа:", non_invoice_note)
 
         recognized_text = QTextEdit(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
         recognized_text.setReadOnly(True)
@@ -4466,6 +4355,12 @@ class SmartReportApp(QMainWindow):
             save_review.setText("Сохранить квитанцию: требует проверки")
             confirm.setEnabled(False)
             confirm.setToolTip("Квитанцию перевода нельзя подтверждать как фактуру.")
+        if order_confirmation_detected:
+            confirm.setEnabled(False)
+            confirm.setToolTip("Для учёта загрузите саму фактуру или чек.")
+        elif non_invoice_type == "tax_decision":
+            confirm.setEnabled(False)
+            confirm.setToolTip("Решение о транспортном налоге нельзя подтвердить как фактуру.")
         maximize_button = QPushButton("На весь экран")
         maximize_button.clicked.connect(
             lambda: dialog.showNormal() if dialog.isMaximized() else dialog.showMaximized()
@@ -4480,6 +4375,18 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(
                     dialog, "Требуется проверка",
                     "Квитанция перевода не является фактурой и сохраняется только со статусом «Требует проверки».",
+                )
+                return
+            if status == "confirmed" and non_invoice_type == "tax_decision":
+                QMessageBox.warning(
+                    dialog, "Тип документа",
+                    "Решение о транспортном налоге нельзя подтвердить как фактуру.",
+                )
+                return
+            if status == "confirmed" and order_confirmation_detected:
+                QMessageBox.warning(
+                    dialog, "Тип документа",
+                    "Подтверждение заказа нельзя подтвердить как расход. Загрузите саму фактуру или чек.",
                 )
                 return
             net_value = parse_decimal(net_amount.text())
@@ -6716,308 +6623,6 @@ class SmartReportApp(QMainWindow):
             combo.setCurrentIndex(2)
         combo.blockSignals(False)
 
-    def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None):
-        fields = {**parsed_fields, **document}
-        source_text = str(fields.get("raw_text") or fields.get("recognized_text") or "")
-        context = invoice_context(source_text)
-        context["prepaid"] = context["prepaid"] or fields.get("prepaid") is True
-        context["reverse_charge"] = context["reverse_charge"] or fields.get("reverse_charge") is True
-        server_document = server_document or document
-        client_id = str(fields.get("client_id") or uuid.uuid4())
-        preview_paths = list(source_paths or fields.get("local_attachment_paths") or [])
-        if not preview_paths and fields.get("has_original"):
-            preview_paths = self._expense_document_original_paths(server_document)
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Проверка фактуры и распределение расходов")
-        dialog.resize(1040, 760)
-        dialog.setMinimumSize(860, 650)
-        layout = QVBoxLayout(dialog)
-        top = QSplitter(Qt.Orientation.Horizontal)
-        top.setChildrenCollapsible(False)
-        gallery = None
-        if preview_paths:
-            try:
-                gallery = DocumentGalleryDialog(preview_paths, "Оригинал", dialog)
-                gallery.setWindowFlags(Qt.WindowType.Widget)
-                top.addWidget(gallery)
-                dialog.finished.connect(lambda _result: gallery.close())
-            except Exception as error:
-                top.addWidget(QLabel(f"Оригинал недоступен: {error}"))
-        else:
-            top.addWidget(QLabel("Оригинал не прикреплён"))
-        details = QWidget()
-        form = QFormLayout(details)
-        inputs = {}
-        for key, label in (
-            ("supplier_name", "Поставщик"), ("invoice_number", "Номер фактуры"),
-            ("document_date", "Дата (ГГГГ-ММ-ДД)"), ("due_date", "Срок оплаты (ГГГГ-ММ-ДД)"), ("currency_code", "Валюта"),
-            ("net_amount", "Сумма без НДС"), ("vat_amount", "НДС фактуры"),
-            ("rounding_amount", "Округление"), ("amount_due", "К оплате"),
-        ):
-            value = fields.get(key)
-            if key == "currency_code" and value == "UNKNOWN":
-                value = None
-            widget = QLineEdit(str(value) if value is not None else "")
-            if key == "rounding_amount":
-                widget.setPlaceholderText("Не указано в документе")
-            elif key == "currency_code":
-                widget.setPlaceholderText("Не указана: выберите валюту")
-            elif key == "due_date":
-                widget.setPlaceholderText("Не указан или требует проверки")
-            widget.setObjectName("invoice_" + key)
-            inputs[key] = widget
-            form.addRow(("Остаток к оплате" if key == "amount_due" and context["prepaid"] else label) + ":", widget)
-        original_due_text = inputs["due_date"].text().strip()
-        due_origin = fields.get("due_date_kind") or ("manual" if original_due_text else "absent")
-        due_origin_note = QLabel()
-        due_origin_note.setObjectName("invoiceDueDateOrigin")
-        due_origin_note.setWordWrap(True)
-        form.addRow("Источник срока:", due_origin_note)
-        due_reviewed = QCheckBox("Срок оплаты и его источник сверены")
-        due_reviewed.setObjectName("invoiceDueDateReviewed")
-        due_reviewed.setChecked(fields.get("due_date_reviewed") is True)
-        due_reviewed.setVisible(bool(fields.get("due_date_review_required") or due_origin in {"calculated", "ambiguous"}))
-        form.addRow(due_reviewed)
-        document_total = QLabel()
-        document_total.setObjectName("invoiceDocumentTotal")
-        if context["prepaid"]:
-            form.addRow("Сумма документа с НДС:", document_total)
-            prepaid_note = QLabel("Предоплаченный документ: общий итог не равен остатку к оплате. Пока доступен только черновик.")
-            prepaid_note.setWordWrap(True)
-            form.addRow(prepaid_note)
-        tax_reviewed = QCheckBox("Обратное начисление проверено по оригиналу")
-        tax_reviewed.setObjectName("invoiceTaxReviewed")
-        tax_reviewed.setChecked(fields.get("tax_reviewed") is True)
-        if context["reverse_charge"]:
-            form.addRow(tax_reviewed)
-        top.addWidget(details)
-        top.setSizes([500, 500])
-        layout.addWidget(top, 3)
-        table = QTableWidget(0, 6)
-        table.setObjectName("invoiceAllocations")
-        table.setHorizontalHeaderLabels(["Заказ / пометка", "Без НДС", "Назначение", "Объект", "Категория", "Источник"])
-        table.setMinimumHeight(155)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(table, 2)
-        source_rows = []
-        objects = list(getattr(self, "_expense_objects", []))
-        distribution = QLabel()
-        distribution.setObjectName("invoiceDistribution")
-        issues_label = QLabel()
-        issues_label.setObjectName("invoiceIssues")
-        issues_label.setWordWrap(True)
-        row_actions = QHBoxLayout()
-        add_row_button = QPushButton("Добавить строку")
-        add_row_button.setObjectName("invoiceAddAllocation")
-        remove_row_button = QPushButton("Удалить строку")
-        remove_row_button.setObjectName("invoiceRemoveAllocation")
-        row_actions.addWidget(add_row_button)
-        row_actions.addWidget(remove_row_button)
-        row_actions.addWidget(distribution, 1)
-        layout.addLayout(row_actions)
-        layout.addWidget(issues_label)
-        ambiguity_reviewed = QCheckBox("Неоднозначные строки исправлены и сверены с оригиналом")
-        ambiguity_reviewed.setObjectName("invoiceAmbiguityReviewed")
-        ambiguity_reviewed.setVisible(any(item.get("ambiguous") for item in fields.get("order_proposals") or []))
-        layout.addWidget(ambiguity_reviewed)
-        extra_toggle = QPushButton("Дополнительно")
-        extra_toggle.setCheckable(True)
-        extra = QTextEdit()
-        extra.setReadOnly(True)
-        extra.setMaximumHeight(90)
-        extra.setPlainText(str(fields.get("raw_text") or fields.get("recognized_text") or "")
-                           + "\n\n" + "\n".join(fields.get("review_reasons") or []))
-        extra.hide()
-        extra_toggle.toggled.connect(extra.setVisible)
-        layout.addWidget(extra_toggle)
-        layout.addWidget(extra)
-        actions = QHBoxLayout()
-        draft = QPushButton("Сохранить черновик")
-        draft.setObjectName("invoiceSaveDraft")
-        confirm = QPushButton("Подтвердить распределение")
-        confirm.setObjectName("invoiceConfirm")
-        cancel = QPushButton("Отмена")
-        actions.addWidget(draft)
-        actions.addStretch()
-        actions.addWidget(confirm)
-        actions.addWidget(cancel)
-        layout.addLayout(actions)
-
-        def values():
-            current = {key: widget.text().strip() for key, widget in inputs.items()}
-            current.update({**context, "tax_reviewed": tax_reviewed.isChecked(), "recognized_text": source_text})
-            current.update(due_date_edit(fields, current["due_date"], due_reviewed.isChecked()))
-            rows = []
-            for index, original in enumerate(source_rows):
-                destination = table.cellWidget(index, 2).currentData()
-                object_id = table.cellWidget(index, 3).currentData() if destination == "object" else None
-                amount = table.item(index, 1).text().strip()
-                unchanged = parse_invoice_money(amount) == parse_invoice_money(original.get("net_amount"))
-                rows.append({
-                    **original, "original_marker": table.item(index, 0).text().strip(),
-                    "net_amount": amount or None, "destination": destination,
-                    "object_id": object_id, "expense_category": table.cellWidget(index, 4).text().strip(),
-                    "vat_amount": original.get("vat_amount") if unchanged else None,
-                    "gross_amount": None,
-                    "ambiguous": bool(original.get("ambiguous")) and not ambiguity_reviewed.isChecked(),
-                })
-            return current, rows
-
-        def refresh(*_):
-            current, rows = values()
-            origin_names = {"explicit": "Явно указан в документе", "calculated": "Рассчитан по условиям оплаты — требуется сверка",
-                            "manual": "Изменён вручную", "ambiguous": "Неоднозначный срок — укажите проверенную дату",
-                            "absent": "Срок в документе не найден"}
-            due_origin_note.setText(origin_names.get(current["due_date_kind"], "Источник требует проверки"))
-            due_reviewed.setVisible(current["due_date_review_required"])
-            net_value = parse_invoice_money(current["net_amount"])
-            vat_value = parse_invoice_money(current["vat_amount"])
-            document_total.setText(decimal_text(net_value + vat_value) if net_value is not None and vat_value is not None else "Неизвестно")
-            allocated = sum((parse_invoice_money(row["net_amount"]) or Decimal(0) for row in rows
-                             if row.get("destination") == "company"
-                             or row.get("destination") == "object" and row.get("object_id") is not None), Decimal(0))
-            total = parse_invoice_money(current["net_amount"])
-            remaining = decimal_text(total - allocated) if total is not None else "неизвестно"
-            distribution.setText(f"Без НДС: распределено {decimal_text(allocated)} / осталось {remaining}")
-            issues = net_invoice_issues(current, rows)
-            if not current["supplier_name"]:
-                issues.append("Укажите поставщика.")
-            if not current["invoice_number"]:
-                issues.append("Укажите номер фактуры.")
-            try:
-                datetime.strptime(current["document_date"], "%Y-%m-%d")
-            except ValueError:
-                issues.append("Укажите корректную дату фактуры.")
-            if current["currency_code"].upper() not in {"SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"}:
-                issues.append("Выберите валюту.")
-            issues_label.setText("Для подтверждения: " + " ".join(issues[:3]) if issues else "Суммы согласованы. Назначения выбраны.")
-            confirm.setEnabled(not issues)
-
-        def append_row(original=None):
-            original = dict(original or {})
-            row = table.rowCount()
-            table.blockSignals(True)
-            table.insertRow(row)
-            marker = str(original.get("original_marker") or original.get("project_code") or "")
-            table.setItem(row, 0, QTableWidgetItem(marker))
-            table.item(row, 0).setToolTip("Заказ: " + str(original.get("order_id") or "не указан"))
-            table.setItem(row, 1, QTableWidgetItem(str(original.get("net_amount") or "")))
-            destination = QComboBox()
-            for label, value in (("Выберите назначение", "unselected"), ("На объект", "object"), ("Общие расходы фирмы", "company")):
-                destination.addItem(label, value)
-            object_combo = QComboBox()
-            object_combo.addItem("Выберите объект", None)
-            for item in objects:
-                object_combo.addItem(f"{item['name']} ({item.get('markning') or ''})", int(item["id"]))
-            selected = original.get("object_id")
-            if selected is None and original.get("project_code"):
-                matches = [int(item["id"]) for item in objects if str(item.get("markning") or "").casefold()
-                           == str(original["project_code"]).casefold()]
-                selected = matches[0] if len(matches) == 1 else None
-            if selected is not None:
-                object_combo.setCurrentIndex(max(0, object_combo.findData(selected)))
-            selected_destination = original.get("destination") or ("object" if selected is not None else "unselected")
-            destination.setCurrentIndex(max(0, destination.findData(selected_destination)))
-            category = QLineEdit(str(original.get("expense_category") or ""))
-            category.setPlaceholderText("Необязательно")
-            table.setCellWidget(row, 2, destination)
-            table.setCellWidget(row, 3, object_combo)
-            table.setCellWidget(row, 4, category)
-            sources = original.get("sources") or []
-            source_button = QPushButton("Стр. " + str(sources[0]["page"]) if sources else "Нет страницы")
-            source_button.setEnabled(bool(gallery and sources))
-            if gallery and sources:
-                source_button.clicked.connect(lambda _checked=False, source=sources[0]: gallery.show_source(
-                    int(source.get("attachment_index") or 0), int(source["page"])))
-            table.setCellWidget(row, 5, source_button)
-            source_rows.append(original)
-            table.blockSignals(False)
-
-            def destination_changed(*_):
-                object_combo.setEnabled(destination.currentData() == "object")
-                category.setEnabled(destination.currentData() == "company")
-                refresh()
-
-            destination.currentIndexChanged.connect(destination_changed)
-            object_combo.currentIndexChanged.connect(refresh)
-            category.textChanged.connect(refresh)
-            destination_changed()
-
-        def remove_row():
-            index = table.currentRow()
-            if index >= 0:
-                table.removeRow(index)
-                source_rows.pop(index)
-                refresh()
-
-        initial_rows = fields.get("order_proposals") or fields.get("allocations") or [{"net_amount": fields.get("net_amount")}]
-        for row in initial_rows:
-            append_row(row)
-        table.itemChanged.connect(refresh)
-        for widget in inputs.values():
-            widget.textChanged.connect(refresh)
-        ambiguity_reviewed.toggled.connect(refresh)
-        tax_reviewed.toggled.connect(refresh)
-        due_reviewed.toggled.connect(refresh)
-        add_row_button.clicked.connect(lambda: append_row())
-        remove_row_button.clicked.connect(remove_row)
-
-        def save(status):
-            current, rows = values()
-            if current["due_date"]:
-                date_errors = due_date_issues({"due_date": current["due_date"], "due_date_kind": "manual"})
-                if date_errors:
-                    QMessageBox.warning(dialog, "Срок оплаты", " ".join(date_errors))
-                    return
-            for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due"):
-                if current[key] and parse_invoice_money(current[key]) is None:
-                    QMessageBox.warning(dialog, "Формат суммы", "Исправьте формат денежной суммы перед сохранением.")
-                    return
-            if any(row.get("net_amount") and parse_invoice_money(row["net_amount"]) is None for row in rows):
-                QMessageBox.warning(dialog, "Распределение", "Исправьте формат суммы без НДС в строках.")
-                return
-            if status == "confirmed" and (net_invoice_issues(current, rows) or not confirm.isEnabled()):
-                return
-            net = parse_invoice_money(current["net_amount"])
-            vat = parse_invoice_money(current["vat_amount"])
-            payload = {**current, "client_id": client_id, "allocation_basis": "net",
-                       "currency_code": current["currency_code"].upper() or "UNKNOWN",
-                       "gross_amount": decimal_text(net + vat) if net is not None and vat is not None else None,
-                       "verification_status": status, "allocations": rows, "order_proposals": rows,
-                       "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
-                       "document_comment": fields.get("document_comment") or "",
-                       "expense_category": fields.get("expense_category") or "Прочие расходы"}
-            known_hashes = [item["sha256"] for item in fields.get("attachments") or [] if item.get("sha256")]
-            if known_hashes:
-                payload["required_attachment_sha256"] = known_hashes
-            staged = []
-            try:
-                if source_paths:
-                    staged = self._store_expense_originals(source_paths, client_id)
-                server_id = server_document.get("server_document_id")
-                if server_id is None and isinstance(server_document.get("id"), int):
-                    server_id = server_document["id"]
-                self.queue_expense_document_operation(
-                    client_id, "upsert", payload, server_document_id=server_id,
-                    server_version=server_document.get("server_version") or server_document.get("sync_version"),
-                    attachment_paths=staged if source_paths else fields.get("local_attachment_paths"),
-                )
-            except Exception as error:
-                for path in staged:
-                    Path(path).unlink(missing_ok=True)
-                QMessageBox.warning(dialog, "Не сохранено", str(error))
-                return
-            dialog.accept()
-            self.load_expense_documents()
-            self.background_sync_with_cloud()
-
-        draft.clicked.connect(lambda: save("draft"))
-        confirm.clicked.connect(lambda: save("confirmed"))
-        cancel.clicked.connect(dialog.reject)
-        refresh()
-        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _expense_document_review_dialog(
         self, document=None, source_paths=None, parsed_fields=None, recognition_message=""
@@ -9281,6 +8886,7 @@ class SmartReportApp(QMainWindow):
         
         if ok and new_pin.strip():
             try:
+                ensure_sync_dataset()
                 headers = sync_headers()
                 response = requests.post(
                     f"{CLOUD_URL}/admin/set-user-pin", 

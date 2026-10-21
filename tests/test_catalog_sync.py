@@ -79,6 +79,96 @@ class CatalogSyncTests(unittest.TestCase):
     def tearDown(self):
         self._case.cleanup()
 
+    def test_clean_baseline_diagnostic_preserves_catalogs_and_empty_operations(self):
+        import desktop_auth
+        import desktop_diagnostics
+        with patch.object(desktop_auth, "server_url", return_value="http://127.0.0.1:5999"):
+            result = desktop_diagnostics.run(self.desktop, "baseline", self._case.name)
+        self.assertTrue(result["ui_created"])
+        self.assertTrue(result["catalogs_unchanged_by_ui"])
+        self.assertTrue(result["operations_remain_empty"])
+        self.assertTrue(result["network_blocked_during_ui_check"])
+        self.assertEqual(result["integrity"], "ok")
+        self.assertEqual(len(result["tabs"]), 7)
+
+    def test_isolated_candidate_saves_and_reopens_local_shift_without_network(self):
+        import desktop_auth
+        import desktop_diagnostics
+        from PyQt6.QtWidgets import QMainWindow
+        with patch.object(desktop_auth, "server_url", return_value="http://127.0.0.1:5999"), \
+                patch.object(self.desktop, "ISOLATED_CANDIDATE", True):
+            # The normal branch does not require a marker unless candidate mode is explicitly requested.
+            for action in ("local-create", "local-reopen"):
+                result = desktop_diagnostics.run(self.desktop, action, self._case.name)
+                self.assertTrue(result["visible_in_history"])
+                self.assertTrue(result["network_disabled"])
+            window = self.desktop.SmartReportApp()
+            try:
+                self.assertIsInstance(window, QMainWindow)
+                self.assertFalse(window.auto_sync_timer.isActive())
+                self.assertFalse(self.desktop.has_sync_credentials())
+                with self.assertRaisesRegex(RuntimeError, "отключена"):
+                    window.perform_sync_logic()
+            finally:
+                window.close()
+
+    def test_transition_preserves_existing_admin_hash_on_restart(self):
+        connection = self.server.get_db_connection()
+        old = connection.execute("SELECT id,password_hash FROM users WHERE role='admin'").fetchall()
+        connection.close()
+        with patch.dict(os.environ, {"ADMIN_PASSWORD": "different-test-bootstrap-not-a-reset"}):
+            self.server.init_cloud_db()
+        connection = self.server.get_db_connection()
+        try:
+            new = connection.execute("SELECT id,password_hash FROM users WHERE role='admin'").fetchall()
+            self.assertEqual([tuple(r) for r in old], [tuple(r) for r in new])
+        finally:
+            connection.close()
+
+    def test_transition_boundary_rejects_legacy_reads_writes_and_old_sessions(self):
+        from sync_dataset import HEADER
+        connection = self.server.get_db_connection()
+        connection.execute("CREATE TABLE sync_dataset(id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL)")
+        connection.execute("INSERT INTO sync_dataset VALUES (1,'new-clean-dataset')")
+        connection.commit()
+        connection.close()
+        old_headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        for method, path in (
+            ("GET", "/sync/capabilities"), ("GET", "/sync/pull"),
+            ("POST", "/sync/push"), ("POST", "/sync-desktop-data"),
+            ("GET", "/get-unsynced"), ("POST", "/mark-synced"),
+            ("GET", "/api/sync/employee-catalog"), ("GET", "/api/expense-documents"),
+            ("POST", "/api/expense-documents"), ("GET", "/api/expense-objects"),
+            ("GET", "/admin/get-users-status"), ("POST", "/admin/set-user-pin"),
+        ):
+            response = self.server_client.open(path, method=method, headers=old_headers, json={} if method=="POST" else None)
+            self.assertEqual(response.status_code, 409, path)
+            self.assertEqual(response.get_json()["code"], "dataset_mismatch")
+        self.assertEqual(self.server_client.post(
+            "/sync/push", headers={**old_headers, HEADER: "another-dataset"}, json={}
+        ).status_code, 409)
+        response = self.server_client.get("/sync/pull", headers={**old_headers, HEADER:"new-clean-dataset"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["changes"], [])
+        with self.server_client.session_transaction() as session:
+            session.update(user_id=1, role="admin")
+        self.assertEqual(self.server_client.post("/submit-shift", json={}).status_code, 401)
+
+    def test_transition_client_refuses_old_server_before_any_upload_or_legacy_pull(self):
+        from sync_dataset import HEADER
+        connection = self.desktop.get_db_connection()
+        connection.execute("CREATE TABLE sync_dataset(id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL)")
+        connection.execute("INSERT INTO sync_dataset VALUES (1,'new-clean-dataset')")
+        connection.commit()
+        connection.close()
+        self.assertEqual(self.desktop.sync_headers()[HEADER], "new-clean-dataset")
+        with patch.object(self.desktop.requests, "get", return_value=SimpleNamespace(headers={}, ok=True)) as get, \
+                patch.object(self.desktop.requests, "post") as post:
+            with self.assertRaisesRegex(RuntimeError, "прежнему"):
+                self.desktop.SmartReportApp.perform_sync_logic(SimpleNamespace())
+            self.assertEqual(get.call_count, 1)
+            post.assert_not_called()
+
     def _add_company(self, name):
         server_conn = self.server.get_db_connection()
         server_conn.execute("INSERT OR IGNORE INTO meta_companies (name) VALUES (?)", (name,))

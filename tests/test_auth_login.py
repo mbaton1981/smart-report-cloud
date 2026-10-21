@@ -53,6 +53,27 @@ class AuthLoginTests(unittest.TestCase):
         self.addCleanup(self._case.cleanup)
         self.addCleanup(self.desktop_auth.set_token, "", False)
 
+    def test_isolated_candidate_requires_matching_separate_profile_and_local_server(self):
+        root = Path(self._case.name)
+        database = root / "candidate.db"
+        database.touch()
+        marker = root / "candidate_profile.json"
+        profile = {"isolated_candidate": True, "database": str(database),
+                   "source_database": str(root / "working.db")}
+        marker.write_text(json.dumps(profile), encoding="utf-8")
+        env = {"SMARTREPORT_CANDIDATE_PROFILE": str(marker), "SMARTREPORT_DB_FILE": str(database),
+               "SMARTREPORT_DATA_DIR": str(root / "profile"), "SMARTREPORT_TRIAL_MODE": "1",
+               "SMARTREPORT_CLOUD_URL": "http://127.0.0.1:5999"}
+        with patch.dict(os.environ, env):
+            self.assertTrue(self.desktop_auth.isolated_candidate_mode())
+            with patch.dict(os.environ, {"SMARTREPORT_CLOUD_URL": "https://example.invalid"}):
+                with self.assertRaises(self.desktop_auth.AuthError):
+                    self.desktop_auth.isolated_candidate_mode()
+            profile["source_database"] = str(database)
+            marker.write_text(json.dumps(profile), encoding="utf-8")
+            with self.assertRaises(self.desktop_auth.AuthError):
+                self.desktop_auth.isolated_candidate_mode()
+
     def _login(self, username="admin", password="isolated-test-only"):
         return self.client.post("/api/auth/token", json={"username": username, "password": password, "device_name": "pc"})
 

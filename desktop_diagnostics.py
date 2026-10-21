@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import uuid
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -27,7 +28,58 @@ def run(app_module, action, work_dir, case="case", out_path=None):
     result = {"action": action, "case": case, "frozen": bool(getattr(sys, "frozen", False)), "server": url}
     state_path = work / f"{case}_state.json"
 
-    if action == "selftest":
+    if action in ("local-create", "local-reopen"):
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+        assert app_module.ISOLATED_CANDIDATE, "Persistence check requires an isolated candidate."
+        application = QApplication.instance() or QApplication([])
+        app_module.init_db_once()
+        marker = "ISOLATED-CANDIDATE-PERSISTENCE-CHECK"
+        with patch.object(requests.sessions.Session, "request",
+                          side_effect=AssertionError("Network forbidden in local persistence check")):
+            window = app_module.SmartReportApp()
+            try:
+                window.show()
+                application.processEvents()
+                assert not window.auto_sync_timer.isActive()
+                if action == "local-create":
+                    with closing(app_module.get_db_connection()) as connection:
+                        assert connection.execute("SELECT count(*) FROM shifts").fetchone()[0] == 0
+                        selected = next(row for row in connection.execute(
+                            "SELECT name,company,markning FROM objects WHERE is_active=1 ORDER BY id"
+                        ) if not any(app_module.matches_special_object(
+                            row["name"], row["markning"], reference
+                        ) for reference in app_module.SPECIAL_OBJECTS.values()))
+                    window.record_type_cb.setCurrentIndex(
+                        window.record_type_cb.findData(app_module.RECORD_TYPE_WORK))
+                    window.comp_cb.setCurrentText(selected["company"])
+                    index = window.obj_cb.findData(selected["name"])
+                    if index < 0:
+                        index = window.obj_cb.findText(selected["name"])
+                    assert index >= 0, "Object not available in input form."
+                    window.obj_cb.setCurrentIndex(index)
+                    assert window.emp_cb.count() > 0
+                    window.date_input.setText("2026-10-20")
+                    window.hours_input.setText("1.25")
+                    window.comment_input.setText(marker)
+                    with patch.object(QMessageBox, "information"), patch.object(
+                        QMessageBox, "warning", side_effect=AssertionError("Save form rejected input")
+                    ):
+                        window.save_shift()
+                window.load_shifts_history()
+                with closing(app_module.get_db_connection()) as connection:
+                    saved = connection.execute("SELECT * FROM shifts WHERE comment=?", (marker,)).fetchall()
+                    assert len(saved) == 1 and saved[0]["hours"] == 1.25
+                    assert connection.execute("SELECT count(*) FROM shifts").fetchone()[0] == 1
+                assert window.table_shifts.rowCount() == 1
+                assert any(window.table_shifts.item(0, column) is not None
+                           and marker in window.table_shifts.item(0, column).text()
+                           for column in range(window.table_shifts.columnCount()))
+                result.update(saved_via_form=True, visible_in_history=True, hours=1.25,
+                              network_disabled=True, auto_sync_disabled=True)
+            finally:
+                window.close()
+    elif action in ("selftest", "baseline"):
         from ob_calculator import load_ob_rules
         from rapidocr_onnxruntime import RapidOCR
         load_ob_rules()
@@ -35,6 +87,53 @@ def run(app_module, action, work_dir, case="case", out_path=None):
         app_module.init_db_once()
         result.update({"ob_rules_loaded": True, "ocr_models_loaded": True, "database": str(Path(app_module.DB_FILE).resolve()),
                        "cwd": os.getcwd()})
+        if action == "baseline":
+            from unittest.mock import patch
+            from PyQt6.QtWidgets import QApplication
+            from document_preview import DocumentGalleryDialog
+            from invoice_review import InvoiceReviewMixin
+            application = QApplication.instance() or QApplication([])
+            tables = ("companies", "employees", "objects", "expense_suppliers",
+                      "object_name_history", "employee_sync_state")
+            operations = ("shifts", "ob_segments", "balance", "company_expenses",
+                          "supplier_documents", "supplier_document_allocations",
+                          "supplier_document_payments", "supplier_document_vat_lines",
+                          "shift_sync_outbox", "expense_document_outbox")
+            with closing(app_module.get_db_connection()) as connection:
+                before = {name: [tuple(row) for row in connection.execute(
+                    f'SELECT * FROM "{name}" ORDER BY rowid')] for name in tables}
+                for name in operations:
+                    assert connection.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0] == 0, name
+            with patch.object(requests.sessions.Session, "request",
+                              side_effect=AssertionError("Network forbidden in baseline UI check")):
+                window = app_module.SmartReportApp()
+                try:
+                    window.auto_sync_timer.stop()
+                    window.show()
+                    application.processEvents()
+                    assert isinstance(window, InvoiceReviewMixin)
+                    assert app_module.DocumentGalleryDialog is DocumentGalleryDialog
+                    result["tabs"] = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+                    assert len(result["tabs"]) == 7
+                    window.load_salary_table_template()
+                    window.load_balance_table()
+                    window.load_shifts_history()
+                    result["ui_created"] = True
+                    result["network_blocked_during_ui_check"] = True
+                finally:
+                    window.close()
+            with closing(app_module.get_db_connection()) as connection:
+                for name, old_rows in before.items():
+                    assert [tuple(row) for row in connection.execute(
+                        f'SELECT * FROM "{name}" ORDER BY rowid')] == old_rows, name
+                for name in operations:
+                    assert connection.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0] == 0, name
+                result["integrity"] = connection.execute("PRAGMA integrity_check").fetchone()[0]
+                assert result["integrity"] == "ok"
+                assert not connection.execute("PRAGMA foreign_key_check").fetchall()
+                result["catalog_counts"] = {name: len(value) for name, value in before.items()}
+            result["catalogs_unchanged_by_ui"] = True
+            result["operations_remain_empty"] = True
     elif action == "login":
         token = desktop_auth.login(url, os.environ["SMARTREPORT_E2E_USER"], os.environ["SMARTREPORT_E2E_PASS"])
         desktop_auth.set_token(token)

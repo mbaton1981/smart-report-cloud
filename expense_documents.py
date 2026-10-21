@@ -109,10 +109,21 @@ def _date_value(value: str | None) -> str | None:
         return None
 
 
+def non_invoice_document_type(text: str) -> str | None:
+    headings = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.startswith("---")]
+    header = "\n".join(headings[:15])
+    if re.search(r"^\s*Beslut\s+om\s+trängselskatt\s*$", header, re.IGNORECASE | re.MULTILINE):
+        return "tax_decision"
+    if re.search(r"^\s*ORDERBEKRÄFTELSE\s*$", header, re.IGNORECASE | re.MULTILINE):
+        return "order_confirmation"
+    return None
+
+
 def parse_document_text(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in (text or "").replace("\r", "\n").split("\n") if line.strip()]
     full_text = "\n".join(lines)
     lower_text = full_text.casefold()
+    non_invoice_type = non_invoice_document_type(full_text)
     is_transfer_receipt = bool(re.search(
         r"payment\s+(?:confirmation|receipt|proof)|transfer\s+(?:confirmation|receipt|proof|date|amount)|"
         r"transaction\s+(?:confirmation|receipt|date|amount)|betalningsbekräftelse|betalningsbekraftelse|"
@@ -121,10 +132,15 @@ def parse_document_text(text: str) -> dict[str, Any]:
     ))
 
     supplier_name = _label_value(lines, r"Leverantör|Leverantor|Supplier|Seller|Säljare|Saljare")
+    if non_invoice_type:
+        supplier_name = None
     if is_transfer_receipt and supplier_name and re.sub(r"[^a-z0-9]+", "", supplier_name.casefold()) in {"lunar", "lunarbank"}:
         supplier_name = None
     supplier_org_number = _label_value(lines, r"Leverantörens\s+Org\.?\s*nr|Leverantorens\s+Org\.?\s*nr|Org\.?\s*nr|Organisationsnummer")
     supplier_vat_number = _label_value(lines, r"VAT(?:\s*(?:no\.?|number|nr))?|Momsreg\.?\s*nr")
+    if non_invoice_type:
+        supplier_org_number = None
+        supplier_vat_number = None
     invoice_number = _label_value(lines, r"Fakturanummer|Faktura\s*nr|Invoice\s*(?:number|no\.?)")
     payment_reference = _label_value(lines, r"OCR(?:-nummer)?|Betalningsreferens|Payment\s*reference")
     document_date = _date_value(_label_value(lines, r"Fakturadatum|Invoice\s*date|Kvitto(?:datum)?|Document\s*date"))
@@ -207,7 +223,7 @@ def parse_document_text(text: str) -> dict[str, Any]:
         currency = "UNKNOWN"
 
     is_credit_note = bool(re.search(r"kreditfaktura|credit\s+note|credit\s+invoice", lower_text))
-    is_receipt = bool(re.search(r"kvitto|receipt|kassakvitto", lower_text))
+    is_receipt = bool(re.search(r"kvitto|receipt|kassakvitto|\bkontantnota\b", lower_text))
     reverse_charge = bool(re.search(r"omvänd\s+skattskyldighet|omvand\s+skattskyldighet|reverse\s+charge", lower_text))
     reasons = []
     if is_transfer_receipt:
@@ -238,6 +254,12 @@ def parse_document_text(text: str) -> dict[str, Any]:
             reasons.append("Итоговая сумма не распознана; проверьте её по оригиналу.")
         if reverse_charge:
             reasons.append("Обнаружено указание на обратное начисление НДС; проверьте его по оригиналу.")
+    if non_invoice_type:
+        reasons.append(
+            "Распознано уведомление о заказе; не подтверждайте его как фактуру без проверки оригинала."
+            if non_invoice_type == "order_confirmation"
+            else "Распознано решение о транспортном налоге, а не фактура; получатель не указан как поставщик."
+        )
 
     if not is_transfer_receipt and net_amount is not None and vat_total is not None and gross_amount is not None:
         difference = (net_amount + vat_total - gross_amount).copy_abs()
@@ -255,6 +277,7 @@ def parse_document_text(text: str) -> dict[str, Any]:
         "supplier_org_number": supplier_org_number,
         "supplier_vat_number": supplier_vat_number,
         "document_type": "transfer_receipt" if is_transfer_receipt else "credit_note" if is_credit_note else "receipt" if is_receipt else "invoice",
+        "non_invoice_document_type": non_invoice_type,
         "expense_category": "Квитанция перевода" if is_transfer_receipt else None,
         "suggested_verification_status": "requires_review" if is_transfer_receipt else None,
         "document_date": document_date,
@@ -401,11 +424,18 @@ def invoice_seller_blocks(cells, page):
         name = company.group(1)
         if ":" in name:
             continue
+        # A receipt may identify the seller in the footer without a postal address.
+        receipt_footer = (
+            cell["y0"] > height * 0.9
+            and re.search(r"\bKONTANTNOTA\b", str(page.get("text") or ""), re.IGNORECASE)
+            and any(re.search(r"\b(?:Org\.?\s*nr|Organisationsnummer)\b", other["text"], re.IGNORECASE)
+                    for other in cells)
+        )
         address_lines = [other["text"] for other in cells
                          if abs(other["x0"] - cell["x0"]) < 16 and 5 < other["y0"] - cell["y0"] < 42]
         has_address = any(re.search(r"\b(?:Box\s*\d+|\d{3}\s?\d{2}\b)|[A-Za-zÅÄÖåäö]+(?:väg|gatan|vägen)\s*\d", line, re.IGNORECASE)
                           for line in [value[len(name):], *address_lines])
-        if not has_address:
+        if not has_address and not receipt_footer:
             continue
         company_stem = re.sub(r"\s+(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS)$", "", name, flags=re.IGNORECASE)
         own_registration = any(
@@ -430,6 +460,7 @@ def invoice_context(text):
 def parse_invoice_pages(pages):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     fields = parse_document_text(text)
+    non_invoice_type = fields.get("non_invoice_document_type")
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
         "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
@@ -446,8 +477,8 @@ def parse_invoice_pages(pages):
     }
     is_receipt = fields.get("document_type") == "receipt"
     if is_receipt:
-        labels["document_date"] += r"|Kvitto(?:datum)?|Köpdatum"
-        labels["invoice_number"] += r"|Kvittonummer|Kvitto\s*nr\.?"
+        labels["document_date"] += r"|Kvitto(?:datum)?|Köpdatum|Följesedeldatum"
+        labels["invoice_number"] += r"|Kvittonummer|Kvitto\s*nr\.?|Kontantnota"
         labels["gross_amount"] += r"|Totalt"
         labels["vat_amount"] += r"|Varav\s+moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?"
     if fields.get("document_type") == "credit_note":
@@ -463,7 +494,8 @@ def parse_invoice_pages(pages):
         if key.endswith("amount") or key == "amount_due":
             return decimal_text(parse_invoice_money(value))
         if key in {"document_date", "due_date"}:
-            return _date_value(value) if re.fullmatch(r"[\d./-]+", value) else None
+            pattern = r"[\d./-]+(?:\s+\d{2}:\d{2}(?::\d{2})?)?" if is_receipt and key == "document_date" else r"[\d./-]+"
+            return _date_value(value) if re.fullmatch(pattern, value) else None
         if key == "currency_code":
             return value.upper() if re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", value, re.IGNORECASE) else None
         if key == "invoice_number":
@@ -484,6 +516,37 @@ def parse_invoice_pages(pages):
         companies.extend(invoice_seller_blocks(cells, page))
         order_lines, order_sources = invoice_order_lines(rows)
         order_pages.append({**page, "text": "\n".join(order_lines), "line_sources": order_sources})
+        if is_receipt:
+            for row in rows:
+                for cell in row:
+                    if re.search(r"\bFöljesedeldatum\s*$", cell["text"], re.IGNORECASE):
+                        dates = [other for other in row if other["x0"] >= cell["x1"]
+                                 and checked_value("document_date", other["text"]) is not None]
+                        if len(dates) == 1:
+                            other = dates[0]
+                            candidates["document_date"].append((checked_value("document_date", other["text"]), {
+                                "page": page.get("page", 1), "attachment_index": page.get("attachment_index", 0),
+                                "caption": "Följesedeldatum", "text": other["text"], "kind": "header",
+                                "box": [other[axis] for axis in ("x0", "y0", "x1", "y1")],
+                            }))
+                    included_vat = re.fullmatch(
+                        r"TOTAL\s*\(\s*Inkl\.?\s*moms\s+(SEK|EUR|NOK|DKK)\s+([\d\s.,]+)\s*\)",
+                        cell["text"], re.IGNORECASE,
+                    )
+                    if included_vat:
+                        gross_cells = [other for other in row if other["x0"] >= cell["x1"]
+                                       and parse_invoice_money(other["text"]) is not None]
+                        vat = decimal_text(parse_invoice_money(included_vat.group(2)))
+                        if len(gross_cells) == 1 and vat is not None:
+                            for key, other, value in (
+                                ("vat_amount", cell, vat),
+                                ("gross_amount", gross_cells[0], decimal_text(parse_invoice_money(gross_cells[0]["text"]))),
+                            ):
+                                candidates[key].append((value, {
+                                    "page": page.get("page", 1), "attachment_index": page.get("attachment_index", 0),
+                                    "caption": cell["text"], "text": other["text"], "kind": "invoice_total",
+                                    "priority": 3, "box": [other[axis] for axis in ("x0", "y0", "x1", "y1")],
+                                }))
         for cell in cells:
             cell_text = cell["text"].strip()
             if fields.get("currency_code") == "UNKNOWN":
@@ -491,6 +554,12 @@ def parse_invoice_pages(pages):
                 if len(currency_codes) == 1:
                     fields["currency_code"] = currency_codes.pop().upper()
             for key, label in labels.items():
+                if is_receipt and key == "gross_amount" and any(
+                    cell in row and sum(bool(re.fullmatch(
+                        r"Antal|A\s*pris|Rabatt\s*(?:%|kr)|Artikel\s*nr|Beskrivning", other["text"], re.IGNORECASE
+                    )) for other in row) >= 2 for row in rows
+                ):
+                    continue
                 if key == "due_date" and re.match(rf"^(?:{label})(?:\s|:|$)", cell_text, re.IGNORECASE):
                     due_caption_seen = True
                 inline = re.fullmatch(rf"(?:{label})(?:\s*:\s*|\s+)(.+)", cell_text, re.IGNORECASE)
@@ -630,6 +699,16 @@ def parse_invoice_pages(pages):
     fields["raw_text"] = text
     fields.update(invoice_context(text))
     fields["document_total"] = fields.get("gross_amount")
+    if non_invoice_type:
+        fields.update(
+            supplier_name=None, supplier_org_number=None, supplier_vat_number=None,
+            invoice_number=None, document_date=None, due_date=None, payment_reference=None,
+        )
+        diagnostics.append(
+            "Распознано уведомление о заказе; суммы из него не являются подтверждёнными суммами фактуры."
+            if non_invoice_type == "order_confirmation"
+            else "Распознано решение о транспортном налоге, а не фактура; данные получателя не являются данными поставщика."
+        )
     fields["review_reasons"] = diagnostics
     for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due"):
         if not fields.get(key):
