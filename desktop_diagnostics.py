@@ -58,12 +58,16 @@ def run(app_module, action, work_dir, case="case", out_path=None):
                 window.selector.setCurrentIndex(index)
                 application.processEvents()
                 assert window.original_available
+                assert window.gallery.isVisible()
+                assert not window.gallery.preview._image.pixmap().isNull()
             window.selector.setCurrentIndex(window.selector.findData(2))
             window.kind.setCurrentIndex(window.kind.findData("receipt"))
             window.object.setCurrentIndex(window.object.findData(1))
             window.checked.setChecked(True)
             assert window.inputs["gross_amount"].text() == "7506.00"
             assert window.save_edits()
+            application.processEvents()
+            assert window.gallery.isVisible()
             with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
                 window.confirm_transfer()
             card = store.card(2)
@@ -76,6 +80,8 @@ def run(app_module, action, work_dir, case="case", out_path=None):
             prompt = PasswordDialog(lambda password: None, offline=False, parent=window)
             assert prompt.password.echoMode() == QLineEdit.EchoMode.Password
             prompt.reject()
+            application.processEvents()
+            assert window.gallery.isVisible()
             window.grab().save(str(work / "incoming.png"))
             window.selector.setCurrentIndex(window.selector.findData(4))
             assert not window.transfer_button.isEnabled()

@@ -239,6 +239,7 @@ class OfflineReviewWindow(QDialog):
             self.gallery = EmbeddedOriginal([path], "Исходный PDF", self)
             self.gallery.setWindowFlags(Qt.WindowType.Widget)
             self.preview_layout.addWidget(self.gallery)
+            self.gallery.show()
             self.original_available = True
         except (ReviewError, OSError, ValueError) as error:
             self.status.setText(f"Оригинал недоступен; перенос запрещён: {error}")

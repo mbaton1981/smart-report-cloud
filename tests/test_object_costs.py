@@ -133,6 +133,9 @@ class ObjectCostTests(unittest.TestCase):
             window.object.setCurrentIndex(window.object.findData(self.object_id))
             window.checked.setChecked(True)
             self.assertTrue(window.save_edits())
+            self.qt_app.processEvents()
+            self.assertTrue(window.gallery.isVisible())
+            self.assertFalse(window.gallery.preview._image.pixmap().isNull())
             self.assertEqual(self.store.latest(2)[1]["supplier_name"], "Manually reviewed seller")
             with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
                 window.confirm_transfer()
