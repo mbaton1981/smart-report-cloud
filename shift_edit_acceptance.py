@@ -11,6 +11,11 @@ def verify_shift_edit(desktop, work, sync=None):
     from ob_calculator import calculate_work_interval, load_ob_rules
 
     application = QApplication.instance() or QApplication([])
+    import sys
+    from pathlib import Path
+    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    for name in ("spin-up.svg", "spin-down.svg"):
+        assert not desktop.QPixmap(str(resource_root / "assets" / name)).isNull(), name
     application.setStyleSheet(desktop.DARK_THEME_QSS)
     zone = ZoneInfo(load_ob_rules()["timezone"])
     calculation = calculate_work_interval("2026-10-21", "16:00", "20:00", 200)

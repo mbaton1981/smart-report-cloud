@@ -3,7 +3,8 @@ import os
 from PyInstaller.utils.hooks import collect_all
 
 root = os.path.abspath(os.path.join(SPECPATH, ".."))
-datas = [(os.path.join(root, "ob_rules.json"), ".")]
+datas = [(os.path.join(root, "ob_rules.json"), "."),
+         (os.path.join(root, "assets"), "assets")]
 manifest = os.environ.get("SMARTREPORT_BUILD_MANIFEST")
 if manifest:
     datas.append((manifest, "."))

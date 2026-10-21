@@ -1783,26 +1783,14 @@ DARK_THEME_QSS = """
         background-color: #2b6cb0;
     }
     QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-        image: none;
-        width: 0px;
-        height: 0px;
-        border-left: 5px solid transparent;
-        border-right: 5px solid transparent;
-        border-bottom: 6px solid #f7fafc;
+        image: url("__SPIN_UP_IMAGE__");
+        width: 12px;
+        height: 8px;
     }
     QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-        image: none;
-        width: 0px;
-        height: 0px;
-        border-left: 5px solid transparent;
-        border-right: 5px solid transparent;
-        border-top: 6px solid #f7fafc;
-    }
-    QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {
-        border-bottom-color: #64748b;
-    }
-    QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
-        border-top-color: #64748b;
+        image: url("__SPIN_DOWN_IMAGE__");
+        width: 12px;
+        height: 8px;
     }
     QTableWidget, QTableView {
         background-color: #1a1f26;
@@ -1849,6 +1837,11 @@ DARK_THEME_QSS = """
         padding: 6px;
     }
 """
+DARK_THEME_QSS = DARK_THEME_QSS.replace(
+    "__SPIN_UP_IMAGE__", (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "spin-up.svg").as_posix()
+).replace(
+    "__SPIN_DOWN_IMAGE__", (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "spin-down.svg").as_posix()
+)
 
 def create_date_field(default_date_str=""):
     date_edit = QDateEdit()
