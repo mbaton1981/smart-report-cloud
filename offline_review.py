@@ -1,7 +1,6 @@
 """Isolated desktop profile: immutable intake snapshot, revisions, atomic test register."""
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
@@ -39,7 +38,9 @@ def digest(content):
 
 
 def current_classification(fields):
-    fresh = copy.deepcopy(fields)
+    fresh = dict(fields)
+    if "review_reasons" in fresh:
+        fresh["review_reasons"] = list(fresh["review_reasons"])
     classify_mail_document(fresh)
     return fresh
 

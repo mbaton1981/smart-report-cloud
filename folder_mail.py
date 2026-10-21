@@ -9,6 +9,7 @@ from datetime import date, timedelta
 from email import policy
 from email.parser import BytesParser
 from threading import Event
+from time import monotonic
 
 from invoice_processing import recognize_invoice
 from mail_import import HOST, ADDRESS, MAX_MESSAGE_BYTES
@@ -50,10 +51,14 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
               "recognition_failed": 0, "skipped": 0, "total": 0, "completed": 0,
               "stopped": False, "phase": "connecting",
               "start": start.isoformat(), "end": end.isoformat()}
+    last_progress = [None, 0.0]
     def notify(phase):
         report["phase"] = phase
         if progress:
-            progress(dict(report))
+            now = monotonic()
+            if phase != last_progress[0] or now - last_progress[1] >= 0.1:
+                progress(dict(report))
+                last_progress[:] = [phase, now]
 
     def stopping():
         if should_stop and should_stop():
@@ -354,10 +359,16 @@ def create_import_dialog(window, start, end, *, archive=False):
 
 
 def open_import_dialog(window, *, archive=False):
+    existing = getattr(window, "_mail_import_dialog", None)
+    if existing is not None and existing.isVisible():
+        existing.raise_()
+        existing.activateWindow()
+        return
     if not window.keep_unsaved():
         return
     period = archive_period(window) if archive else recent_period()
     if period is None:
         return
     dialog = create_import_dialog(window, *period, archive=archive)
-    dialog.exec()
+    window._mail_import_dialog = dialog
+    dialog.show()

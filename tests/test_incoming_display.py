@@ -24,7 +24,8 @@ class IncomingDisplayTests(unittest.TestCase):
 
     def background_refresh(self, window):
         self.host._incoming_viewer = window
-        self.host._expense_read_cache = {}
+        if not hasattr(self.host, "_expense_read_cache"):
+            self.host._expense_read_cache = {}
         self.host._expense_read_attempts = {}
         self.desktop.SmartReportApp._on_expense_read_completed(
             self.host, (None, None), self.host._expense_objects, [], None)
@@ -76,8 +77,47 @@ class IncomingDisplayTests(unittest.TestCase):
         self.store.add_pdf(pdf("No recognizable fields"), "unknown.pdf", {"fields": {}, "state": "failed"})
         window = self.open_window()
         label = window.selector.itemText(window.selector.count() - 1)
-        for value in ("Поставщик не распознан", "Дата не распознана", "Сумма не распознана"):
+        for value in ("Поставщик не распознан", "Дата не распознана", "Сумма не определена — нужна проверка"):
             self.assertIn(value, label)
+        window.selector.setCurrentIndex(window.selector.count() - 1)
+        self.assertEqual(window.inputs["gross_amount"].text(), "")
+        self.assertIn("Сумма не определена — нужна проверка", window.classification.text())
+
+    def test_idle_refresh_does_not_reparse_or_read_documents_or_rerender_pdf(self):
+        window = self.open_window()
+        queries = []
+        self.store.conn.set_trace_callback(queries.append)
+        with patch.object(self.store, "base", side_effect=AssertionError("No unchanged OCR/classification")), \
+                patch.object(self.store, "original", side_effect=AssertionError("No unchanged PDF reads")), \
+                patch.object(window.gallery, "show_page", side_effect=AssertionError("No rerender")):
+            for _ in range(10):
+                window.refresh_document_labels()
+        self.assertEqual(len(queries), 10)
+        self.assertTrue(all(query == "PRAGMA data_version" for query in queries))
+        self.store.conn.set_trace_callback(None)
+
+    def test_only_changed_document_label_is_rebuilt_and_unsaved_fields_survive_reload(self):
+        from test_mail_automation import pdf
+        self.store.add_pdf(pdf("Other document"), "other.pdf", {"fields": self.fields})
+        window = self.open_window()
+        window.expense_button.click()
+        window.inputs["supplier_name"].setText("Unsaved correction")
+        other = window.selector.itemData(1)
+        self.store.set_action(other, "later", 0)
+        with patch.object(window, "document_label", wraps=window.document_label) as label:
+            window.refresh_document_labels()
+            self.assertEqual([call.args[0] for call in label.call_args_list], [other])
+        window.reload_documents()
+        self.assertEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
+        self.assertIn("Разобрать позже", window.selector.itemText(1))
+        window.loaded_payload = window.payload()
+
+    def test_unchanged_server_snapshot_does_not_rebuild_selected_card(self):
+        window = self.open_window()
+        self.background_refresh(window)
+        with patch.object(window, "select_document", side_effect=AssertionError("No full card rebuild")), \
+                patch.object(window, "refresh_objects", side_effect=AssertionError("No unchanged objects")):
+            self.background_refresh(window)
 
     def test_old_invoice_label_with_collection_demand_is_blocked_without_rewriting_draft(self):
         from offline_review import packed

@@ -53,8 +53,10 @@ class OfflineReviewWindow(QDialog):
         banner.setWordWrap(True)
         layout.addWidget(banner)
         self.selector = QComboBox()
+        self._label_signatures = {}
+        self._label_token = None
         for doc in store.documents():
-            self.selector.addItem(self.document_label(doc["id"]), doc["id"])
+            self.selector.addItem("", doc["id"])
         layout.addWidget(self.selector)
         self.classification = QLabel()
         self.classification.setWordWrap(True)
@@ -96,7 +98,8 @@ class OfflineReviewWindow(QDialog):
             box.setContentsMargins(0, 0, 0, 0)
             field = QLineEdit()
             field.setObjectName("review_" + key)
-            field.setPlaceholderText("Не указано / не распознано")
+            field.setPlaceholderText("Сумма не определена — нужна проверка" if key == "gross_amount"
+                                     else "Не указано / не распознано")
             origin = QLabel()
             origin.setWordWrap(True)
             box.addWidget(field)
@@ -300,40 +303,73 @@ class OfflineReviewWindow(QDialog):
         date = fields.get("document_date") or "Дата не распознана"
         amount = fields.get("gross_amount")
         total = (f"{amount} {fields.get('currency_code') or ''}".strip()
-                 if amount not in (None, "") else "Сумма не распознана")
+                 if amount not in (None, "") else "Сумма не определена — нужна проверка")
         status = (self.store.accounting_status(document_id)[0] if self.integrated
                   else "Требует проверки")
         return f"№{document_id} — {supplier} — {date} — {total} — {status}"
 
-    def refresh_document_labels(self):
+    def refresh_document_labels(self, *, server_changed=False):
+        token = (self.store.conn.total_changes, self.store.conn.execute("PRAGMA data_version").fetchone()[0])
+        if token == self._label_token and not server_changed:
+            return
+        signatures = self._label_signatures
+        if token != self._label_token:
+            signatures = {row[0]: tuple(row[1:]) for row in self.store.conn.execute("""
+                SELECT d.id,d.base_json,
+                  (SELECT MAX(revision) FROM revisions WHERE document_id=d.id),
+                  (SELECT payload_json FROM register WHERE document_id=d.id)
+                FROM documents d ORDER BY d.id
+            """)}
+            if self.integrated:
+                actions = dict(self.store.conn.execute(
+                    "SELECT document_id,MAX(revision) FROM document_actions GROUP BY document_id"))
+                deliveries = dict(self.store.conn.execute("SELECT document_id,state FROM deliveries"))
+                signatures = {key: (*value, actions.get(key), deliveries.get(key))
+                              for key, value in signatures.items()}
         self.selector.blockSignals(True)
         try:
             for index in range(self.selector.count()):
                 document_id = self.selector.itemData(index)
+                signature = signatures.get(document_id)
+                card_changed = server_changed and signature is not None and signature[2] is not None
+                if signature == self._label_signatures.get(document_id) and not card_changed:
+                    continue
                 label = self.document_label(document_id)
                 if self.selector.itemText(index) != label:
                     self.selector.setItemText(index, label)
                 if self.integrated:
                     _, green = self.store.accounting_status(document_id)
-                    self.selector.setItemData(index, QColor("#b9efc6") if green else None,
-                                              Qt.ItemDataRole.BackgroundRole)
+                    color = QColor("#b9efc6") if green else None
+                    if self.selector.itemData(index, Qt.ItemDataRole.BackgroundRole) != color:
+                        self.selector.setItemData(index, color, Qt.ItemDataRole.BackgroundRole)
+                self._label_signatures[document_id] = signature
+            self._label_token = token
         finally:
             self.selector.blockSignals(False)
 
     def reload_documents(self):
+        dirty = hasattr(self, "loaded_payload") and self.payload() != self.loaded_payload
         self.selector.blockSignals(True)
         selected = self.selector.currentData()
-        self.selector.clear()
+        existing = {self.selector.itemData(index) for index in range(self.selector.count())}
         for doc in self.store.documents():
-            self.selector.addItem(self.document_label(doc["id"]), doc["id"])
-            if self.integrated:
-                _, green = self.store.accounting_status(doc["id"])
-                if green:
-                    self.selector.setItemData(self.selector.count() - 1, QColor("#b9efc6"),
-                                              Qt.ItemDataRole.BackgroundRole)
+            if doc["id"] not in existing:
+                self.selector.addItem("", doc["id"])
+                self._label_token = None
         self.selector.setCurrentIndex(max(0, self.selector.findData(selected)))
         self.selector.blockSignals(False)
-        self.select_document()
+        if not dirty:
+            self.select_document()
+        else:
+            self.refresh_document_labels()
+
+    def refresh_server_review(self):
+        self.refresh_objects()
+        if self.document_id is not None and self.payload() == self.loaded_payload:
+            revision, payload = self.store.current_review(self.document_id)
+            if revision != self.revision or payload != self.loaded_review:
+                self.select_document()
+        self.refresh_document_labels(server_changed=True)
 
     def refresh_objects(self):
         selected = self.object.currentData()
@@ -379,6 +415,7 @@ class OfflineReviewWindow(QDialog):
             return
         self.revision, payload = (self.store.current_review(self.document_id) if self.integrated
                                   else self.store.latest(self.document_id))
+        self.loaded_review = payload
         self.server_version = payload.get("server_version")
         base = current_classification(self.store.base(self.document_id))
         for key, field in self.inputs.items():
@@ -427,6 +464,9 @@ class OfflineReviewWindow(QDialog):
             if len(candidates) > 1 and payload.get("gross_amount") is None:
                 self.classification.setText(self.classification.text()
                                             + "\nНайдено несколько сумм: выберите подходящую по подписи и странице оригинала.")
+            if payload.get("gross_amount") in (None, ""):
+                self.classification.setText(self.classification.text()
+                                            + "\nСумма не определена — нужна проверка")
         if self.gallery and self.preview_document_id != self.document_id:
             self.gallery.hide()
             self.preview_layout.removeWidget(self.gallery)
@@ -589,12 +629,30 @@ class OfflineReviewWindow(QDialog):
         preview.close()
 
     def closeEvent(self, event):
+        dialog = getattr(self, "_mail_import_dialog", None)
+        if dialog is not None and dialog.worker is not None:
+            dialog.request_stop()
+            dialog.show()
+            dialog.raise_()
+            event.ignore()
+            return
         if not self.keep_unsaved():
             event.ignore()
             return
         if self.gallery:
             self.gallery.close()
+        if dialog is not None:
+            dialog.close()
         super().closeEvent(event)
+
+    def reject(self):
+        dialog = getattr(self, "_mail_import_dialog", None)
+        if dialog is not None and dialog.worker is not None:
+            dialog.request_stop()
+            return
+        if dialog is not None:
+            dialog.close()
+        super().reject()
 
 
 def main():

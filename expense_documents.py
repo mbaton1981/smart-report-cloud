@@ -480,7 +480,7 @@ def parse_invoice_pages(pages):
         "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
         "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
-        "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?",
+        "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Totalt",
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
     }
@@ -488,7 +488,6 @@ def parse_invoice_pages(pages):
     if is_receipt:
         labels["document_date"] += r"|Kvitto(?:datum)?|Köpdatum|Följesedeldatum"
         labels["invoice_number"] += r"|Kvittonummer|Kvitto\s*nr\.?|Kontantnota"
-        labels["gross_amount"] += r"|Totalt"
         labels["vat_amount"] += r"|Varav\s+moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?"
     if fields.get("document_type") == "credit_note":
         labels["amount_due"] += r"|Summa\s+er\s+tillgodo|Belopp\s+att\s+återfå"
@@ -566,6 +565,15 @@ def parse_invoice_pages(pages):
                 if len(currency_codes) == 1:
                     fields["currency_code"] = currency_codes.pop().upper()
             for key, label in labels.items():
+                if key == "gross_amount" and not is_receipt and re.fullmatch(
+                        r"Totalt", cell_text, re.IGNORECASE):
+                    # An unqualified total is safe only in a labelled fiscal summary,
+                    # never an item-table subtotal.
+                    if not any(cell in row and any(re.fullmatch(
+                            rf"(?:{labels['amount_due']}|{labels['net_amount']})\s*:?",
+                            other["text"].strip(), re.IGNORECASE) for other in row if other is not cell)
+                               for row in rows):
+                        continue
                 if is_receipt and key == "gross_amount" and any(
                     cell in row and sum(bool(re.fullmatch(
                         r"Antal|A\s*pris|Rabatt\s*(?:%|kr)|Artikel\s*nr|Beskrivning", other["text"], re.IGNORECASE

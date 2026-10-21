@@ -1,5 +1,38 @@
 # Invoice Recognition and Net Allocations
 
+## Trio VVS summary and responsive incoming review — 1.0.17-rc1
+
+The retained four-page Trio VVS original contains a native-text fiscal summary
+on page 4: `Exkl. moms | Totalt | ATT BETALA`, each amount 48 280,00 SEK.
+The old extractor found net and amount_due, but did not accept plain `Totalt`
+for invoice gross; absent VAT prevented a calculated gross. Neither OCR nor
+the form discarded an existing gross value. Plain `Totalt` now supplies gross
+only when it shares a layout row with an explicit net/payable summary caption,
+not as a lone item-table total. The source page/caption is retained, and VAT
+remains unknown. Conflicting totals remain unknown, never zero. The list,
+classification notice and amount placeholder say **Сумма не определена —
+нужна проверка** when the reviewed amount is missing.
+
+The 632-document copy reproduced a 2-second timer reparsing/reclassifying all
+documents: 6318 SQL queries and 3.882 seconds with cProfile per refresh.
+Unchanged refresh now checks SQLite total_changes/data_version only, without
+reading document JSON, PDF or running recognition. Local changes rebuild only
+affected labels; external registry changes refresh confirmed cards, and an
+unchanged server response does not reconstruct the selected form. PDF gallery,
+page, transform and scrollbars are retained. Classification copies only the
+fields/reasons it modifies rather than deep-copying every evidence tree.
+
+Manual intake progress is nonmodal so the existing review stays usable.
+Duplicate intake windows are prevented, closing the parent requests safe stop,
+and completion preserves unsaved edits. Repeated progress phases are coalesced,
+without dropping terminal phases or cancellation checkpoints. Recognition
+remains in its worker; no mail schedule, mailbox mutation or debt logic.
+
+Verification uses the current 632-document database copied read-only, a single
+retained PDF and simulated IMAP. No live mail access, mass reprocessing,
+replacement of manual/confirmed values or schema migration is performed.
+The existing Trio VVS working draft is intentionally not rewritten.
+
 ## Date-scoped incremental INBOX — 1.0.16-rc1
 
 This supersedes the ALL-UID intake described for 1.0.15 below. The ordinary

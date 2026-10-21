@@ -345,8 +345,8 @@ class IncomingStore(OfflineReviewStore):
         card = self.card(document_id)
         if card is None:
             action = self.action(document_id)[1]
-            if (action not in ("ignore", "later") and current_classification(
-                    self.base(document_id)).get("suggested_document_type") == "payment_reminder"):
+            if (action not in ("ignore", "later") and self.base(
+                    document_id).get("suggested_document_type") == "payment_reminder"):
                 return "Напоминание / требование оплаты — не новая покупка; перенос запрещён", False
             return {"ignore": "Не учитывать — PDF сохранён, расход не создан",
                     "later": "Разобрать позже — PDF сохранён, расход не создан",
@@ -555,7 +555,7 @@ def open_incoming(host, root):
         if store.card(window.document_id):
             window.status.setText(text)
             window.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
-        window.refresh_document_labels()
+        window.refresh_document_labels(server_changed=store.card(window.document_id) is not None)
 
     window.status_timer.timeout.connect(update_status)
     window.status_timer.start(2000)

@@ -86,6 +86,31 @@ class FolderMailUITests(unittest.TestCase):
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM register").fetchone()[0], 0)
         self.assertNotIn("isolated-only", dialog.status.text())
 
+    def test_closing_parent_requests_stop_instead_of_destroying_active_worker(self):
+        original = folder_mail.import_folder
+        def slow_recognition(paths):
+            time.sleep(0.08)
+            return recognized(paths)
+        def isolated_import(*args, **kwargs):
+            return original(*args, **kwargs, client_factory=FolderIMAP, recognizer=slow_recognition)
+        folder_mail.open_import_dialog(self.window)
+        dialog = self.window._mail_import_dialog
+        self.addCleanup(dialog.close)
+        self.window.show()
+        def close_parent(report):
+            if report["phase"] == "recognizing":
+                self.assertFalse(self.window.close())
+                self.window.reject()
+                self.assertTrue(self.window.isVisible())
+                self.assertTrue(dialog.stop_event.is_set())
+        dialog.progress_signal.updated.connect(close_parent)
+        with patch.object(folder_mail, "import_folder", side_effect=isolated_import):
+            dialog.password.setText("isolated-only")
+            dialog.accept()
+            self.finish(dialog)
+        self.assertTrue(dialog.report["stopped"])
+        self.assertTrue(self.window.isVisible())
+
     def test_archive_selection_requires_explicit_confirmation(self):
         end = date.today() - timedelta(days=50)
         start = end - timedelta(days=10)
@@ -108,6 +133,16 @@ class FolderMailUITests(unittest.TestCase):
     def test_declined_archive_never_opens_password_or_connects(self):
         with patch.object(folder_mail, "archive_period", return_value=None), \
                 patch.object(folder_mail, "create_import_dialog", side_effect=AssertionError("No import dialog")):
+            folder_mail.open_import_dialog(self.window, archive=True)
+
+    def test_import_dialog_is_nonmodal_and_duplicate_launch_reuses_it(self):
+        folder_mail.open_import_dialog(self.window)
+        dialog = self.window._mail_import_dialog
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+        self.assertFalse(dialog.isModal())
+        self.assertTrue(self.window.isEnabled())
+        with patch.object(folder_mail, "create_import_dialog", side_effect=AssertionError("No duplicate")):
             folder_mail.open_import_dialog(self.window, archive=True)
 
     def test_invalid_archive_does_not_reach_confirmation_or_mail(self):
