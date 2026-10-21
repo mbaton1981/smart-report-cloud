@@ -25,6 +25,76 @@ This does not revert the parent Beijer rounding-test commit
 `4ce094d2045d2e8e6452fcca0eaf353ecc89d58c`. It changes repository history only;
 it does not publish or deploy the result.
 
+## Future mail intake and document retention (proposal; not enabled)
+
+The current Loopia importer and review UI are a local test-only queue. They do
+not write to the working expense register. Test originals are stored under
+`%LOCALAPPDATA%\SmartReport\mail_faktura_trial\originals\`, with queue state in
+`mail_queue.sqlite3`; this is not a production retention location.
+
+The intended production flow is:
+
+1. **Receive:** store each supported attachment once in an incoming area on the
+   server's persistent document volume, and record mailbox, folder, UIDVALIDITY,
+   UID, MIME-part index, filename, and SHA-256 in the import queue. A unique
+   source-identity constraint makes retrying the same mail part idempotent; a
+   content hash also prevents storing identical bytes twice.
+2. **Recognize:** read the immutable original and save extracted fields,
+   classification, and recognition status in the queue only. Recognition never
+   creates or confirms an expense. Failed attempts retain the original for an
+   explicit retry.
+3. **Review:** require a person to open the original, review/correct the fields,
+   and explicitly confirm an eligible invoice or receipt. Order confirmations,
+   tax decisions, pro formas, and unclassified items cannot pass this step as
+   invoices; an order confirmation requires the actual invoice or receipt.
+4. **Save:** create the expense record only after that confirmation. Prefer
+   retaining the same immutable original on the same persistent volume and
+   linking it to the expense attachment. If a copy is necessary, verify its
+   SHA-256 before committing the attachment metadata. Keep the queue item and
+   original until the server acknowledges the saved record.
+
+In addition to source identity and byte-level SHA-256, the expense API's
+business-key check (supplier, invoice number, date, currency, and gross amount)
+blocks matching invoices with different file bytes. Such matches should be
+shown for human review, not silently discarded. A same-client retry is
+idempotent. This target flow is a design only; no production mail import or
+automatic transfer is enabled.
+
+## Backup and recovery findings and proposed operations
+
+The last recorded provider configuration check (2026-10-17, see `WORK_LOG.md`)
+reported `SMARTREPORT_DOCUMENTS_DIR=/data/documents` and
+`DATABASE_PATH=/data/cloud_database.db` on Render's persistent `/data` disk.
+The live provider settings and disk attachment have not been re-queried for
+this task, and no restart/deploy persistence test was run. Treat those values
+as historical evidence, not confirmation of today's live configuration.
+
+An isolated end-to-end backup/restore exercise passed for an active invoice:
+the SQLite snapshot passed `PRAGMA integrity_check`; the invoice and attachment
+rows were present; the downloaded original matched the recorded SHA-256; after
+restoring both into a temporary server copy, the expense card served the PDF and
+the PDF text could be read. Restoration required mapping archived
+`document_id`/`attachment_id` filenames back to `stored_name` from the database
+snapshot. `server_backup.py` currently downloads a database snapshot and
+originals but does not provide a restore command. Its document listing also
+contains active records only, so deleted-record retention needs an explicit
+policy before calling it a complete archive.
+
+Proposed backup operations, not implemented:
+
+- Every 24 hours, create a SQLite online snapshot and a manifest of every
+  retained attachment, including database/attachment IDs, stored name, byte
+  size, and SHA-256. Include soft-deleted records for the chosen retention
+  period, or explicitly document their expiry.
+- Store the encrypted backup in a separately administered off-server location
+  (separate provider/account and credentials from Render), not only on `/data`.
+- Retain 30 daily and 12 month-end copies. Verify database integrity, attachment
+  hashes, file counts, and the manifest after upload; alert on any missing or
+  mismatched item.
+- Perform a full restore into an isolated environment quarterly and after
+  backup/restore changes. Suggested service targets are RPO 24 hours and RTO
+  4 hours, subject to owner approval and actual backup size.
+
 The migration adds document rounding, amount due, and allocation basis. It rebuilds
 the allocation table so a net allocation can have unknown gross/VAT, and adds an
 explicit destination and optional category. Existing IDs, monetary values and
