@@ -3275,6 +3275,8 @@ class SmartReportApp(QMainWindow):
                 self.load_expense_documents()
                 if self.exp_document_tabs.currentIndex() == 1:
                     self.load_object_expense_overview()
+        if getattr(self, "_incoming_viewer", None) is not None:
+            self._schedule_expense_read((None, None))
         if getattr(self, "_object_edit_sync_pending", False):
             if not success or conflicts:
                 self._object_edit_sync_pending = False
@@ -6326,6 +6328,11 @@ class SmartReportApp(QMainWindow):
         finally:
             conn.close()
 
+    def incoming_after_queue(self):
+        self._expense_read_dirty = True
+        self.load_expense_documents()
+        self.background_sync_with_cloud()
+
     def open_incoming_documents(self):
         from incoming_documents import enabled, open_incoming
         if not enabled():
@@ -6460,6 +6467,9 @@ class SmartReportApp(QMainWindow):
         if not error:
             self._expense_read_cache[key] = list(documents)
             self._expense_objects = list(objects)
+            incoming = getattr(self, "_incoming_viewer", None)
+            if incoming is not None:
+                incoming.refresh_objects()
         if refresh_again:
             self._expense_read_attempts.clear()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3:

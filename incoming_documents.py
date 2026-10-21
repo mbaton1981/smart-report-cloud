@@ -279,6 +279,9 @@ class IncomingStore(OfflineReviewStore):
         with self.conn:
             self.conn.execute("INSERT INTO deliveries VALUES (?,'queued',?)",
                               (card["document_id"], card["client_id"]))
+        callback = getattr(self.host, "incoming_after_queue", None)
+        if callback:
+            callback()
         return card
 
 

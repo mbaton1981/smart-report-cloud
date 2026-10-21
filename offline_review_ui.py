@@ -169,6 +169,16 @@ class OfflineReviewWindow(QDialog):
         self.selector.blockSignals(False)
         self.select_document()
 
+    def refresh_objects(self):
+        selected = self.object.currentData()
+        self.object.blockSignals(True)
+        self.object.clear()
+        self.object.addItem("Обязательно выберите объект", None)
+        for obj in self.store.objects():
+            self.object.addItem(obj["name"], obj["id"])
+        self.object.setCurrentIndex(max(0, self.object.findData(selected)))
+        self.object.blockSignals(False)
+
     def reassign_object(self):
         from PyQt6.QtWidgets import QInputDialog
         objects = self.store.objects()

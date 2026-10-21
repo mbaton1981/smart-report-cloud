@@ -30,6 +30,61 @@ def run(app_module, action, work_dir, case="case", out_path=None):
     if action == "mail-release":
         from release_acceptance import verify_mail_release
         result.update(verify_mail_release(app_module, work))
+    elif action == "incoming-selftest":
+        from PyQt6.QtWidgets import QApplication, QLineEdit, QMessageBox
+        from unittest.mock import patch
+        from incoming_documents import IncomingStore
+        from limited_mail_ui import PasswordDialog
+        application = QApplication.instance() or QApplication([])
+        app_module.init_db_once()
+        queued = []
+        host = SimpleNamespace(
+            _expense_objects=[{"id": 1, "name": "ISOLATED A"}, {"id": 2, "name": "ISOLATED B"}],
+            _incoming_costs_supported=True,
+            incoming_register_snapshot=lambda: [],
+            incoming_delivery_pending=lambda client_id: {"last_error": None},
+            _store_expense_originals=lambda paths, client_id: paths,
+            queue_expense_document_operation=lambda *args, **kwargs: queued.append((args, kwargs)),
+        )
+        store = IncomingStore(work / "incoming", host)
+        store.import_snapshot(work / "snapshot")
+        from offline_review_ui import OfflineReviewWindow
+        window = OfflineReviewWindow(store, integrated=True)
+        try:
+            window.show()
+            application.processEvents()
+            assert window.selector.count() == 5
+            for index in range(window.selector.count()):
+                window.selector.setCurrentIndex(index)
+                application.processEvents()
+                assert window.original_available
+            window.selector.setCurrentIndex(window.selector.findData(2))
+            window.kind.setCurrentIndex(window.kind.findData("receipt"))
+            window.object.setCurrentIndex(window.object.findData(1))
+            window.checked.setChecked(True)
+            assert window.inputs["gross_amount"].text() == "7506.00"
+            assert window.save_edits()
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+                window.confirm_transfer()
+            card = store.card(2)
+            assert card and len(queued) == 1
+            store.transfer(2, card["revision"])
+            assert len(queued) == 1
+            assert queued[0][0][2]["usage"] == "object_cost"
+            assert "settlement_status" not in queued[0][0][2]
+            assert "amount_due" not in window.inputs
+            prompt = PasswordDialog(lambda password: None, offline=False, parent=window)
+            assert prompt.password.echoMode() == QLineEdit.EchoMode.Password
+            prompt.reject()
+            window.grab().save(str(work / "incoming.png"))
+            window.selector.setCurrentIndex(window.selector.findData(4))
+            assert not window.transfer_button.isEnabled()
+            result.update({"incoming_imports_loaded": True, "five_pdfs_opened": True,
+                           "receipt_edit_confirm_retry": True, "nordea_blocked": True,
+                           "masked_password_loaded": True, "queued_count": len(queued)})
+        finally:
+            window.close()
+            store.close()
     elif action == "selftest":
         from ob_calculator import load_ob_rules
         from rapidocr_onnxruntime import RapidOCR
