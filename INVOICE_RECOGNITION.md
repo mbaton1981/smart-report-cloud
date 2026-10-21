@@ -198,3 +198,16 @@ No separate paid-amount storage was introduced; AJ is still draft-only in Qt/API
 Production schemas, existing user databases, mail, push and deployment remain
 unauthorized. Physical-device testing stays BLOCKED; independent unseen text
 invoices and real scanned-document OCR remain separate stages.
+
+## Non-Invoice Classification Safeguards
+
+Documents headed `ORDERBEKRÄFTELSE` are classified as order confirmations.
+Documents headed `Beslut om trängselskatt` are classified as tax decisions.
+Receiver/customer details from these documents are not proposed as supplier or
+invoice identity. Neither type can be confirmed as an invoice expense; an order
+confirmation requires the actual invoice or receipt.
+
+Existing saved mail-queue recognition results are not refreshed automatically.
+The test viewer updates one selected result only after the user confirms the
+explicit reprocess prompt. This updates recognition data only; it does not
+confirm an expense, create an accounting operation, or synchronize anything.

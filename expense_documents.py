@@ -109,10 +109,21 @@ def _date_value(value: str | None) -> str | None:
         return None
 
 
+def non_invoice_document_type(text: str) -> str | None:
+    headings = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.startswith("---")]
+    header = "\n".join(headings[:15])
+    if re.search(r"^\s*Beslut\s+om\s+trängselskatt\s*$", header, re.IGNORECASE | re.MULTILINE):
+        return "tax_decision"
+    if re.search(r"^\s*ORDERBEKRÄFTELSE\s*$", header, re.IGNORECASE | re.MULTILINE):
+        return "order_confirmation"
+    return None
+
+
 def parse_document_text(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in (text or "").replace("\r", "\n").split("\n") if line.strip()]
     full_text = "\n".join(lines)
     lower_text = full_text.casefold()
+    non_invoice_type = non_invoice_document_type(full_text)
     is_transfer_receipt = bool(re.search(
         r"payment\s+(?:confirmation|receipt|proof)|transfer\s+(?:confirmation|receipt|proof|date|amount)|"
         r"transaction\s+(?:confirmation|receipt|date|amount)|betalningsbekräftelse|betalningsbekraftelse|"
@@ -121,10 +132,15 @@ def parse_document_text(text: str) -> dict[str, Any]:
     ))
 
     supplier_name = _label_value(lines, r"Leverantör|Leverantor|Supplier|Seller|Säljare|Saljare")
+    if non_invoice_type:
+        supplier_name = None
     if is_transfer_receipt and supplier_name and re.sub(r"[^a-z0-9]+", "", supplier_name.casefold()) in {"lunar", "lunarbank"}:
         supplier_name = None
     supplier_org_number = _label_value(lines, r"Leverantörens\s+Org\.?\s*nr|Leverantorens\s+Org\.?\s*nr|Org\.?\s*nr|Organisationsnummer")
     supplier_vat_number = _label_value(lines, r"VAT(?:\s*(?:no\.?|number|nr))?|Momsreg\.?\s*nr")
+    if non_invoice_type:
+        supplier_org_number = None
+        supplier_vat_number = None
     invoice_number = _label_value(lines, r"Fakturanummer|Faktura\s*nr|Invoice\s*(?:number|no\.?)")
     payment_reference = _label_value(lines, r"OCR(?:-nummer)?|Betalningsreferens|Payment\s*reference")
     document_date = _date_value(_label_value(lines, r"Fakturadatum|Invoice\s*date|Kvitto(?:datum)?|Document\s*date"))
@@ -209,6 +225,11 @@ def parse_document_text(text: str) -> dict[str, Any]:
     is_credit_note = bool(re.search(r"kreditfaktura|credit\s+note|credit\s+invoice", lower_text))
     is_receipt = bool(re.search(r"kvitto|receipt|kassakvitto", lower_text))
     reverse_charge = bool(re.search(r"omvänd\s+skattskyldighet|omvand\s+skattskyldighet|reverse\s+charge", lower_text))
+    if non_invoice_type:
+        invoice_number = None
+        document_date = None
+        due_date = None
+        payment_reference = None
     reasons = []
     if is_transfer_receipt:
         reasons.append("Распознана квитанция банковского перевода, а не фактура; проверьте получателя и связь с расходом.")
@@ -254,7 +275,11 @@ def parse_document_text(text: str) -> dict[str, Any]:
         "supplier_name": supplier_name,
         "supplier_org_number": supplier_org_number,
         "supplier_vat_number": supplier_vat_number,
-        "document_type": "transfer_receipt" if is_transfer_receipt else "credit_note" if is_credit_note else "receipt" if is_receipt else "invoice",
+        "document_type": non_invoice_type or (
+            "transfer_receipt" if is_transfer_receipt else
+            "credit_note" if is_credit_note else "receipt" if is_receipt else "invoice"
+        ),
+        "non_invoice_document_type": non_invoice_type,
         "expense_category": "Квитанция перевода" if is_transfer_receipt else None,
         "suggested_verification_status": "requires_review" if is_transfer_receipt else None,
         "document_date": document_date,
@@ -430,6 +455,7 @@ def invoice_context(text):
 def parse_invoice_pages(pages):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     fields = parse_document_text(text)
+    non_invoice_type = fields.get("non_invoice_document_type")
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
         "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
@@ -630,6 +656,16 @@ def parse_invoice_pages(pages):
     fields["raw_text"] = text
     fields.update(invoice_context(text))
     fields["document_total"] = fields.get("gross_amount")
+    if non_invoice_type:
+        fields.update(
+            supplier_name=None, supplier_org_number=None, supplier_vat_number=None,
+            invoice_number=None, document_date=None, due_date=None, payment_reference=None,
+        )
+        diagnostics.append(
+            "Распознано уведомление о заказе; суммы из него не являются подтверждёнными суммами фактуры."
+            if non_invoice_type == "order_confirmation"
+            else "Распознано решение о транспортном налоге, а не фактура; данные получателя не являются данными поставщика."
+        )
     fields["review_reasons"] = diagnostics
     for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due"):
         if not fields.get(key):
@@ -965,6 +1001,13 @@ def migrate_invoice_net_schema(connection):
 
 def net_invoice_issues(fields, allocations):
     issues = due_date_issues(fields)
+    non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(
+        str(fields.get("raw_text") or fields.get("recognized_text") or "")
+    )
+    if non_invoice_type == "order_confirmation":
+        issues.append("Подтверждение заказа нельзя подтверждать как расход; загрузите фактуру или чек.")
+    elif non_invoice_type == "tax_decision":
+        issues.append("Решение о транспортном налоге нельзя подтверждать как фактуру.")
     context = invoice_context(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
     context["prepaid"] = context["prepaid"] or fields.get("prepaid") is True
     context["reverse_charge"] = context["reverse_charge"] or fields.get("reverse_charge") is True

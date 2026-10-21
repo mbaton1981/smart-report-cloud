@@ -2801,6 +2801,49 @@ class CatalogSyncTests(unittest.TestCase):
         old_client_response = self.server_client.put(f"/api/expense-documents/{document['id']}", headers=headers, json=old_client_update)
         self.assertEqual(old_client_response.status_code, 409, old_client_response.get_json())
 
+    def test_desktop_invoice_review_blocks_order_and_tax_decision_confirmation(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._expense_objects = []
+        base_fields = {
+            "allocation_basis": "net",
+            "supplier_name": "Receiver AB",
+            "invoice_number": "DOC-1",
+            "document_date": "2026-10-13",
+            "currency_code": "SEK",
+            "net_amount": "100.00",
+            "vat_amount": "25.00",
+            "rounding_amount": "0.00",
+            "amount_due": "125.00",
+            "order_proposals": [{
+                "net_amount": "100.00", "vat_amount": "25.00",
+                "destination": "company", "object_id": None,
+                "expense_category": "Тест",
+            }],
+        }
+
+        def inspect_dialog(dialog):
+            confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
+            self.assertFalse(confirm.isEnabled())
+            dialog.reject()
+            return dialog.result()
+
+        try:
+            for document_type, text in (
+                ("order_confirmation", "ORDERBEKRÄFTELSE"),
+                ("tax_decision", "Beslut om trängselskatt"),
+            ):
+                with self.subTest(document_type=document_type):
+                    fields = {
+                        **base_fields, "document_type": document_type,
+                        "non_invoice_document_type": document_type, "raw_text": text,
+                    }
+                    with patch.object(self.desktop.QDialog, "exec", new=inspect_dialog):
+                        self.assertFalse(window._review_net_invoice({}, [], fields))
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_invoice_vertical_totals_do_not_steal_next_row_amount(self):
         from expense_documents import parse_invoice_pages, net_invoice_issues
 
