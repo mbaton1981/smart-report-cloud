@@ -942,6 +942,15 @@ def expense_due_date_schema_ready(connection):
 
 
 def validate_expense_fields(payload):
+    document_type = payload.get("document_type") or "invoice"
+    object_cost = payload.get("usage") == "object_cost"
+    # A saved or user-supplied invoice label cannot override current reminder classification.
+    from mail_import import classify_mail_document
+    safety = {"document_type": document_type, "raw_text": payload.get("recognized_text") or "",
+              "invoice_number": payload.get("invoice_number"), "net_amount": payload.get("net_amount")}
+    classify_mail_document(safety)
+    if safety.get("suggested_document_type") == "payment_reminder":
+        raise ValueError("Напоминание об оплате нельзя переносить как новую фактуру или чек.")
     reference = payload.get("payment_reference")
     if reference is not None and (not isinstance(reference, str) or len(reference) > 200):
         raise ValueError("OCR/reference должен быть строкой не длиннее 200 символов.")
@@ -950,9 +959,9 @@ def validate_expense_fields(payload):
     if status not in EXPENSE_DOCUMENT_STATUSES:
         raise ValueError("Недопустимый статус документа.")
     context = invoice_context(str(payload.get("recognized_text") or ""))
-    if status == "confirmed" and context["prepaid"]:
+    if status == "confirmed" and context["prepaid"] and not object_cost:
         raise ValueError("Предоплаченный чек: подтверждение пока не поддерживается; сохраните черновик, не заменяя остаток общей суммой.")
-    if status == "confirmed" and context["reverse_charge"] and payload.get("tax_reviewed") is not True:
+    if status == "confirmed" and context["reverse_charge"] and not object_cost and payload.get("tax_reviewed") is not True:
         raise ValueError("Обратное начисление НДС требует явной сверки по оригиналу.")
 
     document_date = str(payload.get("document_date") or "").strip() or None
@@ -977,7 +986,7 @@ def validate_expense_fields(payload):
             or any(not isinstance(item, dict) for item in due_evidence)
             or len(json.dumps(due_evidence, ensure_ascii=False)) > 20000):
         raise ValueError("Некорректные свидетельства срока оплаты.")
-    if status == "confirmed":
+    if status == "confirmed" and not object_cost:
         date_issues = due_date_issues({"due_date": due_date, "due_date_kind": due_kind,
                                       "due_date_review_required": due_required, "due_date_reviewed": due_reviewed})
         if date_issues:
@@ -1027,6 +1036,7 @@ def validate_expense_fields(payload):
         status = "requires_review"
 
     return {
+        "document_type": document_type,
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
         "payment_reference": reference or None,
@@ -1359,6 +1369,8 @@ def serialize_expense_document(cursor, document, include_text=False):
     processing = cursor.execute("SELECT state, details_json FROM expense_processing WHERE document_id=?", (document["id"],)).fetchone()
     serialized["processing"] = ({"state": processing["state"], **json.loads(processing["details_json"])}
                                 if processing else None)
+    if serialized["processing"] and serialized["processing"].get("usage") == "object_cost":
+        serialized["usage"] = "object_cost"
     if include_text:
         serialized["recognized_text"] = document["recognized_text"]
     return serialized
@@ -1430,6 +1442,7 @@ def expense_document_capabilities_api():
             net_features.append("due_date_v1")
         if "payment_reference" in {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}:
             net_features.append("payment_reference_v1")
+        net_features.append("object_costs_v1")
     finally:
         connection.close()
     return jsonify({
@@ -1643,6 +1656,16 @@ def expense_document_create_api():
             document = serialize_expense_document(cursor, existing)
             return jsonify({"ok": True, "duplicate_request": True, "document": document}), 200
 
+        if payload.get("usage") == "object_cost":
+            matching = cursor.execute("""SELECT id FROM expense_documents
+                WHERE supplier_name=? COLLATE NOCASE AND document_date=? AND currency_code=?
+                AND gross_amount=? LIMIT 1""",
+                (fields["supplier_name"], fields["document_date"], fields["currency_code"],
+                 fields["gross_amount"])).fetchone()
+            if matching:
+                return jsonify({"ok": False, "error": "Возможный повтор покупки; требуется ручная сверка.",
+                                "existing_document_id": matching["id"]}), 409
+
         if fields["supplier_name"] and fields["invoice_number"] and fields["document_date"] and fields["gross_amount"]:
             matching_document = cursor.execute("""
                 SELECT id FROM expense_documents
@@ -1742,6 +1765,9 @@ def expense_document_create_api():
         ))
         document_id = int(cursor.lastrowid)
         store_expense_allocation_rows(cursor, document_id, allocations, fields)
+        if payload.get("usage") == "object_cost":
+            cursor.execute("INSERT INTO expense_processing VALUES (?,?,?,?)",
+                           (document_id, "reviewed", json.dumps({"usage": "object_cost"}), now))
         cursor.executemany("""
             INSERT INTO expense_document_attachments (
                 document_id, original_name, stored_name, file_sha256, ordinal, created_at
@@ -1793,8 +1819,18 @@ def expense_document_update_api(document_id):
         restore_operation = str(payload.get("restore_operation_id") or "")
         restore_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
                                                  separators=(",", ":")).encode("utf-8")).hexdigest() if restore else None
-        processing = cursor.execute("SELECT state,details_json FROM expense_processing WHERE document_id=?", (document_id,)).fetchone() if restore else None
+        processing = cursor.execute("SELECT state,details_json FROM expense_processing WHERE document_id=?", (document_id,)).fetchone()
         details = json.loads(processing["details_json"]) if processing else {}
+        cost_operation = str(payload.get("cost_operation_id") or "")
+        cost_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                             separators=(",", ":")).encode("utf-8")).hexdigest()
+        cost_receipt = details.get("cost_operation") or {}
+        if (existing is not None and not existing["is_deleted"] and cost_operation
+                and cost_receipt.get("id") == cost_operation
+                and cost_receipt.get("sha256") == cost_hash
+                and cost_receipt.get("version") == int(existing["sync_version"])):
+            return jsonify({"ok": True, "duplicate_request": True,
+                            "document": serialize_expense_document(cursor, existing)})
         receipt = details.get("restoration") or {}
         if (existing is not None and not existing["is_deleted"] and restore
             and receipt.get("operation_id") == restore_operation and receipt.get("payload_sha256") == restore_hash
@@ -1902,6 +1938,16 @@ def expense_document_update_api(document_id):
                                       "restored_version": int(existing["sync_version"]) + 1, "restored_at": now}
             cursor.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
                            (document_id, "restored", json.dumps(details, ensure_ascii=False), now))
+        if payload.get("usage") == "object_cost":
+            details["usage"] = "object_cost"
+            if cost_operation:
+                if len(cost_operation) > 150:
+                    raise ValueError("Слишком длинный идентификатор изменения расхода.")
+                details["cost_operation"] = {"id": cost_operation, "sha256": cost_hash,
+                                             "version": int(existing["sync_version"]) + 1}
+            cursor.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
+                           (document_id, processing["state"] if processing else "reviewed",
+                            json.dumps(details, ensure_ascii=False), now))
         conn.commit()
         document = cursor.execute(
             "SELECT * FROM expense_documents WHERE id = ?", (document_id,)

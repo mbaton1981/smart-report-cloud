@@ -87,6 +87,7 @@ class DocumentGalleryDialog(QDialog):
         self._pages = []
         self._attachment_offsets = []
         self._page_index = 0
+        self.finished.connect(self.release_resources)
         starting_page = 0
         for attachment_index, path in enumerate(paths):
             self._attachment_offsets.append(len(self._pages))
@@ -169,8 +170,12 @@ class DocumentGalleryDialog(QDialog):
             if index < end:
                 self.show_page(index)
 
-    def closeEvent(self, event):
+    def release_resources(self, _result=None):
         for document in self._pdf_documents:
             document.close()
+        self._pdf_documents.clear()
         self._temporary_directory.cleanup()
+
+    def closeEvent(self, event):
+        self.release_resources()
         super().closeEvent(event)

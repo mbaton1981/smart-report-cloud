@@ -1,5 +1,205 @@
 # Invoice Recognition and Net Allocations
 
+## Main-desktop integration candidate — local only, 2026-10-21
+
+Local branch: `feature/incoming-documents-candidate`. No production installation,
+EXE replacement, deployment, mailbox connection or production snapshot occurred.
+
+The expenses page now has an incoming-documents entry hidden by default.
+Only process-local `SMARTREPORT_INCOMING_DOCUMENTS=1` enables it; unset/0 means
+no incoming profile, viewer, worker or queue scan is started. The former mail
+entry point reports that mail is disabled. This candidate exposes no mail
+fetch/password/IMAP/replay/Cron control. Normal pre-existing expense sync is
+unchanged; it only receives a new document after explicit manual confirmation.
+
+`incoming_documents.py` adapts the offline form to the host's stable object
+catalog and ordinary `expense_document_outbox`. The user can explicitly open
+a local frozen snapshot; nothing imports at startup. Source PDFs/recognition
+remain immutable in the separate profile, with versioned edits and approval.
+The journal is a handoff journal, not a second accounting register.
+Normal pending rows appear in the ordinary desktop document view.
+
+Duplicate review requires the full unfiltered ordinary-register cache plus
+the local outbox; a filtered/offline cache is insufficient and blocks transfer.
+An explicit button requests the normal full-register read; opening the viewer
+does not itself fetch anything. Server duplicate checks remain the final
+concurrent-write guard. Approval reclassifies the original text before handoff,
+requires the selected catalog object and retains due-date provenance/review
+requirements. Unsupported calculated/ambiguous deadlines cannot be silently
+approved by the original-checked checkbox.
+
+The same durable client ID is used across approval, file staging, normal outbox
+enqueue and all retries. Delivery is recorded only after queue commit. A crash
+between commits is retried with that same ID. Original PDF bytes stay in the
+incoming profile even when the ordinary outbox removes its staged copy after
+verified server ACK. No new columns/tables are added to the main desktop DB;
+only a deliveries table is added to the separate incoming profile.
+
+### Receipt limitation — enforced, not a completed server feature
+
+Current server code rejects confirmed prepaid receipts and its invoice-oriented
+net validation does not provide a persisted no-debt receipt contract.
+Local API tests confirmed rejection. The candidate therefore keeps receipts
+editable but disables their ordinary-register handoff in both UI and backend.
+No invented invoice number, amount_due, synthetic payment or debt is sent.
+Repeated attempts create zero ordinary cards and zero outbox rows.
+
+Separate server work is required before enabling receipt handoff:
+
+- persist and return an explicit document type and settlement/no-debt meaning;
+- type-specific validation (receipt number optional; stated receipt total and
+  VAT/net/rounding checked independently of outstanding debt);
+- define paid-receipt treatment without inventing a payment or a supplier debt,
+  including who paid/employee reimbursement when relevant;
+- apply it consistently to object summaries, balance/debt views, API create/
+  update/serialization and attachment/idempotency ACK;
+- add additive schema changes only where existing fields cannot represent the
+  type/settlement, preserve existing invoices, and expose a new capability,
+  e.g. `receipt_no_debt_v1`; the desktop must gate and verify it.
+
+No such server changes or new receipt capability are included/applied here.
+Invoices use the existing net-allocation/due-date/reference contract; the test
+server baseline explicitly enables that already-existing schema before testing.
+This is not a new migration needed by the incoming-documents feature.
+
+### Isolated validation and rollback
+
+`tests/test_incoming_integration.py` exercises default-off in the actual
+SmartReport main-window class with only temporary DB/profile paths, the
+embedded form, existing register view, ordinary outbox and Flask test-client
+API. Socket connects are blocked for delivery checks; no external server used.
+Lost post-commit responses and crashes between handoff/queue commits retain
+one client ID, one card, object allocation and verified PDF.
+
+`tests/incoming_five_pdf_acceptance.py` separately processes the five retained
+PDFs with network blocked: three invoices reach the ordinary isolated registry;
+Bygghemma is held without debt and Nordea is blocked despite its old invoice
+label. Each invoice survives a lost ACK/retry without another card; downloading
+the saved API original returns the exact original SHA-256. All source files
+remain byte-identical.
+
+Rollback was tested by disabling the entry point, checking the unchanged main
+SQLite schema/preserved outbox, and executing the actual previous release's
+`_sync_expense_document_outbox` from commit `38bf30d` against the new pending row
+and isolated API. It delivers successfully without the new feature.
+No old DB restoration is needed or safe over later operations. Keep incoming
+history/originals and pending ordinary rows; disable the flag and return to the
+prior EXE only after separately approved installation. A full packaged-EXE
+swap/launcher rollback has not been performed in this source-level preparation.
+
+## Isolated editable desktop — 2026-10-21, implemented after the review below
+
+Independent technical acceptance additionally verified real native modal
+dialogs and registry-to-PDF opening. Approval-save failures now retain the
+visible edited fields instead of reloading and losing them. Lost post-commit
+responses can be retried without a second card. The shared PDF gallery now
+releases file handles on dialog `finished` (accept/reject), not only closeEvent.
+The 22-test desktop suite and final 46-test related regression pass; no live
+mailbox was connected. Both earlier one-shot mail/test UI background commands
+and all subsequent test helpers have been stopped.
+
+`offline_review_ui.py` is a separate native Qt test desktop, not an update to
+the installed EXE. It imports the frozen five-draft `result.json` plus its
+verified originals into a new, application-ID-checked `OfflineReviewStore`
+profile. It never imports `app.py`, opens a production database, starts an
+API/worker, or connects to mail. Test objects A/B are explicitly synthetic.
+
+The window reuses the multi-page original preview beside editable fields.
+Type is a proposal until explicitly confirmed; object starts unselected,
+including the two-project Beijer invoice. Missing/unknown values are distinct
+from zero. Field captions expose document-date provenance (e.g. delivery-note
+date) and derived receipt net. Unsaved edits prompt Save/Discard/Cancel.
+
+The source snapshot is immutable. Original bytes, original recognition and
+an overlay base are stored separately. Revision zero records parser/classifier
+updates; append-only correction revisions record before/after values and UTC
+timestamps. Optimistic revision checks reject stale edits. Reimporting the
+same snapshot never resets edits/confirmations.
+
+`required_document_fields` is shared by extraction diagnostics, recognition
+status and offline approval. A receipt requires seller/date/currency/net/VAT
+and stated total, but not invoice number or debt. The test registry records
+receipt debt as `0.00` and rejects a nonempty payable field. Unknown VAT is not
+automatically zeroed. Invoice approval retains its invoice-number/payable checks.
+
+The corrected reference captions include `OCR-nr/meddelande` and
+`OCR-/referensnummer`. The actual retained Parkeringsservice PDF now yields
+the exact string `314469748389051`, with coordinate evidence. The previously
+saved null reference remains null in the original snapshot; only the overlay
+is updated and the difference is recorded in revision-zero history.
+
+Approval is a separate default-No `Подтвердить и перенести` action. Both
+opening and transferring reclassify original recognized text under current
+rules. A stale Nordea `invoice` label, edited type or checked-original flag
+cannot bypass the reminder block. The older `DesktopMailStore.approve` path
+also now reclassifies before trusting persisted fields.
+
+The isolated register commits one row, its immutable payload/revision,
+stable client ID and original SHA in one SQLite transaction. Repeated requests
+return the same row; different PDFs with matching invoice identity or matching
+seller/date/total require manual review, never automatic merge or another row.
+Original bytes are retained in the profile database and verified in its PDF
+cache; corrupt/missing originals block transfer. Synthetic pre-commit failure,
+lost acknowledgement after commit, another connection and reopening are tested.
+This register deliberately does not deliver anything to a working desktop
+outbox or server. Production installation/integration remains separately gated.
+
+`tests/offline_five_pdf_acceptance.py --snapshot ... --output ...` exercises
+the five retained PDFs in a NEW output directory (with project root on
+`PYTHONPATH`). It blocks socket connects, compares all source-file hashes,
+exercises actual Qt save/default-No/explicit-Yes actions, checks the two Beijer
+pages and the original PDFs in four test cards, blocks Nordea, and creates
+a second zero-card profile for user inspection. Windows screenshots must use
+`QT_QPA_PLATFORM=windows`; the offscreen plugin lacks system fonts here.
+
+The mail launcher now also has an explicit `--authorized-replay` mode. It
+requires an existing isolated marker, queue and frozen selection; it never
+creates a fresh UID selection or overwrites prior result/outcome files.
+Each replay gets new attempt-specific report names. IMAP replay is still
+one-shot/read-only and must be separately authorized. Five-message replay
+was tested only against fake IMAP: same five draft IDs/results, no new sources,
+drafts or expenses, no SEARCH, no flag changes. No live replay was run.
+
+## Offline review of five retained PDFs — 2026-10-21
+
+All six PDF pages were visually reviewed without connecting to mail or any
+working service. Three ordinary invoices have matching payable/rounding values.
+Parkeringsservice invoice 6836 has explicit OCR `314469748389051` that the current
+parser misses (`OCR-nr/meddelande` caption); this remains a documented extraction
+gap, not an absent source value.
+
+Bygghemma is `Följesedel / Kvitto`, paid by card, with explicit total 7506.00 and
+VAT 1501.20. Net 6004.80 is derived from those totals and must be labelled derived.
+Its number is an order number, its date is labelled delivery-note date, and no
+separate payable/rounding is stated. Do not fill invoice number, debt or zero
+rounding merely to satisfy common invoice-required-field validation.
+
+The file named as a Russian receipt is actually Nordea's `Påminnelse`: a payment
+reminder referring to an existing invoice/notice, not a newly established invoice.
+OCR ran successfully but merged captions and damaged amount punctuation.
+The parser defaulted to invoice and the old mail classifier accepted a `Faktura`
+substring in `Faktura-/Avinummer`.
+The local classifier now sets `unclassified` with a `payment_reminder` suggestion
+for a standalone reminder heading, and warns to reconcile the original debt.
+It does not invent supplier, invoice dates/numbers, tax or payable values.
+Existing saved drafts/results are not rewritten; the five-result acceptance
+was performed on in-memory copies with network blocked. Old results need an
+explicit current safety check when presented/confirmed, not blind trust of the
+persisted invoice label. No existing confirmation UI was activated by this review.
+
+The draft-only API queue still has no desktop edit/approval bridge.
+The next integrated feature must reuse the existing desktop review/outbox:
+side-by-side original, explicit/candidate type and amount provenance, versioned
+edits, required object selection, duplicate review, durable approval and a stable
+client ID only after separate default-No user confirmation. Reminder/order
+documents must not enter this flow as new purchases.
+
+An eventual separately authorized live replay must use the retained queue and
+manifest: folder `INBOX.SmartReport-Test`, UIDVALIDITY `1758653292`,
+UIDs `1,2,4,5,6`. Expected delta: zero source rows, zero drafts, zero expenses;
+existing 5 messages/5 drafts/5 attachments and original/result hashes unchanged.
+The current single-pass launcher does not perform replay automatically.
+
 ## Restricted local folder trial — implementation only, no mailbox connection
 
 `limited_mail.run_limited` is a separate **local-only** entry point, not an option
@@ -916,3 +1116,40 @@ Existing saved mail-queue recognition results are not refreshed automatically.
 The test viewer updates one selected result only after the user confirms the
 explicit reprocess prompt. This updates recognition data only; it does not
 confirm an expense, create an accounting operation, or synchronize anything.
+# Object costs release (2026-10-21)
+
+The desktop incoming queue now uses the ordinary expense registry and outbox.
+PDF text extraction and OCR still autofill editable draft fields. Recognition
+is assistance, not approval: unknown fields remain empty and can be entered
+manually. The user checks the original, selects an object and presses
+`Добавить к расходам объекта`. Receipts need no invoice number or payment status.
+VAT can remain unknown. The expense amount includes explicit rounding; a
+remaining balance after a payment is never substituted for the purchase total.
+
+Mail retrieval is manual, using only `INBOX.SmartReport-Test` on the configured
+Loopia account. Each click scans all current UIDs in that folder, without the
+old five-message restriction. TLS certificate validation, read-only EXAMINE and
+BODY.PEEK are mandatory. No other folders, flags, moves, deletes, schedules or
+Cron are used. Password entry is masked, memory-only and cleared after use.
+Provider exception bodies are never displayed or logged; fixed error codes
+distinguish folder, authentication, UIDVALIDITY and message-identity failures.
+
+SHA-256 prevents reimporting identical PDFs. Different PDFs with the same
+supplier/number or supplier/date/total require manual review. Reminders,
+including old drafts incorrectly labelled invoice, cannot become new expenses.
+The source PDF and initial snapshot remain intact; corrections have revisions.
+Changing the object updates the same client_id and versioned allocation,
+atomically removing the old allocation. Stable operation IDs make lost-ACK
+retries safe. Green `Учтён на объекте` requires an acknowledged ordinary
+registry document; pending or failed outbox entries do not turn green.
+
+Server feature `object_costs_v1` removes payment-related conditions only for
+this personal object-cost workflow. It uses existing expense tables and
+expense_processing metadata, not a supplier-payment/debt ledger. No additional
+payment columns or receipt migration are required. An older server blocks
+delivery without discarding the draft or PDF.
+
+The entry is enabled in this release; set `SMARTREPORT_INCOMING_DOCUMENTS=0`
+to hide it for rollback. Roll back the executable without restoring an old
+database over newer operations. Preserve the incoming sidecar, PDFs and pending
+ordinary outbox. Mail/Cron remain off until a user explicitly retrieves mail.

@@ -2,10 +2,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ProfileRoot,
-    [string]$ExecutablePath = (Join-Path $PSScriptRoot "SmartReport.exe")
+    [string]$ExecutablePath
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $ExecutablePath) {
+    $ExecutablePath = Join-Path $PSScriptRoot "SmartReport.exe"
+}
 $profileDirectory = (Get-Item -LiteralPath $ProfileRoot).FullName
 $database = Get-Item -LiteralPath (Join-Path $profileDirectory "smart_report.db")
 $executable = Get-Item -LiteralPath $ExecutablePath

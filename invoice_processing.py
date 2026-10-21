@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from expense_documents import allocation_vat_from_items, parse_invoice_pages, parse_project_order_allocations
+from expense_documents import (
+    allocation_vat_from_items, parse_invoice_pages, parse_project_order_allocations,
+    required_document_fields,
+)
 
 
 def recognize_invoice(paths, parser=None):
@@ -40,8 +43,8 @@ def recognize_invoice(paths, parser=None):
             fields["order_proposal_warnings"].append(str(error))
     fields["raw_text"] = "\n\n".join(text_parts)
     fields["review_reasons"] = [*fields.get("review_reasons", []), *errors]
-    missing = [key for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due")
-               if fields.get(key) in (None, "")]
+    missing = [key for key in required_document_fields(fields.get("document_type"))
+               if fields.get(key) in (None, "", "UNKNOWN")]
     if not any(page["text"].strip() for page in pages):
         errors.append("Не удалось извлечь текст; оригинал сохранён, доступен повтор обработки.")
     return {"fields": fields, "methods": sorted(methods), "errors": errors, "page_count": len(pages),

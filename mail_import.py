@@ -21,7 +21,7 @@ from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from expense_documents import decimal_text, non_invoice_document_type, sha256_file
+from expense_documents import decimal_text, non_invoice_document_type, required_document_fields, sha256_file
 from invoice_processing import recognize_invoice
 
 
@@ -40,6 +40,10 @@ class MailImportError(RuntimeError):
     pass
 
 
+class WorkerError(RuntimeError):
+    pass
+
+
 TYPE_LABELS = {
     "invoice": "Фактура", "receipt": "Чек", "credit_note": "Кредитная фактура",
     "transfer_receipt": "Подтверждение перевода", "proforma": "Проформа",
@@ -52,8 +56,7 @@ TYPE_LABELS = {
 def recognition_status(result: dict, state: str) -> dict:
     fields = result.get("fields") or {}
     kind = fields.get("document_type")
-    missing = [key for key in ("supplier_name", "invoice_number", "document_date",
-                               "net_amount", "vat_amount", "amount_due", "currency_code")
+    missing = [key for key in required_document_fields(kind)
                if fields.get(key) in (None, "", "UNKNOWN")]
     if state in ("failed", "pending") or result.get("state") == "failed":
         outcome, label = "failed", "Распознавание не завершено — требуется явный повтор"
@@ -94,7 +97,14 @@ class ImportSummary:
 def classify_mail_document(fields: dict) -> None:
     text = fields.get("raw_text") or ""
     detected_type = non_invoice_document_type(text)
-    if detected_type == "tax_decision":
+    if re.search(r"^\s*(?:p[åa]minnelse|betalningsp[åa]minnelse|payment\s+reminder)\s*$",
+                 text, re.IGNORECASE | re.MULTILINE):
+        fields["document_type"] = "unclassified"
+        fields["suggested_document_type"] = "payment_reminder"
+        reason = ("Напоминание об оплате — не подтверждённая новая фактура. "
+                  "Нужна сверка с исходной фактурой и уже учтённым долгом; "
+                  "номер исходного счёта и дату печати не переносить в поля новой фактуры.")
+    elif detected_type == "tax_decision":
         fields["document_type"] = "tax_decision"
         fields.update(
             supplier_name=None, supplier_org_number=None, supplier_vat_number=None,

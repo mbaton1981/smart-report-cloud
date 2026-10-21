@@ -59,7 +59,7 @@ def selected_uid(header: bytes, expected: int):
 
 
 def run_limited(api, host: str, username: str, password: str, folder: str,
-                selection_path: Path, *, client_factory=imaplib.IMAP4_SSL):
+                selection_path: Path, *, client_factory=imaplib.IMAP4_SSL, replay_only=False):
     """First pass pins <=5 UIDs; every retry fetches only those same UIDs."""
     quoted = quoted_folder(folder)
     parsed = urlparse(api.url)
@@ -77,6 +77,8 @@ def run_limited(api, host: str, username: str, password: str, folder: str,
             selection = validate_selection(json.loads(selection_path.read_text(encoding="utf-8")), mailbox, folder)
         except (ValueError, UnicodeError):
             raise WorkerError("selection_file_invalid_do_not_reset") from None
+    if replay_only and selection is None:
+        raise WorkerError("replay_requires_existing_selection")
     status = api.call("GET", "/status")
     if selection is None and (any(status["counts"].values()) or status["epoch"] is not None):
         raise WorkerError("first_limited_pass_requires_empty_intake")

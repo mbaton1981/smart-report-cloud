@@ -459,6 +459,12 @@ def invoice_context(text):
     }
 
 
+def required_document_fields(document_type):
+    common = ("supplier_name", "document_date", "net_amount", "vat_amount", "currency_code")
+    return common + (("gross_amount",) if document_type == "receipt"
+                     else ("invoice_number", "amount_due"))
+
+
 def parse_invoice_pages(pages):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     fields = parse_document_text(text)
@@ -466,7 +472,7 @@ def parse_invoice_pages(pages):
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
         "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
-        "payment_reference": r"OCR(?:-nummer|/Meddelande)?|Betalningsreferens|Payment\s*reference|Vänligen\s+ange\s+referens",
+        "payment_reference": r"OCR(?:-\s*(?:nummer|nr)(?:/meddelande)?|/Meddelande|-/referensnummer)?|Betalningsreferens|Payment\s*reference|Vänligen\s+ange\s+referens",
         "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date",
         "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda\s+senast|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
@@ -716,8 +722,8 @@ def parse_invoice_pages(pages):
             else "Распознано решение о транспортном налоге, а не фактура; данные получателя не являются данными поставщика."
         )
     fields["review_reasons"] = diagnostics
-    for key in ("supplier_name", "invoice_number", "document_date", "net_amount", "vat_amount", "amount_due"):
-        if not fields.get(key):
+    for key in required_document_fields(fields.get("document_type")):
+        if fields.get(key) in (None, "", "UNKNOWN"):
             fields["review_reasons"].append(f"Не подтверждено поле {key}; проверьте оригинал.")
     net = parse_decimal(fields.get("net_amount"))
     vat = parse_decimal(fields.get("vat_amount"))

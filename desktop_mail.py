@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 
 from expense_documents import net_invoice_issues, non_invoice_document_type
 from local_mail import FetchWorker
-from mail_import import ADDRESS, MailImportError, MailQueue, business_key
+from mail_import import ADDRESS, MailImportError, MailQueue, business_key, classify_mail_document
 from mail_trial import TrialStore
 from mail_viewer import MailViewer
 
@@ -48,6 +48,7 @@ class DesktopMailStore(TrialStore):
     def approve(self, document_id, payload, revision):
         document, _ = self.document(document_id)
         fields = json.loads(document["result_json"]).get("fields", {})
+        classify_mail_document(fields)
         if (document["state"] != "requires_review" or fields.get("document_type") != "invoice"
                 or non_invoice_document_type(fields.get("raw_text") or "")
                 or payload.get("verification_status") != "confirmed"):
@@ -150,6 +151,7 @@ class DesktopMailViewer(MailViewer):
         if document["state"] != "requires_review":
             raise MailImportError("Распознавание не завершено. Выполните явный повтор обработки.")
         fields = copy.deepcopy(json.loads(document["result_json"])["fields"])
+        classify_mail_document(fields)
         draft = self.store.latest(document_id)
         revision = draft["revision"] if draft else 0
         if not draft:

@@ -90,3 +90,13 @@ class DesktopMailStoreTests(unittest.TestCase):
         self.store.conn.commit()
         with self.assertRaises(MailImportError):
             self.store.approve(1, self.payload, 0)
+
+    def test_old_reminder_invoice_label_is_rechecked_before_approval(self):
+        import json
+        fields = {**self.payload, "raw_text": "Nordea\nPaminnelse\nFaktura-/Avinummer\n123"}
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET result_json=? WHERE id=1",
+                                    (json.dumps({"fields": fields}),))
+        with self.assertRaises(MailImportError):
+            self.store.approve(1, self.payload, 0)
+        self.assertIsNone(self.store.handoff(1))

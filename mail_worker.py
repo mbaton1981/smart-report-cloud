@@ -16,10 +16,7 @@ from urllib.parse import urlparse
 import requests
 
 from mail_intake import MAX_MESSAGE, mailbox_key
-
-
-class WorkerError(RuntimeError):
-    pass
+from mail_import import WorkerError
 
 
 class IntakeClient:

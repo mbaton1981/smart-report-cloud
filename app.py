@@ -2017,7 +2017,7 @@ class SmartReportApp(QMainWindow):
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
         self.setWindowTitle("SmartReport — смены и расходы по объектам")
         if ISOLATED_CANDIDATE:
-            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.10-rc1"
+            version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.11-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
@@ -2610,6 +2610,8 @@ class SmartReportApp(QMainWindow):
                 required_features.add("due_date_v1")
             if any("payment_reference" in json.loads(row["payload_json"]) for row in rows):
                 required_features.add("payment_reference_v1")
+            if any(json.loads(row["payload_json"]).get("usage") == "object_cost" for row in rows):
+                required_features.add("object_costs_v1")
             try:
                 capability_response = requests.request(
                     "GET",
@@ -6266,8 +6268,10 @@ class SmartReportApp(QMainWindow):
         upload_button.clicked.connect(self.upload_expense_document)
         manual_button = QPushButton("Добавить вручную")
         manual_button.clicked.connect(self.open_manual_document_dialog)
-        mail_button = QPushButton("Входящие фактуры")
-        mail_button.clicked.connect(self.open_mail_queue)
+        from incoming_documents import enabled as incoming_enabled
+        mail_button = QPushButton("Входящие документы")
+        mail_button.setVisible(incoming_enabled())
+        mail_button.clicked.connect(self.open_incoming_documents)
         edit_button = QPushButton("Изменить")
         edit_button.clicked.connect(self.review_selected_document)
         reprocess_button = QPushButton("Распознать сохранённый оригинал")
@@ -6293,27 +6297,62 @@ class SmartReportApp(QMainWindow):
         self.exp_filter_unallocated.toggled.connect(self.load_expense_documents)
 
     def open_mail_queue(self):
-        from desktop_mail import DesktopMailViewer
+        QMessageBox.information(self, "Почта отключена", "Почтовое получение в интеграционный кандидат не включено.")
+        return
 
-        if ISOLATED_CANDIDATE:
-            QMessageBox.information(self, "Изолированный кандидат", "Почтовый перенос в этом профиле отключён.")
+    def incoming_register_snapshot(self):
+        cached = getattr(self, "_expense_read_cache", {})
+        if (None, None) not in cached or not getattr(self, "_expense_online", False):
+            raise ValueError("Для проверки дублей нужен актуальный снимок обычного реестра. Передача остановлена.")
+        documents = list(cached[(None, None)])
+        conn = get_db_connection()
+        try:
+            documents.extend(json.loads(row[0]) for row in conn.execute(
+                "SELECT payload_json FROM expense_document_outbox WHERE operation='upsert'"))
+        finally:
+            conn.close()
+        return documents
+
+    def refresh_incoming_capabilities(self):
+        self._incoming_costs_supported = False
+        result = request_expense_api("GET", "/api/expense-documents/capabilities")
+        self._incoming_costs_supported = "object_costs_v1" in result.get("features", [])
+
+    def incoming_delivery_pending(self, client_id):
+        conn = get_db_connection()
+        try:
+            return conn.execute("SELECT state,last_error FROM expense_document_outbox WHERE client_id=?",
+                                (client_id,)).fetchone()
+        finally:
+            conn.close()
+
+    def open_incoming_documents(self):
+        from incoming_documents import enabled, open_incoming
+        if not enabled():
+            QMessageBox.information(self, "Входящие документы", "Функция выключена; фоновых запусков нет.")
             return
-        viewer = getattr(self, "_mail_viewer", None)
+        viewer = getattr(self, "_incoming_viewer", None)
         if viewer is None:
             try:
                 profile = hashlib.sha256(str(Path(DB_FILE).resolve()).casefold().encode("utf-8")).hexdigest()[:16]
-                viewer = DesktopMailViewer(self, desktop_auth.app_data_dir() / "mail-inbox" / profile)
+                parent = desktop_auth.app_data_dir() / "incoming-documents"
+                parent.mkdir(parents=True, exist_ok=True)
+                viewer = open_incoming(self, parent / profile)
             except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
-                logging.exception("Не удалось открыть почтовую очередь")
-                QMessageBox.warning(self, "Входящие фактуры", str(error))
+                logging.exception("Не удалось открыть входящие документы")
+                QMessageBox.warning(self, "Входящие документы", str(error))
                 return
-            self._mail_viewer = viewer
-            viewer.destroyed.connect(lambda: setattr(self, "_mail_viewer", None))
+            self._incoming_viewer = viewer
+            viewer.finished.connect(lambda: setattr(self, "_incoming_viewer", None))
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
 
     def closeEvent(self, event):
+        incoming = getattr(self, "_incoming_viewer", None)
+        if incoming is not None and not incoming.close():
+            event.ignore()
+            return
         viewer = getattr(self, "_mail_viewer", None)
         if viewer is not None and not viewer.close():
             event.ignore()
@@ -7459,6 +7498,7 @@ class SmartReportApp(QMainWindow):
             "document_comment": comment.text().strip(),
             "invoice_number": invoice_number.text().strip(),
             "document_type": document.get("document_type") or parsed_fields.get("document_type") or "manual",
+            "usage": document.get("usage"),
             "verification_status": status.currentData(),
             "allocations": allocations,
         }

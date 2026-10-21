@@ -481,6 +481,124 @@ SHA релизного коммита и статус deployment — в разд
 - Render (`smart-report-server`, https://smart-report-server.onrender.com): deploy `dep-db9rl15g1s2s73ao9q60` на `5427bd0` — Live; старт-копия БД `/data/backups/backup_20261017_181301_834849.db`.
 - В Render добавлена переменная `SMARTREPORT_UPGRADE_NET_SCHEMA=1`; deploy `dep-db9rltnavr4c73f67j30` Succeeded, старт-копия `/data/backups/backup_20261017_181454_214233.db`, ошибок миграции в логе нет. Миграция идемпотентна; флаг можно оставить или удалить.
 - Проверено после deploy: `/` отвечает 200, API без ключа даёт 403, сервис стартует без ошибок. Функциональные проверки API/клиента с ключом на Render НЕ выполнялись (ключ в модель не передавался). Capability `net_allocations_v1`/`due_date_v1` по HTTP не подтверждены.
+# Incoming-documents integration candidate — 2026-10-21
+
+- Created local isolated branch feature/incoming-documents-candidate, retaining
+  preceding local changes. No push/commit, production install or deployment.
+- Wired a hidden-by-default incoming-documents entry into the ordinary expenses
+  page; enabling requires explicit process flag. Replaced old mail-launch
+  action with disabled notice; no mail API, IMAP/password, replay or Cron UI.
+- Added IncomingStore/embedded shared form, real host catalog, immutable source/
+  revision sidecar and durable same-client-ID handoff to ordinary expense outbox.
+  Ordinary register displays pending invoices. Full cached register plus outbox
+  is required for duplicate review; explicit normal refresh only, no auto fetch.
+- Receipt handoff deliberately blocked in UI/backend: local current-server API
+  rejects prepaid receipts; no number/debt/payments invented. Server work and
+  possible additive type/settlement schema/capability documented separately,
+  not implemented. Nordea old invoice labels blocked on current classification.
+- 10 candidate integration tests pass, including actual main window default-off,
+  no new profile when disabled, normal register/outbox/API, lost ACK, handoff
+  crash/retry, duplicates/Nordea, receipt retries and due-date provenance.
+- Five actual local PDFs pass isolated normal-registry acceptance: 3 ordinary
+  invoices, receipt held, reminder blocked; exactly 3 cards after per-invoice
+  lost-ACK/retry; original API-download hashes exact; every source hash unchanged.
+- Rollback test: main schema unchanged; disabling preserves ordinary outbox;
+  actual previous release sync method (38bf30d) successfully delivers pending
+  candidate invoice without new integration. No restore of stale DB or full
+  installed EXE swap performed. Working snapshots deferred per user's request.
+- Original working DB/profile/app/EXE, Render and backups untouched; no external
+  network/mail, paid resources, schedules or production record transfers.
+
+# Independent local technical acceptance — 2026-10-21 20:01+
+
+- Took over all user-facing technical checks; no user actions required.
+  Verified actual native keyboard/mouse input, missing-object warning,
+  default-No and explicit-Yes modal dialogs, saved corrections/reopening,
+  test registry display and opening the retained card PDF.
+- Reproduced and fixed loss of visible unsaved edits when approval's save
+  fails (e.g. SQLite busy). The failure now leaves input intact and explicitly
+  reports the unsuccessful transfer. Regression covers failure and lost
+  response after commit, then retry with exactly one stable card.
+- A new registry-preview test exposed Windows PDF handles retained when a
+  modal gallery finished via accept/reject rather than closeEvent. Shared
+  gallery cleanup is now idempotent and connected to finished as well.
+  The original failing native test now passes without file-lock cleanup errors.
+- 22 desktop tests passed with native Windows UI. Final focused regression:
+  46/46 across offline review and existing mail trial/review.
+  Five actual retained PDFs were independently checked again after both fixes,
+  using real confirmation dialogs (not mocked answers), socket connects
+  blocked, four test cards, Nordea blocked, receipt debt zero, stable retry
+  and reopen. Source hashes match both current and previous-turn baselines.
+- Closed both prior background commands: limited-live-correct-folder stopped
+  (the old one-shot mail UI, no new run), offline-desktop-preview closed
+  gracefully with exit 0. Verified old process-tree PIDs absent and no owned
+  TCP sockets. All test/UI/importer/worker helpers are stopped.
+- Final evidence: session files/offline-desktop-selfcheck-final-20261021.
+  No production profile/app/EXE/DB, Render, mailbox or backups changed;
+  no Cron, paid resources, push, deployment or production transfer.
+
+# Isolated editable desktop and explicit replay — 2026-10-21
+
+- Implemented offline_review.py / offline_review_ui.py as a separate Qt test
+  desktop with snapshot bridge, native side-by-side PDF, editable fields,
+  candidate/confirmed type, provenance, revision history, mandatory synthetic
+  object selection, default-No approval and atomic idempotent test register.
+  The installed desktop was not launched or modified.
+- Shared type-aware required fields across parser, processing, recognition
+  status and test approval: receipts do not require invoice number/payable and
+  produce zero debt. Derived Bygghemma net remains explicitly marked.
+- Fixed OCR reference captions; actual retained Parkeringsservice PDF yields
+  314469748389051. Stored source null is preserved, correction lives in overlay.
+- Reclassification before approval blocks old Nordea invoice labels, including
+  deliberately forged reviewed fields. Hardened older desktop mail approval too.
+- Prepared explicit replay-only launcher for existing queue/manifest with
+  attempt-specific reports; never starts replay automatically. Fake five-UID
+  replay preserves original results, draft IDs, PDFs and selection without SEARCH.
+- Combined 102 affected tests passed. Final focused suite expanded to 18 tests
+  (including unsaved-edit cancellation and unknown-versus-manual provenance).
+  Static AST syntax and git diff --check pass. Pylance could not resolve files
+  outside its current workspace; no Pylance type-check success is claimed.
+- Actual five-PDF native-Qt acceptance passed with socket connects blocked:
+  four test cards after explicit simulated confirmation, Nordea blocked,
+  receipt debt 0.00, retry/reopen stable. Original queue and every source file
+  hash unchanged. A separate demonstration profile remains at zero cards.
+- Native screenshots and a double-click launcher live in the session's
+  offline-desktop-20261021-ready folder. No deletion, live mailbox connection,
+  real replay, production write, push/deployment, Cron or paid resources.
+
+# Offline original comparison — 2026-10-21
+
+- Reviewed all six pages of the five retained local PDFs; no mail/Render
+  connection or new receipt. Existing originals/result/queue unchanged by hash.
+- Confirmed amounts/date/reference of Storholmen 3539 and Beijer 260410053821;
+  parking invoice 6836 matches amounts but misses explicit OCR 314469748389051.
+- Bygghemma is a card-paid delivery-note/receipt with total 7506.00, VAT 1501.20;
+  net 6004.80 is derived. Invoice number/payable/rounding not stated; not invented.
+- The Russian-named receipt PDF is Nordea payment reminder, not a new invoice.
+  OCR worked; parser lacks reminder labels and default invoice classification
+  was unsafe. Added local mail-level standalone-reminder classification as
+  unclassified + payment_reminder suggestion, without filling absent fields.
+- 3/3 focused classification tests pass; network-blocked in-memory review of
+  all five saved results changes only reminder type, preserves four other types.
+  No saved recognition replaced. Detailed original/draft comparison and next
+  desktop integration/replay plan saved outside Git in the session review folder.
+- Real replay not performed. Working database/profile/app/Render untouched;
+  no Cron, paid resources, deletions, push or deployment.
+
+# Loopia folder preparation — 2026-10-21
+
+- Used the user-shared, authenticated Loopia folder-settings page only.
+  The folder was absent; created `SmartReport-Test` with parent `---`, as
+  explicitly authorized. Loopia confirmed creation and properties show 0 messages.
+- Read only the selected folder's non-secret `_mbox` parameter in its properties
+  frame: the actual server path is **`INBOX.SmartReport-Test`**, not
+  `SmartReport-Test`. No password, browser session token or cookies extracted.
+- Updated the isolated launcher's fixed folder to that verified server path.
+  This is metadata verification in webmail, not a successful IMAP EXAMINE yet.
+- Did not open message lists/bodies from other folders, copy/move/delete mail,
+  start another import or alter working SmartReport/Render.
+  User must copy 1–5 chosen PDF messages into the new empty folder first.
+
 # Offline masked password preparation — 2026-10-21
 
 - Added standalone `limited_mail_ui.py`: masked sensitive input, immediate
@@ -550,3 +668,26 @@ SHA релизного коммита и статус deployment — в разд
 - Python compilation and parsing of the inert two-job YAML template pass.
   Existing CRLF line endings are preserved; whitespace validation uses Git's
   `cr-at-eol` setting for this check only, without changing repository config.
+# 2026-10-21: object-cost release preparation
+
+- User authorized implementation, publication, existing-service deployment and
+  desktop update, with backups first. Mail access is limited to
+  INBOX.SmartReport-Test, all current messages, read-only and manual only.
+- Preserved candidate source (including prior uncommitted experiments), local
+  SQLite backup and server SQLite backup; both database integrity checks passed.
+- Reused normal expense_documents/expense_allocations and desktop outbox.
+  No debt/payment integration, new payment columns or receipt migration.
+- Added manual whole-folder importer, masked memory-only credentials, fixed
+  safe error messages, immutable PDFs, SHA duplicate protection, editable drafts,
+  explicit object-cost confirmation, green ACK-based state and versioned
+  reassignment with crash/retry receipts in existing processing metadata.
+- Removed the unpublished prepaid-receipt experiment from the active candidate;
+  its source remains in the pre-change archive.
+- Full isolated suite: 294 tests passed before the added native UI test.
+  Native Windows targeted checks: 19 tests passed, including real PDF/editor
+  controls, manual edits/save/object selection, receipt confirmation and green.
+- Five retained PDFs: 4 acknowledged ordinary registry cards (3 invoices and
+  a receipt); Nordea reminder blocked. Every lost ACK retried without duplicates,
+  all downloaded PDF hashes match; source snapshot unchanged.
+- Real mail import and installed/frozen verification remain rollout checks,
+  not results claimed by these local automated tests.

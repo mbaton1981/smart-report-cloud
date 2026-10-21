@@ -1,0 +1,393 @@
+"""Reviewed object costs delivered through the ordinary versioned expense outbox."""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+from expense_documents import decimal_text, parse_invoice_money
+from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification, digest, packed
+
+
+def enabled():
+    return os.environ.get("SMARTREPORT_INCOMING_DOCUMENTS", "1") == "1"
+
+
+class IncomingStore(OfflineReviewStore):
+    def __init__(self, root: Path, host):
+        self.host = host
+        super().__init__(root)
+        with self.conn:
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS deliveries(
+                document_id INTEGER PRIMARY KEY REFERENCES documents,
+                state TEXT NOT NULL CHECK(state IN ('queued')),
+                client_id TEXT NOT NULL UNIQUE)""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS mail_epoch(
+                folder TEXT PRIMARY KEY, epoch TEXT NOT NULL)""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS mail_messages(
+                folder TEXT NOT NULL, epoch TEXT NOT NULL, uid INTEGER NOT NULL,
+                sha256 TEXT NOT NULL, PRIMARY KEY(folder,epoch,uid))""")
+
+    def objects(self):
+        return list(self.host._expense_objects)
+
+    def transfer(self, document_id, expected_revision):
+        revision, reviewed = self.latest(document_id)
+        if revision != expected_revision or not revision:
+            raise ReviewError("Сохраните актуальные исправления перед добавлением.")
+        problems = self.issues(document_id, reviewed)
+        if problems:
+            raise ReviewError("\n".join(problems))
+        if not getattr(self.host, "_incoming_costs_supported", False):
+            raise ReviewError("Сервер ещё не поддерживает расходы объекта без платёжных условий. "
+                              "Обновите соединение с сервером; черновик и PDF сохранены.")
+        self._check_existing_register(document_id, reviewed)
+        card = self.card(document_id)
+        if card is None:
+            import uuid
+            with self.conn:
+                self.conn.execute("BEGIN IMMEDIATE")
+                if self.latest(document_id)[0] != revision:
+                    raise ReviewError("Черновик изменён в другом окне. Откройте его заново.")
+                if self.card(document_id) is None:
+                    self._check_existing_register(document_id, reviewed)
+                    self.conn.execute("""INSERT INTO register
+                        (document_id,client_id,revision,business_key,payload_json,sha256,debt_amount,created_at)
+                        VALUES (?,?,?,?,?,?,?,?)""", (
+                            document_id, uuid.uuid4().hex, revision, str(document_id), packed(reviewed),
+                            digest(self.original(document_id).read_bytes()), "0.00",
+                            datetime.now(timezone.utc).isoformat()))
+            card = self.card(document_id)
+        return self.deliver(card)
+
+    def latest(self, document_id):
+        revision, payload = super().latest(document_id)
+        if revision == 0:
+            base = self.base(document_id)
+            amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
+            rounding = parse_invoice_money(base.get("rounding_amount")) or Decimal(0)
+            if all(value is not None for value in amounts):
+                payload["gross_amount"] = decimal_text(sum(amounts) + rounding)
+        return revision, payload
+
+    def provenance(self, document_id, payload=None):
+        result = super().provenance(document_id, payload)
+        base = self.base(document_id)
+        current = payload or self.latest(document_id)[1]
+        amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
+        if all(value is not None for value in amounts):
+            total = decimal_text(sum(amounts) + (parse_invoice_money(base.get("rounding_amount")) or Decimal(0)))
+            if current.get("gross_amount") == total and total != base.get("gross_amount"):
+                result["gross_amount"] = "Вычислено: нетто + НДС + указанное округление; сверьте итог оригинала"
+        return result
+
+    def issues(self, document_id, payload):
+        base = current_classification(self.base(document_id))
+        problems = []
+        if base.get("suggested_document_type") == "payment_reminder" or base.get("document_type") in (
+                "order_confirmation", "tax_decision", "proforma", "transfer_receipt", "non_document"):
+            problems.append("Это не новая покупка: напоминание или иной документ нельзя добавить как новый расход.")
+        if payload.get("confirmed_type") not in ("invoice", "receipt"):
+            problems.append("Укажите тип после сверки оригинала: фактура или чек.")
+        if payload.get("original_checked") is not True:
+            problems.append("Подтвердите сверку оригинала.")
+        if payload.get("object_id") not in {row["id"] for row in self.objects()}:
+            problems.append("Обязательно выберите объект.")
+        for key in ("supplier_name", "document_date", "gross_amount", "currency_code"):
+            if payload.get(key) in (None, "", "UNKNOWN"):
+                problems.append(f"Не заполнено обязательное поле: {key}.")
+        try:
+            date.fromisoformat(payload.get("document_date") or "")
+        except (ValueError, TypeError):
+            problems.append("Укажите корректную дату ГГГГ-ММ-ДД.")
+        gross = parse_invoice_money(payload.get("gross_amount"))
+        vat = parse_invoice_money(payload.get("vat_amount"))
+        if gross is None or not gross.is_finite() or gross <= 0:
+            problems.append("Укажите положительную сумму расхода.")
+        if payload.get("vat_amount") not in (None, "") and (
+                vat is None or not vat.is_finite() or vat < 0 or gross is not None and vat > gross):
+            problems.append("Проверьте НДС; неизвестный НДС оставьте пустым.")
+        return problems
+
+    def add_pdf(self, content, filename, result):
+        sha = digest(content)
+        if self.conn.execute("SELECT 1 FROM documents WHERE sha256=?", (sha,)).fetchone():
+            return False
+        fields = current_classification(result.get("fields") or {})
+        fields["_recognition_state"] = result.get("state")
+        source = {"original": sha + ".pdf", "result": result,
+                  "sources": [{"filename": filename}]}
+        initial = {**{key: fields.get(key) for key in EDITABLE},
+                   "confirmed_type": None, "object_id": None, "original_checked": False}
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO originals VALUES (?,?,?)", (sha, content, sha + ".pdf"))
+            cursor = self.conn.execute("INSERT INTO documents(sha256,source_json,base_json) VALUES (?,?,?)",
+                                       (sha, packed(source), packed(fields)))
+            self.conn.execute("INSERT INTO revisions VALUES (?,?,?,?,?)",
+                              (cursor.lastrowid, 0, packed(initial), "{}",
+                               datetime.now(timezone.utc).isoformat()))
+        return True
+
+    def record_recognition(self, document_id, result):
+        fields = current_classification(result.get("fields") or {})
+        fields["_recognition_state"] = result.get("state")
+        revision, _ = self.latest(document_id)
+        if revision or self.card(document_id):
+            raise ReviewError("Распознавание не заменяет сохранённые ручные исправления.")
+        initial = {**{key: fields.get(key) for key in EDITABLE},
+                   "confirmed_type": None, "object_id": None, "original_checked": False}
+        with self.conn:
+            self.conn.execute("UPDATE documents SET base_json=? WHERE id=?", (packed(fields), document_id))
+            self.conn.execute("UPDATE revisions SET payload_json=? WHERE document_id=? AND revision=0",
+                              (packed(initial), document_id))
+
+    def recognize_document(self, document_id, recognizer=None):
+        from invoice_processing import recognize_invoice
+        try:
+            result = (recognizer or recognize_invoice)([self.original(document_id)])
+        except (OSError, ValueError, RuntimeError):
+            result = {"fields": {}, "state": "failed",
+                      "errors": ["recognition_failed_original_retained_manual_fields_available"]}
+        self.record_recognition(document_id, result)
+        return result
+
+    def reassign(self, document_id, object_id, expected_revision):
+        card = self.card(document_id)
+        revision, payload = self.latest(document_id)
+        if card is None or revision != expected_revision:
+            raise ReviewError("Обновите документ перед сменой объекта.")
+        if object_id not in {row["id"] for row in self.objects()}:
+            raise ReviewError("Выберите действующий объект.")
+        if payload["object_id"] == object_id:
+            return card
+        self._existing(card["client_id"], required=True)
+        previous = payload["object_id"]
+        payload["object_id"] = object_id
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if self.latest(document_id)[0] != revision:
+                raise ReviewError("Привязка изменена в другом окне. Обновите документ.")
+            self.conn.execute("INSERT INTO revisions VALUES (?,?,?,?,?)", (
+                document_id, revision + 1, packed(payload),
+                packed({"object_id": {"before": previous, "after": object_id}}),
+                datetime.now(timezone.utc).isoformat()))
+            self.conn.execute("UPDATE register SET payload_json=?,revision=? WHERE document_id=?",
+                              (packed(payload), revision + 1, document_id))
+            self.conn.execute("DELETE FROM deliveries WHERE document_id=?", (document_id,))
+        return self.deliver(self.card(document_id))
+
+    def _existing(self, client_id, required=False):
+        matches = [row for row in self.host.incoming_register_snapshot() if row.get("client_id") == client_id]
+        if required and not matches:
+            raise ReviewError("Сначала синхронизируйте документ и обновите реестр; новая карточка не создаётся.")
+        return next((row for row in matches if row.get("id") and not row.get("local_pending")), None)
+
+    def accounting_status(self, document_id):
+        card = self.card(document_id)
+        if card is None:
+            return "Черновик — расход не создан", False
+        pending = self.host.incoming_delivery_pending(card["client_id"])
+        if pending:
+            return ("Сохранено локально — ожидает синхронизации"
+                    if not pending["last_error"] else "Не учтён на сервере: " + pending["last_error"]), False
+        if not self.conn.execute("SELECT 1 FROM deliveries WHERE document_id=?", (document_id,)).fetchone():
+            return "Передача прервана — нажмите повтор передачи", False
+        try:
+            existing = self._existing(card["client_id"])
+        except ValueError:
+            return "Обновите реестр для проверки сохранения", False
+        if existing and any(row.get("object_id") == json.loads(card["payload_json"])["object_id"]
+                            for row in existing.get("allocations", [])):
+            return "Учтён на объекте", True
+        return "Ожидает проверки в реестре", False
+
+    @staticmethod
+    def due_fields(base, reviewed):
+        unchanged = reviewed.get("due_date") == base.get("due_date")
+        return {
+            "due_date_kind": (base.get("due_date_kind") or
+                              ("explicit" if reviewed.get("due_date") else "absent")) if unchanged
+                             else ("manual" if reviewed.get("due_date") else "absent"),
+            "due_date_review_required": unchanged and base.get("due_date_review_required") is True,
+            "due_date_reviewed": unchanged and base.get("due_date_reviewed") is True,
+            "due_date_evidence": (base.get("due_date_evidence") or []) if unchanged else [],
+        }
+
+    def _check_existing_register(self, document_id, payload):
+        # Host supplies the cached ordinary register, never triggers a read/network request.
+        own = self.card(document_id)
+        try:
+            snapshot = self.host.incoming_register_snapshot()
+        except ValueError as error:
+            raise ReviewError(str(error)) from error
+        for existing in snapshot:
+            if own and existing.get("client_id") == own["client_id"]:
+                continue
+            if (str(existing.get("supplier_name") or "").strip().casefold() ==
+                    str(payload.get("supplier_name") or "").strip().casefold()
+                    and (
+                        payload.get("invoice_number") and str(existing.get("invoice_number") or "").strip().casefold() ==
+                        str(payload["invoice_number"]).strip().casefold()
+                        or existing.get("document_date") == payload.get("document_date")
+                        and existing.get("gross_amount") == payload.get("gross_amount"))):
+                raise ReviewError("В обычном реестре или очереди уже есть такая фактура. "
+                                  "Нужна ручная сверка, второй расход не создан.")
+            if any(row.get("sha256") == self.conn.execute(
+                    "SELECT sha256 FROM documents WHERE id=?", (document_id,)).fetchone()[0]
+                   for row in existing.get("attachments", [])):
+                raise ReviewError("Этот PDF уже есть в реестре. Второй расход не создан.")
+        for row in self.conn.execute("SELECT document_id,payload_json FROM register WHERE document_id<>?",
+                                     (document_id,)):
+            other = json.loads(row["payload_json"])
+            if (other.get("supplier_name", "").strip().casefold() == payload["supplier_name"].strip().casefold()
+                    and (payload.get("invoice_number") and other.get("invoice_number") == payload["invoice_number"]
+                         or other.get("document_date") == payload["document_date"]
+                         and other.get("gross_amount") == payload["gross_amount"])):
+                raise ReviewError("Возможный повтор покупки с другим PDF. Нужна ручная сверка.")
+
+    def deliver(self, card):
+        delivered = self.conn.execute(
+            "SELECT * FROM deliveries WHERE document_id=?", (card["document_id"],)).fetchone()
+        if delivered:
+            return card
+        payload = json.loads(card["payload_json"])
+        base = self.base(card["document_id"])
+        payload.update(
+            client_id=card["client_id"], document_type="manual", allocation_basis="gross", usage="object_cost",
+            cost_operation_id=f"{card['client_id']}:{card['revision']}",
+            verification_status="confirmed",
+            recognized_text=base.get("raw_text") or "",
+            required_attachment_sha256=[card["sha256"]],
+            allocations=[{"destination": "object", "object_id": payload["object_id"],
+                          "gross_amount": payload["gross_amount"], "vat_amount": payload["vat_amount"]}],
+        )
+        for key in ("amount_due", "settlement_status", "due_date", "rounding_amount"):
+            payload.pop(key, None)
+        # Retry the same client_id through the normal outbox. The queue is durable before
+        # recording delivery; a lost response cannot change the document's identity.
+        original = self.original(card["document_id"])
+        staged = self.host._store_expense_originals([str(original)], card["client_id"])
+        existing = self._existing(card["client_id"])
+        self.host.queue_expense_document_operation(
+            card["client_id"], "upsert", payload,
+            server_document_id=existing.get("id") if existing else None,
+            server_version=existing.get("sync_version") if existing else None,
+            attachment_paths=staged)
+        with self.conn:
+            self.conn.execute("INSERT INTO deliveries VALUES (?,'queued',?)",
+                              (card["document_id"], card["client_id"]))
+        return card
+
+
+def open_incoming(host, root):
+    if not enabled():
+        raise ReviewError("Функция «Входящие документы» выключена.")
+    from PyQt6.QtCore import Qt, QTimer
+    from PyQt6.QtWidgets import QFileDialog, QMessageBox, QPushButton
+    from offline_review_ui import OfflineReviewWindow
+
+    store = IncomingStore(root, host)
+    window = OfflineReviewWindow(store, integrated=True)
+    window.setParent(host, Qt.WindowType.Window)
+    window.setWindowTitle("SmartReport — Входящие документы")
+    retry = QPushButton("Повторить передачу подтверждённого документа")
+
+    def repeat():
+        card = store.card(getattr(window, "document_id", None))
+        if card is None:
+            QMessageBox.warning(window, "Передача запрещена", "Сначала явно подтвердите документ.")
+            return
+        try:
+            store.transfer(window.document_id, card["revision"])
+        except (ReviewError, OSError, sqlite3.Error) as error:
+            QMessageBox.warning(window, "Передача не завершена", str(error))
+            return
+        window.status.setText("Документ находится в обычной очереди синхронизации. Повтор не создаёт карточку.")
+
+    retry.clicked.connect(repeat)
+    refresh = QPushButton("Проверить обычный реестр для поиска дублей")
+
+    def refresh_register():
+        try:
+            host.refresh_incoming_capabilities()
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(window, "Поддержка сервера не проверена", str(error))
+            return
+        host._schedule_expense_read((None, None))
+        window.select_document()
+        window.status.setText("Запрошен полный снимок обычного реестра. До успешного получения перенос запрещён.")
+
+    refresh.clicked.connect(refresh_register)
+    window.layout().insertWidget(window.layout().count() - 1, refresh)
+    load = QPushButton("Открыть сохранённый локальный снимок очереди — без почты")
+
+    def import_snapshot():
+        folder = QFileDialog.getExistingDirectory(window, "Каталог сохранённой очереди")
+        if not folder:
+            return
+        try:
+            store.import_snapshot(Path(folder))
+        except (ReviewError, OSError, sqlite3.Error, ValueError) as error:
+            QMessageBox.warning(window, "Снимок не открыт", str(error))
+            return
+        if not window.close():
+            return
+        host._incoming_viewer = None
+        host.open_incoming_documents()
+
+    load.clicked.connect(import_snapshot)
+    window.layout().insertWidget(window.layout().count() - 1, load)
+    window.layout().insertWidget(window.layout().count() - 1, retry)
+    mail = QPushButton("Получить документы из INBOX.SmartReport-Test")
+    from folder_mail import open_import_dialog
+    mail.clicked.connect(lambda: open_import_dialog(window))
+    window.layout().insertWidget(1, mail)
+    files = QPushButton("Открыть PDF и распознать")
+
+    def import_files():
+        paths, _ = QFileDialog.getOpenFileNames(window, "Открыть документы", "", "PDF (*.pdf)")
+        if not paths or not window.keep_unsaved():
+            return
+        try:
+            for name in paths:
+                path = Path(name)
+                content = path.read_bytes()
+                if store.add_pdf(content, path.name, {"fields": {}, "state": "pending"}):
+                    doc_id = store.conn.execute("SELECT id FROM documents WHERE sha256=?",
+                                                (digest(content),)).fetchone()[0]
+                    store.recognize_document(doc_id)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            QMessageBox.warning(window, "Документ не загружен", str(error))
+        window.reload_documents()
+
+    files.clicked.connect(import_files)
+    window.layout().insertWidget(2, files)
+    try:
+        host.refresh_incoming_capabilities()
+    except (OSError, ValueError, RuntimeError):
+        host._incoming_costs_supported = False
+        window.status.setText("Сервер недоступен. Можно получать и править черновики; добавление заблокировано до проверки сервера.")
+    host._schedule_expense_read((None, None))
+    window.finished.connect(lambda _result: store.close())
+    window.status_timer = QTimer(window)
+
+    def update_status():
+        if window.document_id is None:
+            return
+        text, green = store.accounting_status(window.document_id)
+        if store.card(window.document_id):
+            window.status.setText(text)
+            window.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
+        for index in range(window.selector.count()):
+            from PyQt6.QtGui import QColor
+            _, item_green = store.accounting_status(window.selector.itemData(index))
+            window.selector.setItemData(index, QColor("#b9efc6") if item_green else None,
+                                        Qt.ItemDataRole.BackgroundRole)
+
+    window.status_timer.timeout.connect(update_status)
+    window.status_timer.start(2000)
+    window.finished.connect(lambda _result: window.status_timer.stop())
+    return window

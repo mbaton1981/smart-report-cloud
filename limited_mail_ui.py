@@ -14,7 +14,8 @@ from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QLabel, QLineEdit, QVBoxLayout,
 )
 
-from mail_worker import WorkerError
+from mail_import import WorkerError
+from folder_mail import FolderError
 
 
 ERROR_MESSAGES = {
@@ -25,6 +26,9 @@ ERROR_MESSAGES = {
     "network": "Ошибка соединения. Операция остановлена.",
     "restricted": "Ограниченная проверка остановлена защитой папки, выбранных писем или локального API.",
     "internal": "Внутренняя ошибка. Операция остановлена; текст исключения скрыт для защиты пароля.",
+    "folder": "Папку открыть не удалось: она отсутствует, недоступна или её точный путь отличается. "
+              "Другие папки не проверялись. Подготовьте SmartReport-Test отдельно.",
+    "count": "В выбранной папке должно быть от одного до пяти писем. Содержимое писем не загружалось.",
 }
 
 
@@ -44,8 +48,12 @@ class PasswordOperation(QThread):
             self.outcome.emit("tls")
         except imaplib.IMAP4.error:
             self.outcome.emit("auth")
-        except WorkerError:
-            self.outcome.emit("restricted")
+        except (WorkerError, FolderError) as error:
+            code = {
+                "readonly_folder_failed": "folder",
+                "folder_must_contain_one_to_five_messages": "count",
+            }.get(str(error), str(error))
+            self.outcome.emit(code if code in ERROR_MESSAGES else "restricted")
         except (requests.RequestException, OSError):
             self.outcome.emit("network")
         except Exception:
