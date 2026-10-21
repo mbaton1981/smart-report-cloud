@@ -583,6 +583,7 @@ def init_cloud_db():
             client_id TEXT NOT NULL UNIQUE,
             supplier_name TEXT NOT NULL DEFAULT '',
             invoice_number TEXT NOT NULL DEFAULT '',
+            payment_reference TEXT,
             document_date TEXT,
             due_date TEXT,
             due_date_kind TEXT NOT NULL DEFAULT 'absent',
@@ -616,6 +617,7 @@ def init_cloud_db():
         ("deleted_at", "TEXT"),
         ("sync_version", "INTEGER NOT NULL DEFAULT 1"),
         ("order_proposals_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("payment_reference", "TEXT"),
         ("due_date", "TEXT"),
         ("due_date_kind", "TEXT NOT NULL DEFAULT 'absent'"),
         ("due_date_review_required", "INTEGER NOT NULL DEFAULT 0"),
@@ -903,6 +905,10 @@ def expense_due_date_schema_ready(connection):
 
 
 def validate_expense_fields(payload):
+    reference = payload.get("payment_reference")
+    if reference is not None and (not isinstance(reference, str) or len(reference) > 200):
+        raise ValueError("OCR/reference должен быть строкой не длиннее 200 символов.")
+    reference = reference.strip() if reference is not None else None
     status = str(payload.get("verification_status") or "draft")
     if status not in EXPENSE_DOCUMENT_STATUSES:
         raise ValueError("Недопустимый статус документа.")
@@ -986,6 +992,8 @@ def validate_expense_fields(payload):
     return {
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
+        "payment_reference": reference or None,
+        "payment_reference_provided": "payment_reference" in payload,
         "document_date": document_date,
         "due_date": due_date,
         "due_date_kind": due_kind,
@@ -1191,6 +1199,9 @@ def save_expense_project_code_links(cursor, supplier_name, proposals, now):
 
 
 def store_expense_allocation_rows(cursor, document_id, allocations, fields):
+    if fields.get("payment_reference_provided"):
+        cursor.execute("UPDATE expense_documents SET payment_reference=? WHERE id=?",
+                       (fields["payment_reference"], document_id))
     if fields.get("due_date_provided"):
         cursor.execute("""UPDATE expense_documents SET due_date=?, due_date_kind=?, due_date_review_required=?,
                           due_date_reviewed=?, due_date_evidence_json=? WHERE id=?""",
@@ -1273,6 +1284,7 @@ def serialize_expense_document(cursor, document, include_text=False):
         "client_id": document["client_id"],
         "supplier_name": document["supplier_name"],
         "invoice_number": document["invoice_number"],
+        "payment_reference": document["payment_reference"] if "payment_reference" in document.keys() else None,
         "document_date": document["document_date"],
         "due_date": document["due_date"] if "due_date" in document.keys() else None,
         "due_date_kind": document["due_date_kind"] if "due_date_kind" in document.keys() else "absent",
@@ -1378,6 +1390,8 @@ def expense_document_capabilities_api():
         net_features = ["net_allocations_v1"] if invoice_net_schema_ready(connection) else []
         if expense_due_date_schema_ready(connection):
             net_features.append("due_date_v1")
+        if "payment_reference" in {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}:
+            net_features.append("payment_reference_v1")
     finally:
         connection.close()
     return jsonify({

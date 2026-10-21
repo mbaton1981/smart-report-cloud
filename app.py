@@ -2584,6 +2584,8 @@ class SmartReportApp(QMainWindow):
                 required_features.add("net_allocations_v1")
             if any("due_date" in json.loads(row["payload_json"]) for row in rows):
                 required_features.add("due_date_v1")
+            if any("payment_reference" in json.loads(row["payload_json"]) for row in rows):
+                required_features.add("payment_reference_v1")
             try:
                 capability_response = requests.request(
                     "GET",
@@ -2723,6 +2725,14 @@ class SmartReportApp(QMainWindow):
                                     if payload.get("due_date") else None)
                     if remote_document.get("due_date") != expected_due or remote_document.get("due_date_kind") != payload.get("due_date_kind", "manual" if expected_due else "absent"):
                         raise ValueError("ACK не подтвердил сохранение срока оплаты и его источника; очередь сохранена.")
+                if queued["operation"] != "delete" and "payment_reference" in payload:
+                    expected_reference = str(payload.get("payment_reference") or "").strip() or None
+                    if remote_document.get("payment_reference") != expected_reference:
+                        raise ValueError("ACK не подтвердил сохранение OCR/reference; очередь и оригинал сохранены.")
+                if queued["operation"] != "delete" and payload.get("allocation_basis") == "net":
+                    for key in ("amount_due", "rounding_amount"):
+                        if decimal_text(parse_invoice_money(remote_document.get(key))) != decimal_text(parse_invoice_money(payload.get(key))):
+                            raise ValueError(f"ACK не подтвердил {key}; очередь и оригинал сохранены.")
                 ack_conn = get_db_connection()
                 try:
                     ack_conn.execute("BEGIN IMMEDIATE")
