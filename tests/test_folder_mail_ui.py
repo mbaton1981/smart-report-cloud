@@ -6,8 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt6.QtCore import QDate
-from PyQt6.QtWidgets import QApplication, QDateEdit, QDialog, QMessageBox
+from PyQt6.QtCore import QDate, QTimer
+from PyQt6.QtWidgets import QApplication, QDateEdit, QDialog, QDialogButtonBox, QMessageBox
 
 import folder_mail
 from incoming_documents import IncomingStore
@@ -120,6 +120,22 @@ class FolderMailUITests(unittest.TestCase):
                 patch.object(QMessageBox, "question", side_effect=AssertionError("Invalid archive")):
             self.assertIsNone(folder_mail.archive_period(self.window))
             warning.assert_called_once()
+
+    def test_real_archive_modal_decline_returns_without_import(self):
+        observations = []
+        def decline():
+            prompt = self.app.activeModalWidget()
+            observations.append(isinstance(prompt, QMessageBox))
+            prompt.button(QMessageBox.StandardButton.No).click()
+        def choose():
+            selection = self.app.activeModalWidget()
+            observations.append(selection.findChild(QDateEdit, "archive_start") is not None)
+            observations.append(selection.findChild(QDateEdit, "archive_end") is not None)
+            QTimer.singleShot(0, decline)
+            selection.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+        QTimer.singleShot(0, choose)
+        self.assertIsNone(folder_mail.archive_period(self.window))
+        self.assertEqual(observations, [True, True, True])
 
     def test_network_failure_leaves_partial_results_visible_and_retries_unfinished_uid(self):
         original = folder_mail.import_folder
