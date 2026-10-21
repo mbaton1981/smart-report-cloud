@@ -1,5 +1,70 @@
 # Invoice Recognition and Net Allocations
 
+## Proposed Render mail schedule — NOT implemented or authorized (2026-10-21)
+
+This is a design proposal only. No Render service, secret, schedule, deployment or
+production intake has been created or enabled.
+
+- **Schedule:** a separate Render Cron Job every five minutes, `*/5 * * * *`
+  (UTC). Its start command would execute one headless intake pass and exit; it must
+  not launch Qt or run a scheduler in Flask/Gunicorn workers. Use the same released
+  importer version as the receiving API. At most one run of this job is active;
+  additionally use an API-side mailbox lease to exclude manual/other-job overlap.
+- **Storage boundary:** Render Cron Jobs cannot mount persistent disks, and a
+  service cannot access another service's disk. Therefore the cron process must
+  NOT open the working SQLite file or assume `/data` is shared. It would upload
+  originals and recognition results over an authenticated HTTPS **draft-intake**
+  API to the disk-owning SmartReport service. That API is not implemented yet.
+  Existing expense-confirmation endpoints are not a substitute.
+- **Durable queue:** propose canonical immutable originals under the existing
+  service's `/data/documents`, with checksum/size checks, and queue/source/checkpoint
+  metadata in a dedicated SQLite database under `/data/mail_import`. A received
+  attachment is acknowledged only after its file and queue record are durable.
+  Expense cards are created only after manual review, explicit object choice and
+  confirmation; they reference the already retained original without moving it.
+  Cron scratch space is temporary and never the sole retained copy.
+- **Mailbox access:** IMAPS to `mailcluster.loopia.se:993` with certificate
+  validation, read-only INBOX selection and `BODY.PEEK[]`. No flag changes,
+  STORE/MOVE/DELETE/CLOSE/EXPUNGE. A dedicated mailbox credential, or app password
+  if the provider supports one, is entered only in Render secret environment
+  settings after permission. Use a separate narrowly scoped draft-intake token;
+  it must not authorize confirming expenses or accessing admin functions.
+  Neither credential belongs in source, command arguments, reports or logs.
+- **Catch-up after failure:** the durable cursor is per mailbox/folder/UIDVALIDITY
+  on the disk-owning API, not on cron's ephemeral filesystem. Each pass resumes
+  unfinished UIDs and reads the subsequent UID range in bounded batches. There is
+  no "last five" or rolling seven-day cutoff in production. Record the snapshot
+  upper UID for the pass; messages arriving during it are handled next time.
+  Advance the contiguous checkpoint only after every part of a message is either
+  retained or explicitly recorded as unsupported/no attachment. Recognition
+  failures retain the original and a failed-review state; transport/storage
+  failures remain pending and must not be silently skipped. A UIDVALIDITY change
+  starts a new source namespace and requires paginated reconciliation of INBOX
+  with hash deduplication, not blind reuse of the old cursor.
+- **Retries/deduplication:** retry transient IMAP/HTTP/timeouts with bounded
+  backoff; retain pending work for the next scheduled pass if the time budget is
+  exhausted. Permanent authorization/storage errors stop the run with an alert,
+  not a successful empty report. Deduplicate by mailbox/folder/UIDVALIDITY/UID/part
+  and original SHA-256; warn on supplier/invoice identity matches with different
+  files. A lost HTTP acknowledgement retries the same source identity. Do not
+  overwrite earlier recognition on repeat receipt; explicit selected-document
+  reprocessing stays separate.
+- **Visibility:** expose last successful receipt time, last attempted run,
+  pending backlog, failed attachments and incomplete/unclassified recognition as
+  separate metrics. Propose an alert after three missed five-minute windows or
+  immediately for rejected credentials/storage failures. A missed scheduled run
+  does not imply losing mail: the next pass catches up from durable checkpoints,
+  provided messages still exist in INBOX. Messages removed by other mail clients
+  before any fetch cannot be recovered by this importer.
+
+Before any implementation/release: owner approval, intake API and permission tests,
+bounded cursor/catch-up tests, credential setup and real acceptance without expense
+confirmation. The current desktop test importer is not production-ready scheduling.
+
+Sources verified read-only:
+[Render Cron Jobs](https://render.com/docs/cronjobs),
+[Persistent disks and single-service access](https://render.com/docs/disks).
+
 ## Current local mail acceptance (2026-10-21; not published)
 
 The current owner instruction overrides historical release notes below: **no push,
