@@ -668,7 +668,50 @@ SHA релизного коммита и статус deployment — в разд
 - Python compilation and parsing of the inert two-job YAML template pass.
   Existing CRLF line endings are preserved; whitespace validation uses Git's
   `cr-at-eol` setting for this check only, without changing repository config.
-# 2026-10-21: object-cost release preparation
+# 2026-10-21: deployed object-cost release
+
+- Runtime commit: 95990c59bf6c4369b9058ec931f9eba22e0ca7a4.
+  Published feature/incoming-documents-candidate and deployed that specific
+  commit on the existing Render service, without changing paid resources or Cron.
+  Production capability object_costs_v1 verified with the existing app session.
+- Built and installed SmartReport 1.0.11-rc1 in its own versioned directory;
+  new desktop shortcut uses the existing approved profile. Previous EXEs and
+  shortcuts retained. Installed EXE hash matches the verified build.
+- Final complete unittest run: 295 tests passed. Final frozen EXE separately
+  verified all five original previews, edit/save/receipt confirmation/retry,
+  reminder block, masked password imports and bundled OCR models.
+- Visual frozen testing found and fixed a blank embedded preview after save:
+  explicitly show the replacement embedded gallery; assert actual visibility
+  and non-null rendered pixmap, not only original availability.
+- Real manual import through the installed app: 21 messages, 16 new drafts,
+  4 duplicate PDFs, 1 message without PDF. The currently present original UIDs
+  are 1,4,5,6; old UID2 is absent from the folder and its saved PDF was retained.
+- A second real click: 21 messages, ZERO new drafts, 20 duplicate PDFs skipped.
+  Password entry used only the masked installed dialog; no stored mail password.
+  Both passes used EXAMINE/BODY.PEEK of INBOX.SmartReport-Test only.
+- Offline copy of the complete 21-draft live queue: 15 ordinary object costs
+  edited/saved/confirmed/synced with original-download SHA checks and green
+  ACK status, all lost-ACK retries idempotent. Nordea reminder and negative
+  credit note not added as ordinary positive expenses. Four incomplete
+  recognitions left for manual filling, without guessing missing values.
+- Final production checks: 21 retained drafts, 21 durable UID receipts,
+  ZERO confirmed transfers and ZERO cloud expense cards. Test allocations and
+  test expenses were created only in isolated databases.
+- Installed application left open and usable. Completed password dialog closed;
+  obsolete trial UI stopped. No local test servers, scheduled mail jobs or
+  notification services left running.
+
+## Rollback
+
+Close 1.0.11 after saving drafts and use the preserved 1.0.10 desktop shortcut.
+Both launchers target the same approved profile. Do not overwrite the database
+with a stale backup after new operations: the ordinary outbox and server registry
+remain authoritative, and the incoming sidecar and original PDFs must be retained.
+Server runtime can be returned to the previously accepted unified release if
+necessary; preserve any newer expense operations before database restoration.
+No new payment/receipt schema migration was introduced by this release.
+
+## Preparation evidence
 
 - User authorized implementation, publication, existing-service deployment and
   desktop update, with backups first. Mail access is limited to
