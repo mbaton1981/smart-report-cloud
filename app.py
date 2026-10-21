@@ -1764,6 +1764,18 @@ DARK_THEME_QSS = """
         padding-right: 30px;
         min-height: 22px;
     }
+    QCheckBox#edit_shift_transport::indicator {
+        width: 18px;
+        height: 18px;
+        border: 2px solid #cbd5e0;
+        border-radius: 3px;
+        background-color: #1a1f26;
+    }
+    QCheckBox#edit_shift_transport::indicator:checked {
+        image: url("__TRANSPORT_CHECK_IMAGE__");
+        background-color: #2b6cb0;
+        border-color: #90cdf4;
+    }
     QSpinBox::up-button, QDoubleSpinBox::up-button,
     QSpinBox::down-button, QDoubleSpinBox::down-button {
         subcontrol-origin: border;
@@ -1841,6 +1853,8 @@ DARK_THEME_QSS = DARK_THEME_QSS.replace(
     "__SPIN_UP_IMAGE__", (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "spin-up.svg").as_posix()
 ).replace(
     "__SPIN_DOWN_IMAGE__", (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "spin-down.svg").as_posix()
+).replace(
+    "__TRANSPORT_CHECK_IMAGE__", (Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "transport-check.svg").as_posix()
 )
 
 def create_date_field(default_date_str=""):
