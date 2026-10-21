@@ -2822,6 +2822,33 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertTrue(net_invoice_issues({**fields, "rounding_amount": "2244.00"},
                                           [{"destination": "company", "net_amount": "1795.00"}]))
 
+    def test_beijer_explicit_rounding_reconciles_document_gross_and_amount_due(self):
+        from expense_documents import parse_invoice_pages, net_invoice_issues
+
+        elements = []
+        for index, (caption, value) in enumerate((
+            ("Netto", "6 490,50 SEK"), ("Moms 25,00%", "1 622,63 SEK"),
+            ("Totalt inkl. moms", "8 113,13 SEK"), ("Öresavr.", "-0,13 SEK"),
+            ("Att betala", "8 113,00 SEK"),
+        )):
+            elements.extend([
+                {"text": caption, "x0": 300, "x1": 420, "y0": 100 + 25 * index, "y1": 110 + 25 * index},
+                {"text": value, "x0": 520, "x1": 590, "y0": 100 + 25 * index, "y1": 110 + 25 * index},
+            ])
+
+        fields = parse_invoice_pages([{"page": 2, "elements": elements}])
+        self.assertEqual(fields["gross_amount"], "8113.13")
+        self.assertEqual(fields["rounding_amount"], "-0.13")
+        self.assertEqual(fields["amount_due"], "8113.00")
+        self.assertEqual(fields["field_sources"]["rounding_amount"][0]["caption"], "Öresavr.")
+        self.assertEqual(net_invoice_issues(fields, [{
+            "destination": "company", "net_amount": "6490.50", "vat_amount": "1622.63",
+        }]), [])
+        self.assertTrue(net_invoice_issues(
+            {**fields, "rounding_amount": "0.00"},
+            [{"destination": "company", "net_amount": "6490.50", "vat_amount": "1622.63"}],
+        ))
+
     def test_invoice_explicit_tax_rate_and_buyer_block_never_use_item_price(self):
         from expense_documents import parse_invoice_pages
 
