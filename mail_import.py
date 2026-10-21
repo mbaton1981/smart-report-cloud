@@ -55,6 +55,8 @@ class ImportSummary:
     errors: int = 0
     completed: bool = False
     stop_reason: str | None = None
+    latest_count: int | None = None
+    messages: list[dict] = field(default_factory=list)
 
 
 def classify_mail_document(fields: dict) -> None:
@@ -308,12 +310,19 @@ def fetch_metadata(client, uid: str):
 
 def import_inbox(queue: MailQueue, password: str, *, now: datetime | None = None,
                  client_factory=imaplib.IMAP4_SSL, recognizer=recognize_invoice,
-                 summary: ImportSummary | None = None) -> ImportSummary:
+                 summary: ImportSummary | None = None, since: datetime | None = None,
+                 latest_count: int | None = None) -> ImportSummary:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("Import time must include a timezone.")
+    since = since or now - timedelta(days=7)
+    if since.tzinfo is None or since > now:
+        raise ValueError("Import start must include a timezone and not exceed import time.")
+    if latest_count is not None and (type(latest_count) is not int or not 1 <= latest_count <= 20):
+        raise ValueError("Latest message count must be an integer between 1 and 20.")
     summary = summary if summary is not None else ImportSummary()
-    summary.since = (now - timedelta(days=7)).isoformat()
+    summary.latest_count = latest_count
+    summary.since = "" if latest_count is not None else since.isoformat()
     summary.until = now.isoformat()
     try:
         _import_inbox(queue, password, now, client_factory, recognizer, summary)
@@ -334,7 +343,7 @@ def import_inbox(queue: MailQueue, password: str, *, now: datetime | None = None
 
 
 def _import_inbox(queue, password, now, client_factory, recognizer, summary: ImportSummary):
-    since = now - timedelta(days=7)
+    since = datetime.fromisoformat(summary.since) if summary.since else None
     client = client_factory(HOST, 993, ssl_context=ssl.create_default_context(), timeout=30)
     validity = ""
     try:
@@ -349,20 +358,30 @@ def _import_inbox(queue, password, now, client_factory, recognizer, summary: Imp
         if not validity_data or not validity_data[0] or not validity_data[0].isdigit():
             raise MailImportError("Missing UIDVALIDITY; safe message identity is unavailable.")
         validity = validity_data[0].decode("ascii")
-        # IMAP SINCE is day-granular. Fetch one extra day, then enforce exact UTC bounds.
-        search_day = (since - timedelta(days=1)).date()
-        months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-        search_date = f"{search_day.day:02d}-{months[search_day.month - 1]}-{search_day.year}"
-        data = require_ok(client.uid("SEARCH", None, "SINCE", search_date), "bounded search")
+        if summary.latest_count is not None:
+            data = require_ok(client.uid("SEARCH", None, "ALL"), "latest message search")
+        else:
+            # IMAP SINCE is day-granular; exact UTC bounds are checked below.
+            assert since is not None
+            search_day = (since - timedelta(days=1)).date()
+            months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+            search_date = f"{search_day.day:02d}-{months[search_day.month - 1]}-{search_day.year}"
+            data = require_ok(client.uid("SEARCH", None, "SINCE", search_date), "bounded search")
         uids = data[0].split() if data and data[0] else []
         summary.search_candidates = len(uids)
+        if summary.latest_count is not None:
+            uids = sorted(uids, key=int, reverse=True)[:summary.latest_count]
         for raw_uid in uids:
             uid = raw_uid.decode("ascii")
+            report = {"uid": uid, "attachments": [], "status": "pending"}
+            summary.messages.append(report)
             try:
                 summary.messages_checked += 1
                 received, size = fetch_metadata(client, uid)
-                if not since <= received <= now:
+                report["received_at"] = received.isoformat()
+                if received > now or (since is not None and received < since):
+                    report["status"] = "outside_window"
                     continue
                 summary.messages_in_period += 1
                 if size > MAX_MESSAGE_BYTES:
@@ -374,6 +393,10 @@ def _import_inbox(queue, password, now, client_factory, recognizer, summary: Imp
                 if len(bodies[0]) > MAX_MESSAGE_BYTES:
                     raise MailImportError("Message exceeds the 30 MiB trial limit.")
                 message = BytesParser(policy=policy.default).parsebytes(bodies[0])
+                report.update(
+                    sender=str(message.get("From", "")), subject=str(message.get("Subject", "")),
+                    message_id=str(message.get("Message-ID", "")), status="processed",
+                )
                 for part_index, part in enumerate(message.walk()):
                     if part.is_multipart():
                         continue
@@ -385,10 +408,18 @@ def _import_inbox(queue, password, now, client_factory, recognizer, summary: Imp
                     if suffix not in SUFFIXES:
                         suffix = MIME_SUFFIXES.get(part.get_content_type(), "")
                     if not suffix:
+                        if is_attachment:
+                            report["attachments"].append({
+                                "filename": filename, "content_type": part.get_content_type(),
+                                "status": "unsupported",
+                            })
                         continue
                     if not is_attachment:
                         summary.attachments_found += 1
                     summary.supported_attachments += 1
+                    attachment = {"filename": filename, "content_type": part.get_content_type(),
+                                  "status": "pending"}
+                    report["attachments"].append(attachment)
                     try:
                         payload = part.get_payload(decode=True)
                         if not payload:
@@ -404,17 +435,35 @@ def _import_inbox(queue, password, now, client_factory, recognizer, summary: Imp
                         summary.documents_added += int(created)
                         summary.duplicates_skipped += int(not created)
                         summary.errors += int(recognition_failed)
+                        saved = queue.conn.execute(
+                            "SELECT id,state,result_json FROM documents WHERE sha256=?",
+                            (hashlib.sha256(payload).hexdigest(),),
+                        ).fetchone()
+                        fields = json.loads(saved["result_json"]).get("fields", {})
+                        attachment.update(
+                            status="added" if created else "duplicate",
+                            document_id=saved["id"], recognition_state=saved["state"],
+                            fields={key: fields.get(key) for key in (
+                                "document_type", "supplier_name", "invoice_number", "document_date",
+                                "due_date", "net_amount", "vat_amount", "gross_amount",
+                                "rounding_amount", "amount_due", "currency_code", "payment_reference",
+                            )},
+                        )
                         queue.clear_issue(validity, uid, part_index)
-                    except (imaplib.IMAP4.abort, OSError, sqlite3.Error):
+                    except (imaplib.IMAP4.abort, OSError, sqlite3.Error) as error:
+                        attachment.update(status="error", error=safe_error(error))
                         raise
                     except Exception as error:
                         summary.errors += 1
+                        attachment.update(status="error", error=safe_error(error))
                         queue.issue(validity, uid, part_index, safe_error(error))
                 queue.clear_issue(validity, uid, -1)
-            except (imaplib.IMAP4.abort, OSError, sqlite3.Error):
+            except (imaplib.IMAP4.abort, OSError, sqlite3.Error) as error:
+                report.update(status="error", error=safe_error(error))
                 raise
             except Exception as error:
                 summary.errors += 1
+                report.update(status="error", error=safe_error(error))
                 queue.issue(validity, uid, -1, safe_error(error))
     finally:
         # LOGOUT only; never CLOSE/EXPUNGE/STORE/MOVE.

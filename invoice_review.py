@@ -20,7 +20,7 @@ from expense_documents import (
 
 class InvoiceReviewMixin:
     def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None, *,
-                            trial_save=None, trial_objects=None):
+                            trial_save=None, trial_objects=None, reviewed_save=None):
         fields = {**parsed_fields, **document}
         source_text = str(fields.get("raw_text") or fields.get("recognized_text") or "")
         non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(source_text)
@@ -34,13 +34,16 @@ class InvoiceReviewMixin:
         if not preview_paths and fields.get("has_original"):
             preview_paths = self._expense_document_original_paths(server_document)
         dialog = QDialog(self)
-        dialog.setWindowTitle("Тестовая почтовая очередь — распределение" if trial_save
+        local_review = reviewed_save is not None
+        dialog.setWindowTitle("ЛОКАЛЬНЫЙ ТЕСТ — проверка фактуры" if local_review else
+                              "Тестовая почтовая очередь — распределение" if trial_save
                               else "Проверка фактуры и распределение расходов")
         dialog.resize(1040, 760)
         dialog.setMinimumSize(860, 650)
         layout = QVBoxLayout(dialog)
         if trial_save:
             from mail_import import mail_review_warnings
+        if trial_save and not local_review:
             trial_note = QLabel("ТЕСТОВЫЙ КАТАЛОГ. Сохранение только в почтовой тестовой очереди. "
                                 "Подтверждение, рабочий учёт и синхронизация отключены.")
             trial_note.setWordWrap(True)
@@ -49,6 +52,14 @@ class InvoiceReviewMixin:
             trial_warnings.setObjectName("invoiceTrialDocumentWarnings")
             trial_warnings.setWordWrap(True)
             layout.addWidget(trial_warnings)
+        elif local_review:
+            local_note = QLabel(
+                "ЛОКАЛЬНЫЙ ТЕСТ. До подтверждения — только черновик очереди. "
+                "Для сохранения выберите объект, проверьте оригинал и подтвердите действие. "
+                "Рабочий сервер не используется."
+            )
+            local_note.setWordWrap(True)
+            layout.addWidget(local_note)
         elif non_invoice_type:
             classification_note = QLabel(
                 "Это уведомление о заказе, а не подтверждённая фактура."
@@ -156,6 +167,10 @@ class InvoiceReviewMixin:
         ambiguity_reviewed.setObjectName("invoiceAmbiguityReviewed")
         ambiguity_reviewed.setVisible(any(item.get("ambiguous") for item in fields.get("order_proposals") or []))
         layout.addWidget(ambiguity_reviewed)
+        original_reviewed = QCheckBox("Я проверил оригинал и выбранный объект")
+        original_reviewed.setObjectName("invoiceOriginalReviewed")
+        original_reviewed.setVisible(local_review)
+        layout.addWidget(original_reviewed)
         extra_toggle = QPushButton("Дополнительно")
         extra_toggle.setCheckable(True)
         extra = QTextEdit()
@@ -169,7 +184,7 @@ class InvoiceReviewMixin:
         layout.addWidget(extra)
         actions = QHBoxLayout()
         draft = QPushButton("Сохранить черновик")
-        if trial_save:
+        if trial_save and not local_review:
             draft.setText("Сохранить только в тестовой очереди")
         draft.setObjectName("invoiceSaveDraft")
         confirm = QPushButton("Подтвердить распределение")
@@ -208,7 +223,7 @@ class InvoiceReviewMixin:
 
         def refresh(*_):
             current, rows = values()
-            if trial_save:
+            if trial_save and not local_review:
                 trial_warnings.setText("\n".join(current["mail_review_warnings"]))
             origin_names = {"explicit": "Явно указан в документе", "calculated": "Рассчитан по условиям оплаты — требуется сверка",
                             "manual": "Изменён вручную", "ambiguous": "Неоднозначный срок — укажите проверенную дату",
@@ -235,12 +250,20 @@ class InvoiceReviewMixin:
                 issues.append("Укажите корректную дату фактуры.")
             if current["currency_code"].upper() not in {"SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"}:
                 issues.append("Выберите валюту.")
+            if local_review:
+                if fields.get("document_type") != "invoice":
+                    issues.append("В этом тесте подтверждается только обычная фактура.")
+                if not original_reviewed.isChecked():
+                    issues.append("Сверьте оригинал и выбранный объект.")
+                if not rows or any(row.get("destination") != "object"
+                                   or row.get("object_id") is None for row in rows):
+                    issues.append("Выберите объект для каждой строки.")
             issues_label.setText("Для подтверждения: " + " ".join(issues[:3]) if issues else "Суммы согласованы. Назначения выбраны.")
             confirm.setEnabled(
-                not issues and trial_save is None and non_invoice_type is None
+                not issues and (trial_save is None or local_review) and non_invoice_type is None
                 and non_invoice_type != "tax_decision"
             )
-            if trial_save:
+            if trial_save and not local_review:
                 confirm.setToolTip("Перенос в рабочий учёт отключён для тестовой очереди.")
             elif order_confirmation_detected:
                 confirm.setToolTip("Для учёта загрузите саму фактуру или чек; заказ не подтверждается как расход.")
@@ -314,11 +337,12 @@ class InvoiceReviewMixin:
         ambiguity_reviewed.toggled.connect(refresh)
         tax_reviewed.toggled.connect(refresh)
         due_reviewed.toggled.connect(refresh)
+        original_reviewed.toggled.connect(refresh)
         add_row_button.clicked.connect(lambda: append_row())
         remove_row_button.clicked.connect(remove_row)
 
         def save(status):
-            if trial_save is not None and status != "draft":
+            if trial_save is not None and not local_review and status != "draft":
                 return
             if status == "confirmed" and non_invoice_type == "tax_decision":
                 QMessageBox.warning(dialog, "Тип документа", "Решение о транспортном налоге нельзя подтвердить как фактуру.")
@@ -344,6 +368,16 @@ class InvoiceReviewMixin:
                 return
             if status == "confirmed" and (net_invoice_issues(current, rows) or not confirm.isEnabled()):
                 return
+            if status == "confirmed" and local_review:
+                answer = QMessageBox.question(
+                    dialog, "Подтвердить тестовый расход?",
+                    "Сохранить эту фактуру на выбранные объекты только в локальном тестовом реестре? "
+                    "После подтверждения возможна повторная отправка этого же документа при сбое.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
             net = parse_invoice_money(current["net_amount"])
             vat = parse_invoice_money(current["vat_amount"])
             payload = {**current, "client_id": client_id, "allocation_basis": "net",
@@ -358,7 +392,10 @@ class InvoiceReviewMixin:
                 payload["required_attachment_sha256"] = known_hashes
             if trial_save is not None:
                 try:
-                    trial_save(payload)
+                    if status == "confirmed" and local_review:
+                        reviewed_save(payload)
+                    else:
+                        trial_save(payload)
                 except Exception as error:
                     QMessageBox.warning(dialog, "Не сохранено в тестовой очереди", str(error))
                     return
@@ -389,4 +426,9 @@ class InvoiceReviewMixin:
         confirm.clicked.connect(lambda: save("confirmed"))
         cancel.clicked.connect(dialog.reject)
         refresh()
-        return dialog.exec() == QDialog.DialogCode.Accepted
+        try:
+            return dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            if gallery is not None:
+                gallery.close()
+            dialog.deleteLater()

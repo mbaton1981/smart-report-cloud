@@ -160,6 +160,56 @@ class MailImportTests(unittest.TestCase):
         self.assertEqual(document["sha256"], hashlib.sha256(original.read_bytes()).hexdigest())
         self.assertEqual(len(list(original.parent.iterdir())), 1)
 
+    def test_latest_messages_include_old_mail_and_report_empty_unsupported_and_duplicates(self):
+        client = FakeIMAP({
+            "2": message(("ignored.pdf", b"not selected")),
+            "9": message(("invoice.pdf", b"ordinary invoice")),
+            "10": message(("info.txt", b"not an invoice")),
+            "11": message(),
+        }, {"9": NOW - timedelta(days=40)})
+        recognizer = Mock(side_effect=recognized)
+        first = import_inbox(self.queue, "local-only", now=NOW, client_factory=Mock(return_value=client),
+                             recognizer=recognizer, latest_count=3)
+        self.assertIn(("SEARCH", None, "ALL"), client.calls)
+        bodies = [call[1] for call in client.calls if call[0] == "FETCH" and call[2] == "(BODY.PEEK[])"]
+        self.assertEqual(bodies, ["11", "10", "9"])
+        self.assertEqual([item["uid"] for item in first.messages], ["11", "10", "9"])
+        self.assertEqual(first.messages[0]["attachments"], [])
+        self.assertEqual(first.messages[1]["attachments"][0]["status"], "unsupported")
+        attachment = first.messages[2]["attachments"][0]
+        self.assertEqual(attachment["fields"]["supplier_name"], FIELDS["supplier_name"])
+        self.assertEqual(attachment["status"], "added")
+        self.assertEqual(first.documents_added, 1)
+        self.assertEqual(first.attachments_found, 2)
+        self.assertEqual(first.supported_attachments, 1)
+        self.assertEqual(first.since, "")
+        before = self.queue.review()
+        second = import_inbox(self.queue, "local-only", now=NOW, client_factory=Mock(return_value=client),
+                              recognizer=recognizer, latest_count=3)
+        self.assertEqual(second.documents_added, 0)
+        self.assertEqual(second.duplicates_skipped, 1)
+        self.assertEqual(second.messages[2]["attachments"][0]["status"], "duplicate")
+        self.assertEqual(self.queue.review(), before)
+        self.assertEqual(recognizer.call_count, 1)
+        self.assertTrue(all(call[2] is True for call in client.calls if call[0] == "select"))
+        self.assertFalse(any(call[0] in ("STORE", "MOVE", "EXPUNGE", "CLOSE") for call in client.calls))
+
+    def test_latest_count_rejects_invalid_limits_before_connecting(self):
+        factory = Mock()
+        for limit in (0, -1, 21, True, 1.5, "5"):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                import_inbox(self.queue, "local-only", now=NOW, client_factory=factory, latest_count=limit)
+        factory.assert_not_called()
+
+    def test_message_failure_is_visible_in_per_message_report(self):
+        client = FakeIMAP({"1": message()})
+        client.fail_body.add("1")
+        summary = import_inbox(self.queue, "local-only", now=NOW,
+                               client_factory=Mock(return_value=client), latest_count=5)
+        self.assertEqual(summary.errors, 1)
+        self.assertEqual(summary.messages[0]["status"], "error")
+        self.assertNotIn("private server error", json.dumps(summary.messages))
+
     def test_different_files_same_fields_warn_both_without_merging(self):
         result = self.run_import(FakeIMAP({"1": message(
             ("invoice.pdf", b"version one"), ("copy.pdf", b"version two"))}))

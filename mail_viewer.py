@@ -57,7 +57,7 @@ class MailViewer(InvoiceReviewMixin, QWidget):
         self.documents = [dict(row) for row in self.store.conn.execute("SELECT * FROM documents ORDER BY id")]
         self.table.setRowCount(len(self.documents))
         for index, document in enumerate(self.documents):
-            initial = json.loads(document["result_json"])["fields"]
+            initial = json.loads(document["result_json"]).get("fields", {})
             reviewed = self.audit.get(document["id"], {})
             draft = self.store.latest(document["id"])
             fields = draft["payload"] if draft else (reviewed.get("checked") or reviewed.get("current") or initial)

@@ -1,5 +1,63 @@
 # Invoice Recognition and Net Allocations
 
+## Current local mail acceptance (2026-10-21; not published)
+
+The current owner instruction overrides historical release notes below: **no push,
+deploy, restart, production mail import, or working-data changes are authorized**.
+The backup patch is preserved; no additional backup acceptance is being performed.
+
+An opt-in local acceptance UI is available separately from the existing draft-only
+mail viewer:
+
+```powershell
+python -m local_mail --data-dir "<NEW empty isolated test directory>"
+```
+
+Never point this command at an existing mail queue. It refuses a nonempty directory
+without its local-test marker. The explicit receive action reads the **five latest
+INBOX messages by IMAP UID**, including mail received before the window was opened,
+without a seven-day cutoff. The previous first-launch marker is retained only for
+directory isolation, not used to exclude existing messages. Legacy importer callers
+keep their seven-day default; `latest_count` (1–20) is opt-in.
+The owner enters the mailbox password in a masked local dialog for each fetch; it is
+not persisted. IMAP uses read-only INBOX and BODY.PEEK, with bounded metadata search.
+There is no scheduler and no production endpoint option.
+The read-only report lists each selected message (including those without attachments),
+attachment names/types, unsupported files, recognized fields, duplicates and failures.
+It is displayed as plain text and saved locally in `runs/`; bodies and passwords are
+not included. Repeated receipt does not rerun saved recognition or create expenses.
+
+Storage within that directory:
+
+- `originals/` and `mail_queue.sqlite3`: immutable received originals, recognition,
+  insert-only draft revisions, and approved pending/sent delivery metadata.
+- `register/local-register.db` and `register/documents/`: separate local API register
+  and its originals. The API binds only to `127.0.0.1` on a random port with newly
+  generated test credentials. The working desktop application is not started.
+- `card-originals/`: originals downloaded through saved local cards and SHA-256
+  verified before opening.
+
+Receiving and opening a document never create an expense. The local form reads
+saved recognition, not a new implicit extraction. Reprocessing remains an explicit
+per-document action with a default-No warning. First review requires explicit object
+selection; draft allocations can be resumed. Confirmation is initially disabled:
+the owner must enable the acceptance gate, select objects for all rows, check the
+original-review checkbox, and answer **Yes** in the final confirmation dialog.
+Order confirmations, tax decisions, pro formas, receipts and unclassified documents
+cannot be confirmed as ordinary invoices in this acceptance UI.
+
+Approval persists one `client_id` and payload before the HTTP request. A lost
+response retains the pending delivery, which can be retried after reopening without
+another expense. Sending an unapproved draft is refused; already-sent items are not
+resent. Same mail-part identity and SHA-256 deduplicate repeated receipt; the existing
+API also rejects a matching business identity or an already stored original.
+The original remains in the queue even after acknowledgement.
+
+The existing `mail_viewer` remains draft-only. No automatic production transfer,
+production mailbox scheduling, credential storage, or working-data changes are enabled.
+Automated acceptance uses only synthetic messages and temporary local API databases;
+it is not evidence that the owner's new real message has been fetched.
+
 ## Release Status
 
 On 2026-10-17 the owner authorized completing, pushing and deploying the current
