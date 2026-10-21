@@ -62,23 +62,52 @@ automatic transfer is enabled.
 
 ## Backup and recovery findings and proposed operations
 
-The last recorded provider configuration check (2026-10-17, see `WORK_LOG.md`)
-reported `SMARTREPORT_DOCUMENTS_DIR=/data/documents` and
-`DATABASE_PATH=/data/cloud_database.db` on Render's persistent `/data` disk.
-The live provider settings and disk attachment have not been re-queried for
-this task, and no restart/deploy persistence test was run. Treat those values
-as historical evidence, not confirmation of today's live configuration.
+The read-only provider configuration check on 2026-10-21 confirmed
+`SMARTREPORT_DOCUMENTS_DIR=/data/documents` and
+`DATABASE_PATH=/data/cloud_database.db`, with a 1 GB persistent disk mounted at
+`/data` on `smart-report-server`. The dashboard showed daily disk snapshots for
+October 15–21. No setting was changed and no restart, deploy, or disk restore was
+performed. Persistence across restart/deploy follows Render's persistent-disk
+contract, not a new destructive/restart test. See `WORK_LOG.md`.
 
-An isolated end-to-end backup/restore exercise passed for an active invoice:
-the SQLite snapshot passed `PRAGMA integrity_check`; the invoice and attachment
-rows were present; the downloaded original matched the recorded SHA-256; after
-restoring both into a temporary server copy, the expense card served the PDF and
-the PDF text could be read. Restoration required mapping archived
-`document_id`/`attachment_id` filenames back to `stored_name` from the database
-snapshot. `server_backup.py` currently downloads a database snapshot and
-originals but does not provide a restore command. Its document listing also
-contains active records only, so deleted-record retention needs an explicit
-policy before calling it a complete archive.
+The local full-backup patch adds `GET /api/admin/backup/full` (admin only).
+It returns a ZIP containing `server_snapshot.db`, `manifest.json`, and
+`documents/` with original `stored_name` paths. References come from the database
+snapshot, including soft-deleted cards and hidden split containers, not the
+active-only, limited UI listing. Inactive object links remain in the unchanged
+snapshot too. Legacy primary-original references and unlinked files under the
+document root are also retained. No automatic retention cleanup is enabled.
+
+The existing `SmartReport.exe --backup <folder>` download workflow will use this
+full endpoint once client and server are updated with explicit permission. Its
+output includes the ZIP and a verified expanded copy; an old server without the
+endpoint returns an error, never a silently partial fallback. The database-only
+endpoint still exists but is not a full documents backup.
+
+Offline recovery from a new archive into a new or empty TEST directory:
+
+```powershell
+python -m server_backup --restore "C:\TestBackups\backup.zip" --destination "C:\TestRecovery\restored"
+```
+
+The result is `server_snapshot.db`, `documents/`, and `manifest.json`; no manual
+filename mapping is needed. The command validates the entire archive in a
+staging directory before making the restored directory available. It checks
+SQLite integrity and foreign keys, the database hash, database-to-file
+references, and every original's SHA-256 and size. Existing non-empty
+destinations are rejected. It never changes service configuration or points a
+client at the restored database. Older partial exports are not accepted as
+full archives.
+
+An isolated regression exercise restored active/deleted/split cards, an
+allocation to an inactive object, legacy and unlinked originals. IDs, statuses
+and links survived; the active restored card served its original and Qt rendered
+the test PDFs. Missing or corrupt source originals cause HTTP 409 with
+`complete=false`; missing/corrupt archive data aborts restoration with a nonzero
+CLI exit, without publishing a partial restored database. Deleted cards remain
+deleted and their originals remain inaccessible through the ordinary card API.
+SHA-256 detects inconsistency against the snapshot/manifest; it does not replace
+authenticated encrypted off-server storage.
 
 Proposed backup operations, not implemented:
 

@@ -2162,6 +2162,26 @@ def admin_storage_status():
     return jsonify(status)
 
 
+@app.route("/api/admin/backup/full", methods=["GET"])
+def admin_backup_full():
+    if not admin_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    from server_backup import BackupError, create_full_backup
+
+    temporary = tempfile.TemporaryDirectory(prefix="smartreport-full-export-")
+    archive = Path(temporary.name) / "backup.zip"
+    try:
+        create_full_backup(Path(DB_FILE), expense_documents_root(), archive)
+        response = send_file(archive, as_attachment=True, download_name="smartreport_full_backup.zip")
+    except (BackupError, OSError, sqlite3.Error, RuntimeError, ValueError) as error:
+        temporary.cleanup()
+        logger.error("Полная резервная копия не создана: %s", error)
+        return jsonify({"ok": False, "complete": False, "error": str(error)}), 409
+    response.call_on_close(temporary.cleanup)
+    response.direct_passthrough = False
+    return response
+
+
 @app.route("/api/admin/backup/database", methods=["GET"])
 def admin_backup_database():
     if not admin_api_authorized():

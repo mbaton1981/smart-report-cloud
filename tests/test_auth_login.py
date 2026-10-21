@@ -447,6 +447,183 @@ class AuthLoginTests(unittest.TestCase):
         finally:
             copy.close()
 
+    def test_full_backup_restores_active_deleted_split_and_unlinked_originals(self):
+        import hashlib
+        from io import BytesIO
+        from reportlab.pdfgen import canvas
+        from PyQt6.QtCore import QSize
+        from PyQt6.QtPdf import QPdfDocument
+        from server_backup import pull_backup, restore_backup
+
+        root = Path(self._case.name)
+        originals = root / "originals"
+        originals.mkdir()
+        connection = sqlite3.connect(self.server.DB_FILE)
+        try:
+            for identifier, deleted in ((1, 0), (2, 1), (3, 0)):
+                buffer = BytesIO()
+                pdf = canvas.Canvas(buffer)
+                pdf.drawString(72, 740, f"ISOLATED RESTORED ORIGINAL {identifier}")
+                pdf.save()
+                content = buffer.getvalue()
+                name = f"stored-{identifier}.pdf"
+                digest = hashlib.sha256(content).hexdigest()
+                (originals / name).write_bytes(content)
+                connection.execute("""
+                    INSERT INTO expense_documents
+                        (id,client_id,is_deleted,original_name,stored_name,file_sha256,created_at,updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'x', 'x')
+                """, (identifier, f"backup-{identifier}", deleted, name, name, digest))
+                connection.execute("""
+                    INSERT INTO expense_document_attachments
+                        (id,document_id,original_name,stored_name,file_sha256,created_at)
+                    VALUES (?, ?, ?, ?, ?, 'x')
+                """, (identifier, identifier, name, name, digest))
+            connection.execute("""
+                INSERT INTO expense_processing (document_id,state,details_json,updated_at)
+                VALUES (3,'split','{}','x')
+            """)
+            connection.execute("UPDATE meta_objects SET is_active=0 WHERE id=1")
+            connection.execute("""
+                INSERT INTO expense_allocations (document_id,object_id,allocated_gross)
+                VALUES (1,1,'125.00')
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+        (originals / "unlinked.pdf").write_bytes((originals / "stored-1.pdf").read_bytes())
+        headers = self._bearer(self._token())
+        self.assertEqual(self.client.get("/api/admin/backup/full").status_code, 403)
+        with patch.dict(os.environ, {"SMARTREPORT_DOCUMENTS_DIR": str(originals)}):
+            response = self.client.get("/api/admin/backup/full", headers=headers)
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=False)[:100])
+            archive = root / "full.zip"
+            archive.write_bytes(response.data)
+            response.close()
+        import threading
+        from werkzeug.serving import make_server
+
+        with patch.dict(os.environ, {"SMARTREPORT_DOCUMENTS_DIR": str(originals)}):
+            http_server = make_server("127.0.0.1", 0, self.server.app)
+            worker = threading.Thread(target=http_server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                downloaded, downloaded_manifest = pull_backup(
+                    f"http://127.0.0.1:{http_server.server_port}",
+                    headers["Authorization"].removeprefix("Bearer "), root / "downloaded",
+                )
+                self.assertTrue(downloaded_manifest["complete"])
+                self.assertEqual(len(downloaded_manifest["files"]), 4)
+                self.assertEqual((downloaded / "documents" / "stored-2.pdf").read_bytes(),
+                                 (originals / "stored-2.pdf").read_bytes())
+                self.assertTrue((downloaded / "backup.zip").is_file())
+            finally:
+                http_server.shutdown()
+                worker.join(timeout=10)
+                http_server.server_close()
+            self.assertFalse(worker.is_alive())
+        destination = root / "empty-restored"
+        destination.mkdir()
+        manifest = restore_backup(archive, destination)
+        self.assertEqual(len(manifest["files"]), 4)
+        restored_db = destination / "server_snapshot.db"
+        connection = sqlite3.connect(restored_db)
+        try:
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(connection.execute(
+                "SELECT id,is_deleted FROM expense_documents ORDER BY id"
+            ).fetchall(), [(1, 0), (2, 1), (3, 0)])
+            self.assertEqual(connection.execute(
+                "SELECT document_id,state FROM expense_processing"
+            ).fetchall(), [(3, "split")])
+            self.assertEqual(connection.execute("""
+                SELECT a.document_id,a.object_id,o.is_active,a.allocated_gross
+                FROM expense_allocations a JOIN meta_objects o ON o.id=a.object_id
+            """).fetchall(), [(1, 1, 0, "125.00")])
+            rows = connection.execute(
+                "SELECT document_id,stored_name,file_sha256 FROM expense_document_attachments ORDER BY id"
+            ).fetchall()
+        finally:
+            connection.close()
+        for identifier, name, digest in rows:
+            path = destination / "documents" / name
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+            pdf = QPdfDocument(None)
+            self.assertEqual(pdf.load(str(path)), QPdfDocument.Error.None_)
+            self.assertEqual(pdf.pageCount(), 1)
+            self.assertFalse(pdf.render(0, QSize(300, 400)).isNull())
+            pdf.close()
+        with patch.object(self.server, "DB_FILE", str(restored_db)), patch.dict(
+            os.environ, {"SMARTREPORT_DOCUMENTS_DIR": str(destination / "documents")},
+        ):
+            card = self.client.get("/api/expense-documents/1", headers=headers)
+            self.assertEqual(card.status_code, 200)
+            attachment = card.get_json()["document"]["attachments"][0]
+            response = self.client.get(
+                f"/api/expense-documents/1/attachments/{attachment['id']}/original", headers=headers,
+            )
+            try:
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(hashlib.sha256(response.data).hexdigest(), attachment["sha256"])
+            finally:
+                response.close()
+            self.assertEqual(self.client.get("/api/expense-documents/2", headers=headers).status_code, 404)
+            self.assertEqual(self.client.get(
+                "/api/expense-documents/2/attachments/2/original", headers=headers,
+            ).status_code, 404)
+
+    def test_full_backup_reports_missing_and_corrupt_originals_without_success(self):
+        import hashlib
+
+        root = Path(self._case.name) / "originals"
+        root.mkdir()
+        connection = sqlite3.connect(self.server.DB_FILE)
+        try:
+            connection.execute("""
+                INSERT INTO expense_documents (id,client_id,is_deleted,created_at,updated_at)
+                VALUES (1,'deleted-backup',1,'x','x')
+            """)
+            connection.execute("""
+                INSERT INTO expense_document_attachments
+                    (document_id,original_name,stored_name,file_sha256,created_at)
+                VALUES (1,'absent.pdf','absent.pdf',?,'x')
+            """, (hashlib.sha256(b"original").hexdigest(),))
+            connection.commit()
+        finally:
+            connection.close()
+        headers = self._bearer(self._token())
+        with patch.dict(os.environ, {"SMARTREPORT_DOCUMENTS_DIR": str(root)}):
+            for damaged in (False, True):
+                if damaged:
+                    (root / "absent.pdf").write_bytes(b"damaged")
+                response = self.client.get("/api/admin/backup/full", headers=headers)
+                self.assertEqual(response.status_code, 409)
+                self.assertFalse(response.get_json()["complete"])
+                self.assertFalse(response.get_json()["ok"])
+                self.assertIn("absent.pdf", response.get_json()["error"])
+
+    def test_desktop_backup_command_exits_nonzero_on_incomplete_archive(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-c", """
+import runpy
+import sys
+from unittest.mock import patch
+import server_backup
+sys.argv = ['app.py', '--backup', sys.argv[1]]
+with patch('desktop_auth.load_saved_token', return_value='isolated-test-token'), \\
+     patch.object(server_backup, 'pull_backup', side_effect=server_backup.BackupError('Missing original fixture.pdf')):
+    runpy.run_module('app', run_name='__main__')
+""", str(Path(self._case.name) / "backup")],
+            capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"Missing original fixture.pdf", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+
     def test_login_dialog_rejects_bad_input_shows_server_error_and_returns_token(self):
         import desktop_login
         auth = self.desktop_auth

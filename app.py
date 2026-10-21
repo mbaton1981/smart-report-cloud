@@ -10049,7 +10049,12 @@ if __name__ == "__main__":
             import server_backup
             token = desktop_auth.load_saved_token()
             folder = sys.argv[sys.argv.index("--backup") + 1]
-            target, manifest = server_backup.pull_backup(desktop_auth.server_url(), token, folder)
+            try:
+                target, manifest = server_backup.pull_backup(desktop_auth.server_url(), token, folder)
+            except (server_backup.BackupError, requests.RequestException, OSError) as error:
+                logging.error("Полная резервная копия не создана: %s", error)
+                print(f"Полная резервная копия не создана: {error}", file=sys.stderr)
+                sys.exit(1)
             print(f"Копия сохранена: {target}; файлов: {len(manifest['files'])}; проблем: {len(manifest['problems'])}")
             sys.exit(1 if manifest["problems"] else 0)
         if "--diagnostic" in sys.argv:
