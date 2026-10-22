@@ -274,7 +274,11 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
         journal.append([
             row["date"], row["employee"], TYPE_LABELS.get(row["entry_type"], "Övrig tid"),
             format_quantity(row["hours"]), "\n".join(details),
-            translate(row["comment"] or ""),
+            (
+                report["journal_translations"][row["sync_id"]]
+                if row["sync_id"] in report.get("journal_translations", {})
+                else translate(row["comment"] or "")
+            ),
         ])
     story.append(table(journal, [65, 115, 100, 55, 140, available - 475], numeric=(3,)))
     journal_work_hours = sum(float(row["hours"]) for row in report["journal_rows"] if row["entry_type"] in WORK_TYPES)

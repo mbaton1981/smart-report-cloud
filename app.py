@@ -1661,10 +1661,12 @@ def translate_to_swedish(text, *, allow_network=True):
     t = raw_text.lower()
     if not allow_network:
         for original, translated in (
+            ("внутренних окон комнат", "invändiga fönster i rummen"),
             ("коробов вентиляции", "ventilationskanaler"),
             ("кухонных витяжок", "köksfläktar"),
             ("кухонных вытяжек", "köksfläktar"),
             ("водяных труб", "vattenrör"),
+            ("демонтаж,", "demontering av "),
             ("демонтаж", "demontering av"),
         ):
             t = t.replace(original, translated)
@@ -1705,6 +1707,69 @@ def translate_to_swedish(text, *, allow_network=True):
     if not allow_network:
         result = result.replace(" ,", ",").replace(" ;", ";").replace(" :", ":")
     return result
+
+
+class JournalTranslationDialog(QDialog):
+    def __init__(self, pending, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Проверка перевода описаний для PDF")
+        self.resize(1150, 600)
+        self.translations = {}
+        self._editors = []
+        layout = QVBoxLayout(self)
+        notice = QLabel(
+            "Не удалось полностью перевести указанные записи. Проверьте или введите шведский текст справа.\n"
+            "Исправления используются только в этом PDF. Исходные описания, смены и база не изменяются."
+        )
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        table = QTableWidget(len(pending), 3)
+        table.setHorizontalHeaderLabels(["Запись / дата / сотрудник / объект", "Исходное описание (без изменений)", "Перевод на шведский для PDF"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setWordWrap(True)
+        for index, (row, suggestion, error) in enumerate(pending):
+            context = (
+                f"№{row['id']} · {row['date']}\n{row['employee']}\n"
+                f"{row['object_name']}\nID: {row['sync_id']}"
+            )
+            for column, text in enumerate((context, row["comment"] or "")):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(error if column == 0 else text)
+                table.setItem(index, column, item)
+            editor = QTextEdit()
+            editor.setObjectName("journal_translation_" + str(row["id"]))
+            editor.setPlainText(suggestion)
+            table.setCellWidget(index, 2, editor)
+            table.setRowHeight(index, 130)
+            self._editors.append((row, editor))
+        layout.addWidget(table)
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Использовать перевод и создать PDF")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        import re
+        translations = {}
+        for row, editor in self._editors:
+            text = editor.toPlainText().strip()
+            if not text or re.search(r"[\u0400-\u04ff]", text):
+                self.error_label.setText(
+                    f"Запись №{row['id']} · {row['date']} · {row['employee']}: "
+                    "введите непустой перевод на шведском; в тексте осталась кириллица или поле пустое."
+                )
+                editor.setFocus()
+                return
+            translations[row["sync_id"]] = text
+        self.translations = translations
+        super().accept()
+
 
 try:
     windows_font_path = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts', 'arial.ttf')
@@ -8540,6 +8605,11 @@ class SmartReportApp(QMainWindow):
             )
             return
         try:
+            translations = self._collect_journal_translations(report)
+            if translations is None:
+                self.statusBar().showMessage("Экспорт PDF отменён. Исходные описания не изменены.", 8000)
+                return
+            report = {**report, "journal_translations": translations}
             filename = (
                 ("Arbetsjournal" if journal_only else "Fakturaunderlag")
                 + f"_{report['company']}_{report['object']}_{report['date_from']}_till_{report['date_to']}.pdf"
@@ -8572,6 +8642,22 @@ class SmartReportApp(QMainWindow):
                 "Originaltexten är oförändrad; granska beskrivningen före export."
             )
         return translated
+
+    def _collect_journal_translations(self, report):
+        translations = {}
+        pending = []
+        for row in report["journal_rows"]:
+            text = row["comment"] or ""
+            try:
+                translations[row["sync_id"]] = self._journal_description_swedish(text)
+            except ValueError as error:
+                pending.append((row, translate_to_swedish(text, allow_network=False), str(error)))
+        if pending:
+            dialog = JournalTranslationDialog(pending, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            translations.update(dialog.translations)
+        return translations
 
     def mark_period_as_invoiced(self):
         try:

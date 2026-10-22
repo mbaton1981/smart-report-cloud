@@ -361,6 +361,60 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                         "journal_rows": len(report["journal_rows"]),
                     }
                     QTest.mouseClick(inner, Qt.MouseButton.LeftButton, pos=inner.tabRect(0).center())
+                window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(84))
+                window.inv_date_from.setDate(QDate(2026, 10, 1))
+                window.inv_date_to.setDate(QDate(2026, 10, 31))
+                click(button("Просмотр сводки"))
+                report = window._invoice_report
+                if (report["totals"]["hours"] != 22 or report["totals"]["invoice_total"] != 12790
+                        or report["recorded_trips"] != 3 or len(report["journal_rows"]) != 3):
+                    raise RuntimeError("Actual HOTEL October scenario differs from the reported failure")
+                original_descriptions = {row["id"]: row["comment"] for row in report["journal_rows"]}
+                capture("hotel-october-summary")
+                window.invoice_summary_table.scrollToBottom()
+                QTest.qWait(100)
+                capture("hotel-october-totals")
+                click(button("Сформировать общий PDF"))
+                monthly_pdf = next(work.glob("Fakturaunderlag_*" + report["object"] + "*2026-10-01_till_2026-10-31.pdf"))
+                monthly_reader = PdfReader(monthly_pdf)
+                monthly_text = "\n".join(page.extract_text() for page in monthly_reader.pages)
+                for expected in ("12 790,00", "22,0", "2026-10-20", "2026-10-21", "2026-10-22",
+                                 "dörrar och invändiga fönster i rummen"):
+                    if expected not in monthly_text:
+                        raise RuntimeError("Missing HOTEL monthly PDF content: " + expected)
+                result["hotel_october"] = {
+                    "hours": 22, "invoice_total": 12790, "recorded_trips": 3,
+                    "journal_rows": 3, "original_descriptions": original_descriptions,
+                    "pdf": str(monthly_pdf), "pages": len(monthly_reader.pages),
+                }
+                QTest.mouseClick(inner, Qt.MouseButton.LeftButton, pos=inner.tabRect(1).center())
+                QTest.qWait(100)
+                capture("hotel-october-journal")
+                row = next(row for row in report["journal_rows"] if row["id"] == 111)
+                review = app_module.JournalTranslationDialog(
+                    [(row, app_module.translate_to_swedish(row["comment"], allow_network=False),
+                      "Manual review UI acceptance")], window,
+                )
+
+                def review_translation():
+                    try:
+                        from PyQt6.QtWidgets import QDialogButtonBox, QTextEdit
+                        review.grab().save(str(work / "translation-review-record-111.png"))
+                        editor = review.findChild(QTextEdit, "journal_translation_111")
+                        editor.setPlainText("Demontering av dörrar och invändiga fönster i rummen")
+                        buttons = review.findChild(QDialogButtonBox)
+                        QTest.mouseClick(buttons.button(QDialogButtonBox.StandardButton.Ok), Qt.MouseButton.LeftButton)
+                    except Exception as error:
+                        failures.append(str(error))
+                        review.reject()
+
+                QTimer.singleShot(200, review_translation)
+                if review.exec() != app_module.QDialog.DialogCode.Accepted:
+                    raise RuntimeError("Manual record-specific translation review failed")
+                result["manual_translation_review"] = {
+                    "record_id": 111, "approved_translation": review.translations[row["sync_id"]],
+                    "source_unchanged": row["comment"] == original_descriptions[111],
+                }
                 if failures:
                     raise RuntimeError("; ".join(failures))
             except Exception as error:

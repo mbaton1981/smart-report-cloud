@@ -303,6 +303,88 @@ class CustomerReportTests(unittest.TestCase):
         self.assertTrue(any("Preliminärt totalbelopp" in text and size == 12 for text, size in fragments))
         self.assertEqual(list(self.conn.iterdump()), before)
 
+    def test_hotel_entire_october_real_descriptions_export_without_changing_source(self):
+        descriptions = [
+            ("2026-10-20", 8, "Демонтаж,дверей и внутренних окон комнат"),
+            ("2026-10-21", 8, "Демонтаж кухонных витяжок,демонтаж вентиляции и водяных труб"),
+            ("2026-10-22", 6, "Демонтаж вентиляциии"),
+        ]
+        for day, hours, comment in descriptions:
+            self.shift(day=day, hours=hours, transport=1, object_name="HOTEL Djurgården", comment=comment)
+        self.window.inv_obj_cb.setCurrentIndex(self.window.inv_obj_cb.findData(84))
+        before = list(self.conn.iterdump())
+        report = self.window.generate_invoice()
+        self.assertEqual(report["totals"]["hours"], 22)
+        self.assertEqual(report["totals"]["work_amount"], 11440)
+        self.assertEqual(report["totals"]["transport_amount"], 1350)
+        self.assertEqual(report["totals"]["invoice_total"], 12790)
+        with patch("requests.sessions.Session.request", side_effect=AssertionError("No network")), \
+                patch.object(self.desktop.JournalTranslationDialog, "exec", side_effect=AssertionError("Known translations")):
+            translated = self.window._collect_journal_translations(report)
+        text = "\n".join(page.extract_text() for page in self.pdf({**report, "journal_translations": translated}).pages)
+        self.assertIn("dörrar och invändiga fönster i rummen", text)
+        for day, _, _ in descriptions:
+            self.assertIn(day, text)
+        self.assertEqual(list(self.conn.iterdump()), before)
+
+    def test_manual_review_identifies_record_and_only_changes_pdf_translation(self):
+        self.shift(comment="Неизвестноеслово <A>")
+        self.shift(day="2026-10-22", comment="Неизвестноеслово <A>")
+        before = list(self.conn.iterdump())
+        report = self.window.generate_invoice()
+
+        def review(dialog):
+            table = dialog.findChild(self.desktop.QTableWidget)
+            self.assertEqual(table.rowCount(), 2)
+            self.assertIn("№1 · 2026-10-21", table.item(0, 0).text())
+            self.assertIn("Andrii Piskun", table.item(0, 0).text())
+            self.assertIn("Tomteboda", table.item(0, 0).text())
+            self.assertEqual(table.item(0, 1).text(), "Неизвестноеслово <A>")
+            self.assertFalse(table.item(0, 1).flags() & self.desktop.Qt.ItemFlag.ItemIsEditable)
+            for number, translated in ((1, "Granskat arbete <A>"), (2, "Annat granskat arbete")):
+                dialog.findChild(self.desktop.QTextEdit, "journal_translation_" + str(number)).setPlainText(translated)
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translated = self.window._collect_journal_translations(report)
+        self.assertEqual(translated, {"1": "Granskat arbete <A>", "2": "Annat granskat arbete"})
+        journal = self.pdf({**report, "journal_translations": translated}).pages[-1].extract_text()
+        self.assertIn("Granskat arbete <A>", journal)
+        self.assertIn("Annat granskat arbete", journal)
+        self.assertNotIn("journal_translations", report)
+        self.assertEqual(list(self.conn.iterdump()), before)
+
+    def test_manual_review_requires_nonempty_translation_without_cyrillic(self):
+        self.shift(comment="Неизвестноеслово")
+        report = self.window.generate_invoice()
+        row = report["journal_rows"][0]
+        dialog = self.desktop.JournalTranslationDialog([(row, row["comment"], "Unknown")], self.window)
+        editor = dialog.findChild(self.desktop.QTextEdit, "journal_translation_1")
+        for invalid in ("", " ", "Montering неизвестно"):
+            editor.setPlainText(invalid)
+            dialog.accept()
+            self.assertNotEqual(dialog.result(), self.desktop.QDialog.DialogCode.Accepted)
+            self.assertIn("№1 · 2026-10-21", dialog.error_label.text())
+            self.assertEqual(dialog.translations, {})
+        editor.setPlainText("Montering")
+        dialog.accept()
+        self.assertEqual(dialog.translations, {"1": "Montering"})
+
+    def test_cancelled_translation_review_does_not_write_or_overwrite_pdf(self):
+        self.shift(comment="Неизвестноеслово")
+        before = list(self.conn.iterdump())
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", return_value=self.desktop.QDialog.DialogCode.Rejected), \
+                patch.object(self.desktop, "write_customer_pdf") as writer, \
+                patch.object(self.desktop.os, "makedirs") as mkdir, \
+                patch.object(self.desktop.QMessageBox, "critical") as critical:
+            self.window.export_invoice_to_pdf()
+        writer.assert_not_called()
+        mkdir.assert_not_called()
+        critical.assert_not_called()
+        self.assertIn("отменён", self.window.statusBar().currentMessage())
+        self.assertEqual(list(self.conn.iterdump()), before)
+
 
 if __name__ == "__main__":
     unittest.main()
