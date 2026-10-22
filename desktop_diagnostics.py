@@ -81,6 +81,9 @@ def verify_approved_update(app_module, work_dir, out_path):
             window.show()
             application.processEvents()
             window.grab().save(str(work / (name + "-installed.png")))
+            window.invoice_summary_table.scrollToBottom()
+            application.processEvents()
+            window.grab().save(str(work / (name + "-installed-costs.png")))
         window.close()
         if result["tomteboda"]["totals"]["hours"] != 4 or result["hotel"]["totals"]["hours"] != 8:
             raise RuntimeError("Actual report hours differ from approved scenario")
@@ -118,6 +121,8 @@ def verify_approved_update(app_module, work_dir, out_path):
                 if "01.11.2026" not in information.call_args.args[2]:
                     raise RuntimeError("Missing visible import-start notice")
                 result["pre_start_import_blocked"] = True
+            result["november_replay"] = verify_excluded_pdf_replay(
+                incoming.store, work.parent / "server-originals-for-restoration")
         finally:
             incoming.close()
     if state() != before:
@@ -127,6 +132,82 @@ def verify_approved_update(app_module, work_dir, out_path):
     if out_path:
         Path(out_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def verify_excluded_pdf_replay(store, originals):
+    """Exercise the frozen importer on an in-memory ledger, never real IMAP."""
+    from contextlib import closing
+    from datetime import date
+    from email.message import EmailMessage
+    import sqlite3
+    from unittest.mock import patch
+    import folder_mail
+
+    class CalendarDateType(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, date)
+
+    class November(date, metaclass=CalendarDateType):
+        @classmethod
+        def today(cls):
+            return cls(2026, 11, 14)
+
+    pdf = originals / "b26a90289df34598b6b05c19b9568d1b.pdf"
+    content = pdf.read_bytes()
+    sha = hashlib.sha256(content).hexdigest()
+    if sha != "701648c0e26b4a85e16371966c95e1a0200bfdae8c8851bb0d87f83911d2c1f7":
+        raise RuntimeError("Expected exact backed-up BEIJER PDF")
+    message = EmailMessage()
+    message["Date"] = "Sun, 01 Nov 2026 12:00:00 +0100"
+    message.add_attachment(content, maintype="application", subtype="pdf", filename="replay.pdf")
+    raw = message.as_bytes()
+    epoch = store.conn.execute("SELECT epoch FROM mail_epoch WHERE folder='INBOX'").fetchone()[0]
+    commands = []
+
+    class FakeIMAP:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def login(self, *_args):
+            return "OK", []
+
+        def select(self, _folder, readonly=False):
+            if not readonly:
+                raise RuntimeError("IMAP must be read-only")
+            return "OK", []
+
+        def response(self, _name):
+            return "UIDVALIDITY", [epoch.encode()]
+
+        def uid(self, command, *args):
+            commands.append(command)
+            if command == "SEARCH":
+                if args != (None, "SINCE", "01-Nov-2026", "BEFORE", "15-Nov-2026"):
+                    raise RuntimeError("Wrong 14-day date boundary")
+                return "OK", [b"999999"]
+            if args[-1] == "(UID RFC822.SIZE)":
+                return "OK", [f"999999 (UID 999999 RFC822.SIZE {len(raw)})".encode()]
+            return "OK", [(b"999999 (UID 999999 BODY[])", raw)]
+
+        def logout(self):
+            return "BYE", []
+
+    with closing(sqlite3.connect(":memory:")) as memory:
+        memory.row_factory = sqlite3.Row
+        store.conn.backup(memory)
+        isolated = SimpleNamespace(conn=memory)
+        before = memory.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0]
+        with patch.object(folder_mail, "date", November):
+            first = folder_mail.import_folder(isolated, "unused", client_factory=FakeIMAP)
+            fetches = commands.count("FETCH")
+            second = folder_mail.import_folder(isolated, "unused", client_factory=FakeIMAP)
+        if (first["excluded"] != 1 or first["new_drafts"] != 0 or second["skipped"] != 1
+                or commands.count("FETCH") != fetches
+                or memory.execute("SELECT COUNT(*) FROM documents").fetchone()[0] != 0
+                or memory.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0] != before + 1):
+            raise RuntimeError("Frozen importer replay protection failed")
+    return {"actual_pdf_excluded": True, "new_november_uid": True, "replay_skipped": True,
+            "real_mail_connections": 0, "disk_database_created": False}
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
