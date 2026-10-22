@@ -8362,7 +8362,11 @@ class SmartReportApp(QMainWindow):
             ("Arbete", cls._invoice_value(totals["work_amount"], ",.2f", " kr")),
             ("Resa", cls._invoice_value(totals["transport_amount"], ",.2f", " kr")),
             ("OB-tillägg", cls._invoice_value(totals["ob_amount"], ",.2f", " kr")),
-            ("Delsumma arbete och resa (utan OB-tillägg)", cls._invoice_value(totals["known_subtotal"], ",.2f", " kr")),
+            (
+                "PRELIMINÄR delsumma — utan ej fastställt OB-tillägg (INTE slutkostnad)"
+                if totals["invoice_total"] is None else "Delsumma arbete och resa (utan OB-tillägg)",
+                cls._invoice_value(totals["known_subtotal"], ",.2f", " kr"),
+            ),
             ("Totalt att fakturera exkl. moms", cls._invoice_value(totals["invoice_total"], ",.2f", " kr")),
         ])
         return items

@@ -1811,6 +1811,9 @@ class CatalogSyncTests(unittest.TestCase):
                     self.assertIn('Начисления сотруднику', text)
                     self.assertIn('Стоимость для заказчика', text)
                     self.assertIn('PRELIMINÄRT UNDERLAG', text)
+                    self.assertIn('PRELIMINÄR delsumma', text)
+                    self.assertIn('utan ej fastställt OB-tillägg (INTE slutkostnad)', text)
+                    self.assertIn('2,530.00 kr', text)
                     payroll = report['payroll']['Report worker']
                     self.assertEqual(payroll['base_amount'], 983.2)
                     self.assertEqual(payroll['ob_premium'], 245.8)

@@ -54,7 +54,7 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
     start = max(start, IMPORT_START_DATE)
     if end < start:
         raise FolderError("before_import_start")
-    report = {"messages": 0, "new_drafts": 0, "duplicates": 0, "without_pdf": 0,
+    report = {"messages": 0, "new_drafts": 0, "duplicates": 0, "excluded": 0, "without_pdf": 0,
               "recognition_failed": 0, "skipped": 0, "total": 0, "completed": 0,
               "stopped": False, "phase": "connecting",
               "start": start.isoformat(), "end": end.isoformat()}
@@ -149,6 +149,10 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
                     raise FolderError("pdf_invalid")
                 pdf_count += 1
                 digest = hashlib.sha256(content).hexdigest()
+                if store.conn.execute(
+                        "SELECT 1 FROM mail_excluded_pdfs WHERE sha256=?", (digest,)).fetchone():
+                    report["excluded"] += 1
+                    continue
                 existing = store.conn.execute("SELECT id FROM documents WHERE sha256=?", (digest,)).fetchone()
                 if existing:
                     document_id = existing[0]
@@ -216,6 +220,7 @@ def report_text(report):
         f"Проверено: {report['completed']}/{report['total']}; "
         f"пропущено обработанных: {report['skipped']}; "
         f"новых черновиков: {report['new_drafts']}; повторов PDF: {report['duplicates']}; "
+        f"ранее удалённых тестовых PDF пропущено: {report['excluded']}; "
         f"без PDF: {report['without_pdf']}; ошибок OCR: {report['recognition_failed']}. "
         "Расходы не создавались.")
 

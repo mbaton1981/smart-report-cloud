@@ -254,6 +254,36 @@ class FolderMailTests(unittest.TestCase):
             import_folder(self.store, "isolated-only", start=date(2026, 10, 1),
                           end=date(2026, 10, 31), client_factory=factory)
 
+    def test_cleanup_ledger_blocks_deleted_pdf_in_new_november_message_without_hiding_others(self):
+        import hashlib
+        from unittest.mock import Mock
+        deleted_pdf = pdf("deleted test invoice")
+        with self.store.conn:
+            self.store.conn.execute("INSERT INTO mail_excluded_pdfs VALUES (?,?)",
+                                    (hashlib.sha256(deleted_pdf).hexdigest(), "Approved test cleanup"))
+        FolderIMAP.messages = {1001: eml(deleted_pdf), 1002: eml(pdf("genuinely new invoice"))}
+        FolderIMAP.dates = {uid: date(2026, 11, 1) for uid in FolderIMAP.messages}
+        class November(ImportTestDate):
+            @classmethod
+            def today(cls):
+                return cls(2026, 11, 14)
+        date_patch = patch("folder_mail.date", November)
+        date_patch.start()
+        self.addCleanup(date_patch.stop)
+        recognize = Mock(side_effect=recognized)
+        result = import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognize)
+        self.assertEqual(result["excluded"], 1)
+        self.assertEqual(result["new_drafts"], 1)
+        self.assertEqual(recognize.call_count, 1)
+        self.assertEqual(len(self.store.documents()), 1)
+        markers = list(self.store.conn.execute("SELECT * FROM mail_messages ORDER BY uid"))
+        FolderIMAP.commands = []
+        result = import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognize)
+        self.assertEqual(result["skipped"], 2)
+        self.assertFalse(any(command[0] == "FETCH" for command in FolderIMAP.commands))
+        self.assertEqual(list(self.store.conn.execute("SELECT * FROM mail_messages ORDER BY uid")), markers)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_excluded_pdfs").fetchone()[0], 1)
+
     def test_invalid_period_never_connects(self):
         from unittest.mock import Mock
         factory = Mock(side_effect=AssertionError("No IMAP"))

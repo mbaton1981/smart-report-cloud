@@ -30,6 +30,8 @@ class IncomingStore(OfflineReviewStore):
             self.conn.execute("""CREATE TABLE IF NOT EXISTS mail_messages(
                 folder TEXT NOT NULL, epoch TEXT NOT NULL, uid INTEGER NOT NULL,
                 sha256 TEXT NOT NULL, PRIMARY KEY(folder,epoch,uid))""")
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS mail_excluded_pdfs(
+                sha256 TEXT PRIMARY KEY, reason TEXT NOT NULL)""")
             self.conn.execute("""CREATE TABLE IF NOT EXISTS document_actions(
                 document_id INTEGER NOT NULL REFERENCES documents,
                 revision INTEGER NOT NULL, action TEXT NOT NULL
