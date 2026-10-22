@@ -19,7 +19,119 @@ def _require_local_server():
     return url
 
 
+def verify_approved_update(app_module, work_dir, out_path):
+    """Inspect an existing approved profile without startup migrations or network."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QMessageBox
+    from PyQt6.QtCore import QDate
+    from folder_mail import IMPORT_START_DATE, import_folder, open_import_dialog, FolderError
+    from incoming_documents import open_incoming
+    database = Path(app_module.DB_FILE).resolve()
+    profile = database.parent
+    configuration = json.loads((profile / "working_profile.json").read_text(encoding="utf-8-sig"))
+    if not configuration.get("approved_transition") or not database.is_file():
+        raise RuntimeError("An existing approved profile is required.")
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    application = QApplication.instance() or QApplication([])
+    application.setStyleSheet(app_module.DARK_THEME_QSS)
+
+    def connection():
+        conn = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+
+    def state():
+        with closing(connection()) as conn:
+            return {
+                name: sorted(map(tuple, conn.execute('SELECT * FROM "' + name.replace('"', '""') + '"')),
+                             key=repr)
+                for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+
+    before = state()
+    result = {"database": str(database), "frozen": bool(getattr(sys, "frozen", False)),
+              "network_requests": 0, "import_start": IMPORT_START_DATE.isoformat()}
+    with patch("requests.sessions.Session.request", side_effect=RuntimeError("Read-only verification: network forbidden")), \
+            patch.object(app_module, "get_db_connection", connection), \
+            patch.object(app_module, "REPORTS_DIR", str(work)), \
+            patch.object(app_module.os, "startfile", create=True), \
+            patch.object(QMessageBox, "information") as information, \
+            patch.object(QMessageBox, "critical", side_effect=RuntimeError("PDF export failed")):
+        window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+        QMainWindow.__init__(window)
+        window.tab_invoice = QWidget()
+        window.setCentralWidget(window.tab_invoice)
+        window.setStyleSheet(app_module.DARK_THEME_QSS)
+        window.resize(1450, 1100)
+        window.setup_invoice_tab()
+        window.inv_comp_cb.setCurrentText("Renatur")
+        for field in (window.inv_date_from, window.inv_date_to):
+            field.setDate(QDate(2026, 10, 21))
+        for identifier, name in ((39, "tomteboda"), (84, "hotel")):
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identifier))
+            report = window.generate_invoice()
+            if report is None:
+                raise RuntimeError("Existing Andrii report could not be generated")
+            result[name] = {"totals": report["totals"], "payroll": report["payroll"]}
+            window.export_invoice_to_pdf()
+            window.show()
+            application.processEvents()
+            window.grab().save(str(work / (name + "-installed.png")))
+        window.close()
+        if result["tomteboda"]["totals"]["hours"] != 4 or result["hotel"]["totals"]["hours"] != 8:
+            raise RuntimeError("Actual report hours differ from approved scenario")
+        host = QWidget()
+        host._expense_objects = []
+        host.incoming_delivery_pending = lambda _cid: None
+        host.incoming_register_snapshot = lambda: []
+        host.refresh_incoming_capabilities = lambda: None
+        host._schedule_expense_read = lambda _key: None
+        incoming_root = desktop_auth.app_data_dir() / "incoming-documents"
+        existing = list(incoming_root.glob("*/review.sqlite3"))
+        if len(existing) != 1:
+            raise RuntimeError("Expected one existing incoming queue")
+        with closing(sqlite3.connect(existing[0].as_uri() + "?mode=ro", uri=True)) as conn:
+            result["remaining_documents"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            result["retained_mail_messages"] = conn.execute("SELECT COUNT(*) FROM mail_messages").fetchone()[0]
+            result["excluded_pdf_hashes"] = conn.execute("SELECT COUNT(*) FROM mail_excluded_pdfs").fetchone()[0]
+        if result["remaining_documents"] != 0 or result["excluded_pdf_hashes"] != 632:
+            raise RuntimeError("Incoming cleanup or exact PDF exclusions differ")
+        # Opening the already-updated queue is allowed; the main database stays query_only.
+        incoming = open_incoming(host, existing[0].parent)
+        try:
+            incoming.show()
+            application.processEvents()
+            incoming.grab().save(str(work / "incoming-installed.png"))
+            if app_module.datetime.now().date() < IMPORT_START_DATE:
+                try:
+                    import_folder(incoming.store, "unused-before-approved-start")
+                except FolderError as error:
+                    if str(error) != "import_not_started":
+                        raise
+                else:
+                    raise RuntimeError("Pre-start mail import was not blocked")
+                open_import_dialog(incoming)
+                if "01.11.2026" not in information.call_args.args[2]:
+                    raise RuntimeError("Missing visible import-start notice")
+                result["pre_start_import_blocked"] = True
+        finally:
+            incoming.close()
+    if state() != before:
+        raise RuntimeError("Read-only acceptance changed protected database contents")
+    result["main_database_unchanged"] = True
+    result["balance_rows"] = len(before["balance"])
+    if out_path:
+        Path(out_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "approved-update-readonly":
+        return verify_approved_update(app_module, work_dir, out_path)
     url = _require_local_server()
     import requests
     work = Path(work_dir)
