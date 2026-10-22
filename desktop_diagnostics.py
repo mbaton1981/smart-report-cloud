@@ -64,10 +64,13 @@ def verify_approved_update(app_module, work_dir, out_path):
         window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
         QMainWindow.__init__(window)
         window.tab_invoice = QWidget()
+        window.tab_dagbok = QWidget()
         window.setCentralWidget(window.tab_invoice)
         window.setStyleSheet(app_module.DARK_THEME_QSS)
         window.resize(1450, 1100)
         window.setup_invoice_tab()
+        window.setup_dagbok_tab()
+        window.setup_reporting_pages()
         window.inv_comp_cb.setCurrentText("Renatur")
         for field in (window.inv_date_from, window.inv_date_to):
             field.setDate(QDate(2026, 10, 21))
@@ -210,9 +213,182 @@ def verify_excluded_pdf_replay(store, originals):
             "real_mail_connections": 0, "disk_database_created": False}
 
 
+def verify_reports_ui_readonly(app_module, work_dir, out_path):
+    """Click the real report controls in the visible installed application."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtCore import QDate, QTimer, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
+    from pypdf import PdfReader
+
+    database = Path(app_module.DB_FILE).resolve(strict=True)
+    configuration = json.loads((database.parent / "working_profile.json").read_text(encoding="utf-8-sig"))
+    if configuration.get("approved_transition") is not True:
+        raise RuntimeError("Expected the approved existing profile")
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+
+    def connection():
+        conn = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+
+    def state():
+        with closing(connection()) as conn:
+            return {
+                name: sorted(map(tuple, conn.execute('SELECT * FROM "' + name.replace('"', '""') + '"')),
+                             key=repr)
+                for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+
+    before = state()
+    application = QApplication.instance() or QApplication([])
+    application.setStyleSheet(app_module.DARK_THEME_QSS)
+    failures = []
+    messages = []
+    result = {
+        "database": str(database), "executable": sys.executable,
+        "frozen": bool(getattr(sys, "frozen", False)), "visible_ui": True,
+        "real_network_requests": 0, "new_disk_databases": 0,
+    }
+    resource = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    manifest = resource / "release-manifest.json"
+    if manifest.exists():
+        result["build"] = json.loads(manifest.read_text(encoding="utf-8-sig"))
+
+    def exception_hook(kind, error, traceback):
+        failures.append(f"{kind.__name__}: {error}")
+
+    def dismiss_information():
+        modal = application.activeModalWidget()
+        if isinstance(modal, QMessageBox):
+            messages.append({"title": modal.windowTitle(), "text": modal.text()})
+            if modal.icon() != QMessageBox.Icon.Information:
+                failures.append(modal.text())
+            modal.accept()
+
+    def click(widget):
+        if not widget.isVisible() or not widget.isEnabled():
+            raise RuntimeError("Report control is not visible and enabled")
+        QTest.mouseClick(widget, Qt.MouseButton.LeftButton)
+        QTest.qWait(150)
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+    def button(label):
+        return next(widget for widget in window.tab_invoice.findChildren(QPushButton)
+                    if label in widget.text())
+
+    def capture(name):
+        window.grab().save(str(work / (name + ".png")))
+        screen = application.primaryScreen()
+        if screen is not None:
+            screen.grabWindow(0).save(str(work / (name + "-desktop.png")))
+
+    with patch("requests.sessions.Session.request", side_effect=RuntimeError("UI acceptance: network forbidden")), \
+            patch.object(app_module, "get_db_connection", connection), \
+            patch.object(app_module, "init_db_once"), \
+            patch.object(app_module, "REPORTS_DIR", str(work)), \
+            patch.object(app_module.os, "startfile", create=True), \
+            patch.object(sys, "excepthook", exception_hook):
+        window = app_module.SmartReportApp()
+        window.auto_sync_timer.stop()
+        window.setWindowTitle(window.windowTitle() + " — проверка только чтения")
+        window.statusBar().showMessage("Проверка установленного интерфейса: база только для чтения; сеть запрещена.")
+        window.showMaximized()
+        window.raise_()
+        window.activateWindow()
+        dismissal = QTimer(window)
+        dismissal.timeout.connect(dismiss_information)
+        dismissal.start(100)
+
+        def exercise():
+            try:
+                bar = window.tabs.tabBar()
+                QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(4).center())
+                QTest.qWait(200)
+                if window.tabs.currentWidget().widget() is not window.tab_invoice:
+                    raise RuntimeError("The unified top-level tab did not open")
+                if window.report_pages.count() != 2:
+                    raise RuntimeError("Missing shared journal page")
+                window.inv_comp_cb.setCurrentText("Renatur")
+                for field in (window.inv_date_from, window.inv_date_to):
+                    field.setDate(QDate(2026, 10, 21))
+                for identifier, label, hours, known, final in (
+                    (39, "tomteboda", 4, 2530, None),
+                    (84, "hotel", 8, 4610, 4610),
+                ):
+                    window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identifier))
+                    click(button("Просмотр сводки"))
+                    report = window._invoice_report
+                    if (report["totals"]["hours"] != hours
+                            or report["totals"]["known_subtotal"] != known
+                            or report["totals"]["invoice_total"] != final
+                            or report["recorded_trips"] != 1):
+                        raise RuntimeError("Existing real report differs: " + label)
+                    if window.table_dagbok.rowCount() != len(report["journal_rows"]):
+                        raise RuntimeError("Journal rows differ from shared report")
+                    capture(label + "-summary")
+                    window.invoice_summary_table.scrollToBottom()
+                    QTest.qWait(100)
+                    capture(label + "-totals")
+                    click(button("Сформировать общий PDF"))
+                    pdf = next(work.glob("Fakturaunderlag_*" + report["object"] + "*.pdf"))
+                    reader = PdfReader(pdf)
+                    first = reader.pages[0].extract_text()
+                    journal = "\n".join(page.extract_text() for page in reader.pages[1:])
+                    if ("Fakturaunderlag" not in first or "Arbetsjournal" not in journal
+                            or "SEK" in journal or "Löneunderlag" in first + journal
+                            or "1 229" in first + journal):
+                        raise RuntimeError("Combined PDF sections are invalid")
+                    if final is None and ("Preliminärt totalbelopp" not in first or "utan ej fastställda" not in first):
+                        raise RuntimeError("Missing explicit preliminary total")
+                    inner = window.report_pages.tabBar()
+                    QTest.mouseClick(inner, Qt.MouseButton.LeftButton, pos=inner.tabRect(1).center())
+                    QTest.qWait(100)
+                    capture(label + "-journal")
+                    click(button("PDF только журнала"))
+                    journal_pdf = next(work.glob("Arbetsjournal_*" + report["object"] + "*.pdf"))
+                    if "Fakturaunderlag" in PdfReader(journal_pdf).pages[0].extract_text():
+                        raise RuntimeError("Journal-only export includes customer costing")
+                    result[label] = {
+                        "hours": hours, "totals": report["totals"],
+                        "cost_lines": report["cost_lines"], "recorded_trips": report["recorded_trips"],
+                        "pdf": str(pdf), "pages": len(reader.pages),
+                        "journal_rows": len(report["journal_rows"]),
+                    }
+                    QTest.mouseClick(inner, Qt.MouseButton.LeftButton, pos=inner.tabRect(0).center())
+                if failures:
+                    raise RuntimeError("; ".join(failures))
+            except Exception as error:
+                failures.append(f"{type(error).__name__}: {error}")
+            finally:
+                window.close()
+                application.quit()
+
+        QTimer.singleShot(400, exercise)
+        application.exec()
+    if state() != before:
+        raise RuntimeError("UI acceptance changed protected database contents")
+    if failures:
+        raise RuntimeError("; ".join(failures))
+    result["main_database_unchanged"] = True
+    result["balance_rows"] = len(before["balance"])
+    result["button_clicks_verified"] = True
+    result["export_messages"] = len(messages)
+    if out_path:
+        Path(out_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
     if action == "approved-update-readonly":
         return verify_approved_update(app_module, work_dir, out_path)
+    if action == "reports-ui-readonly":
+        return verify_reports_ui_readonly(app_module, work_dir, out_path)
     url = _require_local_server()
     import requests
     work = Path(work_dir)
