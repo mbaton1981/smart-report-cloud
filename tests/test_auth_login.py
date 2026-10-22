@@ -447,6 +447,53 @@ class AuthLoginTests(unittest.TestCase):
         finally:
             copy.close()
 
+    def test_backup_client_downloads_original_over_http_with_matching_dataset(self):
+        from contextlib import closing
+        import hashlib
+        from threading import Thread
+        from werkzeug.serving import make_server
+        import server_backup
+
+        root = Path(self._case.name) / "originals"
+        root.mkdir()
+        original = b"%PDF isolated backup integration fixture"
+        (root / "stored.pdf").write_bytes(original)
+        with closing(sqlite3.connect(self.server.DB_FILE)) as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS sync_dataset(id INTEGER PRIMARY KEY, dataset_id TEXT);
+                INSERT OR REPLACE INTO sync_dataset VALUES(1,'backup-integration');
+                INSERT INTO expense_documents(id,client_id,created_at,updated_at)
+                    VALUES(1,'backup-integration-document','x','x');
+            """)
+            connection.execute("""
+                INSERT INTO expense_document_attachments
+                    (document_id,original_name,stored_name,file_sha256,created_at)
+                VALUES(1,'invoice.pdf','stored.pdf',?,'x')
+            """, (hashlib.sha256(original).hexdigest(),))
+            connection.commit()
+        token = self._token()
+        http_server = make_server("127.0.0.1", 0, self.server.app)
+        thread = Thread(target=http_server.serve_forever)
+        with patch.dict(os.environ, {"SMARTREPORT_DOCUMENTS_DIR": str(root)}):
+            thread.start()
+            try:
+                target, manifest = server_backup.pull_backup(
+                    f"http://127.0.0.1:{http_server.server_port}", token,
+                    Path(self._case.name) / "backup", expected_dataset="backup-integration",
+                )
+                self.assertEqual(manifest["status"], "complete")
+                self.assertEqual(manifest["problems"], [])
+                self.assertEqual(len(manifest["files"]), 1)
+                self.assertEqual((target / "documents" / manifest["files"][0]["file"]).read_bytes(), original)
+                with closing(sqlite3.connect(target / "server_snapshot.db")) as snapshot:
+                    self.assertEqual(snapshot.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                    self.assertEqual(snapshot.execute("SELECT COUNT(*) FROM expense_document_attachments").fetchone()[0], 1)
+            finally:
+                http_server.shutdown()
+                thread.join(timeout=5)
+                http_server.server_close()
+                self.assertFalse(thread.is_alive())
+
     def test_login_dialog_rejects_bad_input_shows_server_error_and_returns_token(self):
         import desktop_login
         auth = self.desktop_auth
@@ -495,6 +542,56 @@ class AuthLoginTests(unittest.TestCase):
                 self.assertEqual(auth.server_url(), "https://saved.example")
             with patch.dict(os.environ, {"SMARTREPORT_CLOUD_URL": "http://127.0.0.1:5999"}):
                 self.assertEqual(auth.server_url(), "http://127.0.0.1:5999")
+
+    def test_unset_employee_pin_cannot_be_claimed_at_login_and_admin_can_provision(self):
+        from werkzeug.security import check_password_hash
+        connection = sqlite3.connect(self.server.DB_FILE)
+        cursor = connection.execute(
+            "INSERT INTO meta_employees(name,salary_rate,is_active) VALUES ('Unprovisioned audit employee',200,1)"
+        )
+        employee_id = cursor.lastrowid
+        cursor = connection.execute("""
+            INSERT INTO users(username,password_hash,role,employee_id,is_active,created_at)
+            VALUES('Unprovisioned audit employee',NULL,'user',?,1,'isolated')
+        """, (employee_id,))
+        user_id = cursor.lastrowid
+        connection.commit()
+        before = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        connection.close()
+        for _ in range(2):
+            response = self.client.post("/login", json={
+                "username": "Unprovisioned audit employee", "password": "self-chosen-test-pin",
+            })
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.get_json()["code"], "pin_not_provisioned")
+            self.assertIn("администратор", response.get_json()["error"].lower())
+        self.assertEqual(self._query("SELECT * FROM users WHERE id=?", (user_id,))[0], before)
+        connection = sqlite3.connect(self.server.DB_FILE)
+        connection.execute("UPDATE users SET password_hash='' WHERE id=?", (user_id,))
+        connection.commit()
+        connection.close()
+        response = self.client.post("/login", json={
+            "username": "Unprovisioned audit employee", "password": "self-chosen-test-pin",
+        })
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "pin_not_provisioned")
+        self.assertEqual(self._query("SELECT password_hash FROM users WHERE id=?", (user_id,))[0][0], "")
+        self.assertEqual(self.client.get("/me").status_code, 401)
+        self.assertEqual(self.client.post("/admin/set-user-pin", json={
+            "username": "Unprovisioned audit employee", "pin": "admin-issued-test-pin",
+        }).status_code, 403)
+        provisioned = self.client.post("/admin/set-user-pin", headers=self._bearer(self._token()), json={
+            "username": "Unprovisioned audit employee", "pin": "admin-issued-test-pin",
+        })
+        self.assertEqual(provisioned.status_code, 200)
+        stored = self._query("SELECT password_hash FROM users WHERE id=?", (user_id,))[0][0]
+        self.assertTrue(check_password_hash(stored, "admin-issued-test-pin"))
+        response = self.client.post("/login", json={
+            "username": "Unprovisioned audit employee", "password": "admin-issued-test-pin",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.get("/me").get_json()["user"]["employee_id"], employee_id)
+        self.assertEqual(self._query("SELECT password_hash FROM users WHERE id=?", (user_id,))[0][0], stored)
 
 
 if __name__ == "__main__":

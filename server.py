@@ -2517,12 +2517,13 @@ def login():
         return jsonify({"ok": False, "error": "Пользователь не найден в системе"}), 401
 
     elif not user['password_hash']:
-        hashed_pw = generate_password_hash(password)
-        cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed_pw, user['id']))
-        conn.commit()
-        
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user['id'],))
-        user = cursor.fetchone()
+        conn.close()
+        return jsonify({
+            "ok": False,
+            "code": "pin_not_provisioned",
+            "error": "ПИН ещё не назначен. Обратитесь к администратору: "
+                     "первый ПИН задаётся в справочнике сотрудников.",
+        }), 403
 
     elif not check_password_hash(user['password_hash'], password):
         conn.close()

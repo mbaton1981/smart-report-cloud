@@ -59,7 +59,14 @@ from desktop_ui import ReportTable as QTableWidget
 
 import desktop_auth
 
-desktop_auth.use_data_dir_as_working_directory()
+try:
+    desktop_auth.use_data_dir_as_working_directory()
+except desktop_auth.AuthError as error:
+    if not getattr(sys, "frozen", False):
+        raise
+    application = QApplication.instance() or QApplication(sys.argv)
+    QMessageBox.critical(None, "SmartReport — рабочий профиль", str(error))
+    sys.exit(1)
 
 # Локальная база данных SQLite и папки
 DB_FILE = os.environ.get("SMARTREPORT_DB_FILE", "smart_report.db")
@@ -10407,9 +10414,14 @@ if __name__ == "__main__":
             import server_backup
             token = desktop_auth.load_saved_token()
             folder = sys.argv[sys.argv.index("--backup") + 1]
-            target, manifest = server_backup.pull_backup(desktop_auth.server_url(), token, folder)
-            print(f"Копия сохранена: {target}; файлов: {len(manifest['files'])}; проблем: {len(manifest['problems'])}")
-            sys.exit(1 if manifest["problems"] else 0)
+            from sync_dataset import file_dataset
+            target, manifest = server_backup.pull_backup(
+                desktop_auth.server_url(), token, folder, expected_dataset=file_dataset(DB_FILE),
+            )
+            complete = manifest["status"] == "complete"
+            caption = "Копия проверена" if complete else "Копия НЕ завершена"
+            print(f"{caption}: {target}; файлов: {len(manifest['files'])}; проблем: {len(manifest['problems'])}")
+            sys.exit(0 if complete else 1)
         if "--diagnostic" in sys.argv:
             import argparse
             import desktop_diagnostics

@@ -104,8 +104,11 @@ def use_data_dir_as_working_directory():
             os.chdir(data)
             return True
     if getattr(sys, "frozen", False) and not os.environ.get("SMARTREPORT_DB_FILE"):
-        os.chdir(app_data_dir())
-        return True
+        raise AuthError(
+            "Рабочий профиль не указан. Запустите SmartReport через установленный ярлык "
+            "согласованного профиля (launch_existing_profile.ps1). "
+            "Прямой запуск EXE не открывает другую базу и не создаёт новую."
+        )
     return False
 
 

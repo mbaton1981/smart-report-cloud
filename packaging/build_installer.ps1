@@ -1,7 +1,7 @@
 # Сборка установщика: .\packaging\build_installer.ps1 [-Version 1.0.0]
 # Требуется сборочное окружение (venv с PyInstaller) и Inno Setup 6; пути можно задать параметрами.
 param(
-    [string]$Version = "1.0.22-rc1",
+    [string]$Version = "1.0.23-rc1",
     [string]$BuildPython = "$env:LOCALAPPDATA\SmartReport\build\venv\Scripts\python.exe",
     [string]$Iscc = "$env:LOCALAPPDATA\SmartReport\build\InnoSetup6\ISCC.exe",
     [string]$OutputRoot = "$env:LOCALAPPDATA\SmartReport\build\out"
