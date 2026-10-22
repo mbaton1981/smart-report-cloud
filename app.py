@@ -37,6 +37,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -1638,25 +1639,37 @@ def parse_float(val_str, default=0.0):
     except ValueError:
         return default
 
-def translate_to_swedish(text):
+def translate_to_swedish(text, *, allow_network=True):
     if not text or not str(text).strip():
         return ""
     
     raw_text = str(text).strip()
     
-    try:
-        url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(raw_text)}&langpair=ru|sv"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if data and "responseData" in data and data["responseData"].get("translatedText"):
-                translated = data["responseData"]["translatedText"]
-                if "MYMEMORY WARNING" not in translated:
-                    return translated
-    except Exception:
-        pass
+    if allow_network:
+        try:
+            url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(raw_text)}&langpair=ru|sv"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data and "responseData" in data and data["responseData"].get("translatedText"):
+                    translated = data["responseData"]["translatedText"]
+                    if "MYMEMORY WARNING" not in translated:
+                        return translated
+        except Exception:
+            pass
     
     t = raw_text.lower()
+    if not allow_network:
+        for original, translated in (
+            ("коробов вентиляции", "ventilationskanaler"),
+            ("кухонных витяжок", "köksfläktar"),
+            ("кухонных вытяжек", "köksfläktar"),
+            ("водяных труб", "vattenrör"),
+            ("демонтаж", "demontering av"),
+        ):
+            t = t.replace(original, translated)
+        import re
+        t = re.sub(r"([,;:])", r" \1 ", t)
     replacements = {
         "гипсокартон": "gips", "гипсу": "gips", "картон": "kartong",
         "вентиляц": "ventilation", "электрик": "elarbete", "проводк": "eldragning",
@@ -1666,7 +1679,7 @@ def translate_to_swedish(text):
         "изоляц": "isolering", "установк": "installation", "шпаклев": "spackling",
         "шпатлев": "spackling", "уборк": "städning", "убирал": "städade",
         "ремонт": "renovering", "стен": "väggar", "потолк": "tak",
-        "пол": "golv", "окн": "fönster", "двер": "dörrar", "плитк": "kakel",
+        "пол": "golv", "окн": "fönster", "окон": "fönster", "двер": "dörrar", "плитк": "kakel",
         "замен": "byte", "стяжк": "avjämningsmassa", "работ": "arbeten",
         "мусор": "avfall", "доставк": "leverans"
     }
@@ -1674,6 +1687,9 @@ def translate_to_swedish(text):
     translated_words = []
     for word in words:
         clean_w = word.strip(".,;:!?()[]{}\"'")
+        if not allow_network and clean_w == "и":
+            translated_words.append("och")
+            continue
         matched = False
         for ru_root, se_word in replacements.items():
             if ru_root in clean_w:
@@ -1685,7 +1701,10 @@ def translate_to_swedish(text):
                 break
         if not matched:
             translated_words.append(word)
-    return " ".join(translated_words)
+    result = " ".join(translated_words)
+    if not allow_network:
+        result = result.replace(" ,", ",").replace(" ;", ";").replace(" :", ":")
+    return result
 
 try:
     windows_font_path = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts', 'arial.ttf')
@@ -2189,8 +2208,7 @@ class SmartReportApp(QMainWindow):
         self.tabs.addTab(self.tab_salary, "💰 Зарплата")
         self.tabs.addTab(self.tab_balance, "⚖️ Баланс")
         self.tabs.addTab(self.tab_expenses, "Расходы")
-        self.tabs.addTab(self.tab_invoice, "📄 Счёт для бухгалтера")
-        self.tabs.addTab(self.tab_dagbok, "📖 Журнал работ")
+        self.tabs.addTab(self.tab_invoice, "📄 Отчёты и фактурирование")
         self.tabs.addTab(self.tab_sprav, "📚 Справочники")
 
         self.setup_hours_tab()
@@ -2200,6 +2218,7 @@ class SmartReportApp(QMainWindow):
         self.setup_object_expenses_tab()
         self.setup_invoice_tab()
         self.setup_dagbok_tab()
+        self.setup_reporting_pages()
         self.setup_sprav_tab()
         
         self.load_dropdowns()
@@ -2233,7 +2252,7 @@ class SmartReportApp(QMainWindow):
             self.load_expense_documents()
             if self.exp_document_tabs.currentIndex() == 1:
                 self.load_object_expense_overview()
-        elif index == 6:
+        elif index == 5:
             self.load_companies_table()
             self.load_objects_table()
             self.load_employees_table()
@@ -8037,10 +8056,10 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow(fast_pris_box)
 
         btn_layout = QHBoxLayout()
-        gen_btn = QPushButton("📊 Сформировать отчёт для счёта")
+        gen_btn = QPushButton("📊 Просмотр сводки и журнала")
         gen_btn.clicked.connect(self.generate_invoice)
         
-        export_pdf_inv_btn = QPushButton("📄 Экспорт отчета в PDF (SV)")
+        export_pdf_inv_btn = QPushButton("📄 Сформировать общий PDF (SV)")
         export_pdf_inv_btn.setStyleSheet("background-color: #2b6cb0; border-color: #4299e1;")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
         
@@ -8060,25 +8079,24 @@ class SmartReportApp(QMainWindow):
 
         layout.addWidget(card)
         layout.addWidget(QLabel(
-            "<b>Стоимость для заказчика по объекту (не зарплата сотрудника):</b>"
+            "<b>Сводка отработанных часов за период (OB входит в общие часы):</b>"
         ))
         
         self.table_invoice = QTableWidget()
-        self.table_invoice.setColumnCount(10)
+        self.table_invoice.setColumnCount(6)
         self.table_invoice.setHorizontalHeaderLabels([
-            "Сотрудник", "Arbetade h", "Pris/h", "Arbete (SEK)", "Resa (SEK)",
-            "Totalt (SEK)", "OB1 h", "OB2 h", "Övrig OB (h)", "Статус",
+            "Сотрудник", "Всего часов", "Из них OB1", "Из них OB2", "Другие OB", "Статус",
         ])
         invoice_header = self.table_invoice.horizontalHeader()
         invoice_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in {
-            0: 145, 1: 85, 2: 75, 3: 100, 4: 85,
-            5: 95, 6: 65, 7: 65, 9: 100,
+            0: 180, 1: 100, 2: 100, 3: 100, 5: 120,
         }.items():
             self.table_invoice.setColumnWidth(column, width)
-        invoice_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        invoice_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table_invoice.setWordWrap(True)
         self.table_invoice.setAlternatingRowColors(True)
+        self.table_invoice.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table_invoice)
 
         self.invoice_summary_table = QTableWidget(8, 2)
@@ -8118,6 +8136,18 @@ class SmartReportApp(QMainWindow):
             self.inv_obj_cb.setCurrentIndex(-1)
         self.inv_obj_cb.blockSignals(blocked)
 
+    def setup_reporting_pages(self):
+        layout = self.tab_invoice.layout()
+        summary = QWidget()
+        summary_layout = QVBoxLayout(summary)
+        while layout.count() > 1:
+            item = layout.takeAt(1)
+            summary_layout.addWidget(item.widget())
+        self.report_pages = QTabWidget()
+        self.report_pages.addTab(summary, "Сводка и стоимость")
+        self.report_pages.addTab(self.tab_dagbok, "Журнал работ")
+        layout.addWidget(self.report_pages)
+
     def collect_invoice_report(self):
         d_from = self.inv_date_from.text().strip()
         d_to = self.inv_date_to.text().strip()
@@ -8131,6 +8161,8 @@ class SmartReportApp(QMainWindow):
             raise ValueError("Начало периода должно быть не позже окончания.")
         conn = get_db_connection()
         try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
             cursor = conn.cursor()
             obj_row = cursor.execute(
                 "SELECT * FROM objects WHERE id = ? AND company = ?", (object_id, comp)
@@ -8141,6 +8173,16 @@ class SmartReportApp(QMainWindow):
             object_names = invoice_object_names(cursor, obj_row)
             object_placeholders = ','.join('?' for _name in object_names)
             has_ob_schema = invoice_ob_schema_present(cursor)
+            journal_rows = [dict(row) for row in cursor.execute(f"""
+                SELECT * FROM shifts
+                WHERE company = ? AND object_name IN ({object_placeholders})
+                    AND date >= ? AND date <= ?
+                ORDER BY date, employee, id
+            """, (comp, *object_names, d_from, d_to)).fetchall()]
+            journal_segments = {
+                row["sync_id"]: [dict(segment) for segment in get_ob_segments(cursor, row["sync_id"])]
+                for row in journal_rows if has_ob_schema and row["entry_type"] == RECORD_TYPE_OB
+            }
             payroll = collect_invoice_payroll(cursor, comp, object_names, d_from, d_to, has_ob_schema)
             ob_category_hours, ob_premium_hours = (
                 _collect_invoice_ob_hours(cursor, comp, object_names, d_from, d_to)
@@ -8212,6 +8254,8 @@ class SmartReportApp(QMainWindow):
                 'fast_pris_amount': fast_pris_amount,
                 'warnings': warnings,
                 'payroll': payroll,
+                'journal_rows': journal_rows,
+                'journal_segments': journal_segments,
             }
         finally:
             conn.close()
@@ -8312,6 +8356,26 @@ class SmartReportApp(QMainWindow):
         report["warnings"] = list(dict.fromkeys(warnings))
         report["prepared_rows"] = prepared_rows
         report["totals"] = totals
+        if "journal_rows" in report:
+            prepare_customer_costs(report)
+            for row in prepared_rows:
+                employee_shifts = [
+                    shift for shift in report["journal_rows"]
+                    if shift["employee"] == row["employee"] and shift["entry_type"] in ("work", "ob")
+                ]
+                rates = [
+                    positive_rate(shift["rate"] if shift["entry_type"] == "work"
+                                  else shift.get("work_rate_cache")) or positive_rate(report["rate"])
+                    for shift in employee_shifts
+                ]
+                amounts = [money(shift["hours"], rate) for shift, rate in zip(employee_shifts, rates)]
+                row["rate"] = rates[0] if rates and all(rate == rates[0] for rate in rates) else None
+                row["work_amount"] = (
+                    0.0 if report["is_fast_pris"] else
+                    sum(amounts) if all(value is not None for value in amounts) else None
+                )
+                components = (row["work_amount"], row["transport_amount"], row["ob_amount"])
+                row["row_total"] = sum(components) if all(value is not None for value in components) else None
         return report
 
     @classmethod
@@ -8322,8 +8386,8 @@ class SmartReportApp(QMainWindow):
         ob1_hours = totals["ob_categories"].get("weekday_early_evening", 0.0) if split_known else None
         ob2_hours = totals["ob_categories"].get("weekday_late_evening_night", 0.0) if split_known else None
         items = [
-            ("Начисления сотруднику / Löneunderlag — отдельно от счёта заказчику", ""),
-            ("Arbetade timmar totalt", f"{totals['hours']:.1f} tim"),
+            ("Fakturaunderlag — timmar", ""),
+            ("Arbetade timmar totalt", cls._invoice_value(totals["hours"], ".1f", " tim")),
             ("Varav utan OB", cls._invoice_value(totals["without_ob_hours"], ".1f", " tim")),
             (
                 f"Varav {cls._invoice_ob_rule_short_caption('OB1', rule_descriptions.get('OB1', ''))}",
@@ -8338,64 +8402,36 @@ class SmartReportApp(QMainWindow):
             if category in {"weekday_early_evening", "weekday_late_evening_night"}:
                 continue
             label = INVOICE_OB_CATEGORY_LABELS.get(category, category)
-            items.append((f"Varav {label}", f"{totals['ob_categories'][category]:.1f} tim"))
-        for employee, payroll in report.get("payroll", {}).items():
-            items.extend([
-                (f"{employee} — зарплатные ставки", "; ".join(payroll["rates"]) or "Ej fastställbart"),
-                (f"{employee} — базовое начисление", cls._invoice_value(payroll["base_amount"], ",.2f", " SEK")),
-                (f"{employee} — надбавка OB сотруднику", cls._invoice_value(payroll["ob_premium"], ",.2f", " SEK")),
-                (f"{employee} — начислено база + OB (без налогов и прочих начислений)",
-                 cls._invoice_value(payroll["total"], ",.2f", " SEK")),
-            ])
-        items.append(("Стоимость для заказчика / Kundfakturering — не зарплата", ""))
-        if not report["is_fast_pris"]:
-            prepared = report.get("prepared_rows", [])
-            items.append(("Timpris arbete", cls._invoice_value(
-                prepared[0]["rate"] if prepared else None, ",.2f", " kr/tim"
-            )))
-            items.append(("Antal resor", f"{sum(float(row[2] or 0) for row in report.get('rows', [])):g}"))
-            travel_rate = report.get("transport_rate")
-            if travel_rate is not None and (not math.isfinite(travel_rate) or travel_rate <= 0):
-                travel_rate = None
-            items.append(("Pris per resa", cls._invoice_value(travel_rate, ",.2f", " kr")))
-        items.extend([
-            ("Arbete", cls._invoice_value(totals["work_amount"], ",.2f", " kr")),
-            ("Resa", cls._invoice_value(totals["transport_amount"], ",.2f", " kr")),
-            ("OB-tillägg", cls._invoice_value(totals["ob_amount"], ",.2f", " kr")),
-            (
-                "PRELIMINÄR delsumma — utan ej fastställt OB-tillägg (INTE slutkostnad)"
-                if totals["invoice_total"] is None else "Delsumma arbete och resa (utan OB-tillägg)",
-                cls._invoice_value(totals["known_subtotal"], ",.2f", " kr"),
-            ),
-            ("Totalt att fakturera exkl. moms", cls._invoice_value(totals["invoice_total"], ",.2f", " kr")),
-        ])
+            items.append((f"Varav {label}", cls._invoice_value(totals["ob_categories"][category], ".1f", " tim")))
+        items.append(("Kundfakturering", ""))
+        for line in report.get("cost_lines", []):
+            items.append((
+                f"{line['label']} — {cls._invoice_value(line['quantity'], '.1f')} {line['unit']}"
+                f" × {cls._invoice_value(line['rate'])} SEK",
+                cls._invoice_value(line["amount"], ",.2f", " SEK"),
+            ))
+        items.append((
+            "Preliminärt totalbelopp" if totals["invoice_total"] is None else "Totalt belopp",
+            cls._invoice_value(totals["known_subtotal"], ",.2f", " SEK"),
+        ))
         return items
 
     @staticmethod
     def _invoice_value(value, spec=".2f", suffix=""):
+        if value is not None and spec == ".1f":
+            return format_quantity(value, ".") + suffix
         return "Ej fastställbart" if value is None else f"{value:{spec}}{suffix}"
 
     @staticmethod
     def _invoice_summary_note(report):
-        note = (
-            "OB-timmar ingår i arbetade timmar och läggs inte till utöver dessa. "
-            "Löneunderlag och kundfakturering är separata beräkningar och summeras inte. "
-            "Löneunderlaget visar sparad OB och nuvarande lönesats för vanliga arbetspass; "
-            "skatt, semesterersättning och övriga löneposter ingår inte."
-        )
+        note = "OB-timmar ingår i arbetade timmar och läggs inte till."
         if report["totals"]["invoice_total"] is None:
             note += (
-                " PRELIMINÄRT UNDERLAG: kundens OB-tillägg/slutbelopp kan inte fastställas. "
-                "Delsumman arbete och resa är UTAN OB-tillägg och är INTE ett slutbelopp, "
-                "inte heller en fullständig dagskostnad."
+                " PRELIMINÄRT: Endast kända belopp ingår, utan ej fastställda priser "
+                "eller OB-tillägg. Slutbeloppet kan inte fastställas."
             )
         if report["is_fast_pris"]:
-            note += " Fast pris ersätter Resa och OB i faktureringssumman."
-        if report.get("warnings"):
-            note += " VARNING: " + " ".join(report["warnings"])
-        for payroll in report.get("payroll", {}).values():
-            if payroll["warnings"]:
-                note += " " + " ".join(payroll["warnings"])
+            note += " Fast pris inkluderar resa och OB."
         return note
 
     def _render_invoice_summary(self, report):
@@ -8404,6 +8440,16 @@ class SmartReportApp(QMainWindow):
         for row_index, (label, value) in enumerate(items):
             self.invoice_summary_table.setItem(row_index, 0, QTableWidgetItem(label))
             self.invoice_summary_table.setItem(row_index, 1, QTableWidgetItem(value))
+            if label in ("Arbetade timmar totalt", "Totalt belopp", "Preliminärt totalbelopp") or label.startswith("Varav "):
+                for column in range(2):
+                    item = self.invoice_summary_table.item(row_index, column)
+                    strongest = label in ("Totalt belopp", "Preliminärt totalbelopp")
+                    item.setBackground(QColor("#c8ded4" if strongest else "#dbe7ef"))
+                    item.setForeground(QColor("#152a38"))
+                    font = item.font()
+                    font.setBold(True)
+                    font.setPointSize(12 if strongest else 11)
+                    item.setFont(font)
         self.invoice_summary_note.setText(self._invoice_summary_note(report))
         rule_descriptions = report.get("ob_rule_descriptions", {})
         self.invoice_ob_rules_lbl.setText(
@@ -8438,6 +8484,8 @@ class SmartReportApp(QMainWindow):
             report = self.collect_invoice_report()
         except ValueError as error:
             self.table_invoice.setRowCount(0)
+            if hasattr(self, "table_dagbok"):
+                self._render_dagbok_report({"journal_rows": [], "journal_segments": {}})
             empty_report = {
                 "is_fast_pris": False,
                 "totals": {
@@ -8450,6 +8498,7 @@ class SmartReportApp(QMainWindow):
                 "warnings": [str(error)],
             }
             self._render_invoice_summary(empty_report)
+            self.invoice_summary_note.setText(str(error))
             self._invoice_report = None
             QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return None
@@ -8461,9 +8510,8 @@ class SmartReportApp(QMainWindow):
                 for category, hours in sorted(row["other_ob_categories"].items())
             )
             row_values = [
-                row["employee"], f"{row['hours']:.1f}", self._invoice_value(row["rate"]),
-                self._invoice_value(row["work_amount"]), self._invoice_value(row["transport_amount"]),
-                self._invoice_value(row["row_total"]), self._invoice_value(row["ob1_hours"], ".1f"),
+                row["employee"], self._invoice_value(row["hours"], ".1f"),
+                self._invoice_value(row["ob1_hours"], ".1f"),
                 self._invoice_value(row["ob2_hours"], ".1f"), other_ob, row["status"],
             ]
             for col_idx, val in enumerate(row_values):
@@ -8473,138 +8521,57 @@ class SmartReportApp(QMainWindow):
                 self.table_invoice.setItem(row_idx, col_idx, it)
         self._render_invoice_summary(report)
         self._invoice_report = report
+        if hasattr(self, "table_dagbok"):
+            self._render_dagbok_report(report)
         return report
 
     def export_invoice_to_pdf(self):
+        self._export_customer_report_pdf()
+
+    def _export_customer_report_pdf(self, *, journal_only=False):
         report = self.generate_invoice()
         if report is None:
             return
-        d_from, d_to = report['date_from'], report['date_to']
-        comp, obj = report['company'], report['object']
-        rows = report['prepared_rows']
-        is_fast_pris = report['is_fast_pris']
-
-        if not rows and not is_fast_pris:
+        if not report["journal_rows"] and not report["is_fast_pris"]:
             QMessageBox.warning(
-                self, "Нет данных для счёта",
-                f"{comp} / {obj}: за {d_from} — {d_to} нет записей работы или OB. "
-                "Закрытые и незакрытые записи включены; АТФ и больничные в счёт не входят.",
+                self, "Отчёты и фактурирование",
+                f"{report['company']} / {report['object']}: за выбранный период нет записей. "
+                "Закрытые и незакрытые записи включены.",
             )
             return
-
-        if not os.path.exists(REPORTS_DIR):
-            os.makedirs(REPORTS_DIR)
-
-        base_filename = f"Fakturaunderlag_{comp.replace(' ', '_')}_{obj.replace(' ', '_')}_{d_from}_till_{d_to}.pdf"
-        filepath = os.path.join(REPORTS_DIR, base_filename)
-
         try:
-            doc = SimpleDocTemplate(filepath, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-            story = []
-            styles = getSampleStyleSheet()
-            
-            title_style = ParagraphStyle('TitleSV', parent=styles['Heading1'], fontName=DEFAULT_FONT_BOLD, fontSize=15, spaceAfter=4)
-            subtitle_style = ParagraphStyle('SubTitleSV', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=10, spaceAfter=14)
-
-            story.append(Paragraph("<b>Bygger och renoverar i Sthlm AB</b>", title_style))
-            if report["totals"]["invoice_total"] is None:
-                story.append(Paragraph("<b>PRELIMINÄRT UNDERLAG — inte slutlig kundkostnad</b>", subtitle_style))
-            story.append(Paragraph(f"<b>Fakturaunderlag (Underlag för faktura)</b><br/>Beställare (Firma): <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
-            story.append(Spacer(1, 5))
-
-            pdf_header_style = ParagraphStyle(
-                "InvoiceHeader", parent=styles['Normal'], fontName=DEFAULT_FONT_BOLD,
-                fontSize=7, leading=8, wordWrap='CJK', alignment=1,
+            filename = (
+                ("Arbetsjournal" if journal_only else "Fakturaunderlag")
+                + f"_{report['company']}_{report['object']}_{report['date_from']}_till_{report['date_to']}.pdf"
             )
-            table_data = [[
-                Paragraph(escape(label), pdf_header_style)
-                for label in (
-                    "Anställd", "Arbetade h", "Pris/h", "Arbete (SEK)",
-                    "Resa (SEK)", "Totalt (SEK)", "OB1 h", "OB2 h",
-                    "Övrig OB (h)", "Status",
-                )
-            ]]
-            value_style = ParagraphStyle(
-                "InvoiceValue", parent=styles['Normal'], fontName=DEFAULT_FONT,
-                fontSize=7, leading=9, splitLongWords=False,
+            filename = "".join("_" if character in '<>:"/\\|?*' else character for character in filename)
+            os.makedirs(REPORTS_DIR, exist_ok=True)
+            filepath = os.path.join(REPORTS_DIR, filename)
+            write_customer_pdf(
+                report, filepath, DEFAULT_FONT, DEFAULT_FONT_BOLD,
+                self._journal_description_swedish, journal_only=journal_only,
             )
-            for row in rows:
-                other_ob = ", ".join(
-                    f"{INVOICE_OB_CATEGORY_LABELS.get(category, category)} {hours:g}"
-                    for category, hours in sorted(row["other_ob_categories"].items())
-                )
-                employee_style = ParagraphStyle(
-                    f"InvoiceEmployee{len(table_data)}", parent=styles['Normal'],
-                    fontName=DEFAULT_FONT, fontSize=7, leading=9, wordWrap='CJK',
-                )
-                table_data.append([
-                    Paragraph(escape(str(row["employee"])), employee_style),
-                    f"{row['hours']:.1f}", Paragraph(self._invoice_value(row["rate"]), value_style),
-                    Paragraph(self._invoice_value(row["work_amount"]), value_style),
-                    Paragraph(self._invoice_value(row["transport_amount"]), value_style),
-                    Paragraph(self._invoice_value(row["row_total"]), value_style),
-                    self._invoice_value(row["ob1_hours"], ".1f"),
-                    self._invoice_value(row["ob2_hours"], ".1f"), Paragraph(escape(other_ob), employee_style),
-                    Paragraph(escape("Pågående" if row["status"] == "⏳ В работе" else row["status"]), employee_style),
-                ])
-
-            t = LongTable(
-                table_data,
-                colWidths=[78, 43, 45, 58, 48, 54, 40, 40, 76, 53],
-                repeatRows=1,
-                splitByRow=1,
-            )
-            t.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
-                ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),
-                ('FONTSIZE', (0, 0), (-1, -1), 7),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
-                ('TOPPADDING', (0, 0), (-1, 0), 6),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#f9f9f9'), colors.white]),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dddddd')),
-            ]))
-
-            story.append(t)
-            summary_style = ParagraphStyle(
-                "InvoiceSummary", parent=styles['Normal'], fontName=DEFAULT_FONT,
-                fontSize=8, leading=10, wordWrap='CJK',
-            )
-            summary_data = [
-                [Paragraph(escape(label), summary_style), Paragraph(escape(value), summary_style)]
-                for label, value in self._invoice_summary_items(report)
-            ]
-            summary_table = Table(summary_data, colWidths=[420, 115], hAlign='LEFT')
-            summary_table.setStyle(TableStyle([
-                ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cccccc')),
-                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f7f7f7')),
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (0, -1), (-1, -1), DEFAULT_FONT_BOLD),
-                ('TOPPADDING', (0, 0), (-1, -1), 4),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-            ]))
-            summary_note = self._invoice_summary_note(report)
-            story.append(Spacer(1, 10))
-            story.append(KeepTogether([
-                Paragraph("<b>Sammanfattning</b>", summary_style),
-                summary_table,
-                Paragraph(escape(summary_note), summary_style),
-                Paragraph(escape(self.invoice_ob_rules_lbl.text()), summary_style),
-            ]))
-            doc.build(story)
-            QMessageBox.information(self, "Успех", f"PDF-отчет для счета сохранен:\n{base_filename}")
-            
-            if sys.platform == 'win32':
+            QMessageBox.information(self, "Отчёты и фактурирование", f"PDF sparad:\n{filepath}")
+            if sys.platform == "win32":
                 os.startfile(filepath)
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', filepath])
             else:
-                subprocess.run(['xdg-open', filepath])
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF счета: {e}")
+                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(filepath)))
+        except Exception as error:
+            logging.exception("Customer report PDF export failed")
+            QMessageBox.critical(self, "Ошибка PDF", f"Не удалось создать PDF: {error}")
+
+    @staticmethod
+    def _journal_description_swedish(text):
+        import re
+        if not re.search(r"[\u0400-\u04ff]", text):
+            return text
+        translated = translate_to_swedish(text, allow_network=False)
+        if re.search(r"[\u0400-\u04ff]", translated):
+            raise ValueError(
+                "Arbetsbeskrivningen kunde inte översättas fullständigt till svenska. "
+                "Originaltexten är oförändrad; granska beskrivningen före export."
+            )
+        return translated
 
     def mark_period_as_invoiced(self):
         try:
@@ -8726,38 +8693,9 @@ class SmartReportApp(QMainWindow):
 
     def setup_dagbok_tab(self):
         layout = QVBoxLayout(self.tab_dagbok)
-        card = QFrame()
-        card.setObjectName("card")
-        card_layout = QFormLayout(card)
-        card_layout.setSpacing(8)
-
-        self.dag_date_from = create_date_field("2026-10-01")
-        self.dag_date_to = create_date_field("2026-10-31")
-        
-        self.dag_comp_cb = QComboBox()
-        self.load_companies_into_combobox(self.dag_comp_cb)
-        
-        self.dag_obj_cb = QComboBox()
-        self.load_objects_for_company(self.dag_comp_cb.currentText(), self.dag_obj_cb)
-        self.dag_comp_cb.currentTextChanged.connect(lambda comp: self.load_objects_for_company(comp, self.dag_obj_cb))
-
-        card_layout.addRow("Период с:", self.dag_date_from)
-        card_layout.addRow("Период по:", self.dag_date_to)
-        card_layout.addRow("Фирма:", self.dag_comp_cb)
-        card_layout.addRow("Объект:", self.dag_obj_cb)
-
-        btn_layout = QHBoxLayout()
-        gen_dag_btn = QPushButton("📖 Сформировать журнал работ")
-        gen_dag_btn.clicked.connect(self.generate_dagbok)
-        
-        export_pdf_btn = QPushButton("📄 Экспорт в PDF (SV)")
-        export_pdf_btn.clicked.connect(self.export_dagbok_to_pdf)
-
-        btn_layout.addWidget(gen_dag_btn)
-        btn_layout.addWidget(export_pdf_btn)
-        card_layout.addRow(btn_layout)
-
-        layout.addWidget(card)
+        journal_pdf = QPushButton("📖 PDF только журнала (SV)")
+        journal_pdf.clicked.connect(self.export_dagbok_to_pdf)
+        layout.addWidget(journal_pdf)
         layout.addWidget(QLabel("<b>Журнал выполненных работ (Dagbok):</b>"))
         
         self.table_dagbok = QTableWidget()
@@ -8786,7 +8724,7 @@ class SmartReportApp(QMainWindow):
         self.dag_total_sick_lbl = QLabel("<b>Больничный: 0.0 ч</b>")
         self.dag_total_vacation_lbl = QLabel("<b>Отпуск: 0.0 ч</b>")
         self.dag_total_holiday_lbl = QLabel("<b>Красные дни: 0.0 ч</b>")
-        self.dag_total_ob_lbl = QLabel("<b>OB отдельно: 0.0 ч / 0.00 kr</b>")
+        self.dag_total_ob_lbl = QLabel("<b>В том числе записи OB: 0.0 ч</b>")
         dag_summary_box.addWidget(self.dag_total_hours_lbl)
         dag_summary_box.addWidget(self.dag_total_atf_lbl)
         dag_summary_box.addWidget(self.dag_total_sick_lbl)
@@ -8797,46 +8735,16 @@ class SmartReportApp(QMainWindow):
         layout.addLayout(dag_summary_box)
 
     def generate_dagbok(self):
-        d_from = self.dag_date_from.text().strip()
-        d_to = self.dag_date_to.text().strip()
-        comp = self.dag_comp_cb.currentText()
-        obj_data = self.dag_obj_cb.currentData()
-        obj = obj_data if obj_data else self.dag_obj_cb.currentText()
+        return self.generate_invoice()
 
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
-            return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        has_ob_schema = ob_schema_ready(cursor)
-        if has_ob_schema:
-            cursor.execute('''
-                SELECT date, employee, entry_type, hours, comment, sync_id, start_time, end_time
-                FROM shifts
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                ORDER BY date ASC, employee ASC
-            ''', (comp, obj, d_from, d_to))
-        else:
-            cursor.execute('''
-                SELECT date, employee, entry_type, hours, comment, sync_id
-                FROM shifts
-                WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-                ORDER BY date ASC, employee ASC
-            ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        ob_segments_by_id = {
-            row["sync_id"]: get_ob_segments(cursor, row["sync_id"])
-            for row in rows if has_ob_schema and row["entry_type"] == RECORD_TYPE_OB
-        }
-        conn.close()
-
+    def _render_dagbok_report(self, report):
+        rows = report['journal_rows']
+        ob_segments_by_id = report['journal_segments']
         self.table_dagbok.setRowCount(len(rows))
         totals = {
             RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0,
             RECORD_TYPE_VACATION: 0.0, RECORD_TYPE_HOLIDAY: 0.0, RECORD_TYPE_OB: 0.0,
         }
-        ob_amount_total = 0.0
 
         for row_idx, row in enumerate(rows):
             date = row["date"]
@@ -8851,13 +8759,11 @@ class SmartReportApp(QMainWindow):
             detail_tooltip = ""
             if record_type == RECORD_TYPE_OB:
                 segments = ob_segments_by_id.get(row["sync_id"], [])
-                ob_amount = sum(segment["amount"] for segment in segments)
-                ob_amount_total += ob_amount
                 start_t = row["start_time"] if "start_time" in row.keys() else None
                 end_t = row["end_time"] if "end_time" in row.keys() else None
                 detalization = format_ob_detail(start_t, end_t, hrs, segments)
                 if not detalization and segments:
-                    detalization = f"{segments[0]['start_time']}–{segments[-1]['end_time']} ({hrs:.1f} ч)"
+                    detalization = f"{segments[0]['start_time']}–{segments[-1]['end_time']} ({format_quantity(hrs, '.')} ч)"
                 detail_tooltip = "; ".join(
                     f"{segment['segment_date']} {segment['start_time']}–{segment['end_time']} "
                     f"{segment['hours']:.2f} ч, +{segment['premium_percent']:.0f}%, "
@@ -8878,7 +8784,7 @@ class SmartReportApp(QMainWindow):
             it_emp = QTableWidgetItem(str(emp))
             it_type = QTableWidgetItem(record_type_short_label(record_type))
             it_type.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            it_hrs = QTableWidgetItem(f"{hrs:.1f} ч")
+            it_hrs = QTableWidgetItem(format_quantity(hrs, ".") + " ч")
             it_hrs.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             it_det = QTableWidgetItem(str(detalization))
             if detail_tooltip:
@@ -8893,144 +8799,16 @@ class SmartReportApp(QMainWindow):
             self.table_dagbok.setItem(row_idx, 4, it_det)
             self.table_dagbok.setItem(row_idx, 5, it_comm)
 
-        self.dag_total_hours_lbl.setText(f"<b>Работа: {totals[RECORD_TYPE_WORK]:.1f} ч</b>")
+        worked_hours = totals[RECORD_TYPE_WORK] + totals[RECORD_TYPE_OB]
+        self.dag_total_hours_lbl.setText(f"<b>Работа: {format_quantity(worked_hours, '.')} ч</b>")
         self.dag_total_atf_lbl.setText(f"<b>АТФ: {totals[RECORD_TYPE_ATF]:.1f} ч</b>")
         self.dag_total_sick_lbl.setText(f"<b>Больничный: {totals[RECORD_TYPE_SICK]:.1f} ч</b>")
         self.dag_total_vacation_lbl.setText(f"<b>Отпуск: {totals[RECORD_TYPE_VACATION]:.1f} ч</b>")
         self.dag_total_holiday_lbl.setText(f"<b>Красные дни: {totals[RECORD_TYPE_HOLIDAY]:.1f} ч</b>")
-        self.dag_total_ob_lbl.setText(f"<b>OB отдельно: {totals[RECORD_TYPE_OB]:.2f} ч / {ob_amount_total:,.2f} kr</b>")
+        self.dag_total_ob_lbl.setText(f"<b>В том числе записи OB: {totals[RECORD_TYPE_OB]:.2f} ч</b>")
 
     def export_dagbok_to_pdf(self):
-        d_from = self.dag_date_from.text().strip()
-        d_to = self.dag_date_to.text().strip()
-        comp = self.dag_comp_cb.currentText()
-        obj_data = self.dag_obj_cb.currentData()
-        obj = obj_data if obj_data else self.dag_obj_cb.currentText()
-
-        if not comp or not obj:
-            QMessageBox.warning(self, "Ошибка", "Выберите фирму и объект!")
-            return
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        has_ob_schema = ob_schema_ready(cursor)
-        cursor.execute('''
-            SELECT date, employee, entry_type, hours, comment, sync_id
-            FROM shifts
-            WHERE company = ? AND object_name = ? AND date >= ? AND date <= ?
-              AND entry_type IN ('work', 'ob', 'vacation', 'holiday')
-            ORDER BY date ASC, employee ASC
-        ''', (comp, obj, d_from, d_to))
-        rows = cursor.fetchall()
-        ob_segments_by_id = {
-            row["sync_id"]: get_ob_segments(cursor, row["sync_id"])
-            for row in rows if has_ob_schema and row["entry_type"] == RECORD_TYPE_OB
-        }
-        conn.close()
-
-        if not rows:
-            QMessageBox.warning(self, "Внимание", "За выбранный период нет записей!")
-            return
-
-        if not os.path.exists(REPORTS_DIR):
-            os.makedirs(REPORTS_DIR)
-
-        base_filename = f"Arbetsdagbok_{comp.replace(' ', '_')}_{obj.replace(' ', '_')}_{d_from}_till_{d_to}.pdf"
-        filepath = os.path.join(REPORTS_DIR, base_filename)
-        
-        try:
-            doc = SimpleDocTemplate(filepath, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-            story = []
-            styles = getSampleStyleSheet()
-            
-            title_style = ParagraphStyle('TitleSV', parent=styles['Heading1'], fontName=DEFAULT_FONT_BOLD, fontSize=15, spaceAfter=4)
-            subtitle_style = ParagraphStyle('SubTitleSV', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=10, spaceAfter=14)
-            cell_text_style = ParagraphStyle(
-                'CellTextSV', parent=styles['Normal'], fontName=DEFAULT_FONT,
-                fontSize=9, leading=12, wordWrap='CJK'
-            )
-            cell_bold_style = ParagraphStyle(
-                'CellBoldSV', parent=cell_text_style, fontName=DEFAULT_FONT_BOLD
-            )
-
-            story.append(Paragraph("<b>Bygger och renoverar i Sthlm AB</b>", title_style))
-            story.append(Paragraph(f"<b>Arbetsdagbok (Dagbok)</b><br/>Beställare: <b>{comp}</b><br/>Objekt: <b>{obj}</b><br/>Period: {d_from} till {d_to}", subtitle_style))
-            story.append(Spacer(1, 5))
-
-            table_data = [["Datum", "Anställd", "Typ", "Timmar", "Arbetsbeskrivning"]]
-            totals = {
-                RECORD_TYPE_WORK: 0.0, RECORD_TYPE_OB: 0.0,
-                RECORD_TYPE_VACATION: 0.0, RECORD_TYPE_HOLIDAY: 0.0,
-            }
-
-            swedish_type_labels = {
-                RECORD_TYPE_WORK: "Arbete",
-                RECORD_TYPE_OB: "OB / Övertid",
-                RECORD_TYPE_VACATION: "Semester / Semestertimmar",
-                RECORD_TYPE_HOLIDAY: "Röda dagar",
-            }
-
-            for row in rows:
-                date, emp, record_type, hrs, comment = row[0], row[1], row[2], row[3], row[4]
-                if record_type in totals:
-                    totals[record_type] += hrs
-                if record_type == RECORD_TYPE_OB:
-                    segments = ob_segments_by_id.get(row["sync_id"], [])
-                    segment_text = "; ".join(
-                        f"{segment['start_time']}–{segment['end_time']} ({segment['hours']:.2f} tim)"
-                        for segment in segments
-                    )
-                    comment = f"{comment or ''} | OB-intervaller: {segment_text}".strip(" |")
-                translated_comment = translate_to_swedish(comment)
-                type_display = swedish_type_labels.get(record_type, "Arbete")
-                
-                comment_p = Paragraph(str(translated_comment or ""), cell_text_style)
-                emp_p = Paragraph(str(emp), cell_text_style)
-                
-                table_data.append([
-                    str(date),
-                    emp_p,
-                    type_display,
-                    f"{hrs:.2f} tim",
-                    comment_p
-                ])
-
-            table_data.extend([
-                ["Totalt arbete:", "", "", f"{totals[RECORD_TYPE_WORK]:.2f} tim", ""],
-                ["Totalt OB:", "", "", f"{totals[RECORD_TYPE_OB]:.2f} tim", ""],
-                ["Totalt semester:", "", "", f"{totals[RECORD_TYPE_VACATION]:.2f} tim", ""],
-                ["Totalt röda dagar:", "", "", f"{totals[RECORD_TYPE_HOLIDAY]:.2f} tim", ""],
-            ])
-
-            t = Table(table_data, colWidths=[70, 95, 80, 65, 225])
-            t.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4299e1')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('FONTNAME', (0, 0), (-1, -1), DEFAULT_FONT),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
-                ('TOPPADDING', (0, 0), (-1, 0), 6),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -5), [colors.HexColor('#f9f9f9'), colors.white]),
-                ('GRID', (0, 0), (-1, -5), 0.5, colors.HexColor('#dddddd')),
-                ('BACKGROUND', (0, -4), (-1, -1), colors.HexColor('#eeeeee')),
-                ('FONTNAME', (0, -4), (-1, -1), DEFAULT_FONT_BOLD),
-                ('LINEABOVE', (0, -4), (-1, -4), 1.5, colors.HexColor('#2b6cb0')),
-            ]))
-
-            story.append(t)
-            doc.build(story)
-            QMessageBox.information(self, "Успех", f"PDF-отчет сохранен:\n{base_filename}")
-            
-            if sys.platform == 'win32':
-                os.startfile(filepath)
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', filepath])
-            else:
-                subprocess.run(['xdg-open', filepath])
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF: {e}")
+        self._export_customer_report_pdf(journal_only=True)
 
     def setup_sprav_tab(self):
         layout = QVBoxLayout(self.tab_sprav)

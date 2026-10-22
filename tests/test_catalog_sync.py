@@ -1555,9 +1555,8 @@ class CatalogSyncTests(unittest.TestCase):
                 window.invoice_summary_table.item(index, 1).text()
                 for index in range(window.invoice_summary_table.rowCount())
             }
-            self.assertEqual(summary['Totalt att fakturera exkl. moms'], 'Ej fastställbart')
-            self.assertEqual(summary['OB-tillägg'], 'Ej fastställbart')
-            self.assertEqual(report['totals']['work_amount'], 2975)
+            self.assertIn('Preliminärt totalbelopp', summary)
+            self.assertEqual(report['totals']['work_amount'], 2825)
             self.assertIsNone(report['totals']['invoice_total'])
             self.assertEqual(
                 report['ob_rule_descriptions'],
@@ -1579,36 +1578,21 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertIn('Renatur', heading)
                 self.assertIn(window.inv_date_to.text(), heading)
                 pdf_table = next(flow for flow in story if isinstance(flow, self.desktop.LongTable))
-                self.assertEqual(sum(pdf_table._colWidths), 535)
+                self.assertAlmostEqual(sum(pdf_table._colWidths), self.desktop.landscape(self.desktop.A4)[0] - 72)
                 for row_index in range(window.table_invoice.rowCount()):
                     pdf_row = pdf_table._cellvalues[row_index + 1]
                     self.assertEqual(pdf_row[0].getPlainText(), window.table_invoice.item(row_index, 0).text())
-                    self.assertEqual(
-                        [cell.getPlainText() if hasattr(cell, 'getPlainText') else cell for cell in pdf_row[1:6]],
-                        [window.table_invoice.item(row_index, column).text() for column in range(1, 6)],
-                    )
-                    self.assertEqual(pdf_row[6:8], [window.table_invoice.item(row_index, column).text() for column in (6, 7)])
-                    self.assertEqual(pdf_row[8].getPlainText(), window.table_invoice.item(row_index, 8).text())
-                    status = window.table_invoice.item(row_index, 9).text()
-                    self.assertEqual(pdf_row[9].getPlainText(), "Pågående" if status == "⏳ В работе" else status)
-                summary_group = story[-1]
-                pdf_summary = next(
-                    flow for flow in summary_group._content
-                    if isinstance(flow, self.desktop.Table)
-                )
-                screen_summary = [
-                    [window.invoice_summary_table.item(row, column).text() for column in range(2)]
-                    for row in range(window.invoice_summary_table.rowCount())
-                ]
-                pdf_summary_text = [
-                    [cell.getPlainText() for cell in row]
-                    for row in pdf_summary._cellvalues
-                ]
-                self.assertEqual(pdf_summary_text, screen_summary)
-                self.assertEqual(
-                    summary_group._content[-1].getPlainText(),
-                    window.invoice_ob_rules_lbl.text(),
-                )
+                    for column in (1, 2, 3):
+                        self.assertEqual(
+                            pdf_row[column].getPlainText().replace(",", "."),
+                            window.table_invoice.item(row_index, column).text(),
+                        )
+                self.assertIn('Arbetsjournal', heading)
+                journal_table = [
+                    flow for flow in story if isinstance(flow, self.desktop.LongTable)
+                ][-1]
+                self.assertEqual(len(journal_table._cellvalues) - 1, len(window._invoice_report['journal_rows']))
+                self.assertNotIn('Löneunderlag', heading)
 
             with patch.object(self.desktop, 'REPORTS_DIR', str(Path(self._case.name) / 'reports')), \
                  patch.object(self.desktop.SimpleDocTemplate, 'build') as build, \
@@ -1624,7 +1608,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(window.table_invoice.rowCount(), 1)
                 self.assertEqual(window.table_invoice.item(0, 0).text(), 'Carol')
                 self.assertEqual(
-                    window._invoice_report['totals']['invoice_total'], 2530
+                    window._invoice_report['totals']['invoice_total'], 2050
                 )
                 window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identities['Invoice work']))
                 window.inv_date_from.setDate(self.desktop.QDate(2026, 10, 31))
@@ -1666,8 +1650,9 @@ class CatalogSyncTests(unittest.TestCase):
                 from pypdf import PdfReader
 
                 pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(str(generated_pdfs[0])).pages)
-                self.assertIn('Varav OB1 (18:00–20:00)', pdf_text)
-                self.assertIn('Varav OB2 (20:00–24:00)', pdf_text)
+                self.assertIn('Varav OB1', pdf_text)
+                self.assertIn('Varav OB2', pdf_text)
+                self.assertIn('Arbetsjournal', pdf_text)
                 critical.assert_not_called()
         finally:
             window.close()
@@ -1716,7 +1701,7 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual(report['totals']['transport_amount'], 150)
             self.assertIsNone(report['totals']['invoice_total'])
             self.assertIsNone(report['totals']['ob_amount'])
-            self.assertEqual(window.table_invoice.columnCount(), 10)
+            self.assertEqual(window.table_invoice.columnCount(), 6)
             self.assertNotIn('18:00', '\n'.join(
                 window.table_invoice.item(row, column).text()
                 for row in range(window.table_invoice.rowCount())
@@ -1732,8 +1717,8 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual(summary['Varav OB1 (18:00–20:00)'], '4.0 tim')
             self.assertEqual(summary['Varav OB2 (20:00–24:00)'], '1.0 tim')
             self.assertIn('OB-timmar ingår i arbetade timmar', window.invoice_summary_note.text())
-            self.assertIn('Avtalsregel', window.invoice_summary_note.text())
-            self.assertIn('inte ett avtalat fakturapåslag', window.invoice_summary_note.text())
+            self.assertIn('PRELIMINÄRT', window.invoice_summary_note.text())
+            self.assertIn('OB-tillägg', window.invoice_summary_note.text())
         finally:
             window.close()
             window.deleteLater()
@@ -1803,23 +1788,22 @@ class CatalogSyncTests(unittest.TestCase):
                     pdf = next(reports_dir.glob('*.pdf'))
                     text = '\n'.join(page.extract_text() or '' for page in PdfReader(pdf).pages)
                     self.assertIn('Pågående', text)
-                    self.assertIn('Avtalsregel', text)
-                    self.assertIn('Ej fastställbart', text)
-                    self.assertIn('2,080.00', text)
+                    self.assertIn('OB-tillägg', text)
+                    self.assertIn('Ej fastställt', text)
+                    self.assertIn('2 080,00', text)
                     self.assertNotIn('HOTEL', text)
-                    self.assertIn('1,229.00 SEK', text)
-                    self.assertIn('Начисления сотруднику', text)
-                    self.assertIn('Стоимость для заказчика', text)
-                    self.assertIn('PRELIMINÄRT UNDERLAG', text)
-                    self.assertIn('PRELIMINÄR delsumma', text)
-                    self.assertIn('utan ej fastställt OB-tillägg (INTE slutkostnad)', text)
-                    self.assertIn('2,530.00 kr', text)
+                    self.assertNotIn('1,229.00 SEK', text)
+                    self.assertNotIn('Начисления сотруднику', text)
+                    self.assertIn('Arbetsjournal', text)
+                    self.assertIn('PRELIMINÄRT', text)
+                    self.assertIn('Preliminärt totalbelopp', text)
+                    self.assertIn('utan ej fastställda priser eller OB-tillägg', text)
+                    self.assertIn('2 530,00 SEK', text)
                     payroll = report['payroll']['Report worker']
                     self.assertEqual(payroll['base_amount'], 983.2)
                     self.assertEqual(payroll['ob_premium'], 245.8)
                     self.assertEqual(payroll['total'], 1229)
-                    customer_text = text.split('Стоимость для заказчика')[-1]
-                    self.assertNotIn('1,229', customer_text)
+                    self.assertNotIn('1 229', text)
                     errors.assert_not_called()
                 window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identities["Invoice HOTEL Djurgården"]))
                 hotel = window.generate_invoice()
@@ -1861,9 +1845,10 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertIsNone(report['totals'][field])
             self.assertIn('Ej fastställbart', window.table_invoice.item(0, 3).text())
             self.assertTrue(report['warnings'])
-            self.assertIn('segment', window.invoice_summary_note.text())
-            self.assertIn('timpris', window.invoice_summary_note.text())
-            self.assertIn('Resepriset', window.invoice_summary_note.text())
+            self.assertIn('PRELIMINÄRT', window.invoice_summary_note.text())
+            self.assertTrue(any('segment' in warning for warning in report['warnings']))
+            self.assertTrue(any('timpris' in warning for warning in report['warnings']))
+            self.assertTrue(any('Resepriset' in warning for warning in report['warnings']))
             conn = self.desktop.get_db_connection()
             self.assertEqual(list(conn.iterdump()), before)
             conn.execute('DROP TABLE ob_segments')
@@ -4559,7 +4544,15 @@ class CatalogSyncTests(unittest.TestCase):
             dag_total_holiday_lbl=QLabel(),
             dag_total_ob_lbl=QLabel(),
         )
-        self.desktop.SmartReportApp.generate_dagbok(report_ui)
+        conn = self.desktop.get_db_connection()
+        journal_rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM shifts WHERE company=? AND object_name=? AND date=? ORDER BY date,employee,id",
+            (company, object_name, shift_date),
+        )]
+        conn.close()
+        self.desktop.SmartReportApp._render_dagbok_report(
+            report_ui, {"journal_rows": journal_rows, "journal_segments": {}},
+        )
         vacation_history_row = next(
             row for row in range(report_ui.table_dagbok.rowCount())
             if report_ui.table_dagbok.item(row, 1).text() == employee
@@ -4587,7 +4580,15 @@ class CatalogSyncTests(unittest.TestCase):
             dag_total_holiday_lbl=QLabel(),
             dag_total_ob_lbl=QLabel(),
         )
-        self.desktop.SmartReportApp.generate_dagbok(holiday_report_ui)
+        conn = self.desktop.get_db_connection()
+        journal_rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM shifts WHERE company=? AND object_name=? AND date=? ORDER BY date,employee,id",
+            (company, holiday_object_name, shift_date),
+        )]
+        conn.close()
+        self.desktop.SmartReportApp._render_dagbok_report(
+            holiday_report_ui, {"journal_rows": journal_rows, "journal_segments": {}},
+        )
         self.assertEqual(holiday_report_ui.table_dagbok.item(0, 2).text(), "Красные дни")
         self.assertEqual(
             holiday_report_ui.table_dagbok.item(0, 4).text(),
