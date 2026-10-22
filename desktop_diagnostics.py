@@ -160,26 +160,36 @@ def run(app_module, action, work_dir, case="case", out_path=None):
         result.update({"ob_rules_loaded": True, "ocr_models_loaded": True, "database": str(Path(app_module.DB_FILE).resolve()),
                        "cwd": os.getcwd()})
         from PyQt6.QtWidgets import QApplication, QLineEdit
-        from folder_mail import create_import_dialog, recent_period
+        from folder_mail import create_import_dialog, recent_period, import_folder, FolderError, IMPORT_START_DATE
         from incoming_documents import IncomingStore
         from offline_review_ui import OfflineReviewWindow
         application = QApplication.instance() or QApplication([])
         store = IncomingStore(work / "mail-smoke", SimpleNamespace(_expense_objects=[]))
         window = OfflineReviewWindow(store, integrated=True)
-        dialog = create_import_dialog(window, *recent_period())
-        try:
-            assert dialog.password.echoMode() == QLineEdit.EchoMode.Password
-            assert "последние 30 дней" in dialog.notice.text() and "INBOX" in dialog.notice.text()
-            assert not dialog.stop_button.isEnabled()
-            dialog.show()
-            application.processEvents()
-            dialog.grab().save(str(work / "mail-period.png"))
-            dialog.reject()
-            result.update(mail_period_dialog=True, masked_password=True, stop_control=True, mail_connections=0)
-        finally:
-            dialog.close()
-            window.close()
-            store.close()
+        start, end = recent_period()
+        if end < IMPORT_START_DATE:
+            try:
+                import_folder(store, "unused-before-import-start")
+            except FolderError as error:
+                assert str(error) == "import_not_started"
+            else:
+                raise AssertionError("Import must be blocked before 01.11.2026")
+            result.update(mail_import_not_started=True, import_start="2026-11-01", mail_connections=0)
+        else:
+            dialog = create_import_dialog(window, start, end)
+            try:
+                assert dialog.password.echoMode() == QLineEdit.EchoMode.Password
+                assert "последние 14 дней" in dialog.notice.text() and "INBOX" in dialog.notice.text()
+                assert not dialog.stop_button.isEnabled()
+                dialog.show()
+                application.processEvents()
+                dialog.grab().save(str(work / "mail-period.png"))
+                dialog.reject()
+                result.update(mail_period_dialog=True, masked_password=True, stop_control=True, mail_connections=0)
+            finally:
+                dialog.close()
+        window.close()
+        store.close()
     elif action == "login":
         token = desktop_auth.login(url, os.environ["SMARTREPORT_E2E_USER"], os.environ["SMARTREPORT_E2E_PASS"])
         desktop_auth.set_token(token)

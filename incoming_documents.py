@@ -513,9 +513,14 @@ def open_incoming(host, root):
     load.clicked.connect(import_snapshot)
     window.diagnostics_layout.addWidget(load)
     window.diagnostics_layout.addWidget(retry)
-    from folder_mail import open_import_dialog, recent_period
-    start, end = recent_period()
-    mail = QPushButton(f"Получить документы · INBOX · последние 30 дней ({start} — {end})")
+    from folder_mail import open_import_dialog, recent_period, RECENT_DAYS, IMPORT_START_DATE
+    def mail_caption():
+        start, end = recent_period()
+        if end < IMPORT_START_DATE:
+            return "Получение фактур с 01.11.2026 · до этой даты почта не подключается"
+        return f"Получить документы · INBOX · последние {RECENT_DAYS} дней ({start} — {end})"
+
+    mail = QPushButton(mail_caption())
     mail.setObjectName("incoming_receive_mail")
     mail.setToolTip("По дате получения письма. Обработанные UID пропускаются без скачивания и OCR.")
     mail.clicked.connect(lambda: open_import_dialog(window))
@@ -554,8 +559,7 @@ def open_incoming(host, root):
     window.status_timer = QTimer(window)
 
     def update_status():
-        start, end = recent_period()
-        mail.setText(f"Получить документы · INBOX · последние 30 дней ({start} — {end})")
+        mail.setText(mail_caption())
         if window.document_id is None:
             return
         text, green = store.accounting_status(window.document_id)

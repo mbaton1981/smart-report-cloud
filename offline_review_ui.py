@@ -9,11 +9,12 @@ from html import escape
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QPalette, QBrush
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSplitter, QTextEdit,
     QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
+    QStyledItemDelegate, QStyle,
 )
 
 from document_preview import DocumentGalleryDialog
@@ -30,6 +31,26 @@ LABELS = {
 TYPES = {"invoice": "Фактура", "receipt": "Чек", "unclassified": "Тип не установлен",
          "tax_decision": "Решение о транспортном налоге", "order_confirmation": "Подтверждение заказа",
          "credit_note": "Кредитная фактура", "proforma": "Проформа"}
+
+
+class IncomingDocumentDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        accounted = index.data(Qt.ItemDataRole.BackgroundRole) == QColor("#b9efc6")
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        background = QColor("#b9efc6" if accounted else "#f7fafc")
+        if selected:
+            background = QColor("#92cfaa" if accounted else "#bdd9ef")
+        elif hovered:
+            background = QColor("#a9dfba" if accounted else "#e2edf7")
+        foreground = QColor("#12351f" if accounted else "#17202a")
+        option.backgroundBrush = QBrush(background)
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive, QPalette.ColorGroup.Disabled):
+            option.palette.setColor(group, QPalette.ColorRole.Text, foreground)
+            option.palette.setColor(group, QPalette.ColorRole.HighlightedText, foreground)
+            option.palette.setColor(group, QPalette.ColorRole.Base, background)
+            option.palette.setColor(group, QPalette.ColorRole.Highlight, background)
 
 
 class OfflineReviewWindow(QDialog):
@@ -52,6 +73,14 @@ class OfflineReviewWindow(QDialog):
         banner.setWordWrap(True)
         layout.addWidget(banner)
         self.selector = QComboBox()
+        if integrated:
+            self.selector.view().setItemDelegate(IncomingDocumentDelegate(self.selector.view()))
+            self.selector.view().setMouseTracking(True)
+            self.selector.setStyleSheet(
+                "QComboBox { background: #f7fafc; color: #17202a; }"
+                "QComboBox QAbstractItemView { background: #f7fafc; color: #17202a;"
+                " selection-background-color: #92cfaa; selection-color: #12351f; }"
+            )
         self._label_signatures = {}
         self._label_token = None
         for doc in store.documents():
@@ -440,6 +469,9 @@ class OfflineReviewWindow(QDialog):
                     color = QColor("#b9efc6") if green else None
                     if self.selector.itemData(index, Qt.ItemDataRole.BackgroundRole) != color:
                         self.selector.setItemData(index, color, Qt.ItemDataRole.BackgroundRole)
+                    foreground = QColor("#12351f") if green else None
+                    if self.selector.itemData(index, Qt.ItemDataRole.ForegroundRole) != foreground:
+                        self.selector.setItemData(index, foreground, Qt.ItemDataRole.ForegroundRole)
                 self._label_signatures[document_id] = signature
             self._label_token = token
         finally:

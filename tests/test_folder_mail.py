@@ -4,10 +4,25 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from folder_mail import FOLDER, HOST, ADDRESS, FolderError, import_folder
 from incoming_documents import IncomingStore
 from test_mail_automation import eml, pdf, recognized
+
+
+CalendarDate = date
+
+
+class ImportDateType(type):
+    def __instancecheck__(cls, value):
+        return isinstance(value, CalendarDate)
+
+
+class ImportTestDate(date, metaclass=ImportDateType):
+    @classmethod
+    def today(cls):
+        return cls(2027, 1, 15)
 
 
 class FolderIMAP:
@@ -58,6 +73,10 @@ class FolderIMAP:
 
 class FolderMailTests(unittest.TestCase):
     def setUp(self):
+        for name in ("folder_mail.date", __name__ + ".date"):
+            date_patch = patch(name, ImportTestDate)
+            date_patch.start()
+            self.addCleanup(date_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = IncomingStore(Path(self.temp.name) / "incoming", SimpleNamespace())
@@ -190,25 +209,50 @@ class FolderMailTests(unittest.TestCase):
         self.assertEqual(result["new_drafts"], 0)
         recognizer.assert_not_called()
 
-    def test_recent_30_days_inclusive_boundaries_and_explicit_archive(self):
+    def test_recent_14_days_inclusive_boundaries_and_explicit_archive(self):
         from folder_mail import recent_period, imap_date
         today = date.today()
         start, end = recent_period()
-        self.assertEqual(start, today - timedelta(days=29))
+        self.assertEqual(start, today - timedelta(days=13))
         self.assertEqual(end, today)
         FolderIMAP.dates = {1: start - timedelta(days=1), 2: start, 3: today,
-                            4: today + timedelta(days=1), 5: today - timedelta(days=300),
-                            6: today - timedelta(days=400), 7: today - timedelta(days=500)}
+                            4: today + timedelta(days=1), 5: start - timedelta(days=2),
+                            6: start - timedelta(days=3), 7: start - timedelta(days=4)}
         self.assertEqual(self.run_import()["new_drafts"], 2)
         self.assertIn(("SEARCH", None, "SINCE", imap_date(start), "BEFORE",
                        imap_date(end + timedelta(days=1))), FolderIMAP.commands)
-        result = import_folder(self.store, "isolated-only", start=today - timedelta(days=500),
+        result = import_folder(self.store, "isolated-only", start=date(2026, 11, 1),
                                end=start - timedelta(days=1), client_factory=FolderIMAP, recognizer=recognized)
         self.assertEqual(result["new_drafts"], 4)
         self.assertEqual(len(self.store.documents()), 6)
         # Selecting a different period never filters or deletes existing drafts.
         self.assertEqual(self.run_import()["skipped"], 2)
         self.assertEqual(len(self.store.documents()), 6)
+
+    def test_import_start_boundary_and_14_day_window(self):
+        from folder_mail import recent_period
+        self.assertEqual(recent_period(date(2026, 11, 1)), (date(2026, 11, 1), date(2026, 11, 1)))
+        self.assertEqual(recent_period(date(2026, 11, 14)), (date(2026, 11, 1), date(2026, 11, 14)))
+        self.assertEqual(recent_period(date(2026, 11, 15)), (date(2026, 11, 2), date(2026, 11, 15)))
+        from unittest.mock import Mock
+        factory = Mock(side_effect=AssertionError("No IMAP before approved start"))
+        class BeforeStart(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 10, 31)
+        with patch("folder_mail.date", BeforeStart):
+            with self.assertRaisesRegex(FolderError, "import_not_started"):
+                import_folder(self.store, "isolated-only", client_factory=factory)
+        factory.assert_not_called()
+        FolderIMAP.dates = {uid: date(2026, 10, 31) for uid in FolderIMAP.messages}
+        FolderIMAP.dates[2] = date(2026, 11, 1)
+        report = import_folder(self.store, "isolated-only", start=date(2026, 10, 1),
+                               end=date(2026, 11, 1), client_factory=FolderIMAP, recognizer=recognized)
+        self.assertEqual(report["start"], "2026-11-01")
+        self.assertEqual(report["new_drafts"], 1)
+        with self.assertRaisesRegex(FolderError, "before_import_start"):
+            import_folder(self.store, "isolated-only", start=date(2026, 10, 1),
+                          end=date(2026, 10, 31), client_factory=factory)
 
     def test_invalid_period_never_connects(self):
         from unittest.mock import Mock

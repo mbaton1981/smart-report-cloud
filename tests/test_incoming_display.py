@@ -83,6 +83,43 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertEqual(window.inputs["gross_amount"].text(), "")
         self.assertIn("Сумма не определена — нужна проверка", window.classification.text())
 
+    def test_accounted_document_is_readable_selected_hovered_and_inactive_without_data_changes(self):
+        from PyQt6.QtGui import QColor, QPalette
+        from PyQt6.QtWidgets import QStyle, QStyleOptionViewItem
+        window = self.open_window()
+        before = list(self.store.conn.iterdump())
+        with patch.object(self.store, "accounting_status", return_value=("Учтён на объекте", True)):
+            window._label_token = None
+            window._label_signatures = {}
+            window.refresh_document_labels()
+        index = window.selector.model().index(0, 0)
+        self.assertIn("Учтён на объекте", index.data())
+        self.assertEqual(index.data(self.desktop.Qt.ItemDataRole.ForegroundRole), QColor("#12351f"))
+        delegate = window.selector.view().itemDelegate()
+
+        def luminance(color):
+            def linear(value):
+                value /= 255
+                return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+            return sum(weight * linear(channel) for weight, channel in
+                       zip((0.2126, 0.7152, 0.0722), (color.red(), color.green(), color.blue())))
+
+        for state in (QStyle.StateFlag.State_Enabled,
+                      QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Selected,
+                      QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_MouseOver,
+                      QStyle.StateFlag.State_Selected):
+            option = QStyleOptionViewItem()
+            option.initFrom(window.selector.view())
+            option.state = state
+            delegate.initStyleOption(option, index)
+            for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive,
+                          QPalette.ColorGroup.Disabled):
+                foreground = option.palette.color(group, QPalette.ColorRole.HighlightedText)
+                background = option.palette.color(group, QPalette.ColorRole.Highlight)
+                contrast = (luminance(background) + 0.05) / (luminance(foreground) + 0.05)
+                self.assertGreaterEqual(contrast, 7)
+        self.assertEqual(list(self.store.conn.iterdump()), before)
+
     def test_idle_refresh_does_not_reparse_or_read_documents_or_rerender_pdf(self):
         window = self.open_window()
         queries = []

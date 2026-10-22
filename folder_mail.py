@@ -16,6 +16,8 @@ from mail_import import HOST, ADDRESS, MAX_MESSAGE_BYTES
 from offline_review import ReviewError
 
 FOLDER = "INBOX"
+RECENT_DAYS = 14
+IMPORT_START_DATE = date(2026, 11, 1)
 
 
 class FolderError(ReviewError):
@@ -30,7 +32,7 @@ def checked(response, stage):
 
 def recent_period(today=None):
     end = today or date.today()
-    return end - timedelta(days=29), end
+    return max(IMPORT_START_DATE, end - timedelta(days=RECENT_DAYS - 1)), end
 
 
 def checked_period(start, end):
@@ -46,7 +48,12 @@ def imap_date(value):
 
 def import_folder(store, password, *, start=None, end=None, should_stop=None, progress=None,
                   client_factory=imaplib.IMAP4_SSL, recognizer=recognize_invoice):
+    if date.today() < IMPORT_START_DATE:
+        raise FolderError("import_not_started")
     start, end = checked_period(*(recent_period() if start is None and end is None else (start, end)))
+    start = max(start, IMPORT_START_DATE)
+    if end < start:
+        raise FolderError("before_import_start")
     report = {"messages": 0, "new_drafts": 0, "duplicates": 0, "without_pdf": 0,
               "recognition_failed": 0, "skipped": 0, "total": 0, "completed": 0,
               "stopped": False, "phase": "connecting",
@@ -188,6 +195,8 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
 
 
 ERRORS = {
+    "import_not_started": "Получение фактур разрешено с 01.11.2026 включительно. Подключение к почте не выполнялось.",
+    "before_import_start": "Письма до 01.11.2026 не загружаются. Выберите период с этой даты.",
     "auth": "Сервер отклонил вход. Проверьте пароль приложения; настройки безопасности не ослабляются.",
     "folder": "Сервер не открыл основную папку INBOX. Проверьте доступ к входящим подключённого ящика.",
     "epoch_missing": "Сервер не вернул UIDVALIDITY папки. Импорт остановлен.",
@@ -214,6 +223,11 @@ def report_text(report):
 def archive_period(parent):
     from PyQt6.QtCore import QDate
     from PyQt6.QtWidgets import QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QMessageBox
+    if date.today() < IMPORT_START_DATE:
+        QMessageBox.information(parent, "Получение с 01.11.2026", ERRORS["import_not_started"])
+        return None
+    today = date.today()
+    qt_today = QDate(today.year, today.month, today.day)
     dialog = QDialog(parent)
     dialog.setWindowTitle("Загрузить архив — период INBOX")
     layout = QFormLayout(dialog)
@@ -223,9 +237,12 @@ def archive_period(parent):
     for field in (start, end):
         field.setCalendarPopup(True)
         field.setDisplayFormat("yyyy-MM-dd")
-        field.setMaximumDate(QDate.currentDate())
-    end.setDate(QDate.currentDate().addDays(-30))
-    start.setDate(end.date().addMonths(-1))
+        field.setMaximumDate(qt_today)
+        field.setMinimumDate(QDate(IMPORT_START_DATE.year, IMPORT_START_DATE.month, IMPORT_START_DATE.day))
+    end.setDate(max(qt_today.addDays(-RECENT_DAYS),
+                    QDate(IMPORT_START_DATE.year, IMPORT_START_DATE.month, IMPORT_START_DATE.day)))
+    start.setDate(max(end.date().addMonths(-1),
+                      QDate(IMPORT_START_DATE.year, IMPORT_START_DATE.month, IMPORT_START_DATE.day)))
     layout.addRow("Дата получения письма, с:", start)
     layout.addRow("По (включительно):", end)
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -256,6 +273,10 @@ def create_import_dialog(window, start, end, *, archive=False):
     from limited_mail_ui import PasswordDialog, ERROR_MESSAGES
 
     checked_period(start, end)
+    if date.today() < IMPORT_START_DATE:
+        raise FolderError("import_not_started")
+    if start < IMPORT_START_DATE:
+        raise FolderError("before_import_start")
     ERROR_MESSAGES.update(ERRORS)
 
     class Progress(QObject):
@@ -273,9 +294,10 @@ def create_import_dialog(window, start, end, *, archive=False):
                                 else "SmartReport — получить документы из INBOX")
             self.notice.setText(
                 f"Ящик: {ADDRESS}\nINBOX · {start} — {end} (включительно, по дате получения).\n"
-                + ("Архив: выбранный период.\n" if archive else "Только последние 30 дней.\n")
+                + ("Архив: выбранный период.\n" if archive else f"Только последние {RECENT_DAYS} дней.\n")
                 + "Обработанные письма пропускаются без скачивания и OCR.\n"
                 "EXAMINE + BODY.PEEK: письма не меняются. Расписание выключено.")
+            self.notice.setText(self.notice.text() + "\nПисьма до 01.11.2026 не загружаются.")
             self.buttons.button(self.buttons.StandardButton.Ok).setText(
                 "Загрузить архив" if archive else "Получить документы")
             self.progress_bar = QProgressBar()
@@ -359,6 +381,10 @@ def create_import_dialog(window, start, end, *, archive=False):
 
 
 def open_import_dialog(window, *, archive=False):
+    if date.today() < IMPORT_START_DATE:
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(window, "Получение с 01.11.2026", ERRORS["import_not_started"])
+        return
     existing = getattr(window, "_mail_import_dialog", None)
     if existing is not None and existing.isVisible():
         existing.raise_()

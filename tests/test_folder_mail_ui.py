@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import QApplication, QDateEdit, QDialog, QDialogButtonBox, 
 import folder_mail
 from incoming_documents import IncomingStore
 from offline_review_ui import OfflineReviewWindow
-from test_folder_mail import FolderIMAP
+from test_folder_mail import FolderIMAP, ImportTestDate
 from test_mail_automation import eml, pdf, recognized
 
 
@@ -22,6 +22,10 @@ class FolderMailUITests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        for name in ("folder_mail.date", "test_folder_mail.date", __name__ + ".date"):
+            date_patch = patch(name, ImportTestDate)
+            date_patch.start()
+            self.addCleanup(date_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.host = SimpleNamespace(_expense_objects=[], incoming_delivery_pending=lambda client_id: None,
@@ -44,6 +48,43 @@ class FolderMailUITests(unittest.TestCase):
         self.assertIsNone(dialog.worker, "Worker must finish without forced termination")
         self.app.processEvents()
 
+    def test_before_november_no_dialog_or_mail_connection(self):
+        class BeforeStart(ImportTestDate):
+            @classmethod
+            def today(cls):
+                return cls(2026, 10, 31)
+        with patch.object(folder_mail, "date", BeforeStart), \
+                patch.object(QMessageBox, "information") as information, \
+                patch.object(folder_mail, "create_import_dialog", side_effect=AssertionError("No import")), \
+                patch.object(folder_mail.imaplib, "IMAP4_SSL", side_effect=AssertionError("No connection")):
+            folder_mail.open_import_dialog(self.window)
+            folder_mail.open_import_dialog(self.window, archive=True)
+            self.assertEqual(information.call_count, 2)
+            self.assertIn("01.11.2026", information.call_args.args[2])
+
+    def test_diagnostics_selftest_records_blocked_import_before_start(self):
+        import json
+        import sys
+        import desktop_diagnostics
+        class BeforeStart(ImportTestDate):
+            @classmethod
+            def today(cls):
+                return cls(2026, 10, 31)
+        app_module = SimpleNamespace(DB_FILE=str(Path(self.temp.name) / "isolated.db"),
+                                     init_db_once=lambda: None)
+        output = Path(self.temp.name) / "diagnostic.json"
+        with patch.object(folder_mail, "date", BeforeStart), \
+                patch.object(desktop_diagnostics, "_require_local_server", return_value="http://127.0.0.1:5999"), \
+                patch("ob_calculator.load_ob_rules"), \
+                patch.dict(sys.modules, {"rapidocr_onnxruntime": SimpleNamespace(RapidOCR=lambda: None)}), \
+                patch.object(folder_mail, "create_import_dialog", side_effect=AssertionError("No password")):
+            desktop_diagnostics.run(app_module, "selftest", Path(self.temp.name) / "diagnostic",
+                                    out_path=output)
+        result = json.loads(output.read_text(encoding="utf-8"))
+        self.assertTrue(result["mail_import_not_started"])
+        self.assertEqual(result["import_start"], "2026-11-01")
+        self.assertEqual(result["mail_connections"], 0)
+
     def test_masked_password_progress_stop_and_manual_retry(self):
         original = folder_mail.import_folder
         def slow_recognition(paths):
@@ -54,7 +95,8 @@ class FolderMailUITests(unittest.TestCase):
         dialog = folder_mail.create_import_dialog(self.window, *folder_mail.recent_period())
         self.addCleanup(dialog.close)
         self.assertTrue(dialog.password.echoMode() == dialog.password.EchoMode.Password)
-        self.assertIn("последние 30 дней", dialog.notice.text())
+        self.assertIn("последние 14 дней", dialog.notice.text())
+        self.assertIn("01.11.2026", dialog.notice.text())
         self.assertIn("INBOX", dialog.notice.text())
         stopping = [True]
         def stop_during_recognition(report):
@@ -147,8 +189,10 @@ class FolderMailUITests(unittest.TestCase):
 
     def test_invalid_archive_does_not_reach_confirmation_or_mail(self):
         def choose_invalid(dialog):
-            dialog.findChild(QDateEdit, "archive_start").setDate(QDate.currentDate())
-            dialog.findChild(QDateEdit, "archive_end").setDate(QDate.currentDate().addDays(-50))
+            today = date.today()
+            current = QDate(today.year, today.month, today.day)
+            dialog.findChild(QDateEdit, "archive_start").setDate(current)
+            dialog.findChild(QDateEdit, "archive_end").setDate(current.addDays(-50))
             return QDialog.DialogCode.Accepted
         with patch.object(QDialog, "exec", choose_invalid), \
                 patch.object(QMessageBox, "warning") as warning, \
