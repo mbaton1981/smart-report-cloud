@@ -27,6 +27,7 @@ from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_toke
 from web_login_throttle import SQLiteLoginThrottle
 from object_reports import register_object_reports
 from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
+from fixed_pricing import validate_fixed_storage
 from mail_intake import register_mail_intake
 import reportlab
 from reportlab.lib import colors
@@ -4553,6 +4554,7 @@ def sync_capabilities():
         "submission_types": sorted(submission_types),
         "typed_tombstones": True,
         "customer_pricing": 1,
+        "fixed_pricing": 1,
     })
 
 @app.route('/sync/push', methods=['POST'])
@@ -4568,6 +4570,7 @@ def sync_push():
     conn = get_db_connection()
     cursor = conn.cursor()
     results = []
+    touched_fixed = set()
     try:
         cursor.execute("BEGIN IMMEDIATE")
         for change in changes:
@@ -4592,6 +4595,10 @@ def sync_push():
                 raise ValueError("Некорректные данные смены.")
             cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id = ? OR request_id = ?", (sync_id, sync_id))
             existing = cursor.fetchone()
+            if existing and existing["customer_pricing"]:
+                old_fixed = json.loads(existing["customer_pricing"]).get("fixed")
+                if old_fixed:
+                    touched_fixed.add(old_fixed["id"])
             ob_result = None
 
             if operation == 'upsert':
@@ -4653,18 +4660,24 @@ def sync_push():
                     "transport": transport, "comment": comment, "invoiced": invoiced,
                     "submission_type": submission_type
                 }
-                pricing_value = payload.get("customer_pricing", existing["customer_pricing"] if existing else None)
-                if "customer_pricing" in payload or (existing and pricing_value):
-                    normalized["customer_pricing"] = pricing_json(pricing_value, normalized)
-                    if existing and existing["invoiced"] and pricing_value != existing["customer_pricing"]:
-                        if normalized["customer_pricing"] != existing["customer_pricing"]:
-                            raise ValueError("Закрытая клиентская цена защищена; сначала верните запись в работу.")
                 if ob_result:
                     normalized.update({
                         "start_time": ob_result["start_time"],
                         "end_time": ob_result["end_time"],
                         "ob_base_rate": ob_result["ob_base_rate"],
                     })
+                pricing_value = payload.get("customer_pricing", existing["customer_pricing"] if existing else None)
+                if "customer_pricing" in payload or (existing and pricing_value):
+                    normalized["customer_pricing"] = pricing_json(pricing_value, dict(normalized, sync_id=sync_id))
+                    parsed_quote = json.loads(normalized["customer_pricing"]) if normalized["customer_pricing"] else {}
+                    if parsed_quote.get("fixed"):
+                        touched_fixed.add(parsed_quote["fixed"]["id"])
+                    if existing and existing["invoiced"] and normalized["customer_pricing"] != existing["customer_pricing"]:
+                        old_quote = json.loads(existing["customer_pricing"]) if existing["customer_pricing"] else {}
+                        old_fixed = old_quote.pop("fixed", None)
+                        removing_fixed = old_fixed and not invoiced and parsed_quote == old_quote
+                        if not removing_fixed:
+                            raise ValueError("Закрытая клиентская цена защищена; сначала верните запись в работу.")
             else:
                 has_type = 'submission_type' in payload or 'record_type' in payload
                 if has_type:
@@ -4725,7 +4738,7 @@ def sync_push():
                     raise ValueError("Выставленная запись защищена; сначала верните её в работу.")
             if operation == "upsert" and normalized["invoiced"] and (not existing or not existing["invoiced"]):
                 pricing_row = dict(normalized, entry_type=submission_type,
-                                   customer_pricing=normalized.get("customer_pricing"))
+                                   sync_id=sync_id, customer_pricing=normalized.get("customer_pricing"))
                 segments = (ob_result["segments"] if ob_result else [])
                 require_final_prices(pricing_row, segments)
 
@@ -4813,6 +4826,7 @@ def sync_push():
                     replace_ob_segments(cursor, sync_id, ob_result["segments"])
             results.append({"operation_id": operation_id, "ok": True, "version": version, "change_seq": change_seq})
 
+        validate_fixed_storage(cursor, "incoming_submissions", touched_fixed)
         conn.commit()
     except (ValueError, TypeError, sqlite3.IntegrityError) as e:
         conn.rollback()

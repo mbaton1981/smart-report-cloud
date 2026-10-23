@@ -542,11 +542,182 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
     return result
 
 
+def verify_fast_pris_ram(app_module, work_dir, out_path):
+    """Exercise installed controls against an ephemeral RAM copy, never a work database."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtCore import QDate, QTimer, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QDialog, QMainWindow, QMessageBox, QPushButton, QWidget
+    from pypdf import PdfReader
+    from customer_report import write_customer_pdf
+
+    database = Path(app_module.DB_FILE).resolve(strict=True)
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    uri = f"file:fixed-acceptance-{uuid.uuid4()}?mode=memory&cache=shared"
+    master = sqlite3.connect(uri, uri=True)
+    master.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        source.backup(master)
+        before = list(source.iterdump())
+    def connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+    application = QApplication.instance() or QApplication([])
+    application.setStyleSheet(app_module.DARK_THEME_QSS)
+    messages, failures = [], []
+    result = {
+        "database": str(database), "executable": sys.executable,
+        "frozen": bool(getattr(sys, "frozen", False)), "ram_only": True,
+        "new_disk_databases": 0, "real_network_requests": 0,
+        "fixed_amount_is_diagnostic_not_a_contract": True,
+    }
+    resource = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    if (resource / "release-manifest.json").exists():
+        result["build"] = json.loads((resource / "release-manifest.json").read_text(encoding="utf-8-sig"))
+    def click(widget):
+        QTest.mouseClick(widget, Qt.MouseButton.LeftButton)
+        application.processEvents()
+        if failures:
+            raise RuntimeError("; ".join(failures))
+    def message(_parent, title, text, *_args, **_kwargs):
+        messages.append({"title": title, "text": text})
+        return QMessageBox.StandardButton.Ok
+    with patch("requests.sessions.Session.request", side_effect=RuntimeError("RAM acceptance: network forbidden")), \
+            patch.object(app_module, "get_db_connection", connection), \
+            patch.object(app_module, "REPORTS_DIR", str(work)), \
+            patch.object(app_module.os, "startfile", create=True), \
+            patch.object(QMessageBox, "information", message), \
+            patch.object(QMessageBox, "warning", message), \
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+            patch.object(sys, "excepthook", lambda kind, error, _trace: failures.append(f"{kind.__name__}: {error}")):
+        window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+        QMainWindow.__init__(window)
+        window.tab_invoice, window.tab_dagbok = QWidget(), QWidget()
+        window.setCentralWidget(window.tab_invoice)
+        window.resize(1450, 1050)
+        window.setWindowTitle("SmartReport — Fast pris — изолированная копия в памяти")
+        window.setup_invoice_tab()
+        window.setup_dagbok_tab()
+        window.setup_reporting_pages()
+        window.load_shifts_history = lambda: None
+        window.background_sync_with_cloud = lambda: None
+        window.inv_comp_cb.setCurrentText("Renatur")
+        for field in (window.inv_date_from, window.inv_date_to):
+            field.setDate(QDate(2026, 10, 21))
+        window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(39))
+        original = window.collect_invoice_report()
+        if sum(row["hours"] for row in original["journal_rows"]) != 4:
+            raise RuntimeError("Expected the existing Tomteboda 21.10 OB record (4 h).")
+        protected = {
+            name: list(map(tuple, master.execute(f'SELECT * FROM "{name}"')))
+            for name in ("balance", "employees", "objects", "ob_segments")
+            if master.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone()
+        }
+        payroll_before = original["payroll"]
+        window._set_period_invoiced(original, False)
+        for row in original["journal_rows"]:
+            quote = json.loads(row["customer_pricing"])
+            quote.update(base=None, travel=None, ob={})
+            master.execute("UPDATE shifts SET customer_pricing=? WHERE sync_id=?", (json.dumps(quote), row["sync_id"]))
+        master.commit()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        QTest.qWait(300)
+        click(window.fast_pris_check)
+        window.fast_pris_input.setText("3000")
+        report = window.generate_invoice()
+        if report["totals"]["invoice_total"] != 3000:
+            raise RuntimeError("Included unknown prices must not block the fixed package.")
+        def accept_allocation():
+            dialog = application.activeModalWidget()
+            if not isinstance(dialog, QDialog):
+                failures.append("Allocation dialog missing")
+                return
+            identifier = original["journal_rows"][0]["sync_id"]
+            box = dialog.findChild(app_module.QCheckBox, f"fixed_extra_{identifier}_travel")
+            click(box)
+            dialog.grab().save(str(work / "fixed-allocation-dialog.png"))
+            dialog.accept()
+        QTimer.singleShot(100, accept_allocation)
+        button = next(button for button in window.tab_invoice.findChildren(QPushButton)
+                      if button.text().startswith("Fast pris:"))
+        click(button)
+        close_button = next(button for button in window.tab_invoice.findChildren(QPushButton)
+                            if "Закрыть период" in button.text())
+        click(close_button)
+        if not any("транспорт" in item["text"] for item in messages):
+            raise RuntimeError("Unknown explicitly paid travel should explain why closure was blocked.")
+        if master.execute("SELECT invoiced FROM shifts WHERE id=?", (original["journal_rows"][0]["id"],)).fetchone()[0]:
+            raise RuntimeError("Unknown extra unexpectedly closed")
+        for row in original["journal_rows"]:
+            quote = json.loads(master.execute("SELECT customer_pricing FROM shifts WHERE id=?", (row["id"],)).fetchone()[0])
+            quote["travel"] = json.loads(row["customer_pricing"])["travel"]
+            master.execute("UPDATE shifts SET customer_pricing=? WHERE id=?", (json.dumps(quote), row["id"]))
+        master.commit()
+        click(close_button)
+        window.fast_pris_check.setChecked(False)
+        window.fast_pris_input.clear()
+        report = window.generate_invoice()
+        expected = 3000 + sum(
+            row["transport"] * json.loads(row["customer_pricing"])["travel"] for row in original["journal_rows"]
+        )
+        if report["totals"]["invoice_total"] != expected or report["totals"]["hours"] != 4:
+            raise RuntimeError("Saved fixed package/extras totals differ")
+        result["fixed"] = {"totals": report["totals"], "cost_lines": report["cost_lines"]}
+        window.grab().save(str(work / "fixed-installed-summary.png"))
+        window.invoice_summary_table.scrollToBottom()
+        application.processEvents()
+        window.grab().save(str(work / "fixed-installed-total.png"))
+        queued = master.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0]
+        click(close_button)
+        if master.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0] != queued:
+            raise RuntimeError("Repeated closure queued another operation")
+        pdf = work / "Fast-pris-Tomteboda-20261021.pdf"
+        report["journal_translations"] = window._collect_journal_translations(report)
+        write_customer_pdf(report, pdf, app_module.DEFAULT_FONT, app_module.DEFAULT_FONT_BOLD,
+                           window._journal_description_swedish)
+        reader = PdfReader(pdf)
+        if len(reader.pages) < 2 or "SEK" in reader.pages[-1].extract_text():
+            raise RuntimeError("PDF journal separation failed")
+        result["pdf"] = str(pdf)
+        result["pdf_pages"] = len(reader.pages)
+        if report["payroll"] != payroll_before:
+            raise RuntimeError("Payroll changed")
+        for name, rows in protected.items():
+            if list(map(tuple, master.execute(f'SELECT * FROM "{name}"'))) != rows:
+                raise RuntimeError(f"Protected table changed in RAM: {name}")
+        window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(84))
+        hotel = window.generate_invoice()
+        if hotel["totals"]["hours"] != 8:
+            raise RuntimeError("HOTEL hours differ")
+        result["combined_day_hours"] = 4 + hotel["totals"]["hours"]
+        result["unknown_extra_blocked"] = True
+        result["repeat_close_noop"] = True
+        result["payroll_and_protected_tables_unchanged"] = True
+        result["persisted_amount_read_without_checkbox"] = True
+        window.close()
+    master.close()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        if list(source.iterdump()) != before:
+            raise RuntimeError("Working database changed during RAM acceptance")
+    result["working_database_unchanged"] = True
+    result["messages"] = messages
+    Path(out_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
     if action == "approved-update-readonly":
         return verify_approved_update(app_module, work_dir, out_path)
     if action == "reports-ui-readonly":
         return verify_reports_ui_readonly(app_module, work_dir, out_path)
+    if action == "fast-pris-ram":
+        return verify_fast_pris_ram(app_module, work_dir, out_path)
     url = _require_local_server()
     import requests
     work = Path(work_dir)

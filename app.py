@@ -39,6 +39,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
 from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
+from fixed_pricing import fixed_quote, report_agreements, signature
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -3068,6 +3069,7 @@ class SmartReportApp(QMainWindow):
         vacation_sync_supported = False
         holiday_sync_supported = False
         ob_sync_supported = False
+        capability_data = {}
         schema_conn = get_db_connection()
         local_ob_enabled = ob_schema_ready(schema_conn.cursor())
         schema_conn.close()
@@ -3214,6 +3216,12 @@ class SmartReportApp(QMainWindow):
         conflicts = 0
         sync_conflict_reasons = {}
         if changes:
+            if any(
+                (json.loads(change["shift"]["customer_pricing"]) if isinstance(change["shift"].get("customer_pricing"), str)
+                 else change["shift"].get("customer_pricing") or {}).get("fixed")
+                for change in changes
+            ) and not capability_data.get("fixed_pricing"):
+                raise ValueError("Сервер не поддерживает Fast pris. Обновите сервер; локальные подтверждения сохранены.")
             pushed = requests.post(
                 f"{CLOUD_URL}/sync/push", headers=headers, json={"changes": changes}, timeout=4
             )
@@ -8134,6 +8142,15 @@ class SmartReportApp(QMainWindow):
         fast_pris_box.addWidget(self.fast_pris_check)
         fast_pris_box.addWidget(self.fast_pris_input)
         card_layout.addRow(fast_pris_box)
+        self.fast_pris_saved_note = QLabel()
+        self.fast_pris_saved_note.setWordWrap(True)
+        card_layout.addRow(self.fast_pris_saved_note)
+        fast_details = QPushButton("Fast pris: включённые работы и платные дополнения…")
+        fast_details.clicked.connect(self.configure_fast_pris)
+        card_layout.addRow(fast_details)
+        self.inv_obj_cb.currentIndexChanged.connect(self._reset_fast_pris_draft)
+        self.inv_date_from.dateChanged.connect(self._reset_fast_pris_draft)
+        self.inv_date_to.dateChanged.connect(self._reset_fast_pris_draft)
 
         btn_layout = QHBoxLayout()
         gen_btn = QPushButton("📊 Просмотр сводки и журнала")
@@ -8333,7 +8350,7 @@ class SmartReportApp(QMainWindow):
             fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
             if is_fast_pris and (not math.isfinite(fast_pris_amount) or fast_pris_amount <= 0):
                 raise ValueError("Укажите положительную фиксированную цену; стоимость не рассчитана.")
-            return {
+            report = {
                 'object_id': object_id, 'sync_id': obj_row['sync_id'], 'company': comp, 'object': obj,
                 'object_names': object_names,
                 'date_from': d_from, 'date_to': d_to, 'rows': rows,
@@ -8348,8 +8365,89 @@ class SmartReportApp(QMainWindow):
                 'journal_rows': journal_rows,
                 'journal_segments': journal_segments,
             }
+            scope = self._fixed_scope(report)
+            draft = getattr(self, "_fast_pris_draft", {})
+            report["fast_pris_extras"] = draft.get("extras", {}) if draft.get("scope") == scope else {}
+            return report
         finally:
             conn.close()
+
+    @staticmethod
+    def _fixed_scope(report):
+        return (
+            report["company"], report["sync_id"], report["date_from"], report["date_to"],
+            tuple((row["sync_id"], json.dumps(signature(row), sort_keys=True))
+                  for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")),
+        )
+
+    def _reset_fast_pris_draft(self, *_args):
+        self._fast_pris_draft = {}
+        self.fast_pris_check.setChecked(False)
+        self.fast_pris_input.clear()
+        self.fast_pris_saved_note.clear()
+
+    def configure_fast_pris(self):
+        try:
+            report = self.collect_invoice_report()
+            rows = [row for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")]
+            if not rows:
+                raise ValueError("За выбранный период нет рабочих записей.")
+            if any(row["invoiced"] for row in rows):
+                raise ValueError("Закрытые записи защищены. Их цены и состав Fast pris не изменены.")
+            if not report["is_fast_pris"]:
+                raise ValueError("Включите Fast pris и укажите фиксированную сумму.")
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Fast pris — включённые работы и дополнения")
+            dialog.resize(1000, 540)
+            layout = QVBoxLayout(dialog)
+            note = QLabel(
+                "Без отметки — входит в фиксированную сумму. Отметка — оплачивается сверх неё "
+                "по подтверждённой клиентской цене. OB — часть часов, не дополнительные часы.\n"
+                "Зарплата не меняется. Выбор и сумма сохраняются при закрытии периода."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            table = QTableWidget(len(rows), 4)
+            table.setHorizontalHeaderLabels(["Запись", "Работа — доп.", "OB — доп.", "Транспорт — доп."])
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            fields = {}
+            for index, row in enumerate(rows):
+                table.setItem(index, 0, QTableWidgetItem(
+                    f"№{row['id']} · {row['date']} · {row['employee']} · {row['hours']:g} ч"
+                ))
+                fields[row["sync_id"]] = {}
+                for column, key in enumerate(("base", "ob", "travel"), 1):
+                    box = QCheckBox("Включено")
+                    box.setObjectName(f"fixed_extra_{row['sync_id']}_{key}")
+                    box.setMaximumWidth(170)
+                    box.setStyleSheet(
+                        "QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #a0aec0; }"
+                        "QCheckBox::indicator:checked { background-color: #38a169; border: 2px solid #c6f6d5; }"
+                    )
+                    box.toggled.connect(lambda checked, field=box: field.setText(
+                        "Дополнительно" if checked else "Включено"
+                    ))
+                    box.setChecked(report["fast_pris_extras"].get(row["sync_id"], {}).get(key, False))
+                    box.setEnabled(key == "base" or (key == "ob" and row["entry_type"] == "ob")
+                                   or (key == "travel" and bool(row["transport"])))
+                    fields[row["sync_id"]][key] = box
+                    table.setCellWidget(index, column, box)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            layout.addWidget(table)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._fast_pris_draft = {
+                "scope": self._fixed_scope(report),
+                "extras": {identifier: {key: box.isChecked() for key, box in boxes.items()}
+                           for identifier, boxes in fields.items()},
+            }
+            self.generate_invoice()
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Fast pris", str(error))
 
     def _prepare_invoice_view(self, report):
         prepared_rows = []
@@ -8522,7 +8620,10 @@ class SmartReportApp(QMainWindow):
                 "eller OB-tillägg. Slutbeloppet kan inte fastställas."
             )
         if report["is_fast_pris"]:
-            note += " Fast pris inkluderar resa och OB."
+            note += (
+                " Fast pris: inkluderade poster debiteras inte igen; endast uttryckligen "
+                "markerade extraposter tillkommer."
+            )
         return note
 
     def _render_invoice_summary(self, report):
@@ -8634,6 +8735,25 @@ class SmartReportApp(QMainWindow):
         if issues:
             detail += "\nНужно подтвердить клиентские цены (зарплатные ставки не используются):\n"
             detail += "\n".join(issues)
+        if report.get("fixed_allocations"):
+            detail += "\nFast pris: без отметки «доп.» позиция включена в сумму."
+            for shift in work_rows:
+                fixed = report["fixed_allocations"].get(shift["sync_id"])
+                if fixed:
+                    extra = fixed["members"][shift["sync_id"]]["extra"]
+                    detail += (
+                        f"\n№{shift['id']} · {shift['date']}: "
+                        + "; ".join(
+                            label + (" — доп." if extra[key] else " — включено")
+                            for key, label in (("base", "работа"), ("ob", "OB"), ("travel", "транспорт"))
+                        )
+                    )
+        saved_fixed = any(row_prices(row).get("fixed") for row in work_rows)
+        self.fast_pris_saved_note.setText(
+            f"Применяется сохранённый Fast pris: {report['fast_pris_amount']:,.2f} SEK "
+            "(плюс явно выбранные дополнения). Поля выше не заменяют подтверждённую сумму."
+            if saved_fixed else ""
+        )
         self.invoice_status_note.setPlainText(detail)
         self._render_invoice_summary(report)
         self._invoice_report = report
@@ -8825,12 +8945,31 @@ class SmartReportApp(QMainWindow):
 
     def _set_period_invoiced(self, report, closed):
         selected = [row for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")]
+        groups, allocations = report_agreements(report)
+        if groups and not report["fixed_complete"]:
+            raise ValueError("Выберите весь подтверждённый состав Fast pris; часть записей отсутствует.")
+        if groups and not closed:
+            member_ids = {key for fixed in groups.values() for key in fixed["members"]}
+            if not member_ids <= {row["sync_id"] for row in selected}:
+                raise ValueError("Fast pris возвращается в работу только целиком.")
         changed = [row for row in selected if bool(row["invoiced"]) != closed]
         if not changed:
             return 0, 0.0
+        new_fixed = groups and not any(row_prices(row).get("fixed") for row in selected)
+        if new_fixed and any(row["invoiced"] for row in selected):
+            raise ValueError("Нельзя включать уже закрытые записи в новый Fast pris. Закрытые цены сохранены.")
         if closed:
-            if report["is_fast_pris"]:
-                raise ValueError("Фиксированная цена доступна для предварительного PDF. Для закрытия подтвердите исторические построчные клиентские цены.")
+            for row in changed:
+                checked = dict(row)
+                if row["sync_id"] in allocations:
+                    checked["customer_pricing"] = fixed_quote(row, allocations[row["sync_id"]])
+                try:
+                    require_final_prices(checked, report["journal_segments"].get(row["sync_id"], []))
+                except ValueError as error:
+                    raise ValueError(
+                        f"№{row['id']} · {row['date']} · {row['employee']}: {error}\n"
+                        "Закрытие не выполнено. Просмотр и предварительный PDF доступны."
+                    ) from error
             split_ok = all(
                 row["entry_type"] != "ob" or abs(
                     sum(float(segment["hours"]) for segment in report["journal_segments"].get(row["sync_id"], []))
@@ -8838,7 +8977,7 @@ class SmartReportApp(QMainWindow):
                 ) < 0.000001
                 for row in changed
             )
-            check = dict(report, journal_rows=changed, warnings=[], totals={
+            check = dict(report, journal_rows=selected if groups else changed, warnings=[], totals={
                 "without_ob_hours": 0.0 if split_ok else None, "ob_categories": {},
             })
             prepare_customer_costs(check)
@@ -8866,6 +9005,15 @@ class SmartReportApp(QMainWindow):
                 actual = cursor.execute("SELECT * FROM shifts WHERE id=?", (row["id"],)).fetchone()
                 if actual is None or dict(actual) != row:
                     raise ValueError("Записи изменились после просмотра. Обновите отчёт; статус не изменён.")
+            for row in changed:
+                fixed = allocations.get(row["sync_id"])
+                if closed and fixed:
+                    store_pricing(cursor, "shifts", row["sync_id"], fixed_quote(row, fixed))
+                elif not closed and row_prices(row).get("fixed"):
+                    quote = json.loads(row["customer_pricing"])
+                    quote.pop("fixed")
+                    cursor.execute("UPDATE shifts SET invoiced=0 WHERE id=?", (row["id"],))
+                    store_pricing(cursor, "shifts", row["sync_id"], quote)
             ids = tuple(row["id"] for row in changed)
             marks = ",".join("?" for _ in ids)
             cursor.execute(f"UPDATE shifts SET invoiced=? WHERE id IN ({marks})", (int(closed), *ids))
@@ -8880,7 +9028,7 @@ class SmartReportApp(QMainWindow):
 
     def mark_period_as_invoiced(self):
         try:
-            report = self.collect_invoice_report()
+            report = self._prepare_invoice_view(self.collect_invoice_report())
         except ValueError as error:
             QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return
@@ -8889,7 +9037,13 @@ class SmartReportApp(QMainWindow):
 
         reply = QMessageBox.question(
             self, "Подтверждение",
-            f"Отметить все смены по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b> как выставленные в счет?",
+            f"Закрыть все рабочие записи по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b>?"
+            + (
+                f"<br>Fast pris: {report['fast_pris_amount']:,.2f} SEK; "
+                f"итог с явно выбранными дополнениями: {self._invoice_value(report['totals']['invoice_total'])} SEK."
+                "<br>Включённые работа, OB и транспорт повторно не начисляются."
+                if report["is_fast_pris"] else ""
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )

@@ -2,6 +2,7 @@
 from datetime import date, datetime, timezone
 import json
 import math
+from fixed_pricing import parse_fixed
 
 
 def ensure_pricing_schema(cursor, table):
@@ -59,13 +60,16 @@ def parse_pricing(value, row):
     ob = value.get("ob", {})
     if not isinstance(ob, dict) or len(ob) > 30:
         raise ValueError("Некорректные клиентские категории OB.")
-    return {
+    result = {
         "version": 1, "company": value["company"], "object_name": value["object_name"],
         "date_from": start, "date_to": end, "source": source.strip()[:500],
         **confirmation,
         "base": checked_rate(value.get("base")), "travel": checked_rate(value.get("travel")),
         "ob": {str(key): checked_rate(rate) for key, rate in ob.items()},
     }
+    if value.get("fixed") is not None:
+        result["fixed"] = parse_fixed(value["fixed"], dict(row))
+    return result
 
 
 def pricing_json(value, row):
@@ -106,6 +110,8 @@ def fill_missing_prices(row, value):
     """Period prices fill gaps without overwriting individually agreed prices."""
     proposed = parse_pricing(value, row)
     previous = parse_pricing(row.get("customer_pricing"), row)
+    if previous and previous.get("fixed"):
+        raise ValueError("Fast pris защищён. Сначала верните весь подтверждённый период в работу.")
     existing = row_prices(row)
     merged = dict(proposed, ob=dict(proposed["ob"]))
     retained = []
@@ -139,12 +145,14 @@ def fill_missing_prices(row, value):
 
 def require_final_prices(row, segments):
     prices = row_prices(row)
+    fixed = prices.get("fixed")
+    extra = fixed["members"][row["sync_id"]]["extra"] if fixed else dict.fromkeys(("base", "ob", "travel"), True)
     missing = []
-    if prices["base"] is None:
+    if extra["base"] and prices["base"] is None:
         missing.append("работа")
-    if row.get("transport") and prices["travel"] is None:
+    if extra["travel"] and row.get("transport") and prices["travel"] is None:
         missing.append("транспорт")
-    if row["entry_type"] == "ob":
+    if row["entry_type"] == "ob" and extra["ob"]:
         if not segments or abs(sum(float(s["hours"]) for s in segments) - row["hours"]) > 0.000001:
             missing.append("распределение OB")
         for segment in segments:
@@ -170,6 +178,8 @@ def agreed_prices_for_date(cursor, table, row):
     matches = set()
     for candidate in candidates:
         raw = json.loads(candidate[0])
+        if raw.get("fixed"):
+            continue
         if raw["date_from"] <= row["date"] <= raw["date_to"]:
             matches.add(pricing_json(raw, row))
     # Conflicting historical evidence requires explicit review, not last-write guessing.

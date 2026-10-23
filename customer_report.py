@@ -6,6 +6,7 @@ import math
 import os
 from xml.sax.saxutils import escape
 from customer_pricing import row_prices
+from fixed_pricing import report_agreements
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_RIGHT
@@ -70,16 +71,28 @@ def prepare_customer_costs(report):
     travel = defaultdict(float)
     ob_costs = defaultdict(float)
     ob_intervals = defaultdict(list)
+    groups, allocations = report_agreements(report)
     trips = 0.0
+    unassigned_hours = 0.0
     for row in report["journal_rows"]:
         if row["entry_type"] not in WORK_TYPES:
             continue
         prices = row_prices(row)
-        grouped[prices["base"]] += float(row["hours"])
+        fixed = allocations.get(row["sync_id"])
         count = float(row["transport"] or 0)
-        travel[prices["travel"]] += count
         trips += count
-        if row["entry_type"] == "ob":
+        if not fixed and any(
+            agreement["date_from"] <= row["date"] <= agreement["date_to"]
+            for agreement in groups.values()
+        ):
+            unassigned_hours += float(row["hours"])
+            continue
+        extra = fixed["members"][row["sync_id"]]["extra"] if fixed else dict.fromkeys(("base", "ob", "travel"), True)
+        if extra["base"]:
+            grouped[(prices["base"], bool(fixed))] += float(row["hours"])
+        if extra["travel"]:
+            travel[(prices["travel"], bool(fixed))] += count
+        if row["entry_type"] == "ob" and extra["ob"]:
             for segment in report.get("journal_segments", {}).get(row["sync_id"], []):
                 if float(segment["premium_percent"] or 0) > 0:
                     category = segment["category"]
@@ -88,65 +101,75 @@ def prepare_customer_costs(report):
                     start, end = start_h * 60 + start_m, end_h * 60 + end_m
                     if end <= start:
                         end += 24 * 60
-                    ob_intervals[(row["employee"], category, segment["segment_date"])].append(
+                    ob_intervals[(row["employee"], category, segment["segment_date"], bool(fixed))].append(
                         (start, end, prices["ob"].get(category))
                     )
-    for (_employee, category, _day), intervals in ob_intervals.items():
+    for (_employee, category, _day, is_extra), intervals in ob_intervals.items():
         boundaries = sorted({point for start, end, _rate in intervals for point in (start, end)})
         for start, end in zip(boundaries, boundaries[1:]):
             active = {rate for left, right, rate in intervals if left <= start and right >= end}
             if active:
                 rate = next(iter(active)) if len(active) == 1 else None
-                ob_costs[(category, rate)] += (end - start) / 60
+                ob_costs[(category, rate, is_extra)] += (end - start) / 60
     lines = []
-    if report["is_fast_pris"]:
+    for fixed in groups.values():
         lines.append({
-            "label": "Fast pris (inklusive resa och OB)", "quantity": 1,
-            "unit": "st", "rate": report["fast_pris_amount"],
-            "amount": report["fast_pris_amount"],
+            "label": f"Fast pris {fixed['date_from']} – {fixed['date_to']} (inkluderade poster)",
+            "quantity": 1, "unit": "st", "rate": float(fixed["amount"]),
+            "amount": float(fixed["amount"]) if report["fixed_complete"] else None,
         })
-    else:
-        for rate, hours in sorted(grouped.items(), key=lambda item: (item[0] is None, item[0] or 0)):
+    if unassigned_hours:
+        lines.append({
+            "label": "Nya poster utanför bekräftat fast pris – kräver separat beslut",
+            "quantity": unassigned_hours, "unit": "h", "rate": None, "amount": None,
+        })
+        report.setdefault("warnings", []).append(
+            "Nya poster ingår inte automatiskt i fast pris och debiteras inte automatiskt som extra."
+        )
+    for (rate, is_extra), hours in sorted(grouped.items(), key=lambda item: (item[0][0] is None, item[0][0] or 0, item[0][1])):
+        lines.append({
+            "label": "Arbete" + (" – extra utöver fast pris" if is_extra else ""),
+            "quantity": hours, "unit": "h", "rate": rate, "amount": money(hours, rate),
+        })
+    for (category, rate, is_extra), hours in sorted(
+        ob_costs.items(), key=lambda item: (item[0][0], item[0][1] is None, item[0][1] or 0, item[0][2])
+    ):
+        if hours:
             lines.append({
-                "label": "Arbete", "quantity": hours, "unit": "h",
-                "rate": rate, "amount": money(hours, rate),
+                "label": CATEGORY_LABELS.get(category, "Övrig OB") + " – tillägg"
+                + (" utöver fast pris" if is_extra else ""),
+                "quantity": hours, "unit": "h", "rate": rate, "amount": money(hours, rate),
             })
-        for (category, rate), hours in sorted(
-            ob_costs.items(), key=lambda item: (item[0][0], item[0][1] is None, item[0][1] or 0)
-        ):
-            if hours:
-                lines.append({
-                    "label": CATEGORY_LABELS.get(category, "Övrig OB") + " – tillägg",
-                    "quantity": hours, "unit": "h", "rate": rate, "amount": money(hours, rate),
-                })
-        if report["totals"]["without_ob_hours"] is None:
+    unknown_ob_billable = report["totals"]["without_ob_hours"] is None and any(
+        row["entry_type"] == "ob" and (
+            row["sync_id"] not in allocations
+            or allocations[row["sync_id"]]["members"][row["sync_id"]]["extra"]["ob"]
+        ) for row in report["journal_rows"]
+    )
+    if unknown_ob_billable:
+        lines.append({
+            "label": "OB – fördelning ej verifierad", "quantity": None,
+            "unit": "h", "rate": None, "amount": None,
+        })
+    for (travel_rate, is_extra), count in sorted(travel.items(), key=lambda item: (item[0][0] is None, item[0][0] or 0, item[0][1])):
+        if count:
             lines.append({
-                "label": "OB – fördelning ej verifierad", "quantity": None,
-                "unit": "h", "rate": None, "amount": None,
-            })
-        for travel_rate, count in sorted(travel.items(), key=lambda item: (item[0] is None, item[0] or 0)):
-            if not count:
-                continue
-            lines.append({
-                "label": "Resa", "quantity": count, "unit": "st",
+                "label": "Resa" + (" – extra utöver fast pris" if is_extra else ""),
+                "quantity": count, "unit": "st",
                 "rate": travel_rate, "amount": money(count, travel_rate),
             })
     totals = report["totals"]
     totals["work_amount"] = sum(
         line["amount"] or 0 for line in lines
-        if line["label"] == "Arbete" or report["is_fast_pris"]
+        if line["label"].startswith(("Arbete", "Fast pris"))
     )
-    if any(line["amount"] is None for line in lines if line["label"] == "Arbete"):
+    if any(line["amount"] is None for line in lines if line["label"].startswith(("Arbete", "Fast pris"))):
         totals["work_amount"] = None
     def component(prefix):
         selected = [line["amount"] for line in lines if line["label"].startswith(prefix)]
         return sum(selected) if all(value is not None for value in selected) else None
     totals["transport_amount"] = component("Resa")
-    totals["ob_amount"] = (
-        None if report["is_fast_pris"] and (
-            totals["without_ob_hours"] is None or any(totals["ob_categories"].values())
-        ) else component("OB")
-    )
+    totals["ob_amount"] = None if totals["without_ob_hours"] is None else component("OB")
     known_values = [Decimal(str(line["amount"])) for line in lines if line["amount"] is not None]
     unknown = any(line["amount"] is None for line in lines)
     known = float(sum(known_values)) if known_values or not unknown else None
@@ -271,6 +294,21 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
             total=True, numeric=tuple(range(1, len(categories) + 2)),
         ))
         story.append(paragraph("OB-timmar ingår i arbetade timmar och läggs inte till."))
+        if report.get("fixed_agreements"):
+            story.append(paragraph(
+                "Fast pris omfattar inkluderade poster. Endast uttryckligen markerade "
+                "extraposter debiteras utöver paketet."
+            ))
+            included = [["Datum / medarbetare", "Arbete", "OB", "Resa"]]
+            for row in report["journal_rows"]:
+                fixed = report["fixed_allocations"].get(row["sync_id"])
+                if fixed:
+                    extra = fixed["members"][row["sync_id"]]["extra"]
+                    included.append([
+                        f"{row['date']} / {row['employee']}",
+                        *["Extra" if extra[key] else "Ingår" for key in ("base", "ob", "travel")],
+                    ])
+            story.append(table(included, [available * .55] + [available * .15] * 3))
         story.append(Spacer(1, 10))
         costs = [["Position", "Antal", "Pris (SEK)", "Belopp (SEK)"]]
         for line in report["cost_lines"]:
