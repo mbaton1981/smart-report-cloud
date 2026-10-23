@@ -43,6 +43,7 @@ from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
 import employee_cards
+import desktop_theme
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -2262,7 +2263,7 @@ class SmartReportApp(QMainWindow):
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
         self.resize(1240, 880)
-        self.setStyleSheet(DARK_THEME_QSS)
+        desktop_theme.ensure_theme(DARK_THEME_QSS)
         self._async_expense_reads = True
         self._expense_read_cache = {}
         self._expense_read_attempts = {}
@@ -2285,6 +2286,7 @@ class SmartReportApp(QMainWindow):
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.addWidget(desktop_theme.header(self))
 
         self.tabs = QTabWidget()
         self.tabs.setUsesScrollButtons(True)
@@ -2428,7 +2430,7 @@ class SmartReportApp(QMainWindow):
         
         control_card = QFrame()
         control_card.setObjectName("card")
-        control_card.setStyleSheet("QFrame#card { background-color: #242933; border: 1px solid #3182ce; border-radius: 8px; margin-top: 5px; }")
+        desktop_theme.apply_style(control_card, "QFrame#card { background-color: #242933; border: 1px solid #3182ce; border-radius: 8px; margin-top: 5px; }")
         c_layout = QVBoxLayout(control_card)
         c_layout.setSpacing(8)
 
@@ -3633,7 +3635,7 @@ class SmartReportApp(QMainWindow):
         layout = QVBoxLayout(self.tab_salary)
         total_card = QFrame()
         total_card.setObjectName("card")
-        total_card.setStyleSheet("QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; margin-bottom: 5px; }")
+        desktop_theme.apply_style(total_card, "QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; margin-bottom: 5px; }")
         t_layout = QHBoxLayout(total_card)
         t_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         
@@ -4231,17 +4233,17 @@ class SmartReportApp(QMainWindow):
 
         total_card = QFrame()
         total_card.setObjectName("card")
-        total_card.setStyleSheet("QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; }")
+        desktop_theme.apply_style(total_card, "QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; }")
         
         total_layout = QVBoxLayout(total_card)
         total_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         total_title = QLabel("💰 ОБЩИЙ ИТОГ (БАЛАНС ПО ВСЕМ СОТРУДНИКАМ):")
         total_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        total_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #63b3ed; border: none;")
+        desktop_theme.apply_style(total_title, "font-size: 13px; font-weight: bold; color: #63b3ed; border: none;")
         
         self.total_sum_label = QLabel("0.00 kr")
         self.total_sum_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.total_sum_label.setStyleSheet("font-size: 26px; font-weight: bold; color: #ffffff; border: none;")
+        desktop_theme.apply_style(self.total_sum_label, "font-size: 26px; font-weight: bold; color: #ffffff; border: none;")
         
         total_layout.addWidget(total_title)
         total_layout.addWidget(self.total_sum_label)
@@ -6262,7 +6264,7 @@ class SmartReportApp(QMainWindow):
             cell.addWidget(QLabel(title))
             value = QLabel("—")
             value.setWordWrap(True)
-            value.setStyleSheet("font-weight: bold; color: #63b3ed; border: none;")
+            desktop_theme.apply_style(value, "font-weight: bold; color: #63b3ed; border: none;")
             cell.addWidget(value)
             row.addLayout(cell, 1)
             labels[key] = value
@@ -6596,7 +6598,7 @@ class SmartReportApp(QMainWindow):
             value = QLabel("—")
             value.setWordWrap(True)
             value.setToolTip(label)
-            value.setStyleSheet("font-weight: bold; color: #63b3ed; border: none;")
+            desktop_theme.apply_style(value, "font-weight: bold; color: #63b3ed; border: none;")
             setattr(self, attribute, value)
             totals_row.addWidget(QLabel(f"{label}:"))
             totals_row.addWidget(value)
@@ -8256,7 +8258,7 @@ class SmartReportApp(QMainWindow):
 
         fast_pris_box = QHBoxLayout()
         self.fast_pris_check = QCheckBox("📌 Фиксированная цена за объект (Fast pris)")
-        self.fast_pris_check.setStyleSheet("color: #63b3ed; font-weight: bold;")
+        desktop_theme.apply_style(self.fast_pris_check, "color: #63b3ed; font-weight: bold;")
         self.fast_pris_input = QLineEdit()
         self.fast_pris_input.setPlaceholderText("Сумма без НДС (SEK)")
         self.fast_pris_input.setEnabled(False)
@@ -8280,11 +8282,11 @@ class SmartReportApp(QMainWindow):
         gen_btn.clicked.connect(self.generate_invoice)
         
         export_pdf_inv_btn = QPushButton("📄 Сформировать общий PDF (SV)")
-        export_pdf_inv_btn.setStyleSheet("background-color: #2b6cb0; border-color: #4299e1;")
+        export_pdf_inv_btn.setObjectName("primaryAction")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
         
         mark_invoiced_btn = QPushButton("✅ Закрыть период")
-        mark_invoiced_btn.setStyleSheet("background-color: #276749; border-color: #38a169;")
+        mark_invoiced_btn.setObjectName("successAction")
         mark_invoiced_btn.clicked.connect(self.mark_period_as_invoiced)
 
         unmark_invoiced_btn = QPushButton("❌ Вернуть в работу")
@@ -8547,7 +8549,7 @@ class SmartReportApp(QMainWindow):
                     box = QCheckBox("Включено")
                     box.setObjectName(f"fixed_extra_{row['sync_id']}_{key}")
                     box.setMaximumWidth(170)
-                    box.setStyleSheet(
+                    desktop_theme.apply_style(box,
                         "QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #a0aec0; }"
                         "QCheckBox::indicator:checked { background-color: #38a169; border: 2px solid #c6f6d5; }"
                     )
@@ -8837,7 +8839,7 @@ class SmartReportApp(QMainWindow):
             for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
                 if row["status"].startswith("✅ Выставлен"):
-                    it.setBackground(QColor("#1c4532"))
+                    desktop_theme.item_color(it, "#1c4532")
                 related = [shift for shift in report["journal_rows"] if shift["employee"] == row["employee"]
                            and shift["entry_type"] in ("work", "ob")]
                 it.setToolTip("\n".join(
@@ -9574,7 +9576,7 @@ class SmartReportApp(QMainWindow):
             "QCheckBox::indicator:checked { background-color: #3182CE; border-color: #90CDF4; }"
         )
         self.show_inactive_employees_check = QCheckBox("Показать неактивных")
-        self.show_inactive_employees_check.setStyleSheet(archive_filter_style)
+        desktop_theme.apply_style(self.show_inactive_employees_check, archive_filter_style)
         self.show_inactive_employees_check.setChecked(False)
         self.show_inactive_employees_check.toggled.connect(self.load_employees_table)
         self.employee_counts_label = QLabel()
@@ -9632,7 +9634,7 @@ class SmartReportApp(QMainWindow):
 
         object_view_layout = QHBoxLayout()
         self.show_archived_objects_check = QCheckBox("Показать архив")
-        self.show_archived_objects_check.setStyleSheet(archive_filter_style)
+        desktop_theme.apply_style(self.show_archived_objects_check, archive_filter_style)
         self.show_archived_objects_check.setChecked(False)
         self.show_archived_objects_check.toggled.connect(self.load_objects_table)
         self.object_counts_label = QLabel()
@@ -10143,8 +10145,8 @@ class SmartReportApp(QMainWindow):
             if not row[6]:
                 for column in range(self.table_objects.columnCount()):
                     cell = self.table_objects.item(row_idx, column)
-                    cell.setForeground(QColor("#A0AEC0"))
-                    cell.setBackground(QColor("#2D3748"))
+                    desktop_theme.item_color(cell, "#A0AEC0", foreground=True)
+                    desktop_theme.item_color(cell, "#2D3748")
             if selected_object_id is not None and int(row[0]) == int(selected_object_id):
                 self.table_objects.selectRow(row_idx)
 
@@ -10281,9 +10283,9 @@ class SmartReportApp(QMainWindow):
             pin_text = "Неизвестно" if has_pin is None else "Задан" if has_pin else "Не задан"
             pin_item = QTableWidgetItem(pin_text)
             if has_pin:
-                pin_item.setForeground(QColor("#68D391"))
+                desktop_theme.item_color(pin_item, "#68D391", foreground=True)
             elif has_pin is False:
-                pin_item.setForeground(QColor("#F6AD55"))
+                desktop_theme.item_color(pin_item, "#F6AD55", foreground=True)
             self.table_employees.setItem(row_idx, 3, pin_item)
             if self.table_employees.columnCount() >= 5:
                 state = card_states.get(employee_sync_key(name))
@@ -10295,8 +10297,8 @@ class SmartReportApp(QMainWindow):
             if not is_active:
                 for column in range(self.table_employees.columnCount()):
                     cell = self.table_employees.item(row_idx, column)
-                    cell.setForeground(QColor("#A0AEC0"))
-                    cell.setBackground(QColor("#2D3748"))
+                    desktop_theme.item_color(cell, "#A0AEC0", foreground=True)
+                    desktop_theme.item_color(cell, "#2D3748")
             if selected_employee_id is not None and employee_id == int(selected_employee_id):
                 self.table_employees.selectRow(row_idx)
         self.update_employee_status_action()
@@ -10663,7 +10665,7 @@ class SmartReportApp(QMainWindow):
                     elif col_idx in (2, 3, 4, 7, 10) and val:
                         it.setToolTip(str(val))
                     if is_inv:
-                        it.setBackground(QColor("#1c4532"))
+                        desktop_theme.item_color(it, "#1c4532")
                     self.table_shifts.setItem(row_idx, col_idx, it)
             self.load_dropdowns()
             self.apply_shifts_filters()
@@ -11175,7 +11177,7 @@ if __name__ == "__main__":
                 sys.exit(1)
             sys.exit(0)
         app = QApplication(sys.argv)
-        app.setStyleSheet(DARK_THEME_QSS)
+        desktop_theme.ensure_theme(DARK_THEME_QSS)
         resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         icon_path = next((p for p in (resource_dir / "Logo.ico", Path("logo.ico")) if p.exists()), None)
         if icon_path:

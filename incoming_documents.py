@@ -567,7 +567,8 @@ def open_incoming(host, root):
         text, green = store.accounting_status(window.document_id)
         if store.card(window.document_id):
             window.status.setText(text)
-            window.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
+            from desktop_theme import apply_style
+            apply_style(window.status, "background:#1c4532;color:#68d391;padding:6px" if green else "")
         window.refresh_document_labels(server_changed=store.card(window.document_id) is not None)
 
     window.status_timer.timeout.connect(update_status)

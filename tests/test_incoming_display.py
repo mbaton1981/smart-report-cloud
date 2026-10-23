@@ -96,6 +96,8 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("Учтён на объекте", index.data())
         self.assertEqual(index.data(self.desktop.Qt.ItemDataRole.ForegroundRole), QColor("#12351f"))
         delegate = window.selector.view().itemDelegate()
+        from offline_review_ui import IncomingDocumentDelegate
+        self.assertIsInstance(delegate, IncomingDocumentDelegate)
 
         def luminance(color):
             def linear(value):
@@ -116,8 +118,9 @@ class IncomingDisplayTests(unittest.TestCase):
                           QPalette.ColorGroup.Disabled):
                 foreground = option.palette.color(group, QPalette.ColorRole.HighlightedText)
                 background = option.palette.color(group, QPalette.ColorRole.Highlight)
-                contrast = (luminance(background) + 0.05) / (luminance(foreground) + 0.05)
-                self.assertGreaterEqual(contrast, 7)
+                darker, lighter = sorted((luminance(background), luminance(foreground)))
+                contrast = (lighter + 0.05) / (darker + 0.05)
+                self.assertGreaterEqual(contrast, 7, (foreground.name(), background.name()))
         self.assertEqual(list(self.store.conn.iterdump()), before)
 
     def test_idle_refresh_does_not_reparse_or_read_documents_or_rerender_pdf(self):

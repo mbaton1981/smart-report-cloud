@@ -149,7 +149,8 @@ class ObjectCostTests(unittest.TestCase):
             self.host.incoming_register_snapshot = self.documents
             window.select_document()
             self.assertEqual(window.status.text(), "Учтён на объекте")
-            self.assertIn("#b9efc6", window.status.styleSheet())
+            from desktop_theme import color
+            self.assertIn(color("#1c4532").name(), window.status.styleSheet())
             self.assertFalse(window.transfer_button.isEnabled())
             self.assertTrue(window.reassign_button.isEnabled())
         finally:

@@ -400,6 +400,8 @@ class AccountantDirectory(QDialog):
         self.client = CardClient()
         self.records = []
         layout = QVBoxLayout(self)
+        from desktop_theme import header
+        layout.addWidget(header(self))
         layout.addWidget(QLabel("Доступ только к карточкам сотрудников. Смены, зарплатные расчёты и «Баланс» недоступны."))
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["ФИО", "Статус", "Данные"])

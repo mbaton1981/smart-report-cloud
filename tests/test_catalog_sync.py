@@ -2141,6 +2141,7 @@ class CatalogSyncTests(unittest.TestCase):
         from desktop_ui import TableDelegate
         table = self.desktop.QTableWidget(0, 2)
         table.setHorizontalHeaderLabels(["Объект", "Сумма (SEK)"])
+        table.resize(640, 360)
         try:
             table.show()
             self.qt_app.processEvents()

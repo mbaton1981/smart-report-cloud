@@ -55,6 +55,59 @@ def verify_pdf_save_ram(app_module, work_dir, out_path):
     return 0
 
 
+def verify_theme_ram(app_module, work_dir, case, out_path):
+    """Verify frozen live switching and preference persistence without a database."""
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLineEdit, QTableWidgetItem
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QFontInfo
+    from employee_cards_ui import EmployeeCardDialog
+    import employee_cards
+    import desktop_theme
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    application = QApplication.instance() or QApplication([])
+    manager = desktop_theme.ensure_theme(app_module.DARK_THEME_QSS)
+    loaded = manager.name
+    if case in {"dark", "light"} and loaded != case:
+        raise AssertionError(f"Stored theme mismatch: expected {case}, got {loaded}")
+    window = QMainWindow()
+    panel = QWidget()
+    window.setCentralWidget(panel)
+    layout = QVBoxLayout(panel)
+    layout.addWidget(desktop_theme.header(window))
+    field = QLineEdit("Synthetic 00100")
+    layout.addWidget(field)
+    record = dict(id=123, name="Synthetic Employee", salary_rate=200, is_active=True,
+                  card=employee_cards.empty_card(), card_version=0, employee_revision=0)
+    dialog = EmployeeCardDialog(None, record, parent=window)
+    window.resize(900, 320)
+    window.show()
+    exercised = []
+    try:
+        if case not in {"dark", "light"}:
+            for name in ("light", "dark"):
+                if manager.name != name and not manager.toggle():
+                    raise AssertionError("Theme preference could not be saved")
+                application.processEvents()
+                window.grab().save(str(work / (name + ".png")))
+                dialog.show()
+                application.processEvents()
+                dialog.grab().save(str(work / (name + "-card.png")))
+                dialog.hide()
+                exercised.append(name)
+            if not manager.settings_path.is_file():
+                raise AssertionError("Theme preference was not persisted")
+        proof = dict(frozen=bool(getattr(sys, "frozen", False)), loaded_theme=loaded, saved_theme=manager.name,
+                     exercised=exercised, database_opened=False, server_contacted=False,
+                     field_unchanged=field.text() == "Synthetic 00100",
+                     ui_font=QFontInfo(field.font()).family())
+        Path(out_path).write_text(json.dumps(proof, indent=2), encoding="utf-8")
+    finally:
+        dialog.close()
+        window.close()
+    return 0
+
+
 def verify_approved_update(app_module, work_dir, out_path):
     """Inspect an existing approved profile without startup migrations or network."""
     from contextlib import closing
@@ -1454,6 +1507,8 @@ def verify_new_shift_prices_ram(app_module, work_dir, out_path):
 def run(app_module, action, work_dir, case="case", out_path=None):
     if action == "pdf-save-ram":
         return verify_pdf_save_ram(app_module, work_dir, out_path)
+    if action == "theme-ram":
+        return verify_theme_ram(app_module, work_dir, case, out_path)
     if action == "new-shift-prices-ram":
         return verify_new_shift_prices_ram(app_module, work_dir, out_path)
     if action == "employee-cards-local":

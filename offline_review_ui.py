@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from document_preview import DocumentGalleryDialog
 from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
+import desktop_theme
 
 
 LABELS = {
@@ -45,12 +46,22 @@ class IncomingDocumentDelegate(QStyledItemDelegate):
         elif hovered:
             background = QColor("#a9dfba" if accounted else "#e2edf7")
         foreground = QColor("#12351f" if accounted else "#17202a")
+        manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+        if manager is not None and manager.name == "dark":
+            background = QColor("#1c4532" if accounted else "#28303d")
+            if selected:
+                background = QColor("#28573d" if accounted else "#2d567c")
+            elif hovered:
+                background = QColor("#224e38" if accounted else "#303c4b")
+            foreground = QColor("#c6f6d5" if accounted else "#e2e8f0")
         option.backgroundBrush = QBrush(background)
+        palette = QPalette(option.palette)
         for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive, QPalette.ColorGroup.Disabled):
-            option.palette.setColor(group, QPalette.ColorRole.Text, foreground)
-            option.palette.setColor(group, QPalette.ColorRole.HighlightedText, foreground)
-            option.palette.setColor(group, QPalette.ColorRole.Base, background)
-            option.palette.setColor(group, QPalette.ColorRole.Highlight, background)
+            palette.setColor(group, QPalette.ColorRole.Text, foreground)
+            palette.setColor(group, QPalette.ColorRole.HighlightedText, foreground)
+            palette.setColor(group, QPalette.ColorRole.Base, background)
+            palette.setColor(group, QPalette.ColorRole.Highlight, background)
+        option.palette = palette
 
 
 class OfflineReviewWindow(QDialog):
@@ -74,12 +85,12 @@ class OfflineReviewWindow(QDialog):
         layout.addWidget(banner)
         self.selector = QComboBox()
         if integrated:
-            self.selector.view().setItemDelegate(IncomingDocumentDelegate(self.selector.view()))
+            self.selector._smartreport_delegate = IncomingDocumentDelegate(self.selector.view())
             self.selector.view().setMouseTracking(True)
-            self.selector.setStyleSheet(
-                "QComboBox { background: #f7fafc; color: #17202a; }"
-                "QComboBox QAbstractItemView { background: #f7fafc; color: #17202a;"
-                " selection-background-color: #92cfaa; selection-color: #12351f; }"
+            desktop_theme.apply_style(self.selector,
+                "QComboBox { background: #28303d; color: #e2e8f0; }"
+                "QComboBox QAbstractItemView { background: #28303d; color: #e2e8f0;"
+                " selection-background-color: #2b6cb0; selection-color: #ffffff; }"
             )
         self._label_signatures = {}
         self._label_token = None
@@ -404,7 +415,7 @@ class OfflineReviewWindow(QDialog):
         self.status.setText(labels[action])
         if action in ("ignore", "later") and self.payload() != self.loaded_payload:
             self.status.setText(labels[action] + ". Несохранённые правки полей не применены.")
-        self.status.setStyleSheet("")
+        desktop_theme.apply_style(self.status, "")
 
     def update_action_controls(self):
         if not self.integrated or self.document_id is None:
@@ -650,7 +661,7 @@ class OfflineReviewWindow(QDialog):
         if self.integrated:
             text, green = self.store.accounting_status(self.document_id)
             self.status.setText(text)
-            self.status.setStyleSheet("background:#b9efc6;color:#14552b;padding:6px" if green else "")
+            desktop_theme.apply_style(self.status, "background:#1c4532;color:#68d391;padding:6px" if green else "")
             self.update_action_controls()
         self.refresh_document_labels()
 
