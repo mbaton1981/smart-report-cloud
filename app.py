@@ -3645,6 +3645,12 @@ class SmartReportApp(QMainWindow):
         self.sal_report_mode.addItem("Часы бухгалтеру / ориентировочный расчёт", "management")
         self.sal_report_mode.addItem("Сохранённые расчёты / зарплатная история", "history")
         card_layout.addWidget(self.sal_report_mode)
+        employee_layout = QHBoxLayout()
+        employee_layout.addWidget(QLabel("Сотрудник:"))
+        self.sal_employee_filter = QComboBox()
+        self.sal_employee_filter.addItem("Все сотрудники", None)
+        employee_layout.addWidget(self.sal_employee_filter, 1)
+        card_layout.addLayout(employee_layout)
         period_layout.addWidget(QLabel("<b>Период:</b>"))
         self.sal_date_from = create_date_field("2026-10-01")
         self.sal_date_to = create_date_field("2026-10-31")
@@ -3761,6 +3767,7 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(self.table_salary)
         QTimer.singleShot(0, self.resize_salary_table_columns)
         self.sal_report_mode.currentIndexChanged.connect(self.on_salary_report_mode_changed)
+        self.sal_employee_filter.currentIndexChanged.connect(lambda: self.load_salary_table_template())
 
     def on_salary_report_mode_changed(self):
         self.sal_history_parameters.setVisible(not payroll_ui.management_mode(self))

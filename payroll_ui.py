@@ -31,11 +31,57 @@ HISTORY_HEADERS = [
     "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)", "Semestertimmar\ntim", "Röda dagar\ntim",
 ]
 MANAGEMENT_HEADERS = [
-    "Сотрудник", "Всего\nотработано, ч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
-    "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB не\nопределён, ч", "Сверх нормы\nсправочно, ч",
-    "Текущая зарпл.\nставка, SEK/ч", "База\nориентир, SEK", "Надбавки OB\nориентир, SEK",
-    "Итого\nориентир, SEK", "ATF, ч", "Больничные, ч", "Отпуск, ч", "Нерабочие\nпраздники, ч",
+    "ФИО", "Отработано,\nч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
+    "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB не\nопределён, ч", "Зарплата за период\nориентир, SEK",
+    "ATF, ч", "Больничные, ч", "Отпуск, ч", "Нерабочие\nпраздники, ч",
 ]
+
+ABSENCE_KEYS = ("atf", "sick", "vacation", "holiday")
+
+
+def employee_filter(window, items):
+    control = getattr(window, "sal_employee_filter", None)
+    employee = control.currentData() if control is not None else None
+    return [item for item in items if employee is None or item["employee"] == employee]
+
+
+def refresh_employees(window, cursor):
+    control = getattr(window, "sal_employee_filter", None)
+    if control is None:
+        return
+    selected = control.currentData()
+    names = {r[0] for r in cursor.execute("SELECT name FROM employees UNION SELECT employee FROM shifts")}
+    _, _, periods = history.state(history.events(cursor))
+    names.update(name for name, _, _ in periods)
+    if selected is not None:
+        names.add(selected)
+    control.blockSignals(True)
+    try:
+        control.clear()
+        control.addItem("Все сотрудники", None)
+        for name in sorted(names):
+            control.addItem(name, name)
+        control.setCurrentIndex(max(0, control.findData(selected)))
+    finally:
+        control.blockSignals(False)
+
+
+def summary_values(report):
+    return [report["employee"], f"{report['worked']:g}",
+            *[f"{report['categories'][key]:g}" for key in management.CATEGORIES],
+            summary_money(report["total"]),
+            *[f"{report['absence'][key]:g}" for key in ABSENCE_KEYS]]
+
+
+def summary_money(value):
+    return "Не определено" if value is None else f"{value:,.2f}"
+
+
+def summary_total(items):
+    return dict(employee="ИТОГО", worked=sum(r["worked"] for r in items),
+                categories={k: sum(r["categories"][k] for r in items) for k in management.CATEGORIES},
+                total=None if any(r["total"] is None for r in items) else history.money(sum(r["total"] for r in items)),
+                absence={k: sum(r["absence"][k] for r in items) for k in ABSENCE_KEYS})
 
 
 def management_mode(window):
@@ -48,8 +94,10 @@ def selected_reports(window, app):
         return reports(window, app)
     conn = app.get_db_connection()
     try:
-        return management.reports(conn.cursor(), window.sal_date_from.text(), window.sal_date_to.text(),
-                                  app.swedish_public_holidays, app.swedish_workday_norm)
+        refresh_employees(window, conn.cursor())
+        items = management.reports(conn.cursor(), window.sal_date_from.text(), window.sal_date_to.text(),
+                                   app.swedish_public_holidays, app.swedish_workday_norm)
+        return employee_filter(window, items)
     finally:
         conn.close()
 
@@ -77,24 +125,23 @@ def render_management(window, app):
     try:
         table.setColumnCount(len(MANAGEMENT_HEADERS))
         table.setHorizontalHeaderLabels(MANAGEMENT_HEADERS)
-        table.setRowCount(len(items))
-        for index, report in enumerate(items):
-            values = [
-                report["employee"], f"{report['worked']:g}",
-                *[f"{report['categories'][key]:g}" for key in management.CATEGORIES],
-                f"{report['above_norm']:g}",
-                *[management_number(report[key]) for key in ("rate", "base", "premium", "total")],
-                *[f"{report['absence'][key]:g}" for key in ("atf", "sick", "vacation", "holiday")],
-            ]
+        table.setRowCount(len(items)+1)
+        for index, report in enumerate([*items, summary_total(items)]):
+            values = summary_values(report)
             warnings = "\n".join(f"{l['date']} · {l['object_name']} · {l['sync_id']}: {w}"
-                                 for l in report["lines"] for w in l["warnings"])
+                                 for l in report.get("lines", []) for w in l["warnings"])
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip(management_description(report)+"\n"+warnings)
+                item.setToolTip((management_description(report) if "lines" in report else "Итог выбранных сотрудников")+"\n"+warnings)
+                if index == len(items):
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
                 table.setItem(index, column, item)
         for column in range(table.columnCount()):
             table.setColumnWidth(column, 150 if column == 0 else 125)
+            table.setColumnHidden(column, column >= 9 and not any(r["absence"][ABSENCE_KEYS[column-9]] for r in items))
         table.resizeRowsToContents()
     finally:
         table.blockSignals(False)
@@ -105,12 +152,10 @@ def render_management(window, app):
     window.sal_summary_vacation_lbl.setText(f"Отпуск: {sum(r['absence']['vacation'] for r in items):g} ч")
     known = sum(r["total"] for r in items if r["total"] is not None)
     incomplete = any(r["total"] is None for r in items)
-    window.sal_summary_net_lbl.setText("Итого: не определено (см. базу/OB)" if incomplete else f"Ориентировочно: {known:,.2f} SEK")
+    window.sal_summary_net_lbl.setText("Итого: не определено" if incomplete else f"Ориентировочно: {known:,.2f} SEK")
     window.sal_summary_employer_lbl.setText("Официальное начисление: Fortnox")
     window.payroll_history_note.setText(
-        management.NOTICE + ". Экспорт часов не требует подтверждения ставок или закрытия.\n" +
-        "OB — часть общих часов. Неизвестная разбивка/сумма отмечена, а не заменена нулём. " +
-        "«Сверх нормы» не означает сверхурочные; ATF — отдельно. Сохранённые расчёты доступны в другом режиме.")
+        management.NOTICE + ". OB входит в общие часы; неизвестная сумма не равна нулю.")
 
 
 def enabled(cursor):
@@ -139,6 +184,7 @@ def reports(window, app):
     conn = app.get_db_connection()
     try:
         cursor = conn.cursor()
+        refresh_employees(window, cursor)
         entries = history.events(cursor)
         start, end = window.sal_date_from.text(), window.sal_date_to.text()
         employees = {r[0] for r in cursor.execute(
@@ -159,7 +205,7 @@ def reports(window, app):
                                                    if l["kind"] in ("work", "ob")) -
                                            app.swedish_workday_norm(start, end))
             result.append(report)
-        return result
+        return employee_filter(window, result)
     finally:
         conn.close()
 
@@ -183,7 +229,10 @@ def render(window, app):
     items = reports(window, app)
     window.table_salary.blockSignals(True)
     try:
+        window.table_salary.setColumnCount(len(HISTORY_HEADERS))
         window.table_salary.setHorizontalHeaderLabels(HISTORY_HEADERS)
+        for column in range(len(HISTORY_HEADERS)):
+            window.table_salary.setColumnHidden(column, False)
         window.table_salary.setRowCount(len(items))
         for index, report in enumerate(items):
             lines = report["lines"]
@@ -526,46 +575,36 @@ def write_pdf(path, items, font, bold):
 
 
 def write_management_pdf(path, items, font, bold):
-    style = ParagraphStyle("management", fontName=font, fontSize=8, leading=11)
+    style = ParagraphStyle("management", fontName=font, fontSize=9, leading=12)
     heading = ParagraphStyle("management-heading", parent=style, fontName=bold, fontSize=13, leading=16)
     def p(text):
         return Paragraph(escape(str(text)), style)
-    story = []
-    for index, report in enumerate(items):
-        if index:
-            story.append(PageBreak())
-        story.extend([Paragraph("Часы бухгалтеру / Timmar till bokföring", heading),
-                      p(report["employee"]), p(f"{report['date_from']} — {report['date_to']}"),
-                      p(management_description(report)), p(f"Правила: {report['rules_version']}"),
-                      Spacer(1, 8), p(f"Всего отработано: {report['worked']:g} ч"),
-                      p(" · ".join(f"{management.LABELS[k]}: {report['categories'][k]:g} ч"
-                                   for k in management.CATEGORIES)),
-                      p(f"Сверх нормы (справочно, не сверхурочные): {report['above_norm']:g} ч"),
-                      p(" · ".join(f"{label}: {report['absence'][key]:g} ч" for key, label in (
-                          ("atf", "ATF"), ("sick", "Больничные"), ("vacation", "Отпуск"),
-                          ("holiday", "Нерабочие праздники")))),
-                      p(f"Текущая зарплатная ставка: {management_number(report['rate'])} SEK/ч"),
-                      p(f"База: {management_number(report['base'])} SEK · "
-                        f"Надбавки OB: {management_number(report['premium'])} SEK · "
-                        f"Итого ориентировочно: {management_number(report['total'])} SEK"), Spacer(1, 8)])
-        rows = [[p(v) for v in ("Дата / объект / запись", "Всего ч", "Разбивка часов (не прибавлять к итогу)",
-                                "База SEK", "OB SEK", "Итого SEK")]]
-        for line in report["lines"]:
-            if line["kind"] in ("work", "ob"):
-                details = " · ".join(f"{s['date']} {management.LABELS[s['category']]}: {s['hours']:g}"
-                                     for s in line["segments"])
-                amounts = [management_number(line[k]) for k in ("base", "premium", "total")]
-            else:
-                details, amounts = line["kind"]+" (отсутствие / ATF)", ["—"]*3
-            rows.append([p(f"{line['date']} · {line['company']} · {line['object_name']} · {line['sync_id']}"),
-                         p(f"{line['hours']:g}"), p(details), *[p(v) for v in amounts]])
-            for warning in line["warnings"]:
-                rows.append([p(warning), "", "", "", "", ""])
-        table = LongTable(rows, colWidths=[210, 45, 210, 85, 85, 85], repeatRows=1)
-        table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                                   ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8edf2")),
-                                   ("GRID", (0, 0), (-1, -1), .3, colors.lightgrey)]))
-        story.append(table)
+    report = items[0]
+    columns = [*range(9), *[9+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
+    headers = [MANAGEMENT_HEADERS[i].replace("\n", " ") for i in columns]
+    rows = [[p(v) for v in headers]]
+    rows.extend([p(summary_values(r)[i]) for i in columns] for r in [*items, summary_total(items)])
+    width = A4[1]-60
+    widths = [140 if i == 0 else 105 if i == 8 else (width-245)/(len(columns)-2) for i in columns]
+    table = LongTable(rows, colWidths=widths, repeatRows=1)
+    table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8edf2")),
+                               ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8edf2")),
+                               ("FONTNAME", (0, -1), (-1, -1), bold),
+                               ("GRID", (0, 0), (-1, -1), .3, colors.lightgrey),
+                               ("TOPPADDING", (0, 0), (-1, -1), 7),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+    story = [Paragraph("Зарплата за период — сводка", heading),
+             p(f"{report['date_from']} — {report['date_to']}"), p(management.NOTICE),
+             Spacer(1, 10), table, Spacer(1, 8), p("OB входит в отработанные часы. Официальное начисление — Fortnox.")]
+    warnings = []
+    if any(r["categories"]["unknown"] for r in items):
+        warnings.append("OB не определён для части часов: нет точных временных данных.")
+    if any(r["total"] is None for r in items):
+        warnings.append("«Не определено»: неизвестна ставка или надбавка; итоговая зарплата не подменена нулём.")
+    if any("Зона" in w for r in items for l in r["lines"] for w in l["warnings"]):
+        warnings.append("Зона объекта не подтверждена; разбивка по местному времени предварительная.")
+    story.extend(p(warning) for warning in warnings)
     SimpleDocTemplate(path if hasattr(path, "write") else str(path), pagesize=(A4[1], A4[0]),
                       leftMargin=30, rightMargin=30, topMargin=25, bottomMargin=25).build(story)
 

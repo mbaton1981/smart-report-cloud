@@ -217,8 +217,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         row = next(i for i in range(window.table_salary.rowCount())
                    if window.table_salary.item(i, 0).text() == "Management Test")
         self.assertEqual(window.table_salary.item(row, 1).text(), "4")
-        self.assertEqual(window.table_salary.item(row, 9).text(), "100.00")
-        self.assertEqual(window.table_salary.item(row, 12).text(), "500.00")
+        self.assertEqual(window.table_salary.item(row, 8).text(), "500.00")
         self.assertIn("OB1", window.table_salary.horizontalHeaderItem(3).text())
         from PyQt6.QtCore import Qt
         from PyQt6.QtTest import QTest
@@ -233,9 +232,9 @@ class PayrollIntegrationTests(unittest.TestCase):
             text = "\n".join(p.extract_text() for p in PdfReader(Path(folder)/"hours.pdf").pages)
             self.assertIn("Предварительный расчёт по текущим ставкам", text)
             self.assertIn("500.00", text)
-            self.assertIn("OB1 +20%: 1", text)
-            self.assertIn("OB2 +40%: 2", text)
-            self.assertIn("Всего отработано: 4", text)
+            self.assertIn("OB1", text)
+            self.assertIn("OB2", text)
+            self.assertIn("Отработано", text)
             self.assertIn("Fortnox", text)
             self.assertNotIn("999.00", text)
             self.assertNotIn("историческая ставка", information.call_args.args[2])
@@ -243,7 +242,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         window.sal_report_mode.setCurrentIndex(1)
         self.assertIn("Grundlön", window.table_salary.horizontalHeaderItem(7).text())
         window.sal_report_mode.setCurrentIndex(0)
-        self.assertIn("База", window.table_salary.horizontalHeaderItem(10).text())
+        self.assertIn("Зарплата", window.table_salary.horizontalHeaderItem(8).text())
         self.assertEqual(before, list(conn.iterdump()))
 
     def test_management_missing_rate_exports_without_amount_and_no_period_close(self):
@@ -258,8 +257,8 @@ class PayrollIntegrationTests(unittest.TestCase):
         pdf = BytesIO()
         payroll_ui.write_pdf(pdf, [report], self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
         text = "\n".join(p.extract_text() for p in PdfReader(pdf).pages)
-        self.assertIn("Всего отработано: 4", text)
-        self.assertIn("без суммы", text)
+        self.assertIn("Отработано", text)
+        self.assertIn("Не определено", text)
         self.assertEqual(before, list(conn.iterdump()))
 
     def preview_pdf_fixture(self, folder):
@@ -383,7 +382,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             _, window, source = self.preview_pdf_fixture(folder)
             reports = payroll_ui.selected_reports(window, self.desktop)
-            payroll_ui.write_pdf(source, reports*2, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+            payroll_ui.write_pdf(source, reports*60, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
             dialog = payroll_preview.PayrollPdfPreviewDialog(source, source, window)
             output = Path(folder)/"second-page.pdf"
             def accept_print(print_dialog):
@@ -396,7 +395,7 @@ class PayrollIntegrationTests(unittest.TestCase):
             try:
                 with patch.object(payroll_preview.QPrintDialog, "exec", accept_print):
                     dialog.print_pdf()
-                self.assertEqual(len(PdfReader(source).pages), 2)
+                self.assertGreaterEqual(len(PdfReader(source).pages), 2)
                 self.assertEqual(len(PdfReader(output).pages), 1)
                 with patch.object(payroll_preview.QPrintDialog, "exec", return_value=1), \
                         patch.object(dialog, "print_document", side_effect=RuntimeError("printer offline")), \
@@ -416,9 +415,9 @@ class PayrollIntegrationTests(unittest.TestCase):
         def inspect(dialog):
             text = "\n".join(p.extract_text() for p in PdfReader(dialog.source).pages)
             self.assertIn("Предварительный расчёт", text)
-            self.assertIn("OB не определён: 4", text)
-            self.assertIn("Нет времени начала/окончания", text)
-            self.assertIn("без суммы", text)
+            self.assertIn("OB не определён", text)
+            self.assertIn("нет точных временных данных", text)
+            self.assertIn("Не определено", text)
             return 0
         with patch.object(payroll_preview.PayrollPdfPreviewDialog, "exec", inspect), \
                 patch.object(payroll_ui.QFileDialog, "getSaveFileName") as picker:
@@ -450,6 +449,91 @@ class PayrollIntegrationTests(unittest.TestCase):
                 self.assertLogs("payroll_ui", level="ERROR"):
             payroll_ui.preview(window, self.desktop)
         self.assertIn("database unavailable", critical.call_args.args[2])
+
+    def test_summary_employee_and_period_filter_shared_by_table_preview_and_export(self):
+        conn = self.seed_management_shift()
+        conn.execute("INSERT INTO employees(name,salary_rate,is_active) VALUES('Andrii Piskun',200,1)")
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,rate,entry_type,start_time,end_time)
+                        VALUES('andrii','2026-10-22','Andrii Piskun','Renatur','Site',2,999,'work','10:00','12:00')""")
+        conn.commit()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        window.load_salary_table_template()
+        self.assertEqual(window.sal_employee_filter.currentText(), "Все сотрудники")
+        self.assertEqual(window.table_salary.rowCount(), 3)
+        self.assertEqual(window.table_salary.item(2, 0).text(), "ИТОГО")
+        self.assertEqual(window.table_salary.item(2, 1).text(), "6")
+        self.assertEqual(window.table_salary.item(2, 8).text(), "900.00")
+        window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Andrii Piskun"))
+        self.assertEqual(window.table_salary.rowCount(), 2)
+        self.assertEqual(window.table_salary.item(0, 0).text(), "Andrii Piskun")
+        self.assertEqual(window.table_salary.item(0, 1).text(), "2")
+        self.assertEqual(window.table_salary.item(1, 8).text(), "400.00")
+        self.assertEqual([r["employee"] for r in payroll_ui.selected_reports(window, self.desktop)], ["Andrii Piskun"])
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)/"selected.pdf"
+            with patch.object(payroll_ui.QFileDialog, "getSaveFileName", return_value=(str(output), "")), \
+                    patch.object(payroll_ui.QMessageBox, "information"):
+                window.export_salary_to_pdf()
+            text = "\n".join(p.extract_text() for p in PdfReader(output).pages)
+            self.assertIn("Andrii Piskun", text)
+            self.assertNotIn("Management Test", text)
+            self.assertEqual(len(PdfReader(output).pages), 1)
+            def inspect(dialog):
+                preview_text = "\n".join(p.extract_text() for p in PdfReader(dialog.source).pages)
+                self.assertEqual(preview_text, text)
+                return 0
+            with patch.object(payroll_preview.PayrollPdfPreviewDialog, "exec", inspect):
+                payroll_ui.preview(window, self.desktop)
+        from PyQt6.QtCore import QDate
+        window.sal_date_from.setDate(QDate(2026, 10, 21))
+        window.sal_date_to.setDate(QDate(2026, 10, 21))
+        window.load_salary_table_template()
+        self.assertEqual(window.sal_employee_filter.currentData(), "Andrii Piskun")
+        self.assertEqual(payroll_ui.selected_reports(window, self.desktop), [])
+        self.assertEqual(window.table_salary.rowCount(), 1)
+        self.assertEqual(window.table_salary.item(0, 1).text(), "0")
+        window.sal_employee_filter.setCurrentIndex(0)
+        self.assertEqual(window.table_salary.item(0, 0).text(), "Management Test")
+        self.assertEqual(window.table_salary.item(1, 1).text(), "4")
+        window.sal_report_mode.setCurrentIndex(1)
+        window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Andrii Piskun"))
+        self.assertEqual(payroll_ui.selected_reports(window, self.desktop), [])
+        self.assertEqual(before, list(conn.iterdump()))
+
+    def test_summary_one_page_total_and_unknown_salary_not_partial_success(self):
+        conn = self.seed_management_shift()
+        window = self.salary_window(management_mode=True)
+        items = payroll_ui.selected_reports(window, self.desktop)
+        items = [dict(items[0], employee=f"Employee {i:02}") for i in range(12)]
+        pdf = BytesIO()
+        payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        reader = PdfReader(pdf)
+        self.assertEqual(len(reader.pages), 1)
+        text = reader.pages[0].extract_text()
+        self.assertIn("ИТОГО", text)
+        self.assertIn("6,000.00", text)
+        self.assertEqual(payroll_ui.summary_total(items)["worked"], 48)
+        items[0] = dict(items[0], total=None)
+        self.assertIsNone(payroll_ui.summary_total(items)["total"])
+        pdf = BytesIO()
+        payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        self.assertIn("Не определено", PdfReader(pdf).pages[0].extract_text())
+        self.assertNotIn("5,500.00", PdfReader(pdf).pages[0].extract_text())
+
+    def test_summary_many_employees_readable_multipage_with_repeated_header_and_one_total(self):
+        self.seed_management_shift()
+        window = self.salary_window(management_mode=True)
+        report = payroll_ui.selected_reports(window, self.desktop)[0]
+        pdf = BytesIO()
+        payroll_ui.write_pdf(pdf, [dict(report, employee=f"Employee {i:03}") for i in range(100)],
+                             self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        reader = PdfReader(pdf)
+        self.assertGreater(len(reader.pages), 1)
+        self.assertTrue(all("ФИО" in p.extract_text() for p in reader.pages))
+        text = "\n".join(p.extract_text() for p in reader.pages)
+        self.assertEqual(text.count("ИТОГО"), 1)
+        self.assertIn("50,000.00", text)
 
 
 if __name__ == "__main__":

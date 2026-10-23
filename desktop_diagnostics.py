@@ -889,7 +889,8 @@ def verify_payroll_ram(app_module, work_dir, out_path):
     return result
 
 
-def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False, preview_mode=False):
+def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False, preview_mode=False,
+                                  employee=None):
     """Click export, exercise real dialogs, and preserve all source payroll data."""
     from contextlib import closing
     import sqlite3
@@ -975,6 +976,11 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
         window.sal_date_from.setDate(QDate(2026, 10, 1))
         window.sal_date_to.setDate(QDate(2026, 10, 31))
         window.load_salary_table_template()
+        if employee is not None:
+            index = window.sal_employee_filter.findData(employee)
+            if index < 0:
+                raise RuntimeError(f"Employee filter is missing {employee}")
+            window.sal_employee_filter.setCurrentIndex(index)
         window.show()
         application.processEvents()
         window.grab().save(str(work/"salary-table.png"))
@@ -982,6 +988,12 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
             import payroll_ui
             result["reports"] = payroll_ui.selected_reports(window, app_module)
             result["default_management_mode"] = window.sal_report_mode.currentIndex() == 0
+            result["employee_filter"] = window.sal_employee_filter.currentData()
+            if employee is not None and [r["employee"] for r in result["reports"]] != [employee]:
+                raise RuntimeError("Selected employee did not match report.")
+            result["table_total"] = [
+                window.table_salary.item(window.table_salary.rowCount()-1, column).text()
+                for column in range(window.table_salary.columnCount())]
         button = next(b for b in window.findChildren(QPushButton)
                       if (b.text() == "Предпросмотр PDF" if preview_mode else "Экспорт зарплат" in b.text()))
         timer = QTimer(window)
@@ -1010,6 +1022,11 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
         raise RuntimeError("Real October payroll preview lost employee or unknown rates.")
     if not management_mode and "историческая ставка" not in result["success_message"]:
         raise RuntimeError("Missing confirmation explanation was not shown.")
+    if management_mode:
+        if "ИТОГО" not in text or len(PdfReader(filename).pages) != 1:
+            raise RuntimeError("Real October summary must have totals and fit on one page.")
+        if employee == "Andrii Piskun" and "Aliaksei Patonich" in text:
+            raise RuntimeError("Selected Andrii PDF includes a different employee.")
     with closing(connection()) as conn:
         if list(conn.iterdump()) != before:
             raise RuntimeError("Salary export changed source data.")
@@ -1020,6 +1037,9 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "payroll-summary-readonly":
+        return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True,
+                                              employee=None if case == "case" else case)
     if action == "payroll-preview-readonly":
         return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True)
     if action == "management-export-readonly":
