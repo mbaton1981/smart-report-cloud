@@ -53,13 +53,13 @@ class NewShiftPricesTests(unittest.TestCase):
         conn.close()
         return response, row
 
-    def desktop_save(self, rate="", hours=8):
+    def desktop_save(self, rate="", hours=8, *, object_name="Hotel", transport=1, day="2026-10-23"):
         d = self.desktop
         window = d.SmartReportApp.__new__(d.SmartReportApp)
         d.QMainWindow.__init__(window)
         self.addCleanup(window.close)
-        window.date_input = d.QLineEdit("2026-10-23")
-        for attr, text in (("emp_cb", "Price Test"), ("comp_cb", "Renatur"), ("obj_cb", "Hotel")):
+        window.date_input = d.QLineEdit(day)
+        for attr, text in (("emp_cb", "Price Test"), ("comp_cb", "Renatur"), ("obj_cb", object_name)):
             combo = d.QComboBox()
             combo.addItem(text, text)
             setattr(window, attr, combo)
@@ -67,7 +67,7 @@ class NewShiftPricesTests(unittest.TestCase):
         window.record_type_cb.addItem("Work", "work")
         window.hours_input = d.QLineEdit(str(hours))
         window.rate_input = d.QLineEdit(rate)
-        window.trans_input = d.QLineEdit("1")
+        window.trans_input = d.QLineEdit(str(transport))
         window.comment_input = d.QLineEdit("Synthetic")
         with patch.object(window, "background_sync_with_cloud"), \
                 patch.object(window, "load_shifts_history"), \

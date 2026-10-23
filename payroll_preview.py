@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from PyQt6.QtCore import QBuffer, QIODevice, QPointF, QRectF, Qt, QUrl
+from PyQt6.QtCore import QBuffer, QIODevice, QPointF, QRectF, QSaveFile, Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QImage, QPageLayout, QPainter
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
@@ -118,7 +118,16 @@ class PayrollPdfPreviewDialog(QDialog):
             target = target.with_suffix(".pdf")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self.source, target)
+            if self._source_bytes is not None or self.source.resolve() != target:
+                data = self._source_bytes if self._source_bytes is not None else self.source.read_bytes()
+                output = QSaveFile(str(target))
+                if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                    raise OSError(output.errorString())
+                if output.write(data) != len(data):
+                    output.cancelWriting()
+                    raise OSError(output.errorString() or "Не удалось записать PDF полностью.")
+                if not output.commit():
+                    raise OSError(output.errorString())
         except OSError as error:
             logger.exception("Salary PDF preview Save As failed; destination=%s", target)
             QMessageBox.critical(self, "Ошибка сохранения PDF", f"Не удалось сохранить файл:\n{target}\n{error}")

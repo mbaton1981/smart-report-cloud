@@ -332,12 +332,17 @@ class PayrollIntegrationTests(unittest.TestCase):
             _, window, source = self.preview_pdf_fixture(folder)
             dialog = payroll_preview.PayrollPdfPreviewDialog(source, source, window)
             try:
-                with patch.object(payroll_preview.QFileDialog, "getSaveFileName", return_value=(str(source), "")), \
-                        patch.object(payroll_preview.shutil, "copyfile", side_effect=PermissionError("file locked")), \
+                target = Path(folder) / "locked.pdf"
+                with patch.object(payroll_preview.QFileDialog, "getSaveFileName", return_value=(str(target), "")), \
+                        patch.object(payroll_preview, "QSaveFile") as save_file, \
                         patch.object(payroll_preview.QMessageBox, "critical") as critical, \
+                        patch.object(payroll_preview.QMessageBox, "information") as success, \
                         self.assertLogs("payroll_preview", level="ERROR"):
+                    save_file.return_value.open.return_value = False
+                    save_file.return_value.errorString.return_value = "file locked"
                     dialog.save_as()
                 self.assertIn("file locked", critical.call_args.args[2])
+                success.assert_not_called()
             finally:
                 dialog.release_resources()
 

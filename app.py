@@ -3617,6 +3617,8 @@ class SmartReportApp(QMainWindow):
         self.background_sync_with_cloud()
 
     def background_sync_with_cloud(self):
+        if getattr(self, "_closing_after_sync", False):
+            return
         if ISOLATED_CANDIDATE:
             self.statusBar().showMessage("Сохранено локально. Синхронизация в кандидате отключена.")
             self._manual_sync_requested = False
@@ -4303,8 +4305,8 @@ class SmartReportApp(QMainWindow):
         emp = self.bal_emp_cb.currentText()
         desc = self.bal_desc.text().strip()
         amt = parse_float(self.bal_amount.text(), None)
-        if amt is None:
-            QMessageBox.warning(self, "Баланс", "Введите корректную сумму.")
+        if amt is None or not math.isfinite(amt):
+            QMessageBox.warning(self, "Баланс", "Введите конечную числовую сумму; NaN и бесконечность недопустимы.")
             return
         if self.__dict__.get("_editing_balance_id") is not None:
             return self.update_balance_entry()
@@ -6088,7 +6090,7 @@ class SmartReportApp(QMainWindow):
         employee = self.bal_emp_cb.currentText().strip() if employee is None else str(employee).strip()
         description = self.bal_desc.text().strip() if description is None else str(description).strip()
         amount = parse_float(self.bal_amount.text(), None) if amount is None else parse_float(amount, None)
-        if amount is None or not employee:
+        if amount is None or not math.isfinite(amount) or not employee:
             QMessageBox.warning(self, "Баланс", "Введите сотрудника/контакт и корректную сумму.")
             return False
         conn = get_db_connection()
@@ -6723,6 +6725,18 @@ class SmartReportApp(QMainWindow):
             return
         viewer = getattr(self, "_mail_viewer", None)
         if viewer is not None and not viewer.close():
+            event.ignore()
+            return
+        running = [worker for worker in self.findChildren(SyncWorker) if worker.isRunning()]
+        if running:
+            if not getattr(self, "_closing_after_sync", False):
+                self._closing_after_sync = True
+                timer = getattr(self, "auto_sync_timer", None)
+                if timer is not None:
+                    timer.stop()
+                for worker in running:
+                    worker.finished.connect(self.close)
+            self.statusBar().showMessage("Завершение синхронизации перед закрытием…")
             event.ignore()
             return
         super().closeEvent(event)

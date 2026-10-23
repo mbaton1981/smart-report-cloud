@@ -213,8 +213,9 @@ class IncomingIntegrationTests(unittest.TestCase):
             conn.close()
             self.assertEqual([r[0] for r in saved], [card["client_id"]])
         # Execute the previous release's actual sync function, not a mock of an old reader.
-        source = subprocess.check_output(
-            ["git", "--no-pager", "show", "38bf30d:app.py"], text=True, encoding="utf-8")
+        fixture = os.environ.get("SMARTREPORT_PREVIOUS_RELEASE_FIXTURE")
+        source = (Path(fixture).read_text(encoding="utf-8") if fixture else subprocess.check_output(
+            ["git", "--no-pager", "show", "38bf30d:app.py"], text=True, encoding="utf-8"))
         tree = ast.parse(source)
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SmartReportApp")
         method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)

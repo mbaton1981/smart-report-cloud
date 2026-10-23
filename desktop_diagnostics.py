@@ -19,6 +19,42 @@ def _require_local_server():
     return url
 
 
+def verify_pdf_save_ram(app_module, work_dir, out_path):
+    """Exercise frozen PDF Save As without opening any database or server."""
+    from io import BytesIO
+    from unittest.mock import patch
+    from reportlab.pdfgen import canvas
+    from PyQt6.QtWidgets import QApplication
+    import payroll_preview
+    application = QApplication.instance() or QApplication([])
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    stream = BytesIO()
+    document = canvas.Canvas(stream)
+    document.drawString(30, 700, "Synthetic PDF save verification")
+    document.save()
+    data = stream.getvalue()
+    target = work / "synthetic-saved.pdf"
+    for source in (data, target):
+        dialog = payroll_preview.PayrollPdfPreviewDialog(source, target)
+        try:
+            with patch.object(payroll_preview.QFileDialog, "getSaveFileName",
+                              return_value=(str(target), "PDF")), \
+                    patch.object(payroll_preview.QMessageBox, "critical") as failure, \
+                    patch.object(payroll_preview.QMessageBox, "information"):
+                dialog.save_as()
+                if failure.called or target.read_bytes() != data:
+                    raise AssertionError("PDF Save As did not preserve source bytes")
+        finally:
+            dialog.release_resources()
+            dialog.close()
+    proof = dict(frozen=bool(getattr(sys, "frozen", False)), memory_pdf_saved=True,
+                 same_path_saved=True, database_opened=False, server_contacted=False,
+                 pdf=str(target), sha256=hashlib.sha256(data).hexdigest())
+    Path(out_path).write_text(json.dumps(proof, indent=2), encoding="utf-8")
+    return 0
+
+
 def verify_approved_update(app_module, work_dir, out_path):
     """Inspect an existing approved profile without startup migrations or network."""
     from contextlib import closing
@@ -1416,6 +1452,8 @@ def verify_new_shift_prices_ram(app_module, work_dir, out_path):
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "pdf-save-ram":
+        return verify_pdf_save_ram(app_module, work_dir, out_path)
     if action == "new-shift-prices-ram":
         return verify_new_shift_prices_ram(app_module, work_dir, out_path)
     if action == "employee-cards-local":
