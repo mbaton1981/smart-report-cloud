@@ -11,7 +11,8 @@ from xml.sax.saxutils import escape
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidgetItem, QTextEdit, QVBoxLayout,
+    QAbstractItemView, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
 )
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -82,6 +83,63 @@ def summary_total(items):
                 categories={k: sum(r["categories"][k] for r in items) for k in management.CATEGORIES},
                 total=None if any(r["total"] is None for r in items) else history.money(sum(r["total"] for r in items)),
                 absence={k: sum(r["absence"][k] for r in items) for k in ABSENCE_KEYS})
+
+
+def unknown_ob_rows(items):
+    return [dict(employee=report["employee"], date=line["date"], company=line["company"],
+                 object_name=line["object_name"], hours=line["categories"]["unknown"],
+                 start_time=line["start_time"], end_time=line["end_time"], sync_id=line["sync_id"],
+                 saved_intervals=line["saved_intervals"], reason="\n".join(line["warnings"]))
+            for report in items for line in report["lines"] if line["categories"]["unknown"]]
+
+
+def show_unknown_ob(window, app):
+    try:
+        rows = unknown_ob_rows(selected_reports(window, app))
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
+        logger.exception("Unknown payroll OB details failed")
+        QMessageBox.critical(window, "Расшифровка OB", f"Не удалось прочитать записи:\n{error}")
+        return
+    if not rows:
+        QMessageBox.information(window, "Расшифровка OB", "В выбранном периоде и составе сотрудников нет часов с неопределённым OB.")
+        return
+    dialog = QDialog(window)
+    dialog.setObjectName("payrollUnknownObDialog")
+    dialog.setWindowTitle("OB не определён — исходные записи")
+    dialog.resize(1250, 650)
+    layout = QVBoxLayout(dialog)
+    notice = QLabel(f"Всего OB не определён: {sum(r['hours'] for r in rows):g} ч · "
+                    f"{window.sal_date_from.text()} — {window.sal_date_to.text()}\n"
+                    "«Не сохранено» означает отсутствие значения в записи, а не 00:00. "
+                    "Таблица только для просмотра: время не дописывается, «Баланс» не меняется.")
+    notice.setWordWrap(True)
+    layout.addWidget(notice)
+    table = QTableWidget(len(rows), 9, dialog)
+    table.setObjectName("payrollUnknownObTable")
+    table.setHorizontalHeaderLabels(["Сотрудник", "Дата", "Объект", "Часы", "Начало\nсохранённое",
+                                    "Конец\nсохранённый", "Сохранённые OB-сегменты", "Причина", "ID записи"])
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setWordWrap(True)
+    for index, row in enumerate(rows):
+        intervals = "\n".join(f"{s['date']} {s['start_time']}–{s['end_time']} ({s['hours']:g} ч)"
+                              for s in row["saved_intervals"]) or "Отсутствуют"
+        values = [row["employee"], row["date"], f"{row['company']} · {row['object_name']}",
+                  f"{row['hours']:g}", row["start_time"] or "Не сохранено", row["end_time"] or "Не сохранено",
+                  intervals, row["reason"], row["sync_id"]]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            item.setToolTip(value)
+            table.setItem(index, column, item)
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    for column, width in enumerate((140, 100, 180, 55, 100, 100, 165, 300, 260)):
+        table.setColumnWidth(column, width)
+    table.resizeRowsToContents()
+    layout.addWidget(table)
+    close = QPushButton("Закрыть")
+    close.clicked.connect(dialog.accept)
+    layout.addWidget(close)
+    dialog.exec()
 
 
 def management_mode(window):
@@ -156,6 +214,12 @@ def render_management(window, app):
     window.sal_summary_employer_lbl.setText("Официальное начисление: Fortnox")
     window.payroll_history_note.setText(
         management.NOTICE + ". OB входит в общие часы; неизвестная сумма не равна нулю.")
+    button = getattr(window, "sal_unknown_ob_button", None)
+    if button is not None:
+        hours = sum(r["categories"]["unknown"] for r in items)
+        button.setVisible(True)
+        button.setEnabled(hours > 0)
+        button.setText(f"OB не определён: {hours:g} ч — показать записи…")
 
 
 def enabled(cursor):
@@ -226,6 +290,9 @@ def status(report):
 def render(window, app):
     if management_mode(window):
         return render_management(window, app)
+    button = getattr(window, "sal_unknown_ob_button", None)
+    if button is not None:
+        button.setVisible(False)
     items = reports(window, app)
     window.table_salary.blockSignals(True)
     try:

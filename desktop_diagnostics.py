@@ -890,14 +890,14 @@ def verify_payroll_ram(app_module, work_dir, out_path):
 
 
 def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False, preview_mode=False,
-                                  employee=None):
+                                  employee=None, details_mode=False):
     """Click export, exercise real dialogs, and preserve all source payroll data."""
     from contextlib import closing
     import sqlite3
     from unittest.mock import patch
     from PyQt6.QtCore import QDate, QTimer, Qt
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QWidget
+    from PyQt6.QtWidgets import QApplication, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QTableWidget, QWidget
     from pypdf import PdfReader
     import payroll_preview
 
@@ -924,7 +924,19 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
                              options=QFileDialog.Option.DontUseNativeDialog)
     def handle_dialog():
         modal = application.activeModalWidget()
-        if isinstance(modal, payroll_preview.PayrollPdfPreviewDialog):
+        if modal is not None and modal.objectName() == "payrollUnknownObDialog":
+            table = modal.findChild(QTableWidget, "payrollUnknownObTable")
+            rows = [[table.item(i, j).text() for j in range(table.columnCount())]
+                    for i in range(table.rowCount())]
+            result["unknown_ob_display_rows"] = rows
+            result["unknown_ob_display_hours"] = sum(float(row[3]) for row in rows)
+            if len(rows) != 4 or result["unknown_ob_display_hours"] != 24:
+                errors.append("Expected four existing unknown OB records totalling 24 hours.")
+            if any(row[4:7] != ["Не сохранено", "Не сохранено", "Отсутствуют"] for row in rows):
+                errors.append("Expected absent saved times and OB segments.")
+            modal.grab().save(str(work/"unknown-ob-details.png"))
+            modal.accept()
+        elif isinstance(modal, payroll_preview.PayrollPdfPreviewDialog):
             if not result.get("preview_seen"):
                 result.update(preview_seen=True, preview_before_save=not result["save_dialog_seen"],
                               preview_pages=len(modal._pages), temporary_pdf=str(modal.source))
@@ -999,6 +1011,10 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
         timer = QTimer(window)
         timer.timeout.connect(handle_dialog)
         timer.start(150)
+        if details_mode:
+            QTest.mouseClick(window.sal_unknown_ob_button, Qt.MouseButton.LeftButton)
+            if "unknown_ob_display_rows" not in result:
+                errors.append("Unknown OB details dialog did not open.")
         QTest.mouseClick(button, Qt.MouseButton.LeftButton)
         application.processEvents()
         timer.stop()
@@ -1037,6 +1053,9 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "payroll-ob-details-readonly":
+        return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True,
+                                              employee="Andrii Piskun", details_mode=True)
     if action == "payroll-summary-readonly":
         return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True,
                                               employee=None if case == "case" else case)

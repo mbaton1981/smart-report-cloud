@@ -3671,6 +3671,9 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(export_salary_pdf_btn)
         period_layout.addStretch()
         card_layout.addLayout(period_layout)
+        self.sal_unknown_ob_button = QPushButton("OB не определён — показать записи…")
+        self.sal_unknown_ob_button.clicked.connect(lambda: payroll_ui.show_unknown_ob(self, sys.modules[__name__]))
+        card_layout.addWidget(self.sal_unknown_ob_button)
 
         history_btn = QPushButton("Необязательно: история ставок, сохранённые расчёты и корректировки…")
         history_btn.clicked.connect(lambda: payroll_ui.open_history(self, sys.modules[__name__]))

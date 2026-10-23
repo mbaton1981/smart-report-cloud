@@ -173,3 +173,33 @@ class ManagementPayrollTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Начало"):
             self.report("2026-10-31", "2026-10-01")
 
+    def test_unknown_details_keep_null_partial_and_mismatched_source_times(self):
+        for start, end, expected in ((None, None, "начала и окончания"),
+                                     ("16:00", None, "окончания"), (None, "20:00", "начала")):
+            with self.subTest(start=start, end=end):
+                self.db.execute("DELETE FROM shifts")
+                self.add(start=start, end=end)
+                line = self.report()["lines"][0]
+                self.assertEqual(line["start_time"], start)
+                self.assertEqual(line["end_time"], end)
+                self.assertEqual(line["saved_intervals"], [])
+                self.assertIn(expected, line["warnings"][0])
+                self.assertEqual(line["categories"]["unknown"], 4)
+        self.db.execute("DELETE FROM shifts")
+        self.add(start="16:00", end="20:00", hours=3)
+        line = self.report()["lines"][0]
+        self.assertEqual((line["start_time"], line["end_time"]), ("16:00", "20:00"))
+        self.assertIn("перерыва", line["warnings"][0])
+
+    def test_saved_times_and_segment_fallback_are_used_not_marked_unknown(self):
+        self.add(kind="work")
+        line = self.report()["lines"][0]
+        self.assertEqual(line["categories"]["unknown"], 0)
+        self.assertEqual((line["start_time"], line["end_time"]), ("16:00", "20:00"))
+        self.db.execute("UPDATE shifts SET start_time=NULL,end_time=NULL")
+        self.db.execute("INSERT INTO ob_segments VALUES(1,'one','2026-10-21','16:00','20:00',4,'old',50,1.5,999,5994)")
+        line = self.report()["lines"][0]
+        self.assertEqual(line["categories"]["unknown"], 0)
+        self.assertEqual(line["total"], 500)
+        self.assertEqual(line["saved_intervals"], [
+            dict(date="2026-10-21", start_time="16:00", end_time="20:00", hours=4)])

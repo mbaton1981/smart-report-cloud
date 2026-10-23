@@ -70,7 +70,10 @@ def line(row, saved, zone, start, end, rate, holidays):
                         raise ValueError("Сохранённые часы не совпадают с временными границами.")
                     segments.extend(parts)
             else:
-                raise ValueError("Нет времени начала/окончания для разбивки OB.")
+                missing = ("начала и окончания" if not row.get("start_time") and not row.get("end_time")
+                           else "начала" if not row.get("start_time") else "окончания")
+                raise ValueError(f"Нет сохранённого времени {missing}; OB-сегменты отсутствуют. "
+                                 "По одному количеству часов разбивка OB не определяется.")
             if abs(sum(p["hours"] for p in segments)-hours) > .00001:
                 raise ValueError("Часы не совпадают с интервалом: нужно уточнить время неоплачиваемого перерыва или переход часов.")
             if not zone:
@@ -94,6 +97,9 @@ def line(row, saved, zone, start, end, rate, holidays):
         warnings.append("Зарплатная ставка в справочнике не задана: выгружены часы без суммы.")
     return dict(sync_id=row["sync_id"], date=row["date"], company=row["company"],
                 object_name=row["object_name"], kind=kind, hours=sum(s["hours"] for s in segments),
+                start_time=row.get("start_time"), end_time=row.get("end_time"),
+                saved_intervals=[dict(date=s["segment_date"], start_time=s["start_time"],
+                                      end_time=s["end_time"], hours=s["hours"]) for s in saved],
                 categories=categories, segments=segments, rate=rate,
                 base=base, premium=premium,
                 total=history.money(base+premium) if base is not None and premium is not None else None,

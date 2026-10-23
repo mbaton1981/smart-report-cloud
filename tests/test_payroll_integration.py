@@ -535,6 +535,70 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertEqual(text.count("ИТОГО"), 1)
         self.assertIn("50,000.00", text)
 
+    def test_unknown_ob_details_button_preserves_records_and_shows_saved_times_and_reason(self):
+        conn = self.seed_management_shift()
+        conn.execute("UPDATE shifts SET start_time=NULL,end_time=NULL WHERE sync_id='management-one'")
+        conn.commit()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        window.load_salary_table_template()
+        self.assertTrue(window.sal_unknown_ob_button.isEnabled())
+        self.assertIn("4 ч", window.sal_unknown_ob_button.text())
+        rows = payroll_ui.unknown_ob_rows(payroll_ui.selected_reports(window, self.desktop))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["start_time"], rows[0]["end_time"]), (None, None))
+        seen = []
+        def inspect(dialog):
+            table = dialog.findChild(payroll_ui.QTableWidget, "payrollUnknownObTable")
+            self.assertEqual(table.rowCount(), 1)
+            self.assertEqual(table.item(0, 0).text(), "Management Test")
+            self.assertEqual(table.item(0, 1).text(), "2026-10-21")
+            self.assertEqual(table.item(0, 3).text(), "4")
+            self.assertEqual(table.item(0, 4).text(), "Не сохранено")
+            self.assertEqual(table.item(0, 5).text(), "Не сохранено")
+            self.assertEqual(table.item(0, 6).text(), "Отсутствуют")
+            self.assertIn("начала и окончания", table.item(0, 7).text())
+            self.assertEqual(table.item(0, 8).text(), "management-one")
+            self.assertFalse(table.item(0, 4).flags() & self.desktop.Qt.ItemFlag.ItemIsEditable)
+            seen.append(True)
+            return 0
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        window.show()
+        self.qt_app.processEvents()
+        with patch.object(payroll_ui.QDialog, "exec", inspect):
+            QTest.mouseClick(window.sal_unknown_ob_button, Qt.MouseButton.LeftButton)
+        self.assertEqual(seen, [True])
+        self.assertEqual(before, list(conn.iterdump()))
+        conn.execute("UPDATE shifts SET start_time='16:00',end_time='20:00'")
+        conn.commit()
+        window.load_salary_table_template()
+        self.assertFalse(window.sal_unknown_ob_button.isEnabled())
+        self.assertEqual(payroll_ui.unknown_ob_rows(payroll_ui.selected_reports(window, self.desktop)), [])
+
+    def test_unknown_ob_details_follow_employee_period_and_show_existing_interval_mismatch(self):
+        conn = self.seed_management_shift()
+        conn.execute("UPDATE shifts SET hours=3")
+        conn.execute("INSERT INTO employees(name,salary_rate,is_active) VALUES('Other',100,1)")
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,rate,entry_type)
+                      VALUES('other','2026-10-22','Other','Renatur','Site',8,999,'work')""")
+        conn.commit()
+        window = self.salary_window(management_mode=True)
+        window.load_salary_table_template()
+        self.assertEqual(sum(r["hours"] for r in payroll_ui.unknown_ob_rows(
+            payroll_ui.selected_reports(window, self.desktop))), 11)
+        window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Management Test"))
+        rows = payroll_ui.unknown_ob_rows(payroll_ui.selected_reports(window, self.desktop))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["start_time"], rows[0]["end_time"]), ("16:00", "20:00"))
+        self.assertIn("перерыва", rows[0]["reason"])
+        from PyQt6.QtCore import QDate
+        window.sal_date_from.setDate(QDate(2026, 10, 22))
+        window.sal_date_to.setDate(QDate(2026, 10, 22))
+        window.load_salary_table_template()
+        self.assertFalse(window.sal_unknown_ob_button.isEnabled())
+        self.assertEqual(payroll_ui.unknown_ob_rows(payroll_ui.selected_reports(window, self.desktop)), [])
+
 
 if __name__ == "__main__":
     unittest.main()
