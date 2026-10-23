@@ -888,7 +888,96 @@ def verify_payroll_ram(app_module, work_dir, out_path):
     return result
 
 
+def verify_salary_export_readonly(app_module, work_dir, out_path):
+    """Click export, exercise real dialogs, and preserve all source payroll data."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtCore import QDate, QTimer, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QWidget
+    from pypdf import PdfReader
+
+    database = Path(app_module.DB_FILE).resolve(strict=True)
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    def connection():
+        conn = sqlite3.connect(database.as_uri()+"?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+    with closing(connection()) as conn:
+        before = list(conn.iterdump())
+    application = QApplication.instance() or QApplication([])
+    application.setStyleSheet(app_module.DARK_THEME_QSS)
+    filename = work/"Salary-October-2026-preview.pdf"
+    result = dict(frozen=bool(getattr(sys, "frozen", False)), source_database=str(database),
+                  network_requests=0, save_dialog_seen=False, success_message_seen=False)
+    errors = []
+    original_save = QFileDialog.getSaveFileName
+    def choose(parent, title, suggested, file_filter):
+        return original_save(parent, title, suggested, file_filter,
+                             options=QFileDialog.Option.DontUseNativeDialog)
+    def handle_dialog():
+        modal = application.activeModalWidget()
+        if isinstance(modal, QFileDialog):
+            result["save_dialog_seen"] = True
+            modal.findChild(QLineEdit, "fileNameEdit").setText(filename.name)
+            modal.grab().save(str(work/"save-dialog.png"))
+            modal.accept()
+        elif isinstance(modal, QMessageBox):
+            text = modal.text()
+            if modal.icon() == QMessageBox.Icon.Information:
+                result.update(success_message_seen=True, success_message=text)
+                modal.grab().save(str(work/"export-result.png"))
+            else:
+                errors.append(text)
+            modal.accept()
+    with patch.object(app_module, "get_db_connection", connection), \
+            patch.object(app_module, "REPORTS_DIR", str(work)), \
+            patch("requests.sessions.Session.request", side_effect=RuntimeError("Read-only export: network forbidden")), \
+            patch.object(QFileDialog, "getSaveFileName", side_effect=choose), \
+            patch.object(sys, "excepthook", side_effect=lambda kind, error, trace: errors.append(str(error))):
+        window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+        QMainWindow.__init__(window)
+        window.tab_salary = QWidget()
+        window.setCentralWidget(window.tab_salary)
+        window.resize(1550, 950)
+        window.setup_salary_tab()
+        window.sal_date_from.setDate(QDate(2026, 10, 1))
+        window.sal_date_to.setDate(QDate(2026, 10, 31))
+        window.load_salary_table_template()
+        window.show()
+        application.processEvents()
+        button = next(b for b in window.findChildren(QPushButton) if "Экспорт зарплат" in b.text())
+        timer = QTimer(window)
+        timer.timeout.connect(handle_dialog)
+        timer.start(150)
+        QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+        application.processEvents()
+        timer.stop()
+        window.close()
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    if not result["save_dialog_seen"] or not result["success_message_seen"]:
+        raise RuntimeError("Export did not show both the save dialog and success message.")
+    text = "\n".join(p.extract_text() for p in PdfReader(filename).pages)
+    if "Требует подтверждения" not in text or "Andrii Piskun" not in text:
+        raise RuntimeError("Real October payroll preview lost employee or unknown rates.")
+    if "историческая ставка" not in result["success_message"]:
+        raise RuntimeError("Missing confirmation explanation was not shown.")
+    with closing(connection()) as conn:
+        if list(conn.iterdump()) != before:
+            raise RuntimeError("Salary export changed source data.")
+    result.update(pdf=str(filename), source_unchanged=True, balance_unchanged=True,
+                  payment_confirmation_not_required=True)
+    Path(out_path or work/"result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "salary-export-readonly":
+        return verify_salary_export_readonly(app_module, work_dir, out_path)
     if action == "payroll-ram":
         return verify_payroll_ram(app_module, work_dir, out_path)
     if action == "approved-update-readonly":

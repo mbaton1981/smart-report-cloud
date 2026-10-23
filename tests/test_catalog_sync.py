@@ -4686,6 +4686,8 @@ class CatalogSyncTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="smartreport-salary-pdf-") as report_dir, \
              patch.object(self.desktop, "REPORTS_DIR", report_dir), \
+             patch("payroll_ui.QFileDialog.getSaveFileName",
+                   return_value=(str(Path(report_dir)/"Loneunderlag_test.pdf"), "PDF (*.pdf)")), \
              patch.object(self.desktop.QMessageBox, "information"), \
              patch.object(self.desktop.os, "startfile", create=True):
             self.desktop.SmartReportApp.export_salary_to_pdf(salary_ui)

@@ -4041,11 +4041,16 @@ class SmartReportApp(QMainWindow):
         self.load_salary_table_template()
 
     def export_salary_to_pdf(self):
-        conn = get_db_connection()
         try:
-            historical = payroll_ui.enabled(conn.cursor())
-        finally:
-            conn.close()
+            conn = get_db_connection()
+            try:
+                historical = payroll_ui.enabled(conn.cursor())
+            finally:
+                conn.close()
+        except sqlite3.Error as error:
+            logger.exception("Salary PDF schema lookup failed")
+            QMessageBox.critical(self, "Ошибка экспорта зарплаты", f"Не удалось прочитать зарплатные данные:\n{error}")
+            return
         if historical:
             return payroll_ui.export(self, sys.modules[__name__])
         self.load_salary_table_template()
@@ -10921,7 +10926,7 @@ if __name__ == "__main__":
     try:
         if getattr(sys, "frozen", False):
             logging.basicConfig(filename=str(desktop_auth.app_data_dir() / "smartreport.log"), level=logging.INFO,
-                                format="%(asctime)s [%(levelname)s] %(message)s", encoding="utf-8")
+                                format="%(asctime)s [%(levelname)s] %(message)s", encoding="utf-8", force=True)
         if "--logout" in sys.argv:
             desktop_auth.logout(CLOUD_URL)
             sys.exit(0)

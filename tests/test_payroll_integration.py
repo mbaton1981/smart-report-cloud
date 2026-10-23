@@ -1,6 +1,8 @@
 from io import BytesIO
+from pathlib import Path
 import json
 import sqlite3
+import tempfile
 import unittest
 import uuid
 from unittest.mock import patch
@@ -118,6 +120,77 @@ class PayrollIntegrationTests(unittest.TestCase):
             self.assertEqual({s["base_rate"] for s in result["segments"]}, {100, 200})
         finally:
             local.close()
+
+    def salary_window(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_salary = self.desktop.QWidget()
+        window.setCentralWidget(window.tab_salary)
+        window.setup_salary_tab()
+        self.addCleanup(window.close)
+        return window
+
+    def payroll_draft(self):
+        self.prepare()
+        response, _ = self.request("preview", date_from="2026-10-01", date_to="2026-10-31", parameters=PARAMS)
+        return response.get_json()["preview"]
+
+    def test_export_button_saves_unknown_unpaid_report_to_selected_path(self):
+        draft = self.payroll_draft()
+        window = self.salary_window()
+        button = next(b for b in window.findChildren(self.desktop.QPushButton)
+                      if "Экспорт зарплат" in b.text())
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        window.show()
+        self.qt_app.processEvents()
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(payroll_ui, "reports", return_value=[draft]), \
+                patch.object(payroll_ui.QFileDialog, "getSaveFileName",
+                             return_value=(str(Path(folder)/"chosen.pdf"), "PDF (*.pdf)")) as choose, \
+                patch.object(payroll_ui.QMessageBox, "information") as information:
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            choose.assert_called_once()
+            information.assert_called_once()
+            message = information.call_args.args[2]
+            self.assertIn("Payroll Test", message)
+            self.assertIn("2026-10-21", message)
+            self.assertIn("payroll-one", message)
+            self.assertIn("историческая ставка", message)
+            self.assertIn(str(Path(folder)/"chosen.pdf"), message)
+            reader = PdfReader(Path(folder)/"chosen.pdf")
+            self.assertIn("Требует подтверждения", "\n".join(p.extract_text() for p in reader.pages))
+        self.assertFalse(draft["paid"])
+
+    def test_export_cancel_does_not_write_or_show_success(self):
+        draft = self.payroll_draft()
+        with patch.object(payroll_ui, "reports", return_value=[draft]), \
+                patch.object(payroll_ui.QFileDialog, "getSaveFileName", return_value=("", "")), \
+                patch.object(payroll_ui, "write_pdf") as write, \
+                patch.object(payroll_ui.QMessageBox, "information") as information:
+            payroll_ui.export(self.salary_window(), self.desktop)
+        write.assert_not_called()
+        information.assert_not_called()
+
+    def test_export_reports_read_failure_is_logged_and_visible(self):
+        with patch.object(payroll_ui, "reports", side_effect=sqlite3.OperationalError("ledger unreadable")), \
+                patch.object(payroll_ui.QMessageBox, "critical") as critical, \
+                self.assertLogs("payroll_ui", level="ERROR") as log:
+            payroll_ui.export(self.salary_window(), self.desktop)
+        self.assertIn("ledger unreadable", critical.call_args.args[2])
+        self.assertIn("ledger unreadable", "\n".join(log.output))
+
+    def test_export_write_failure_is_logged_and_visible(self):
+        draft = self.payroll_draft()
+        with patch.object(payroll_ui, "reports", return_value=[draft]), \
+                patch.object(payroll_ui.QFileDialog, "getSaveFileName", return_value=("locked.pdf", "")), \
+                patch.object(payroll_ui, "write_pdf", side_effect=PermissionError("file is open")), \
+                patch.object(payroll_ui.QMessageBox, "critical") as critical, \
+                patch.object(payroll_ui.QMessageBox, "information") as information, \
+                self.assertLogs("payroll_ui", level="ERROR"):
+            payroll_ui.export(self.salary_window(), self.desktop)
+        self.assertIn("file is open", critical.call_args.args[2])
+        information.assert_not_called()
 
 
 if __name__ == "__main__":

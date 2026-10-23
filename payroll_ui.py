@@ -1,21 +1,26 @@
 """Desktop views of explicit payroll evidence; never posts to Balance."""
 import json
+import logging
 from datetime import date, timedelta
 from pathlib import Path
+import sqlite3
 import uuid
 from xml.sax.saxutils import escape
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidgetItem, QTextEdit, QVBoxLayout,
 )
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import LongTable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, TableStyle
+from reportlab.platypus.doctemplate import LayoutError
 
 import payroll_history as history
+
+logger = logging.getLogger(__name__)
 
 
 def enabled(cursor):
@@ -425,16 +430,55 @@ def write_pdf(path, items, font, bold):
                       topMargin=25, bottomMargin=25).build(story)
 
 
+def export_issues(items):
+    issues = []
+    for report in items:
+        employee = report["employee"]
+        if report["status"] == "overlap":
+            issues.append(f"{employee}: выберите точные границы сохранённого зарплатного периода.")
+        elif report["status"] == "draft":
+            issues.append(f"{employee}: расчёт за {report['date_from']} — {report['date_to']} не подтверждён.")
+        if report.get("source_changed"):
+            issues.append(f"{employee}: смены изменились; показана сохранённая версия, нужна отдельная корректировка.")
+        for line in report["lines"]:
+            source = line["source"]
+            prefix = f"{employee} · {source['date']} · {source['object_name']} · запись {line['sync_id']}"
+            issues.extend(f"{prefix}: {warning}" for warning in line["warnings"])
+    return list(dict.fromkeys(issues))
+
+
 def export(window, app):
-    items = reports(window, app)
-    if not items:
-        QMessageBox.warning(window, "Löneunderlag", "Нет данных для выбранного периода.")
-        return
-    path = Path(app.REPORTS_DIR) / f"Loneunderlag_{window.sal_date_from.text()}_till_{window.sal_date_to.text()}.pdf"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = None
     try:
+        items = reports(window, app)
+        if not items:
+            QMessageBox.warning(window, "Löneunderlag", "Нет данных для выбранного периода.")
+            return
+        issues = export_issues(items)
+        filename = f"Loneunderlag_{window.sal_date_from.text()}_till_{window.sal_date_to.text()}.pdf"
+        suggested = (Path(app.REPORTS_DIR) / filename).resolve()
+        title = "Сохранить предварительный расчёт зарплаты" if issues else "Сохранить расчёт зарплаты"
+        selected, _ = QFileDialog.getSaveFileName(window, title, str(suggested), "PDF (*.pdf)")
+        if not selected:
+            logger.info("Salary PDF export cancelled for %s — %s",
+                        window.sal_date_from.text(), window.sal_date_to.text())
+            return
+        path = Path(selected).resolve()
+        if not path.suffix:
+            path = path.with_suffix(".pdf")
+        path.parent.mkdir(parents=True, exist_ok=True)
         write_pdf(path, items, app.DEFAULT_FONT, app.DEFAULT_FONT_BOLD)
-    except (OSError, ValueError, TypeError) as error:
-        QMessageBox.critical(window, "Löneunderlag", str(error))
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error, LayoutError) as error:
+        logger.exception("Salary PDF export failed; destination=%s", path)
+        QMessageBox.critical(window, "Ошибка экспорта зарплаты",
+                             f"Не удалось сформировать PDF.\n{error}\n" +
+                             (f"Файл: {path}\n" if path else "") +
+                             "Выплату отмечать не нужно. «Баланс» не изменён.")
         return
-    QMessageBox.information(window, "Löneunderlag", f"PDF sparad:\n{path}")
+    logger.info("Salary PDF saved: %s; preliminary=%s; employees=%d", path, bool(issues), len(items))
+    message = f"PDF сохранён:\n{path}"
+    if issues:
+        message += ("\n\nЭто предварительный расчёт. Экспорт разрешён без подтверждения выплаты.\n"
+                    "Необходимые подтверждения / уточнения:\n" + "\n".join(issues))
+    message += "\n\n«Баланс» и отметки выплаты не изменены."
+    QMessageBox.information(window, "Зарплата — PDF сохранён", message)
