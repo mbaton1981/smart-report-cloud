@@ -331,6 +331,38 @@ class AssistantApiTests(unittest.TestCase):
             self.assertEqual(response.get_json()["clarification"]["field"], field)
             self.assertNotIn("Уточните команду", response.get_json()["clarification"]["question"])
 
+    def test_transport_variants_use_supported_function_and_specific_scope_question(self):
+        with patch("assistant_api.requests.post") as provider, patch("assistant_api.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+            for text in ("Проверь транспорт на этой неделе для всех сотрудников",
+                         "Проверьте клиентский транспорт за текущую неделю, ничего не изменяй.",
+                         "Проверить транспорт за эту неделю",
+                         "Проверь транспорт с 2026-10-19 по 2026-10-25 для сотрудника Synthetic Employee"):
+                with self.subTest(text=text):
+                    response = self.post("command", dict(text=text, operation_id=str(uuid.uuid4())))
+                    self.assertEqual(response.status_code, 200, response.get_json())
+                    chosen = response.get_json()["result"]["plan"]
+                    self.assertEqual(chosen["purpose"], "transport_check")
+                    self.assertEqual((chosen["date_from"], chosen["date_to"]), ("2026-10-19", "2026-10-25"))
+            response = self.post("command", dict(text="Проверь транспорт за текущую неделю для одного сотрудника",
+                                                 operation_id=str(uuid.uuid4())))
+            self.assertEqual(response.get_json()["clarification"]["field"], "scope")
+            provider.assert_not_called()
+        self.assertIsNone(assistant.transport_command("Проверь транспорт за текущую неделю и удали дубликаты"))
+        self.assertIsNone(assistant.transport_command("Проверь транспорт по объекту Hotel"))
+        with self.assertRaises(assistant.AssistantError):
+            assistant.transport_command("Проверь транспорт с 2026-99-19 по 2026-10-25")
+
+    def test_general_transport_router_documents_real_capability_and_requires_a_tool(self):
+        with patch("assistant_api.requests.post", return_value=self.response(plan("transport_check"))) as provider:
+            response = self.post("command", dict(text="Сверь цены выезда с текущим справочником за октябрь 2026",
+                                                 operation_id=str(uuid.uuid4())))
+        self.assertEqual(response.status_code, 200)
+        body = provider.call_args.kwargs["json"]
+        self.assertEqual(body["tool_choice"], "required")
+        self.assertIn("ARE SUPPORTED", body["instructions"])
+        self.assertEqual(response.get_json()["result"]["plan"]["purpose"], "transport_check")
+
     def test_button_to_table_and_voice_to_editable_text_then_explicit_command(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtCore import QDate

@@ -31,7 +31,10 @@ INPUT_MICRO_USD = Decimal("0.25")
 OUTPUT_MICRO_USD = Decimal("2")
 TOOLS = [{
     "type": "function", "name": "inspect_records",
-    "description": "Read SmartReport records or prepare an existing desktop report. Never change records or send mail.",
+    "description": "Read SmartReport records. transport_check IS SUPPORTED: check saved customer trips, travel rates "
+                   "and catalogue differences. Russian: проверка транспорта, выездов и цен выезда. "
+                   "search lists shifts, check checks saved rates/data, explain shows stored base/travel amounts. "
+                   "payroll_pdf/customer_pdf/catalog_preview prepare existing desktop reports, never writes.",
     "strict": True,
     "parameters": {
         "type": "object", "additionalProperties": False,
@@ -161,29 +164,60 @@ def validate_plan(plan):
     return plan
 
 
+def transport_command(text):
+    match = re.fullmatch(
+        r"(?:проверь(?:те)?|проверить)\s+(?:клиентский\s+)?транспорт"
+        r"(?:\s+(?:за|на)\s+(?P<week>текущую неделю|эту неделю|этой неделе|прошлую неделю|прошлой неделе)"
+        r"|\s+с\s+(?P<start>\d{4}-\d{2}-\d{2})\s+по\s+(?P<end>\d{4}-\d{2}-\d{2}))?"
+        r"(?:,?\s+(?:для|у)\s+(?P<scope>всех сотрудников|одного сотрудника|сотрудника\s+(?P<name>[^,\n]+)))?"
+        r"(?:,\s*ничего не изменяй)?[.!?]?",
+        " ".join(text.strip().split()), re.IGNORECASE)
+    if match is None:
+        return None
+    if match["scope"] and match["scope"].casefold() == "одного сотрудника":
+        raise AssistantQuestion("scope")
+    if not match["week"] and not match["start"]:
+        raise AssistantQuestion("period")
+    if match["week"]:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday())
+        if match["week"].casefold().startswith("прошл"):
+            start -= timedelta(days=7)
+        begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
+    else:
+        begin, end = match["start"], match["end"]
+    return validate_plan(dict(purpose="transport_check", date_from=begin, date_to=end,
+                              employee=(match["name"] or "").strip(), company="", object_name=""))
+
+
 def select_plan(text, conn, actor, operation, post=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
         raise AssistantError("Введите команду длиной не более 8000 байт.")
     normalized = " ".join(text.casefold().strip(" .!?").split())
-    if normalized in {"проверь транспорт", "проверьте транспорт"}:
+    try:
+        known_plan = transport_command(text)
+    except AssistantQuestion:
         reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
         finish(conn, actor, operation, "transport_check", "clarification")
-        raise AssistantQuestion("period")
-    if normalized in {"проверь транспорт за текущую неделю",
-                      "проверь транспорт за текущую неделю, ничего не изменяй"}:
-        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
-        start = today - timedelta(days=today.weekday())
+        raise
+    if known_plan:
         reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
         finish(conn, actor, operation, "transport_check", "routed")
-        return dict(purpose="transport_check", date_from=start.isoformat(),
-                    date_to=(start + timedelta(days=6)).isoformat(), employee="", company="", object_name="")
+        return known_plan
     # A byte per token is a conservative input bound; output includes reasoning tokens.
     instructions = (
         "You are a SmartReport command router. Call inspect_records once only if all parameters are clear. "
         "Do not calculate money or invent records. catalog_preview prepares native price-review only; it never changes data. "
         "Do not change data, close periods or send mail. "
         "Transport checks MUST use transport_check, not search or check. "
+        "Transport/travel checks ARE SUPPORTED even though physical journeys cannot be verified: "
+        "inspect_records checks saved trip quantities, customer travel rates and catalogue differences. "
+        "Russian транспорт/выезды/цена выезда refer to these supported fields, not vehicle tracking. "
+        "Example: 'Проверь транспорт на этой неделе для всех сотрудников' -> transport_check, "
+        "current Monday-Sunday, all filters empty. "
+        "'Для одного сотрудника' without a name -> request_clarification field scope. "
+        "Only mark unsupported for an action outside the listed read/report capabilities, not for missing filters. "
         "For missing parameters call request_clarification with the specific field; "
         "for unsupported actions use field unsupported. Never return free text instead of a tool. "
         "Current week means Monday through Sunday inclusive. No employee filter means all employees; "
