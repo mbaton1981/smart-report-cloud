@@ -43,14 +43,26 @@ def parse_pricing(value, row):
         raise ValueError("Клиентская цена не действует на дату записи.")
     if value.get("company") != row["company"] or value.get("object_name") != row["object_name"]:
         raise ValueError("Клиентская цена относится к другому заказчику или объекту.")
-    if not isinstance(value.get("source"), str) or not value["source"].strip():
-        raise ValueError("Укажите основание подтверждения клиентских цен.")
+    source = value.get("source", "")
+    if not isinstance(source, str):
+        raise ValueError("Комментарий к ценам должен быть текстом.")
+    confirmation = {}
+    if "confirmed" in value or "confirmed_at" in value:
+        if value.get("confirmed") is not True or not isinstance(value.get("confirmed_at"), str):
+            raise ValueError("Некорректное подтверждение клиентских цен.")
+        confirmed_at = datetime.fromisoformat(value["confirmed_at"])
+        if confirmed_at.tzinfo is None:
+            raise ValueError("Дата подтверждения клиентских цен должна содержать часовой пояс.")
+        confirmation = {"confirmed": True, "confirmed_at": confirmed_at.isoformat()}
+    elif not source.strip():
+        raise ValueError("Клиентские цены не подтверждены пользователем.")
     ob = value.get("ob", {})
     if not isinstance(ob, dict) or len(ob) > 30:
         raise ValueError("Некорректные клиентские категории OB.")
     return {
         "version": 1, "company": value["company"], "object_name": value["object_name"],
-        "date_from": start, "date_to": end, "source": value["source"].strip()[:500],
+        "date_from": start, "date_to": end, "source": source.strip()[:500],
+        **confirmation,
         "base": checked_rate(value.get("base")), "travel": checked_rate(value.get("travel")),
         "ob": {str(key): checked_rate(rate) for key, rate in ob.items()},
     }

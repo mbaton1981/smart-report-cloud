@@ -2,6 +2,7 @@ import json
 import sqlite3
 import unittest
 import uuid
+from datetime import datetime
 from unittest.mock import patch
 
 import test_customer_report as reports
@@ -137,6 +138,59 @@ class HistoricalPricesTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 parse_pricing(dict(quote, **{key: value}), row)
 
+    def test_confirm_prices_without_comment_records_confirmation_and_date(self):
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QLabel
+        identifier = self.shift(confirmed=False)
+        failures = []
+
+        def accept_prices():
+            try:
+                dialog = QApplication.activeModalWidget()
+                self.assertIsInstance(dialog, QDialog)
+                labels = [label.text() for label in dialog.findChildren(QLabel)]
+                self.assertIn("Комментарий к ценам:", labels)
+                self.assertNotIn("Основание цен:", labels)
+                comment = dialog.findChild(QLineEdit, "customer_price_comment")
+                self.assertEqual(comment.text(), "")
+                for field in dialog.findChildren(QLineEdit):
+                    if field is not comment:
+                        field.setText("520")
+                dialog.accept()
+            except Exception as error:
+                failures.append(error)
+                if QApplication.activeModalWidget():
+                    QApplication.activeModalWidget().reject()
+
+        QTimer.singleShot(0, accept_prices)
+        with patch.object(self.desktop.QMessageBox, "information"), \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(self.window, "background_sync_with_cloud"):
+            self.window.confirm_customer_prices()
+        self.assertEqual(failures, [])
+        warning.assert_not_called()
+        row = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone())
+        quote = json.loads(row["customer_pricing"])
+        self.assertEqual(quote["source"], "")
+        self.assertIs(quote["confirmed"], True)
+        self.assertIsNotNone(datetime.fromisoformat(quote["confirmed_at"]).tzinfo)
+        self.assertEqual(parse_pricing(quote, row), quote)
+        self.assertEqual(self.window.generate_invoice()["totals"]["invoice_total"], 4160)
+        queued = json.loads(self.conn.execute("SELECT payload_json FROM shift_sync_outbox").fetchone()[0])
+        self.assertEqual(json.loads(queued["customer_pricing"]), quote)
+
+    def test_confirmation_metadata_roundtrip_and_legacy_comments(self):
+        identifier = self.shift()
+        row = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone())
+        legacy = json.loads(row["customer_pricing"])
+        self.assertEqual(parse_pricing(legacy, row)["source"], legacy["source"])
+        quote = dict(legacy, source="", confirmed=True, confirmed_at="2026-10-23T07:42:00+02:00")
+        self.assertEqual(parse_pricing(quote, row), quote)
+        for fields in ({"confirmed": False}, {"confirmed_at": "bad"},
+                       {"confirmed_at": "2026-10-23T07:42:00"}):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                parse_pricing(dict(quote, **fields), row)
+
     def test_contract_reuse_only_in_valid_period_and_no_guess_on_conflict(self):
         first = self.shift(day="2026-10-21")
         row = self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (first,)).fetchone()
@@ -182,7 +236,8 @@ class PricingSyncTests(unittest.TestCase):
         segments = list(map(tuple, conn.execute("SELECT * FROM ob_segments")))
         conn.close()
         quote = {"version": 1, "company": "Renatur", "object_name": "Travel B",
-                 "date_from": "2026-10-20", "date_to": "2026-10-20", "source": "Synthetic contract",
+                 "date_from": "2026-10-20", "date_to": "2026-10-20", "source": "",
+                 "confirmed": True, "confirmed_at": "2026-10-23T07:42:00+02:00",
                  "base": 300, "travel": 450, "ob": {"weekday_early_evening": 50, "weekday_late_evening_night": 70}}
         payload = {key: before[key] for key in ("date", "employee", "company", "object_name", "hours", "rate",
                    "transport", "comment", "start_time", "end_time")}

@@ -8743,7 +8743,8 @@ class SmartReportApp(QMainWindow):
             note = QLabel(
                 f"{report['object']}: {report['date_from']} — {report['date_to']}.\n"
                 f"Открытых записей: {len(candidates)}. Закрытые записи не затрагиваются.\n"
-                "Введите подтверждённые договором цены, не зарплатные ставки.\n"
+                "Введите подтверждённые вами клиентские цены, не зарплатные ставки.\n"
+                "При сохранении подтверждение и дата записываются автоматически.\n"
                 "Пусто — неизвестно; 0 — подтверждённая нулевая цена.\n"
                 "Для разных цен выберите отдельные периоды. Транспорт — цена за записанную единицу."
             )
@@ -8758,8 +8759,9 @@ class SmartReportApp(QMainWindow):
                 fields[key] = field
                 form.addRow(label, field)
             source = QLineEdit()
-            source.setPlaceholderText("Договор / приложение / подтверждение, дата")
-            form.addRow("Основание цен:", source)
+            source.setObjectName("customer_price_comment")
+            source.setPlaceholderText("Необязательно")
+            form.addRow("Комментарий к ценам:", source)
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
             buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить цены")
             buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
@@ -8772,6 +8774,7 @@ class SmartReportApp(QMainWindow):
                 "version": 1, "company": report["company"], "object_name": report["object"],
                 "date_from": report["date_from"], "date_to": report["date_to"],
                 "source": source.text(),
+                "confirmed": True, "confirmed_at": datetime.now(timezone.utc).isoformat(),
                 "base": fields["base"].text().strip().replace(",", ".") or None,
                 "travel": fields["travel"].text().strip().replace(",", ".") or None,
                 "ob": {category: fields[category].text().strip().replace(",", ".") or None for category in categories},
