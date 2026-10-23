@@ -1105,7 +1105,123 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
     return result
 
 
+def verify_catalog_prices_ram(app_module, work_dir, out_path):
+    """Exercise the real price preview on an existing dataset, changing only RAM."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtCore import QDate, QTimer
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QDialog, QMessageBox
+    from customer_report import write_customer_pdf
+    from customer_pricing import row_prices
+
+    database = Path(app_module.DB_FILE).resolve()
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    uri = f"file:catalog-price-check-{uuid.uuid4()}?mode=memory&cache=shared"
+    master = sqlite3.connect(uri, uri=True)
+    master.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        before_source = list(source.iterdump())
+        source.backup(master)
+    before = list(master.iterdump())
+    application = QApplication.instance() or QApplication([])
+
+    def connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    errors, preview = [], []
+    with patch("requests.sessions.Session.request", side_effect=RuntimeError("Network forbidden")), \
+            patch.object(app_module, "get_db_connection", connection):
+        window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+        QMainWindow.__init__(window)
+        window.tab_invoice, window.tab_dagbok = QWidget(), QWidget()
+        window.setCentralWidget(window.tab_invoice)
+        window.setup_invoice_tab()
+        window.setup_dagbok_tab()
+        window.inv_comp_cb.setCurrentText("Renatur")
+        window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(84))
+        window.inv_date_from.setDate(QDate(2026, 10, 1))
+        window.inv_date_to.setDate(QDate(2026, 10, 31))
+        old = window.generate_invoice()
+        old_rows = {row["sync_id"]: row for row in old["journal_rows"]}
+        work_pdfs = []
+        for name, report in (("before", old),):
+            path = work / (name + ".pdf")
+            write_customer_pdf(report, str(path), app_module.DEFAULT_FONT, app_module.DEFAULT_FONT_BOLD,
+                               window._journal_description_swedish)
+            work_pdfs.append(str(path))
+
+        def accept_preview():
+            dialog = QApplication.activeModalWidget()
+            try:
+                assert isinstance(dialog, QDialog) and dialog.objectName() == "catalog_prices_preview"
+                table = dialog.findChild(app_module.QTableWidget, "catalog_prices_table")
+                for row in range(table.rowCount()):
+                    preview.append([table.item(row, col).text() for col in range(1, table.columnCount())])
+                dialog.grab().save(str(work / "price-preview.png"))
+                dialog.accept()
+            except Exception as error:
+                errors.append(str(error))
+                if dialog:
+                    dialog.reject()
+
+        QTimer.singleShot(100, accept_preview)
+        with patch.object(window, "background_sync_with_cloud") as sync, \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as question, \
+                patch.object(QMessageBox, "warning", side_effect=lambda _p, _t, text: errors.append(text)), \
+                patch.object(QMessageBox, "information"):
+            button = window.findChild(app_module.QPushButton, "apply_catalog_prices")
+            QTest.mouseClick(button, app_module.Qt.MouseButton.LeftButton)
+        assert not errors, errors
+        assert preview and question.called and sync.called
+        new = window.generate_invoice()
+        changed = []
+        for row in new["journal_rows"]:
+            previous = old_rows[row["sync_id"]]
+            if row != previous:
+                assert not previous["invoiced"]
+                assert {k: v for k, v in row.items() if k != "customer_pricing"} == {
+                    k: v for k, v in previous.items() if k != "customer_pricing"}
+                assert row_prices(row)["ob"] == row_prices(previous)["ob"]
+                assert (row_prices(row)["base"], row_prices(row)["travel"]) == (new["rate"], new["transport_rate"])
+                changed.append(row["id"])
+        assert changed
+        path = work / "after.pdf"
+        write_customer_pdf(new, str(path), app_module.DEFAULT_FONT, app_module.DEFAULT_FONT_BOLD,
+                           window._journal_description_swedish)
+        work_pdfs.append(str(path))
+        window.grab().save(str(work / "report-after.png"))
+        after = list(master.iterdump())
+        for line in before:
+            if line.startswith('INSERT INTO "') and not line.startswith(tuple(
+                f'INSERT INTO "{table}"' for table in
+                ("shifts", "customer_price_audit", "shift_sync_outbox", "sqlite_sequence")
+            )):
+                assert line in after
+        repeated = list(master.iterdump())
+        assert window._apply_catalog_prices(window.collect_invoice_report(), {
+            row["sync_id"] for row in new["journal_rows"] if row["id"] in changed
+        }) == 0
+        assert list(master.iterdump()) == repeated
+        window.close()
+    master.close()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        assert list(source.iterdump()) == before_source
+    result = dict(frozen=bool(getattr(sys, "frozen", False)), source_unchanged=True,
+                  source_database=str(database), network_requests=0, changed_in_ram=changed,
+                  manual_confirmation_shown=question.called, preview=preview, pdfs=work_pdfs,
+                  before=old["totals"], after=new["totals"], repeat_noop=True)
+    Path(out_path or work / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "catalog-prices-ram":
+        return verify_catalog_prices_ram(app_module, work_dir, out_path)
     if action == "payroll-estimate-readonly":
         return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True,
                                               employee=None if case == "case" else case, norm_mode=True)

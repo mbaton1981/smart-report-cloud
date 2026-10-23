@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
     QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
-    QTextEdit, QSplitter, QGraphicsView, QGraphicsScene
+    QTextEdit, QSplitter, QGraphicsView, QGraphicsScene, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool
 from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QImage, QPixmap
@@ -38,7 +38,7 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
-from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
+from customer_pricing import agreed_prices_for_date, apply_catalog_price, catalog_price_preview, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
@@ -8273,6 +8273,10 @@ class SmartReportApp(QMainWindow):
         prices_btn = QPushButton("Клиентские цены выбранного периода…")
         prices_btn.clicked.connect(self.confirm_customer_prices)
         card_layout.addRow(prices_btn)
+        catalog_prices_btn = QPushButton("Применить цены справочника…")
+        catalog_prices_btn.setObjectName("apply_catalog_prices")
+        catalog_prices_btn.clicked.connect(self.preview_catalog_prices)
+        card_layout.addRow(catalog_prices_btn)
 
         layout.addWidget(card)
         layout.addWidget(QLabel(
@@ -8943,6 +8947,125 @@ class SmartReportApp(QMainWindow):
                 return None
             translations.update(dialog.translations)
         return translations
+
+    def _apply_catalog_prices(self, report, selected_ids, *, replace_confirmed=False):
+        selected = [row for row in report["journal_rows"] if row["sync_id"] in selected_ids]
+        if not selected or len(selected) != len(set(selected_ids)):
+            raise ValueError("Выберите записи из предварительного просмотра.")
+        conn = get_db_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            obj = cursor.execute("SELECT * FROM objects WHERE id=?", (report["object_id"],)).fetchone()
+            if obj is None or any(obj[key] != report[report_key] for key, report_key in (
+                ("company", "company"), ("name", "object"), ("sync_id", "sync_id"),
+                ("rate", "rate"), ("transport_rate", "transport_rate"),
+            )):
+                raise ValueError("Цены или объект справочника изменились. Откройте просмотр заново.")
+            changed = []
+            for old in selected:
+                current = cursor.execute("SELECT * FROM shifts WHERE sync_id=?", (old["sync_id"],)).fetchone()
+                if current is None or dict(current) != old:
+                    raise ValueError("Записи изменились. Откройте предварительный просмотр заново.")
+                if current["entry_type"] not in ("work", "ob"):
+                    raise ValueError("Цены применяются только к рабочим записям.")
+                if apply_catalog_price(cursor, dict(current), report["rate"], report["transport_rate"],
+                                       replace_confirmed=replace_confirmed):
+                    changed.append(current["id"])
+            if changed:
+                marks = ",".join("?" for _ in changed)
+                enqueue_matching_shifts(cursor, f"id IN ({marks})", tuple(changed))
+            conn.commit()
+            return len(changed)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def preview_catalog_prices(self):
+        try:
+            report = self.collect_invoice_report()
+            proposals = catalog_price_preview(report["journal_rows"], report["rate"], report["transport_rate"])
+            if not any(item["eligible"] for item in proposals):
+                raise ValueError("Нет доступных изменений. Закрытые записи и Fast pris защищены.")
+            dialog = QDialog(self)
+            dialog.setObjectName("catalog_prices_preview")
+            dialog.setWindowTitle("Применить клиентские цены справочника")
+            dialog.resize(1180, 580)
+            layout = QVBoxLayout(dialog)
+            note = QLabel(
+                f"{report['object']} · {report['date_from']} — {report['date_to']}\n"
+                "Отметьте записи для изменения. Обновляются ОБА поля: клиентская ставка (SEK/ч) "
+                "и цена транспорта (SEK/выезд).\n"
+                "Количество выездов не меняется. Ручные / сохранённые цены требуют подтверждения замены.\n"
+                "Клиентские доплаты OB, зарплаты, «Баланс», закрытые записи и Fast pris не изменяются."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            table = QTableWidget(len(proposals), 9)
+            table.setObjectName("catalog_prices_table")
+            table.setHorizontalHeaderLabels([
+                "Выбрать", "№ · дата", "Сотрудник", "Часы / выезды", "Ставка была",
+                "Ставка станет", "Транспорт был", "Транспорт станет", "Источник / защита",
+            ])
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            for index, item in enumerate(proposals):
+                row = item["row"]
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                               if item["eligible"] else Qt.ItemFlag.NoItemFlags)
+                check.setCheckState(Qt.CheckState.Checked if item["eligible"] else Qt.CheckState.Unchecked)
+                table.setItem(index, 0, check)
+                def price(value):
+                    return "Не задана" if value is None else f"{value:.2f}"
+                for column, text in enumerate([
+                    f"№{row['id']} · {row['date']}", row["employee"],
+                    f"{row['hours']:g} ч / {row['transport'] or 0:g} выезд.",
+                    price(item["before"]["base"]), price(item["base"]),
+                    price(item["before"]["travel"]), price(item["travel"]), item["reason"],
+                ], 1):
+                    cell = QTableWidgetItem(text)
+                    cell.setToolTip(item["before"].get("source") or item["origin"])
+                    table.setItem(index, column, cell)
+            table.resizeColumnsToContents()
+            table.horizontalHeader().setStretchLastSection(True)
+            layout.addWidget(table)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+            buttons.button(QDialogButtonBox.StandardButton.Save).setText("Применить к отмеченным записям")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected = [item for index, item in enumerate(proposals) if item["eligible"]
+                        and table.item(index, 0).checkState() == Qt.CheckState.Checked]
+            if not selected:
+                raise ValueError("Не выбраны записи для применения цен.")
+            protected = [item for item in selected if item["replace_confirmation"]]
+            if protected and QMessageBox.question(
+                self, "Подтвердите замену ручных / сохранённых цен",
+                "Заменить цены в отмеченных записях ценами справочника?\n"
+                + "\n".join(f"№{item['row']['id']} · {item['row']['date']} · {item['origin']}" for item in protected)
+                + "\nПредыдущие цены сохранятся в журнале изменений.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            changed = self._apply_catalog_prices(
+                report, {item["row"]["sync_id"] for item in selected}, replace_confirmed=bool(protected)
+            )
+            self.generate_invoice()
+            if hasattr(self, "table_shifts"):
+                self.load_shifts_history()
+            if changed:
+                self.background_sync_with_cloud()
+            QMessageBox.information(self, "Цены справочника",
+                                    f"Обновлены обе клиентские цены: {changed} записей.\n"
+                                    "Зарплаты, «Баланс» и закрытые записи не изменены.")
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Цены не применены", str(error))
 
     def confirm_customer_prices(self):
         try:

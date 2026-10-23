@@ -5,6 +5,61 @@ import math
 from fixed_pricing import parse_fixed
 
 
+CATALOG_PRICE_SOURCE = "Цены справочника объекта (применены пользователем)"
+
+
+def catalog_price_preview(rows, base, travel):
+    """Propose only customer base/travel replacements, never payroll or OB changes."""
+    base, travel = checked_rate(base), checked_rate(travel)
+    if base is None or travel is None:
+        raise ValueError("В справочнике должны быть заданы обе цены: работа и транспорт.")
+    result = []
+    for row in rows:
+        if row["entry_type"] not in ("work", "ob"):
+            continue
+        prices = row_prices(row)
+        reason = (
+            "Закрыта / выставлена — защищена" if row["invoiced"] else
+            "Fast pris — защищён" if prices.get("fixed") else ""
+        )
+        changed = [key for key, new in (("base", base), ("travel", travel)) if prices[key] != new]
+        source = prices.get("source", "")
+        origin = (
+            "Справочник (ранее применён)" if source == CATALOG_PRICE_SOURCE else
+            "Ручная цена" if source.startswith("Ручн") else
+            "Сохранённые цены; происхождение не указано" if any(
+                prices[key] is not None for key in ("base", "travel")
+            ) else "Цены не заданы"
+        )
+        protected = source != CATALOG_PRICE_SOURCE and any(prices[key] is not None for key in changed)
+        result.append({
+            "row": row, "before": prices, "base": base, "travel": travel,
+            "eligible": bool(changed) and not reason, "replace_confirmation": protected,
+            "origin": origin, "reason": reason or ("Без изменений" if not changed else origin),
+        })
+    return result
+
+
+def apply_catalog_price(cursor, row, base, travel, *, replace_confirmed=False):
+    if row["entry_type"] not in ("work", "ob"):
+        raise ValueError("Цены применяются только к рабочим записям.")
+    proposal = catalog_price_preview([row], base, travel)[0]
+    if row["invoiced"] or proposal["before"].get("fixed"):
+        raise ValueError("Закрытая запись или Fast pris защищены от изменения цен.")
+    if not proposal["eligible"]:
+        return False
+    if proposal["replace_confirmation"] and not replace_confirmed:
+        raise ValueError("Замена ручных / сохранённых цен требует отдельного подтверждения.")
+    quote = {
+        "version": 1, "company": row["company"], "object_name": row["object_name"],
+        "date_from": row["date"], "date_to": row["date"],
+        "source": CATALOG_PRICE_SOURCE, "confirmed": True,
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        "base": proposal["base"], "travel": proposal["travel"], "ob": proposal["before"]["ob"],
+    }
+    return store_pricing(cursor, "shifts", row["sync_id"], quote)
+
+
 def ensure_pricing_schema(cursor, table):
     if table not in {"shifts", "incoming_submissions"}:
         raise ValueError("Unsupported pricing table")
