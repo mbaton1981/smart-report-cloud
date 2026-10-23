@@ -10,6 +10,7 @@ from unittest.mock import patch
 from pypdf import PdfReader
 import payroll_history as history
 import payroll_ui
+import payroll_preview
 import test_catalog_sync as catalog
 from test_payroll_history import PARAMS
 
@@ -260,6 +261,195 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertIn("Всего отработано: 4", text)
         self.assertIn("без суммы", text)
         self.assertEqual(before, list(conn.iterdump()))
+
+    def preview_pdf_fixture(self, folder):
+        conn = self.seed_management_shift()
+        window = self.salary_window(management_mode=True)
+        source = Path(folder)/"preview.pdf"
+        payroll_ui.write_pdf(source, payroll_ui.selected_reports(window, self.desktop),
+                             self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        return conn, window, source
+
+    def test_preview_button_opens_all_pages_without_save_picker_and_deletes_temporary_pdf(self):
+        conn = self.seed_management_shift()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        captured = []
+        def inspect(dialog):
+            dialog.show()
+            self.qt_app.processEvents()
+            captured.append(dialog.source)
+            text = "\n".join(p.extract_text() for p in PdfReader(dialog.source).pages)
+            self.assertIn("Предварительный расчёт по текущим ставкам", text)
+            self.assertIn("Fortnox", text)
+            self.assertTrue(dialog.preview._image.pixmap().width() > 0)
+            dialog.show_page(len(dialog._pages)-1)
+            self.assertEqual(dialog._page_index, len(dialog._pages)-1)
+            current = dialog.preview.transform().m11()
+            dialog.preview.zoom(1.2)
+            self.assertGreater(dialog.preview.transform().m11(), current)
+            buttons = [b.text() for b in dialog.findChildren(self.desktop.QPushButton)]
+            self.assertIn("Сохранить как…", buttons)
+            self.assertIn("Печать", buttons)
+            dialog.accept()
+            return 1
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        window.show()
+        self.qt_app.processEvents()
+        button = next(b for b in window.findChildren(self.desktop.QPushButton) if b.text() == "Предпросмотр PDF")
+        with patch.object(payroll_preview.PayrollPdfPreviewDialog, "exec", inspect), \
+                patch.object(payroll_ui.QFileDialog, "getSaveFileName") as picker:
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+        picker.assert_not_called()
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0].exists())
+        self.assertEqual(before, list(conn.iterdump()))
+
+    def test_preview_save_as_copies_identical_pdf_and_cancel_does_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn, window, source = self.preview_pdf_fixture(folder)
+            before = list(conn.iterdump())
+            dialog = payroll_preview.PayrollPdfPreviewDialog(source, Path(folder)/"suggested.pdf", window)
+            try:
+                target = Path(folder)/"chosen.pdf"
+                with patch.object(payroll_preview.QFileDialog, "getSaveFileName", return_value=("", "")), \
+                        patch.object(payroll_preview.QMessageBox, "information") as message:
+                    dialog.save_as()
+                message.assert_not_called()
+                self.assertFalse(target.exists())
+                with patch.object(payroll_preview.QFileDialog, "getSaveFileName", return_value=(str(target), "")), \
+                        patch.object(payroll_preview.QMessageBox, "information") as message:
+                    dialog.save_as()
+                self.assertEqual(source.read_bytes(), target.read_bytes())
+                message.assert_called_once()
+                self.assertEqual(before, list(conn.iterdump()))
+            finally:
+                dialog.release_resources()
+
+    def test_preview_save_failure_is_logged_and_visible(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, window, source = self.preview_pdf_fixture(folder)
+            dialog = payroll_preview.PayrollPdfPreviewDialog(source, source, window)
+            try:
+                with patch.object(payroll_preview.QFileDialog, "getSaveFileName", return_value=(str(source), "")), \
+                        patch.object(payroll_preview.shutil, "copyfile", side_effect=PermissionError("file locked")), \
+                        patch.object(payroll_preview.QMessageBox, "critical") as critical, \
+                        self.assertLogs("payroll_preview", level="ERROR"):
+                    dialog.save_as()
+                self.assertIn("file locked", critical.call_args.args[2])
+            finally:
+                dialog.release_resources()
+
+    def test_preview_print_cancel_and_pdf_printer_all_pages(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conn, window, source = self.preview_pdf_fixture(folder)
+            before = list(conn.iterdump())
+            dialog = payroll_preview.PayrollPdfPreviewDialog(source, source, window)
+            try:
+                with patch.object(payroll_preview.QPrintDialog, "exec", return_value=0), \
+                        patch.object(dialog, "print_document") as print_document:
+                    dialog.print_pdf()
+                print_document.assert_not_called()
+                printer = payroll_preview.QPrinter()
+                printer.setResolution(72)
+                printer.setPageOrientation(payroll_preview.QPageLayout.Orientation.Landscape)
+                printer.setOutputFormat(payroll_preview.QPrinter.OutputFormat.PdfFormat)
+                output = Path(folder)/"print.pdf"
+                printer.setOutputFileName(str(output))
+                dialog.print_document(printer)
+                self.assertEqual(len(PdfReader(output).pages), len(PdfReader(source).pages))
+                self.assertTrue(all(p.images for p in PdfReader(output).pages))
+                self.assertEqual(before, list(conn.iterdump()))
+            finally:
+                dialog.release_resources()
+
+    def test_preview_system_fallback_keeps_pdf_available_after_preview_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, window, source = self.preview_pdf_fixture(folder)
+            original = source.read_bytes()
+            with patch.object(payroll_preview, "PayrollPdfPreviewDialog", side_effect=ImportError("viewer missing")), \
+                    patch.object(payroll_preview.QDesktopServices, "openUrl", return_value=True) as open_url, \
+                    self.assertLogs("payroll_preview", level="ERROR"):
+                payroll_preview.open_preview(source, source, window)
+            external = Path(open_url.call_args.args[0].toLocalFile())
+            try:
+                self.assertNotEqual(source, external)
+                self.assertEqual(external.read_bytes(), original)
+            finally:
+                external.unlink()
+
+    def test_preview_print_dialog_accepts_selected_page_and_reports_print_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, window, source = self.preview_pdf_fixture(folder)
+            reports = payroll_ui.selected_reports(window, self.desktop)
+            payroll_ui.write_pdf(source, reports*2, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+            dialog = payroll_preview.PayrollPdfPreviewDialog(source, source, window)
+            output = Path(folder)/"second-page.pdf"
+            def accept_print(print_dialog):
+                printer = print_dialog.printer()
+                printer.setOutputFormat(payroll_preview.QPrinter.OutputFormat.PdfFormat)
+                printer.setOutputFileName(str(output))
+                printer.setResolution(72)
+                printer.setFromTo(2, 2)
+                return payroll_preview.QDialog.DialogCode.Accepted
+            try:
+                with patch.object(payroll_preview.QPrintDialog, "exec", accept_print):
+                    dialog.print_pdf()
+                self.assertEqual(len(PdfReader(source).pages), 2)
+                self.assertEqual(len(PdfReader(output).pages), 1)
+                with patch.object(payroll_preview.QPrintDialog, "exec", return_value=1), \
+                        patch.object(dialog, "print_document", side_effect=RuntimeError("printer offline")), \
+                        patch.object(payroll_preview.QMessageBox, "critical") as critical, \
+                        self.assertLogs("payroll_preview", level="ERROR"):
+                    dialog.print_pdf()
+                self.assertIn("printer offline", critical.call_args.args[2])
+            finally:
+                dialog.release_resources()
+
+    def test_preview_keeps_unknown_ob_warning_and_does_not_confirm_history(self):
+        conn = self.seed_management_shift()
+        conn.execute("UPDATE shifts SET start_time=NULL,end_time=NULL WHERE sync_id='management-one'")
+        conn.commit()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        def inspect(dialog):
+            text = "\n".join(p.extract_text() for p in PdfReader(dialog.source).pages)
+            self.assertIn("Предварительный расчёт", text)
+            self.assertIn("OB не определён: 4", text)
+            self.assertIn("Нет времени начала/окончания", text)
+            self.assertIn("без суммы", text)
+            return 0
+        with patch.object(payroll_preview.PayrollPdfPreviewDialog, "exec", inspect), \
+                patch.object(payroll_ui.QFileDialog, "getSaveFileName") as picker:
+            payroll_ui.preview(window, self.desktop)
+        picker.assert_not_called()
+        self.assertEqual(before, list(conn.iterdump()))
+
+    def test_preview_fallback_failure_shows_clear_error(self):
+        self.seed_management_shift()
+        window = self.salary_window(management_mode=True)
+        with patch.object(payroll_preview, "PayrollPdfPreviewDialog", side_effect=RuntimeError("render failed")), \
+                patch.object(payroll_preview.QDesktopServices, "openUrl", return_value=False) as open_url, \
+                patch.object(payroll_ui.QMessageBox, "critical") as critical, \
+                self.assertLogs(level="ERROR"):
+            payroll_ui.preview(window, self.desktop)
+        text = critical.call_args.args[2]
+        self.assertIn("render failed", text)
+        self.assertIn("Системная программа", text)
+        self.assertFalse(Path(open_url.call_args.args[0].toLocalFile()).exists())
+
+    def test_preview_generation_error_and_empty_period_are_visible(self):
+        window = self.salary_window(management_mode=True)
+        with patch.object(payroll_ui, "selected_reports", return_value=[]), \
+                patch.object(payroll_ui.QMessageBox, "warning") as warning:
+            payroll_ui.preview(window, self.desktop)
+        warning.assert_called_once()
+        with patch.object(payroll_ui, "selected_reports", side_effect=sqlite3.OperationalError("database unavailable")), \
+                patch.object(payroll_ui.QMessageBox, "critical") as critical, \
+                self.assertLogs("payroll_ui", level="ERROR"):
+            payroll_ui.preview(window, self.desktop)
+        self.assertIn("database unavailable", critical.call_args.args[2])
 
 
 if __name__ == "__main__":

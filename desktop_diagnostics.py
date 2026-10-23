@@ -889,7 +889,7 @@ def verify_payroll_ram(app_module, work_dir, out_path):
     return result
 
 
-def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False):
+def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False, preview_mode=False):
     """Click export, exercise real dialogs, and preserve all source payroll data."""
     from contextlib import closing
     import sqlite3
@@ -898,6 +898,7 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QWidget
     from pypdf import PdfReader
+    import payroll_preview
 
     database = Path(app_module.DB_FILE).resolve(strict=True)
     work = Path(work_dir).resolve()
@@ -915,13 +916,37 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
     result = dict(frozen=bool(getattr(sys, "frozen", False)), source_database=str(database),
                   network_requests=0, save_dialog_seen=False, success_message_seen=False)
     errors = []
+    preview_bytes = []
     original_save = QFileDialog.getSaveFileName
     def choose(parent, title, suggested, file_filter):
         return original_save(parent, title, suggested, file_filter,
                              options=QFileDialog.Option.DontUseNativeDialog)
     def handle_dialog():
         modal = application.activeModalWidget()
-        if isinstance(modal, QFileDialog):
+        if isinstance(modal, payroll_preview.PayrollPdfPreviewDialog):
+            if not result.get("preview_seen"):
+                result.update(preview_seen=True, preview_before_save=not result["save_dialog_seen"],
+                              preview_pages=len(modal._pages), temporary_pdf=str(modal.source))
+                preview_bytes.append(modal.source.read_bytes())
+                modal.grab().save(str(work/"preview-first-page.png"))
+                modal.show_page(len(modal._pages)-1)
+                zoom = modal.preview.transform().m11()
+                modal.preview.zoom(1.2)
+                if modal.preview.transform().m11() <= zoom:
+                    errors.append("Preview zoom did not change.")
+                result.update(last_page_seen=modal._page_index == len(modal._pages)-1, zoom_verified=True)
+                modal.grab().save(str(work/"preview-last-page.png"))
+                printer = payroll_preview.QPrinter()
+                printer.setResolution(150)
+                printer.setPageOrientation(payroll_preview.QPageLayout.Orientation.Landscape)
+                printer.setOutputFormat(payroll_preview.QPrinter.OutputFormat.PdfFormat)
+                printer.setOutputFileName(str(work/"printed-preview.pdf"))
+                modal.print_document(printer)
+                result["printed_pages"] = len(PdfReader(work/"printed-preview.pdf").pages)
+                QTimer.singleShot(0, modal.save_as)
+            elif result["success_message_seen"]:
+                modal.accept()
+        elif isinstance(modal, QFileDialog):
             result["save_dialog_seen"] = True
             modal.findChild(QLineEdit, "fileNameEdit").setText(filename.name)
             modal.grab().save(str(work/"save-dialog.png"))
@@ -957,7 +982,8 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
             import payroll_ui
             result["reports"] = payroll_ui.selected_reports(window, app_module)
             result["default_management_mode"] = window.sal_report_mode.currentIndex() == 0
-        button = next(b for b in window.findChildren(QPushButton) if "Экспорт зарплат" in b.text())
+        button = next(b for b in window.findChildren(QPushButton)
+                      if (b.text() == "Предпросмотр PDF" if preview_mode else "Экспорт зарплат" in b.text()))
         timer = QTimer(window)
         timer.timeout.connect(handle_dialog)
         timer.start(150)
@@ -969,6 +995,15 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
         raise RuntimeError("; ".join(errors))
     if not result["save_dialog_seen"] or not result["success_message_seen"]:
         raise RuntimeError("Export did not show both the save dialog and success message.")
+    if preview_mode:
+        if not result.get("preview_before_save") or not result.get("last_page_seen"):
+            raise RuntimeError("Preview did not precede optional saving or last page was unavailable.")
+        if filename.read_bytes() != preview_bytes[0] or Path(result["temporary_pdf"]).exists():
+            raise RuntimeError("Saved PDF differs from preview or temporary PDF was not cleaned up.")
+        result["preview_bytes_saved_unchanged"] = True
+        result["temporary_pdf_removed"] = True
+        if result["printed_pages"] != result["preview_pages"]:
+            raise RuntimeError("Print did not include every PDF page.")
     text = "\n".join(p.extract_text() for p in PdfReader(filename).pages)
     expected = "Предварительный расчёт по текущим ставкам" if management_mode else "Требует подтверждения"
     if expected not in text or "Andrii Piskun" not in text:
@@ -985,6 +1020,8 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "payroll-preview-readonly":
+        return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True)
     if action == "management-export-readonly":
         return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True)
     if action == "salary-export-readonly":

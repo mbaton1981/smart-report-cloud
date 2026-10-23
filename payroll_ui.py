@@ -4,6 +4,7 @@ import logging
 from datetime import date, timedelta
 from pathlib import Path
 import sqlite3
+import tempfile
 import uuid
 from xml.sax.saxutils import escape
 
@@ -589,6 +590,26 @@ def export_issues(items):
             prefix = f"{employee} · {source['date']} · {source['object_name']} · запись {line['sync_id']}"
             issues.extend(f"{prefix}: {warning}" for warning in line["warnings"])
     return list(dict.fromkeys(issues))
+
+
+def preview(window, app):
+    try:
+        items = selected_reports(window, app)
+        if not items:
+            QMessageBox.warning(window, "Предпросмотр PDF", "Нет данных для выбранного периода.")
+            return
+        filename = f"{'Timmar' if management_mode(window) else 'Loneunderlag'}_{window.sal_date_from.text()}_till_{window.sal_date_to.text()}.pdf"
+        from payroll_preview import open_preview
+        with tempfile.TemporaryDirectory(prefix="SmartReport-payroll-preview-") as folder:
+            path = Path(folder)/filename
+            write_pdf(path, items, app.DEFAULT_FONT, app.DEFAULT_FONT_BOLD)
+            logger.info("Salary PDF preview generated: %s; employees=%d", path, len(items))
+            open_preview(path, (Path(app.REPORTS_DIR)/filename).resolve(), window)
+    except (ImportError, OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error, LayoutError) as error:
+        logger.exception("Salary PDF preview failed")
+        QMessageBox.critical(window, "Ошибка предпросмотра PDF",
+                             f"Не удалось открыть зарплатный PDF:\n{error}\n"
+                             "Подтверждать ставки, закрывать период или отмечать выплату не нужно. «Баланс» не изменён.")
 
 
 def export(window, app):

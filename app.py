@@ -3656,6 +3656,9 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(self.sal_date_to)
         period_layout.addWidget(calc_btn)
 
+        preview_salary_pdf_btn = QPushButton("Предпросмотр PDF")
+        preview_salary_pdf_btn.clicked.connect(lambda: payroll_ui.preview(self, sys.modules[__name__]))
+        period_layout.addWidget(preview_salary_pdf_btn)
         export_salary_pdf_btn = QPushButton("🖨 Экспорт зарплат в PDF")
         export_salary_pdf_btn.setObjectName("secondaryAction")
         export_salary_pdf_btn.clicked.connect(self.export_salary_to_pdf)
