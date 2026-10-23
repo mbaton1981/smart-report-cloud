@@ -102,16 +102,29 @@ class ManagementPayrollTests(unittest.TestCase):
         self.add(hours=3)
         r = self.report()
         self.assertEqual((r["worked"], r["categories"]["unknown"], r["base"]), (3, 3, 300))
-        self.assertIsNone(r["premium"])
-        self.assertIsNone(r["total"])
+        self.assertEqual(r["premium"], 0)
+        self.assertEqual(r["total"], 300)
         self.assertIn("перерыва", r["lines"][0]["warnings"][0])
 
-    def test_no_times_exports_hours_not_zero_ob(self):
+    def test_no_times_exports_hours_with_base_only_and_unknown_category(self):
         self.add(start=None, end=None)
         r = self.report()
         self.assertEqual(r["worked"], 4)
         self.assertEqual(r["categories"]["unknown"], 4)
-        self.assertIsNone(r["total"])
+        self.assertEqual((r["base"], r["premium"], r["total"]), (400, 0, 400))
+
+    def test_known_premiums_plus_base_for_all_35_hours_do_not_invent_unknown_ob(self):
+        self.db.execute("UPDATE employees SET salary_rate=245.8")
+        self.add("four", hours=4)
+        self.add("seven", day="2026-10-22", hours=7, end="23:00")
+        for key, hours in (("eight1", 8), ("eight2", 8), ("six", 6), ("two", 2)):
+            self.add(key, hours=hours, start=None, end=None)
+        r = self.report()
+        self.assertEqual(r["worked"], 35)
+        self.assertEqual(r["categories"]["unknown"], 24)
+        self.assertEqual((r["base"], r["premium"], r["total"]), (8603, 860.3, 9463.3))
+        self.assertEqual(r["above_norm"], 0)
+        self.assertEqual(sum(r["categories"].values()), 35)
 
     def test_zero_missing_or_inactive_employee_rate_does_not_block_hours(self):
         self.add()

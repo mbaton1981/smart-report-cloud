@@ -417,7 +417,9 @@ class PayrollIntegrationTests(unittest.TestCase):
             self.assertIn("Предварительный расчёт", text)
             self.assertIn("OB не определён", text)
             self.assertIn("нет точных временных данных", text)
-            self.assertIn("Не определено", text)
+            self.assertIn("4 ч — OB не определён, учтена только базовая оплата", text)
+            self.assertIn("400.00", text)
+            self.assertNotIn("Не определено", text)
             return 0
         with patch.object(payroll_preview.PayrollPdfPreviewDialog, "exec", inspect), \
                 patch.object(payroll_ui.QFileDialog, "getSaveFileName") as picker:
@@ -575,6 +577,119 @@ class PayrollIntegrationTests(unittest.TestCase):
         window.load_salary_table_template()
         self.assertFalse(window.sal_unknown_ob_button.isEnabled())
         self.assertEqual(payroll_ui.unknown_ob_rows(payroll_ui.selected_reports(window, self.desktop)), [])
+
+    def test_management_norm_calendar_partial_period_holidays_and_unknown_hours(self):
+        conn = self.seed_management_shift()
+        conn.execute("UPDATE shifts SET hours=10,start_time=NULL,end_time=NULL,date='2026-12-24'")
+        conn.commit()
+        window = self.salary_window(management_mode=True)
+        from PyQt6.QtCore import QDate
+        for start, end, expected in (("2026-10-01", "2026-10-31", 176),
+                                     ("2026-12-24", "2026-12-27", 8),
+                                     ("2026-12-25", "2026-12-27", 0),
+                                     ("2026-12-24", "2026-12-24", 8)):
+            window.sal_date_from.setDate(QDate.fromString(start, "yyyy-MM-dd"))
+            window.sal_date_to.setDate(QDate.fromString(end, "yyyy-MM-dd"))
+            window.load_salary_table_template()
+            self.assertIn(f"Норма периода: {expected:g} ч", window.sal_norm_label.text())
+        report = payroll_ui.selected_reports(window, self.desktop)[0]
+        self.assertEqual((report["worked"], report["norm"], report["above_norm"]), (10, 8, 2))
+        self.assertEqual(report["total"], 1000)
+        self.assertEqual(window.table_salary.item(0, 9).text(), "2")
+        self.assertIn("10 ч — OB не определён, учтена только базовая оплата", window.payroll_history_note.text())
+        self.assertEqual(self.desktop.swedish_workday_norm("2026-12-31", "2027-01-06"), 24)
+        self.assertEqual(self.desktop.swedish_workday_norm("2026-04-02", "2026-04-06"), 8)
+
+    def test_individual_norm_persists_only_for_employee_exact_period_and_never_changes_pay(self):
+        conn = self.seed_management_shift()
+        conn.execute("INSERT INTO employees(name,salary_rate,is_active) VALUES('Other',100,1)")
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,rate,entry_type)
+                      VALUES('other','2026-10-22','Other','Renatur','Site',1,999,'work')""")
+        conn.commit()
+        before = list(conn.iterdump())
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(self.desktop.desktop_auth, "app_data_dir", return_value=Path(folder)):
+            window = self.salary_window(management_mode=True)
+            window.load_salary_table_template()
+            def change(dialog):
+                selector = dialog.findChild(payroll_ui.QComboBox, "payrollNormEmployee")
+                selector.setCurrentText("Management Test")
+                dialog.findChild(payroll_ui.QDoubleSpinBox, "payrollNormHours").setValue(2)
+                button = next(b for b in dialog.findChildren(payroll_ui.QPushButton) if b.text() == "Сохранить норму")
+                QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+                return 0
+            with patch.object(payroll_ui.QDialog, "exec", change):
+                window.show()
+                self.qt_app.processEvents()
+                QTest.mouseClick(window.sal_norm_button, Qt.MouseButton.LeftButton)
+            self.assertTrue(payroll_ui.norm_path(self.desktop).is_file())
+            other_window = self.salary_window(management_mode=True)
+            items = payroll_ui.selected_reports(other_window, self.desktop)
+            first = next(r for r in items if r["employee"] == "Management Test")
+            second = next(r for r in items if r["employee"] == "Other")
+            self.assertEqual((first["norm"], first["above_norm"], first["total"]), (2, 2, 500))
+            self.assertEqual((second["norm"], second["above_norm"], second["total"]), (176, 0, 100))
+            self.assertEqual(payroll_ui.summary_total(items)["above_norm"], 2)
+            pdf = BytesIO()
+            payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+            text = PdfReader(pdf).pages[0].extract_text()
+            self.assertIn("Сверх нормы", text)
+            self.assertIn("Индивидуальная норма: Management Test: 2 ч", text)
+            from PyQt6.QtCore import QDate
+            other_window.sal_date_to.setDate(QDate(2026, 10, 30))
+            self.assertFalse(payroll_ui.selected_reports(other_window, self.desktop)[0]["norm_override"])
+            def reset(dialog):
+                button = next(b for b in dialog.findChildren(payroll_ui.QPushButton) if b.text() == "Вернуть календарную")
+                QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+                return 0
+            with patch.object(payroll_ui.QDialog, "exec", reset):
+                payroll_ui.edit_norm(window, self.desktop)
+            self.assertFalse(payroll_ui.selected_reports(window, self.desktop)[0]["norm_override"])
+            self.assertEqual(before, list(conn.iterdump()))
+
+    def test_unknown_base_only_summary_remains_one_page_for_twelve_employees(self):
+        conn = self.seed_management_shift()
+        conn.execute("UPDATE shifts SET start_time=NULL,end_time=NULL")
+        conn.commit()
+        window = self.salary_window(management_mode=True)
+        report = payroll_ui.selected_reports(window, self.desktop)[0]
+        items = [dict(report, employee=f"Employee {i:02}") for i in range(12)]
+        pdf = BytesIO()
+        payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        reader = PdfReader(pdf)
+        self.assertEqual(len(reader.pages), 1)
+        text = reader.pages[0].extract_text()
+        self.assertIn("4,800.00", text)
+        self.assertIn("Сверх", text)
+        self.assertIn("без OB за 48 ч", text)
+        self.assertEqual(payroll_ui.summary_total(items)["total"], 4800)
+
+    def test_invalid_norm_file_and_save_failure_are_visible_not_silent_defaults(self):
+        self.seed_management_shift()
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(self.desktop.desktop_auth, "app_data_dir", return_value=Path(folder)):
+            path = payroll_ui.norm_path(self.desktop)
+            path.write_text('{"bad": -1}', encoding="utf-8")
+            window = self.salary_window(management_mode=True)
+            with patch.object(payroll_ui.QMessageBox, "critical") as critical, \
+                    self.assertLogs("payroll_ui", level="ERROR"):
+                window.load_salary_table_template()
+            self.assertIn("Не удалось прочитать", critical.call_args.args[2])
+            self.assertEqual(window.table_salary.rowCount(), 0)
+            path.unlink()
+            def fail(dialog):
+                button = next(b for b in dialog.findChildren(payroll_ui.QPushButton) if b.text() == "Сохранить норму")
+                button.click()
+                return 0
+            with patch.object(payroll_ui.QDialog, "exec", fail), \
+                    patch.object(payroll_ui.QSaveFile, "open", return_value=False), \
+                    patch.object(payroll_ui.QMessageBox, "critical") as critical, \
+                    self.assertLogs("payroll_ui", level="ERROR"):
+                payroll_ui.edit_norm(window, self.desktop)
+            self.assertIn("Не удалось сохранить", critical.call_args.args[2])
+            self.assertFalse(path.exists())
 
     def test_unknown_ob_details_follow_employee_period_and_show_existing_interval_mismatch(self):
         conn = self.seed_management_shift()

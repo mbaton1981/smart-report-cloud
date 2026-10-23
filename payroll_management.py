@@ -7,7 +7,7 @@ from ob_calculator import _localize, _parse_time
 import payroll_history as history
 
 
-VERSION = "management-ob-2026-10-v1"
+VERSION = "management-ob-2026-10-v2"
 NOTICE = "Предварительный расчёт по текущим ставкам"
 CATEGORIES = ("day", "ob1", "ob2", "ob3", "helg", "unknown")
 LABELS = dict(day="Без OB", ob1="OB1 +20%", ob2="OB2 +40%",
@@ -90,7 +90,7 @@ def line(row, saved, zone, start, end, rate, holidays):
     worked = sum(categories.values())
     base = history.money(Decimal(str(worked))*Decimal(str(rate))) if rate is not None else None
     premium = None
-    if rate is not None and not categories["unknown"]:
+    if rate is not None:
         premium = history.money(sum(Decimal(str(categories[key]))*Decimal(str(value))*Decimal(str(rate))
                                     for key, value in PREMIUM.items()))
     if rate is None and worked:
@@ -109,6 +109,7 @@ def line(row, saved, zone, start, end, rate, holidays):
 def reports(cursor, start, end, holidays, norm):
     if date.fromisoformat(start) > date.fromisoformat(end):
         raise ValueError("Начало периода позже окончания.")
+    standard_norm = norm(start, end)
     rates = {row["name"]: row["salary_rate"] for row in cursor.execute("SELECT name,salary_rate FROM employees")}
     _, zones, periods = history.state(history.events(cursor))
     previous = (date.fromisoformat(start)-timedelta(days=1)).isoformat()
@@ -138,7 +139,8 @@ def reports(cursor, start, end, holidays, norm):
             mode="management", employee=employee, date_from=start, date_to=end, rules_version=VERSION,
             lines=lines, categories=categories, worked=worked, rate=rate,
             base=total("base"), premium=total("premium"), total=total("total"),
-            above_norm=max(0, worked-norm(start, end)),
+            standard_norm=standard_norm, norm=standard_norm, norm_override=False,
+            above_norm=max(0, worked-standard_norm),
             absence={key: sum(l["hours"] for l in lines if l["kind"] == key)
                      for key in ("atf", "sick", "vacation", "holiday")},
             saved_periods=sum(name == employee and left <= end and start <= right for name, left, right in periods),

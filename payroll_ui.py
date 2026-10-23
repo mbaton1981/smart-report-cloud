@@ -8,7 +8,7 @@ import tempfile
 import uuid
 from xml.sax.saxutils import escape
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QIODevice, QSaveFile, Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
     QAbstractItemView, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -34,6 +34,7 @@ HISTORY_HEADERS = [
 MANAGEMENT_HEADERS = [
     "ФИО", "Отработано,\nч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
     "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB не\nопределён, ч", "Зарплата за период\nориентир, SEK",
+    "Сверх нормы,\nч",
     "ATF, ч", "Больничные, ч", "Отпуск, ч", "Нерабочие\nпраздники, ч",
 ]
 
@@ -71,6 +72,7 @@ def summary_values(report):
     return [report["employee"], f"{report['worked']:g}",
             *[f"{report['categories'][key]:g}" for key in management.CATEGORIES],
             summary_money(report["total"]),
+            f"{report['above_norm']:g}",
             *[f"{report['absence'][key]:g}" for key in ABSENCE_KEYS]]
 
 
@@ -80,9 +82,107 @@ def summary_money(value):
 
 def summary_total(items):
     return dict(employee="ИТОГО", worked=sum(r["worked"] for r in items),
+                above_norm=sum(r["above_norm"] for r in items),
                 categories={k: sum(r["categories"][k] for r in items) for k in management.CATEGORIES},
                 total=None if any(r["total"] is None for r in items) else history.money(sum(r["total"] for r in items)),
                 absence={k: sum(r["absence"][k] for r in items) for k in ABSENCE_KEYS})
+
+
+def estimate_note(report):
+    hours = report["categories"]["unknown"]
+    if not hours:
+        return ""
+    if report["rate"] is None:
+        return f"{hours:g} ч — OB не определён; базовая ставка не задана, часы без суммы"
+    return f"{hours:g} ч — OB не определён, учтена только базовая оплата"
+
+
+def norm_description(value):
+    hours = value["standard_norm"]
+    return f"Норма периода: {hours:g} ч — {hours/8:g} рабочих дней × 8 ч"
+
+
+def norm_path(app):
+    return app.desktop_auth.app_data_dir() / "payroll-management-norms.json"
+
+
+def norm_key(employee, start, end):
+    return json.dumps([employee, start, end], ensure_ascii=False)
+
+
+def read_norms(app):
+    path = norm_path(app)
+    if not path.exists():
+        return {}
+    values = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(values, dict):
+        raise ValueError("Неверный формат индивидуальных норм управленческого отчёта.")
+    return {key: history.number(value) for key, value in values.items()}
+
+
+def edit_norm(window, app):
+    try:
+        items = selected_reports(window, app)
+        if not items:
+            QMessageBox.information(window, "Норма периода", "Нет сотрудников с записями за выбранный период.")
+            return
+        dialog = QDialog(window)
+        dialog.setObjectName("payrollNormDialog")
+        dialog.setWindowTitle("Индивидуальная норма — только управленческий отчёт")
+        layout = QVBoxLayout(dialog)
+        note = QLabel(norm_description(items[0]) + "\nНорма сохраняется локально для сотрудника и точных дат "
+                      "выбранного периода. Другие периоды не меняются. Доплаты и операции «Баланса» не создаются.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        employee = QComboBox()
+        employee.setObjectName("payrollNormEmployee")
+        for report in items:
+            employee.addItem(report["employee"])
+        value = QDoubleSpinBox()
+        value.setObjectName("payrollNormHours")
+        value.setRange(0, 100000)
+        value.setDecimals(2)
+        value.setSuffix(" ч")
+        def load_value():
+            value.setValue(items[employee.currentIndex()]["norm"])
+        employee.currentIndexChanged.connect(load_value)
+        load_value()
+        layout.addWidget(employee)
+        layout.addWidget(value)
+        actions = QHBoxLayout()
+        layout.addLayout(actions)
+        def save(reset=False):
+            try:
+                report = items[employee.currentIndex()]
+                values = read_norms(app)
+                key = norm_key(report["employee"], report["date_from"], report["date_to"])
+                if reset:
+                    values.pop(key, None)
+                else:
+                    values[key] = history.number(value.value())
+                output = QSaveFile(str(norm_path(app)))
+                content = json.dumps(values, ensure_ascii=False, indent=2).encode("utf-8")
+                if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                    raise OSError(output.errorString())
+                if output.write(content) != len(content):
+                    output.cancelWriting()
+                    raise OSError(output.errorString())
+                if not output.commit():
+                    raise OSError(output.errorString())
+                dialog.accept()
+                window.load_salary_table_template()
+            except (OSError, ValueError, TypeError) as error:
+                logger.exception("Saving management payroll norm failed")
+                QMessageBox.critical(dialog, "Норма периода", f"Не удалось сохранить норму:\n{error}")
+        for title, action in (("Сохранить норму", save), ("Вернуть календарную", lambda: save(True)),
+                              ("Отмена", dialog.reject)):
+            button = QPushButton(title)
+            button.clicked.connect(lambda checked=False, action=action: action())
+            actions.addWidget(button)
+        dialog.exec()
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
+        logger.exception("Management payroll norm dialog failed")
+        QMessageBox.critical(window, "Норма периода", f"Не удалось прочитать нормы:\n{error}")
 
 
 def unknown_ob_rows(items):
@@ -155,6 +255,13 @@ def selected_reports(window, app):
         refresh_employees(window, conn.cursor())
         items = management.reports(conn.cursor(), window.sal_date_from.text(), window.sal_date_to.text(),
                                    app.swedish_public_holidays, app.swedish_workday_norm)
+        norms = read_norms(app)
+        for report in items:
+            key = norm_key(report["employee"], report["date_from"], report["date_to"])
+            if key in norms:
+                report["norm"] = norms[key]
+                report["norm_override"] = True
+                report["above_norm"] = max(0, report["worked"]-report["norm"])
         return employee_filter(window, items)
     finally:
         conn.close()
@@ -191,7 +298,8 @@ def render_management(window, app):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip((management_description(report) if "lines" in report else "Итог выбранных сотрудников")+"\n"+warnings)
+                item.setToolTip((management_description(report) + "\n" + estimate_note(report)
+                                 if "lines" in report else "Итог выбранных сотрудников")+"\n"+warnings)
                 if index == len(items):
                     font = item.font()
                     font.setBold(True)
@@ -199,7 +307,7 @@ def render_management(window, app):
                 table.setItem(index, column, item)
         for column in range(table.columnCount()):
             table.setColumnWidth(column, 150 if column == 0 else 125)
-            table.setColumnHidden(column, column >= 9 and not any(r["absence"][ABSENCE_KEYS[column-9]] for r in items))
+            table.setColumnHidden(column, column >= 10 and not any(r["absence"][ABSENCE_KEYS[column-10]] for r in items))
         table.resizeRowsToContents()
     finally:
         table.blockSignals(False)
@@ -210,10 +318,23 @@ def render_management(window, app):
     window.sal_summary_vacation_lbl.setText(f"Отпуск: {sum(r['absence']['vacation'] for r in items):g} ч")
     known = sum(r["total"] for r in items if r["total"] is not None)
     incomplete = any(r["total"] is None for r in items)
-    window.sal_summary_net_lbl.setText("Итого: не определено" if incomplete else f"Ориентировочно: {known:,.2f} SEK")
+    unknown_hours = sum(r["categories"]["unknown"] for r in items)
+    suffix = f" · без OB за {unknown_hours:g} ч" if unknown_hours else ""
+    window.sal_summary_net_lbl.setText("Итого: не определено (не задана ставка)" if incomplete
+                                      else f"Предварительно: {known:,.2f} SEK{suffix}")
     window.sal_summary_employer_lbl.setText("Официальное начисление: Fortnox")
+    notes = [f"{r['employee']}: {estimate_note(r)}" for r in items if r["categories"]["unknown"]]
     window.payroll_history_note.setText(
-        management.NOTICE + ". OB входит в общие часы; неизвестная сумма не равна нулю.")
+        management.NOTICE + ". " + "; ".join(notes))
+    norm_label = getattr(window, "sal_norm_label", None)
+    if norm_label is not None:
+        standard = app.swedish_workday_norm(window.sal_date_from.text(), window.sal_date_to.text())
+        overrides = [f"{r['employee']}: {r['norm']:g} ч" for r in items if r["norm_override"]]
+        norm_label.setText(norm_description(dict(standard_norm=standard)) +
+                           (" · Индивидуально: " + "; ".join(overrides) if overrides else "") +
+                           ". Сверх нормы — справочно, без автоматической доплаты.")
+        norm_label.setVisible(True)
+        window.sal_norm_button.setVisible(True)
     button = getattr(window, "sal_unknown_ob_button", None)
     if button is not None:
         hours = sum(r["categories"]["unknown"] for r in items)
@@ -288,8 +409,19 @@ def status(report):
 
 
 def render(window, app):
+    if getattr(window, "sal_norm_label", None) is not None:
+        window.sal_norm_label.setVisible(management_mode(window))
+        window.sal_norm_button.setVisible(management_mode(window))
     if management_mode(window):
-        return render_management(window, app)
+        try:
+            return render_management(window, app)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
+            logger.exception("Management payroll rendering failed")
+            window.table_salary.setRowCount(0)
+            window.sal_summary_net_lbl.setText("Расчёт недоступен")
+            window.payroll_history_note.setText(f"Не удалось прочитать расчёт: {error}")
+            QMessageBox.critical(window, "Расчёт зарплаты", f"Не удалось прочитать расчёт:\n{error}")
+            return
     button = getattr(window, "sal_unknown_ob_button", None)
     if button is not None:
         button.setVisible(False)
@@ -647,7 +779,7 @@ def write_management_pdf(path, items, font, bold):
     def p(text):
         return Paragraph(escape(str(text)), style)
     report = items[0]
-    columns = [*range(9), *[9+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
+    columns = [*range(10), *[10+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
     headers = [MANAGEMENT_HEADERS[i].replace("\n", " ") for i in columns]
     rows = [[p(v) for v in headers]]
     rows.extend([p(summary_values(r)[i]) for i in columns] for r in [*items, summary_total(items)])
@@ -663,12 +795,21 @@ def write_management_pdf(path, items, font, bold):
                                ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
     story = [Paragraph("Зарплата за период — сводка", heading),
              p(f"{report['date_from']} — {report['date_to']}"), p(management.NOTICE),
+             p(norm_description(report) + ". Сверх нормы — справочно, без доплаты."),
              Spacer(1, 10), table, Spacer(1, 8), p("OB входит в отработанные часы. Официальное начисление — Fortnox.")]
     warnings = []
     if any(r["categories"]["unknown"] for r in items):
-        warnings.append("OB не определён для части часов: нет точных временных данных.")
+        hours = sum(r["categories"]["unknown"] for r in items)
+        base_only = sum(r["categories"]["unknown"] for r in items if r["rate"] is not None)
+        if base_only:
+            warnings.append(f"{base_only:g} ч — OB не определён, учтена только базовая оплата.")
+        warnings.append(f"Предварительно, без OB за {hours:g} ч; нет точных временных данных. "
+                        "Распределение по сотрудникам — в колонке «OB не определён».")
     if any(r["total"] is None for r in items):
-        warnings.append("«Не определено»: неизвестна ставка или надбавка; итоговая зарплата не подменена нулём.")
+        warnings.append("«Не определено»: не задана базовая зарплатная ставка; выгружены часы без суммы.")
+    overrides = [f"{r['employee']}: {r['norm']:g} ч" for r in items if r["norm_override"]]
+    if overrides:
+        warnings.append("Индивидуальная норма: " + "; ".join(overrides))
     if any("Зона" in w for r in items for l in r["lines"] for w in l["warnings"]):
         warnings.append("Зона объекта не подтверждена; разбивка по местному времени предварительная.")
     story.extend(p(warning) for warning in warnings)

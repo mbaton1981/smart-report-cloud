@@ -3674,6 +3674,12 @@ class SmartReportApp(QMainWindow):
         self.sal_unknown_ob_button = QPushButton("OB не определён — показать записи…")
         self.sal_unknown_ob_button.clicked.connect(lambda: payroll_ui.show_unknown_ob(self, sys.modules[__name__]))
         card_layout.addWidget(self.sal_unknown_ob_button)
+        self.sal_norm_label = QLabel()
+        self.sal_norm_label.setWordWrap(True)
+        card_layout.addWidget(self.sal_norm_label)
+        self.sal_norm_button = QPushButton("Изменить норму сотрудника за выбранный период…")
+        self.sal_norm_button.clicked.connect(lambda: payroll_ui.edit_norm(self, sys.modules[__name__]))
+        card_layout.addWidget(self.sal_norm_button)
 
         history_btn = QPushButton("Необязательно: история ставок, сохранённые расчёты и корректировки…")
         history_btn.clicked.connect(lambda: payroll_ui.open_history(self, sys.modules[__name__]))

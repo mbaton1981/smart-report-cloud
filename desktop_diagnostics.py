@@ -890,9 +890,9 @@ def verify_payroll_ram(app_module, work_dir, out_path):
 
 
 def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False, preview_mode=False,
-                                  employee=None, details_mode=False):
+                                  employee=None, details_mode=False, norm_mode=False):
     """Click export, exercise real dialogs, and preserve all source payroll data."""
-    from contextlib import closing
+    from contextlib import closing, nullcontext
     import sqlite3
     from unittest.mock import patch
     from PyQt6.QtCore import QDate, QTimer, Qt
@@ -900,6 +900,7 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
     from PyQt6.QtWidgets import QApplication, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPushButton, QTableWidget, QWidget
     from pypdf import PdfReader
     import payroll_preview
+    import payroll_ui
 
     database = Path(app_module.DB_FILE).resolve(strict=True)
     work = Path(work_dir).resolve()
@@ -924,7 +925,19 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
                              options=QFileDialog.Option.DontUseNativeDialog)
     def handle_dialog():
         modal = application.activeModalWidget()
-        if modal is not None and modal.objectName() == "payrollUnknownObDialog":
+        if modal is not None and modal.objectName() == "payrollNormDialog":
+            selector = modal.findChild(payroll_ui.QComboBox, "payrollNormEmployee")
+            selector.setCurrentText("Andrii Piskun")
+            if not result.get("norm_saved"):
+                modal.findChild(payroll_ui.QDoubleSpinBox, "payrollNormHours").setValue(30)
+                modal.grab().save(str(work/"individual-norm-dialog.png"))
+                result["norm_saved"] = True
+                title = "Сохранить норму"
+            else:
+                result["norm_reset"] = True
+                title = "Вернуть календарную"
+            next(b for b in modal.findChildren(QPushButton) if b.text() == title).click()
+        elif modal is not None and modal.objectName() == "payrollUnknownObDialog":
             table = modal.findChild(QTableWidget, "payrollUnknownObTable")
             rows = [[table.item(i, j).text() for j in range(table.columnCount())]
                     for i in range(table.rowCount())]
@@ -976,6 +989,8 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
             patch.object(app_module, "REPORTS_DIR", str(work)), \
             patch("requests.sessions.Session.request", side_effect=RuntimeError("Read-only export: network forbidden")), \
             patch.object(QFileDialog, "getSaveFileName", side_effect=choose), \
+            (patch.object(payroll_ui, "norm_path", return_value=work/"diagnostic-norms.json")
+             if norm_mode else nullcontext()), \
             patch.object(sys, "excepthook", side_effect=lambda kind, error, trace: errors.append(str(error))):
         window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
         QMainWindow.__init__(window)
@@ -1001,6 +1016,11 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
             result["reports"] = payroll_ui.selected_reports(window, app_module)
             result["default_management_mode"] = window.sal_report_mode.currentIndex() == 0
             result["employee_filter"] = window.sal_employee_filter.currentData()
+            result["norm_label"] = window.sal_norm_label.text()
+            result["estimate_label"] = window.sal_summary_net_lbl.text()
+            result["estimate_note"] = window.payroll_history_note.text()
+            result["summary_headers"] = [window.table_salary.horizontalHeaderItem(i).text()
+                                         for i in range(window.table_salary.columnCount())]
             if employee is not None and [r["employee"] for r in result["reports"]] != [employee]:
                 raise RuntimeError("Selected employee did not match report.")
             result["table_total"] = [
@@ -1011,6 +1031,20 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
         timer = QTimer(window)
         timer.timeout.connect(handle_dialog)
         timer.start(150)
+        if norm_mode:
+            QTest.mouseClick(window.sal_norm_button, Qt.MouseButton.LeftButton)
+            adjusted = payroll_ui.selected_reports(window, app_module)
+            andrii = next(r for r in adjusted if r["employee"] == "Andrii Piskun")
+            if (andrii["norm"], andrii["above_norm"], andrii["total"]) != (30, 5, 9463.3):
+                errors.append("Individual norm must change excess hours only, not salary.")
+            result["individual_norm"] = andrii["norm"]
+            result["individual_above_norm"] = andrii["above_norm"]
+            result["individual_norm_salary_unchanged"] = andrii["total"] == 9463.3
+            window.grab().save(str(work/"individual-norm-summary.png"))
+            QTest.mouseClick(window.sal_norm_button, Qt.MouseButton.LeftButton)
+            restored = payroll_ui.selected_reports(window, app_module)
+            if any(r["norm_override"] for r in restored):
+                errors.append("Calendar norm was not restored after explicit reset.")
         if details_mode:
             QTest.mouseClick(window.sal_unknown_ob_button, Qt.MouseButton.LeftButton)
             if "unknown_ob_display_rows" not in result:
@@ -1053,6 +1087,9 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "payroll-estimate-readonly":
+        return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True,
+                                              employee=None if case == "case" else case, norm_mode=True)
     if action == "payroll-ob-details-readonly":
         return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True, preview_mode=True,
                                               employee="Andrii Piskun", details_mode=True)
