@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import LongTable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 from reportlab.platypus.doctemplate import LayoutError
 
@@ -32,10 +33,10 @@ HISTORY_HEADERS = [
     "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)", "Semestertimmar\ntim", "Röda dagar\ntim",
 ]
 MANAGEMENT_HEADERS = [
-    "ФИО", "Отработано,\nч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
-    "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB не\nопределён, ч", "Зарплата за период\nориентир, SEK",
+    "ФИО", "Ставка,\nSEK/ч", "Всего,\nч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
+    "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB\nне определён,\nч", "Зарплата,\nSEK",
     "Сверх нормы,\nч",
-    "ATF, ч", "Больничные, ч", "Отпуск, ч", "Нерабочие\nпраздники, ч",
+    "ATF,\nч", "Болезнь,\nч", "Отпуск,\nч", "Праздн.,\nч",
 ]
 
 ABSENCE_KEYS = ("atf", "sick", "vacation", "holiday")
@@ -69,7 +70,9 @@ def refresh_employees(window, cursor):
 
 
 def summary_values(report):
-    return [report["employee"], f"{report['worked']:g}",
+    rate = ("" if "lines" not in report else
+            "Не задана" if report["rate"] is None else f"{report['rate']:,.2f}")
+    return [report["employee"], rate, f"{report['worked']:g}",
             *[f"{report['categories'][key]:g}" for key in management.CATEGORIES],
             summary_money(report["total"]),
             f"{report['above_norm']:g}",
@@ -307,7 +310,7 @@ def render_management(window, app):
                 table.setItem(index, column, item)
         for column in range(table.columnCount()):
             table.setColumnWidth(column, 150 if column == 0 else 125)
-            table.setColumnHidden(column, column >= 10 and not any(r["absence"][ABSENCE_KEYS[column-10]] for r in items))
+            table.setColumnHidden(column, column >= 11 and not any(r["absence"][ABSENCE_KEYS[column-11]] for r in items))
         table.resizeRowsToContents()
     finally:
         table.blockSignals(False)
@@ -774,23 +777,31 @@ def write_pdf(path, items, font, bold):
 
 
 def write_management_pdf(path, items, font, bold):
-    style = ParagraphStyle("management", fontName=font, fontSize=9, leading=12)
+    style = ParagraphStyle("management", fontName=font, fontSize=9, leading=11,
+                           splitLongWords=False)
+    header_style = ParagraphStyle("management-header", parent=style, fontName=bold)
     heading = ParagraphStyle("management-heading", parent=style, fontName=bold, fontSize=13, leading=16)
     def p(text):
         return Paragraph(escape(str(text)), style)
     report = items[0]
-    columns = [*range(10), *[10+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
-    headers = [MANAGEMENT_HEADERS[i].replace("\n", " ") for i in columns]
-    rows = [[p(v) for v in headers]]
+    columns = [*range(11), *[11+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
+    rows = [[Paragraph(escape(MANAGEMENT_HEADERS[i]).replace("\n", "<br/>"), header_style) for i in columns]]
     rows.extend([p(summary_values(r)[i]) for i in columns] for r in [*items, summary_total(items)])
     width = A4[1]-60
-    widths = [140 if i == 0 else 105 if i == 8 else (width-245)/(len(columns)-2) for i in columns]
+    widths = [max(120 if i == 0 else 60 if i == 1 else 80 if i == 9 else 0,
+                  max(stringWidth(word, bold, 9) for word in MANAGEMENT_HEADERS[i].split())+8)
+              for i in columns]
+    extra = (width-sum(widths))/len(columns)
+    widths = [value+extra for value in widths]
     table = LongTable(rows, colWidths=widths, repeatRows=1)
     table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
                                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8edf2")),
                                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8edf2")),
                                ("FONTNAME", (0, -1), (-1, -1), bold),
                                ("GRID", (0, 0), (-1, -1), .3, colors.lightgrey),
+                               ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                                ("TOPPADDING", (0, 0), (-1, -1), 7),
                                ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
     story = [Paragraph("Зарплата за период — сводка", heading),

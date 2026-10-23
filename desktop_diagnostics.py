@@ -951,17 +951,33 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
             modal.accept()
         elif isinstance(modal, payroll_preview.PayrollPdfPreviewDialog):
             if not result.get("preview_seen"):
+                result["initial_render_frames"] = result.get("initial_render_frames", 0)+1
+                if result["initial_render_frames"] < 6:
+                    return
                 result.update(preview_seen=True, preview_before_save=not result["save_dialog_seen"],
                               preview_pages=len(modal._pages), temporary_pdf=str(modal.source))
+                result["preview_backend"] = type(modal.preview).__name__
+                result["preview_device_pixel_ratio"] = modal.preview.devicePixelRatioF()
                 preview_bytes.append(modal.source.read_bytes())
                 modal.grab().save(str(work/"preview-first-page.png"))
                 modal.show_page(len(modal._pages)-1)
-                zoom = modal.preview.transform().m11()
-                modal.preview.zoom(1.2)
-                if modal.preview.transform().m11() <= zoom:
+                zoom = modal.preview.zoomFactor()
+                modal.zoom(1.2)
+                if modal.preview.zoomFactor() <= zoom:
                     errors.append("Preview zoom did not change.")
                 result.update(last_page_seen=modal._page_index == len(modal._pages)-1, zoom_verified=True)
                 modal.grab().save(str(work/"preview-last-page.png"))
+                modal.set_zoom(2)
+                result["zoomed_text"] = modal.document.getAllText(modal._page_index).text()
+                result["zoomed_render_pending"] = True
+                return
+            elif result.get("zoomed_render_pending"):
+                result["zoom_render_frames"] = result.get("zoom_render_frames", 0)+1
+                if result["zoom_render_frames"] < 6:
+                    return
+                result.pop("zoomed_render_pending")
+                modal.grab().save(str(work/"preview-200-percent.png"))
+                result["preview_zoom_factor"] = modal.preview.zoomFactor()
                 printer = payroll_preview.QPrinter()
                 printer.setResolution(150)
                 printer.setPageOrientation(payroll_preview.QPageLayout.Orientation.Landscape)
@@ -1026,6 +1042,9 @@ def verify_salary_export_readonly(app_module, work_dir, out_path, management_mod
             result["table_total"] = [
                 window.table_salary.item(window.table_salary.rowCount()-1, column).text()
                 for column in range(window.table_salary.columnCount())]
+            result["table_rows"] = [[window.table_salary.item(row, column).text()
+                                     for column in range(window.table_salary.columnCount())]
+                                    for row in range(window.table_salary.rowCount())]
         button = next(b for b in window.findChildren(QPushButton)
                       if (b.text() == "Предпросмотр PDF" if preview_mode else "Экспорт зарплат" in b.text()))
         timer = QTimer(window)

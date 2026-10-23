@@ -4,47 +4,108 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from PyQt6.QtCore import QRectF, Qt, QUrl
+from PyQt6.QtCore import QBuffer, QIODevice, QPointF, QRectF, Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QImage, QPageLayout, QPainter
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
-from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QMessageBox, QPushButton
-
-from document_preview import DocumentGalleryDialog
+from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
 
 logger = logging.getLogger(__name__)
 
 
-class PayrollPdfPreviewDialog(DocumentGalleryDialog):
+class PayrollPdfPreviewDialog(QDialog):
     def __init__(self, source, suggested_path, parent=None):
+        from PyQt6.QtPdf import QPdfDocument
+        from PyQt6.QtPdfWidgets import QPdfView
+        import pypdfium2 as pdfium
+
+        super().__init__(parent)
         self.source = Path(source)
         self.suggested_path = Path(suggested_path)
-        self._ready = False
+        self.setWindowTitle("Предпросмотр зарплатного PDF")
+        self.resize(1180, 900)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMaximizeButtonHint)
+        self.document = QPdfDocument(self)
+        self._buffer = QBuffer(self)
+        self._buffer.setData(self.source.read_bytes())
+        self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        self.document.load(self._buffer)
+        error = self.document.error()
+        if error != QPdfDocument.Error.None_:
+            self.document.close()
+            self._buffer.close()
+            raise ValueError(f"Не удалось прочитать PDF: {error.name}")
         try:
-            super().__init__([self.source], "Предпросмотр зарплатного PDF", parent)
-        except (ImportError, OSError, ValueError, RuntimeError):
-            if hasattr(self, "_pdf_documents"):
-                self.release_resources()
+            self._pdf_documents = [pdfium.PdfDocument(str(self.source))]
+        except (OSError, ValueError, RuntimeError):
+            self.document.close()
             raise
+        self._pages = list(range(self.document.pageCount()))
+        self._page_index = 0
         if not self._pages:
             self.release_resources()
             raise ValueError("В сформированном PDF нет страниц.")
-        self._ready = True
+        layout = QVBoxLayout(self)
+        navigation = QHBoxLayout()
+        self.previous_button = QPushButton("‹")
+        self.next_button = QPushButton("›")
+        self.previous_button.clicked.connect(lambda: self.show_page(self._page_index-1))
+        self.next_button.clicked.connect(lambda: self.show_page(self._page_index+1))
+        self.page_label = QLabel()
+        for widget in (self.previous_button, self.page_label, self.next_button):
+            navigation.addWidget(widget)
+        navigation.addStretch()
+        layout.addLayout(navigation)
+        self.preview = QPdfView(self)
+        self.preview.setDocument(self.document)
+        self.preview.setPageMode(QPdfView.PageMode.MultiPage)
+        self.preview.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.preview.pageNavigator().currentPageChanged.connect(self.update_page)
+        zoom_controls = QHBoxLayout()
+        for label, callback in (("−", lambda: self.zoom(1/1.2)),
+                                ("По ширине", lambda: self.preview.setZoomMode(QPdfView.ZoomMode.FitToWidth)),
+                                ("100%", lambda: self.set_zoom(1)),
+                                ("+", lambda: self.zoom(1.2))):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            zoom_controls.addWidget(button)
+        zoom_controls.addStretch()
+        layout.addLayout(zoom_controls)
         actions = QHBoxLayout()
         for label, callback in (("Сохранить как…", self.save_as), ("Печать", self.print_pdf)):
             button = QPushButton(label)
             button.clicked.connect(callback)
             actions.addWidget(button)
         actions.addStretch()
-        self.layout().insertLayout(2, actions)
+        layout.addLayout(actions)
+        layout.addWidget(self.preview, 1)
+        self.finished.connect(self.release_resources)
+        self.update_page(0)
+
+    def set_zoom(self, value):
+        self.preview.setZoomMode(self.preview.ZoomMode.Custom)
+        self.preview.setZoomFactor(max(.1, min(8, value)))
+
+    def zoom(self, factor):
+        self.set_zoom(self.preview.zoomFactor()*factor)
+
+    def update_page(self, index):
+        self._page_index = index
+        self.page_label.setText(f"{index+1} / {len(self._pages)} · {self.source.name}")
+        self.previous_button.setEnabled(index > 0)
+        self.next_button.setEnabled(index+1 < len(self._pages))
 
     def show_page(self, index):
-        try:
-            super().show_page(index)
-        except (OSError, ValueError, RuntimeError) as error:
-            if not self._ready:
-                raise
-            logger.exception("Salary PDF page rendering failed")
-            QMessageBox.critical(self, "Предпросмотр PDF", f"Не удалось показать страницу:\n{error}")
+        index = max(0, min(index, len(self._pages)-1))
+        self.preview.pageNavigator().jump(index, QPointF(), self.preview.zoomFactor())
+        self.update_page(index)
+
+    def release_resources(self, _result=None):
+        if hasattr(self, "preview"):
+            self.preview.setDocument(None)
+        self.document.close()
+        for document in self._pdf_documents:
+            document.close()
+        self._pdf_documents.clear()
 
     def save_as(self):
         selected, _ = QFileDialog.getSaveFileName(self, "Сохранить зарплатный PDF",

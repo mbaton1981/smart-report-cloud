@@ -216,9 +216,10 @@ class PayrollIntegrationTests(unittest.TestCase):
         window.load_salary_table_template()
         row = next(i for i in range(window.table_salary.rowCount())
                    if window.table_salary.item(i, 0).text() == "Management Test")
-        self.assertEqual(window.table_salary.item(row, 1).text(), "4")
-        self.assertEqual(window.table_salary.item(row, 8).text(), "500.00")
-        self.assertIn("OB1", window.table_salary.horizontalHeaderItem(3).text())
+        self.assertEqual(window.table_salary.item(row, 1).text(), "100.00")
+        self.assertEqual(window.table_salary.item(row, 2).text(), "4")
+        self.assertEqual(window.table_salary.item(row, 9).text(), "500.00")
+        self.assertIn("OB1", window.table_salary.horizontalHeaderItem(4).text())
         from PyQt6.QtCore import Qt
         from PyQt6.QtTest import QTest
         window.show()
@@ -234,7 +235,7 @@ class PayrollIntegrationTests(unittest.TestCase):
             self.assertIn("500.00", text)
             self.assertIn("OB1", text)
             self.assertIn("OB2", text)
-            self.assertIn("Отработано", text)
+            self.assertIn("Всего", text)
             self.assertIn("Fortnox", text)
             self.assertNotIn("999.00", text)
             self.assertNotIn("историческая ставка", information.call_args.args[2])
@@ -242,7 +243,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         window.sal_report_mode.setCurrentIndex(1)
         self.assertIn("Grundlön", window.table_salary.horizontalHeaderItem(7).text())
         window.sal_report_mode.setCurrentIndex(0)
-        self.assertIn("Зарплата", window.table_salary.horizontalHeaderItem(8).text())
+        self.assertIn("Зарплата", window.table_salary.horizontalHeaderItem(9).text())
         self.assertEqual(before, list(conn.iterdump()))
 
     def test_management_missing_rate_exports_without_amount_and_no_period_close(self):
@@ -257,7 +258,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         pdf = BytesIO()
         payroll_ui.write_pdf(pdf, [report], self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
         text = "\n".join(p.extract_text() for p in PdfReader(pdf).pages)
-        self.assertIn("Отработано", text)
+        self.assertIn("Всего", text)
         self.assertIn("Не определено", text)
         self.assertEqual(before, list(conn.iterdump()))
 
@@ -281,12 +282,12 @@ class PayrollIntegrationTests(unittest.TestCase):
             text = "\n".join(p.extract_text() for p in PdfReader(dialog.source).pages)
             self.assertIn("Предварительный расчёт по текущим ставкам", text)
             self.assertIn("Fortnox", text)
-            self.assertTrue(dialog.preview._image.pixmap().width() > 0)
+            self.assertEqual(dialog.document.pageCount(), len(PdfReader(dialog.source).pages))
             dialog.show_page(len(dialog._pages)-1)
             self.assertEqual(dialog._page_index, len(dialog._pages)-1)
-            current = dialog.preview.transform().m11()
-            dialog.preview.zoom(1.2)
-            self.assertGreater(dialog.preview.transform().m11(), current)
+            current = dialog.preview.zoomFactor()
+            dialog.zoom(1.2)
+            self.assertGreater(dialog.preview.zoomFactor(), current)
             buttons = [b.text() for b in dialog.findChildren(self.desktop.QPushButton)]
             self.assertIn("Сохранить как…", buttons)
             self.assertIn("Печать", buttons)
@@ -464,13 +465,13 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertEqual(window.sal_employee_filter.currentText(), "Все сотрудники")
         self.assertEqual(window.table_salary.rowCount(), 3)
         self.assertEqual(window.table_salary.item(2, 0).text(), "ИТОГО")
-        self.assertEqual(window.table_salary.item(2, 1).text(), "6")
-        self.assertEqual(window.table_salary.item(2, 8).text(), "900.00")
+        self.assertEqual(window.table_salary.item(2, 2).text(), "6")
+        self.assertEqual(window.table_salary.item(2, 9).text(), "900.00")
         window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Andrii Piskun"))
         self.assertEqual(window.table_salary.rowCount(), 2)
         self.assertEqual(window.table_salary.item(0, 0).text(), "Andrii Piskun")
-        self.assertEqual(window.table_salary.item(0, 1).text(), "2")
-        self.assertEqual(window.table_salary.item(1, 8).text(), "400.00")
+        self.assertEqual(window.table_salary.item(0, 2).text(), "2")
+        self.assertEqual(window.table_salary.item(1, 9).text(), "400.00")
         self.assertEqual([r["employee"] for r in payroll_ui.selected_reports(window, self.desktop)], ["Andrii Piskun"])
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder)/"selected.pdf"
@@ -494,10 +495,10 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertEqual(window.sal_employee_filter.currentData(), "Andrii Piskun")
         self.assertEqual(payroll_ui.selected_reports(window, self.desktop), [])
         self.assertEqual(window.table_salary.rowCount(), 1)
-        self.assertEqual(window.table_salary.item(0, 1).text(), "0")
+        self.assertEqual(window.table_salary.item(0, 2).text(), "0")
         window.sal_employee_filter.setCurrentIndex(0)
         self.assertEqual(window.table_salary.item(0, 0).text(), "Management Test")
-        self.assertEqual(window.table_salary.item(1, 1).text(), "4")
+        self.assertEqual(window.table_salary.item(1, 2).text(), "4")
         window.sal_report_mode.setCurrentIndex(1)
         window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Andrii Piskun"))
         self.assertEqual(payroll_ui.selected_reports(window, self.desktop), [])
@@ -536,6 +537,106 @@ class PayrollIntegrationTests(unittest.TestCase):
         text = "\n".join(p.extract_text() for p in reader.pages)
         self.assertEqual(text.count("ИТОГО"), 1)
         self.assertIn("50,000.00", text)
+
+    def test_summary_rate_is_actual_current_salary_rate_per_employee_and_refreshes(self):
+        conn = self.seed_management_shift()
+        conn.execute("INSERT INTO employees(name,salary_rate,is_active) VALUES('Andrii Piskun',245.8,1)")
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,rate,entry_type)
+                      VALUES('andrii','2026-10-22','Andrii Piskun','Renatur','Site',8,999,'work')""")
+        conn.commit()
+        window = self.salary_window(management_mode=True)
+        window.load_salary_table_template()
+        self.assertIn("Ставка", window.table_salary.horizontalHeaderItem(1).text())
+        items = payroll_ui.selected_reports(window, self.desktop)
+        by_name = {r["employee"]: r for r in items}
+        for index, report in enumerate(items):
+            self.assertEqual(window.table_salary.item(index, 1).text(), f"{report['rate']:,.2f}")
+            self.assertTrue(all(line["rate"] == report["rate"] for line in report["lines"]))
+        self.assertEqual(by_name["Andrii Piskun"]["base"], 8*245.8)
+        self.assertEqual(window.table_salary.item(len(items), 1).text(), "")
+        conn.execute("UPDATE employees SET salary_rate=250 WHERE name='Andrii Piskun'")
+        conn.commit()
+        window.load_salary_table_template()
+        self.assertEqual(window.table_salary.item(0, 1).text(), "250.00")
+        self.assertEqual(payroll_ui.selected_reports(window, self.desktop)[0]["base"], 2000)
+        self.assertEqual(window.table_salary.item(1, 1).text(), "100.00")
+        for rate in (None, 0):
+            conn.execute("UPDATE employees SET salary_rate=? WHERE name='Andrii Piskun'", (rate,))
+            conn.commit()
+            window.load_salary_table_template()
+            self.assertEqual(window.table_salary.item(0, 1).text(), "Не задана")
+            self.assertIsNone(payroll_ui.selected_reports(window, self.desktop)[0]["total"])
+        conn.execute("DELETE FROM employees WHERE name='Andrii Piskun'")
+        conn.commit()
+        self.assertIsNone(payroll_ui.selected_reports(window, self.desktop)[0]["rate"])
+
+    def test_summary_vector_pdf_embeds_cyrillic_and_twelve_employees_all_columns_fit(self):
+        self.seed_management_shift()
+        window = self.salary_window(management_mode=True)
+        report = payroll_ui.selected_reports(window, self.desktop)[0]
+        items = [dict(report, employee=f"Андрей Пискун {i:02}", rate=245.8,
+                      absence=dict(atf=1, sick=1, vacation=1, holiday=1)) for i in range(12)]
+        pdf = BytesIO()
+        with patch.object(payroll_ui, "LongTable", wraps=payroll_ui.LongTable) as table:
+            payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        reader = PdfReader(pdf)
+        self.assertEqual(len(reader.pages), 1)
+        page = reader.pages[0]
+        self.assertEqual(len(page.images), 0)
+        text = page.extract_text()
+        self.assertIn("Андрей Пискун 00", text)
+        self.assertIn("245.80", text)
+        self.assertIn("Ставка,", text)
+        self.assertGreater(float(page.mediabox.width), float(page.mediabox.height))
+        font = None
+        text_fonts = set()
+        for operands, operator in page.get_contents().operations:
+            if operator == b"Tf":
+                font = operands[0]
+                self.assertGreaterEqual(float(operands[1]), 9)
+            if operator in (b"Tj", b"TJ"):
+                text_fonts.add(font)
+        for name in text_fonts:
+            definition = page["/Resources"]["/Font"][name].get_object()
+            self.assertIn("/ToUnicode", definition)
+            descriptor = definition["/FontDescriptor"].get_object()
+            self.assertIn("/FontFile2", descriptor)
+        widths = table.call_args.kwargs["colWidths"]
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        self.assertEqual(len(widths), len(payroll_ui.MANAGEMENT_HEADERS))
+        for header, width in zip(payroll_ui.MANAGEMENT_HEADERS, widths):
+            self.assertGreaterEqual(width-8, max(stringWidth(w, self.desktop.DEFAULT_FONT_BOLD, 9)
+                                                for w in header.split()))
+
+    def test_native_pdf_preview_renders_zoomed_text_and_hidpi_without_page_bitmap_stretch(self):
+        from PyQt6.QtCore import QSize
+        from PyQt6.QtPdfWidgets import QPdfView
+        with tempfile.TemporaryDirectory() as folder:
+            _, window, source = self.preview_pdf_fixture(folder)
+            dialog = payroll_preview.PayrollPdfPreviewDialog(source, source, window)
+            try:
+                dialog.show()
+                self.qt_app.processEvents()
+                self.assertIsInstance(dialog.preview, QPdfView)
+                self.assertFalse(hasattr(dialog.preview, "_image"))
+                self.assertEqual(dialog.preview.pageMode(), QPdfView.PageMode.MultiPage)
+                dialog.set_zoom(2)
+                self.assertEqual(dialog.preview.zoomFactor(), 2)
+                self.assertEqual(dialog.preview.zoomMode(), QPdfView.ZoomMode.Custom)
+                size = dialog.document.pagePointSize(0)
+                normal = dialog.document.render(0, QSize(round(size.width()), round(size.height())))
+                hidpi = dialog.document.render(0, QSize(round(size.width()*4), round(size.height()*4)))
+                self.assertFalse(hidpi.isNull())
+                self.assertEqual(hidpi.width(), normal.width()*4)
+                self.assertGreater(len(set(hidpi.constBits().asstring(hidpi.sizeInBytes())[::997])), 2)
+                self.assertIn("Management Test", dialog.document.getAllText(0).text())
+                dialog.set_zoom(1)
+                self.assertEqual(dialog.preview.zoomFactor(), 1)
+                dialog.show_page(0)
+            finally:
+                dialog.release_resources()
+            source.unlink()
+            self.assertFalse(source.exists())
 
     def test_unknown_ob_details_button_preserves_records_and_shows_saved_times_and_reason(self):
         conn = self.seed_management_shift()
@@ -595,7 +696,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         report = payroll_ui.selected_reports(window, self.desktop)[0]
         self.assertEqual((report["worked"], report["norm"], report["above_norm"]), (10, 8, 2))
         self.assertEqual(report["total"], 1000)
-        self.assertEqual(window.table_salary.item(0, 9).text(), "2")
+        self.assertEqual(window.table_salary.item(0, 10).text(), "2")
         self.assertIn("10 ч — OB не определён, учтена только базовая оплата", window.payroll_history_note.text())
         self.assertEqual(self.desktop.swedish_workday_norm("2026-12-31", "2027-01-06"), 24)
         self.assertEqual(self.desktop.swedish_workday_norm("2026-04-02", "2026-04-06"), 8)
