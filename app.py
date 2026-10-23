@@ -40,6 +40,8 @@ from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
 from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
 from fixed_pricing import fixed_quote, report_agreements, signature
+import payroll_history
+import payroll_ui
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -519,6 +521,7 @@ def init_db_once():
     ''')
 
     ensure_pricing_schema(cursor, "shifts")
+    payroll_history.ensure_schema(cursor)
     cursor.execute("PRAGMA table_info(shifts)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'invoiced' not in columns:
@@ -1270,12 +1273,26 @@ def invoice_ob_schema_present(cursor):
     }.issubset(columns)
 
 
-def get_local_employee_ob_base_rate(cursor, employee):
+def get_local_employee_ob_base_rate(cursor, employee, work_date=None):
+    if work_date:
+        rates, _, _ = payroll_history.state(payroll_history.events(cursor))
+        applied = payroll_history.dated_rate(rates, employee, work_date)
+        if applied is not None:
+            return applied["rate"]
     cursor.execute("SELECT COALESCE(salary_rate, 0.0) FROM employees WHERE name = ?", (employee,))
     row = cursor.fetchone()
     if not row:
         raise ValueError("Для OB не найден профиль сотрудника с базовой ставкой")
     return float(row[0])
+
+
+def calculate_payroll_ob(day, start, end, base_rate, employee, company, object_name):
+    conn = get_db_connection()
+    try:
+        return payroll_history.entry_interval(conn.cursor(), employee, company, object_name,
+                                               day, start, end, base_rate)
+    finally:
+        conn.close()
 
 
 def replace_ob_segments(cursor, sync_id, segments):
@@ -1432,6 +1449,8 @@ def collect_invoice_ob_category_hours(cursor, company, object_names, date_from, 
 
 
 def collect_invoice_payroll(cursor, company, object_names, date_from, date_to, has_ob_schema):
+    if payroll_ui.enabled(cursor):
+        return payroll_history.customer_payroll(cursor, company, object_names, date_from, date_to)
     placeholders = ",".join("?" for _ in object_names)
     shifts = cursor.execute(f"""
         SELECT employee, entry_type, hours, sync_id
@@ -2530,15 +2549,17 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            base_rate = get_local_employee_ob_base_rate(cursor, self.emp_cb.currentText().strip())
-            if base_rate <= 0:
+            base_rate = get_local_employee_ob_base_rate(cursor, self.emp_cb.currentText().strip(), self.date_input.text())
+            if not payroll_history.rate_known(cursor, self.emp_cb.currentText().strip(), self.date_input.text(), base_rate):
                 self.ob_preview_lbl.setText("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
                 return
-            result = calculate_work_interval(
+            result = calculate_payroll_ob(
                 self.date_input.text(),
                 self.ob_start_time.currentText(),
                 self.ob_end_time.currentText(),
                 base_rate,
+                self.emp_cb.currentText().strip(), self.comp_cb.currentText(),
+                self.obj_cb.currentData() or self.obj_cb.currentText(),
             )
         except (TypeError, ValueError) as error:
             self.ob_preview_lbl.setText(f"Ошибка интервала: {error}")
@@ -3482,6 +3503,10 @@ class SmartReportApp(QMainWindow):
         finally:
             conn.close()
         expense_sync_result = self._sync_expense_document_outbox()
+        if capability_data.get("payroll_history"):
+            payroll_response = requests.get(f"{CLOUD_URL}/sync/payroll", headers=headers, timeout=20)
+            raise_for_sync_response(payroll_response)
+            payroll_ui.cache(sys.modules[__name__], payroll_response.json()["events"])
         self._expense_read_dirty = getattr(self, "_expense_read_dirty", False) or bool(expense_sync_result.get("synced") or expense_sync_result.get("conflicts"))
         conflicts += expense_sync_result["conflicts"]
         if expense_sync_result["conflicts"]:
@@ -3634,6 +3659,13 @@ class SmartReportApp(QMainWindow):
         period_layout.addStretch()
         card_layout.addLayout(period_layout)
 
+        history_btn = QPushButton("История зарплаты: ставки, подтверждение, закрытие, корректировки…")
+        history_btn.clicked.connect(lambda: payroll_ui.open_history(self, sys.modules[__name__]))
+        card_layout.addWidget(history_btn)
+        self.payroll_history_note = QLabel("Закрытие зарплаты не означает выплату. «Баланс» не меняется.")
+        self.payroll_history_note.setWordWrap(True)
+        card_layout.addWidget(self.payroll_history_note)
+
         settings_layout = QHBoxLayout()
         settings_layout.addWidget(QLabel("Semesterersättning %"))
         self.sal_vacation_percent = QDoubleSpinBox()
@@ -3731,6 +3763,13 @@ class SmartReportApp(QMainWindow):
         self.table_salary.schedule_layout()
 
     def load_salary_table_template(self):
+        conn = get_db_connection()
+        try:
+            historical = payroll_ui.enabled(conn.cursor())
+        finally:
+            conn.close()
+        if historical:
+            return payroll_ui.render(self, sys.modules[__name__])
         try:
             self.table_salary.cellChanged.disconnect(self.on_salary_cell_changed)
         except TypeError:
@@ -3911,6 +3950,11 @@ class SmartReportApp(QMainWindow):
 
             conn = get_db_connection()
             cursor = conn.cursor()
+            if payroll_ui.enabled(cursor):
+                conn.close()
+                self.load_salary_table_template()
+                QMessageBox.warning(self, "История зарплаты", "Ставку изменяют действием «Ставка с даты», не в расчётной таблице.")
+                return
             cursor.execute('''
                 INSERT INTO employees (name, salary_rate) VALUES (?, ?)
                 ON CONFLICT(name) DO UPDATE SET salary_rate = ?
@@ -3922,6 +3966,13 @@ class SmartReportApp(QMainWindow):
             self.background_sync_with_cloud()
 
     def calculate_salary_row(self, row_idx):
+        conn = get_db_connection()
+        try:
+            historical = payroll_ui.enabled(conn.cursor())
+        finally:
+            conn.close()
+        if historical:
+            return self.load_salary_table_template()
         hrs_item = self.table_salary.item(row_idx, 1)
         atf_item = self.table_salary.item(row_idx, 2)
         sick_item = self.table_salary.item(row_idx, 3)
@@ -3990,6 +4041,13 @@ class SmartReportApp(QMainWindow):
         self.load_salary_table_template()
 
     def export_salary_to_pdf(self):
+        conn = get_db_connection()
+        try:
+            historical = payroll_ui.enabled(conn.cursor())
+        finally:
+            conn.close()
+        if historical:
+            return payroll_ui.export(self, sys.modules[__name__])
         self.load_salary_table_template()
         d_from = self.sal_date_from.text().strip()
         d_to = self.sal_date_to.text().strip()
@@ -10166,13 +10224,14 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(self, "Требуется миграция", "Сначала выполните migrate_ob.py с резервной копией desktop-базы.")
                 return
             try:
-                base_rate = get_local_employee_ob_base_rate(cursor, emp)
-                if base_rate <= 0:
+                base_rate = get_local_employee_ob_base_rate(cursor, emp, date)
+                if not payroll_history.rate_known(cursor, emp, date, base_rate):
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
-                ob_result = calculate_work_interval(
+                ob_result = calculate_payroll_ob(
                     date, self.ob_start_time.currentText(),
                     self.ob_end_time.currentText(),
                     base_rate,
+                    emp, comp, obj_name,
                 )
                 date = ob_result["start_date"]
             except (TypeError, ValueError) as error:
@@ -10564,13 +10623,15 @@ class SmartReportApp(QMainWindow):
             preview_conn = get_db_connection()
             try:
                 base_rate = get_local_employee_ob_base_rate(
-                    preview_conn.cursor(), selected_employee_name()
+                    preview_conn.cursor(), selected_employee_name(), date_field.text()
                 )
-                if base_rate <= 0:
+                if not payroll_history.rate_known(preview_conn.cursor(), selected_employee_name(), date_field.text(), base_rate):
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
-                result = calculate_work_interval(
+                result = calculate_payroll_ob(
                     date_field.text(), ob_start_field.currentText(),
                     ob_end_field.currentText(), base_rate,
+                    selected_employee_name(), company_field.currentText().strip(),
+                    object_field.currentData() or object_field.currentText().strip(),
                 )
             except (TypeError, ValueError) as error:
                 ob_preview_field.setText(f"Ошибка интервала: {error}")
@@ -10672,9 +10733,10 @@ class SmartReportApp(QMainWindow):
             rate_cursor = schema_conn.cursor()
             try:
                 employee_base_rate = get_local_employee_ob_base_rate(
-                    rate_cursor, selected_employee_name()
+                    rate_cursor, selected_employee_name(), date_field.text()
                 ) if schema_ready else None
-                if employee_base_rate is not None and employee_base_rate <= 0:
+                if employee_base_rate is not None and not payroll_history.rate_known(
+                        rate_cursor, selected_employee_name(), date_field.text(), employee_base_rate):
                     raise ValueError("В профиле сотрудника не настроена базовая ставка. Попросите администратора обновить профиль.")
             except ValueError as error:
                 schema_conn.close()
@@ -10685,9 +10747,10 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(self, "Требуется миграция", "Сначала выполните migrate_ob.py с резервной копией desktop-базы.")
                 return
             try:
-                ob_result = calculate_work_interval(
+                ob_result = calculate_payroll_ob(
                     date_field.text(), ob_start_field.currentText(),
                     ob_end_field.currentText(), employee_base_rate,
+                    selected_employee_name(), company_field.currentText().strip(), object_name,
                 )
                 payload_date = ob_result["start_date"]
             except (TypeError, ValueError) as error:

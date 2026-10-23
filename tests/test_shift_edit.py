@@ -60,7 +60,7 @@ class ShiftEditTests(unittest.TestCase):
         payload.update(transport=1, record_type="ob")
         request = {"changes": [{"sync_id": "preserve-ob", "operation_id": "transport-only",
                                "operation": "upsert", "base_version": before["version"], "shift": payload}]}
-        with patch.object(self.server, "calculate_work_interval", side_effect=AssertionError("No OB recalculation")):
+        with patch.object(self.server.payroll_history, "calculate_work_interval", side_effect=AssertionError("No OB recalculation")):
             for _ in range(2):
                 response = self.server_client.post("/sync/push", json=request,
                     headers={"X-Sync-Key": "isolated-sync-test-key"})
@@ -81,7 +81,7 @@ class ShiftEditTests(unittest.TestCase):
         connection = self.server.get_db_connection()
         segments = [tuple(row) for row in connection.execute("SELECT * FROM ob_segments ORDER BY id")]
         connection.close()
-        with patch.object(self.server, "calculate_work_interval", side_effect=AssertionError("No OB recalculation")):
+        with patch.object(self.server.payroll_history, "calculate_work_interval", side_effect=AssertionError("No OB recalculation")):
             response = self.server_client.post("/edit-shift", json={
                 "sync_id": before["sync_id"], "version": before["version"],
                 "operation_id": "web-transport-only", "transport": 1})
@@ -93,7 +93,8 @@ class ShiftEditTests(unittest.TestCase):
     def test_changed_ob_interval_still_recalculates(self):
         self.submit("changed-ob", "ob", "Travel B", 0)
         before = self.records()[0]
-        with patch.object(self.server, "calculate_work_interval", wraps=self.server.calculate_work_interval) as calculate:
+        with patch.object(self.server.payroll_history, "calculate_work_interval",
+                          wraps=self.server.payroll_history.calculate_work_interval) as calculate:
             response = self.server_client.post("/edit-shift", json={
                 "sync_id": before["sync_id"], "version": before["version"],
                 "operation_id": "new-interval", "start_time": "17:00", "end_time": "22:00", "transport": 1})

@@ -711,7 +711,186 @@ def verify_fast_pris_ram(app_module, work_dir, out_path):
     return result
 
 
+def verify_payroll_ram(app_module, work_dir, out_path):
+    """Exercise payroll migration and readers on a RAM copy of the real profile."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtCore import QDate, QTimer, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QComboBox, QMainWindow, QMessageBox, QPushButton, QTextEdit, QWidget
+    from pypdf import PdfReader
+    import payroll_history as payroll
+    import payroll_ui
+
+    database = Path(app_module.DB_FILE).resolve(strict=True)
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    uri = f"file:payroll-check-{uuid.uuid4()}?mode=memory&cache=shared"
+    master = sqlite3.connect(uri, uri=True)
+    master.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(database.as_uri()+"?mode=ro", uri=True)) as source:
+        source.backup(master)
+        before = list(source.iterdump())
+    protected = {r[0]: list(master.execute('SELECT * FROM "'+r[0].replace('"', '""')+'"'))
+                 for r in master.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'payroll_%'")}
+    payroll.ensure_schema(master.cursor())
+    master.commit()
+    def connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+    application = QApplication.instance() or QApplication([])
+    application.setStyleSheet(app_module.DARK_THEME_QSS)
+    result = dict(frozen=bool(getattr(sys, "frozen", False)), ram_only=True, network_requests=0,
+                  source_database=str(database), writer_enabled=payroll.WRITES_ENABLED)
+    with patch("requests.sessions.Session.request", side_effect=RuntimeError("RAM-only payroll check: network forbidden")), \
+            patch.object(app_module, "get_db_connection", connection):
+        window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+        QMainWindow.__init__(window)
+        window.tab_salary = QWidget()
+        window.setCentralWidget(window.tab_salary)
+        window.resize(1550, 950)
+        window.setWindowTitle("SmartReport — зарплатная история — копия в памяти")
+        window.setup_salary_tab()
+        window.sal_date_from.setDate(QDate(2026, 10, 1))
+        window.sal_date_to.setDate(QDate(2026, 10, 31))
+        window.load_salary_table_template()
+        window.show()
+        application.processEvents()
+        window.grab().save(str(work/"payroll-unknown.png"))
+        initial = payroll_ui.reports(window, app_module)
+        target = next(r for r in initial if r["employee"] == "Andrii Piskun")
+        result["initial_history_unknown"] = target["amounts"] is None
+        if not result["initial_history_unknown"]:
+            raise RuntimeError("Real legacy history must not be auto-confirmed.")
+        pdf = work/"Payroll-real-history-preview.pdf"
+        payroll_ui.write_pdf(pdf, [target], app_module.DEFAULT_FONT, app_module.DEFAULT_FONT_BOLD)
+        text = "\n".join(p.extract_text() for p in PdfReader(pdf).pages)
+        if "Требует подтверждения" not in text:
+            raise RuntimeError("Unknown historical salary disappeared in PDF.")
+        # Explicit diagnostic confirmation in RAM only; never adopts today's catalogue salary.
+        overrides = {f"{line['sync_id']}:{s['date']}": 100 for line in target["lines"]
+                     for s in line["segments"] if s["rate"] is None}
+        draft = payroll.preview(master.cursor(), "shifts", payroll.events(master.cursor()),
+                                target["employee"], "2026-10-01", "2026-10-31",
+                                payroll_ui.parameters(window), overrides)
+        # Timed rows with unknown zones cannot be confirmed even with proposed rates.
+        result["unknown_zone_blocks_confirmation"] = any(
+            "зон" in warning for line in draft["lines"] for warning in line["warnings"])
+        sample = next(row for row in master.execute(
+            "SELECT * FROM shifts WHERE employee='Andrii Piskun' AND entry_type='work' "
+            "AND date BETWEEN '2026-10-01' AND '2026-10-31' ORDER BY date LIMIT 1"))
+        sample_day = sample["date"]
+        sample_overrides = {}
+        sample_draft = payroll.preview(master.cursor(), "shifts", payroll.events(master.cursor()),
+                                       sample["employee"], sample_day, sample_day,
+                                       payroll_ui.parameters(window))
+        sample_overrides.update({f"{line['sync_id']}:{s['date']}": 100 for line in sample_draft["lines"]
+                                 for s in line["segments"] if s["rate"] is None})
+        sample_draft = payroll.preview(master.cursor(), "shifts", payroll.events(master.cursor()),
+                                       sample["employee"], sample_day, sample_day,
+                                       payroll_ui.parameters(window), sample_overrides)
+        request = dict(kind="close", employee=sample["employee"], date_from=sample_day, date_to=sample_day,
+                       parameters=payroll_ui.parameters(window), overrides=sample_overrides,
+                       preview_hash=sample_draft["preview_hash"], expected_seq=len(payroll.events(master.cursor())),
+                       operation_id=str(uuid.uuid4()))
+        payroll.apply_action(master.cursor(), "shifts", request, "RAM diagnostic only", writes_enabled=True)
+        master.commit()
+        saved = payroll.state(payroll.events(master.cursor()))[2][(sample["employee"], sample_day, sample_day)]
+        # Changing current catalogue salary in this RAM clone cannot alter a saved result.
+        old_rate = master.execute("SELECT salary_rate FROM employees WHERE name=?", (sample["employee"],)).fetchone()[0]
+        master.execute("UPDATE employees SET salary_rate=salary_rate+10 WHERE name=?", (sample["employee"],))
+        reread = payroll.preview(master.cursor(), "shifts", payroll.events(master.cursor()),
+                                 sample["employee"], sample_day, sample_day, payroll_ui.parameters(window))
+        if reread["previous"] != saved:
+            raise RuntimeError("Snapshot was recalculated.")
+        master.execute("UPDATE employees SET salary_rate=? WHERE name=?", (old_rate, sample["employee"]))
+        with patch.object(payroll, "WRITES_ENABLED", False):
+            try:
+                payroll.apply_action(master.cursor(), "shifts", request, "rollback-reader")
+            except ValueError:
+                result["rollback_writer_blocked"] = True
+            else:
+                raise RuntimeError("Rollback reader allowed financial writes.")
+        window.sal_date_from.setDate(QDate.fromString(sample_day, "yyyy-MM-dd"))
+        window.sal_date_to.setDate(QDate.fromString(sample_day, "yyyy-MM-dd"))
+        window.load_salary_table_template()
+        application.processEvents()
+        window.grab().save(str(work/"payroll-saved.png"))
+        result["saved_revision"] = saved["revision"]
+        result["sample_amounts"] = saved["amounts"]
+        result["sample_rate_is_diagnostic_not_actual"] = True
+        master.commit()
+        errors = []
+        def api(method, path, **kwargs):
+            if path != "/sync/payroll":
+                raise RuntimeError("Only isolated payroll API is allowed.")
+            body = kwargs.get("json", {})
+            if method == "GET":
+                return {"events": payroll.events(master.cursor())}
+            if body["kind"] == "preview":
+                value = payroll.preview(master.cursor(), "shifts", payroll.events(master.cursor()),
+                                        body["employee"], body["date_from"], body["date_to"],
+                                        body["parameters"], body.get("overrides"), body.get("reprice", False))
+                return {"events": payroll.events(master.cursor()), "preview": value}
+            value = payroll.apply_action(master.cursor(), "shifts", body, "RAM UI diagnostic")
+            master.commit()
+            return {"events": payroll.events(master.cursor()), "result": value}
+        def exercise():
+            dialog = application.activeModalWidget()
+            try:
+                dialog.findChild(QComboBox, "payroll_employee").setCurrentText(sample["employee"])
+                preview_button = next(b for b in dialog.findChildren(QPushButton) if b.text() == "Просмотр")
+                QTest.mouseClick(preview_button, Qt.MouseButton.LeftButton)
+                application.processEvents()
+                text = dialog.findChild(QTextEdit).toPlainText()
+                if "Сохранённая версия 1" not in text:
+                    raise RuntimeError("Salary history dialog did not display the saved snapshot.")
+                dialog.grab().save(str(work/"payroll-history-dialog.png"))
+                count = len(payroll.events(master.cursor()))
+                if payroll.WRITES_ENABLED:
+                    close_button = next(b for b in dialog.findChildren(QPushButton) if b.text() == "Закрыть зарплату")
+                    QTest.mouseClick(close_button, Qt.MouseButton.LeftButton)
+                    application.processEvents()
+                    if len(payroll.events(master.cursor())) != count:
+                        raise RuntimeError("Repeated GUI closure duplicated payroll.")
+                result["visible_history_dialog_checked"] = True
+                result["gui_repeat_no_duplicate"] = payroll.WRITES_ENABLED
+            except Exception as error:
+                errors.append(str(error))
+            finally:
+                if dialog:
+                    dialog.reject()
+        with patch.object(app_module, "request_expense_api", api), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+                patch.object(QMessageBox, "warning", side_effect=lambda _w, _t, message: errors.append(message)):
+            QTimer.singleShot(150, exercise)
+            payroll_ui.open_history(window, app_module)
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        window.close()
+    for table, rows in protected.items():
+        if list(master.execute('SELECT * FROM "'+table.replace('"', '""')+'"')) != rows:
+            raise RuntimeError(f"Protected RAM table changed: {table}")
+    master.commit()
+    with closing(sqlite3.connect(":memory:")) as restored:
+        restored.row_factory = sqlite3.Row
+        master.backup(restored)
+        if payroll.events(restored.cursor()) != payroll.events(master.cursor()):
+            raise RuntimeError("Payroll restore lost history.")
+    master.close()
+    with closing(sqlite3.connect(database.as_uri()+"?mode=ro", uri=True)) as source:
+        if list(source.iterdump()) != before:
+            raise RuntimeError("Original database changed during isolated check.")
+    result.update(source_unchanged=True, protected_tables_preserved=True, restore_verified=True)
+    Path(out_path or work/"payroll-result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "payroll-ram":
+        return verify_payroll_ram(app_module, work_dir, out_path)
     if action == "approved-update-readonly":
         return verify_approved_update(app_module, work_dir, out_path)
     if action == "reports-ui-readonly":

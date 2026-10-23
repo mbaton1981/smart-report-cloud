@@ -609,6 +609,8 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         date, start_time: start, end_time: end,
+                        company: document.getElementById(edit ? 'edit-company' : 'company').value,
+                        object_name: document.getElementById(edit ? 'edit-object' : 'object_name').value,
                         employee: edit ? activeEditShift.employee : getShiftEmployee()
                     })
                 });

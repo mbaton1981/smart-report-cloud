@@ -4626,11 +4626,25 @@ class CatalogSyncTests(unittest.TestCase):
             sal_summary_ob_lbl=QLabel(),
             sal_summary_net_lbl=QLabel(),
             sal_summary_employer_lbl=QLabel(),
+            payroll_history_note=QLabel(),
             on_salary_cell_changed=lambda *_: None,
         )
         salary_ui.sal_vacation_percent.setValue(13)
         salary_ui.load_salary_table_template = lambda: self.desktop.SmartReportApp.load_salary_table_template(salary_ui)
         verify_conn = self.desktop.get_db_connection()
+        import payroll_history
+        for fixture_employee in (employee, holiday_employee, inactive_employee):
+            fixture_rate = verify_conn.execute(
+                "SELECT salary_rate FROM employees WHERE name=?", (fixture_employee,)
+            ).fetchone()[0]
+            payroll_history.apply_action(
+                verify_conn.cursor(), "shifts", {
+                    "kind": "rate", "employee": fixture_employee, "effective_from": shift_date,
+                    "rate": fixture_rate, "operation_id": str(uuid.uuid4()),
+                    "expected_seq": len(payroll_history.events(verify_conn.cursor())),
+                }, "explicit synthetic fixture confirmation", writes_enabled=True,
+            )
+        verify_conn.commit()
         self.assertEqual(verify_conn.execute(
             "SELECT COUNT(*) FROM shifts WHERE employee = ?", (inactive_employee,)
         ).fetchone()[0], 5)
@@ -4670,29 +4684,14 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertIn("10.0", salary_ui.sal_summary_hours_lbl.text())
         self.assertIn("6.0", salary_ui.sal_summary_vacation_lbl.text())
 
-        pdf_tables = []
-
-        class CapturePdfDocument:
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def build(self, story):
-                table = next(item for item in story if hasattr(item, "_cellvalues"))
-                pdf_tables.append([
-                    [
-                        cell.getPlainText() if hasattr(cell, "getPlainText") else str(cell)
-                        for cell in row
-                    ]
-                    for row in table._cellvalues
-                ])
-
         with tempfile.TemporaryDirectory(prefix="smartreport-salary-pdf-") as report_dir, \
              patch.object(self.desktop, "REPORTS_DIR", report_dir), \
-             patch.object(self.desktop, "SimpleDocTemplate", CapturePdfDocument), \
              patch.object(self.desktop.QMessageBox, "information"), \
              patch.object(self.desktop.os, "startfile", create=True):
             self.desktop.SmartReportApp.export_salary_to_pdf(salary_ui)
-        pdf_text = "\n".join(str(row) for table in pdf_tables for row in table)
+            from pypdf import PdfReader
+            pdf_path = next(Path(report_dir).glob("Loneunderlag_*.pdf"))
+            pdf_text = "\n".join(page.extract_text() for page in PdfReader(pdf_path).pages)
         self.assertIn(inactive_employee, pdf_text)
         self.assertIn(holiday_employee, pdf_text)
         self.assertIn("Сверх нормы, ч", pdf_text)

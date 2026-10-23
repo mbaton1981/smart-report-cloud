@@ -28,6 +28,7 @@ from web_login_throttle import SQLiteLoginThrottle
 from object_reports import register_object_reports
 from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
 from fixed_pricing import validate_fixed_storage
+import payroll_history
 from mail_intake import register_mail_intake
 import reportlab
 from reportlab.lib import colors
@@ -128,7 +129,8 @@ def get_employee_ob_base_rate(cursor, employee):
     return salary_rate
 
 
-def calculate_ob_payload(cursor, work_date, start_time, end_time, employee, existing=None):
+def calculate_ob_payload(cursor, work_date, start_time, end_time, employee, existing=None,
+                         company=None, object_name=None):
     if (existing and not existing["is_deleted"] and existing["submission_type"] == "ob"
             and (work_date, start_time, end_time, employee) == (
                 existing["date"], existing["start_time"], existing["end_time"], existing["employee"])):
@@ -142,7 +144,12 @@ def calculate_ob_payload(cursor, work_date, start_time, end_time, employee, exis
                 "base_rate_configured": True, "preserved": True,
             }
     base_rate = get_employee_ob_base_rate(cursor, employee)
-    result = calculate_work_interval(work_date, start_time, end_time, base_rate)
+    if existing:
+        company = company or existing["company"]
+        object_name = object_name or existing["object_name"]
+    result = payroll_history.entry_interval(cursor, employee, company, object_name,
+                                             work_date, start_time, end_time, base_rate)
+    base_rate = result["segments"][0]["base_rate"]
     return {
         "date": result["start_date"],
         "start_time": result["start_time"],
@@ -154,7 +161,7 @@ def calculate_ob_payload(cursor, work_date, start_time, end_time, employee, exis
         "segments": result["segments"],
         "total_amount": result["total_amount"],
         "rules_version": result["rules_version"],
-        "base_rate_configured": base_rate > 0,
+        "base_rate_configured": payroll_history.rate_known(cursor, employee, work_date, base_rate),
     }
 
 
@@ -515,6 +522,7 @@ def init_cloud_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_change_seq ON incoming_submissions(change_seq)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_pending ON incoming_submissions(desktop_acked, source, is_deleted)")
     ensure_pricing_schema(cursor, "incoming_submissions")
+    payroll_history.ensure_schema(cursor)
     cursor.execute("PRAGMA table_info(incoming_submissions)")
     submission_columns = {column[1] for column in cursor.fetchall()}
     if 'submission_type' not in submission_columns:
@@ -905,6 +913,50 @@ def verify_sync_key():
         return True
     logger.warning(f"Несанкционированная попытка доступа с IP: {request.remote_addr}")
     return False
+
+
+@app.route("/sync/payroll", methods=["GET", "POST"])
+def payroll_history_api():
+    if not verify_sync_key():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    conn = get_db_connection()
+    try:
+        if request.method == "GET":
+            return jsonify({"ok": True, "events": payroll_history.events(conn.cursor()),
+                            "writes_enabled": payroll_history.WRITES_ENABLED})
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError("Ожидается объект запроса.")
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        if data.get("kind") == "zone":
+            if not cursor.execute("SELECT 1 FROM meta_objects WHERE company=? AND name=?",
+                                  (data.get("company"), data.get("object_name"))).fetchone():
+                raise ValueError("Объект не найден.")
+        elif not cursor.execute("SELECT 1 FROM meta_employees WHERE name=?",
+                                (data.get("employee"),)).fetchone():
+            raise ValueError("Сотрудник не найден.")
+        if data.get("kind") == "preview":
+            draft = payroll_history.preview(cursor, "incoming_submissions", payroll_history.events(cursor),
+                                            data["employee"], data["date_from"], data["date_to"],
+                                            data["parameters"], data.get("overrides"),
+                                            bool(data.get("reprice")))
+            return jsonify({"ok": True, "preview": draft, "events": payroll_history.events(cursor)})
+        admin = bearer_admin_user()
+        result = payroll_history.apply_action(cursor, "incoming_submissions", data,
+                                               admin["username"] if admin else "sync-admin")
+        conn.commit()
+        return jsonify({"ok": True, "result": result, "events": payroll_history.events(cursor)})
+    except (ValueError, KeyError, TypeError) as error:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception:
+        conn.rollback()
+        logger.exception("Ошибка зарплатной истории")
+        return jsonify({"ok": False, "error": "Зарплатная операция не подтверждена; ошибка сервера."}), 500
+    finally:
+        conn.close()
+
 
 auth_throttle = LoginThrottle()
 web_login_throttle = SQLiteLoginThrottle(lambda: get_db_connection())
@@ -2815,7 +2867,8 @@ def submit_shift():
             return jsonify({"ok": False, "error": "OB-схема не подготовлена. Выполните migrate_ob.py с backup."}), 503
         try:
             ob_result = calculate_ob_payload(
-                cursor, date_str, data.get("start_time"), data.get("end_time"), employee
+                cursor, date_str, data.get("start_time"), data.get("end_time"), employee,
+                company=company, object_name=object_name,
             )
             if not ob_result["base_rate_configured"]:
                 conn.close()
@@ -2986,7 +3039,8 @@ def calculate_ob_preview():
             employee, session.get("employee_id"),
         )
         result = calculate_ob_payload(
-            cursor, data.get("date"), data.get("start_time"), data.get("end_time"), employee
+            cursor, data.get("date"), data.get("start_time"), data.get("end_time"), employee,
+            company=data.get("company"), object_name=data.get("object_name"),
         )
     except PermissionError as error:
         return jsonify({"ok": False, "error": str(error)}), 403
@@ -3047,6 +3101,7 @@ def edit_shift():
                 data.get("end_time", existing["end_time"]),
                 employee,
                 existing=existing,
+                company=company, object_name=object_name,
             )
             if not ob_result["base_rate_configured"]:
                 raise ValueError("Не удалось пересчитать OB-смену. Обратитесь к администратору.")
@@ -4555,6 +4610,7 @@ def sync_capabilities():
         "typed_tombstones": True,
         "customer_pricing": 1,
         "fixed_pricing": 1,
+        "payroll_history": 1,
     })
 
 @app.route('/sync/push', methods=['POST'])
@@ -4641,6 +4697,7 @@ def sync_push():
                     ob_result = calculate_ob_payload(
                         cursor, date_val, payload.get("start_time"), payload.get("end_time"), employee,
                         existing=existing,
+                        company=company, object_name=object_name,
                     )
                     if not ob_result["base_rate_configured"]:
                         raise ValueError("В профиле сотрудника не настроена базовая ставка.")
