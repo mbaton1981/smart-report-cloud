@@ -9,7 +9,7 @@ from ob_calculator import calculate_work_interval, load_ob_rules
 
 
 RULES_VERSION = "payroll-1"
-WRITES_ENABLED = False
+WRITES_ENABLED = True
 PARAMETERS = ("vacation", "tax", "employer_fee", "atf", "sick")
 
 
