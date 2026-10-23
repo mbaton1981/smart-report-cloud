@@ -8179,8 +8179,13 @@ class SmartReportApp(QMainWindow):
         self.table_invoice.setAlternatingRowColors(True)
         self.table_invoice.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table_invoice)
-        self.invoice_status_note = QLabel()
-        self.invoice_status_note.setWordWrap(True)
+        self.invoice_status_note = QTextEdit()
+        self.invoice_status_note.setReadOnly(True)
+        self.invoice_status_note.setAcceptRichText(False)
+        self.invoice_status_note.ensurePolished()
+        self.invoice_status_note.setFixedHeight(
+            self.invoice_status_note.fontMetrics().lineSpacing() * 6 + 24
+        )
         layout.addWidget(self.invoice_status_note)
 
         self.invoice_summary_table = QTableWidget(8, 2)
@@ -8626,16 +8631,8 @@ class SmartReportApp(QMainWindow):
         )
         if issues:
             detail += "\nНужно подтвердить клиентские цены (зарплатные ставки не используются):\n"
-            detail += "\n".join(issues[:3])
-            if len(issues) > 3:
-                detail += f"\nЕщё записей: {len(issues) - 3}. Уточните период."
-        self.invoice_status_note.setText(detail)
-        self.invoice_status_note.setMinimumHeight(
-            self.invoice_status_note.fontMetrics().boundingRect(
-                0, 0, max(400, self.invoice_status_note.width()), 10000,
-                int(Qt.TextFlag.TextWordWrap), detail,
-            ).height() + 32
-        )
+            detail += "\n".join(issues)
+        self.invoice_status_note.setPlainText(detail)
         self._render_invoice_summary(report)
         self._invoice_report = report
         if hasattr(self, "table_dagbok"):

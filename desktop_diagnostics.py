@@ -430,6 +430,15 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                             "weekday_early_evening": 4, "weekday_late_evening_night": 3}):
                     raise RuntimeError("Actual Tomteboda October hours differ")
                 capture("tomteboda-october-status-and-prices")
+                note = window.invoice_status_note
+                result["pricing_note_layout"] = {
+                    "viewport_height": note.viewport().height(),
+                    "document_height": note.document().size().height(),
+                    "scroll_maximum": note.verticalScrollBar().maximum(),
+                }
+                if (note.document().size().height() > note.viewport().height()
+                        and note.verticalScrollBar().maximum() == 0):
+                    raise RuntimeError("Pricing diagnostics are clipped without a scrollbar")
                 with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
                         patch.object(QMessageBox, "warning") as warning:
                     click(button("Закрыть период"))
@@ -438,7 +447,7 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 click(button("Сформировать общий PDF"))
                 result["tomteboda_october"] = {
                     "totals": tom["totals"], "rows": len(tom["journal_rows"]),
-                    "unknown_close_blocked": True, "status_detail": window.invoice_status_note.text(),
+                    "unknown_close_blocked": True, "status_detail": window.invoice_status_note.toPlainText(),
                 }
                 def inspect_prices():
                     dialog = application.activeModalWidget()
