@@ -830,7 +830,7 @@ def enforce_dataset_boundary():
     if not expected:
         return None
     guarded = (
-        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards"))
+        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/"))
         or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced"}
     )
     if guarded:
@@ -4386,6 +4386,9 @@ def apply_employee_sync_event(cursor, event, operation):
 from employee_cards_api import register_employee_cards
 register_employee_cards(app, lambda: get_db_connection(), lambda: bearer_user(),
                         lambda cursor, event, operation: apply_employee_sync_event(cursor, event, operation))
+
+from assistant_api import register_assistant
+register_assistant(app, lambda: get_db_connection(), lambda: bearer_user())
 
 
 @app.route('/sync-desktop-data', methods=['POST'])

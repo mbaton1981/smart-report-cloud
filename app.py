@@ -2286,7 +2286,11 @@ class SmartReportApp(QMainWindow):
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.addWidget(desktop_theme.header(self))
+        header = desktop_theme.header(self)
+        assistant_button = QPushButton("ИИ-помощник")
+        assistant_button.clicked.connect(self.open_assistant)
+        header.layout().addWidget(assistant_button)
+        main_layout.addWidget(header)
 
         self.tabs = QTabWidget()
         self.tabs.setUsesScrollButtons(True)
@@ -6729,6 +6733,10 @@ class SmartReportApp(QMainWindow):
         if viewer is not None and not viewer.close():
             event.ignore()
             return
+        assistant = getattr(self, "_assistant_dialog", None)
+        if assistant is not None and not assistant.close():
+            event.ignore()
+            return
         running = [worker for worker in self.findChildren(SyncWorker) if worker.isRunning()]
         if running:
             if not getattr(self, "_closing_after_sync", False):
@@ -6742,6 +6750,10 @@ class SmartReportApp(QMainWindow):
             event.ignore()
             return
         super().closeEvent(event)
+
+    def open_assistant(self):
+        import assistant_ui
+        assistant_ui.open_dialog(self)
 
     def _on_expense_view_changed(self, index):
         self.load_expense_document_filters()
