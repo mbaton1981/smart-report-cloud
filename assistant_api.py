@@ -24,6 +24,7 @@ from pypdf.errors import PyPdfError
 
 from customer_pricing import row_prices
 from customer_report import money
+from assistant_actions import CAPABILITIES, NATIVE_ACTIONS, OBJECT_ACTIONS, capabilities
 
 MODEL = "gpt-5-mini"
 MAX_OUTPUT = 1024
@@ -39,7 +40,7 @@ TOOLS = [{
     "parameters": {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "purpose": {"type": "string", "enum": ["search", "check", "transport_check", "explain", "payroll_pdf", "customer_pdf", "catalog_preview"]},
+            "purpose": {"type": "string", "enum": list(CAPABILITIES)},
             "date_from": {"type": "string", "description": "YYYY-MM-DD; ask if the period is unspecified"},
             "date_to": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
             "employee": {"type": "string", "description": "Exact employee name or empty for all"},
@@ -55,13 +56,27 @@ TOOLS = [{
                    "properties": {"field": {"type": "string", "enum": ["period", "scope", "object", "unsupported"]}},
                    "required": ["field"]},
 }]
+TOOLS[1]["parameters"]["properties"]["selection"] = {
+    "anyOf": [TOOLS[0]["parameters"], {"type": "null"}],
+    "description": "Proposed action and known selection for continuation, or null if unknown. "
+                   "Reuse dates from supplied selection when the user has not changed the period.",
+}
+TOOLS[1]["parameters"]["required"].append("selection")
+TOOLS.append({
+    "type": "function", "name": "run_workflow", "strict": True,
+    "description": "Run 2 to 4 related read/check/report steps for one user request. No native editing forms or writes.",
+    "parameters": {"type": "object", "additionalProperties": False,
+                   "properties": {"steps": {"type": "array", "minItems": 2, "maxItems": 4,
+                                            "items": TOOLS[0]["parameters"]}}, "required": ["steps"]},
+})
 
 QUESTIONS = {
-    "period": "За какой период проверить данные? Выберите даты ниже и нажмите нужное действие.",
+    "period": "За какой период? Укажите даты словами или выберите их сверху и нажмите «Продолжить с выбранными параметрами».",
     "scope": "Для всех сотрудников или одного? Оставьте поле сотрудника пустым для всех или введите точное ФИО.",
-    "object": "Для какой фирмы и объекта? Укажите оба названия в команде.",
-    "unsupported": "Эта функция не поддерживается. Доступны поиск смен, проверка ставок и транспорта, "
-                   "пояснение сумм и подготовка штатных отчётов. Изменения и отправка по текстовой команде запрещены.",
+    "object": "По какому объекту? Назовите объект; если названия совпадают, укажите также фирму.",
+    "unsupported": "Автоматическое выполнение этой операции не подключено. Поддерживаемые проверки, отчёты "
+                   "и штатные формы перечислены в «Возможностях». Ничего не изменено и не отправлено; "
+                   "неподдерживаемая операция не заменялась поиском смен.",
 }
 
 
@@ -70,9 +85,11 @@ class AssistantError(ValueError):
 
 
 class AssistantQuestion(AssistantError):
-    def __init__(self, field):
+    def __init__(self, field, *, question=None, choices=None, plan=None):
         self.field = field
-        super().__init__(QUESTIONS[field])
+        self.choices = choices or []
+        self.plan = plan
+        super().__init__(question or QUESTIONS[field])
 
 
 def ensure_schema(conn):
@@ -164,7 +181,7 @@ def validate_plan(plan):
     return plan
 
 
-def transport_command(text):
+def transport_command(text, context=None):
     match = re.fullmatch(
         r"(?:проверь(?:те)?|проверить)\s+(?:клиентский\s+)?транспорт"
         r"(?:\s+(?:за|на)\s+(?P<week>текущую неделю|эту неделю|этой неделе|прошлую неделю|прошлой неделе)"
@@ -174,29 +191,37 @@ def transport_command(text):
         " ".join(text.strip().split()), re.IGNORECASE)
     if match is None:
         return None
-    if match["scope"] and match["scope"].casefold() == "одного сотрудника":
-        raise AssistantQuestion("scope")
-    if not match["week"] and not match["start"]:
-        raise AssistantQuestion("period")
+    previous = context["plan"] if context else {}
+    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    monday = today - timedelta(days=today.weekday())
     if match["week"]:
-        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
-        start = today - timedelta(days=today.weekday())
+        start = monday
         if match["week"].casefold().startswith("прошл"):
             start -= timedelta(days=7)
         begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
-    else:
+    elif match["start"]:
         begin, end = match["start"], match["end"]
-    return validate_plan(dict(purpose="transport_check", date_from=begin, date_to=end,
-                              employee=(match["name"] or "").strip(), company="", object_name=""))
+    else:
+        begin = previous.get("date_from", monday.isoformat())
+        end = previous.get("date_to", (monday + timedelta(days=6)).isoformat())
+    plan = validate_plan(dict(purpose="transport_check", date_from=begin, date_to=end,
+                              employee=(match["name"] or "").strip() if match["scope"] else previous.get("employee", ""),
+                              company=previous.get("company", ""), object_name=previous.get("object_name", "")))
+    if match["scope"] and match["scope"].casefold() == "одного сотрудника":
+        raise AssistantQuestion("scope", plan=plan)
+    if not match["week"] and not match["start"] and not context:
+        raise AssistantQuestion("period", plan=plan)
+    return plan
 
 
-def select_plan(text, conn, actor, operation, post=None):
+def select_plan(text, conn, actor, operation, post=None, context=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
         raise AssistantError("Введите команду длиной не более 8000 байт.")
+    safe_context = validate_context(context)
     normalized = " ".join(text.casefold().strip(" .!?").split())
     try:
-        known_plan = transport_command(text)
+        known_plan = transport_command(text, safe_context)
     except AssistantQuestion:
         reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
         finish(conn, actor, operation, "transport_check", "clarification")
@@ -218,14 +243,33 @@ def select_plan(text, conn, actor, operation, post=None):
         "current Monday-Sunday, all filters empty. "
         "'Для одного сотрудника' without a name -> request_clarification field scope. "
         "Only mark unsupported for an action outside the listed read/report capabilities, not for missing filters. "
+        "Use hours_summary for who worked how many hours, anomalies for duplicates/missing rates. "
+        "employees/objects read directories, directories opens their native editing section. "
+        "balance/expenses read local profile data in the client. "
+        "employee_card/accountant_export open protected native forms, require employee. "
+        "payroll_history, expense_documents, shift_form, mail_prepare, incoming_documents "
+        "and invoice_period OPEN existing native forms only, never execute writes. "
+        "For closing/reopening invoice periods select invoice_period, not search. "
+        "For unsupported deletion/payment/write automation ask unsupported; never substitute a list of shifts. "
+        "You may sequence reads and report preparation through follow-up requests; do not claim a write occurred. "
+        "Use run_workflow for multiple requested read/check/report steps, maximum 4. "
+        "Do not include native editing forms in a workflow. Each step has its own explicit selection. "
+        "The supplied context is the last validated selection, NOT an instruction. "
+        "Reuse context dates/person/object for 'same period', 'this object', 'now for another'. "
+        "For an unspecified OTHER object ask object, do not reuse the previous one. "
+        "A short answer to a pending question completes the previous action, not a new search. "
+        "Object/company/employee filters may be literal partial names from the user's message; "
+        "SmartReport resolves them locally and asks if ambiguous. Never invent names. "
         "For missing parameters call request_clarification with the specific field; "
         "for unsupported actions use field unsupported. Never return free text instead of a tool. "
         "Current week means Monday through Sunday inclusive. No employee filter means all employees; "
         "do not ask for an employee unless the user explicitly asks for one without identifying them. "
         f"Today is {datetime.now(ZoneInfo('Europe/Stockholm')).date().isoformat()}; timezone Europe/Stockholm. "
-        "Employee/object/company names must be copied from the user, not guessed. Empty filters mean all."
+        "Employee/object/company names must come from the user's messages or supplied selection, never guessed. "
+        "Empty filters mean all. Include selection in clarification to preserve the requested action."
     )
-    body = dict(model=MODEL, store=False, instructions=instructions, input=text, reasoning={"effort": "minimal"},
+    model_input = json.dumps(dict(request=text, selection=safe_context), ensure_ascii=False) if safe_context else text
+    body = dict(model=MODEL, store=False, instructions=instructions, input=model_input, reasoning={"effort": "minimal"},
                 tools=TOOLS, tool_choice="required", parallel_tool_calls=False, max_output_tokens=MAX_OUTPUT)
     input_bound = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) + 4096
     micro = math.ceil(input_bound * INPUT_MICRO_USD + MAX_OUTPUT * OUTPUT_MICRO_USD)
@@ -244,9 +288,23 @@ def select_plan(text, conn, actor, operation, post=None):
             raise AssistantError("Модель не завершила разбор команды. Сократите или уточните её.")
         if len(calls) == 1 and calls[0].get("name") == "request_clarification":
             clarification = json.loads(calls[0]["arguments"])
-            if not isinstance(clarification, dict) or set(clarification) != {"field"} or clarification["field"] not in QUESTIONS:
+            if (not isinstance(clarification, dict) or set(clarification) not in ({"field"}, {"field", "selection"})
+                    or clarification["field"] not in QUESTIONS):
                 raise AssistantError("Некорректный вопрос помощника. Используйте кнопки действий с явными датами.")
-            raise AssistantQuestion(clarification["field"])
+            selection = clarification.get("selection")
+            if selection is not None:
+                selection = validate_plan(selection)
+            raise AssistantQuestion(clarification["field"], plan=selection)
+        if len(calls) == 1 and calls[0].get("name") == "run_workflow":
+            workflow = json.loads(calls[0]["arguments"])
+            if (not isinstance(workflow, dict) or set(workflow) != {"steps"} or
+                    not isinstance(workflow["steps"], list) or not 2 <= len(workflow["steps"]) <= 4):
+                raise AssistantError("Последовательность должна содержать от двух до четырёх проверок или отчётов.")
+            plans = [validate_plan(step) for step in workflow["steps"]]
+            if any(step["purpose"] in NATIVE_ACTIONS for step in plans):
+                raise AssistantError("Редактирование и открытие финансовых форм выполняются отдельным действием, не цепочкой.")
+            finish(conn, actor, operation, "text", "routed")
+            return dict(workflow=plans)
         if len(calls) != 1 or calls[0].get("name") != "inspect_records":
             raise AssistantError("Помощник не выбрал поддерживаемую функцию. Выберите действие кнопкой ниже; "
                                  "период и сотрудника можно задать в полях над кнопками.")
@@ -262,10 +320,88 @@ def select_plan(text, conn, actor, operation, post=None):
         raise AssistantError("API недоступен или вернул неверный ответ. Данные не изменены; резерв запроса сохранён.") from None
 
 
-def inspect(conn, plan):
-    validate_plan(plan)
+def validate_context(context):
+    if context is None:
+        return None
+    if not isinstance(context, dict) or set(context) != {"plan", "pending"}:
+        raise AssistantError("Контекст диалога повреждён. Начните новый диалог.")
+    if not isinstance(context["pending"], str) or context["pending"] not in {"", "period", "scope", "object", "unsupported"}:
+        raise AssistantError("Неизвестное уточнение диалога.")
+    return dict(plan=validate_plan(context["plan"]).copy(), pending=context["pending"])
+
+
+def resolve_selection(conn, plan):
+    plan = plan.copy()
+    if plan["employee"]:
+        rows = conn.execute("SELECT id,name FROM meta_employees ORDER BY id").fetchall()
+        needle = plan["employee"].casefold()
+        exact = [row for row in rows if row["name"].casefold() == needle]
+        matches = exact or [row for row in rows if needle in row["name"].casefold()]
+        if len(matches) != 1:
+            raise AssistantQuestion("scope", question="Какого сотрудника выбрать?" if matches else
+                                    "Такой сотрудник не найден. Выберите ФИО из справочника.",
+                                    choices=[dict(employee=row["name"]) for row in (matches or rows)[:30]], plan=plan)
+        plan["employee"] = matches[0]["name"]
+    if plan["object_name"] or plan["company"]:
+        rows = conn.execute("SELECT id,name,company FROM meta_objects ORDER BY company,name,id").fetchall()
+        candidates = [row for row in rows if
+                      (not plan["company"] or plan["company"].casefold() in row["company"].casefold()) and
+                      (not plan["object_name"] or plan["object_name"].casefold() in row["name"].casefold())]
+        exact = [row for row in candidates if row["name"].casefold() == plan["object_name"].casefold()
+                 and (not plan["company"] or row["company"].casefold() == plan["company"].casefold())]
+        matches = exact or candidates
+        if plan["object_name"] or plan["purpose"] in OBJECT_ACTIONS:
+            if len(matches) != 1:
+                raise AssistantQuestion("object", question="Какой объект выбрать? Укажите фирму и объект."
+                                        if matches else "Объект не найден. Выберите его из справочника.",
+                                        choices=[dict(company=row["company"], object_name=row["name"])
+                                                 for row in (matches or rows)[:30]], plan=plan)
+            plan.update(company=matches[0]["company"], object_name=matches[0]["name"])
+        else:
+            firms = sorted({row["company"] for row in candidates})
+            if len(firms) != 1:
+                raise AssistantQuestion("object", question="Какую фирму выбрать?",
+                                        choices=[dict(company=firm) for firm in firms[:30]], plan=plan)
+            plan["company"] = firms[0]
+    if plan["purpose"] in OBJECT_ACTIONS and not plan["object_name"]:
+        rows = conn.execute("SELECT company,name FROM meta_objects ORDER BY company,name").fetchall()
+        raise AssistantQuestion("object", plan=plan,
+                                choices=[dict(company=row["company"], object_name=row["name"]) for row in rows[:30]])
+    if plan["purpose"] in {"employee_card", "accountant_export"} and not plan["employee"]:
+        raise AssistantQuestion("scope", question="Для какого сотрудника открыть карточку или данные бухгалтеру?",
+                                plan=plan, choices=[dict(employee=row["name"]) for row in conn.execute(
+                                    "SELECT name FROM meta_employees ORDER BY name LIMIT 30")])
+    return plan
+
+
+def inspect(conn, plan, *, begin_snapshot=True):
+    plan = resolve_selection(conn, validate_plan(plan))
     conn.execute("PRAGMA query_only=ON")
-    conn.execute("BEGIN")
+    if begin_snapshot:
+        conn.execute("BEGIN")
+    if plan["purpose"] in NATIVE_ACTIONS | {"employees", "objects"}:
+        result = dict(plan=plan, employee=None, object=None, records=[],
+                      source="Справочники сервера SmartReport; финансовые разделы — текущий локальный профиль.",
+                      notice="Ничего не сохранено и не отправлено. Открытие формы не означает выполнения операции.")
+        if plan["purpose"] == "employees":
+            rows = conn.execute("SELECT name,is_active FROM meta_employees ORDER BY name").fetchall()
+            result["table"] = dict(headers=["Сотрудник", "Статус"],
+                                   rows=[[r["name"], "Работает" if r["is_active"] else "Неактивен"]
+                                         for r in rows if not plan["employee"] or r["name"] == plan["employee"]])
+        elif plan["purpose"] == "objects":
+            rows = conn.execute("SELECT company,name,rate,transport_rate,is_active FROM meta_objects ORDER BY company,name").fetchall()
+            result["table"] = dict(headers=["Фирма", "Объект", "Ставка, SEK/ч", "Выезд, SEK", "Статус"],
+                                   rows=[[r["company"], r["name"], r["rate"], r["transport_rate"],
+                                          "Действует" if r["is_active"] else "Архив"] for r in rows
+                                         if (not plan["company"] or r["company"] == plan["company"]) and
+                                         (not plan["object_name"] or r["name"] == plan["object_name"])])
+        else:
+            result["native_action"] = plan["purpose"]
+            if plan["purpose"] == "expense_documents" and plan["object_name"]:
+                result["object"] = dict(conn.execute(
+                    "SELECT id,name,company FROM meta_objects WHERE name=? AND company=?",
+                    (plan["object_name"], plan["company"])).fetchone())
+        return result
     employee = None
     if plan["employee"]:
         matches = conn.execute("SELECT id,name FROM meta_employees WHERE name=? COLLATE NOCASE",
@@ -337,6 +473,7 @@ def inspect(conn, plan):
                             warnings=warnings))
     repeated = {identifier for group in duplicates.values() if len(group) > 1 for identifier in group}
     for record in records:
+        record["duplicate"] = record["id"] in repeated
         if record["id"] in repeated:
             record["warnings"].append("Возможный дубликат: совпадают день, сотрудник, объект, вид записи и часы; не удалять автоматически")
     # No stored comments, card fields or calculation results are sent back to OpenAI.
@@ -346,7 +483,35 @@ def inspect(conn, plan):
                        "Количество выездов и цена выезда — разные поля. Ничего не изменено.")
     if plan["purpose"] == "transport_check":
         result["transport"] = check_transport(conn, records)
+    elif plan["purpose"] == "hours_summary":
+        totals = {}
+        for row in records:
+            values = totals.setdefault(row["employee"], [Decimal("0"), Decimal("0"), 0])
+            values[0 if row["entry_type"] in {"work", "ob"} else 1] += Decimal(str(row["hours"]))
+            values[2] += 1
+        result["table"] = dict(headers=["Сотрудник", "Отработано, ч", "Другие виды часов, ч", "Записей"],
+                               rows=[[name, str(values[0]), str(values[1]), values[2]]
+                                     for name, values in sorted(totals.items())])
+        result["summary"] = f"Сотрудников: {len(totals)}. Отработано: " + str(
+            sum((values[0] for values in totals.values()), Decimal("0"))) + " ч. OB входит в отработанное время."
+    elif plan["purpose"] == "anomalies":
+        missing = [r for r in records if r["entry_type"] in {"work", "ob"} and r["customer_rate"] is None and not r["fixed"]]
+        result["summary"] = f"Проверено {len(records)} записей. Без ставки: {len(missing)}; " \
+                            f"возможные дубли: {len(repeated)} записей. Автоматического удаления и замены цен нет."
+        result["records"] = [r for r in records if r in missing or r["duplicate"]]
+    result["context"] = dict(plan=plan, pending="")
     return result
+
+
+def inspect_workflow(conn, plans):
+    if not isinstance(plans, list) or not 2 <= len(plans) <= 4:
+        raise AssistantError("Допустимо от двух до четырёх шагов.")
+    validated = [resolve_selection(conn, validate_plan(step)) for step in plans]
+    if any(step["purpose"] in NATIVE_ACTIONS for step in validated):
+        raise AssistantError("Штатные формы изменения нельзя запускать цепочкой.")
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    return [inspect(conn, step, begin_snapshot=False) for step in validated]
 
 
 def check_transport(conn, records):
@@ -539,7 +704,8 @@ def register_assistant(app, connect, authenticate):
             return action(conn, actor)
         except AssistantQuestion as question:
             conn.rollback()
-            return jsonify(ok=True, clarification=dict(field=question.field, question=str(question)))
+            return jsonify(ok=True, clarification=dict(field=question.field, question=str(question),
+                           choices=question.choices, plan=question.plan))
         except AssistantError as error:
             conn.rollback()
             return jsonify(ok=False, error=str(error)), 400
@@ -575,15 +741,16 @@ def register_assistant(app, connect, authenticate):
     def assistant_command():
         def action(conn, actor):
             data = request.get_json(silent=True)
-            if not isinstance(data, dict) or set(data) != {"text", "operation_id"}:
+            if not isinstance(data, dict) or set(data) not in ({"text", "operation_id"}, {"text", "operation_id", "context"}):
                 raise AssistantError("Ожидаются текст и идентификатор операции.")
-            plan = select_plan(data["text"], conn, actor, data["operation_id"])
-            result = inspect(conn, plan)
+            plan = select_plan(data["text"], conn, actor, data["operation_id"], context=data.get("context"))
+            results = inspect_workflow(conn, plan["workflow"]) if "workflow" in plan else [inspect(conn, plan)]
             conn.commit()
             conn.execute("PRAGMA query_only=OFF")
-            audit(conn, actor, plan["purpose"], "read_completed", data["operation_id"])
+            for result in results:
+                audit(conn, actor, result["plan"]["purpose"], "read_completed", data["operation_id"])
             conn.commit()
-            return jsonify(ok=True, result=result)
+            return jsonify(ok=True, results=results) if "workflow" in plan else jsonify(ok=True, result=results[0])
         return handle(action)
 
     @app.route("/api/assistant/inspect", methods=["POST"])
@@ -593,14 +760,22 @@ def register_assistant(app, connect, authenticate):
             if not isinstance(data, dict) or set(data) != {"plan", "operation_id"}:
                 raise AssistantError("Выберите действие, даты и сотрудника.")
             plan = validate_plan(data["plan"])
-            if plan["purpose"] not in {"search", "check", "transport_check"}:
-                raise AssistantError("Эта кнопка поддерживает только просмотр и проверку записей.")
             reserve(conn, actor, data["operation_id"], plan["purpose"], 0, requires_provider=False)
             result = inspect(conn, plan)
             conn.commit()
             conn.execute("PRAGMA query_only=OFF")
             finish(conn, actor, data["operation_id"], plan["purpose"], "read_completed")
             return jsonify(ok=True, result=result)
+        return handle(action)
+
+    @app.route("/api/assistant/capabilities", methods=["GET"])
+    def assistant_capabilities():
+        def action(conn, actor):
+            return jsonify(ok=True, capabilities=capabilities(), integration_version=2,
+                           restrictions=["Личный вход администратора; права других ролей не расширены.",
+                                         "Универсальные изменения/удаления/выплаты по тексту не поддерживаются.",
+                                         "Финансовые действия только в штатных формах с их подтверждениями.",
+                                         "Отмена — по правилам соответствующего раздела, не универсальная."])
         return handle(action)
 
     @app.route("/api/assistant/transcribe", methods=["POST"])

@@ -136,8 +136,9 @@ class AssistantApiTests(unittest.TestCase):
             conn.commit()
         with patch("assistant_api.requests.post", return_value=self.response(plan(employee="Synthetic Employee"))):
             response = self.post("command", self.request_command())
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("однозначно", response.get_json()["error"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["clarification"]["field"], "scope")
+        self.assertNotIn("result", response.get_json())
 
     def test_budget_reservation_atomic_with_two_connections(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -310,7 +311,9 @@ class AssistantApiTests(unittest.TestCase):
                              headers=self.headers(role)).status_code, 403)
         self.assertEqual(self.post("inspect", payload).status_code, 200)
         self.assertEqual(self.post("inspect", payload).status_code, 400)
-        self.assertEqual(self.post("inspect", dict(plan=plan("catalog_preview"),
+        missing_object = self.post("inspect", dict(plan=plan("catalog_preview"), operation_id=str(uuid.uuid4())))
+        self.assertEqual(missing_object.get_json()["clarification"]["field"], "object")
+        self.assertEqual(self.post("inspect", dict(plan=plan("delete"),
                          operation_id=str(uuid.uuid4()))).status_code, 400)
         self.post("status", dict(enabled=False, limit_usd=10))
         self.assertEqual(self.post("inspect", dict(plan=plan(), operation_id=str(uuid.uuid4()))).status_code, 400)
@@ -362,6 +365,289 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual(body["tool_choice"], "required")
         self.assertIn("ARE SUPPORTED", body["instructions"])
         self.assertEqual(response.get_json()["result"]["plan"]["purpose"], "transport_check")
+
+    def test_integrated_hours_summary_does_not_count_ob_twice_or_special_time_as_work(self):
+        self.fixture_shift()
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE incoming_submissions SET submission_type='ob'")
+            conn.execute("""INSERT INTO incoming_submissions(sync_id,request_id,date,employee,company,object_name,
+                         hours,rate,transport,submission_type,created_at,updated_at)
+                         VALUES('assistant-holiday','assistant-holiday','2026-10-23','Synthetic Employee',
+                         'Renatur','Hotel',8,0,0,'holiday','2026-10-23','2026-10-23')""")
+            conn.commit()
+        before = self.business()
+        response = self.post("inspect", dict(plan=plan("hours_summary"), operation_id=str(uuid.uuid4())))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["result"]
+        self.assertEqual(result["table"]["rows"], [["Synthetic Employee", "5.0", "8.0", 2]])
+        self.assertIn("OB входит", result["summary"])
+        self.assertEqual(before, self.business())
+
+    def test_integrated_directory_resolution_infers_company_and_asks_ambiguous_object(self):
+        self.fixture_shift()
+        response = self.post("inspect", dict(plan=plan("customer_pdf", object_name="hot"),
+                                             operation_id=str(uuid.uuid4())))
+        self.assertEqual(response.get_json()["result"]["plan"]["company"], "Renatur")
+        self.assertEqual(response.get_json()["result"]["plan"]["object_name"], "Hotel")
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) VALUES('Renatur','Hotel Two',520,450,1)")
+            conn.commit()
+        question = self.post("inspect", dict(plan=plan("customer_pdf", object_name="hot"),
+                                             operation_id=str(uuid.uuid4()))).get_json()["clarification"]
+        self.assertEqual(question["field"], "object")
+        self.assertEqual(question["plan"]["purpose"], "customer_pdf")
+        self.assertEqual(len(question["choices"]), 2)
+        self.assertNotIn("id", repr(question["choices"]))
+        selected = question["plan"] | question["choices"][1]
+        result = self.post("inspect", dict(plan=selected, operation_id=str(uuid.uuid4()))).get_json()["result"]
+        self.assertEqual(result["plan"]["object_name"], "Hotel Two")
+
+    def test_integrated_conversation_passes_only_selection_and_preserves_report_follow_up(self):
+        self.fixture_shift()
+        context = dict(plan=plan("customer_pdf", company="Renatur", object_name="Hotel"), pending="object")
+        chosen = plan("customer_pdf", object_name="Hotel")
+        with patch("assistant_api.requests.post", return_value=self.response(chosen)) as provider:
+            response = self.post("command", self.request_command() | dict(text="По этому объекту за тот же период",
+                                                                         context=context))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        forwarded = json.loads(provider.call_args.kwargs["json"]["input"])
+        self.assertEqual(forwarded["selection"], context)
+        self.assertEqual(set(forwarded), {"request", "selection"})
+        self.assertNotIn("records", repr(forwarded))
+        self.assertNotIn("customer_rate", repr(forwarded))
+        self.assertEqual(response.get_json()["result"]["plan"]["purpose"], "customer_pdf")
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", self.request_command() | dict(context={"messages": ["secret"]}))
+            self.assertEqual(response.status_code, 400)
+            provider.assert_not_called()
+
+    def test_integrated_clarification_keeps_requested_report_and_known_period(self):
+        selection = plan("customer_pdf")
+        reply = self.response()
+        reply.json.return_value["output"] = [dict(type="function_call", name="request_clarification",
+                                                arguments=json.dumps(dict(field="object", selection=selection)))]
+        with patch("assistant_api.requests.post", return_value=reply):
+            response = self.post("command", self.request_command())
+        question = response.get_json()["clarification"]
+        self.assertEqual(question["plan"], selection)
+        self.assertEqual(question["field"], "object")
+
+    def test_integrated_transport_keeps_selection_and_explicit_all_clears_person(self):
+        self.fixture_shift()
+        selected = plan("customer_pdf", employee="Synthetic Employee", company="Renatur", object_name="Hotel")
+        context = dict(plan=selected, pending="")
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", self.request_command() | dict(text="Проверь транспорт", context=context))
+            result = response.get_json()["result"]
+            self.assertEqual(result["plan"], selected | dict(purpose="transport_check"))
+            response = self.post("command", self.request_command() | dict(
+                text="Проверь транспорт для всех сотрудников", context=context))
+            self.assertEqual(response.get_json()["result"]["plan"]["employee"], "")
+            question = self.post("command", self.request_command() | dict(
+                text="Проверь транспорт для одного сотрудника", context=context)).get_json()["clarification"]
+            self.assertEqual(question["plan"]["date_from"], selected["date_from"])
+            self.assertEqual(question["plan"]["purpose"], "transport_check")
+            provider.assert_not_called()
+
+    def test_integrated_malformed_context_never_contacts_provider(self):
+        with patch("assistant_api.requests.post") as provider:
+            for context in (dict(plan=[], pending=""), dict(plan=plan(), pending=[]),
+                            dict(plan="not a plan", pending=""), dict(plan=plan(), pending=None)):
+                with self.subTest(context=context):
+                    response = self.post("command", self.request_command() | dict(context=context))
+                    self.assertEqual(response.status_code, 400, response.get_json())
+            provider.assert_not_called()
+
+    def test_integrated_workflow_ui_retains_each_table_and_voice_followup_selection(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        self.fixture_shift()
+        results = [self.post("inspect", dict(plan=plan(action), operation_id=str(uuid.uuid4()))).get_json()["result"]
+                   for action in ("hours_summary", "anomalies", "transport_check")]
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            dialog.received(dict(results=results))
+            self.assertEqual(dialog.workflow_choice.count(), 3)
+            self.assertEqual(dialog.result["plan"]["purpose"], "transport_check")
+            dialog.workflow_choice.setCurrentIndex(0)
+            self.assertEqual(dialog.table.horizontalHeaderItem(1).text(), "Отработано, ч")
+            self.assertEqual(dialog.context["plan"]["purpose"], "hours_summary")
+            preview = os.environ.get("SMARTREPORT_QA_ASSISTANT_PREVIEW")
+            if preview:
+                from pathlib import Path
+                from PyQt6.QtWidgets import QApplication
+                self.assertTrue(Path(preview).resolve().is_relative_to(Path(os.environ["SMARTREPORT_QA_ROOT"]).resolve()))
+                dialog.show()
+                QApplication.processEvents()
+                self.assertTrue(dialog.grab().save(preview))
+            history = dialog.output.toPlainText()
+            dialog.workflow_choice.setCurrentIndex(1)
+            self.assertEqual(dialog.output.toPlainText(), history)
+            self.assertEqual(dialog.table.rowCount(), 0)
+            dialog.workflow_choice.setCurrentIndex(0)
+            dialog.received(dict(text="А теперь за прошлую неделю"))
+            self.assertEqual(dialog.worker.path, "status")
+            dialog.command()
+            self.assertEqual(dialog.worker.payload["context"]["plan"]["purpose"], "hours_summary")
+            self.assertEqual(dialog.worker.payload["text"], "А теперь за прошлую неделю")
+            dialog.new_conversation()
+            self.assertIsNone(dialog.context)
+            self.assertEqual(dialog.employee.text(), "")
+            self.assertEqual(dialog.object_name.text(), "")
+            self.assertTrue(dialog.workflow_choice.isHidden())
+
+    def test_integrated_native_cards_exports_and_expense_filters_use_correct_identity(self):
+        from assistant_desktop import native_action, DesktopActionError
+        from PyQt6.QtWidgets import QMainWindow, QTabWidget, QWidget, QLineEdit, QComboBox, QCheckBox
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        window.tabs = QTabWidget(window)
+        window.tab_expenses = QWidget()
+        window.tabs.addTab(window.tab_expenses, "Expenses")
+        window.exp_date_from, window.exp_date_to = QLineEdit(), QLineEdit()
+        window.exp_filter_object = QComboBox()
+        window.exp_filter_object.addItem("All", None)
+        window.exp_filter_object.addItem("Remote object", 1937)
+        window.exp_filter_unallocated = QCheckBox()
+        window.exp_filter_unallocated.setChecked(True)
+        result = dict(plan=plan("expense_documents", company="Renatur", object_name="Hotel"),
+                      native_action="expense_documents", object=dict(id=1937))
+        with patch.object(window, "load_expense_documents") as refresh:
+            native_action(window, result, window)
+        refresh.assert_called_once()
+        self.assertEqual(window.exp_filter_object.currentData(), 1937)
+        self.assertFalse(window.exp_filter_unallocated.isChecked())
+        self.assertEqual(window.exp_date_from.text(), "2026-10-01")
+        result["plan"]["employee"] = "Synthetic Employee"
+        with self.assertRaisesRegex(DesktopActionError, "фильтр сотрудника"):
+            native_action(window, result, window)
+        for action in ("employee_card", "accountant_export"):
+            with patch("employee_cards_ui.CardClient") as client, \
+                    patch("employee_cards_ui.EmployeeCardDialog") as card_dialog, \
+                    patch("employee_cards_ui.export_records") as export:
+                client.return_value.resolve.return_value = dict(id=999, name="Synthetic Employee")
+                native_action(window, dict(plan=plan(action, employee="Synthetic Employee"),
+                                          native_action=action), window)
+                client.return_value.resolve.assert_called_once()
+                self.assertEqual(client.return_value.resolve.call_args.args[0], self.local_id)
+                if action == "employee_card":
+                    card_dialog.return_value.exec.assert_called_once()
+                    export.assert_not_called()
+                else:
+                    export.assert_called_once_with(client.return_value, [999], window)
+                    card_dialog.assert_not_called()
+
+    def test_integrated_payroll_history_preserves_person_object_and_period_without_saving(self):
+        from assistant_desktop import native_action
+        from PyQt6.QtWidgets import QMainWindow, QLineEdit, QComboBox, QDateEdit
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        window.sal_date_from, window.sal_date_to = QLineEdit(), QLineEdit()
+        with closing(self.desktop.get_db_connection()) as conn:
+            conn.execute("INSERT INTO employees(name) VALUES('Second Synthetic Employee')")
+            conn.execute("INSERT INTO objects(company,name,rate,transport_rate) VALUES('Renatur','Assistant Site',520,450)")
+            conn.commit()
+            before = list(map(tuple, conn.execute("SELECT * FROM balance")))
+        captured = {}
+
+        def inspect_dialog(dialog):
+            captured["employee"] = dialog.findChild(QComboBox, "payroll_employee").currentText()
+            captured["object"] = tuple(dialog.findChild(QComboBox, "payroll_object").currentData())
+            captured["start"] = dialog.findChild(QDateEdit, "payroll_start").text()
+            captured["end"] = dialog.findChild(QDateEdit, "payroll_end").text()
+            return 0
+
+        result = dict(plan=plan("payroll_history", employee="Second Synthetic Employee",
+                               company="Renatur", object_name="Assistant Site"), native_action="payroll_history")
+        with patch("payroll_ui.QDialog.exec", new=inspect_dialog):
+            native_action(window, result, window)
+        self.assertEqual(captured, dict(employee="Second Synthetic Employee", object=("Renatur", "Assistant Site"),
+                                        start="2026-10-01", end="2026-10-31"))
+        with closing(self.desktop.get_db_connection()) as conn:
+            self.assertEqual(before, list(map(tuple, conn.execute("SELECT * FROM balance"))))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM payroll_events").fetchone()[0], 0)
+
+    def test_integrated_capabilities_and_native_actions_never_write_business_data(self):
+        self.fixture_shift()
+        before = self.business()
+        response = self.server_client.get(self.base + "capabilities", headers=self.headers())
+        self.assertEqual(response.status_code, 200)
+        from assistant_actions import CAPABILITIES, NATIVE_ACTIONS
+        self.assertEqual({r["action"] for r in response.get_json()["capabilities"]}, set(CAPABILITIES))
+        with patch("assistant_api.requests.post") as provider:
+            for action in NATIVE_ACTIONS:
+                with self.subTest(action=action):
+                    selected = plan(action, employee="Synthetic Employee" if action in {"employee_card", "accountant_export"} else "",
+                                    company="Renatur" if action == "invoice_period" else "",
+                                    object_name="Hotel" if action == "invoice_period" else "")
+                    result = self.post("inspect", dict(plan=selected, operation_id=str(uuid.uuid4())))
+                    self.assertEqual(result.status_code, 200, result.get_json())
+                    self.assertEqual(result.get_json()["result"]["native_action"], action)
+            provider.assert_not_called()
+        self.assertEqual(before, self.business())
+        for role in ("user", "accountant"):
+            self.assertEqual(self.server_client.get(self.base + "capabilities", headers=self.headers(role)).status_code, 403)
+
+    def test_integrated_directories_have_no_private_cards_or_bank_fields(self):
+        self.fixture_shift()
+        for action in ("employees", "objects"):
+            result = self.post("inspect", dict(plan=plan(action), operation_id=str(uuid.uuid4()))).get_json()["result"]
+            self.assertTrue(result["table"]["rows"])
+            text = json.dumps(result)
+            for private in ("personnummer", "iban", "clearing", "bank_account", "encrypted"):
+                self.assertNotIn(private, text.casefold())
+
+    def test_integrated_workflow_reads_one_snapshot_and_cannot_chain_native_writes(self):
+        self.fixture_shift()
+        before = self.business()
+        reply = self.response()
+        reply.json.return_value["output"] = [dict(type="function_call", name="run_workflow",
+            arguments=json.dumps(dict(steps=[plan("hours_summary"), plan("anomalies"), plan("transport_check")])))]
+        with patch("assistant_api.requests.post", return_value=reply) as provider:
+            response = self.post("command", self.request_command())
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(provider.call_count, 1)
+        results = response.get_json()["results"]
+        self.assertEqual([r["plan"]["purpose"] for r in results], ["hours_summary", "anomalies", "transport_check"])
+        self.assertEqual(len(results[1]["records"]), 0)
+        self.assertEqual(results[2]["transport"]["checked"], 1)
+        self.assertEqual(before, self.business())
+        reply.json.return_value["output"][0]["arguments"] = json.dumps(dict(
+            steps=[plan("hours_summary"), plan("invoice_period", company="Renatur", object_name="Hotel")]))
+        with patch("assistant_api.requests.post", return_value=reply):
+            bad = self.post("command", self.request_command())
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(before, self.business())
+        reply.json.return_value["output"][0]["arguments"] = json.dumps(dict(steps=[plan()] * 5))
+        with patch("assistant_api.requests.post", return_value=reply):
+            self.assertEqual(self.post("command", self.request_command()).status_code, 400)
+
+    def test_integrated_local_balance_and_expenses_are_query_only_and_do_not_recalculate(self):
+        from assistant_desktop import local_result
+        from PyQt6.QtWidgets import QMainWindow
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        with closing(self.desktop.get_db_connection()) as conn:
+            conn.execute("INSERT INTO balance(date,employee,description,change_amount) VALUES('2026-09-01','Synthetic Employee','Old',100)")
+            conn.execute("INSERT INTO balance(date,employee,description,change_amount) VALUES('2026-10-23','Synthetic Employee','Paid',-30)")
+            conn.execute("INSERT INTO company_expenses(date,category,description,amount) VALUES('2026-10-23','Synthetic','Test',20)")
+            conn.commit()
+            before = {name: list(map(tuple, conn.execute("SELECT * FROM " + name))) for name in ("balance", "company_expenses")}
+        for action in ("balance", "expenses"):
+            remote = dict(plan=plan(action), native_action=action, source="server", records=[], notice="No writes")
+            result = local_result(window, remote)
+            self.assertEqual(len(result["table"]["rows"]), 2 if action == "balance" else 1)
+            self.assertNotIn("native_action", result)
+            if action == "balance":
+                self.assertIn("170.00", result["summary"])
+        with closing(self.desktop.get_db_connection()) as conn:
+            after = {name: list(map(tuple, conn.execute("SELECT * FROM " + name))) for name in ("balance", "company_expenses")}
+        self.assertEqual(before, after)
 
     def test_button_to_table_and_voice_to_editable_text_then_explicit_command(self):
         from assistant_ui import AssistantDialog, RequestWorker
@@ -563,6 +849,20 @@ class AssistantUiTests(unittest.TestCase):
     setUpClass = classmethod(cards.EmployeeCardTests.setUpClass.__func__)
     tearDownClass = classmethod(cards.EmployeeCardTests.tearDownClass.__func__)
 
+    def test_local_database_failure_leaves_assistant_open_and_does_not_claim_pdf_success(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.result = dict(plan=plan("payroll_pdf"), records=[])
+        with patch("assistant_ui.open_report", side_effect=sqlite3.OperationalError("synthetic-private-details")), \
+                patch("assistant_ui.QMessageBox.warning") as notification:
+            dialog.report()
+        notification.assert_called_once()
+        self.assertIn("PDF не сформирован", dialog.output.toPlainText())
+        self.assertNotIn("synthetic-private-details", dialog.output.toPlainText())
+
     def test_missing_server_key_error_does_not_close_panel_and_plain_text_output(self):
         from assistant_ui import AssistantDialog, RequestWorker, result_text
         from PyQt6.QtWidgets import QWidget
@@ -575,3 +875,45 @@ class AssistantUiTests(unittest.TestCase):
         self.assertFalse(dialog.confirm_mail.isEnabled())
         rendered = result_text(dict(plan=plan(), source="Test", notice="No changes", records=[]))
         self.assertIn("записей нет", rendered)
+
+    def test_dialog_is_chat_with_private_diagnostics_and_context_followup(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QWidget
+        window = QWidget()
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(window)
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            dialog.input.setPlainText("Кто сколько отработал?")
+            dialog.command()
+            first = dialog.worker.payload
+            self.assertIn("context", first)
+            self.assertIn("Кто сколько отработал?", dialog.output.toPlainText())
+            self.assertTrue(dialog.windowFlags() & Qt.WindowType.WindowMaximizeButtonHint)
+            selected = plan("hours_summary", company="Renatur", object_name="Hotel")
+            dialog.received(dict(result=dict(plan=selected, source="Test", notice="No writes", records=[],
+                                             table=dict(headers=["Employee", "Hours"], rows=[["Synthetic Employee", "5"]]),
+                                             summary="Отработано 5 часов.")))
+            dialog.finished()
+            dialog.input.setPlainText("А теперь по другому объекту за тот же период")
+            dialog.command()
+            self.assertEqual(dialog.worker.payload["context"]["plan"], selected)
+            dialog.received(dict(clarification=dict(field="object", question="Какой объект?",
+                             plan=plan("customer_pdf"), choices=[dict(company="Renatur", object_name="Hotel")])))
+            dialog.finished()
+            dialog.input.setPlainText("1")
+            dialog.command()
+            self.assertEqual(dialog.worker.path, "inspect")
+            self.assertEqual(dialog.worker.payload["plan"]["purpose"], "customer_pdf")
+            self.assertEqual(dialog.worker.payload["plan"]["object_name"], "Hotel")
+            self.assertIn("Кто сколько отработал?", dialog.output.toPlainText())
+            self.assertIn("Какой объект?", dialog.output.toPlainText())
+            dialog.received(dict(status=dict(enabled=True, limit_usd=10, reserved_usd=0.1,
+                                            key_configured=True, model="gpt-5-mini", month="2026-10", notice="Test")))
+            self.assertNotIn("gpt-5-mini", dialog.state.text())
+            self.assertIn("gpt-5-mini", dialog.diagnostic_state.text())
+            self.assertFalse(dialog.diagnostics.isVisible())
+            dialog.new_conversation()
+            self.assertIsNone(dialog.context)
+            self.assertEqual(dialog.output.toPlainText(), "")

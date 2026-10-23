@@ -3,6 +3,7 @@ import io
 import base64
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import uuid
@@ -11,15 +12,17 @@ from decimal import Decimal
 from urllib.parse import urlsplit
 
 import requests
-from PyQt6.QtCore import QBuffer, QByteArray, QDate, QIODevice, QSignalBlocker, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QBuffer, QDate, QIODevice, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog, QDateEdit,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox,
 )
 
 import desktop_auth
 from sync_dataset import HEADER, file_dataset, require_response_dataset
+from assistant_actions import CAPABILITIES, REPORT_ACTIONS
+from assistant_desktop import DesktopActionError, local_result, native_action
 
 
 class AssistantClientError(ValueError):
@@ -88,6 +91,14 @@ def result_text(result):
     lines = [f'Период: {plan["date_from"]} — {plan["date_to"]}.',
              "Сотрудник: " + (plan["employee"] or "все сотрудники") + ".",
              f'Найдено записей: {len(result["records"])}.']
+    if "table" in result or "native_action" in result:
+        lines[2] = CAPABILITIES[plan["purpose"]][0]
+        lines.extend([result.get("summary", "Готово к открытию штатной формы." if "native_action" in result
+                                 else f'Строк в таблице: {len(result["table"]["rows"])}.'),
+                      result["source"], result["notice"]])
+        return "\n".join(lines)
+    if result.get("summary"):
+        lines.append(result["summary"])
     if "transport" in result:
         t = result["transport"]
         lines.extend([t["scope"], f'Проверено: {t["checked"]}; требуют внимания: {t["attention"]}; '
@@ -116,6 +127,9 @@ def result_text(result):
 
 
 def result_table(result):
+    if "table" in result:
+        table = result["table"]
+        return table["headers"], [["Не задано" if value is None else str(value) for value in row] for row in table["rows"]]
     transport = result["plan"]["purpose"] == "transport_check"
     headers = ["Дата", "Сотрудник", "Фирма / объект", "Часы", "Выезды", "Цена выезда, SEK",
                "Транспорт, SEK", "Проверка / замечания"]
@@ -141,7 +155,7 @@ def result_table(result):
 
 def open_report(window, result):
     plan = result["plan"]
-    if plan["purpose"] not in {"payroll_pdf", "customer_pdf", "catalog_preview"}:
+    if plan["purpose"] not in REPORT_ACTIONS:
         raise AssistantClientError("Для PDF попросите зарплатную сводку либо отчёт по фирме и объекту.")
     import sys
     app = sys.modules[window.__class__.__module__]
@@ -150,7 +164,7 @@ def open_report(window, result):
         conn.execute("PRAGMA query_only=ON")
         filters, values = ["date>=?", "date<=?"], [plan["date_from"], plan["date_to"]]
         # Existing customer reports are whole-object documents, not a single worker subset.
-        if plan["purpose"] in {"customer_pdf", "catalog_preview"} and plan["employee"]:
+        if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"} and plan["employee"]:
             raise AssistantClientError("Клиентский PDF включает весь объект. Повторите команду без фильтра сотрудника.")
         for name, value in (("employee", plan["employee"]), ("company", plan["company"]), ("object_name", plan["object_name"])):
             if value:
@@ -171,7 +185,7 @@ def open_report(window, result):
         remote = {r["id"]: {key: r[key] for key in fields} for r in result["records"]}
         if local != remote:
             raise AssistantClientError("Локальные записи отличаются от серверной выборки. Сначала синхронизируйте и повторите команду.")
-        if plan["purpose"] in {"customer_pdf", "catalog_preview"}:
+        if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"}:
             obj = result["object"]
             if obj is None:
                 raise AssistantClientError("Для клиентского PDF укажите точную фирму и объект.")
@@ -219,6 +233,8 @@ def open_report(window, result):
         window.generate_invoice()
         if plan["purpose"] == "catalog_preview":
             window.preview_catalog_prices()
+        elif plan["purpose"] == "journal_pdf":
+            window.export_dagbok_to_pdf()
         else:
             window.export_invoice_to_pdf()
 
@@ -227,15 +243,25 @@ class AssistantDialog(QDialog):
     def __init__(self, window):
         super().__init__(window)
         self.window, self.worker, self.result, self.audio = window, None, None, None
+        self.context = None
+        self.choices = []
+        self.capability_data = []
+        self.auto_report = False
+        self.workflow_results = []
         self.database = getattr(sys.modules.get(window.__class__.__module__), "DB_FILE", None)
         self.setWindowTitle("SmartReport — ИИ-помощник")
         self.resize(1000, 740)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
+        self.setSizeGripEnabled(True)
         layout = QVBoxLayout(self)
-        notice = QLabel("Текст и голос → официальный API. Не вводите пароли, ключи или реквизиты.\n"
-                        "Записи и суммы не отправляются модели: она выбирает разрешённую функцию.\n"
-                        "Изменения учётных данных заблокированы. Письмо отправляется только отдельной кнопкой подтверждения.")
+        notice = QLabel("SmartReport — рабочий помощник. Опишите задачу обычными словами.\n"
+                        "Период и выбранные объекты сохраняются в этом диалоге. Не вводите пароли и реквизиты.")
         notice.setWordWrap(True)
         layout.addWidget(notice)
+        self.diagnostics = QDialog(self)
+        self.diagnostics.setWindowTitle("Помощник — диагностика и настройки")
+        self.diagnostics.resize(800, 600)
+        diagnostic_layout = QVBoxLayout(self.diagnostics)
         form = QFormLayout()
         self.enabled = QCheckBox("Помощник включён на сервере")
         self.limit = QDoubleSpinBox()
@@ -244,7 +270,10 @@ class AssistantDialog(QDialog):
         self.limit.setValue(10)
         form.addRow(self.enabled)
         form.addRow("Месячный лимит резервов, USD:", self.limit)
-        layout.addLayout(form)
+        diagnostic_layout.addLayout(form)
+        self.diagnostic_state = QLabel()
+        self.diagnostic_state.setWordWrap(True)
+        diagnostic_layout.addWidget(self.diagnostic_state)
         self.state = QLabel("Подключение…")
         self.state.setWordWrap(True)
         layout.addWidget(self.state)
@@ -255,7 +284,17 @@ class AssistantDialog(QDialog):
             button = QPushButton(text)
             button.clicked.connect(action)
             controls.addWidget(button)
-        layout.addLayout(controls)
+        diagnostic_layout.addLayout(controls)
+        self.diagnostic_output = QTextEdit()
+        self.diagnostic_output.setReadOnly(True)
+        diagnostic_layout.addWidget(self.diagnostic_output)
+        header = QHBoxLayout()
+        for text, action in (("Новый диалог", self.new_conversation), ("Возможности", self.show_capabilities),
+                             ("Диагностика и настройки", self.diagnostics.show)):
+            button = QPushButton(text)
+            button.clicked.connect(action)
+            header.addWidget(button)
+        layout.addLayout(header)
         filters = QHBoxLayout()
         today = QDate.currentDate()
         monday = today.addDays(1 - today.dayOfWeek())
@@ -265,46 +304,88 @@ class AssistantDialog(QDialog):
             field.setCalendarPopup(True)
         self.employee = QLineEdit()
         self.employee.setPlaceholderText("Все сотрудники (или точное ФИО)")
+        self.company, self.object_name = QLineEdit(), QLineEdit()
+        self.company.setPlaceholderText("Все фирмы")
+        self.object_name.setPlaceholderText("Все объекты")
         filters.addWidget(QLabel("С:"))
         filters.addWidget(self.date_from)
         filters.addWidget(QLabel("По:"))
         filters.addWidget(self.date_to)
         filters.addWidget(self.employee)
+        filters.addWidget(self.company)
+        filters.addWidget(self.object_name)
         layout.addLayout(filters)
         shortcuts = QHBoxLayout()
-        for text, purpose in (("Показать смены", "search"), ("Проверить ставки и данные", "check"),
+        for text, purpose in (("Кто сколько отработал", "hours_summary"), ("Дубли и пропущенные ставки", "anomalies"),
                               ("Проверить транспорт", "transport_check")):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, purpose=purpose: self.quick_action(purpose))
             shortcuts.addWidget(button)
         layout.addLayout(shortcuts)
-        hint = QLabel("Кнопки используют даты и сотрудника выше, без обращения к OpenAI. "
-                      "Текстовая команда использует собственные даты и фильтры.")
+        actions = QHBoxLayout()
+        self.action_choice = QComboBox()
+        for key, (title, mode) in CAPABILITIES.items():
+            self.action_choice.addItem(title, key)
+        actions.addWidget(self.action_choice)
+        run_action = QPushButton("Подготовить выбранное действие")
+        run_action.clicked.connect(lambda: self.quick_action(self.action_choice.currentData()))
+        actions.addWidget(run_action)
+        layout.addLayout(actions)
+        self.workflow_choice = QComboBox()
+        self.workflow_choice.setVisible(False)
+        self.workflow_choice.currentIndexChanged.connect(self.select_workflow_result)
+        layout.addWidget(self.workflow_choice)
+        clarification_row = QHBoxLayout()
+        self.clarification_choice = QComboBox()
+        self.clarification_choice.setVisible(False)
+        clarification_row.addWidget(self.clarification_choice)
+        self.choose_clarification = QPushButton("Выбрать")
+        self.choose_clarification.setVisible(False)
+        self.choose_clarification.clicked.connect(self.choose_answer)
+        clarification_row.addWidget(self.choose_clarification)
+        self.continue_selection = QPushButton("Продолжить с выбранными параметрами")
+        self.continue_selection.setVisible(False)
+        self.continue_selection.clicked.connect(lambda: self.quick_action(self.context["plan"]["purpose"])
+                                                if self.context else None)
+        clarification_row.addWidget(self.continue_selection)
+        layout.addLayout(clarification_row)
+        hint = QLabel("Выбор выше — контекст диалога. Можно изменить его словами: «за прошлую неделю», "
+                      "«по другому объекту». Открытие формы не означает сохранения данных.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.input = QTextEdit()
         self.input.setAcceptRichText(False)
         self.input.setMaximumHeight(100)
-        self.input.setPlaceholderText("Например: проверь смены с 2026-10-01 по 2026-10-31 по фирме Renatur")
+        self.input.setPlaceholderText("Например: покажи, кто сколько отработал на этой неделе")
         layout.addWidget(self.input)
         row = QHBoxLayout()
-        self.send = QPushButton("Выполнить текстовую команду")
+        self.send = QPushButton("Отправить")
         self.send.clicked.connect(self.command)
         row.addWidget(self.send)
         self.voice = QPushButton("Записать голос (до 60 с)")
         self.voice.clicked.connect(self.record)
         row.addWidget(self.voice)
-        self.pdf = QPushButton("Открыть существующий PDF по результату")
+        tools = QHBoxLayout()
+        self.pdf = QPushButton("Создать / открыть PDF")
         self.pdf.setEnabled(False)
         self.pdf.clicked.connect(self.report)
-        row.addWidget(self.pdf)
+        tools.addWidget(self.pdf)
         mail = QPushButton("Подготовить письмо с PDF")
         mail.clicked.connect(self.prepare_mail)
-        row.addWidget(mail)
+        tools.addWidget(mail)
         layout.addLayout(row)
+        layout.addLayout(tools)
+        self.native = QPushButton("Открыть штатную форму")
+        self.native.setEnabled(False)
+        self.native.clicked.connect(self.open_native)
+        tools.addWidget(self.native)
+        self.open_records = QPushButton("Открыть выбранную запись")
+        self.open_records.setEnabled(False)
+        self.open_records.clicked.connect(self.record_details)
+        tools.addWidget(self.open_records)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
-        self.output.setMaximumHeight(180)
+        self.output.setMinimumHeight(150)
         layout.addWidget(self.output)
         self.table = QTableWidget()
         self.table.setMinimumHeight(170)
@@ -314,6 +395,15 @@ class AssistantDialog(QDialog):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setVisible(False)
         layout.addWidget(self.table)
+        layout.removeWidget(self.output)
+        layout.insertWidget(layout.indexOf(self.input), self.output, 2)
+        layout.removeWidget(self.table)
+        layout.insertWidget(layout.indexOf(self.input), self.table, 2)
+        self.result_heading = QLabel()
+        self.result_heading.setTextFormat(Qt.TextFormat.PlainText)
+        self.result_heading.setWordWrap(True)
+        layout.insertWidget(layout.indexOf(self.table), self.result_heading)
+        self.table.cellDoubleClicked.connect(lambda *_: self.record_details())
         self.confirm_mail = QPushButton("Подтвердить отправку подготовленного письма…")
         self.confirm_mail.setEnabled(False)
         self.confirm_mail.clicked.connect(self.send_mail)
@@ -322,6 +412,56 @@ class AssistantDialog(QDialog):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.stop_recording)
         self.call("status")
+
+    def append_message(self, role, text):
+        cursor = self.output.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(("\n\n" if self.output.toPlainText() else "") + role + ":\n" + text)
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
+
+    def new_conversation(self):
+        if self.audio is not None or self.worker and self.worker.isRunning():
+            self.state.setText("Сначала завершите запись или запрос.")
+            return
+        self.context = None
+        self.result = None
+        self.auto_report = False
+        self.choices = []
+        self.workflow_results = []
+        self.workflow_choice.setVisible(False)
+        self.clear_clarification()
+        self.pending_draft = None
+        self.input.clear()
+        for field in (self.employee, self.company, self.object_name):
+            field.clear()
+        today = QDate.currentDate()
+        monday = today.addDays(1 - today.dayOfWeek())
+        self.date_from.setDate(monday)
+        self.date_to.setDate(monday.addDays(6))
+        self.output.clear()
+        self.table.setVisible(False)
+        self.result_heading.clear()
+        for button in (self.pdf, self.native, self.open_records, self.confirm_mail):
+            button.setEnabled(False)
+        self.state.setText("Новый диалог. Укажите задачу или выберите действие.")
+
+    def selection(self, purpose="search"):
+        return dict(purpose=purpose, date_from=self.date_from.date().toString("yyyy-MM-dd"),
+                    date_to=self.date_to.date().toString("yyyy-MM-dd"), employee=self.employee.text().strip(),
+                    company=self.company.text().strip(), object_name=self.object_name.text().strip())
+
+    def clear_clarification(self):
+        for widget in (self.clarification_choice, self.choose_clarification, self.continue_selection):
+            widget.setVisible(False)
+
+    def choose_answer(self):
+        if self.choices:
+            self.input.setPlainText(str(self.clarification_choice.currentIndex() + 1))
+            self.command()
+
+    def show_capabilities(self):
+        self.call("capabilities")
 
     def call(self, path, payload=None, audio=None):
         if self.audio is not None:
@@ -332,6 +472,9 @@ class AssistantDialog(QDialog):
             return
         self.send.setEnabled(False)
         self.voice.setEnabled(False)
+        self.native.setEnabled(False)
+        self.open_records.setEnabled(False)
+        self.workflow_choice.setEnabled(False)
         self.worker = RequestWorker(path, payload, audio, self, database=self.database)
         self.worker.ready.connect(self.received)
         self.worker.failed.connect(self.failed)
@@ -343,21 +486,60 @@ class AssistantDialog(QDialog):
             self.worker.audio = None
         self.send.setEnabled(True)
         self.voice.setEnabled(True)
+        self.workflow_choice.setEnabled(True)
+        self.native.setEnabled(bool(self.result and "native_action" in self.result))
+        self.open_records.setEnabled(bool(self.result and self.result["records"] and "table" not in self.result))
+        if self.auto_report:
+            self.auto_report = False
+            self.report()
 
     def failed(self, message):
         self.state.setText(message)
-        self.output.setPlainText(message + "\nПредыдущий результат очищен; данные не изменены.")
+        self.append_message("SmartReport", message + "\nНовая операция не выполнена; автоматического повтора нет.")
         self.table.setVisible(False)
         self.result = None
+        self.result_heading.clear()
         self.pdf.setEnabled(False)
         self.confirm_mail.setEnabled(False)
+        self.native.setEnabled(False)
+        self.open_records.setEnabled(False)
+        self.auto_report = False
 
     def received(self, data):
-        if "clarification" in data:
+        if "results" in data:
+            self.workflow_results = data["results"]
+            with QSignalBlocker(self.workflow_choice):
+                self.workflow_choice.clear()
+                for index, result in enumerate(self.workflow_results):
+                    self.workflow_choice.addItem(f'{index + 1}. {CAPABILITIES[result["plan"]["purpose"]][0]}')
+                    self.received(dict(result=result, _workflow=True))
+                self.workflow_choice.setCurrentIndex(len(self.workflow_results) - 1)
+            self.workflow_choice.setVisible(True)
+            self.append_message("SmartReport", "Шаги выполнены только для чтения. Результат каждого шага доступен в списке над перепиской.")
+        elif "clarification" in data:
             self.result = None
+            self.result_heading.clear()
             self.pdf.setEnabled(False)
             self.table.setVisible(False)
-            self.output.setPlainText(data["clarification"]["question"])
+            clarification = data["clarification"]
+            pending_plan = clarification.get("plan") or (self.context["plan"] if self.context else self.selection())
+            self.context = dict(plan=pending_plan, pending=clarification["field"])
+            self.choices = clarification.get("choices", [])
+            self.clear_clarification()
+            self.date_from.setDate(QDate.fromString(pending_plan["date_from"], "yyyy-MM-dd"))
+            self.date_to.setDate(QDate.fromString(pending_plan["date_to"], "yyyy-MM-dd"))
+            self.employee.setText(pending_plan["employee"])
+            self.company.setText(pending_plan["company"])
+            self.object_name.setText(pending_plan["object_name"])
+            self.append_message("SmartReport", clarification["question"])
+            if self.choices:
+                self.clarification_choice.clear()
+                self.clarification_choice.addItems([" / ".join(choice.values()) for choice in self.choices])
+                self.clarification_choice.setVisible(True)
+                self.choose_clarification.setVisible(True)
+                self.append_message("SmartReport", "\n".join(
+                    f"{index + 1}. " + " / ".join(choice.values()) for index, choice in enumerate(self.choices)))
+            self.continue_selection.setVisible(clarification["field"] != "unsupported")
             self.state.setText("Нужен ответ. Выберите параметры и действие либо уточните текстовую команду.")
             if data["clarification"]["field"] == "scope":
                 self.employee.setFocus()
@@ -365,40 +547,72 @@ class AssistantDialog(QDialog):
                 self.date_from.setFocus()
             else:
                 self.input.setFocus()
+        elif "capabilities" in data:
+            self.capability_data = data["capabilities"]
+            text = "\n".join(item["title"] + " — " + item["notice"] for item in self.capability_data)
+            self.append_message("SmartReport", text + "\n\nОграничения:\n" + "\n".join(data["restrictions"]))
         elif "status" in data:
             s = data["status"]
             self.enabled.setChecked(s["enabled"])
             self.limit.setValue(s["limit_usd"])
             key = "настроен" if s["key_configured"] else "НЕ настроен"
-            self.state.setText(f'Ключ: {key}; модель {s["model"]}; {s["month"]}: '
+            self.diagnostic_state.setText(f'Ключ: {key}; модель {s["model"]}; {s["month"]}: '
                                f'резерв {s["reserved_usd"]:.4f} / {s["limit_usd"]:.2f} USD.\n{s["notice"]}')
+            self.state.setText("Помощник готов. Опишите задачу." if s["enabled"] else
+                               "Помощник выключен. Включить можно в диагностике и настройках.")
         elif "text" in data:
             self.input.setPlainText(data["text"])
-            self.state.setText("Речь распознана. Проверьте ФИО, даты и числа, затем нажмите «Выполнить».")
+            self.state.setText("Речь распознана. Проверьте ФИО, даты и числа, затем нажмите «Отправить».")
         elif "actions" in data:
-            self.table.setVisible(False)
             names = {"search": "Поиск смен", "check": "Проверка данных", "transport_check": "Проверка транспорта",
                      "text": "Текстовая команда", "voice": "Голос", "settings": "Настройки"}
             outcomes = {"reserved": "Начато", "routed": "Действие определено", "read_completed": "Просмотр завершён",
                         "failed": "Не выполнено", "clarification": "Запрошено уточнение"}
-            self.output.setPlainText("\n".join(
+            self.diagnostic_output.setPlainText("\n".join(
                 f'{r["created_at"]} — {names.get(r["action"], "Действие помощника")}: '
                 f'{outcomes.get(r["outcome"], r["outcome"])}' for r in data["actions"]) or "Журнал пуст.")
         elif "draft" in data:
             self.pending_draft = data["draft"]
-            self.output.setPlainText("Письмо подготовлено, НЕ отправлено.\n"
+            self.append_message("SmartReport", "Письмо подготовлено, НЕ отправлено.\n"
                                      f'Кому: {self.mail_data["to"]}\nТема: {self.mail_data["subject"]}\n'
                                      f'{self.mail_data["body"]}\n\nPDF: {self.mail_filename}\n'
-                                     f'SHA256: {self.pending_draft["sha256"]}\n'
                                      + self.pending_draft["notice"])
+            self.diagnostic_output.setPlainText("SHA256 вложения: " + self.pending_draft["sha256"])
             self.state.setText("Проверьте письмо и вложение. Кнопка подтверждения доступна ниже.")
             self.confirm_mail.setEnabled(True)
         elif "mail" in data:
             self.confirm_mail.setEnabled(False)
-            self.output.setPlainText(data["mail"]["notice"] + "\nMessage-ID: " + data["mail"]["message_id"])
+            self.append_message("SmartReport", data["mail"]["notice"])
+            self.diagnostic_output.setPlainText("Message-ID: " + data["mail"]["message_id"])
         elif "result" in data:
+            self.clear_clarification()
+            if not data.get("_workflow") and not data.get("_repeat"):
+                self.workflow_results = []
+                self.workflow_choice.setVisible(False)
             self.result = data["result"]
-            self.output.setPlainText(result_text(self.result))
+            try:
+                if self.result["plan"]["purpose"] in {"balance", "expenses"}:
+                    self.result = local_result(self.window, self.result)
+            except DesktopActionError as error:
+                self.failed(str(error))
+                return
+            except sqlite3.Error:
+                self.failed("Не удалось прочитать выбранный локальный раздел или фильтр не поддерживается. "
+                            "Откройте раздел вручную; другие профили не использовались.")
+                return
+            plan = self.result["plan"]
+            self.context = dict(plan=plan, pending="")
+            self.choices = []
+            self.date_from.setDate(QDate.fromString(plan["date_from"], "yyyy-MM-dd"))
+            self.date_to.setDate(QDate.fromString(plan["date_to"], "yyyy-MM-dd"))
+            self.employee.setText(plan["employee"])
+            self.company.setText(plan["company"])
+            self.object_name.setText(plan["object_name"])
+            if not data.get("_repeat"):
+                self.append_message("SmartReport", result_text(self.result))
+            self.result_heading.setText(CAPABILITIES[plan["purpose"]][0] +
+                                        f' · {plan["date_from"]} — {plan["date_to"]}' +
+                                        ("\n" + self.result["summary"] if self.result.get("summary") else ""))
             headers, rows = result_table(self.result)
             self.table.setColumnCount(len(headers))
             self.table.setHorizontalHeaderLabels(headers)
@@ -410,11 +624,20 @@ class AssistantDialog(QDialog):
             for column in range(len(headers)):
                 self.table.setColumnWidth(column, min(310, self.table.columnWidth(column)))
             self.table.resizeRowsToContents()
-            self.table.setVisible(True)
-            self.pdf.setEnabled(self.result["plan"]["purpose"] in {"payroll_pdf", "customer_pdf", "catalog_preview"})
+            self.table.setVisible(bool(rows))
+            self.pdf.setEnabled(plan["purpose"] in REPORT_ACTIONS)
             self.pdf.setText("Открыть штатный просмотр изменений…" if self.result["plan"]["purpose"] == "catalog_preview"
-                             else "Открыть существующий PDF по результату")
+                             else "Создать / открыть PDF")
             self.state.setText("Готово. Результат получен из программы, не сочинён моделью. Данные не изменены.")
+            self.native.setEnabled("native_action" in self.result)
+            self.open_records.setEnabled(bool(self.result["records"]) and "table" not in self.result)
+            self.auto_report = plan["purpose"] in REPORT_ACTIONS and not data.get("_repeat")
+
+    def select_workflow_result(self, index):
+        if self.worker and self.worker.isRunning():
+            return
+        if 0 <= index < len(self.workflow_results):
+            self.received(dict(result=self.workflow_results[index], _repeat=True))
 
     def quick_action(self, purpose):
         if self.date_from.date() > self.date_to.date():
@@ -422,10 +645,8 @@ class AssistantDialog(QDialog):
             return
         self.result = None
         self.pdf.setEnabled(False)
-        self.call("inspect", dict(plan=dict(purpose=purpose,
-                  date_from=self.date_from.date().toString("yyyy-MM-dd"),
-                  date_to=self.date_to.date().toString("yyyy-MM-dd"),
-                  employee=self.employee.text().strip(), company="", object_name=""),
+        self.append_message("Вы", CAPABILITIES[purpose][0])
+        self.call("inspect", dict(plan=self.selection(purpose),
                   operation_id=str(uuid.uuid4())))
 
     def command(self):
@@ -434,7 +655,63 @@ class AssistantDialog(QDialog):
             return
         self.result = None
         self.pdf.setEnabled(False)
-        self.call("command", dict(text=self.input.toPlainText(), operation_id=str(uuid.uuid4())))
+        text = self.input.toPlainText().strip()
+        if not text:
+            self.state.setText("Напишите или продиктуйте задачу.")
+            return
+        if self.worker and self.worker.isRunning():
+            self.state.setText("Дождитесь ответа на предыдущую задачу.")
+            return
+        self.append_message("Вы", text)
+        if self.choices and text.isdecimal() and 1 <= int(text) <= len(self.choices):
+            plan = self.context["plan"].copy()
+            plan.update(self.choices[int(text) - 1])
+            self.call("inspect", dict(plan=plan, operation_id=str(uuid.uuid4())))
+        else:
+            context = self.context or dict(plan=self.selection(), pending="")
+            if not context["pending"]:
+                context = dict(plan=self.selection(context["plan"]["purpose"]), pending="")
+            self.context = context
+            self.call("command", dict(text=text, context=context, operation_id=str(uuid.uuid4())))
+        self.input.clear()
+
+    def open_native(self):
+        if not self.result or "native_action" not in self.result:
+            return
+        if self.audio is not None or self.worker and self.worker.isRunning():
+            self.state.setText("Сначала завершите текущую запись или запрос.")
+            return
+        try:
+            if self.result["native_action"] == "mail_prepare":
+                self.prepare_mail()
+            else:
+                self.append_message("SmartReport", native_action(self.window, self.result, self))
+        except (DesktopActionError, ValueError) as error:
+            self.failed(str(error))
+        except sqlite3.Error:
+            self.failed("Не удалось открыть штатный раздел текущего профиля. Ничего не сохранено помощником.")
+
+    def record_details(self):
+        if not self.result or "table" in self.result:
+            return
+        index = self.table.currentRow()
+        if not 0 <= index < len(self.result["records"]):
+            self.state.setText("Выберите строку результата.")
+            return
+        row = self.result["records"][index]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Запись SmartReport — только просмотр")
+        dialog.resize(700, 500)
+        layout = QVBoxLayout(dialog)
+        details = QTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(f'{row["date"]} — {row["employee"]}\n{row["company"]} / {row["object_name"]}\n'
+                             f'Отработано/указано: {row["hours"]:g} ч; выезды: {row["trips"]:g}\n'
+                             f'Начало: {row["start_time"] or "не задано"}; конец: {row["end_time"] or "не задано"}\n'
+                             f'Источник цен: {row["price_source"]}\n'
+                             + "\n".join(row["warnings"]) + "\n\nПравки здесь не сохраняются.")
+        layout.addWidget(details)
+        dialog.exec()
 
     def save_settings(self):
         self.call("status", dict(enabled=self.enabled.isChecked(), limit_usd=self.limit.value()))
@@ -444,7 +721,12 @@ class AssistantDialog(QDialog):
             if self.result:
                 open_report(self.window, self.result)
         except (AssistantClientError, ValueError) as error:
+            self.append_message("SmartReport", "Отчёт пока не подготовлен: " + str(error))
             QMessageBox.warning(self, "PDF не сформирован", str(error))
+        except sqlite3.Error:
+            message = "Не удалось прочитать локальную базу для отчёта. PDF не сформирован. Проверьте профиль и синхронизацию."
+            self.append_message("SmartReport", message)
+            QMessageBox.warning(self, "PDF не сформирован", message)
 
     def prepare_mail(self):
         if self.worker and self.worker.isRunning():

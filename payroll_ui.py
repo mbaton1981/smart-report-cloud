@@ -503,7 +503,7 @@ def ensure_pending(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS payroll_pending(operation_id TEXT PRIMARY KEY,request_json TEXT NOT NULL)")
 
 
-def open_history(window, app):
+def open_history(window, app, *, employee_name="", object_key=None):
     dialog = QDialog(window)
     dialog.setWindowTitle("Зарплата: ставки, подтверждение и корректировки")
     dialog.resize(1000, 820)
@@ -517,6 +517,17 @@ def open_history(window, app):
         employee.addItems([r[0] for r in conn.execute("SELECT name FROM employees ORDER BY name")])
         for row in conn.execute("SELECT company,name FROM objects ORDER BY company,name"):
             objects.addItem(f"{row[0]} | {row[1]}", (row[0], row[1]))
+        if employee_name:
+            index = employee.findText(employee_name)
+            if index < 0:
+                raise ValueError("Сотрудник отсутствует в локальной истории зарплаты. Синхронизируйте справочник.")
+            employee.setCurrentIndex(index)
+        if object_key is not None:
+            index = next((i for i in range(objects.count())
+                          if tuple(objects.itemData(i)) == tuple(object_key)), -1)
+            if index < 0:
+                raise ValueError("Объект отсутствует в локальной истории зарплаты. Синхронизируйте справочник.")
+            objects.setCurrentIndex(index)
         ensure_pending(conn)
         conn.commit()
     finally:
