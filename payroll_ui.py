@@ -19,8 +19,97 @@ from reportlab.platypus import LongTable, PageBreak, Paragraph, SimpleDocTemplat
 from reportlab.platypus.doctemplate import LayoutError
 
 import payroll_history as history
+import payroll_management as management
 
 logger = logging.getLogger(__name__)
+
+HISTORY_HEADERS = [
+    "Anställd", "Arbete\ntim", "ATF\ntim", "Sjukfrånvaro\ntim", "Timlön\n(SEK)",
+    "OB timmar /\nspecifikation", "Сверх нормы, ч", "Grundlön + OB\n(SEK)", "Semesterersättning\n(SEK)",
+    "ATF/KLS\n(SEK)", "Sjuklön\n(SEK)", "Skatt\n(SEK)", "Nettolön\n(SEK)",
+    "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)", "Semestertimmar\ntim", "Röda dagar\ntim",
+]
+MANAGEMENT_HEADERS = [
+    "Сотрудник", "Всего\nотработано, ч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
+    "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB не\nопределён, ч", "Сверх нормы\nсправочно, ч",
+    "Текущая зарпл.\nставка, SEK/ч", "База\nориентир, SEK", "Надбавки OB\nориентир, SEK",
+    "Итого\nориентир, SEK", "ATF, ч", "Больничные, ч", "Отпуск, ч", "Нерабочие\nпраздники, ч",
+]
+
+
+def management_mode(window):
+    control = getattr(window, "sal_report_mode", None)
+    return control is not None and control.currentData() == "management"
+
+
+def selected_reports(window, app):
+    if not management_mode(window):
+        return reports(window, app)
+    conn = app.get_db_connection()
+    try:
+        return management.reports(conn.cursor(), window.sal_date_from.text(), window.sal_date_to.text(),
+                                  app.swedish_public_holidays, app.swedish_workday_norm)
+    finally:
+        conn.close()
+
+
+def management_number(value):
+    return "Не определено / без суммы" if value is None else f"{value:,.2f}"
+
+
+def management_description(report):
+    return (f"{management.NOTICE}. Ориентировочно, не ведомость: официальное начисление — в Fortnox. "
+            "Всего = без OB + OB1 + OB2 + OB3 ночь + OB3 Helg + OB не определён. "
+            "OB входит в отработанные часы; к базе прибавляется только надбавка. "
+            "Helg: суббота, воскресенье и официальные праздники Швеции (без канунов). "
+            "Сверх нормы — только сравнение с нормой 8 ч/будний день; это не подтверждённые сверхурочные. "
+            "ATF и отсутствие не включены в отработанные часы или ориентировочную сумму. "
+            "Ставки/период подтверждать и выплату отмечать для экспорта не нужно. «Баланс» не меняется." +
+            (f" Сохранённых расчётов в периоде: {report['saved_periods']}; доступны отдельно, не изменены."
+             if report["saved_periods"] else ""))
+
+
+def render_management(window, app):
+    items = selected_reports(window, app)
+    table = window.table_salary
+    table.blockSignals(True)
+    try:
+        table.setColumnCount(len(MANAGEMENT_HEADERS))
+        table.setHorizontalHeaderLabels(MANAGEMENT_HEADERS)
+        table.setRowCount(len(items))
+        for index, report in enumerate(items):
+            values = [
+                report["employee"], f"{report['worked']:g}",
+                *[f"{report['categories'][key]:g}" for key in management.CATEGORIES],
+                f"{report['above_norm']:g}",
+                *[management_number(report[key]) for key in ("rate", "base", "premium", "total")],
+                *[f"{report['absence'][key]:g}" for key in ("atf", "sick", "vacation", "holiday")],
+            ]
+            warnings = "\n".join(f"{l['date']} · {l['object_name']} · {l['sync_id']}: {w}"
+                                 for l in report["lines"] for w in l["warnings"])
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(management_description(report)+"\n"+warnings)
+                table.setItem(index, column, item)
+        for column in range(table.columnCount()):
+            table.setColumnWidth(column, 150 if column == 0 else 125)
+        table.resizeRowsToContents()
+    finally:
+        table.blockSignals(False)
+    window.sal_summary_hours_lbl.setText(f"Всего отработано: {sum(r['worked'] for r in items):g} ч")
+    window.sal_summary_ob_lbl.setText("OB1 / OB2 / OB3: " + " / ".join(
+        f"{sum(r['categories'][k] for r in items):g}" for k in ("ob1", "ob2")) +
+        f" / {sum(r['categories']['ob3']+r['categories']['helg'] for r in items):g} ч (часть итога)")
+    window.sal_summary_vacation_lbl.setText(f"Отпуск: {sum(r['absence']['vacation'] for r in items):g} ч")
+    known = sum(r["total"] for r in items if r["total"] is not None)
+    incomplete = any(r["total"] is None for r in items)
+    window.sal_summary_net_lbl.setText("Итого: не определено (см. базу/OB)" if incomplete else f"Ориентировочно: {known:,.2f} SEK")
+    window.sal_summary_employer_lbl.setText("Официальное начисление: Fortnox")
+    window.payroll_history_note.setText(
+        management.NOTICE + ". Экспорт часов не требует подтверждения ставок или закрытия.\n" +
+        "OB — часть общих часов. Неизвестная разбивка/сумма отмечена, а не заменена нулём. " +
+        "«Сверх нормы» не означает сверхурочные; ATF — отдельно. Сохранённые расчёты доступны в другом режиме.")
 
 
 def enabled(cursor):
@@ -88,9 +177,12 @@ def status(report):
 
 
 def render(window, app):
+    if management_mode(window):
+        return render_management(window, app)
     items = reports(window, app)
     window.table_salary.blockSignals(True)
     try:
+        window.table_salary.setHorizontalHeaderLabels(HISTORY_HEADERS)
         window.table_salary.setRowCount(len(items))
         for index, report in enumerate(items):
             lines = report["lines"]
@@ -389,6 +481,8 @@ def open_history(window, app):
 
 
 def write_pdf(path, items, font, bold):
+    if items and items[0].get("mode") == "management":
+        return write_management_pdf(path, items, font, bold)
     style = ParagraphStyle("payroll", fontName=font, fontSize=9, leading=13)
     heading = ParagraphStyle("payroll-heading", parent=style, fontName=bold, fontSize=14, spaceAfter=10)
     story = []
@@ -430,10 +524,60 @@ def write_pdf(path, items, font, bold):
                       topMargin=25, bottomMargin=25).build(story)
 
 
+def write_management_pdf(path, items, font, bold):
+    style = ParagraphStyle("management", fontName=font, fontSize=8, leading=11)
+    heading = ParagraphStyle("management-heading", parent=style, fontName=bold, fontSize=13, leading=16)
+    def p(text):
+        return Paragraph(escape(str(text)), style)
+    story = []
+    for index, report in enumerate(items):
+        if index:
+            story.append(PageBreak())
+        story.extend([Paragraph("Часы бухгалтеру / Timmar till bokföring", heading),
+                      p(report["employee"]), p(f"{report['date_from']} — {report['date_to']}"),
+                      p(management_description(report)), p(f"Правила: {report['rules_version']}"),
+                      Spacer(1, 8), p(f"Всего отработано: {report['worked']:g} ч"),
+                      p(" · ".join(f"{management.LABELS[k]}: {report['categories'][k]:g} ч"
+                                   for k in management.CATEGORIES)),
+                      p(f"Сверх нормы (справочно, не сверхурочные): {report['above_norm']:g} ч"),
+                      p(" · ".join(f"{label}: {report['absence'][key]:g} ч" for key, label in (
+                          ("atf", "ATF"), ("sick", "Больничные"), ("vacation", "Отпуск"),
+                          ("holiday", "Нерабочие праздники")))),
+                      p(f"Текущая зарплатная ставка: {management_number(report['rate'])} SEK/ч"),
+                      p(f"База: {management_number(report['base'])} SEK · "
+                        f"Надбавки OB: {management_number(report['premium'])} SEK · "
+                        f"Итого ориентировочно: {management_number(report['total'])} SEK"), Spacer(1, 8)])
+        rows = [[p(v) for v in ("Дата / объект / запись", "Всего ч", "Разбивка часов (не прибавлять к итогу)",
+                                "База SEK", "OB SEK", "Итого SEK")]]
+        for line in report["lines"]:
+            if line["kind"] in ("work", "ob"):
+                details = " · ".join(f"{s['date']} {management.LABELS[s['category']]}: {s['hours']:g}"
+                                     for s in line["segments"])
+                amounts = [management_number(line[k]) for k in ("base", "premium", "total")]
+            else:
+                details, amounts = line["kind"]+" (отсутствие / ATF)", ["—"]*3
+            rows.append([p(f"{line['date']} · {line['company']} · {line['object_name']} · {line['sync_id']}"),
+                         p(f"{line['hours']:g}"), p(details), *[p(v) for v in amounts]])
+            for warning in line["warnings"]:
+                rows.append([p(warning), "", "", "", "", ""])
+        table = LongTable(rows, colWidths=[210, 45, 210, 85, 85, 85], repeatRows=1)
+        table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                   ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8edf2")),
+                                   ("GRID", (0, 0), (-1, -1), .3, colors.lightgrey)]))
+        story.append(table)
+    SimpleDocTemplate(path if hasattr(path, "write") else str(path), pagesize=(A4[1], A4[0]),
+                      leftMargin=30, rightMargin=30, topMargin=25, bottomMargin=25).build(story)
+
+
 def export_issues(items):
     issues = []
     for report in items:
         employee = report["employee"]
+        if report.get("mode") == "management":
+            for line in report["lines"]:
+                issues.extend(f"{employee} · {line['date']} · {line['object_name']} · запись {line['sync_id']}: {w}"
+                              for w in line["warnings"])
+            continue
         if report["status"] == "overlap":
             issues.append(f"{employee}: выберите точные границы сохранённого зарплатного периода.")
         elif report["status"] == "draft":
@@ -450,12 +594,12 @@ def export_issues(items):
 def export(window, app):
     path = None
     try:
-        items = reports(window, app)
+        items = selected_reports(window, app)
         if not items:
             QMessageBox.warning(window, "Löneunderlag", "Нет данных для выбранного периода.")
             return
         issues = export_issues(items)
-        filename = f"Loneunderlag_{window.sal_date_from.text()}_till_{window.sal_date_to.text()}.pdf"
+        filename = f"{'Timmar' if management_mode(window) else 'Loneunderlag'}_{window.sal_date_from.text()}_till_{window.sal_date_to.text()}.pdf"
         suggested = (Path(app.REPORTS_DIR) / filename).resolve()
         title = "Сохранить предварительный расчёт зарплаты" if issues else "Сохранить расчёт зарплаты"
         selected, _ = QFileDialog.getSaveFileName(window, title, str(suggested), "PDF (*.pdf)")
@@ -477,8 +621,10 @@ def export(window, app):
         return
     logger.info("Salary PDF saved: %s; preliminary=%s; employees=%d", path, bool(issues), len(items))
     message = f"PDF сохранён:\n{path}"
+    if management_mode(window):
+        message += f"\n\n{management.NOTICE}. Официальное начисление — в Fortnox."
     if issues:
-        message += ("\n\nЭто предварительный расчёт. Экспорт разрешён без подтверждения выплаты.\n"
-                    "Необходимые подтверждения / уточнения:\n" + "\n".join(issues))
+        message += ("\n\nЭкспорт разрешён без подтверждения выплаты.\n"
+                    "Уточнения (не блокируют экспорт часов):\n" + "\n".join(issues))
     message += "\n\n«Баланс» и отметки выплаты не изменены."
     QMessageBox.information(window, "Зарплата — PDF сохранён", message)

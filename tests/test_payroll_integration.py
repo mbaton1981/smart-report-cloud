@@ -18,7 +18,10 @@ class PayrollIntegrationTests(unittest.TestCase):
     setUpClass = classmethod(catalog.CatalogSyncTests.setUpClass.__func__)
     tearDownClass = classmethod(catalog.CatalogSyncTests.tearDownClass.__func__)
     setUp = catalog.CatalogSyncTests.setUp
-    tearDown = catalog.CatalogSyncTests.tearDown
+    def tearDown(self):
+        if hasattr(self, "management_connection"):
+            self.management_connection.close()
+        catalog.CatalogSyncTests.tearDown(self)
     _add_company = catalog.CatalogSyncTests._add_company
     _worker = catalog.CatalogSyncTests._worker
     _confirm_fixture_customer_prices = catalog.CatalogSyncTests._confirm_fixture_customer_prices
@@ -121,12 +124,14 @@ class PayrollIntegrationTests(unittest.TestCase):
         finally:
             local.close()
 
-    def salary_window(self):
+    def salary_window(self, management_mode=False):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
         window.tab_salary = self.desktop.QWidget()
         window.setCentralWidget(window.tab_salary)
         window.setup_salary_tab()
+        if not management_mode:
+            window.sal_report_mode.setCurrentIndex(1)
         self.addCleanup(window.close)
         return window
 
@@ -173,10 +178,11 @@ class PayrollIntegrationTests(unittest.TestCase):
         information.assert_not_called()
 
     def test_export_reports_read_failure_is_logged_and_visible(self):
+        window = self.salary_window()
         with patch.object(payroll_ui, "reports", side_effect=sqlite3.OperationalError("ledger unreadable")), \
                 patch.object(payroll_ui.QMessageBox, "critical") as critical, \
                 self.assertLogs("payroll_ui", level="ERROR") as log:
-            payroll_ui.export(self.salary_window(), self.desktop)
+            payroll_ui.export(window, self.desktop)
         self.assertIn("ledger unreadable", critical.call_args.args[2])
         self.assertIn("ledger unreadable", "\n".join(log.output))
 
@@ -191,6 +197,69 @@ class PayrollIntegrationTests(unittest.TestCase):
             payroll_ui.export(self.salary_window(), self.desktop)
         self.assertIn("file is open", critical.call_args.args[2])
         information.assert_not_called()
+
+    def seed_management_shift(self):
+        conn = self.desktop.get_db_connection()
+        conn.execute("INSERT INTO employees(name,salary_rate,is_active) VALUES('Management Test',100,1)")
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,rate,
+                      entry_type,start_time,end_time) VALUES('management-one','2026-10-21',
+                      'Management Test','Renatur','Site',4,999,'ob','16:00','20:00')""")
+        conn.commit()
+        self.management_connection = conn
+        return conn
+
+    def test_management_is_default_hours_pdf_and_gui_match_without_confirmation(self):
+        conn = self.seed_management_shift()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        window.load_salary_table_template()
+        row = next(i for i in range(window.table_salary.rowCount())
+                   if window.table_salary.item(i, 0).text() == "Management Test")
+        self.assertEqual(window.table_salary.item(row, 1).text(), "4")
+        self.assertEqual(window.table_salary.item(row, 9).text(), "100.00")
+        self.assertEqual(window.table_salary.item(row, 12).text(), "500.00")
+        self.assertIn("OB1", window.table_salary.horizontalHeaderItem(3).text())
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        window.show()
+        self.qt_app.processEvents()
+        button = next(b for b in window.findChildren(self.desktop.QPushButton) if "Экспорт зарплат" in b.text())
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(payroll_ui.QFileDialog, "getSaveFileName",
+                             return_value=(str(Path(folder)/"hours.pdf"), "PDF (*.pdf)")), \
+                patch.object(payroll_ui.QMessageBox, "information") as information:
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            text = "\n".join(p.extract_text() for p in PdfReader(Path(folder)/"hours.pdf").pages)
+            self.assertIn("Предварительный расчёт по текущим ставкам", text)
+            self.assertIn("500.00", text)
+            self.assertIn("OB1 +20%: 1", text)
+            self.assertIn("OB2 +40%: 2", text)
+            self.assertIn("Всего отработано: 4", text)
+            self.assertIn("Fortnox", text)
+            self.assertNotIn("999.00", text)
+            self.assertNotIn("историческая ставка", information.call_args.args[2])
+        self.assertEqual(before, list(conn.iterdump()))
+        window.sal_report_mode.setCurrentIndex(1)
+        self.assertIn("Grundlön", window.table_salary.horizontalHeaderItem(7).text())
+        window.sal_report_mode.setCurrentIndex(0)
+        self.assertIn("База", window.table_salary.horizontalHeaderItem(10).text())
+        self.assertEqual(before, list(conn.iterdump()))
+
+    def test_management_missing_rate_exports_without_amount_and_no_period_close(self):
+        conn = self.seed_management_shift()
+        conn.execute("UPDATE employees SET salary_rate=0 WHERE name='Management Test'")
+        conn.commit()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        items = payroll_ui.selected_reports(window, self.desktop)
+        report = next(r for r in items if r["employee"] == "Management Test")
+        self.assertIsNone(report["total"])
+        pdf = BytesIO()
+        payroll_ui.write_pdf(pdf, [report], self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        text = "\n".join(p.extract_text() for p in PdfReader(pdf).pages)
+        self.assertIn("Всего отработано: 4", text)
+        self.assertIn("без суммы", text)
+        self.assertEqual(before, list(conn.iterdump()))
 
 
 if __name__ == "__main__":

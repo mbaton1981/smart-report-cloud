@@ -3641,10 +3641,14 @@ class SmartReportApp(QMainWindow):
         card_layout = QVBoxLayout(card)
         period_layout = QHBoxLayout()
 
+        self.sal_report_mode = QComboBox()
+        self.sal_report_mode.addItem("Часы бухгалтеру / ориентировочный расчёт", "management")
+        self.sal_report_mode.addItem("Сохранённые расчёты / зарплатная история", "history")
+        card_layout.addWidget(self.sal_report_mode)
         period_layout.addWidget(QLabel("<b>Период:</b>"))
         self.sal_date_from = create_date_field("2026-10-01")
         self.sal_date_to = create_date_field("2026-10-31")
-        calc_btn = QPushButton("🔄 Рассчитать зарплату")
+        calc_btn = QPushButton("🔄 Обновить расчёт")
         calc_btn.clicked.connect(self.calculate_salary)
 
         period_layout.addWidget(self.sal_date_from)
@@ -3659,14 +3663,15 @@ class SmartReportApp(QMainWindow):
         period_layout.addStretch()
         card_layout.addLayout(period_layout)
 
-        history_btn = QPushButton("История зарплаты: ставки, подтверждение, закрытие, корректировки…")
+        history_btn = QPushButton("Необязательно: история ставок, сохранённые расчёты и корректировки…")
         history_btn.clicked.connect(lambda: payroll_ui.open_history(self, sys.modules[__name__]))
         card_layout.addWidget(history_btn)
         self.payroll_history_note = QLabel("Закрытие зарплаты не означает выплату. «Баланс» не меняется.")
         self.payroll_history_note.setWordWrap(True)
         card_layout.addWidget(self.payroll_history_note)
 
-        settings_layout = QHBoxLayout()
+        self.sal_history_parameters = QWidget()
+        settings_layout = QHBoxLayout(self.sal_history_parameters)
         settings_layout.addWidget(QLabel("Semesterersättning %"))
         self.sal_vacation_percent = QDoubleSpinBox()
         self.sal_vacation_percent.setRange(0, 100)
@@ -3709,7 +3714,8 @@ class SmartReportApp(QMainWindow):
         self.sal_sick_percent.setToolTip("Задайте внутреннюю долю оплаты больничных; 0% означает, что автоматическая доплата не задана.")
         settings_layout.addWidget(self.sal_sick_percent)
         settings_layout.addStretch()
-        card_layout.addLayout(settings_layout)
+        card_layout.addWidget(self.sal_history_parameters)
+        self.sal_history_parameters.setVisible(False)
         for rate_control in (
             self.sal_vacation_percent, self.sal_tax_percent,
             self.sal_employer_fee_percent, self.sal_atf_percent,
@@ -3751,6 +3757,11 @@ class SmartReportApp(QMainWindow):
         self.table_salary.installEventFilter(self)
         layout.addWidget(self.table_salary)
         QTimer.singleShot(0, self.resize_salary_table_columns)
+        self.sal_report_mode.currentIndexChanged.connect(self.on_salary_report_mode_changed)
+
+    def on_salary_report_mode_changed(self):
+        self.sal_history_parameters.setVisible(not payroll_ui.management_mode(self))
+        self.load_salary_table_template()
 
     def eventFilter(self, watched, event):
         if getattr(self, "table_salary", None) is watched and event.type() == QEvent.Type.Resize:
@@ -3763,6 +3774,8 @@ class SmartReportApp(QMainWindow):
         self.table_salary.schedule_layout()
 
     def load_salary_table_template(self):
+        if payroll_ui.management_mode(self):
+            return payroll_ui.render(self, sys.modules[__name__])
         conn = get_db_connection()
         try:
             historical = payroll_ui.enabled(conn.cursor())
@@ -4041,6 +4054,8 @@ class SmartReportApp(QMainWindow):
         self.load_salary_table_template()
 
     def export_salary_to_pdf(self):
+        if payroll_ui.management_mode(self):
+            return payroll_ui.export(self, sys.modules[__name__])
         try:
             conn = get_db_connection()
             try:

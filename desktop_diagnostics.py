@@ -753,6 +753,7 @@ def verify_payroll_ram(app_module, work_dir, out_path):
         window.resize(1550, 950)
         window.setWindowTitle("SmartReport — зарплатная история — копия в памяти")
         window.setup_salary_tab()
+        window.sal_report_mode.setCurrentIndex(1)
         window.sal_date_from.setDate(QDate(2026, 10, 1))
         window.sal_date_to.setDate(QDate(2026, 10, 31))
         window.load_salary_table_template()
@@ -888,7 +889,7 @@ def verify_payroll_ram(app_module, work_dir, out_path):
     return result
 
 
-def verify_salary_export_readonly(app_module, work_dir, out_path):
+def verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=False):
     """Click export, exercise real dialogs, and preserve all source payroll data."""
     from contextlib import closing
     import sqlite3
@@ -944,11 +945,18 @@ def verify_salary_export_readonly(app_module, work_dir, out_path):
         window.setCentralWidget(window.tab_salary)
         window.resize(1550, 950)
         window.setup_salary_tab()
+        if not management_mode:
+            window.sal_report_mode.setCurrentIndex(1)
         window.sal_date_from.setDate(QDate(2026, 10, 1))
         window.sal_date_to.setDate(QDate(2026, 10, 31))
         window.load_salary_table_template()
         window.show()
         application.processEvents()
+        window.grab().save(str(work/"salary-table.png"))
+        if management_mode:
+            import payroll_ui
+            result["reports"] = payroll_ui.selected_reports(window, app_module)
+            result["default_management_mode"] = window.sal_report_mode.currentIndex() == 0
         button = next(b for b in window.findChildren(QPushButton) if "Экспорт зарплат" in b.text())
         timer = QTimer(window)
         timer.timeout.connect(handle_dialog)
@@ -962,9 +970,10 @@ def verify_salary_export_readonly(app_module, work_dir, out_path):
     if not result["save_dialog_seen"] or not result["success_message_seen"]:
         raise RuntimeError("Export did not show both the save dialog and success message.")
     text = "\n".join(p.extract_text() for p in PdfReader(filename).pages)
-    if "Требует подтверждения" not in text or "Andrii Piskun" not in text:
+    expected = "Предварительный расчёт по текущим ставкам" if management_mode else "Требует подтверждения"
+    if expected not in text or "Andrii Piskun" not in text:
         raise RuntimeError("Real October payroll preview lost employee or unknown rates.")
-    if "историческая ставка" not in result["success_message"]:
+    if not management_mode and "историческая ставка" not in result["success_message"]:
         raise RuntimeError("Missing confirmation explanation was not shown.")
     with closing(connection()) as conn:
         if list(conn.iterdump()) != before:
@@ -976,6 +985,8 @@ def verify_salary_export_readonly(app_module, work_dir, out_path):
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "management-export-readonly":
+        return verify_salary_export_readonly(app_module, work_dir, out_path, management_mode=True)
     if action == "salary-export-readonly":
         return verify_salary_export_readonly(app_module, work_dir, out_path)
     if action == "payroll-ram":
