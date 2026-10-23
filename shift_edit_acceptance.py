@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 def verify_shift_edit(desktop, work, sync=None):
     from PyQt6.QtCore import Qt
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication, QCheckBox, QStyle, QStyleOptionSpinBox
+    from PyQt6.QtWidgets import QApplication, QCheckBox, QStyle, QStyleOptionButton, QStyleOptionSpinBox
     from ob_calculator import calculate_work_interval, load_ob_rules
 
     application = QApplication.instance() or QApplication([])
@@ -104,7 +104,12 @@ def verify_shift_edit(desktop, work, sync=None):
                         assert spin.value() > original_value
                         QTest.mouseClick(spin, Qt.MouseButton.LeftButton, pos=down.center())
                         assert spin.value() == original_value
-                QTest.mouseClick(travel, Qt.MouseButton.LeftButton)
+                checkbox_option = QStyleOptionButton()
+                travel.initStyleOption(checkbox_option)
+                indicator = travel.style().subElementRect(
+                    QStyle.SubElement.SE_CheckBoxIndicator, checkbox_option, travel)
+                assert not indicator.isEmpty() and travel.rect().contains(indicator.center())
+                QTest.mouseClick(travel, Qt.MouseButton.LeftButton, pos=indicator.center())
                 assert travel.isChecked()
                 dialog.grab().save(str(work / (before["entry_type"] + "-edit.png")))
                 return desktop.QDialog.DialogCode.Accepted
