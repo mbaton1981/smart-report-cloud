@@ -73,6 +73,9 @@ class HistoricalPricesTests(unittest.TestCase):
         report = self.window.generate_invoice()
         self.assertEqual(report["totals"]["hours"], 4)
         self.assertIsNone(report["totals"]["invoice_total"])
+        self.assertIn("№1 · 2026-10-21", self.window.invoice_status_note.text())
+        self.assertIn("OB1", self.window.invoice_status_note.text())
+        self.assertGreater(self.window.invoice_status_note.minimumHeight(), 32)
         with self.assertRaisesRegex(ValueError, "OB1"):
             self.window._set_period_invoiced(self.window.collect_invoice_report(), True)
         self.assertEqual(self.conn.execute("SELECT SUM(invoiced) FROM shifts").fetchone()[0], 0)

@@ -8631,7 +8631,10 @@ class SmartReportApp(QMainWindow):
                 detail += f"\nЕщё записей: {len(issues) - 3}. Уточните период."
         self.invoice_status_note.setText(detail)
         self.invoice_status_note.setMinimumHeight(
-            self.invoice_status_note.fontMetrics().lineSpacing() * (detail.count("\n") + 2)
+            self.invoice_status_note.fontMetrics().boundingRect(
+                0, 0, max(400, self.invoice_status_note.width()), 10000,
+                int(Qt.TextFlag.TextWordWrap), detail,
+            ).height() + 32
         )
         self._render_invoice_summary(report)
         self._invoice_report = report
