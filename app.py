@@ -42,6 +42,7 @@ from customer_pricing import agreed_prices_for_date, apply_catalog_price, catalo
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
+import employee_cards
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -418,6 +419,7 @@ def init_db_once():
             created_at TEXT NOT NULL
         )
     ''')
+    employee_cards.ensure_schema(cursor, "employees")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_employee_sync_outbox_name ON employee_sync_outbox(employee_name)")
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS employee_sync_state (
@@ -9558,9 +9560,11 @@ class SmartReportApp(QMainWindow):
         emp_card_layout.addLayout(employee_view_layout)
 
         self.table_employees = QTableWidget()
-        self.table_employees.setColumnCount(4)
-        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус", "ПИН"])
+        self.table_employees.setColumnCount(5)
+        self.table_employees.setHorizontalHeaderLabels(["ФИО", "kr/ч", "Статус", "ПИН", "Карточка"])
         self.table_employees.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_employees.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table_employees.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_employees.itemSelectionChanged.connect(self.update_employee_status_action)
         self.table_employees.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         emp_card_layout.addWidget(self.table_employees, stretch=1)
@@ -9577,6 +9581,20 @@ class SmartReportApp(QMainWindow):
         emp_btn_layout.addWidget(self.employee_status_button)
         emp_btn_layout.addWidget(set_pin_btn)
         emp_card_layout.addLayout(emp_btn_layout)
+        from employee_cards_ui import open_employee_card, accountant_export, accountant_access
+        card_actions = QHBoxLayout()
+        open_card = QPushButton("Открыть карточку")
+        open_card.setObjectName("open_employee_card")
+        open_card.clicked.connect(lambda: open_employee_card(self))
+        export_cards = QPushButton("Данные для бухгалтера")
+        export_cards.setObjectName("export_employee_cards")
+        export_cards.clicked.connect(lambda: accountant_export(self))
+        card_actions.addWidget(open_card)
+        card_actions.addWidget(export_cards)
+        emp_card_layout.addLayout(card_actions)
+        card_access = QPushButton("Доступ бухгалтера…")
+        card_access.clicked.connect(lambda: accountant_access(self))
+        emp_card_layout.addWidget(card_access)
         top_layout.addWidget(emp_card, stretch=1)
 
         layout.addLayout(top_layout, stretch=1)
@@ -10220,6 +10238,12 @@ class SmartReportApp(QMainWindow):
         self.table_employees.clearSelection()
         self.table_employees.setCurrentCell(-1, -1)
         self.table_employees.setRowCount(len(rows))
+        from employee_cards_client import CardClient
+        card_states, card_error = {}, ""
+        try:
+            card_states = {employee_sync_key(item["name"]): item for item in CardClient().employees()}
+        except employee_cards.CardError as error:
+            card_error = str(error)
         for row_idx, row in enumerate(rows):
             employee_id, name, rate, is_active = int(row[0]), row[1], row[2], bool(row[3])
             has_pin = pin_statuses.get(name.strip().lower(), None)
@@ -10237,6 +10261,13 @@ class SmartReportApp(QMainWindow):
             elif has_pin is False:
                 pin_item.setForeground(QColor("#F6AD55"))
             self.table_employees.setItem(row_idx, 3, pin_item)
+            if self.table_employees.columnCount() >= 5:
+                state = card_states.get(employee_sync_key(name))
+                issues = (state["missing"] + state["warnings"]) if state else []
+                summary = ("Не хватает данных" if issues else "Данные заполнены") if state else "Карточка недоступна"
+                card_item = QTableWidgetItem(summary)
+                card_item.setToolTip("\n".join(issues) if state else card_error or "Обновите справочник.")
+                self.table_employees.setItem(row_idx, 4, card_item)
             if not is_active:
                 for column in range(self.table_employees.columnCount()):
                     cell = self.table_employees.item(row_idx, column)
@@ -11124,6 +11155,11 @@ if __name__ == "__main__":
         if not ensure_login():
             sys.exit(0)
         CLOUD_URL = desktop_auth.server_url()
+        if desktop_auth.current_user().get("role") == "accountant":
+            from employee_cards_ui import AccountantDirectory
+            directory = AccountantDirectory()
+            directory.show()
+            sys.exit(app.exec())
         window = SmartReportApp()
         window.show()
         sys.exit(app.exec())

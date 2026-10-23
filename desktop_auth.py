@@ -8,6 +8,22 @@ import requests
 
 DEFAULT_SERVER_URL = "https://smart-report-server.onrender.com"
 _token = ""
+_user = {}
+
+
+def current_user():
+    return dict(_user)
+
+
+def saved_account_role():
+    path = app_data_dir() / "account-role.dat"
+    if not path.is_file():
+        return None
+    try:
+        value = _unprotect(path.read_bytes())
+        return value.decode("ascii") if value else "unknown"
+    except (OSError, UnicodeError):
+        return "unknown"
 
 
 class AuthError(Exception):
@@ -231,6 +247,11 @@ def check_token(url, token):
     except requests.RequestException:
         return None
     if response.status_code == 200:
+        global _user
+        _user = response.json().get("user", {})
+        protected = _protect(str(_user.get("role", "unknown")).encode("ascii"))
+        if protected is not None:
+            (app_data_dir() / "account-role.dat").write_bytes(protected)
         return True
     if response.status_code in (401, 403):
         return False

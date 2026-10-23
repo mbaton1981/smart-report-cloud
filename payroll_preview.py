@@ -19,14 +19,15 @@ class PayrollPdfPreviewDialog(QDialog):
         import pypdfium2 as pdfium
 
         super().__init__(parent)
-        self.source = Path(source)
+        self._source_bytes = source if isinstance(source, bytes) else None
+        self.source = Path("employee-data.pdf") if self._source_bytes is not None else Path(source)
         self.suggested_path = Path(suggested_path)
         self.setWindowTitle("Предпросмотр зарплатного PDF")
         self.resize(1180, 900)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMaximizeButtonHint)
         self.document = QPdfDocument(self)
         self._buffer = QBuffer(self)
-        self._buffer.setData(self.source.read_bytes())
+        self._buffer.setData(self._source_bytes if self._source_bytes is not None else self.source.read_bytes())
         self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
         self.document.load(self._buffer)
         error = self.document.error()
@@ -35,7 +36,7 @@ class PayrollPdfPreviewDialog(QDialog):
             self._buffer.close()
             raise ValueError(f"Не удалось прочитать PDF: {error.name}")
         try:
-            self._pdf_documents = [pdfium.PdfDocument(str(self.source))]
+            self._pdf_documents = [pdfium.PdfDocument(self._source_bytes if self._source_bytes is not None else str(self.source))]
         except (OSError, ValueError, RuntimeError):
             self.document.close()
             raise

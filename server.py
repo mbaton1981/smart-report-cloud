@@ -29,6 +29,7 @@ from object_reports import register_object_reports
 from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
 from fixed_pricing import validate_fixed_storage
 import payroll_history
+import employee_cards
 from mail_intake import register_mail_intake
 import reportlab
 from reportlab.lib import colors
@@ -587,6 +588,7 @@ def init_cloud_db():
             created_at TEXT NOT NULL
         )
     ''')
+    employee_cards.ensure_schema(cursor, "meta_employees")
     cursor.execute("PRAGMA table_info(employee_sync_events)")
     employee_event_columns = {column[1] for column in cursor.fetchall()}
     if "state_hash" not in employee_event_columns:
@@ -828,7 +830,7 @@ def enforce_dataset_boundary():
     if not expected:
         return None
     guarded = (
-        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/"))
+        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards"))
         or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced"}
     )
     if guarded:
@@ -876,6 +878,9 @@ def enforce_active_session():
         session["username"] = user["username"]
         session["role"] = user["role"]
         session["employee_id"] = user["employee_id"]
+        if user["role"] == "accountant":
+            session.clear()
+            return jsonify({"ok": False, "error": "Бухгалтеру доступен только защищённый раздел карточек."}), 403
         if user["role"] != "admin":
             if user["employee_id"]:
                 cursor.execute(
@@ -894,7 +899,7 @@ def enforce_active_session():
         conn.close()
     return None
 
-def bearer_admin_user():
+def bearer_user():
     header = request.headers.get('Authorization', '')
     if not header.startswith('Bearer '):
         return None
@@ -903,7 +908,12 @@ def bearer_admin_user():
         user = lookup_token(conn, header[7:].strip())
     finally:
         conn.close()
-    return user if user and user['role'] == 'admin' else None
+    return user
+
+
+def bearer_admin_user():
+    user = bearer_user()
+    return user if user and user["role"] == "admin" else None
 
 def verify_sync_key():
     sync_key = request.headers.get('X-Sync-Key') or request.headers.get('X-API-Key')
@@ -976,7 +986,7 @@ def api_auth_token():
         user = conn.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (username,)).fetchone()
         stored_hash = (user['password_hash'] if user else None) or generate_password_hash('invalid-user-placeholder')
         password_ok = check_password_hash(stored_hash, password)
-        if not user or not user['password_hash'] or not password_ok or user['role'] != 'admin':
+        if not user or not user['password_hash'] or not password_ok or user['role'] not in employee_cards.CARD_ROLES:
             auth_throttle.record_failure(throttle_key)
             return jsonify({"ok": False, "error": "Неверный логин или пароль."}), 401
         auth_throttle.reset(throttle_key)
@@ -990,8 +1000,8 @@ def api_auth_token():
 
 @app.route('/api/auth/me', methods=['GET'])
 def api_auth_me():
-    user = bearer_admin_user()
-    if user is None:
+    user = bearer_user()
+    if user is None or user["role"] not in employee_cards.CARD_ROLES:
         return jsonify({"ok": False, "error": "Не авторизован"}), 401
     return jsonify({"ok": True, "user": {"username": user['username'], "role": user['role']}})
 
@@ -4366,6 +4376,11 @@ def apply_employee_sync_event(cursor, event, operation):
         "revision": revision,
         "employee": get_employee_sync_state(cursor, profile_id),
     }
+
+
+from employee_cards_api import register_employee_cards
+register_employee_cards(app, lambda: get_db_connection(), lambda: bearer_user(),
+                        lambda cursor, event, operation: apply_employee_sync_event(cursor, event, operation))
 
 
 @app.route('/sync-desktop-data', methods=['POST'])

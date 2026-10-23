@@ -1219,7 +1219,120 @@ def verify_catalog_prices_ram(app_module, work_dir, out_path):
     return result
 
 
+def verify_employee_cards_local(app_module, work_dir, out_path):
+    """Synthetic-only, loopback-only check of the packaged card and memory PDF."""
+    _require_local_server()
+    from contextlib import closing
+    from unittest.mock import patch
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtPrintSupport import QPrinter
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QMessageBox
+    from pypdf import PdfReader
+    from employee_cards_client import CardClient
+    from employee_cards_ui import EmployeeCardDialog, ConfidentialPreview, accountant_pdf
+    work = Path(work_dir)
+    database = Path(app_module.DB_FILE).resolve()
+    if database.name != "synthetic-employee-cards.db" or database.parent != work.resolve() or database.exists():
+        raise RuntimeError("A fresh synthetic card fixture is required; existing databases are forbidden.")
+    application = QApplication.instance() or QApplication([])
+    application.setStyleSheet(app_module.DARK_THEME_QSS)
+    app_module.init_db_once()
+    with closing(app_module.get_db_connection()) as conn:
+        local_id = conn.execute("INSERT INTO employees(name,salary_rate) VALUES('Synthetic Employee',245.8)").lastrowid
+        conn.commit()
+    desktop_auth.set_token(os.environ["SMARTREPORT_TEST_CARD_TOKEN"], persist=False)
+    window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+    QMainWindow.__init__(window)
+    window.tab_sprav = QWidget()
+    window.setCentralWidget(window.tab_sprav)
+    window.setup_sprav_tab()
+    window.resize(1400, 1000)
+    window.load_employees_table()
+    for index in range(window.table_employees.rowCount()):
+        if window.table_employees.item(index, 0).data(app_module.Qt.ItemDataRole.UserRole) == local_id:
+            window.table_employees.selectRow(index)
+            break
+    errors = []
+    bank_number = "000012345" + str(len(work.name) % 10)
+
+    def fill_card():
+        dialog = QApplication.activeModalWidget()
+        try:
+            assert isinstance(dialog, EmployeeCardDialog)
+            values = dict(
+                start_date="2026-10-01", identifier="0000000000",
+                address="Synthetic street 0", postal_code="00100", city="Synthetic city", country="Test country",
+                phone="+000 000000", email="synthetic@example.invalid", bank_name="Synthetic bank",
+                account_holder="Synthetic Employee", clearing="0001", account_number=bank_number)
+            dialog.fields["identifier_type"].setCurrentIndex(dialog.fields["identifier_type"].findData("samordningsnummer"))
+            for key, text in values.items():
+                dialog.fields[key].setText(text)
+            dialog.save()
+            assert not dialog.dirty()
+            dialog.findChild(app_module.QTabWidget).setCurrentIndex(3)
+            application.processEvents()
+            dialog.grab().save(str(work / "employee-card.png"))
+            dialog.accept()
+        except Exception as error:
+            errors.append(type(error).__name__)
+            if dialog:
+                dialog.accept()
+
+    QTimer.singleShot(150, fill_card)
+    with patch.object(QMessageBox, "information"), \
+            patch.object(QMessageBox, "warning", side_effect=lambda *_args: errors.append("Card warning")):
+        QTest.mouseClick(window.findChild(app_module.QPushButton, "open_employee_card"),
+                         app_module.Qt.MouseButton.LeftButton)
+    if errors:
+        raise RuntimeError("Synthetic card verification failed: " + ", ".join(errors))
+    client = CardClient(app_module.get_db_connection)
+    record = client.resolve(local_id)
+    assert record["card"]["account_number"] == bank_number and record["card"]["postal_code"] == "00100"
+    assert record["card"]["clearing"] == "0001"
+    pdf = accountant_pdf([record], app_module.DEFAULT_FONT, app_module.DEFAULT_FONT_BOLD)
+    viewer = ConfidentialPreview(pdf, client, window)
+    try:
+        viewer.show()
+        viewer.set_zoom(2)
+        QTest.qWait(900)
+        viewer.grab().save(str(work / "accountant-preview-200.png"))
+        saved = work / "synthetic-accountant.pdf"
+        with patch("employee_cards_ui.QFileDialog.getSaveFileName", return_value=(str(saved), "PDF")), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+                patch.object(QMessageBox, "information"):
+            viewer.save_as()
+        assert saved.read_bytes() == pdf
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setResolution(150)
+        printer.setOutputFileName(str(work / "synthetic-printed.pdf"))
+        viewer.print_document(printer)
+        pages = len(PdfReader(saved).pages)
+        assert len(PdfReader(printer.outputFileName()).pages) == pages
+        for page in PdfReader(saved).pages:
+            assert len(page.images) == 0
+            assert "0001" in page.extract_text()
+    finally:
+        viewer.release_resources()
+        viewer.close()
+        window.close()
+    with closing(app_module.get_db_connection()) as conn:
+        row = conn.execute("SELECT * FROM employees WHERE id=?", (local_id,)).fetchone()
+        assert bank_number not in row["card_cipher"]
+        assert row["salary_rate"] == 245.8
+    result = dict(frozen=bool(getattr(sys, "frozen", False)), synthetic_only=True,
+                  leading_zeroes_preserved=True, saved_and_reopened=True, encrypted_cache=True,
+                  native_preview=True, zoom=2, pages=pages, saved_bytes_identical=True,
+                  print_pages=pages, local_id=local_id, server_id=record["id"],
+                  payroll_rate_unchanged=True, real_data_used=False)
+    Path(out_path).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "employee-cards-local":
+        return verify_employee_cards_local(app_module, work_dir, out_path)
     if action == "catalog-prices-ram":
         return verify_catalog_prices_ram(app_module, work_dir, out_path)
     if action == "payroll-estimate-readonly":

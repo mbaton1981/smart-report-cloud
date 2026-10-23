@@ -2,7 +2,7 @@
 import os
 
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QPushButton, QHBoxLayout, QVBoxLayout,
+    QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QPushButton, QHBoxLayout, QVBoxLayout, QMessageBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -76,6 +76,10 @@ def ensure_login():
     saved = desktop_auth.load_saved_token()
     if saved:
         state = desktop_auth.check_token(url, saved)
+        if state is None and desktop_auth.saved_account_role() not in (None, "admin"):
+            QMessageBox.warning(None, "Требуется подключение",
+                                "Для ограниченной учётной записи требуется онлайн-проверка прав. Повторите подключение.")
+            return False
         if state is not False:
             desktop_auth.set_token(saved, persist=False)
             return True
@@ -84,4 +88,6 @@ def ensure_login():
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return False
     desktop_auth.set_token(dialog.token)
+    if desktop_auth.check_token(desktop_auth.server_url(), dialog.token) is not True:
+        return False
     return True
