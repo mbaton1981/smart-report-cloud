@@ -1044,7 +1044,8 @@
                 const result = await response.json();
                 if (response.ok) {
                     pendingShiftRequestId = null;
-                    showFormAlert("Смена успешно отправлена!", "success");
+                    showFormAlert(result.message || "Смена успешно отправлена!",
+                        result.pricing_warning ? "error" : "success");
                     
                     document.getElementById('comment').value = '';
                     document.getElementById('transport_check').checked = false;

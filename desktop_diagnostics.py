@@ -1330,7 +1330,94 @@ def verify_employee_cards_local(app_module, work_dir, out_path):
     return result
 
 
+def verify_new_shift_prices_ram(app_module, work_dir, out_path):
+    """Check the two approved HOTEL records and real creation handler only in RAM."""
+    from contextlib import closing
+    import sqlite3
+    from unittest.mock import patch
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QLineEdit, QComboBox, QMessageBox
+    from PyQt6.QtCore import QDate
+    from customer_pricing import new_shift_pricing, store_pricing, row_prices
+    from customer_report import write_customer_pdf
+
+    database = Path(app_module.DB_FILE).resolve()
+    work = Path(work_dir).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    uri = f"file:new-prices-{uuid.uuid4()}?mode=memory&cache=shared"
+    master = sqlite3.connect(uri, uri=True)
+    master.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        before_source = list(source.iterdump())
+        source.backup(master)
+
+    def connection():
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    application = QApplication.instance() or QApplication([])
+    ids = ("27c73254-efda-43d9-b2a6-ffcce6906978", "51f051cf-5eee-44a1-a0b4-901a1d29517d")
+    original = [dict(master.execute("SELECT * FROM shifts WHERE sync_id=?", (key,)).fetchone()) for key in ids]
+    with patch("requests.sessions.Session.request", side_effect=RuntimeError("Network forbidden")), \
+            patch.object(app_module, "get_db_connection", connection):
+        window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
+        QMainWindow.__init__(window)
+        window.date_input = QLineEdit("2026-10-23")
+        for attr, value in (("emp_cb", original[0]["employee"]), ("comp_cb", original[0]["company"]),
+                            ("obj_cb", original[0]["object_name"])):
+            combo = QComboBox()
+            combo.addItem(value, value)
+            setattr(window, attr, combo)
+        window.record_type_cb = QComboBox()
+        window.record_type_cb.addItem("Work", "work")
+        window.hours_input, window.rate_input = QLineEdit("0.5"), QLineEdit("")
+        window.trans_input, window.comment_input = QLineEdit("0"), QLineEdit("RAM acceptance only")
+        with patch.object(window, "background_sync_with_cloud"), \
+                patch.object(window, "load_shifts_history"), \
+                patch.object(QMessageBox, "information"), \
+                patch.object(QMessageBox, "warning") as warning:
+            window.save_shift()
+        if warning.called:
+            raise RuntimeError("New shift creation failed.")
+        created = dict(master.execute("SELECT * FROM shifts ORDER BY id DESC LIMIT 1").fetchone())
+        assert row_prices(created)["base"] == 520 and row_prices(created)["travel"] == 450
+        master.execute("DELETE FROM shifts WHERE sync_id=?", (created["sync_id"],))
+        entries = []
+        for row in original:
+            assert row["entry_type"] == "work" and not row["invoiced"]
+            if not row["customer_pricing"] and not row["rate"]:
+                store_pricing(master.cursor(), "shifts", row["sync_id"], new_shift_pricing(master.cursor(), "shifts", row))
+            updated = dict(master.execute("SELECT * FROM shifts WHERE sync_id=?", (row["sync_id"],)).fetchone())
+            assert {k: v for k, v in updated.items() if k != "customer_pricing"} == {
+                k: v for k, v in row.items() if k != "customer_pricing"}
+            entries.append(dict(employee=row["employee"], hours=row["hours"], base=row_prices(updated)["base"]))
+        master.commit()
+        window.tab_invoice, window.tab_dagbok = QWidget(), QWidget()
+        window.setup_invoice_tab()
+        window.setup_dagbok_tab()
+        window.inv_comp_cb.setCurrentText("Renatur")
+        window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(84))
+        window.inv_date_from.setDate(QDate(2026, 10, 23))
+        window.inv_date_to.setDate(QDate(2026, 10, 23))
+        report = window.generate_invoice()
+        assert report["totals"]["hours"] == 13
+        assert report["totals"]["work_amount"] == 6760
+        assert report["totals"]["transport_amount"] == 900
+        assert report["totals"]["invoice_total"] == 7660
+        pdf = work / "HOTEL-20261023.pdf"
+        write_customer_pdf(report, str(pdf), app_module.DEFAULT_FONT, app_module.DEFAULT_FONT_BOLD, lambda text: text)
+        window.close()
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        assert list(source.iterdump()) == before_source
+    master.close()
+    result = dict(source_unchanged=True, desktop_creation_price=520, entries=entries,
+                  totals=report["totals"], pdf=str(pdf), frozen=bool(getattr(sys, "frozen", False)))
+    Path(out_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "new-shift-prices-ram":
+        return verify_new_shift_prices_ram(app_module, work_dir, out_path)
     if action == "employee-cards-local":
         return verify_employee_cards_local(app_module, work_dir, out_path)
     if action == "catalog-prices-ram":

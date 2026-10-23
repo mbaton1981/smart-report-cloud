@@ -6,6 +6,39 @@ from fixed_pricing import parse_fixed
 
 
 CATALOG_PRICE_SOURCE = "Цены справочника объекта (применены пользователем)"
+NEW_SHIFT_PRICE_SOURCE = "Цены справочника объекта при создании записи"
+
+
+def new_shift_pricing(cursor, table, row, *, manual_base=None):
+    """Snapshot prices for a NEW record, never reprice existing history."""
+    object_table = {"shifts": "objects", "incoming_submissions": "meta_objects"}.get(table)
+    if object_table is None:
+        raise ValueError("Unsupported pricing table")
+    objects = cursor.execute(
+        f"SELECT * FROM {object_table} WHERE company=? AND name=? AND is_active=1",
+        (row["company"], row["object_name"]),
+    ).fetchall()
+    if len(objects) != 1:
+        raise ValueError("Объект не найден в выбранной фирме или неоднозначен. Обновите справочник.")
+    obj = objects[0]
+    quote = agreed_prices_for_date(cursor, table, row, reject_conflicts=True)
+    if quote:
+        quote = parse_pricing(quote, row)
+    else:
+        base = checked_rate(obj["rate"])
+        quote = {
+            "version": 1, "company": row["company"], "object_name": row["object_name"],
+            "date_from": row["date"], "date_to": row["date"], "source": NEW_SHIFT_PRICE_SOURCE,
+            "confirmed": True, "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            "base": base if base else None, "travel": checked_rate(obj["transport_rate"]), "ob": {},
+        }
+    if manual_base is not None:
+        quote.update(
+            base=checked_rate(manual_base), date_from=row["date"], date_to=row["date"],
+            source="Ручной ввод клиентской цены при создании записи",
+            confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat(),
+        )
+    return quote
 
 
 def catalog_price_preview(rows, base, travel):
@@ -25,13 +58,14 @@ def catalog_price_preview(rows, base, travel):
         changed = [key for key, new in (("base", base), ("travel", travel)) if prices[key] != new]
         source = prices.get("source", "")
         origin = (
-            "Справочник (ранее применён)" if source == CATALOG_PRICE_SOURCE else
+            "Справочник (ранее применён)" if source in (CATALOG_PRICE_SOURCE, NEW_SHIFT_PRICE_SOURCE) else
             "Ручная цена" if source.startswith("Ручн") else
             "Сохранённые цены; происхождение не указано" if any(
                 prices[key] is not None for key in ("base", "travel")
             ) else "Цены не заданы"
         )
-        protected = source != CATALOG_PRICE_SOURCE and any(prices[key] is not None for key in changed)
+        protected = source not in (CATALOG_PRICE_SOURCE, NEW_SHIFT_PRICE_SOURCE) and any(
+            prices[key] is not None for key in changed)
         result.append({
             "row": row, "before": prices, "base": base, "travel": travel,
             "eligible": bool(changed) and not reason, "replace_confirmation": protected,
@@ -221,7 +255,7 @@ def require_final_prices(row, segments):
         raise ValueError("Не подтверждены исторические клиентские цены: " + ", ".join(sorted(set(missing))))
 
 
-def agreed_prices_for_date(cursor, table, row):
+def agreed_prices_for_date(cursor, table, row, *, reject_conflicts=False):
     """Reuse a confirmed contract only within its recorded validity, never today's catalogue."""
     if table not in {"shifts", "incoming_submissions"}:
         raise ValueError("Unsupported pricing table")
@@ -233,9 +267,11 @@ def agreed_prices_for_date(cursor, table, row):
     matches = set()
     for candidate in candidates:
         raw = json.loads(candidate[0])
-        if raw.get("fixed"):
+        if raw.get("fixed") or raw.get("source") == NEW_SHIFT_PRICE_SOURCE:
             continue
         if raw["date_from"] <= row["date"] <= raw["date_to"]:
             matches.add(pricing_json(raw, row))
     # Conflicting historical evidence requires explicit review, not last-write guessing.
+    if len(matches) > 1 and reject_conflicts:
+        raise ValueError("На дату смены найдены противоречащие договорные цены. Требуется проверка администратором.")
     return next(iter(matches)) if len(matches) == 1 else None

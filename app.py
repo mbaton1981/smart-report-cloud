@@ -38,7 +38,7 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
-from customer_pricing import agreed_prices_for_date, apply_catalog_price, catalog_price_preview, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
+from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
@@ -2381,7 +2381,8 @@ class SmartReportApp(QMainWindow):
 
         self.hours_input = QLineEdit("8.0")
         self.rate_input = QLineEdit()
-        self.rate_input.setPlaceholderText("Не задана")
+        self.rate_input.setPlaceholderText("Автоматически из договора / справочника")
+        self.rate_input.setToolTip("Оставьте пустым для автоматической цены. Введённая цена сохраняется как ручная.")
         self.trans_input = QLineEdit("0")
         self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
@@ -2734,6 +2735,15 @@ class SmartReportApp(QMainWindow):
             (record_type == RECORD_TYPE_OB and (not local['start_time'] or not local['end_time']))
         )
         if local and remote_version <= local['sync_version'] and not needs_type_repair:
+            # Push ACK may arrive before the canonical server price is pulled.
+            local_quote = json.loads(local["customer_pricing"]) if local["customer_pricing"] else {}
+            if (remote_version == local["sync_version"] and not has_pending
+                    and not local["invoiced"] and not shift.get("invoiced")
+                    and shift.get("customer_pricing") and (
+                        local_quote.get("source") == NEW_SHIFT_PRICE_SOURCE
+                        or (not local_quote and not local["rate"]))
+                    and all(local[key] == shift.get(key) for key in ("date", "company", "object_name"))):
+                store_pricing(cursor, "shifts", sync_id, shift["customer_pricing"], from_sync=True)
             return
         if ob_schema_ready(cursor):
             start_t = shift.get("start_time") if record_type == RECORD_TYPE_OB else None
@@ -10481,6 +10491,16 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Проверьте часы, ставку и транспорт (от 0 до 10000)!")
             return
 
+        quote = None
+        if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+            try:
+                quote = new_shift_pricing(cursor, "shifts", {
+                    "date": date, "company": comp, "object_name": obj_name,
+                }, manual_base=customer_base_rate)
+            except ValueError as error:
+                conn.close()
+                QMessageBox.warning(self, "Клиентские цены", str(error))
+                return
         sync_id = str(uuid.uuid4())
         cursor.execute('''
             INSERT INTO shifts (
@@ -10500,19 +10520,8 @@ class SmartReportApp(QMainWindow):
                 (ob_result["start_time"], ob_result["end_time"], ob_result["segments"][0]["base_rate"], shift_id),
             )
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
-        if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) and rate_input_str:
-            store_pricing(cursor, "shifts", sync_id, {
-                "version": 1, "company": comp, "object_name": obj_name,
-                "date_from": date, "date_to": date, "source": "Ручной ввод клиентской цены при создании записи",
-                "base": customer_base_rate, "travel": None, "ob": {},
-                "confirmed": True, "confirmed_at": datetime.now(timezone.utc).isoformat(),
-            })
-        elif record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
-            quote = agreed_prices_for_date(cursor, "shifts", {
-                "date": date, "company": comp, "object_name": obj_name,
-            })
-            if quote:
-                store_pricing(cursor, "shifts", sync_id, quote)
+        if quote:
+            store_pricing(cursor, "shifts", sync_id, quote)
         payload = {
             "date": date, "employee": emp, "company": comp, "object_name": obj_name,
             "hours": hours_val, "rate": rate_val, "transport": trans_val,
@@ -10535,6 +10544,12 @@ class SmartReportApp(QMainWindow):
         ):
             self.background_sync_with_cloud()
             QMessageBox.information(self, "Успех", "OB-интервал сохранён и рассчитан." if record_type == RECORD_TYPE_OB else "Смена успешно сохранена!")
+            if quote and (quote["base"] is None or (trans_val and quote["travel"] is None)):
+                QMessageBox.warning(
+                    self, "Клиентские цены не заданы",
+                    "Смена сохранена без полной клиентской цены. Проверьте справочник объекта; "
+                    "недостающие цены будут явно показаны в фактуре.",
+                )
         else:
             QMessageBox.information(self, "Сохранено локально", "Запись сохранена отдельно от рабочих часов. Сервер не поддерживает этот тип, поэтому запись остаётся в локальной очереди.")
         self.load_shifts_history()

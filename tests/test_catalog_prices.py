@@ -180,6 +180,7 @@ class CatalogPricesSyncTests(unittest.TestCase):
         self.submit("catalog-price-sync", "ob", "Travel B", 1)
         conn = self.server.get_db_connection()
         before = dict(conn.execute("SELECT * FROM incoming_submissions WHERE sync_id='catalog-price-sync'").fetchone())
+        audit_before = conn.execute("SELECT COUNT(*) FROM customer_price_audit").fetchone()[0]
         segments = list(map(tuple, conn.execute("SELECT * FROM ob_segments")))
         conn.close()
         quote = {
@@ -205,7 +206,7 @@ class CatalogPricesSyncTests(unittest.TestCase):
             for key in ("hours", "rate", "transport", "invoiced", "ob_base_rate"):
                 self.assertEqual(after[key], before[key], key)
             self.assertEqual(list(map(tuple, conn.execute("SELECT * FROM ob_segments"))), segments)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM customer_price_audit").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM customer_price_audit").fetchone()[0], audit_before + 1)
             self.assertEqual(after["version"], before["version"] + 1)
             remote = self.server.serialize_submission(after, cursor=conn.cursor())
         finally:

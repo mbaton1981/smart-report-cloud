@@ -26,7 +26,7 @@ from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
 from web_login_throttle import SQLiteLoginThrottle
 from object_reports import register_object_reports
-from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
+from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
 from fixed_pricing import validate_fixed_storage
 import payroll_history
 import employee_cards
@@ -2842,6 +2842,7 @@ def submit_shift():
     conn = get_db_connection()
     cursor = conn.cursor()
     ob_result = None
+    quote = None
 
     if session.get('role') == 'admin':
         employee = str(data.get('employee', '')).strip()
@@ -3006,11 +3007,10 @@ def submit_shift():
                 hours, rate, transport, comment, change_seq, payload_hash, now, now
             ))
         if submission_type in ("work", "ob"):
-            quote = agreed_prices_for_date(cursor, "incoming_submissions", {
+            quote = new_shift_pricing(cursor, "incoming_submissions", {
                 "date": date_str, "company": company, "object_name": final_obj_name,
-            })
-            if quote:
-                store_pricing(cursor, "incoming_submissions", request_id, quote)
+            }, manual_base=(data.get("rate") if session.get("role") == "admin" else None))
+            store_pricing(cursor, "incoming_submissions", request_id, quote)
         conn.commit()
     except ValueError as e:
         conn.rollback()
@@ -3023,6 +3023,11 @@ def submit_shift():
         conn.close()
 
     response = {"ok": True, "message": "Смена успешно сохранена!", "request_id": request_id}
+    if quote and (quote["base"] is None or (transport and quote["travel"] is None)):
+        response.update(
+            pricing_warning=True,
+            message="Смена сохранена. Не все клиентские цены заданы; администратору нужно проверить справочник.",
+        )
     if ob_result:
         response.update(public_ob_result(ob_result))
     return jsonify(response), 201
@@ -4738,8 +4743,10 @@ def sync_push():
                         "end_time": ob_result["end_time"],
                         "ob_base_rate": ob_result["ob_base_rate"],
                     })
-                pricing_value = payload.get("customer_pricing", existing["customer_pricing"] if existing else None)
-                if "customer_pricing" in payload or (existing and pricing_value):
+                pricing_value = payload.get(
+                    "customer_pricing", existing["customer_pricing"] if existing and base_version > 0 else None,
+                )
+                if "customer_pricing" in payload or (existing and base_version > 0 and pricing_value):
                     normalized["customer_pricing"] = pricing_json(pricing_value, dict(normalized, sync_id=sync_id))
                     parsed_quote = json.loads(normalized["customer_pricing"]) if normalized["customer_pricing"] else {}
                     if parsed_quote.get("fixed"):
@@ -4802,6 +4809,14 @@ def sync_push():
             if not existing and base_version != 0:
                 results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
                 continue
+
+            if operation == "upsert" and not existing and submission_type in ("work", "ob") and not invoiced:
+                supplied_quote = json.loads(normalized["customer_pricing"]) if normalized.get("customer_pricing") else {}
+                if not supplied_quote or supplied_quote.get("source") == NEW_SHIFT_PRICE_SOURCE:
+                    quote = new_shift_pricing(
+                        cursor, "incoming_submissions", normalized, manual_base=rate if rate > 0 else None,
+                    )
+                    normalized["customer_pricing"] = pricing_json(quote, normalized)
 
             if operation == "upsert" and existing and existing["invoiced"]:
                 if any(normalized.get(key) != (existing[key] or "" if key == "comment" else existing[key]) for key in (

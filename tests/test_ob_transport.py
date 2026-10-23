@@ -252,7 +252,7 @@ class OBTransportTests(unittest.TestCase):
             window.inv_date_to.setDate(self.desktop.QDate(2026, 10, 31))
             report = window._prepare_invoice_view(window.collect_invoice_report())
             self.assertEqual(report["recorded_trips"], 1)
-            self.assertIsNone(report["totals"]["transport_amount"])
+            self.assertEqual(report["totals"]["transport_amount"], 450)
             self.assertIsNone(report["totals"]["invoice_total"])
         finally:
             window.close()
