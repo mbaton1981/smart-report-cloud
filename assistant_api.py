@@ -1,6 +1,7 @@
 """Allowlisted director assistant. No SQL, credentials or financial writes from a model."""
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import make_msgid
@@ -35,7 +36,7 @@ TOOLS = [{
     "parameters": {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "purpose": {"type": "string", "enum": ["search", "check", "explain", "payroll_pdf", "customer_pdf", "catalog_preview"]},
+            "purpose": {"type": "string", "enum": ["search", "check", "transport_check", "explain", "payroll_pdf", "customer_pdf", "catalog_preview"]},
             "date_from": {"type": "string", "description": "YYYY-MM-DD; ask if the period is unspecified"},
             "date_to": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
             "employee": {"type": "string", "description": "Exact employee name or empty for all"},
@@ -44,11 +45,31 @@ TOOLS = [{
         },
         "required": ["purpose", "date_from", "date_to", "employee", "company", "object_name"],
     },
+}, {
+    "type": "function", "name": "request_clarification", "strict": True,
+    "description": "Ask a specific question when a required parameter is missing or the action is unsupported.",
+    "parameters": {"type": "object", "additionalProperties": False,
+                   "properties": {"field": {"type": "string", "enum": ["period", "scope", "object", "unsupported"]}},
+                   "required": ["field"]},
 }]
+
+QUESTIONS = {
+    "period": "За какой период проверить данные? Выберите даты ниже и нажмите нужное действие.",
+    "scope": "Для всех сотрудников или одного? Оставьте поле сотрудника пустым для всех или введите точное ФИО.",
+    "object": "Для какой фирмы и объекта? Укажите оба названия в команде.",
+    "unsupported": "Эта функция не поддерживается. Доступны поиск смен, проверка ставок и транспорта, "
+                   "пояснение сумм и подготовка штатных отчётов. Изменения и отправка по текстовой команде запрещены.",
+}
 
 
 class AssistantError(ValueError):
     pass
+
+
+class AssistantQuestion(AssistantError):
+    def __init__(self, field):
+        self.field = field
+        super().__init__(QUESTIONS[field])
 
 
 def ensure_schema(conn):
@@ -90,7 +111,7 @@ def status(conn):
                 notice="Лимит по консервативным резервам; не счёт OpenAI. Неудачные запросы тоже расходуют резерв.")
 
 
-def reserve(conn, actor, operation, kind, micro):
+def reserve(conn, actor, operation, kind, micro, *, requires_provider=True):
     try:
         uuid.UUID(operation)
     except (ValueError, TypeError, AttributeError):
@@ -99,7 +120,7 @@ def reserve(conn, actor, operation, kind, micro):
     state = status(conn)
     if not state["enabled"]:
         raise AssistantError("Помощник выключен. Обычная программа продолжает работать.")
-    if not state["key_configured"]:
+    if requires_provider and not state["key_configured"]:
         raise AssistantError("API-ключ на сервере не настроен. Подписка ChatGPT не подключает API.")
     if conn.execute("SELECT 1 FROM assistant_requests WHERE operation_id=?", (operation,)).fetchone():
         raise AssistantError("Операция уже отправлялась. Автоматический повтор заблокирован.")
@@ -144,17 +165,34 @@ def select_plan(text, conn, actor, operation, post=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
         raise AssistantError("Введите команду длиной не более 8000 байт.")
+    normalized = " ".join(text.casefold().strip(" .!?").split())
+    if normalized in {"проверь транспорт", "проверьте транспорт"}:
+        reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
+        finish(conn, actor, operation, "transport_check", "clarification")
+        raise AssistantQuestion("period")
+    if normalized in {"проверь транспорт за текущую неделю",
+                      "проверь транспорт за текущую неделю, ничего не изменяй"}:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday())
+        reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
+        finish(conn, actor, operation, "transport_check", "routed")
+        return dict(purpose="transport_check", date_from=start.isoformat(),
+                    date_to=(start + timedelta(days=6)).isoformat(), employee="", company="", object_name="")
     # A byte per token is a conservative input bound; output includes reasoning tokens.
     instructions = (
         "You are a SmartReport command router. Call inspect_records once only if all parameters are clear. "
         "Do not calculate money or invent records. catalog_preview prepares native price-review only; it never changes data. "
         "Do not change data, close periods or send mail. "
-        "If unclear, do not call a tool; the application will ask for clarification. "
-        f"Today is {date.today().isoformat()}; timezone Europe/Stockholm. "
+        "Transport checks MUST use transport_check, not search or check. "
+        "For missing parameters call request_clarification with the specific field; "
+        "for unsupported actions use field unsupported. Never return free text instead of a tool. "
+        "Current week means Monday through Sunday inclusive. No employee filter means all employees; "
+        "do not ask for an employee unless the user explicitly asks for one without identifying them. "
+        f"Today is {datetime.now(ZoneInfo('Europe/Stockholm')).date().isoformat()}; timezone Europe/Stockholm. "
         "Employee/object/company names must be copied from the user, not guessed. Empty filters mean all."
     )
     body = dict(model=MODEL, store=False, instructions=instructions, input=text, reasoning={"effort": "minimal"},
-                tools=TOOLS, parallel_tool_calls=False, max_output_tokens=MAX_OUTPUT)
+                tools=TOOLS, tool_choice="required", parallel_tool_calls=False, max_output_tokens=MAX_OUTPUT)
     input_bound = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) + 4096
     micro = math.ceil(input_bound * INPUT_MICRO_USD + MAX_OUTPUT * OUTPUT_MICRO_USD)
     reserve(conn, actor, operation, "text", micro)
@@ -170,13 +208,21 @@ def select_plan(text, conn, actor, operation, post=None):
         calls = [item for item in data.get("output", []) if isinstance(item, dict) and item.get("type") == "function_call"]
         if data.get("status") == "incomplete":
             raise AssistantError("Модель не завершила разбор команды. Сократите или уточните её.")
+        if len(calls) == 1 and calls[0].get("name") == "request_clarification":
+            clarification = json.loads(calls[0]["arguments"])
+            if not isinstance(clarification, dict) or set(clarification) != {"field"} or clarification["field"] not in QUESTIONS:
+                raise AssistantError("Некорректный вопрос помощника. Используйте кнопки действий с явными датами.")
+            raise AssistantQuestion(clarification["field"])
         if len(calls) != 1 or calls[0].get("name") != "inspect_records":
-            raise AssistantError("Уточните команду: действие, сотрудник/объект и даты. Изменения и отправка писем пока недоступны.")
+            raise AssistantError("Помощник не выбрал поддерживаемую функцию. Выберите действие кнопкой ниже; "
+                                 "период и сотрудника можно задать в полях над кнопками.")
         plan = validate_plan(json.loads(calls[0]["arguments"]))
+        if re.match(r"проверь(?:те)?\s+транспорт\b", normalized) and plan["purpose"] in {"search", "check", "explain"}:
+            plan["purpose"] = "transport_check"
         finish(conn, actor, operation, "text", "routed")
         return plan
     except (requests.RequestException, ValueError, KeyError, TypeError) as error:
-        finish(conn, actor, operation, "text", "failed")
+        finish(conn, actor, operation, "text", "clarification" if isinstance(error, AssistantQuestion) else "failed")
         if isinstance(error, AssistantError):
             raise
         raise AssistantError("API недоступен или вернул неверный ответ. Данные не изменены; резерв запроса сохранён.") from None
@@ -260,10 +306,56 @@ def inspect(conn, plan):
         if record["id"] in repeated:
             record["warnings"].append("Возможный дубликат: совпадают день, сотрудник, объект, вид записи и часы; не удалять автоматически")
     # No stored comments, card fields or calculation results are sent back to OpenAI.
-    return dict(plan=plan, employee=employee, object=obj, records=records,
+    result = dict(plan=plan, employee=employee, object=obj, records=records,
                 source="Сервер SmartReport; локальные несинхронизированные записи не включены",
                 notice="Суммы зарплаты, OB и фактуры рассчитываются только существующими отчётами. "
                        "Количество выездов и цена выезда — разные поля. Ничего не изменено.")
+    if plan["purpose"] == "transport_check":
+        result["transport"] = check_transport(conn, records)
+    return result
+
+
+def check_transport(conn, records):
+    """Validate saved transport inputs, not the occurrence of actual journeys."""
+    checked, excluded, issues, subtotal = 0, 0, 0, Decimal("0")
+    for row in records:
+        findings = []
+        row["transport_findings"] = findings
+        if row["entry_type"] not in {"work", "ob"} or row["fixed"]:
+            excluded += 1
+            findings.append("Не проверено: не рабочая запись или Fast pris; проверьте штатный отчёт договора.")
+            continue
+        checked += 1
+        trips = row["trips"]
+        valid_trips = isinstance(trips, (int, float)) and math.isfinite(trips) and trips >= 0
+        if not valid_trips:
+            findings.append("Ошибка: количество выездов должно быть конечным неотрицательным числом.")
+        if row["travel_rate"] is None:
+            findings.append("Цена выезда не задана; стоимость не подтверждена, даже если выезды равны нулю.")
+        objects = conn.execute("SELECT transport_rate FROM meta_objects WHERE company=? AND name=?",
+                               (row["company"], row["object_name"])).fetchall()
+        row["catalog_travel_rate"] = objects[0]["transport_rate"] if len(objects) == 1 else None
+        if len(objects) != 1:
+            findings.append("Не удалось однозначно найти фирму и объект в справочнике.")
+        elif objects[0]["transport_rate"] is None:
+            findings.append("В справочнике не задана цена выезда.")
+        elif row["travel_rate"] is not None and row["travel_rate"] != objects[0]["transport_rate"]:
+            findings.append("Сохранённая цена отличается от текущего справочника. Это может быть ручная "
+                            "или историческая цена; требуется проверка, автоматической замены нет.")
+        if valid_trips and row["travel_rate"] is not None and row["travel_only"] is not None:
+            subtotal += Decimal(str(row["travel_only"]))
+        if findings:
+            issues += 1
+        elif trips == 0:
+            findings.append("Выезды не заявлены. По записи нельзя установить, был ли фактический выезд.")
+        else:
+            findings.append("Цена совпадает со справочником; количество и стоимость заполнены.")
+    return dict(checked=checked, excluded=excluded, attention=issues, known_subtotal=str(subtotal),
+                scope="Проверен клиентский транспорт: сохранённые выезды, наличие цены и её совпадение с текущим справочником.",
+                limits="Фактические поездки, право на оплату, объединение выездов и условия договора "
+                       "автоматически не подтверждаются. Подытог известных сумм — не итог фактуры. "
+                       "Нулевые выезды не означают отсутствия поездки. Личные транспортные расходы "
+                       "и выплаты сотрудникам здесь не проверяются. Данные не изменены.")
 
 
 def transcribe(audio, conn, actor, operation, post=None):
@@ -411,6 +503,9 @@ def register_assistant(app, connect, authenticate):
             ensure_schema(conn)
             actor = authenticate()
             return action(conn, actor)
+        except AssistantQuestion as question:
+            conn.rollback()
+            return jsonify(ok=True, clarification=dict(field=question.field, question=str(question)))
         except AssistantError as error:
             conn.rollback()
             return jsonify(ok=False, error=str(error)), 400
@@ -454,6 +549,23 @@ def register_assistant(app, connect, authenticate):
             conn.execute("PRAGMA query_only=OFF")
             audit(conn, actor, plan["purpose"], "read_completed", data["operation_id"])
             conn.commit()
+            return jsonify(ok=True, result=result)
+        return handle(action)
+
+    @app.route("/api/assistant/inspect", methods=["POST"])
+    def assistant_inspect():
+        def action(conn, actor):
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict) or set(data) != {"plan", "operation_id"}:
+                raise AssistantError("Выберите действие, даты и сотрудника.")
+            plan = validate_plan(data["plan"])
+            if plan["purpose"] not in {"search", "check", "transport_check"}:
+                raise AssistantError("Эта кнопка поддерживает только просмотр и проверку записей.")
+            reserve(conn, actor, data["operation_id"], plan["purpose"], 0, requires_provider=False)
+            result = inspect(conn, plan)
+            conn.commit()
+            conn.execute("PRAGMA query_only=OFF")
+            finish(conn, actor, data["operation_id"], plan["purpose"], "read_completed")
             return jsonify(ok=True, result=result)
         return handle(action)
 

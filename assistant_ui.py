@@ -7,13 +7,15 @@ from pathlib import Path
 import sys
 import uuid
 import wave
+from decimal import Decimal
 from urllib.parse import urlsplit
 
 import requests
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QSignalBlocker, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QBuffer, QByteArray, QDate, QIODevice, QSignalBlocker, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog,
+    QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog, QDateEdit,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
 )
 
 import desktop_auth
@@ -82,28 +84,59 @@ class RequestWorker(QThread):
 
 
 def result_text(result):
-    lines = [result["source"], result["notice"], ""]
-    for r in result["records"]:
-        price = "Не задана" if r["customer_rate"] is None else f'{r["customer_rate"]:g} SEK/ч'
-        travel = "Не задана" if r["travel_rate"] is None else f'{r["travel_rate"]:g} SEK/выезд'
-        lines.extend([f'{r["date"]} | {r["employee"]} | {r["company"]} / {r["object_name"]}',
-                      f'ID {r["id"]}; {r["entry_type"]}; {r["hours"]:g} ч; клиентская ставка: {price}; '
-                      f'выезды: {r["trips"]:g}; цена выезда: {travel}',
-                      f'Источник цены: {r["price_source"]}'])
-        if r["fixed"]:
-            lines.append("Fast pris: почасовое умножение не является итогом договора.")
-        else:
-            base = "Не определена" if r["base_only"] is None else f'{r["base_only"]:,.2f} SEK'
-            travel_sum = "Не определена" if r["travel_only"] is None else f'{r["travel_only"]:,.2f} SEK'
-            lines.append(f'Базовая стоимость без OB: {base}; транспорт отдельно: {travel_sum}. '
-                         "Это не итог фактуры: OB/условия договора смотрите в штатном расчёте.")
-        for interval in r["intervals"]:
-            lines.append(f'Время: {interval["start_time"]}–{interval["end_time"]}, {interval["hours"]:g} ч')
-        lines.extend("⚠ " + w for w in r["warnings"])
-        lines.append("")
+    plan = result["plan"]
+    lines = [f'Период: {plan["date_from"]} — {plan["date_to"]}.',
+             "Сотрудник: " + (plan["employee"] or "все сотрудники") + ".",
+             f'Найдено записей: {len(result["records"])}.']
+    if "transport" in result:
+        t = result["transport"]
+        lines.extend([t["scope"], f'Проверено: {t["checked"]}; требуют внимания: {t["attention"]}; '
+                      f'не проверено (другой вид / Fast pris): {t["excluded"]}.',
+                      f'Подытог известных сумм транспорта: {Decimal(t["known_subtotal"]):,.2f} SEK.',
+                      "Расхождения перечислены в таблице." if t["attention"] else
+                      "В проверенных полях расхождений не найдено." if t["checked"] else
+                      "Нет записей, для которых выполнена проверка транспорта.",
+                      t["limits"]])
+    else:
+        lines.append("Проверены сохранённые ставки, связь фирмы и объекта, время и возможные дубликаты."
+                     if plan["purpose"] == "check" else "Показаны сохранённые записи выбранного периода.")
+        count = sum(bool(row["warnings"]) for row in result["records"])
+        lines.append(f'Записей с предупреждениями: {count}. Подробности — в таблице.')
+        known = [row["base_only"] for row in result["records"] if row["base_only"] is not None]
+        if known:
+            subtotal = sum((Decimal(str(value)) for value in known), Decimal("0"))
+            lines.append(f'Подытог известных базовых стоимостей без OB: {subtotal:,.2f} SEK '
+                         f'({len(known)} записей; остальные не включены).')
+        lines.append("Это не итог фактуры: OB, Fast pris и условия договора проверяйте в штатном отчёте.")
+        lines.append(result["notice"])
+    lines.append(result["source"])
     if not result["records"]:
         lines.append("По выбранным фильтрам на сервере записей нет. Это не проверка других профилей или несинхронизированных данных.")
     return "\n".join(lines)
+
+
+def result_table(result):
+    transport = result["plan"]["purpose"] == "transport_check"
+    headers = ["Дата", "Сотрудник", "Фирма / объект", "Часы", "Выезды", "Цена выезда, SEK",
+               "Транспорт, SEK", "Проверка / замечания"]
+    if transport:
+        headers.insert(6, "Справочник, SEK/выезд")
+    else:
+        headers.insert(4, "Ставка, SEK/ч")
+    rows = []
+    for r in result["records"]:
+        cells = [r["date"], r["employee"], f'{r["company"]} / {r["object_name"]}',
+                 f'{r["hours"]:g}', f'{r["trips"]:g}',
+                 "Не задана" if r["travel_rate"] is None else f'{r["travel_rate"]:g}',
+                 "Не определён" if r["travel_only"] is None else f'{r["travel_only"]:,.2f}',
+                 "\n".join(r.get("transport_findings", []) if transport else r["warnings"]) or "Без предупреждений"]
+        if transport:
+            rate = r.get("catalog_travel_rate")
+            cells.insert(6, "Не определена" if rate is None else f"{rate:g}")
+        else:
+            cells.insert(4, "Не задана" if r["customer_rate"] is None else f'{r["customer_rate"]:g}')
+        rows.append(cells)
+    return headers, rows
 
 
 def open_report(window, result):
@@ -223,6 +256,32 @@ class AssistantDialog(QDialog):
             button.clicked.connect(action)
             controls.addWidget(button)
         layout.addLayout(controls)
+        filters = QHBoxLayout()
+        today = QDate.currentDate()
+        monday = today.addDays(1 - today.dayOfWeek())
+        self.date_from, self.date_to = QDateEdit(monday), QDateEdit(monday.addDays(6))
+        for field in (self.date_from, self.date_to):
+            field.setDisplayFormat("dd.MM.yyyy")
+            field.setCalendarPopup(True)
+        self.employee = QLineEdit()
+        self.employee.setPlaceholderText("Все сотрудники (или точное ФИО)")
+        filters.addWidget(QLabel("С:"))
+        filters.addWidget(self.date_from)
+        filters.addWidget(QLabel("По:"))
+        filters.addWidget(self.date_to)
+        filters.addWidget(self.employee)
+        layout.addLayout(filters)
+        shortcuts = QHBoxLayout()
+        for text, purpose in (("Показать смены", "search"), ("Проверить ставки и данные", "check"),
+                              ("Проверить транспорт", "transport_check")):
+            button = QPushButton(text)
+            button.clicked.connect(lambda checked=False, purpose=purpose: self.quick_action(purpose))
+            shortcuts.addWidget(button)
+        layout.addLayout(shortcuts)
+        hint = QLabel("Кнопки используют даты и сотрудника выше, без обращения к OpenAI. "
+                      "Текстовая команда использует собственные даты и фильтры.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         self.input = QTextEdit()
         self.input.setAcceptRichText(False)
         self.input.setMaximumHeight(100)
@@ -245,7 +304,16 @@ class AssistantDialog(QDialog):
         layout.addLayout(row)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
+        self.output.setMaximumHeight(180)
         layout.addWidget(self.output)
+        self.table = QTableWidget()
+        self.table.setMinimumHeight(170)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setVisible(False)
+        layout.addWidget(self.table)
         self.confirm_mail = QPushButton("Подтвердить отправку подготовленного письма…")
         self.confirm_mail.setEnabled(False)
         self.confirm_mail.clicked.connect(self.send_mail)
@@ -278,12 +346,26 @@ class AssistantDialog(QDialog):
 
     def failed(self, message):
         self.state.setText(message)
+        self.output.setPlainText(message + "\nПредыдущий результат очищен; данные не изменены.")
+        self.table.setVisible(False)
         self.result = None
         self.pdf.setEnabled(False)
         self.confirm_mail.setEnabled(False)
 
     def received(self, data):
-        if "status" in data:
+        if "clarification" in data:
+            self.result = None
+            self.pdf.setEnabled(False)
+            self.table.setVisible(False)
+            self.output.setPlainText(data["clarification"]["question"])
+            self.state.setText("Нужен ответ. Выберите параметры и действие либо уточните текстовую команду.")
+            if data["clarification"]["field"] == "scope":
+                self.employee.setFocus()
+            elif data["clarification"]["field"] == "period":
+                self.date_from.setFocus()
+            else:
+                self.input.setFocus()
+        elif "status" in data:
             s = data["status"]
             self.enabled.setChecked(s["enabled"])
             self.limit.setValue(s["limit_usd"])
@@ -294,7 +376,14 @@ class AssistantDialog(QDialog):
             self.input.setPlainText(data["text"])
             self.state.setText("Речь распознана. Проверьте ФИО, даты и числа, затем нажмите «Выполнить».")
         elif "actions" in data:
-            self.output.setPlainText(json.dumps(data["actions"], ensure_ascii=False, indent=2))
+            self.table.setVisible(False)
+            names = {"search": "Поиск смен", "check": "Проверка данных", "transport_check": "Проверка транспорта",
+                     "text": "Текстовая команда", "voice": "Голос", "settings": "Настройки"}
+            outcomes = {"reserved": "Начато", "routed": "Действие определено", "read_completed": "Просмотр завершён",
+                        "failed": "Не выполнено", "clarification": "Запрошено уточнение"}
+            self.output.setPlainText("\n".join(
+                f'{r["created_at"]} — {names.get(r["action"], "Действие помощника")}: '
+                f'{outcomes.get(r["outcome"], r["outcome"])}' for r in data["actions"]) or "Журнал пуст.")
         elif "draft" in data:
             self.pending_draft = data["draft"]
             self.output.setPlainText("Письмо подготовлено, НЕ отправлено.\n"
@@ -310,10 +399,34 @@ class AssistantDialog(QDialog):
         elif "result" in data:
             self.result = data["result"]
             self.output.setPlainText(result_text(self.result))
+            headers, rows = result_table(self.result)
+            self.table.setColumnCount(len(headers))
+            self.table.setHorizontalHeaderLabels(headers)
+            self.table.setRowCount(len(rows))
+            for index, cells in enumerate(rows):
+                for column, value in enumerate(cells):
+                    self.table.setItem(index, column, QTableWidgetItem(value))
+            self.table.resizeColumnsToContents()
+            for column in range(len(headers)):
+                self.table.setColumnWidth(column, min(310, self.table.columnWidth(column)))
+            self.table.resizeRowsToContents()
+            self.table.setVisible(True)
             self.pdf.setEnabled(self.result["plan"]["purpose"] in {"payroll_pdf", "customer_pdf", "catalog_preview"})
             self.pdf.setText("Открыть штатный просмотр изменений…" if self.result["plan"]["purpose"] == "catalog_preview"
                              else "Открыть существующий PDF по результату")
             self.state.setText("Готово. Результат получен из программы, не сочинён моделью. Данные не изменены.")
+
+    def quick_action(self, purpose):
+        if self.date_from.date() > self.date_to.date():
+            self.failed("Начальная дата должна быть не позже конечной.")
+            return
+        self.result = None
+        self.pdf.setEnabled(False)
+        self.call("inspect", dict(plan=dict(purpose=purpose,
+                  date_from=self.date_from.date().toString("yyyy-MM-dd"),
+                  date_to=self.date_to.date().toString("yyyy-MM-dd"),
+                  employee=self.employee.text().strip(), company="", object_name=""),
+                  operation_id=str(uuid.uuid4())))
 
     def command(self):
         if self.audio is not None:

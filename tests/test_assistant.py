@@ -1,4 +1,6 @@
 from contextlib import closing
+from datetime import datetime, timezone
+from decimal import Decimal
 from io import BytesIO
 import base64
 import json
@@ -243,6 +245,145 @@ class AssistantApiTests(unittest.TestCase):
             store_pricing(conn.cursor(), "incoming_submissions", row["sync_id"], quote)
             conn.commit()
 
+    def test_transport_command_and_button_produce_same_clear_result_without_provider(self):
+        self.fixture_shift()
+        before = self.business()
+        command = dict(text="Проверь транспорт за текущую неделю", operation_id=str(uuid.uuid4()))
+        with patch("assistant_api.requests.post") as provider, patch("assistant_api.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+            response = self.post("command", command)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            result = response.get_json()["result"]
+            self.assertEqual(result["plan"]["purpose"], "transport_check")
+            self.assertEqual(result["plan"]["date_from"], "2026-10-19")
+            self.assertEqual(result["plan"]["date_to"], "2026-10-25")
+            button = self.post("inspect", dict(plan=result["plan"], operation_id=str(uuid.uuid4())))
+            self.assertEqual(button.status_code, 200, button.get_json())
+            self.assertEqual(button.get_json()["result"], result)
+            provider.assert_not_called()
+        self.assertEqual(result["transport"]["checked"], 1)
+        self.assertEqual(result["transport"]["attention"], 0)
+        self.assertEqual(Decimal(result["transport"]["known_subtotal"]), Decimal("0"))
+        self.assertEqual(before, self.business())
+        from assistant_ui import result_text, result_table
+        text = result_text(result)
+        self.assertIn("2026-10-19", text)
+        self.assertIn("требуют внимания: 0", text)
+        self.assertIn("Фактические поездки", text)
+        self.assertNotIn("assistant-five", text)
+        headers, rows = result_table(result)
+        self.assertIn("Справочник, SEK/выезд", headers)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(headers), len(rows[0]))
+        self.assertNotIn("assistant-five", repr(rows))
+        with closing(self.server.get_db_connection()) as conn:
+            self.assertEqual(assistant.status(conn)["reserved_usd"], 0)
+
+    def test_transport_mismatch_missing_quantity_fixed_and_closed_are_not_repriced(self):
+        self.fixture_shift()
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE incoming_submissions SET transport=2,invoiced=1")
+            conn.execute("UPDATE meta_objects SET transport_rate=500")
+            conn.commit()
+        before = self.business()
+        response = self.post("inspect", dict(plan=plan("transport_check"), operation_id=str(uuid.uuid4())))
+        result = response.get_json()["result"]
+        self.assertEqual(result["transport"]["attention"], 1)
+        self.assertEqual(Decimal(result["transport"]["known_subtotal"]), Decimal("900"))
+        self.assertEqual(before, self.business())
+        with closing(self.server.get_db_connection()) as conn:
+            records = result["records"]
+            records[0].update(travel_rate=None, travel_only=None)
+            missing = assistant.check_transport(conn, records)
+            self.assertEqual(missing["attention"], 1)
+            self.assertIn("не задана", " ".join(records[0]["transport_findings"]))
+            records[0].update(travel_rate=450, trips=-1)
+            self.assertEqual(assistant.check_transport(conn, records)["attention"], 1)
+            records[0]["fixed"] = True
+            fixed = assistant.check_transport(conn, records)
+            self.assertEqual((fixed["checked"], fixed["excluded"]), (0, 1))
+
+    def test_buttons_preserve_admin_boundary_disabled_gate_and_duplicate_protection(self):
+        payload = dict(plan=plan("transport_check"), operation_id=str(uuid.uuid4()))
+        for role in ("user", "accountant"):
+            self.assertEqual(self.server_client.post(self.base + "inspect", json=payload,
+                             headers=self.headers(role)).status_code, 403)
+        self.assertEqual(self.post("inspect", payload).status_code, 200)
+        self.assertEqual(self.post("inspect", payload).status_code, 400)
+        self.assertEqual(self.post("inspect", dict(plan=plan("catalog_preview"),
+                         operation_id=str(uuid.uuid4()))).status_code, 400)
+        self.post("status", dict(enabled=False, limit_usd=10))
+        self.assertEqual(self.post("inspect", dict(plan=plan(), operation_id=str(uuid.uuid4()))).status_code, 400)
+
+    def test_specific_questions_and_unsupported_action(self):
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", dict(text="Проверь транспорт", operation_id=str(uuid.uuid4())))
+            provider.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["clarification"]["field"], "period")
+        for field in ("scope", "unsupported"):
+            mock = self.response()
+            mock.json.return_value["output"][0] = dict(type="function_call", name="request_clarification",
+                                                       arguments=json.dumps(dict(field=field)))
+            with patch("assistant_api.requests.post", return_value=mock):
+                response = self.post("command", self.request_command())
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()["clarification"]["field"], field)
+            self.assertNotIn("Уточните команду", response.get_json()["clarification"]["question"])
+
+    def test_button_to_table_and_voice_to_editable_text_then_explicit_command(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtCore import QDate
+        from PyQt6.QtWidgets import QWidget, QPushButton
+        self.fixture_shift()
+        before = self.business()
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            dialog.date_from.setDate(QDate(2026, 10, 19))
+            dialog.date_to.setDate(QDate(2026, 10, 25))
+
+            def local_api(path, payload=None, audio=None, database=None):
+                if audio is not None:
+                    reply = self.server_client.post(self.base + path, data=audio,
+                        headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
+                else:
+                    reply = self.post(path, payload)
+                self.assertEqual(reply.status_code, 200, reply.get_json())
+                return reply.get_json()
+
+            with patch("assistant_ui.request_api", side_effect=local_api) as api:
+                button = next(b for b in dialog.findChildren(QPushButton) if b.text() == "Проверить транспорт")
+                button.click()
+                dialog.worker.run()
+                dialog.finished()
+                self.assertEqual(dialog.table.rowCount(), 1)
+                self.assertIn("требуют внимания: 0", dialog.output.toPlainText())
+                self.assertEqual(dialog.table.item(0, 1).text(), "Synthetic Employee")
+                self.assertNotIn("assistant-five", dialog.output.toPlainText())
+                dialog.audio = Mock()
+                dialog.buffer = Mock()
+                dialog.buffer.data.return_value = b"\x00" * 32000
+                dialog.stop_recording()
+                self.assertEqual(dialog.worker.path, "transcribe")
+                audio_response = Mock(status_code=200, json=Mock(return_value={
+                    "text": "Проверь транспорт за текущую неделю"}))
+                with patch("assistant_api.requests.post", return_value=audio_response):
+                    dialog.worker.run()
+                dialog.finished()
+                self.assertEqual(dialog.input.toPlainText(), "Проверь транспорт за текущую неделю")
+                self.assertEqual(api.call_count, 2)  # Transcription did not execute a command.
+                with patch("assistant_api.datetime", wraps=datetime) as clock:
+                    clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+                    dialog.send.click()
+                    dialog.worker.run()
+                dialog.finished()
+                self.assertEqual(api.call_count, 3)
+                self.assertEqual(dialog.result["plan"]["purpose"], "transport_check")
+                self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertEqual(before, self.business())
+
     def test_actual_saved_prices_five_hours_2600_and_no_transport(self):
         self.fixture_shift()
         before = self.business()
@@ -400,5 +541,5 @@ class AssistantUiTests(unittest.TestCase):
         self.assertIn("не настроен", dialog.state.text())
         self.assertFalse(dialog.pdf.isEnabled())
         self.assertFalse(dialog.confirm_mail.isEnabled())
-        rendered = result_text(dict(source="Test", notice="No changes", records=[]))
+        rendered = result_text(dict(plan=plan(), source="Test", notice="No changes", records=[]))
         self.assertIn("записей нет", rendered)
