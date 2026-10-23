@@ -9,7 +9,7 @@ from ob_calculator import calculate_work_interval, load_ob_rules
 
 
 RULES_VERSION = "payroll-1"
-WRITES_ENABLED = True
+WRITES_ENABLED = False
 PARAMETERS = ("vacation", "tax", "employer_fee", "atf", "sick")
 
 
@@ -383,14 +383,14 @@ def customer_payroll(cursor, company, object_names, start, end):
         lines = [line for p in frozen for line in p["lines"]]
         excluded = []
         for row, segments in source_rows(cursor, "shifts", employee, start, end):
-            if any(p["date_from"] <= row["date"] <= p["date_to"] for p in frozen):
-                excluded.append(row["sync_id"])
-                continue
             line = calculate_line(row, segments, rates, zones, start, end)
             if line:
                 # A night shift may enter a frozen period from the preceding day.
-                line = dict(line, segments=[s for s in line["segments"] if not any(
-                    p["date_from"] <= s["date"] <= p["date_to"] for p in frozen)])
+                remaining = [s for s in line["segments"] if not any(
+                    p["date_from"] <= s["date"] <= p["date_to"] for p in frozen)]
+                if len(remaining) != len(line["segments"]):
+                    excluded.append(row["sync_id"])
+                line = dict(line, segments=remaining)
                 lines.append(line)
         item = dict(base_amount=Decimal(0), ob_premium=Decimal(0), rates=set(), warnings=[])
         relevant = False

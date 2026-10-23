@@ -229,6 +229,18 @@ class PayrollHistoryTests(unittest.TestCase):
         self.assertEqual(len(draft["lines"]), 1)
         self.assertIsNone(draft["amounts"])
 
+    def test_one_closed_night_date_does_not_hide_unclosed_next_date(self):
+        self.db.execute("DELETE FROM shifts")
+        self.add("night", "2026-10-21", 6, start="22:00", end="04:00")
+        self.zone()
+        self.action("rate", effective_from="2026-10-01", rate=100)
+        draft = self.preview(start="2026-10-21", end="2026-10-21")
+        self.action("close", date_from="2026-10-21", date_to="2026-10-21",
+                    parameters=PARAMS, preview_hash=draft["preview_hash"])
+        report = payroll.customer_payroll(self.db.cursor(), "Customer", ["Site"],
+                                          "2026-10-01", "2026-10-31")
+        self.assertEqual(report["Worker"]["total"], 600)
+
 
 if __name__ == "__main__":
     unittest.main()
