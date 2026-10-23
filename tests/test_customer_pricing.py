@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import test_customer_report as reports
 import test_ob_transport as transport
-from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, parse_pricing, row_prices, store_pricing
+from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, fill_missing_prices, parse_pricing, row_prices, store_pricing
 
 
 class HistoricalPricesTests(unittest.TestCase):
@@ -30,6 +30,10 @@ class HistoricalPricesTests(unittest.TestCase):
                 operation TEXT,base_version INTEGER,payload_json TEXT,state TEXT,created_at TEXT);
             CREATE TABLE balance(id INTEGER,change_amount REAL);
             INSERT INTO balance VALUES(1,100),(2,-20),(3,35);
+            ALTER TABLE employees ADD COLUMN is_active INTEGER DEFAULT 1;
+            ALTER TABLE objects ADD COLUMN is_active INTEGER DEFAULT 1;
+            ALTER TABLE shifts ADD COLUMN work_transport_cache REAL DEFAULT 0;
+            ALTER TABLE shifts ADD COLUMN ob_base_rate REAL;
         """)
         ensure_pricing_schema(master.cursor(), "shifts")
         master.commit()
@@ -49,6 +53,127 @@ class HistoricalPricesTests(unittest.TestCase):
         store_pricing(self.conn.cursor(), "shifts", identifier, quote)
         self.conn.commit()
         return identifier
+
+    def load_history(self):
+        if not hasattr(self.window, "table_shifts"):
+            self.window.table_shifts = self.desktop.QTableWidget(0, 15)
+        with patch.object(self.window, "load_dropdowns"), \
+                patch.object(self.window, "apply_shifts_filters"), \
+                patch.object(self.desktop.QMessageBox, "critical") as error:
+            self.window.load_shifts_history()
+        error.assert_not_called()
+
+    def confirm_period(self, base="520", ob1="125", ob2="175"):
+        def accept(dialog):
+            fields = dialog.findChildren(self.desktop.QLineEdit)
+            for field, value in zip(fields, (base, "450", ob1, ob2)):
+                if field.objectName() != "customer_price_comment":
+                    field.setText(value)
+            return self.desktop.QDialog.DialogCode.Accepted
+        with patch.object(self.desktop.QDialog, "exec", accept), \
+                patch.object(self.desktop.QMessageBox, "information") as info, \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(self.window, "background_sync_with_cloud"), \
+                patch.object(self.window, "load_shifts_history"):
+            self.window.confirm_customer_prices()
+        warning.assert_not_called()
+        return info.call_args.args[2]
+
+    def test_period_prices_feed_history_editor_and_report_without_duplicate_entry(self):
+        identifier = self.shift(confirmed=False)
+        self.confirm_period()
+        self.load_history()
+        self.assertEqual(self.window.table_shifts.item(0, 8).text(), "520.00")
+        self.assertEqual(self.window.generate_invoice()["prepared_rows"][0]["rate"], 520)
+        self.assertEqual(self.conn.execute("SELECT rate FROM shifts").fetchone()[0], 0)
+        before = self.conn.execute("SELECT customer_pricing FROM shifts").fetchone()[0]
+        self.window.table_shifts.selectRow(0)
+        def accept(dialog):
+            self.assertEqual(dialog.findChild(self.desktop.QDoubleSpinBox, "edit_shift_rate").value(), 520)
+            return self.desktop.QDialog.DialogCode.Accepted
+        with patch.object(self.desktop.QDialog, "exec", accept), \
+                patch.object(self.desktop.QMessageBox, "information"), \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(self.window, "background_sync_with_cloud"), \
+                patch.object(self.window, "load_shifts_history"):
+            self.window.edit_shift()
+        warning.assert_not_called()
+        self.assertEqual(self.conn.execute("SELECT customer_pricing FROM shifts").fetchone()[0], before)
+        self.assertEqual(row_prices(dict(self.conn.execute("SELECT * FROM shifts").fetchone()))["base"], 520)
+        self.assertEqual(self.window.generate_invoice()["totals"]["invoice_total"], 4160)
+
+    def test_bulk_prices_keep_individual_quotes_legacy_zero_and_noop_repeat(self):
+        legacy_id = self.shift(rate=610, confirmed=False)
+        explicit_id = self.shift(rate=600)
+        zero_id = self.shift()
+        row = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (zero_id,)).fetchone())
+        quote = json.loads(row["customer_pricing"])
+        quote["base"] = 0
+        store_pricing(self.conn.cursor(), "shifts", zero_id, quote)
+        self.conn.commit()
+        message = self.confirm_period()
+        self.assertIn("Индивидуальные цены сохранены без замены", message)
+        for identifier, expected in ((legacy_id, 610), (explicit_id, 600), (zero_id, 0)):
+            row = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone())
+            self.assertEqual(row_prices(row)["base"], expected)
+        before = list(map(tuple, self.conn.execute("SELECT * FROM customer_price_audit")))
+        queued = self.conn.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0]
+        self.confirm_period()
+        self.assertEqual(list(map(tuple, self.conn.execute("SELECT * FROM customer_price_audit"))), before)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0], queued)
+        self.assertEqual(self.window.generate_invoice()["totals"]["work_amount"], (610 + 600) * 8)
+
+    def test_ob_history_shows_client_base_and_premiums_not_payroll(self):
+        identifier = self.ob()
+        self.conn.execute("UPDATE shifts SET customer_pricing=NULL,start_time='16:00',end_time='20:00'")
+        self.conn.commit()
+        segments = list(map(tuple, self.conn.execute("SELECT * FROM ob_segments")))
+        self.load_history()
+        self.assertEqual(self.window.table_shifts.item(0, 8).text(), "Не задана")
+        self.assertEqual(self.window.table_shifts.item(0, 13).text(), "Не задана")
+        self.confirm_period()
+        self.load_history()
+        self.assertEqual(self.window.table_shifts.item(0, 8).text(), "520.00")
+        self.assertEqual(self.window.table_shifts.item(0, 13).text(), "125.00")
+        self.assertEqual(self.window.table_shifts.item(0, 14).text(), "Не задана")
+        self.assertEqual(list(map(tuple, self.conn.execute("SELECT * FROM ob_segments"))), segments)
+        self.assertEqual(self.window.generate_invoice()["totals"]["ob_amount"], 250)
+        self.window.table_shifts.selectRow(0)
+        def accept(dialog):
+            base = dialog.findChild(self.desktop.QDoubleSpinBox, "edit_shift_rate")
+            ob1 = dialog.findChild(self.desktop.QDoubleSpinBox, "edit_shift_client_ob1")
+            self.assertEqual(base.value(), 520)
+            self.assertFalse(base.isHidden())
+            self.assertEqual(ob1.value(), 125)
+            base.setValue(550)
+            ob1.setValue(150)
+            return self.desktop.QDialog.DialogCode.Accepted
+        with patch.object(self.desktop.QDialog, "exec", accept), \
+                patch.object(self.desktop.QMessageBox, "information"), \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(self.window, "background_sync_with_cloud"), \
+                patch.object(self.window, "load_shifts_history"):
+            self.window.edit_shift()
+        warning.assert_not_called()
+        report = self.window.generate_invoice()
+        self.assertEqual(report["totals"]["work_amount"], 2200)
+        self.assertEqual(report["totals"]["ob_amount"], 300)
+        self.assertEqual(list(map(tuple, self.conn.execute("SELECT * FROM ob_segments"))), segments)
+        self.load_history()
+        self.assertEqual(self.window.table_shifts.item(0, 8).text(), "550.00")
+        self.assertEqual(self.window.table_shifts.item(0, 13).text(), "150.00")
+
+    def test_merging_missing_prices_does_not_extend_individual_validity(self):
+        identifier = self.shift()
+        row = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone())
+        proposed = dict(json.loads(row["customer_pricing"]), base=600, date_from="2026-10-01", date_to="2026-10-31",
+                        ob={"weekday_early_evening": 100})
+        merged, retained = fill_missing_prices(row, proposed)
+        self.assertEqual(merged["base"], 520)
+        self.assertIn("base", retained)
+        self.assertEqual(merged["ob"]["weekday_early_evening"], 100)
+        self.assertEqual(merged["date_from"], row["date"])
+        self.assertEqual(merged["date_to"], row["date"])
 
     def test_close_and_reopen_work_and_ob_noop_repeat_and_balance_unchanged(self):
         self.confirmed_ob()

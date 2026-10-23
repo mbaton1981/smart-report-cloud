@@ -314,6 +314,52 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                     QTest.qWait(100)
                     result["main_tabs"].append(bar.tabText(index))
                     capture(f"main-tab-{index}")
+                QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(0).center())
+                table = window.table_shifts
+                if "Клиентская ставка" not in table.horizontalHeaderItem(8).text():
+                    raise RuntimeError("Client rate history header is missing")
+                if "Зарплата" not in table.horizontalHeaderItem(12).text():
+                    raise RuntimeError("Payroll OB is not labelled separately")
+                with closing(connection()) as history_connection:
+                    records = {
+                        str(row["id"]): dict(row)
+                        for row in history_connection.execute("SELECT * FROM shifts")
+                    }
+                ob_row = None
+                for index in range(table.rowCount()):
+                    row = records[table.item(index, 0).text()]
+                    if row["entry_type"] not in ("work", "ob"):
+                        continue
+                    prices = app_module.row_prices(row)
+                    for column, rate in (
+                        (8, prices["base"]),
+                        (13, prices["ob"].get("weekday_early_evening")),
+                        (14, prices["ob"].get("weekday_late_evening_night")),
+                    ):
+                        if column != 8 and row["entry_type"] != "ob":
+                            continue
+                        expected = f"{rate:.2f}" if rate is not None else "Не задана"
+                        if table.item(index, column).text() != expected:
+                            raise RuntimeError("History client prices differ from report pricing")
+                    if row["entry_type"] == "ob":
+                        ob_row = index
+                table.horizontalScrollBar().setValue(0)
+                capture("client-prices-history")
+                table.horizontalScrollBar().setValue(table.horizontalScrollBar().maximum())
+                QTest.qWait(100)
+                capture("client-ob-columns")
+                if ob_row is not None:
+                    table.selectRow(ob_row)
+                    def inspect_client_editor():
+                        dialog = application.activeModalWidget()
+                        if dialog is None:
+                            failures.append("Missing shift editor")
+                            return
+                        dialog.grab().save(str(work / "client-ob-editor.png"))
+                        dialog.reject()
+                    QTimer.singleShot(200, inspect_client_editor)
+                    window.edit_shift()
+                result["history_client_prices_match_report"] = True
                 QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(4).center())
                 QTest.qWait(200)
                 if window.tabs.currentWidget().widget() is not window.tab_invoice:
@@ -323,18 +369,18 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 window.inv_comp_cb.setCurrentText("Renatur")
                 for field in (window.inv_date_from, window.inv_date_to):
                     field.setDate(QDate(2026, 10, 21))
-                for identifier, label, hours, known, final in (
-                    (39, "tomteboda", 4, None, None),
-                    (84, "hotel", 8, None, None),
+                for identifier, label, hours in (
+                    (39, "tomteboda", 4),
+                    (84, "hotel", 8),
                 ):
                     window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identifier))
                     click(button("Просмотр сводки"))
                     report = window._invoice_report
-                    if (report["totals"]["hours"] != hours
-                            or report["totals"]["known_subtotal"] != known
-                            or report["totals"]["invoice_total"] != final
-                            or report["recorded_trips"] != 1):
+                    if report["totals"]["hours"] != hours or report["recorded_trips"] != 1:
                         raise RuntimeError("Existing real report differs: " + label)
+                    for shift in report["journal_rows"]:
+                        if app_module.row_prices(shift) != app_module.row_prices(records[str(shift["id"])]):
+                            raise RuntimeError("Report prices differ from the persisted history prices")
                     if window.table_dagbok.rowCount() != len(report["journal_rows"]):
                         raise RuntimeError("Journal rows differ from shared report")
                     capture(label + "-summary")
@@ -350,7 +396,8 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                             or "SEK" in journal or "Löneunderlag" in first + journal
                             or "1 229" in first + journal):
                         raise RuntimeError("Combined PDF sections are invalid")
-                    if final is None and ("Preliminärt totalbelopp" not in first or "utan ej fastställda" not in first):
+                    if report["totals"]["invoice_total"] is None and (
+                            "Preliminärt totalbelopp" not in first or "utan ej fastställda" not in first):
                         raise RuntimeError("Missing explicit preliminary total")
                     inner = window.report_pages.tabBar()
                     QTest.mouseClick(inner, Qt.MouseButton.LeftButton, pos=inner.tabRect(1).center())
@@ -372,7 +419,7 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 window.inv_date_to.setDate(QDate(2026, 10, 31))
                 click(button("Просмотр сводки"))
                 report = window._invoice_report
-                if (report["totals"]["hours"] != 22 or report["totals"]["invoice_total"] is not None
+                if (report["totals"]["hours"] != 22
                         or report["recorded_trips"] != 3 or len(report["journal_rows"]) != 3):
                     raise RuntimeError("Actual HOTEL October scenario differs from the reported failure")
                 original_descriptions = {row["id"]: row["comment"] for row in report["journal_rows"]}
@@ -384,12 +431,12 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 monthly_pdf = next(work.glob("Fakturaunderlag_*" + report["object"] + "*2026-10-01_till_2026-10-31.pdf"))
                 monthly_reader = PdfReader(monthly_pdf)
                 monthly_text = "\n".join(page.extract_text() for page in monthly_reader.pages)
-                for expected in ("Preliminärt totalbelopp", "22,0", "2026-10-20", "2026-10-21", "2026-10-22",
+                for expected in ("Totalt antal timmar", "22,0", "2026-10-20", "2026-10-21", "2026-10-22",
                                  "dörrar och invändiga fönster i rummen"):
                     if expected not in monthly_text:
                         raise RuntimeError("Missing HOTEL monthly PDF content: " + expected)
                 result["hotel_october"] = {
-                    "hours": 22, "invoice_total": None, "recorded_trips": 3,
+                    "hours": 22, "invoice_total": report["totals"]["invoice_total"], "recorded_trips": 3,
                     "journal_rows": 3, "original_descriptions": original_descriptions,
                     "pdf": str(monthly_pdf), "pages": len(monthly_reader.pages),
                 }
@@ -439,15 +486,26 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 if (note.document().size().height() > note.viewport().height()
                         and note.verticalScrollBar().maximum() == 0):
                     raise RuntimeError("Pricing diagnostics are clipped without a scrollbar")
-                with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
-                        patch.object(QMessageBox, "warning") as warning:
-                    click(button("Закрыть период"))
-                    if not warning.called or "не подтверждены" not in warning.call_args.args[2]:
-                        raise RuntimeError("Unknown customer prices did not block final closing")
+                unknown_close_blocked = None
+                missing_open_prices = False
+                for row in tom["journal_rows"]:
+                    if row["invoiced"] or row["entry_type"] not in ("work", "ob"):
+                        continue
+                    try:
+                        app_module.require_final_prices(row, tom["journal_segments"].get(row["sync_id"], []))
+                    except ValueError:
+                        missing_open_prices = True
+                if missing_open_prices:
+                    with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+                            patch.object(QMessageBox, "warning") as warning:
+                        click(button("Закрыть период"))
+                        if not warning.called or "не подтверждены" not in warning.call_args.args[2]:
+                            raise RuntimeError("Unknown customer prices did not block final closing")
+                    unknown_close_blocked = True
                 click(button("Сформировать общий PDF"))
                 result["tomteboda_october"] = {
                     "totals": tom["totals"], "rows": len(tom["journal_rows"]),
-                    "unknown_close_blocked": True, "status_detail": window.invoice_status_note.toPlainText(),
+                    "unknown_close_blocked": unknown_close_blocked, "status_detail": window.invoice_status_note.toPlainText(),
                 }
                 def inspect_prices():
                     dialog = application.activeModalWidget()
@@ -456,8 +514,11 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                         return
                     dialog.grab().save(str(work / "customer-prices-dialog.png"))
                     dialog.reject()
-                QTimer.singleShot(200, inspect_prices)
-                click(button("Клиентские цены"))
+                if any(not row["invoiced"] for row in tom["journal_rows"]):
+                    QTimer.singleShot(200, inspect_prices)
+                    click(button("Клиентские цены"))
+                else:
+                    result["pricing_dialog_skipped"] = "All actual records are closed; no reopening performed"
                 if failures:
                     raise RuntimeError("; ".join(failures))
             except Exception as error:

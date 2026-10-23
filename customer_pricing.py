@@ -102,6 +102,41 @@ def row_prices(row):
     return {"base": saved if saved else None, "travel": None, "ob": {}}
 
 
+def fill_missing_prices(row, value):
+    """Period prices fill gaps without overwriting individually agreed prices."""
+    proposed = parse_pricing(value, row)
+    previous = parse_pricing(row.get("customer_pricing"), row)
+    existing = row_prices(row)
+    merged = dict(proposed, ob=dict(proposed["ob"]))
+    retained = []
+    added = False
+    for key in ("base", "travel"):
+        old, new = existing[key], proposed[key]
+        if old is not None:
+            merged[key] = old
+            if new is not None and new != old:
+                retained.append(key)
+        elif new is not None:
+            added = True
+    for category in existing["ob"].keys() | proposed["ob"].keys():
+        old, new = existing["ob"].get(category), proposed["ob"].get(category)
+        if old is not None:
+            merged["ob"][category] = old
+            if new is not None and new != old:
+                retained.append(category)
+        elif new is not None:
+            added = True
+    if previous:
+        if not added:
+            return previous, retained
+        merged["date_from"] = max(previous["date_from"], proposed["date_from"])
+        merged["date_to"] = min(previous["date_to"], proposed["date_to"])
+    elif existing["base"] is not None:
+        # A legacy individual rate is evidence for this record, not the whole period.
+        merged["date_from"] = merged["date_to"] = row["date"]
+    return merged, retained
+
+
 def require_final_prices(row, segments):
     prices = row_prices(row)
     missing = []

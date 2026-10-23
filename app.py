@@ -38,7 +38,7 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
-from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, require_final_prices, row_prices, store_pricing
+from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -2359,7 +2359,7 @@ class SmartReportApp(QMainWindow):
 
         self.hours_input = QLineEdit("8.0")
         self.rate_input = QLineEdit()
-        self.rate_input.setPlaceholderText("Клиентская цена SEK/ч; пусто — неизвестна")
+        self.rate_input.setPlaceholderText("Не задана")
         self.trans_input = QLineEdit("0")
         self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
@@ -2378,7 +2378,7 @@ class SmartReportApp(QMainWindow):
         self.record_type_status_lbl.setWordWrap(True)
         card_layout.addRow(self.record_type_status_lbl)
         card_layout.addRow("Часы:", self.hours_input)
-        card_layout.addRow("Фактурная ставка (крон/час):", self.rate_input)
+        card_layout.addRow("Клиентская ставка (SEK/ч):", self.rate_input)
         card_layout.addRow("Транспорт (0 или 1):", self.trans_input)
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
         card_layout.addRow("Время начала:", self.ob_start_time)
@@ -2388,7 +2388,7 @@ class SmartReportApp(QMainWindow):
         self._ob_form_widgets = (
             self.ob_start_time, self.ob_end_time, self.ob_preview_lbl,
         )
-        self._standard_hour_widgets = (self.hours_input, self.rate_input)
+        self._standard_hour_widgets = (self.hours_input,)
         self.record_type_cb.currentIndexChanged.connect(self.update_ob_form_visibility)
         self.date_input.dateChanged.connect(self.refresh_ob_preview)
         self.ob_start_time.currentTextChanged.connect(self.refresh_ob_preview)
@@ -2480,8 +2480,8 @@ class SmartReportApp(QMainWindow):
         
         self.table_shifts = QTableWidget()
         self.table_shifts.setMinimumHeight(220)
-        self.table_shifts.setColumnCount(13)
-        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Факт. ставка", "Транспорт", "Комментарий", "Статус фактуры", "OB сумма (SEK)"])
+        self.table_shifts.setColumnCount(15)
+        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Клиентская ставка (SEK/ч)", "Транспорт", "Комментарий", "Статус фактуры", "Зарплата OB (SEK)", "Клиентская доплата OB1 (SEK/ч)", "Клиентская доплата OB2 (SEK/ч)"])
         self.table_shifts.setColumnHidden(0, True)
         shifts_header = self.table_shifts.horizontalHeader()
         shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -2493,10 +2493,12 @@ class SmartReportApp(QMainWindow):
             5: 75,   # Тип: узкая (Работа / OB / АТФ / Больничный)
             6: 60,   # Часы: узкая под 2-3 цифры (напр. 8.0)
             7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
-            8: 80,   # Факт. ставка: максимально узкая
+            8: 130,
             9: 70,   # Транспорт: узкая под 0.0 / 1.0
             11: 110, # Статус фактуры: узкая под статус (⌛ В работе / ✅ Выставлен)
             12: 95,  # OB сумма (SEK)
+            13: 130,
+            14: 130,
         }.items():
             self.table_shifts.setColumnWidth(column, width)
         shifts_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)  # Комментарий: забирает всё свободное место
@@ -8746,6 +8748,8 @@ class SmartReportApp(QMainWindow):
                 "Введите подтверждённые вами клиентские цены, не зарплатные ставки.\n"
                 "При сохранении подтверждение и дата записываются автоматически.\n"
                 "Пусто — неизвестно; 0 — подтверждённая нулевая цена.\n"
+                "Заполняются только неизвестные цены; индивидуальные цены сохраняются.\n"
+                "Индивидуальную цену можно изменить в записи смены.\n"
                 "Для разных цен выберите отдельные периоды. Транспорт — цена за записанную единицу."
             )
             note.setWordWrap(True)
@@ -8755,7 +8759,7 @@ class SmartReportApp(QMainWindow):
                 (category, f"{INVOICE_OB_CATEGORY_LABELS.get(category, category)}, доплата SEK/ч") for category in categories
             ]:
                 field = QLineEdit()
-                field.setPlaceholderText("Неизвестно")
+                field.setPlaceholderText("Не задана")
                 fields[key] = field
                 form.addRow(label, field)
             source = QLineEdit()
@@ -8786,11 +8790,16 @@ class SmartReportApp(QMainWindow):
                 cursor = conn.cursor()
                 ensure_pricing_schema(cursor, "shifts")
                 changed = []
+                retained = []
                 for old in candidates:
                     current = cursor.execute("SELECT * FROM shifts WHERE id=?", (old["id"],)).fetchone()
                     if current is None or dict(current) != old:
                         raise ValueError("Записи изменились. Обновите отчёт перед подтверждением цен.")
-                    row_quote = dict(quote, object_name=current["object_name"])
+                    row_quote, protected = fill_missing_prices(
+                        dict(current), dict(quote, object_name=current["object_name"])
+                    )
+                    if protected:
+                        retained.append(f"№{current['id']}")
                     if store_pricing(cursor, "shifts", current["sync_id"], row_quote):
                         changed.append(current["id"])
                 if changed:
@@ -8802,8 +8811,13 @@ class SmartReportApp(QMainWindow):
                 raise
             finally:
                 conn.close()
-            QMessageBox.information(self, "Клиентские цены", f"Сохранены цены: {len(changed)} записей. Зарплатные ставки не изменены.")
+            message = f"Сохранены цены: {len(changed)} записей. Зарплатные ставки не изменены."
+            if retained:
+                message += "\nИндивидуальные цены сохранены без замены: " + ", ".join(retained)
+            QMessageBox.information(self, "Клиентские цены", message)
             self.generate_invoice()
+            if hasattr(self, "table_shifts"):
+                self.load_shifts_history()
             if changed:
                 self.background_sync_with_cloud()
         except (ValueError, sqlite3.Error) as error:
@@ -9243,7 +9257,7 @@ class SmartReportApp(QMainWindow):
         
         self.table_objects = QTableWidget()
         self.table_objects.setColumnCount(6)
-        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Факт. ставка (kr/ч)", "Транспорт (kr/выезд)", "Состояние"])
+        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Клиентская ставка (SEK/ч)", "Транспорт (kr/выезд)", "Состояние"])
         
         obj_header = self.table_objects.horizontalHeader()
         obj_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -10035,21 +10049,25 @@ class SmartReportApp(QMainWindow):
         hours_val = ob_result["total_hours"] if ob_result else parse_float(self.hours_input.text(), -1)
         
         rate_input_str = self.rate_input.text().strip()
-        if ob_result:
-            rate_val = 0.0
-        elif rate_input_str:
+        if rate_input_str:
             rate_val = parse_float(rate_input_str, -1)
         else:
             rate_val = 0.0
 
         trans_val = parse_float(self.trans_input.text(), 0.0)
         comment = self.comment_input.text().strip()
+        customer_base_rate = rate_val if rate_input_str else None
         if record_type == RECORD_TYPE_OB:
             rate_val = 0.0
         elif record_type in SPECIAL_OBJECTS:
             rate_val = 0.0
             trans_val = 0.0
 
+        if (customer_base_rate is not None and (
+                not math.isfinite(customer_base_rate) or not 0 <= customer_base_rate <= 100000)):
+            conn.close()
+            QMessageBox.warning(self, "Ошибка", "Клиентская ставка должна быть от 0 до 100000 SEK.")
+            return
         if (not math.isfinite(hours_val) or not math.isfinite(rate_val)
                 or hours_val < 0 or not 0 <= rate_val <= 100000
                 or not math.isfinite(trans_val) or not 0 <= trans_val <= 10000):
@@ -10076,11 +10094,12 @@ class SmartReportApp(QMainWindow):
                 (ob_result["start_time"], ob_result["end_time"], ob_result["segments"][0]["base_rate"], shift_id),
             )
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
-        if record_type == RECORD_TYPE_WORK and rate_input_str:
+        if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) and rate_input_str:
             store_pricing(cursor, "shifts", sync_id, {
                 "version": 1, "company": comp, "object_name": obj_name,
                 "date_from": date, "date_to": date, "source": "Ручной ввод клиентской цены при создании записи",
-                "base": rate_val, "travel": None, "ob": {},
+                "base": customer_base_rate, "travel": None, "ob": {},
+                "confirmed": True, "confirmed_at": datetime.now(timezone.utc).isoformat(),
             })
         elif record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
             quote = agreed_prices_for_date(cursor, "shifts", {
@@ -10119,10 +10138,7 @@ class SmartReportApp(QMainWindow):
             conn = get_db_connection()
             cursor = conn.cursor()
             has_ob_schema = ob_schema_ready(cursor)
-            if has_ob_schema:
-                cursor.execute("SELECT id, date, employee, company, object_name, entry_type, hours, rate, transport, comment, invoiced, start_time, end_time, sync_id FROM shifts ORDER BY id DESC LIMIT 200")
-            else:
-                cursor.execute("SELECT id, date, employee, company, object_name, entry_type, hours, rate, transport, comment, invoiced FROM shifts ORDER BY id DESC LIMIT 200")
+            cursor.execute("SELECT * FROM shifts ORDER BY id DESC LIMIT 200")
             rows = cursor.fetchall()
 
             ob_segments_by_id = {}
@@ -10143,6 +10159,10 @@ class SmartReportApp(QMainWindow):
                 if entry_type == RECORD_TYPE_WORK and has_start and has_end:
                     entry_type = RECORD_TYPE_OB
                 short_type = record_type_short_label(entry_type)
+                prices = row_prices(dict(row)) if entry_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else None
+
+                def client_rate(value):
+                    return f"{value:.2f}" if value is not None else "Не задана"
 
                 detalization = ""
                 ob_amount_str = ""
@@ -10169,7 +10189,7 @@ class SmartReportApp(QMainWindow):
                         detail_tooltip = ";\n".join(
                             f"{s['segment_date']} {s['start_time']}–{s['end_time']}: {s['hours']:.2f} ч (×{s['multiplier']:.2f}, {s['amount']:.2f} kr)"
                             for s in segments
-                        ) + f"\nИтого OB: {ob_amount:.2f} kr"
+                        ) + f"\nЗарплатное начисление OB: {ob_amount:.2f} kr (не клиентские доплаты)"
                 elif entry_type == RECORD_TYPE_ATF:
                     detalization = "АТФ (p1000)"
                 elif entry_type == RECORD_TYPE_SICK:
@@ -10188,19 +10208,23 @@ class SmartReportApp(QMainWindow):
                     short_type,                                      # 5: Тип
                     f"{float(row['hours'] or 0.0):.1f}",             # 6: Часы
                     detalization,                                    # 7: Детализация / OB
-                    f"{float(row['rate'] or 0.0):.2f}" if row['rate'] else "0.00", # 8: Факт. ставка
+                    client_rate(prices["base"]) if prices else "—",
                     f"{float(row['transport'] or 0.0):.1f}" if row['transport'] else "0.0", # 9: Транспорт
                     row["comment"] or "",                            # 10: Комментарий
                     status_text,                                     # 11: Статус фактуры
                     ob_amount_str,                                   # 12: OB сумма (SEK)
+                    client_rate(prices["ob"].get("weekday_early_evening")) if entry_type == RECORD_TYPE_OB else "—",
+                    client_rate(prices["ob"].get("weekday_late_evening_night")) if entry_type == RECORD_TYPE_OB else "—",
                 ]
 
                 for col_idx, val in enumerate(values):
                     it = QTableWidgetItem(str(val))
-                    if col_idx in (1, 5, 6, 8, 9, 11, 12):
+                    if col_idx in (1, 5, 6, 8, 9, 11, 12, 13, 14):
                         it.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                     if col_idx == 7 and detail_tooltip:
                         it.setToolTip(detail_tooltip)
+                    elif col_idx in (8, 13, 14):
+                        it.setToolTip("Применённая историческая клиентская цена из того же снимка, что и в отчёте. Не зарплатная ставка.")
                     elif col_idx in (2, 3, 4, 7, 10) and val:
                         it.setToolTip(str(val))
                     if is_inv:
@@ -10232,9 +10256,11 @@ class SmartReportApp(QMainWindow):
         conn.close()
         if not shift:
             return
+        client_prices = row_prices(dict(shift))
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Изменить смену")
+        dialog.setMinimumWidth(650)
         form = QFormLayout(dialog)
         date_field = create_date_field(shift['date'])
         employee_field = QComboBox()
@@ -10302,9 +10328,23 @@ class SmartReportApp(QMainWindow):
         hours_field.setDecimals(1)
         hours_field.setValue(shift['hours'])
         rate_field = QDoubleSpinBox()
-        rate_field.setRange(0, 100000)
+        rate_field.setRange(-1, 100000)
+        rate_field.setSpecialValueText("Не задана")
         rate_field.setDecimals(2)
-        rate_field.setValue(shift['rate'])
+        rate_field.setValue(client_prices["base"] if client_prices["base"] is not None else -1)
+        client_ob_fields = {}
+        for category, name in (
+            ("weekday_early_evening", "edit_shift_client_ob1"),
+            ("weekday_late_evening_night", "edit_shift_client_ob2"),
+        ):
+            field = QDoubleSpinBox()
+            field.setObjectName(name)
+            field.setRange(-1, 100000)
+            field.setSpecialValueText("Не задана")
+            field.setDecimals(2)
+            value = client_prices["ob"].get(category)
+            field.setValue(value if value is not None else -1)
+            client_ob_fields[category] = field
         original_transport = float(shift["transport"] or 0)
         if original_transport in (0, 1):
             transport_field = QCheckBox("Учитывать поездку")
@@ -10341,14 +10381,12 @@ class SmartReportApp(QMainWindow):
 
         def update_type_values():
             new_type = record_type_field.currentData()
-            if previous_type[0] == RECORD_TYPE_WORK and new_type != RECORD_TYPE_WORK:
+            if previous_type[0] in (RECORD_TYPE_WORK, RECORD_TYPE_OB) and new_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
                 work_values[0] = rate_field.value()
                 work_values[1] = transport_amount()
-                rate_field.setValue(0.0)
-            elif previous_type[0] != RECORD_TYPE_WORK and new_type == RECORD_TYPE_WORK:
+                rate_field.setValue(-1)
+            elif previous_type[0] not in (RECORD_TYPE_WORK, RECORD_TYPE_OB) and new_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
                 rate_field.setValue(work_values[0])
-            elif new_type != RECORD_TYPE_WORK:
-                rate_field.setValue(0.0)
             if new_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
                 if previous_type[0] in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
                     transport_value[0] = transport_amount()
@@ -10397,11 +10435,16 @@ class SmartReportApp(QMainWindow):
 
         def update_dialog_ob_visibility(*_):
             is_ob = record_type_field.currentData() == RECORD_TYPE_OB
-            for widget in (hours_field, rate_field):
+            for widget in (hours_field,):
                 widget.setVisible(not is_ob)
                 label = form.labelForField(widget)
                 if label:
                     label.setVisible(not is_ob)
+            for widget in client_ob_fields.values():
+                widget.setVisible(is_ob)
+                label = form.labelForField(widget)
+                if label:
+                    label.setVisible(is_ob)
             for widget in (ob_start_field, ob_end_field, ob_preview_field):
                 widget.setVisible(is_ob)
                 label = form.labelForField(widget)
@@ -10422,12 +10465,17 @@ class SmartReportApp(QMainWindow):
         form.addRow("Тип записи:", record_type_field)
         form.addRow("Объект:", object_field)
         form.addRow("Часы:", hours_field)
-        form.addRow("Клиентская цена SEK/ч:", rate_field)
+        form.addRow("Клиентская ставка (база), SEK/ч:", rate_field)
+        for category, label in (
+            ("weekday_early_evening", "Клиентская доплата OB1, SEK/ч:"),
+            ("weekday_late_evening_night", "Клиентская доплата OB2, SEK/ч:"),
+        ):
+            form.addRow(label, client_ob_fields[category])
         form.addRow("Транспорт:", transport_field)
         form.addRow("Комментарий:", comment_field)
         form.addRow("Время начала:", ob_start_field)
         form.addRow("Время окончания:", ob_end_field)
-        form.addRow("Рассчитанные OB-сегменты:", ob_preview_field)
+        form.addRow("Зарплатные OB-сегменты (не цены заказчику):", ob_preview_field)
         update_dialog_ob_visibility()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -10498,11 +10546,14 @@ class SmartReportApp(QMainWindow):
             "date": payload_date, "employee": selected_employee_name(),
             "company": company_field.currentText().strip(), "object_name": object_name,
             "hours": shift["hours"] if preserve_ob else ob_result["total_hours"] if ob_result else hours_field.value(),
-            "rate": rate_field.value() if record_type == RECORD_TYPE_WORK else 0.0,
+            "rate": max(0.0, rate_field.value()) if record_type == RECORD_TYPE_WORK else 0.0,
             "transport": transport_amount() if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0.0,
             "comment": comment_field.text().strip(),
             "invoiced": shift['invoiced'] or 0, "record_type": record_type
         }
+        identity_changed = any(payload[key] != shift[key] for key in ("date", "company", "object_name"))
+        if identity_changed:
+            payload["rate"] = 0.0
         if ob_result:
             payload.update({
                 "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
@@ -10536,7 +10587,7 @@ class SmartReportApp(QMainWindow):
                 ''', (
                     payload['date'], payload['employee'], payload['company'], payload['object_name'],
                     payload['hours'], payload['rate'], payload['transport'], payload['comment'], sync_id, record_type,
-                    rate_field.value() if record_type == RECORD_TYPE_WORK else work_values[0],
+                    payload["rate"] if record_type == RECORD_TYPE_WORK else max(0.0, work_values[0]),
                     transport_amount() if record_type == RECORD_TYPE_WORK else work_values[1],
                     shift["start_time"] if preserve_ob else ob_result["start_time"] if ob_result else None,
                     shift["end_time"] if preserve_ob else ob_result["end_time"] if ob_result else None,
@@ -10552,7 +10603,7 @@ class SmartReportApp(QMainWindow):
                 ''', (
                     payload['date'], payload['employee'], payload['company'], payload['object_name'],
                     payload['hours'], payload['rate'], payload['transport'], payload['comment'], sync_id, record_type,
-                    rate_field.value() if record_type == RECORD_TYPE_WORK else work_values[0],
+                    payload["rate"] if record_type == RECORD_TYPE_WORK else max(0.0, work_values[0]),
                     transport_amount() if record_type == RECORD_TYPE_WORK else work_values[1],
                     local_id
                 ))
@@ -10560,16 +10611,35 @@ class SmartReportApp(QMainWindow):
                 replace_ob_segments(cursor, sync_id, ob_result["segments"])
             elif not preserve_ob and ob_schema_ready(cursor) and shift['entry_type'] == RECORD_TYPE_OB:
                 cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
-            if "customer_pricing" in shift.keys() and shift["customer_pricing"]:
-                if any(payload[key] != shift[key] for key in ("date", "company", "object_name")):
-                    store_pricing(cursor, "shifts", sync_id, None)
-                elif record_type == RECORD_TYPE_WORK and payload["rate"] != shift["rate"]:
-                    quote = json.loads(shift["customer_pricing"])
-                    quote.update(base=payload["rate"], source="Ручное изменение клиентской цены записи")
-                    store_pricing(cursor, "shifts", sync_id, quote)
-                payload["customer_pricing"] = cursor.execute(
-                    "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)
-                ).fetchone()[0]
+            base_price = rate_field.value() if rate_field.value() >= 0 else None
+            ob_prices = dict(client_prices["ob"])
+            if record_type == RECORD_TYPE_OB:
+                ob_prices.update({
+                    category: field.value() if field.value() >= 0 else None
+                    for category, field in client_ob_fields.items()
+                })
+            prices_changed = base_price != client_prices["base"] or ob_prices != {
+                **client_prices["ob"],
+                **({category: client_prices["ob"].get(category) for category in client_ob_fields}
+                   if record_type == RECORD_TYPE_OB else {}),
+            }
+            if identity_changed or record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+                store_pricing(cursor, "shifts", sync_id, None)
+            elif prices_changed:
+                quote = json.loads(shift["customer_pricing"]) if shift["customer_pricing"] else {
+                    "version": 1, "company": payload["company"], "object_name": payload["object_name"],
+                    "date_from": payload["date"], "date_to": payload["date"], "travel": None,
+                }
+                # Editing one record must not extend its individual prices to other dates.
+                quote.update(
+                    base=base_price, ob=ob_prices, date_from=payload["date"], date_to=payload["date"],
+                    source="Ручное изменение клиентской цены записи",
+                    confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                store_pricing(cursor, "shifts", sync_id, quote)
+            payload["customer_pricing"] = cursor.execute(
+                "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)
+            ).fetchone()[0]
             enqueue_shift_operation(cursor, sync_id, 'upsert', shift['sync_version'], payload)
             conn.commit()
         except (ValueError, sqlite3.Error) as error:
