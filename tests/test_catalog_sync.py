@@ -96,6 +96,19 @@ class CatalogSyncTests(unittest.TestCase):
             json=payload,
         )
 
+    def _confirm_fixture_customer_prices(self, conn):
+        """Explicit fixture contract, not a production current-price fallback."""
+        for row in conn.execute("SELECT * FROM shifts").fetchall():
+            obj = conn.execute("SELECT * FROM objects WHERE company=? AND name=?",
+                               (row["company"], row["object_name"])).fetchone()
+            if obj is None:
+                continue
+            base = row["rate"] if row["entry_type"] == "work" and row["rate"] > 0 else obj["rate"]
+            quote = {"version": 1, "company": row["company"], "object_name": row["object_name"],
+                     "date_from": row["date"], "date_to": row["date"], "source": "Synthetic fixture contract",
+                     "base": base, "travel": obj["transport_rate"], "ob": {}}
+            conn.execute("UPDATE shifts SET customer_pricing=? WHERE id=?", (json.dumps(quote), row["id"]))
+
     def _worker(self, failure=None):
         mode = {"value": failure}
 
@@ -1534,6 +1547,7 @@ class CatalogSyncTests(unittest.TestCase):
             VALUES ('2026-10-31','Alice','Renatur','Invoice work',1,0,0,0,'ob',?,'18:00','19:00',400)
         """, (ob_id,))
         self.desktop.replace_ob_segments(desktop_conn.cursor(), ob_id, result['segments'])
+        self._confirm_fixture_customer_prices(desktop_conn)
         desktop_conn.commit()
         original_shifts = [tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')]
         desktop_conn.close()
@@ -1683,6 +1697,7 @@ class CatalogSyncTests(unittest.TestCase):
                 VALUES ('2026-10-05',?,'Renatur','Compact OB test',?,0,0,0,'ob',?,?,?,100)
             """, (employee, result['total_hours'], sync_id, start_time, end_time))
             self.desktop.replace_ob_segments(desktop_conn.cursor(), sync_id, result['segments'])
+        self._confirm_fixture_customer_prices(desktop_conn)
         desktop_conn.commit()
         desktop_conn.close()
 
@@ -1745,6 +1760,7 @@ class CatalogSyncTests(unittest.TestCase):
         calculation = self.desktop.calculate_work_interval('2026-10-21', '16:00', '20:00', 245.8)
         self.desktop.replace_ob_segments(conn.cursor(), ob_id, calculation['segments'])
         self.assertEqual(calculation['total_amount'], 1229)
+        self._confirm_fixture_customer_prices(conn)
         conn.commit()
         before = list(conn.iterdump())
         conn.close()
@@ -1777,9 +1793,10 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertIsNone(totals['ob_amount'])
                 self.assertIsNone(totals['invoice_total'])
                 self.assertEqual(report['prepared_rows'][0]['rate'], 520)
-                self.assertEqual(report['prepared_rows'][0]['status'], '⏳ В работе')
+                self.assertIn('⏳ В работе', report['prepared_rows'][0]['status'])
                 reports_dir = Path(self._case.name) / 'ob-only-pdf'
                 with patch.object(self.desktop, 'REPORTS_DIR', str(reports_dir)), \
+                     patch.object(window, '_collect_journal_translations', return_value={ob_id: 'Bevarad manuell kommentar'}), \
                      patch.object(self.desktop.os, 'startfile', create=True), \
                      patch.object(self.desktop.QMessageBox, 'information'), \
                      patch.object(self.desktop.QMessageBox, 'critical') as errors:
@@ -1811,7 +1828,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(hotel['totals']['work_amount'], 4160)
                 self.assertEqual(hotel['totals']['invoice_total'], 4610)
                 self.assertEqual(totals['hours'] + hotel['totals']['hours'], 12)
-                self.assertEqual(hotel['prepared_rows'][0]['status'], '✅ Выставлен')
+                self.assertIn('✅ Выставлен', hotel['prepared_rows'][0]['status'])
             conn = self.desktop.get_db_connection()
             self.assertEqual(list(conn.iterdump()), before)
             conn.close()
@@ -1847,8 +1864,7 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertTrue(report['warnings'])
             self.assertIn('PRELIMINÄRT', window.invoice_summary_note.text())
             self.assertTrue(any('segment' in warning for warning in report['warnings']))
-            self.assertTrue(any('timpris' in warning for warning in report['warnings']))
-            self.assertTrue(any('Resepriset' in warning for warning in report['warnings']))
+            self.assertTrue(any('Historiska kundpriser' in warning for warning in report['warnings']))
             conn = self.desktop.get_db_connection()
             self.assertEqual(list(conn.iterdump()), before)
             conn.execute('DROP TABLE ob_segments')

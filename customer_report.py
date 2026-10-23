@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import math
 import os
 from xml.sax.saxutils import escape
+from customer_pricing import row_prices
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_RIGHT
@@ -64,16 +65,39 @@ def format_quantity(value, decimal_separator=","):
 
 
 def prepare_customer_costs(report):
-    """Use recorded customer prices, falling back only to the object's price."""
+    """Use only confirmed historical customer prices; never current wage/catalogue rates."""
     grouped = defaultdict(float)
+    travel = defaultdict(float)
+    ob_costs = defaultdict(float)
+    ob_intervals = defaultdict(list)
     trips = 0.0
     for row in report["journal_rows"]:
         if row["entry_type"] not in WORK_TYPES:
             continue
-        saved_rate = row["rate"] if row["entry_type"] == "work" else row.get("work_rate_cache")
-        rate = positive_rate(saved_rate) or positive_rate(report["rate"])
-        grouped[rate] += float(row["hours"])
-        trips += float(row["transport"] or 0)
+        prices = row_prices(row)
+        grouped[prices["base"]] += float(row["hours"])
+        count = float(row["transport"] or 0)
+        travel[prices["travel"]] += count
+        trips += count
+        if row["entry_type"] == "ob":
+            for segment in report.get("journal_segments", {}).get(row["sync_id"], []):
+                if float(segment["premium_percent"] or 0) > 0:
+                    category = segment["category"]
+                    start_h, start_m = map(int, segment["start_time"].split(":"))
+                    end_h, end_m = map(int, segment["end_time"].split(":"))
+                    start, end = start_h * 60 + start_m, end_h * 60 + end_m
+                    if end <= start:
+                        end += 24 * 60
+                    ob_intervals[(row["employee"], category, segment["segment_date"])].append(
+                        (start, end, prices["ob"].get(category))
+                    )
+    for (_employee, category, _day), intervals in ob_intervals.items():
+        boundaries = sorted({point for start, end, _rate in intervals for point in (start, end)})
+        for start, end in zip(boundaries, boundaries[1:]):
+            active = {rate for left, right, rate in intervals if left <= start and right >= end}
+            if active:
+                rate = next(iter(active)) if len(active) == 1 else None
+                ob_costs[(category, rate)] += (end - start) / 60
     lines = []
     if report["is_fast_pris"]:
         lines.append({
@@ -87,22 +111,25 @@ def prepare_customer_costs(report):
                 "label": "Arbete", "quantity": hours, "unit": "h",
                 "rate": rate, "amount": money(hours, rate),
             })
-        for category, hours in sorted(report["totals"]["ob_categories"].items()):
+        for (category, rate), hours in sorted(
+            ob_costs.items(), key=lambda item: (item[0][0], item[0][1] is None, item[0][1] or 0)
+        ):
             if hours:
                 lines.append({
                     "label": CATEGORY_LABELS.get(category, "Övrig OB") + " – tillägg",
-                    "quantity": hours, "unit": "h", "rate": None, "amount": None,
+                    "quantity": hours, "unit": "h", "rate": rate, "amount": money(hours, rate),
                 })
         if report["totals"]["without_ob_hours"] is None:
             lines.append({
                 "label": "OB – fördelning ej verifierad", "quantity": None,
                 "unit": "h", "rate": None, "amount": None,
             })
-        if trips:
-            travel_rate = positive_rate(report["transport_rate"])
+        for travel_rate, count in sorted(travel.items(), key=lambda item: (item[0] is None, item[0] or 0)):
+            if not count:
+                continue
             lines.append({
-                "label": "Resa", "quantity": trips, "unit": "st",
-                "rate": travel_rate, "amount": money(trips, travel_rate),
+                "label": "Resa", "quantity": count, "unit": "st",
+                "rate": travel_rate, "amount": money(count, travel_rate),
             })
     totals = report["totals"]
     totals["work_amount"] = sum(
@@ -111,16 +138,27 @@ def prepare_customer_costs(report):
     )
     if any(line["amount"] is None for line in lines if line["label"] == "Arbete"):
         totals["work_amount"] = None
-    totals["transport_amount"] = (
-        money(trips, positive_rate(report["transport_rate"]))
-        if not report["is_fast_pris"] else 0.0
+    def component(prefix):
+        selected = [line["amount"] for line in lines if line["label"].startswith(prefix)]
+        return sum(selected) if all(value is not None for value in selected) else None
+    totals["transport_amount"] = component("Resa")
+    totals["ob_amount"] = (
+        None if report["is_fast_pris"] and (
+            totals["without_ob_hours"] is None or any(totals["ob_categories"].values())
+        ) else component("OB")
     )
-    known = float(sum(Decimal(str(line["amount"])) for line in lines if line["amount"] is not None))
+    known_values = [Decimal(str(line["amount"])) for line in lines if line["amount"] is not None]
     unknown = any(line["amount"] is None for line in lines)
+    known = float(sum(known_values)) if known_values or not unknown else None
     totals["known_subtotal"] = known
     totals["invoice_total"] = None if unknown else known
     report["cost_lines"] = lines
     report["recorded_trips"] = trips
+    if unknown:
+        report.setdefault("warnings", []).append(
+            "Historiska kundpriser saknas eller är ofullständiga. "
+            "Preliminärt belopp utan ej fastställda poster; lönepriser används inte."
+        )
     return report
 
 

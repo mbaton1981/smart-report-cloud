@@ -169,6 +169,52 @@ class OBTransportTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(sum(float(row["Транспорт"]) for row in rows), 2)
 
+    def test_server_reports_distinguish_entire_ob_shift_from_premium_hours(self):
+        response = self.server_client.post("/submit-shift", json={
+            "request_id": "ob-mixed-report", "date": "2026-10-20", "employee": "Travel Test",
+            "company": "Renatur", "object_name": "Travel B", "submission_type": "ob",
+            "start_time": "16:00", "end_time": "20:00", "transport": 1,
+        })
+        self.assertEqual(response.status_code, 201, response.get_json())
+        conn = self.server.get_db_connection()
+        self.addCleanup(conn.close)
+        before = list(conn.iterdump())
+        report, error = self.server.fetch_arbetsdagbok_records(conn.cursor(), "Travel Test", "2026-10")
+        self.assertIsNone(error)
+        self.assertEqual(report["totals_by_type"]["ob"], 4)
+        self.assertEqual(report["shifts"][0]["ob_premium_hours"], 2)
+        self.assertEqual([segment["premium_percent"] for segment in report["shifts"][0]["ob_segments"]], [0, 50])
+        preview = self.server_client.get("/report-preview?employee=Travel%20Test&month=2026-10")
+        html = preview.get_data(as_text=True)
+        for text in ("Arbetad tid i OB-poster (hela passet)", "Timmar med OB-tillägg: 2.00",
+                     "Utan OB-tillägg", "OB-tillägg 50", "Hela passet: 4.00"):
+            self.assertIn(text, html)
+        pdf = self.server_client.get("/download-arbetsdagbok.pdf?employee=Travel%20Test&month=2026-10")
+        self.assertEqual(pdf.status_code, 200)
+        text = "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(pdf.data)).pages)
+        for label in ("Arbetad tid i OB-poster (hela passet): 4.00",
+                      "Timmar med OB-tillägg: 2.00", "Utan OB-tillägg", "OB-tillägg 50"):
+            self.assertIn(label, text)
+        pdf.close()
+        csv_response = self.server_client.post("/export-shifts-csv", json={
+            "employee": "Travel Test", "month": "2026-10"})
+        csv_text = csv_response.data.decode("utf-8-sig")
+        self.assertIn("Часы (вся запись; OB — полное отработанное время)", csv_text)
+        self.assertEqual(list(conn.iterdump()), before)
+        conn.close()
+
+    def test_missing_ob_segments_do_not_claim_zero_premium_hours(self):
+        self.submit("ob-legacy-report", "ob", "Travel B", 0)
+        conn = self.server.get_db_connection()
+        conn.execute("DELETE FROM ob_segments")
+        conn.commit()
+        report, error = self.server.fetch_arbetsdagbok_records(conn.cursor(), "Travel Test", "2026-10")
+        conn.close()
+        self.assertIsNone(error)
+        self.assertIsNone(report["shifts"][0]["ob_premium_hours"])
+        response = self.server_client.get("/report-preview?employee=Travel%20Test&month=2026-10")
+        self.assertIn("Timmar med OB-tillägg: uppgift saknas", response.get_data(as_text=True))
+
     def test_sync_preserves_one_ob_trip_both_directions_and_aggregated_invoice(self):
         self.submit("work-sync", "work", "Travel A", 1)
         self.submit("ob-sync", "ob", "Travel B", 1)
@@ -205,6 +251,8 @@ class OBTransportTests(unittest.TestCase):
             window.inv_date_from.setDate(self.desktop.QDate(2026, 10, 1))
             window.inv_date_to.setDate(self.desktop.QDate(2026, 10, 31))
             report = window._prepare_invoice_view(window.collect_invoice_report())
-            self.assertEqual(report["totals"]["transport_amount"], 450)
+            self.assertEqual(report["recorded_trips"], 1)
+            self.assertIsNone(report["totals"]["transport_amount"])
+            self.assertIsNone(report["totals"]["invoice_total"])
         finally:
             window.close()

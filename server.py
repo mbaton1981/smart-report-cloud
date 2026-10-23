@@ -18,12 +18,15 @@ from xml.sax.saxutils import escape
 from flask import Flask, render_template, request, jsonify, session, make_response, send_file, redirect
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 from expense_documents import build_project_order_allocations, decimal_text, parse_decimal
 from expense_documents import migrate_invoice_net_schema, invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations, parse_invoice_money, invoice_context
 from expense_documents import due_date_issues
 from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
+from web_login_throttle import SQLiteLoginThrottle
 from object_reports import register_object_reports
+from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
 from mail_intake import register_mail_intake
 import reportlab
 from reportlab.lib import colors
@@ -313,12 +316,38 @@ if not SYNC_API_KEY:
     logger.critical("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения SYNC_API_KEY не задана!")
     raise RuntimeError("SYNC_API_KEY environment variable is required.")
 
-use_secure = os.environ.get('USE_SECURE_COOKIES', 'false').lower() == 'true'
-app.config.update(
-    SESSION_COOKIE_SECURE=use_secure,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax'
-)
+def configure_session_security(application, environment=None):
+    """HTTPS by default; local HTTP explicitly sets USE_SECURE_COOKIES=false.
+
+    TRUSTED_PROXY_HOPS is opt-in: the server must only be reachable through that
+    many trusted proxies, which overwrite forwarded headers from clients.
+    """
+    environment = os.environ if environment is None else environment
+    secure_value = environment.get("USE_SECURE_COOKIES", "true").strip().lower()
+    if secure_value not in {"true", "false"}:
+        raise ValueError("USE_SECURE_COOKIES must be true or false")
+    proxy_hops = int(environment.get("TRUSTED_PROXY_HOPS", "0"))
+    if proxy_hops < 0:
+        raise ValueError("TRUSTED_PROXY_HOPS must be nonnegative")
+    application.config.update(
+        SESSION_COOKIE_SECURE=secure_value == "true",
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+    )
+    if proxy_hops:
+        application.wsgi_app = ProxyFix(
+            application.wsgi_app, x_for=proxy_hops, x_proto=proxy_hops,
+            x_host=0, x_port=0, x_prefix=0,
+        )
+
+    @application.after_request
+    def secure_transport_headers(response):
+        if application.config["SESSION_COOKIE_SECURE"] and request.is_secure:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
+        return response
+
+
+configure_session_security(app)
 
 DB_FILE = os.environ.get('DATABASE_PATH', "cloud_database.db")
 
@@ -484,6 +513,7 @@ def init_cloud_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_employee_date ON incoming_submissions(employee, date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_change_seq ON incoming_submissions(change_seq)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_incoming_pending ON incoming_submissions(desktop_acked, source, is_deleted)")
+    ensure_pricing_schema(cursor, "incoming_submissions")
     cursor.execute("PRAGMA table_info(incoming_submissions)")
     submission_columns = {column[1] for column in cursor.fetchall()}
     if 'submission_type' not in submission_columns:
@@ -876,6 +906,7 @@ def verify_sync_key():
     return False
 
 auth_throttle = LoginThrottle()
+web_login_throttle = SQLiteLoginThrottle(lambda: get_db_connection())
 
 @app.route('/api/auth/token', methods=['POST'])
 def api_auth_token():
@@ -2500,12 +2531,26 @@ def check_user_pin():
 
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.json or {}
-    username = data.get('username', '').strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Неверные данные для входа"}), 400
+    username = data.get('username', '')
     password = data.get('password', '')
 
-    if not username or not password or len(username) > 100:
+    if not isinstance(username, str) or not isinstance(password, str):
         return jsonify({"ok": False, "error": "Неверные данные для входа"}), 400
+    username = username.strip()
+    if not username or not password or len(username) > 100 or len(password) > 200:
+        return jsonify({"ok": False, "error": "Неверные данные для входа"}), 400
+
+    try:
+        attempt_id = web_login_throttle.reserve(username, request.remote_addr or "unknown")
+    except sqlite3.Error:
+        return jsonify({"ok": False, "error": "Вход временно недоступен. Повторите позже."}), 503
+    if attempt_id is None:
+        return jsonify({
+            "ok": False, "error": "Слишком много неудачных попыток. Повторите через несколько минут.",
+        }), 429, {"Retry-After": str(math.ceil(web_login_throttle.window))}
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -2548,6 +2593,11 @@ def login():
     conn.commit()
     conn.close()
 
+    try:
+        web_login_throttle.complete_success(attempt_id)
+    except sqlite3.Error:
+        return jsonify({"ok": False, "error": "Вход временно недоступен. Повторите позже."}), 503
+    session.clear()
     session.permanent = True
     session['user_id'] = user['id']
     session['username'] = user['username']
@@ -2891,7 +2941,12 @@ def submit_shift():
                 request_id, request_id, submission_type, date_str, employee, company, final_obj_name,
                 hours, rate, transport, comment, change_seq, payload_hash, now, now
             ))
-        
+        if submission_type in ("work", "ob"):
+            quote = agreed_prices_for_date(cursor, "incoming_submissions", {
+                "date": date_str, "company": company, "object_name": final_obj_name,
+            })
+            if quote:
+                store_pricing(cursor, "incoming_submissions", request_id, quote)
         conn.commit()
     except ValueError as e:
         conn.rollback()
@@ -3005,7 +3060,9 @@ def edit_shift():
             if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, transport)):
                 raise ValueError("Числовое поле должно быть конечным.")
         comment = str(data.get('comment', existing['comment'] or ''))[:2000]
-        invoiced = int(existing['invoiced']) if submission_type == 'work' else 0
+        invoiced = int(existing['invoiced']) if submission_type in ('work', 'ob') else 0
+        if existing["invoiced"]:
+            raise ValueError("Выставленная запись защищена. Сначала верните её в работу в приложении.")
         normalized = {
             "date": date_val, "employee": employee, "company": company,
             "object_name": object_name, "hours": hours, "rate": existing['rate'],
@@ -3063,6 +3120,10 @@ def edit_shift():
                 invoiced, submission_type, new_version, change_seq, operation_id,
                 operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
             ))
+        if existing["customer_pricing"] and any(
+            normalized[key] != existing[key] for key in ("date", "company", "object_name")
+        ):
+            store_pricing(cursor, "incoming_submissions", sync_id, None)
         if ob_result and not ob_result.get("preserved"):
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
         elif not ob_result and ob_schema_ready(cursor) and existing['submission_type'] == "ob":
@@ -3419,7 +3480,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
 
     type_labels = {
         'work': 'Arbete',
-        'ob': 'OB / Övertid',
+        'ob': 'Arbete (OB-post)',
         'vacation': 'Semester / Semestertimmar',
         'holiday': 'Röda dagar',
     }
@@ -3453,6 +3514,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
                     'start_time': seg['start_time'],
                     'end_time': seg['end_time'],
                     'hours': float(seg['hours']),
+                    'premium_percent': float(seg['premium_percent']),
                 })
 
         formatted_shifts.append({
@@ -3465,6 +3527,10 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
             'type_key': sub_type,
             'type_label': type_labels.get(sub_type, 'Arbete'),
             'ob_segments': ob_segments,
+            'ob_premium_hours': (
+                sum(segment['hours'] for segment in ob_segments if segment['premium_percent'] > 0)
+                if ob_segments else None
+            ),
         })
 
     total_hours = sum(totals_by_type.values())
@@ -3583,7 +3649,7 @@ def download_arbetsdagbok_pdf():
             Paragraph('Datum', cell_style),
             Paragraph('Objekt / Arbetsbeskrivning', cell_style),
             Paragraph('Typ', cell_style),
-            Paragraph('Timmar', hours_style),
+            Paragraph('Timmar totalt', hours_style),
         ]]
 
         for shift in report_data['shifts']:
@@ -3599,13 +3665,19 @@ def download_arbetsdagbok_pdf():
             if shift['ob_segments']:
                 interval_lines = [
                     f"{escape(segment['start_time'])}–{escape(segment['end_time'])} "
-                    f"({float(segment['hours']):.2f} h)"
+                    f"({float(segment['hours']):.2f} h; "
+                    + (f"OB-tillägg {segment['premium_percent']:g}%"
+                       if segment['premium_percent'] > 0 else "Utan OB-tillägg") + ")"
                     for segment in shift['ob_segments']
                 ]
-                interval_lines.append(f"<b>Totalt: {float(shift['hours']):.2f} h</b>")
+                interval_lines.append(f"<b>Hela passet: {float(shift['hours']):.2f} h</b>")
+                interval_lines.append(f"Timmar med OB-tillägg: {shift['ob_premium_hours']:.2f} h")
                 description_parts.append(
-                    '<font size="8">OB intervals:<br/>' + '<br/>'.join(interval_lines) + '</font>'
+                    '<font size="8">Delintervaller (med/utan OB-tillägg):<br/>'
+                    + '<br/>'.join(interval_lines) + '</font>'
                 )
+            elif shift['type_key'] == 'ob':
+                description_parts.append('Timmar med OB-tillägg: uppgift saknas')
 
             table_data.append([
                 Paragraph(escape(shift['date'] or ''), cell_style),
@@ -3645,8 +3717,8 @@ def download_arbetsdagbok_pdf():
         total_ob = totals_by_type.get('ob', 0.0)
         total_vacation = totals_by_type.get('vacation', 0.0)
         total_holiday = totals_by_type.get('holiday', 0.0)
-        story.append(Paragraph(f"<b>Totalt arbete: {total_work:.2f} tim</b>", meta_style))
-        story.append(Paragraph(f"<b>Totalt OB: {total_ob:.2f} tim</b>", meta_style))
+        story.append(Paragraph(f"<b>Arbetad tid i vanliga arbetsposter: {total_work:.2f} tim</b>", meta_style))
+        story.append(Paragraph(f"<b>Arbetad tid i OB-poster (hela passet): {total_ob:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt semester: {total_vacation:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt röda dagar: {total_holiday:.2f} tim</b>", meta_style))
         document.build(story)
@@ -3722,8 +3794,9 @@ def export_shifts_csv():
     output = io.StringIO()
     writer = csv.writer(output, delimiter=';')
     writer.writerow([
-        'Дата', 'Сотрудник', 'Фирма', 'Объект', 'Тип записи', 'Часы', 'Ставка',
-        'Транспорт', 'Комментарий', 'Время начала', 'Время окончания', 'OB сегменты', 'OB сумма'
+        'Дата', 'Сотрудник', 'Фирма', 'Объект', 'Тип записи', 'Часы (вся запись; OB — полное отработанное время)', 'Ставка',
+        'Транспорт', 'Комментарий', 'Время начала', 'Время окончания',
+        'OB сегменты (hours — часы интервала; premium_percent — надбавка %)', 'OB надбавка (сумма)'
     ])
     
     for r in rows:
@@ -4420,7 +4493,8 @@ def serialize_submission(row, cursor=None):
         "comment": row['comment'] or "",
         "submission_type": sub_type,
         "record_type": sub_type,
-        "invoiced": row['invoiced']
+        "invoiced": row['invoiced'],
+        "customer_pricing": row["customer_pricing"] if "customer_pricing" in row.keys() else None,
     }
     if sub_type == "ob":
         start_time = row["start_time"] if "start_time" in row.keys() else None
@@ -4477,7 +4551,8 @@ def sync_capabilities():
     return jsonify({
         "ok": True,
         "submission_types": sorted(submission_types),
-        "typed_tombstones": True
+        "typed_tombstones": True,
+        "customer_pricing": 1,
     })
 
 @app.route('/sync/push', methods=['POST'])
@@ -4552,7 +4627,7 @@ def sync_push():
                     cursor, submission_type, company, object_name,
                     allow_inactive=preserve_history_object,
                 )
-                invoiced = int(bool(payload.get('invoiced', 0))) if submission_type == 'work' else 0
+                invoiced = int(bool(payload.get('invoiced', 0))) if submission_type in ('work', 'ob') else 0
                 if submission_type == "ob":
                     if not ob_schema_ready(cursor):
                         raise ValueError("OB-схема не подготовлена; выполните миграцию с backup")
@@ -4578,6 +4653,12 @@ def sync_push():
                     "transport": transport, "comment": comment, "invoiced": invoiced,
                     "submission_type": submission_type
                 }
+                pricing_value = payload.get("customer_pricing", existing["customer_pricing"] if existing else None)
+                if "customer_pricing" in payload or (existing and pricing_value):
+                    normalized["customer_pricing"] = pricing_json(pricing_value, normalized)
+                    if existing and existing["invoiced"] and pricing_value != existing["customer_pricing"]:
+                        if normalized["customer_pricing"] != existing["customer_pricing"]:
+                            raise ValueError("Закрытая клиентская цена защищена; сначала верните запись в работу.")
                 if ob_result:
                     normalized.update({
                         "start_time": ob_result["start_time"],
@@ -4636,6 +4717,17 @@ def sync_push():
             if not existing and base_version != 0:
                 results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
                 continue
+
+            if operation == "upsert" and existing and existing["invoiced"]:
+                if any(normalized.get(key) != (existing[key] or "" if key == "comment" else existing[key]) for key in (
+                    "date", "employee", "company", "object_name", "hours", "rate", "transport", "comment", "submission_type"
+                )):
+                    raise ValueError("Выставленная запись защищена; сначала верните её в работу.")
+            if operation == "upsert" and normalized["invoiced"] and (not existing or not existing["invoiced"]):
+                pricing_row = dict(normalized, entry_type=submission_type,
+                                   customer_pricing=normalized.get("customer_pricing"))
+                segments = (ob_result["segments"] if ob_result else [])
+                require_final_prices(pricing_row, segments)
 
             now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
             change_seq = next_change_sequence(cursor)
@@ -4711,6 +4803,9 @@ def sync_push():
                         normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
                         normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now
                     ))
+            if operation == "upsert" and "customer_pricing" in normalized:
+                ensure_pricing_schema(cursor, "incoming_submissions")
+                store_pricing(cursor, "incoming_submissions", sync_id, normalized["customer_pricing"], from_sync=True)
             if ob_schema_ready(cursor):
                 if operation == "delete" and existing and existing["submission_type"] == "ob":
                     cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))

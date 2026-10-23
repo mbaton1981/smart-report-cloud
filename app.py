@@ -38,6 +38,7 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
+from customer_pricing import agreed_prices_for_date, ensure_pricing_schema, require_final_prices, row_prices, store_pricing
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -516,6 +517,7 @@ def init_db_once():
         )
     ''')
 
+    ensure_pricing_schema(cursor, "shifts")
     cursor.execute("PRAGMA table_info(shifts)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'invoiced' not in columns:
@@ -1552,7 +1554,8 @@ def shift_payload(row):
         "object_name": row['object_name'], "hours": row['hours'], "rate": row['rate'],
         "transport": row['transport'] or 0.0, "comment": row['comment'] or "",
         "record_type": row['entry_type'] if 'entry_type' in row.keys() else RECORD_TYPE_WORK,
-        "invoiced": row['invoiced'] or 0
+        "invoiced": row['invoiced'] or 0,
+        "customer_pricing": row["customer_pricing"] if "customer_pricing" in row.keys() else None,
     }
     if payload["record_type"] == RECORD_TYPE_OB:
         payload.update({
@@ -2356,7 +2359,7 @@ class SmartReportApp(QMainWindow):
 
         self.hours_input = QLineEdit("8.0")
         self.rate_input = QLineEdit()
-        self.rate_input.setPlaceholderText("Например: 520 (или берется из объекта)")
+        self.rate_input.setPlaceholderText("Клиентская цена SEK/ч; пусто — неизвестна")
         self.trans_input = QLineEdit("0")
         self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
@@ -2697,7 +2700,7 @@ class SmartReportApp(QMainWindow):
         values = (
             shift['date'], shift['employee'], shift['company'], shift['object_name'], shift['hours'],
             stored_rate, stored_transport, shift.get('comment', ''),
-            int(bool(shift.get('invoiced', 0))) if record_type == RECORD_TYPE_WORK else 0,
+            int(bool(shift.get('invoiced', 0))) if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0,
             remote_version, record_type, work_rate_cache, work_transport_cache
         )
         needs_type_repair = local and (
@@ -2740,6 +2743,9 @@ class SmartReportApp(QMainWindow):
                      sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache))
+        if "customer_pricing" in shift:
+            ensure_pricing_schema(cursor, "shifts")
+            store_pricing(cursor, "shifts", sync_id, shift["customer_pricing"], from_sync=True)
         if record_type == RECORD_TYPE_OB:
             segments = shift.get("ob_segments")
             if segments and segments != get_ob_segments(cursor, sync_id):
@@ -8148,6 +8154,9 @@ class SmartReportApp(QMainWindow):
         btn_layout.addWidget(mark_invoiced_btn)
         btn_layout.addWidget(unmark_invoiced_btn)
         card_layout.addRow(btn_layout)
+        prices_btn = QPushButton("Клиентские цены выбранного периода…")
+        prices_btn.clicked.connect(self.confirm_customer_prices)
+        card_layout.addRow(prices_btn)
 
         layout.addWidget(card)
         layout.addWidget(QLabel(
@@ -8170,6 +8179,9 @@ class SmartReportApp(QMainWindow):
         self.table_invoice.setAlternatingRowColors(True)
         self.table_invoice.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table_invoice)
+        self.invoice_status_note = QLabel()
+        self.invoice_status_note.setWordWrap(True)
+        layout.addWidget(self.invoice_status_note)
 
         self.invoice_summary_table = QTableWidget(8, 2)
         self.invoice_summary_table.setHorizontalHeaderLabels(["Sammanfattning", "Värde"])
@@ -8365,13 +8377,6 @@ class SmartReportApp(QMainWindow):
             premium_hours = report["ob_premium_hours"].get(employee, 0.0)
             without_ob_hours = hours - premium_hours if categories is not None else None
             ob_amount = None if categories is None or premium_hours > 0 else 0.0
-            if ob_amount is None:
-                warnings.append(
-                    "Avtalsregel för OB-tillägg i kundfakturan saknas. Sparade lönebelopp "
-                    "och löneprocent är inte ett avtalat fakturapåslag. "
-                    + ("OB-tillägget kan inte fastställas separat." if report["is_fast_pris"]
-                       else "OB och slutbelopp kan inte fastställas.")
-                )
             other_categories = {
                 category: category_hours for category, category_hours in (categories or {}).items()
                 if category not in {"weekday_early_evening", "weekday_late_evening_night"}
@@ -8379,10 +8384,6 @@ class SmartReportApp(QMainWindow):
             rate = 0.0 if report["is_fast_pris"] else positive_rate(report["rate"])
             work_amount = 0.0 if report["is_fast_pris"] else amount(hours, rate)
             transport_amount = amount(trips, positive_rate(report["transport_rate"]))
-            if work_amount is None:
-                warnings.append("Objektets timpris är inte fastställt; arbetskostnaden kan inte beräknas.")
-            if transport_amount is None:
-                warnings.append("Resepriset är inte fastställt; resekostnaden kan inte beräknas.")
             row_total = (
                 work_amount + transport_amount + ob_amount
                 if all(value is not None for value in (work_amount, transport_amount, ob_amount))
@@ -8393,6 +8394,13 @@ class SmartReportApp(QMainWindow):
                 else "✅ Выставлен" if status_code == 1
                 else "⏳ В работе"
             )
+            matching = [
+                shift for shift in report.get("journal_rows", [])
+                if shift["employee"] == employee and shift["entry_type"] in ("work", "ob")
+            ]
+            if matching:
+                closed = [shift for shift in matching if shift["invoiced"]]
+                status += f" · {len(closed)}/{len(matching)} записей, {sum(s['hours'] for s in closed):g}/{hours:g} ч"
             prepared_rows.append({
                 "employee": employee, "hours": hours, "rate": rate,
                 "work_amount": work_amount, "transport_amount": transport_amount,
@@ -8435,19 +8443,23 @@ class SmartReportApp(QMainWindow):
                     shift for shift in report["journal_rows"]
                     if shift["employee"] == row["employee"] and shift["entry_type"] in ("work", "ob")
                 ]
-                rates = [
-                    positive_rate(shift["rate"] if shift["entry_type"] == "work"
-                                  else shift.get("work_rate_cache")) or positive_rate(report["rate"])
-                    for shift in employee_shifts
-                ]
+                rates = [row_prices(shift)["base"] for shift in employee_shifts]
                 amounts = [money(shift["hours"], rate) for shift, rate in zip(employee_shifts, rates)]
                 row["rate"] = rates[0] if rates and all(rate == rates[0] for rate in rates) else None
                 row["work_amount"] = (
                     0.0 if report["is_fast_pris"] else
                     sum(amounts) if all(value is not None for value in amounts) else None
                 )
+                personal = dict(report, journal_rows=employee_shifts, totals={
+                    "without_ob_hours": row["without_ob_hours"],
+                    "ob_categories": report["ob_category_hours"].get(row["employee"]) or {},
+                }, warnings=[])
+                prepare_customer_costs(personal)
+                row["transport_amount"] = personal["totals"]["transport_amount"]
+                row["ob_amount"] = personal["totals"]["ob_amount"]
                 components = (row["work_amount"], row["transport_amount"], row["ob_amount"])
                 row["row_total"] = sum(components) if all(value is not None for value in components) else None
+        report["warnings"] = list(dict.fromkeys(report["warnings"]))
         return report
 
     @classmethod
@@ -8554,6 +8566,7 @@ class SmartReportApp(QMainWindow):
     def generate_invoice(self):
         try:
             report = self.collect_invoice_report()
+            report = self._prepare_invoice_view(report)
         except ValueError as error:
             self.table_invoice.setRowCount(0)
             if hasattr(self, "table_dagbok"):
@@ -8572,9 +8585,9 @@ class SmartReportApp(QMainWindow):
             self._render_invoice_summary(empty_report)
             self.invoice_summary_note.setText(str(error))
             self._invoice_report = None
+            self.invoice_status_note.clear()
             QMessageBox.warning(self, "Счёт для бухгалтера", str(error))
             return None
-        report = self._prepare_invoice_view(report)
         self.table_invoice.setRowCount(len(report["prepared_rows"]))
         for row_idx, row in enumerate(report["prepared_rows"]):
             other_ob = ", ".join(
@@ -8588,9 +8601,38 @@ class SmartReportApp(QMainWindow):
             ]
             for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
-                if row["status"] == "✅ Выставлен":
+                if row["status"].startswith("✅ Выставлен"):
                     it.setBackground(QColor("#1c4532"))
+                related = [shift for shift in report["journal_rows"] if shift["employee"] == row["employee"]
+                           and shift["entry_type"] in ("work", "ob")]
+                it.setToolTip("\n".join(
+                    f"№{shift['id']} · {shift['date']} · {shift['hours']:g} ч · "
+                    + ("выставлена" if shift["invoiced"] else "открыта")
+                    for shift in related
+                ))
                 self.table_invoice.setItem(row_idx, col_idx, it)
+        work_rows = [shift for shift in report["journal_rows"] if shift["entry_type"] in ("work", "ob")]
+        open_rows = [shift for shift in work_rows if not shift["invoiced"]]
+        issues = []
+        for shift in work_rows:
+            try:
+                require_final_prices(shift, report["journal_segments"].get(shift["sync_id"], []))
+            except ValueError as error:
+                issues.append(f"№{shift['id']} · {shift['date']}: {error}")
+        detail = (
+            f"Закрыто {len(work_rows) - len(open_rows)} из {len(work_rows)} записей; "
+            f"открыто {sum(row['hours'] for row in open_rows):g} из {report['totals']['hours']:g} ч. "
+            "Статус записи не означает оплату. Состояние синхронизации проверяется отдельно."
+        )
+        if issues:
+            detail += "\nНужно подтвердить клиентские цены (зарплатные ставки не используются):\n"
+            detail += "\n".join(issues[:3])
+            if len(issues) > 3:
+                detail += f"\nЕщё записей: {len(issues) - 3}. Уточните период."
+        self.invoice_status_note.setText(detail)
+        self.invoice_status_note.setMinimumHeight(
+            self.invoice_status_note.fontMetrics().lineSpacing() * (detail.count("\n") + 2)
+        )
         self._render_invoice_summary(report)
         self._invoice_report = report
         if hasattr(self, "table_dagbok"):
@@ -8640,12 +8682,29 @@ class SmartReportApp(QMainWindow):
     @staticmethod
     def _journal_description_swedish(text):
         import re
-        if not re.search(r"[\u0400-\u04ff]", text):
-            return text
-        translated = translate_to_swedish(text, allow_network=False)
-        if re.search(r"[\u0400-\u04ff]", translated):
+        translated = (
+            translate_to_swedish(text, allow_network=False)
+            if re.search(r"[\u0400-\u04ff]", text) else text
+        )
+        # Latin script alone does not establish Swedish. Unknown vocabulary,
+        # including English/transliteration, goes to the existing per-record review.
+        known_swedish = set((
+            "av och i på med till för från utan samt vid efter före mellan under över "
+            "arbete arbeten elarbete eldragning montering demontering rivning installation "
+            "målning målade färg isolering spackling städning städade renovering byte "
+            "gips kartong ventilation ventilationskanaler vägguttag väggar vägg tak "
+            "golv fönster dörrar dörr kakel avjämningsmassa avfall leverans "
+            "invändiga utvändiga inre yttre rum rummen köksfläktar vattenrör "
+            "skruvar lister socklar kök badrum hall trappa trappor "
+            "förberedelse förberedelser rengöring borttagning transport material "
+            "verktyg bygg byggarbete betong trä metall rör kanaler el "
+            "nya nytt gammal gamla befintlig befintliga färdig klart"
+        ).split())
+        words = re.findall(r"[^\W\d_]+", translated.casefold())
+        if (re.search(r"[\u0400-\u04ff]", translated)
+                or any(len(word) > 1 and word not in known_swedish for word in words)):
             raise ValueError(
-                "Arbetsbeskrivningen kunde inte översättas fullständigt till svenska. "
+                "Arbetsbeskrivningen kunde inte säkert översättas eller verifieras som svenska. "
                 "Originaltexten är oförändrad; granska beskrivningen före export."
             )
         return translated
@@ -8665,6 +8724,142 @@ class SmartReportApp(QMainWindow):
                 return None
             translations.update(dialog.translations)
         return translations
+
+    def confirm_customer_prices(self):
+        try:
+            report = self.collect_invoice_report()
+            candidates = [row for row in report["journal_rows"]
+                          if row["entry_type"] in ("work", "ob") and not row["invoiced"]]
+            if not candidates:
+                raise ValueError("Нет открытых рабочих записей. Закрытые цены не изменяются.")
+            categories = sorted({
+                segment["category"] for segments in report["journal_segments"].values()
+                for segment in segments if float(segment["premium_percent"] or 0) > 0
+            })
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Подтверждение исторических клиентских цен")
+            dialog.setMinimumWidth(600)
+            form = QFormLayout(dialog)
+            note = QLabel(
+                f"{report['object']}: {report['date_from']} — {report['date_to']}.\n"
+                f"Открытых записей: {len(candidates)}. Закрытые записи не затрагиваются.\n"
+                "Введите подтверждённые договором цены, не зарплатные ставки.\n"
+                "Пусто — неизвестно; 0 — подтверждённая нулевая цена.\n"
+                "Для разных цен выберите отдельные периоды. Транспорт — цена за записанную единицу."
+            )
+            note.setWordWrap(True)
+            form.addRow(note)
+            fields = {}
+            for key, label in [("base", "Работа, SEK/ч"), ("travel", "Транспорт, SEK/ед.")] + [
+                (category, f"{INVOICE_OB_CATEGORY_LABELS.get(category, category)}, доплата SEK/ч") for category in categories
+            ]:
+                field = QLineEdit()
+                field.setPlaceholderText("Неизвестно")
+                fields[key] = field
+                form.addRow(label, field)
+            source = QLineEdit()
+            source.setPlaceholderText("Договор / приложение / подтверждение, дата")
+            form.addRow("Основание цен:", source)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+            buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить цены")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            form.addRow(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            quote = {
+                "version": 1, "company": report["company"], "object_name": report["object"],
+                "date_from": report["date_from"], "date_to": report["date_to"],
+                "source": source.text(),
+                "base": fields["base"].text().strip().replace(",", ".") or None,
+                "travel": fields["travel"].text().strip().replace(",", ".") or None,
+                "ob": {category: fields[category].text().strip().replace(",", ".") or None for category in categories},
+            }
+            # Object aliases share the selected contract but retain their original identity.
+            conn = get_db_connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                ensure_pricing_schema(cursor, "shifts")
+                changed = []
+                for old in candidates:
+                    current = cursor.execute("SELECT * FROM shifts WHERE id=?", (old["id"],)).fetchone()
+                    if current is None or dict(current) != old:
+                        raise ValueError("Записи изменились. Обновите отчёт перед подтверждением цен.")
+                    row_quote = dict(quote, object_name=current["object_name"])
+                    if store_pricing(cursor, "shifts", current["sync_id"], row_quote):
+                        changed.append(current["id"])
+                if changed:
+                    marks = ",".join("?" for _ in changed)
+                    enqueue_matching_shifts(cursor, f"id IN ({marks})", tuple(changed))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            QMessageBox.information(self, "Клиентские цены", f"Сохранены цены: {len(changed)} записей. Зарплатные ставки не изменены.")
+            self.generate_invoice()
+            if changed:
+                self.background_sync_with_cloud()
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Клиентские цены не сохранены", str(error))
+
+    def _set_period_invoiced(self, report, closed):
+        selected = [row for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")]
+        changed = [row for row in selected if bool(row["invoiced"]) != closed]
+        if not changed:
+            return 0, 0.0
+        if closed:
+            if report["is_fast_pris"]:
+                raise ValueError("Фиксированная цена доступна для предварительного PDF. Для закрытия подтвердите исторические построчные клиентские цены.")
+            split_ok = all(
+                row["entry_type"] != "ob" or abs(
+                    sum(float(segment["hours"]) for segment in report["journal_segments"].get(row["sync_id"], []))
+                    - row["hours"]
+                ) < 0.000001
+                for row in changed
+            )
+            check = dict(report, journal_rows=changed, warnings=[], totals={
+                "without_ob_hours": 0.0 if split_ok else None, "ob_categories": {},
+            })
+            prepare_customer_costs(check)
+            if check["totals"]["invoice_total"] is None:
+                unknown = ", ".join(sorted({line["label"] for line in check["cost_lines"] if line["amount"] is None}))
+                ids = ", ".join(f"№{row['id']} ({row['date']})" for row in changed)
+                raise ValueError(
+                    f"Закрытие не выполнено: не подтверждены клиентские цены — {unknown}.\n"
+                    f"Записи: {ids}.\nПросмотр и предварительный PDF доступны. "
+                    "Уточните цены через «Клиентские цены выбранного периода»."
+                )
+        conn = get_db_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            marks_scope = ",".join("?" for _ in report["object_names"])
+            actual_ids = {row[0] for row in cursor.execute(
+                f"SELECT id FROM shifts WHERE company=? AND object_name IN ({marks_scope}) "
+                "AND date>=? AND date<=? AND entry_type IN ('work','ob')",
+                (report["company"], *report["object_names"], report["date_from"], report["date_to"]),
+            )}
+            if actual_ids != {row["id"] for row in selected}:
+                raise ValueError("Состав периода изменился. Обновите отчёт; статус не изменён.")
+            for row in selected:
+                actual = cursor.execute("SELECT * FROM shifts WHERE id=?", (row["id"],)).fetchone()
+                if actual is None or dict(actual) != row:
+                    raise ValueError("Записи изменились после просмотра. Обновите отчёт; статус не изменён.")
+            ids = tuple(row["id"] for row in changed)
+            marks = ",".join("?" for _ in ids)
+            cursor.execute(f"UPDATE shifts SET invoiced=? WHERE id IN ({marks})", (int(closed), *ids))
+            enqueue_matching_shifts(cursor, f"id IN ({marks})", ids)
+            conn.commit()
+            return len(changed), sum(row["hours"] for row in changed)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def mark_period_as_invoiced(self):
         try:
@@ -8688,20 +8883,18 @@ class SmartReportApp(QMainWindow):
                     or self.inv_date_from.text() != d_from or self.inv_date_to.text() != d_to):
                 QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; период не закрыт.")
                 return
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            placeholders = ','.join('?' for _name in report['object_names'])
-            work_filter = f"company = ? AND object_name IN ({placeholders}) AND date >= ? AND date <= ? AND entry_type = 'work'"
-            parameters = (comp, *report['object_names'], d_from, d_to)
-            cursor.execute(f"UPDATE shifts SET invoiced = 1 WHERE {work_filter}", parameters)
-            enqueue_matching_shifts(cursor, work_filter, parameters)
-            conn.commit()
-            conn.close()
-
-            QMessageBox.information(self, "Успех", "Период успешно закрыт!")
+            try:
+                count, hours = self._set_period_invoiced(report, True)
+            except (ValueError, sqlite3.Error) as error:
+                QMessageBox.warning(self, "Период не закрыт", str(error))
+                return
+            QMessageBox.information(self, "Закрытие периода",
+                                    f"Отмечено как выставленные: {count} записей, {hours:g} ч. Синхронизация — отдельно."
+                                    if count else "Все рабочие записи уже закрыты. Изменений и новых операций нет.")
             self.generate_invoice()
             self.load_shifts_history()
-            self.background_sync_with_cloud()
+            if count:
+                self.background_sync_with_cloud()
 
     def unmark_period_as_invoiced(self):
         try:
@@ -8725,20 +8918,18 @@ class SmartReportApp(QMainWindow):
                     or self.inv_date_from.text() != d_from or self.inv_date_to.text() != d_to):
                 QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; статус периода не изменён.")
                 return
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            placeholders = ','.join('?' for _name in report['object_names'])
-            work_filter = f"company = ? AND object_name IN ({placeholders}) AND date >= ? AND date <= ? AND entry_type = 'work'"
-            parameters = (comp, *report['object_names'], d_from, d_to)
-            cursor.execute(f"UPDATE shifts SET invoiced = 0 WHERE {work_filter}", parameters)
-            enqueue_matching_shifts(cursor, work_filter, parameters)
-            conn.commit()
-            conn.close()
-
-            QMessageBox.information(self, "Успех", "Статус сброшен!")
+            try:
+                count, hours = self._set_period_invoiced(report, False)
+            except (ValueError, sqlite3.Error) as error:
+                QMessageBox.warning(self, "Статус не изменён", str(error))
+                return
+            QMessageBox.information(self, "Возврат в работу",
+                                    f"Возвращено: {count} записей, {hours:g} ч. Исторические цены сохранены."
+                                    if count else "Все рабочие записи уже открыты. Изменений и новых операций нет.")
             self.generate_invoice()
             self.load_shifts_history()
-            self.background_sync_with_cloud()
+            if count:
+                self.background_sync_with_cloud()
 
     def load_objects_for_company(self, comp_name, obj_cb, record_type=None, archived_object_name=None):
         selected_name = obj_cb.currentData() or archived_object_name
@@ -9846,19 +10037,19 @@ class SmartReportApp(QMainWindow):
         elif rate_input_str:
             rate_val = parse_float(rate_input_str, -1)
         else:
-            cursor.execute("SELECT rate FROM objects WHERE name = ? AND company = ? AND is_active = 1", (obj_name, comp))
-            obj_row = cursor.fetchone()
-            rate_val = obj_row[0] if obj_row and obj_row[0] else 0.0
+            rate_val = 0.0
 
         trans_val = parse_float(self.trans_input.text(), 0.0)
         comment = self.comment_input.text().strip()
-        if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+        if record_type == RECORD_TYPE_OB:
             rate_val = 0.0
         elif record_type in SPECIAL_OBJECTS:
             rate_val = 0.0
             trans_val = 0.0
 
-        if hours_val < 0 or rate_val < 0 or not math.isfinite(trans_val) or not 0 <= trans_val <= 10000:
+        if (not math.isfinite(hours_val) or not math.isfinite(rate_val)
+                or hours_val < 0 or not 0 <= rate_val <= 100000
+                or not math.isfinite(trans_val) or not 0 <= trans_val <= 10000):
             conn.close()
             QMessageBox.warning(self, "Ошибка", "Проверьте часы, ставку и транспорт (от 0 до 10000)!")
             return
@@ -9882,6 +10073,18 @@ class SmartReportApp(QMainWindow):
                 (ob_result["start_time"], ob_result["end_time"], ob_result["segments"][0]["base_rate"], shift_id),
             )
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
+        if record_type == RECORD_TYPE_WORK and rate_input_str:
+            store_pricing(cursor, "shifts", sync_id, {
+                "version": 1, "company": comp, "object_name": obj_name,
+                "date_from": date, "date_to": date, "source": "Ручной ввод клиентской цены при создании записи",
+                "base": rate_val, "travel": None, "ob": {},
+            })
+        elif record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
+            quote = agreed_prices_for_date(cursor, "shifts", {
+                "date": date, "company": comp, "object_name": obj_name,
+            })
+            if quote:
+                store_pricing(cursor, "shifts", sync_id, quote)
         payload = {
             "date": date, "employee": emp, "company": comp, "object_name": obj_name,
             "hours": hours_val, "rate": rate_val, "transport": trans_val,
@@ -9892,6 +10095,9 @@ class SmartReportApp(QMainWindow):
                 "start_time": ob_result["start_time"],
                 "end_time": ob_result["end_time"],
             })
+        payload["customer_pricing"] = cursor.execute(
+            "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)
+        ).fetchone()[0]
         enqueue_shift_operation(cursor, sync_id, 'upsert', 0, payload)
         conn.commit()
         conn.close()
@@ -10213,7 +10419,7 @@ class SmartReportApp(QMainWindow):
         form.addRow("Тип записи:", record_type_field)
         form.addRow("Объект:", object_field)
         form.addRow("Часы:", hours_field)
-        form.addRow("Ставка:", rate_field)
+        form.addRow("Клиентская цена SEK/ч:", rate_field)
         form.addRow("Транспорт:", transport_field)
         form.addRow("Комментарий:", comment_field)
         form.addRow("Время начала:", ob_start_field)
@@ -10308,6 +10514,11 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            current = cursor.execute("SELECT * FROM shifts WHERE id=?", (local_id,)).fetchone()
+            if current is None or dict(current) != dict(shift):
+                raise ValueError("Запись изменилась. Обновите историю перед редактированием.")
+            if current["invoiced"]:
+                raise ValueError("Сначала верните выставленную запись в работу.")
             sync_id = shift['sync_id'] or str(uuid.uuid4())
             if record_type != shift['entry_type']:
                 cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE sync_id = ? AND state = 'pending'", (sync_id,))
@@ -10346,8 +10557,22 @@ class SmartReportApp(QMainWindow):
                 replace_ob_segments(cursor, sync_id, ob_result["segments"])
             elif not preserve_ob and ob_schema_ready(cursor) and shift['entry_type'] == RECORD_TYPE_OB:
                 cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
+            if "customer_pricing" in shift.keys() and shift["customer_pricing"]:
+                if any(payload[key] != shift[key] for key in ("date", "company", "object_name")):
+                    store_pricing(cursor, "shifts", sync_id, None)
+                elif record_type == RECORD_TYPE_WORK and payload["rate"] != shift["rate"]:
+                    quote = json.loads(shift["customer_pricing"])
+                    quote.update(base=payload["rate"], source="Ручное изменение клиентской цены записи")
+                    store_pricing(cursor, "shifts", sync_id, quote)
+                payload["customer_pricing"] = cursor.execute(
+                    "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)
+                ).fetchone()[0]
             enqueue_shift_operation(cursor, sync_id, 'upsert', shift['sync_version'], payload)
             conn.commit()
+        except (ValueError, sqlite3.Error) as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Изменение не сохранено", str(error))
+            return
         except Exception:
             conn.rollback()
             raise

@@ -251,7 +251,7 @@
                     <th style="width: 15%;">Datum</th>
                     <th style="width: 53%;">Objekt / Arbetsbeskrivning</th>
                     <th style="width: 18%;">Typ</th>
-                    <th style="width: 14%;" class="hours-col">Timmar</th>
+                    <th style="width: 14%;" class="hours-col">Timmar totalt</th>
                 </tr>
             </thead>
             <tbody>
@@ -269,12 +269,16 @@
                             {% endif %}
                             {% if shift.ob_segments %}
                             <div class="ob-intervals">
-                                <b>OB-intervaller:</b><br>
+                                <b>Delintervaller (med/utan OB-tillägg):</b><br>
                                 {% for seg in shift.ob_segments %}
-                                {{ seg.start_time }}–{{ seg.end_time }} ({{ "%.2f"|format(seg.hours) }} tim)<br>
+                                {{ seg.start_time }}–{{ seg.end_time }} ({{ "%.2f"|format(seg.hours) }} tim;
+                                {% if seg.premium_percent > 0 %}OB-tillägg {{ "%g"|format(seg.premium_percent) }}%{% else %}Utan OB-tillägg{% endif %})<br>
                                 {% endfor %}
-                                <b>Totalt: {{ "%.2f"|format(shift.hours) }} tim</b>
+                                <b>Hela passet: {{ "%.2f"|format(shift.hours) }} tim</b><br>
+                                Timmar med OB-tillägg: {{ "%.2f"|format(shift.ob_premium_hours) }} tim
                             </div>
+                            {% elif shift.type_key == 'ob' %}
+                            <div class="ob-intervals">Timmar med OB-tillägg: uppgift saknas</div>
                             {% endif %}
                             {% if shift.transport %}
                             <div class="shift-desc-line">Resa: {{ "%g"|format(shift.transport) }} (denna post)</div>
@@ -306,11 +310,11 @@
         {% endif %}
 
         <div class="totals-bar">
-            <span>Totalt arbete:</span>
+            <span>Arbetad tid i vanliga arbetsposter:</span>
             <span>{{ "%.2f"|format(totals_by_type.work) }} tim</span>
         </div>
         <div class="totals-bar" style="margin-top: 8px; border-top: 1px dashed #b2bec3; font-size: 15px;">
-            <span>Totalt OB:</span>
+            <span>Arbetad tid i OB-poster (hela passet):</span>
             <span>{{ "%.2f"|format(totals_by_type.ob) }} tim</span>
         </div>
         <div class="totals-bar" style="margin-top: 8px; border-top: 1px dashed #b2bec3; font-size: 15px;">

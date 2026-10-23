@@ -308,6 +308,12 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
         def exercise():
             try:
                 bar = window.tabs.tabBar()
+                result["main_tabs"] = []
+                for index in range(bar.count()):
+                    QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(index).center())
+                    QTest.qWait(100)
+                    result["main_tabs"].append(bar.tabText(index))
+                    capture(f"main-tab-{index}")
                 QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(4).center())
                 QTest.qWait(200)
                 if window.tabs.currentWidget().widget() is not window.tab_invoice:
@@ -318,8 +324,8 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 for field in (window.inv_date_from, window.inv_date_to):
                     field.setDate(QDate(2026, 10, 21))
                 for identifier, label, hours, known, final in (
-                    (39, "tomteboda", 4, 2530, None),
-                    (84, "hotel", 8, 4610, 4610),
+                    (39, "tomteboda", 4, None, None),
+                    (84, "hotel", 8, None, None),
                 ):
                     window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(identifier))
                     click(button("Просмотр сводки"))
@@ -366,7 +372,7 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 window.inv_date_to.setDate(QDate(2026, 10, 31))
                 click(button("Просмотр сводки"))
                 report = window._invoice_report
-                if (report["totals"]["hours"] != 22 or report["totals"]["invoice_total"] != 12790
+                if (report["totals"]["hours"] != 22 or report["totals"]["invoice_total"] is not None
                         or report["recorded_trips"] != 3 or len(report["journal_rows"]) != 3):
                     raise RuntimeError("Actual HOTEL October scenario differs from the reported failure")
                 original_descriptions = {row["id"]: row["comment"] for row in report["journal_rows"]}
@@ -378,12 +384,12 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 monthly_pdf = next(work.glob("Fakturaunderlag_*" + report["object"] + "*2026-10-01_till_2026-10-31.pdf"))
                 monthly_reader = PdfReader(monthly_pdf)
                 monthly_text = "\n".join(page.extract_text() for page in monthly_reader.pages)
-                for expected in ("12 790,00", "22,0", "2026-10-20", "2026-10-21", "2026-10-22",
+                for expected in ("Preliminärt totalbelopp", "22,0", "2026-10-20", "2026-10-21", "2026-10-22",
                                  "dörrar och invändiga fönster i rummen"):
                     if expected not in monthly_text:
                         raise RuntimeError("Missing HOTEL monthly PDF content: " + expected)
                 result["hotel_october"] = {
-                    "hours": 22, "invoice_total": 12790, "recorded_trips": 3,
+                    "hours": 22, "invoice_total": None, "recorded_trips": 3,
                     "journal_rows": 3, "original_descriptions": original_descriptions,
                     "pdf": str(monthly_pdf), "pages": len(monthly_reader.pages),
                 }
@@ -415,6 +421,34 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                     "record_id": 111, "approved_translation": review.translations[row["sync_id"]],
                     "source_unchanged": row["comment"] == original_descriptions[111],
                 }
+                window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(39))
+                QTest.mouseClick(inner, Qt.MouseButton.LeftButton, pos=inner.tabRect(0).center())
+                click(button("Просмотр сводки"))
+                tom = window._invoice_report
+                if (tom["totals"]["hours"] != 13 or tom["totals"]["without_ob_hours"] != 6
+                        or tom["totals"]["ob_categories"] != {
+                            "weekday_early_evening": 4, "weekday_late_evening_night": 3}):
+                    raise RuntimeError("Actual Tomteboda October hours differ")
+                capture("tomteboda-october-status-and-prices")
+                with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+                        patch.object(QMessageBox, "warning") as warning:
+                    click(button("Закрыть период"))
+                    if not warning.called or "не подтверждены" not in warning.call_args.args[2]:
+                        raise RuntimeError("Unknown customer prices did not block final closing")
+                click(button("Сформировать общий PDF"))
+                result["tomteboda_october"] = {
+                    "totals": tom["totals"], "rows": len(tom["journal_rows"]),
+                    "unknown_close_blocked": True, "status_detail": window.invoice_status_note.text(),
+                }
+                def inspect_prices():
+                    dialog = application.activeModalWidget()
+                    if dialog is None:
+                        failures.append("Missing customer pricing dialog")
+                        return
+                    dialog.grab().save(str(work / "customer-prices-dialog.png"))
+                    dialog.reject()
+                QTimer.singleShot(200, inspect_prices)
+                click(button("Клиентские цены"))
                 if failures:
                     raise RuntimeError("; ".join(failures))
             except Exception as error:

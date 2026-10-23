@@ -1,4 +1,5 @@
 import importlib
+import json
 from io import BytesIO
 import os
 import sqlite3
@@ -31,7 +32,8 @@ class CustomerReportTests(unittest.TestCase):
             CREATE TABLE shifts(id INTEGER PRIMARY KEY, date TEXT, employee TEXT, company TEXT,
                 object_name TEXT, hours REAL, rate REAL DEFAULT 0, transport REAL DEFAULT 0,
                 invoiced INTEGER DEFAULT 0, entry_type TEXT DEFAULT 'work', sync_id TEXT,
-                start_time TEXT, end_time TEXT, work_rate_cache REAL DEFAULT 0, comment TEXT);
+                start_time TEXT, end_time TEXT, work_rate_cache REAL DEFAULT 0, comment TEXT,
+                customer_pricing TEXT);
             CREATE TABLE ob_segments(id INTEGER PRIMARY KEY,shift_id TEXT,segment_date TEXT,
                 start_time TEXT,end_time TEXT,hours REAL,category TEXT,premium_percent REAL,
                 multiplier REAL,base_rate REAL,calculated_rate REAL,amount REAL,
@@ -66,13 +68,18 @@ class CustomerReportTests(unittest.TestCase):
         self.conn.close()
 
     def shift(self, name="Andrii Piskun", day="2026-10-21", hours=8, rate=0,
-              transport=0, kind="work", object_name="Tomteboda ÄTA", comment="Montering"):
+              transport=0, kind="work", object_name="Tomteboda ÄTA", comment="Montering", confirmed=True):
         identifier = str(self.conn.execute("SELECT COUNT(*) FROM shifts").fetchone()[0] + 1)
         self.conn.execute("""
             INSERT INTO shifts(date,employee,company,object_name,hours,rate,transport,
                 entry_type,sync_id,comment)
             VALUES(?,?,'Renatur',?,?,?,?,?,?,?)
         """, (day, name, object_name, hours, rate, transport, kind, identifier, comment))
+        if confirmed:
+            quote = {"version": 1, "company": "Renatur", "object_name": object_name,
+                     "date_from": day, "date_to": day, "source": "Synthetic test contract",
+                     "base": rate if rate > 0 else 520, "travel": 450, "ob": {}}
+            self.conn.execute("UPDATE shifts SET customer_pricing=? WHERE sync_id=?", (json.dumps(quote), identifier))
         self.conn.commit()
         return identifier
 
@@ -154,19 +161,20 @@ class CustomerReportTests(unittest.TestCase):
         self.assertEqual(self.window.table_invoice.rowCount(), 10)
         self.assertEqual(self.window.table_dagbok.rowCount(), 70)
 
-    def test_different_recorded_customer_rates_and_object_fallback(self):
+    def test_different_recorded_customer_rates_without_object_fallback(self):
         self.shift(hours=2, rate=500, transport=1)
         self.shift(day="2026-10-22", hours=3, rate=550)
-        self.shift(day="2026-10-23", hours=1, rate=0)
+        self.shift(day="2026-10-23", hours=1, rate=0, confirmed=False)
         report = self.window.generate_invoice()
         work = [line for line in report["cost_lines"] if line["label"] == "Arbete"]
-        self.assertEqual([(line["quantity"], line["rate"]) for line in work], [(2, 500), (1, 520), (3, 550)])
-        self.assertEqual(report["totals"]["work_amount"], 3170)
-        self.assertEqual(report["totals"]["invoice_total"], 3620)
+        self.assertEqual([(line["quantity"], line["rate"]) for line in work], [(2, 500), (3, 550), (1, None)])
+        self.assertIsNone(report["totals"]["work_amount"])
+        self.assertIsNone(report["totals"]["invoice_total"])
+        self.assertEqual(report["totals"]["known_subtotal"], 3100)
         self.assertEqual(report["recorded_trips"], 1)
 
     def test_missing_rates_and_missing_segments_keep_full_hours(self):
-        self.shift(hours=4, kind="ob", transport=1)
+        self.shift(hours=4, kind="ob", transport=1, confirmed=False)
         self.conn.execute("UPDATE objects SET rate=NULL,transport_rate=NULL WHERE id=39")
         self.conn.commit()
         report = self.window.generate_invoice()
@@ -232,6 +240,36 @@ class CustomerReportTests(unittest.TestCase):
         buttons = [button.text() for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)]
         self.assertIn("📄 Сформировать общий PDF (SV)", buttons)
         self.assertIn("📖 PDF только журнала (SV)", buttons)
+
+    def test_latin_english_and_mixed_descriptions_require_review_offline(self):
+        with patch("requests.sessions.Session.request", side_effect=AssertionError("No network")):
+            for text in ("Installation of doors", "Painting walls", "demontazh okon",
+                         "Montering and painting", "Монтаж and painting"):
+                with self.subTest(text=text), self.assertRaisesRegex(ValueError, "granska"):
+                    self.window._journal_description_swedish(text)
+            for text in ("Montering", "Målning av väggar", "Montering <A> & B.", ""):
+                self.assertEqual(self.window._journal_description_swedish(text), text)
+
+    def test_english_descriptions_use_existing_per_record_review_without_source_changes(self):
+        self.shift(comment="Installation of doors")
+        self.shift(day="2026-10-22", comment="Installation of doors")
+        before = list(self.conn.iterdump())
+        report = self.window.generate_invoice()
+
+        def review(dialog):
+            table = dialog.findChild(self.desktop.QTableWidget)
+            self.assertEqual(table.rowCount(), 2)
+            self.assertIn("№1 · 2026-10-21", table.item(0, 0).text())
+            self.assertIn("№2 · 2026-10-22", table.item(1, 0).text())
+            dialog.findChild(self.desktop.QTextEdit, "journal_translation_1").setPlainText("Montering av dörrar")
+            dialog.findChild(self.desktop.QTextEdit, "journal_translation_2").setPlainText("Byte av dörrar")
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translated = self.window._collect_journal_translations(report)
+        self.assertEqual(translated, {"1": "Montering av dörrar", "2": "Byte av dörrar"})
+        self.assertEqual(list(self.conn.iterdump()), before)
 
     def test_other_ob_category_and_unknown_split_are_not_zero(self):
         self.ob()
