@@ -140,7 +140,8 @@ class BackupWorker(QThread):
                 "onedrive_cloud_upload_confirmed": False,
                 "test_environment": "Fresh isolated venv, empty disposable Windows profile paths, "
                                     "network blocked by verifier; same physical host",
-                "production_database_modified": False,
+                "production_business_data_modified": False,
+                "normal_auth_access_metadata_may_update": True,
                 "retention": "Append-only unique filenames; no automatic deletion or replacement",
             }
             report = json.dumps(proof, ensure_ascii=False, indent=2)
