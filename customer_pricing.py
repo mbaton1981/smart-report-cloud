@@ -267,11 +267,15 @@ def agreed_prices_for_date(cursor, table, row, *, reject_conflicts=False):
     matches = set()
     for candidate in candidates:
         raw = json.loads(candidate[0])
-        if raw.get("fixed") or raw.get("source") == NEW_SHIFT_PRICE_SOURCE:
+        if raw.get("fixed") or raw.get("source") in (CATALOG_PRICE_SOURCE, NEW_SHIFT_PRICE_SOURCE):
             continue
         if raw["date_from"] <= row["date"] <= raw["date_to"]:
             matches.add(pricing_json(raw, row))
-    # Conflicting historical evidence requires explicit review, not last-write guessing.
-    if len(matches) > 1 and reject_conflicts:
+    prices = {
+        json.dumps({key: json.loads(value)[key] for key in ("base", "travel", "ob")}, sort_keys=True)
+        for value in matches
+    }
+    # Confirmation timestamps do not create a price conflict; different amounts do.
+    if len(prices) > 1 and reject_conflicts:
         raise ValueError("На дату смены найдены противоречащие договорные цены. Требуется проверка администратором.")
-    return next(iter(matches)) if len(matches) == 1 else None
+    return min(matches) if len(prices) == 1 else None

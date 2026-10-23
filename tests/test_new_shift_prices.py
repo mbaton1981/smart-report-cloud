@@ -5,7 +5,7 @@ import uuid
 from unittest.mock import patch
 
 import test_catalog_sync as catalog
-from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, row_prices, store_pricing
+from customer_pricing import CATALOG_PRICE_SOURCE, NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, row_prices, store_pricing
 
 
 class NewShiftPricesTests(unittest.TestCase):
@@ -209,6 +209,34 @@ class NewShiftPricesTests(unittest.TestCase):
         response, row = self.submit(self.payload())
         self.assertTrue(response.json["pricing_warning"])
         self.assertIsNone(json.loads(row["customer_pricing"])["base"])
+
+    def test_selected_record_catalog_prices_do_not_become_contracts_or_conflicts(self):
+        _, first = self.submit(self.payload())
+        _, second = self.submit(self.payload(hours=5))
+        conn = self.server.get_db_connection()
+        for index, row in enumerate((first, second)):
+            quote = json.loads(row["customer_pricing"])
+            quote.update(source=CATALOG_PRICE_SOURCE, confirmed_at=f"2026-10-23T17:00:0{index}+00:00")
+            store_pricing(conn.cursor(), "incoming_submissions", row["sync_id"], quote)
+        conn.execute("UPDATE meta_objects SET rate=530 WHERE company='Renatur'")
+        conn.commit()
+        conn.close()
+        _, new = self.submit(self.payload(hours=2))
+        self.assertEqual(json.loads(new["customer_pricing"])["base"], 530)
+
+    def test_identical_contract_prices_with_distinct_confirmation_metadata_are_not_conflicts(self):
+        _, first = self.submit(self.payload())
+        _, second = self.submit(self.payload(hours=5))
+        conn = self.server.get_db_connection()
+        for index, row in enumerate((first, second)):
+            quote = json.loads(row["customer_pricing"])
+            quote.update(source="Confirmed period", date_from="2026-10-01", date_to="2026-10-31",
+                         base=610, confirmed_at=f"2026-10-23T17:00:0{index}+00:00")
+            store_pricing(conn.cursor(), "incoming_submissions", row["sync_id"], quote)
+        conn.commit()
+        conn.close()
+        _, new = self.submit(self.payload(hours=2))
+        self.assertEqual(json.loads(new["customer_pricing"])["base"], 610)
 
 
 if __name__ == "__main__":
