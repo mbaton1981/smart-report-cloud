@@ -226,9 +226,14 @@ def strip_no_change_suffix(text):
 def recognized_read_command(text, context=None):
     text = strip_no_change_suffix(text)
     normalized = " ".join(text.casefold().strip(" .!?").split())
-    if re.search(r"\b(?:объект|фирм|компан|сотрудник|для\s+(?!всех\s+сотрудник))", normalized):
-        return None
-    if re.fullmatch(r"(?:покажи\s*,?\s*)?кто\s+сколько\s+(?:отработал|работал)(?:\s+.+)?", normalized):
+    hours_request = re.fullmatch(
+        r"(?:покажи\s*,?\s*)?(?:кто\s+сколько\s+(?:отработал|работал)"
+        r"|сколько\s+час(?:ов|а)?\s+(?:отработал|работал)\s+"
+        r"(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|сотрудники))"
+        r"(?:\s+.+)?",
+        normalized,
+    )
+    if hours_request:
         purpose = "hours_summary"
     elif re.search(r"\bдубл\w*", normalized) or re.search(
             r"\b(?:пропущен|отсутств|без|не\s+задан)\w*\s+ставк\w*", normalized):
@@ -236,12 +241,24 @@ def recognized_read_command(text, context=None):
     else:
         return None
 
+    if not hours_request and re.search(
+            r"\b(?:объект|фирм|компан|сотрудник|для\s+(?!всех\s+сотрудник))", normalized):
+        return None
+
     previous = context["plan"] if context else {}
     week = re.search(r"\b(текущ\w*|эт\w*|прошл\w*)\s+недел\w*\b|\b(this|last)\s+week\b", normalized)
+    date_token = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})"
     date_range = re.search(
-        r"\bс\s+(\d{4}-\d{2}-\d{2})\s+по\s+(\d{4}-\d{2}-\d{2})\b", normalized)
+        rf"\bс\s+({date_token})\s+(?:по|до)\s+({date_token})\b", normalized)
     if date_range:
-        begin, end = date_range.groups()
+        try:
+            begin, end = (
+                date.fromisoformat(value).isoformat() if "-" in value
+                else datetime.strptime(value, "%d.%m.%Y").date().isoformat()
+                for value in date_range.groups()
+            )
+        except ValueError:
+            raise AssistantError("Укажите корректный период.") from None
     elif week:
         today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
         start = today - timedelta(days=today.weekday())
@@ -258,11 +275,32 @@ def recognized_read_command(text, context=None):
 
     plan = validate_plan(dict(
         purpose=purpose, date_from=begin, date_to=end,
-        employee="" if "для всех сотрудников" in normalized else previous.get("employee", ""),
+        employee="" if re.search(
+            r"\b(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|все\s+сотрудники)\b", normalized
+        ) else previous.get("employee", ""),
         company=previous.get("company", ""), object_name=previous.get("object_name", "")))
     if not (week or date_range or previous):
         raise AssistantQuestion("period", plan=plan)
     return plan
+
+
+def wants_hours_summary_only(text):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    return bool(re.search(r"\bтолько\s+итог\w*\b", normalized) and
+                re.search(r"\bбез\s+(?:списка\s+)?(?:всех\s+)?смен\w*\b", normalized))
+
+
+def compact_hours_summary(result):
+    table = result.get("table")
+    if not isinstance(table, dict):
+        return
+    rows = [[row[0], str(row[1])] for row in table["rows"]]
+    total = sum((Decimal(str(row[1])) for row in rows), Decimal("0"))
+    total_text = format(total.normalize(), "f")
+    rows.append(["Общий итог", total_text])
+    result["table"] = dict(headers=["Сотрудник", "Отработано, ч"], rows=rows)
+    result["summary"] = f"Сотрудников: {len(rows) - 1}. Общий итог отработанного времени: {total_text} ч."
+    result["summary_only"] = True
 
 
 def select_plan(text, conn, actor, operation, post=None, context=None):
@@ -800,6 +838,8 @@ def register_assistant(app, connect, authenticate):
                 raise AssistantError("Ожидаются текст и идентификатор операции.")
             plan = select_plan(data["text"], conn, actor, data["operation_id"], context=data.get("context"))
             results = inspect_workflow(conn, plan["workflow"]) if "workflow" in plan else [inspect(conn, plan)]
+            if plan.get("purpose") == "hours_summary" and wants_hours_summary_only(data["text"]):
+                compact_hours_summary(results[0])
             conn.commit()
             conn.execute("PRAGMA query_only=OFF")
             for result in results:

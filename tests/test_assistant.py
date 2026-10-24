@@ -417,6 +417,81 @@ class AssistantApiTests(unittest.TestCase):
             self.assertEqual(response.get_json()["clarification"]["plan"]["purpose"], "anomalies")
             provider.assert_not_called()
 
+    def test_hours_followup_reuses_transport_period_and_returns_only_employee_totals(self):
+        self.fixture_shift()
+        with patch("assistant_api.requests.post") as provider:
+            transport = self.post("command", dict(
+                text="Проверь транспорт с 2026-10-19 по 2026-10-25",
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(transport.status_code, 200, transport.get_json())
+            context = transport.get_json()["result"]["context"]
+            self.assertEqual(
+                (context["plan"]["date_from"], context["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+
+            followup = self.post("command", dict(
+                text=("Покажи, сколько часов отработал каждый сотрудник за тот же период. "
+                      "Только итог по каждому и общий итог, без списка всех смен"),
+                operation_id=str(uuid.uuid4()),
+                context=context,
+            ))
+            self.assertEqual(followup.status_code, 200, followup.get_json())
+            result = followup.get_json()["result"]
+
+        self.assertEqual(result["plan"]["purpose"], "hours_summary")
+        self.assertEqual(
+            (result["plan"]["date_from"], result["plan"]["date_to"]),
+            ("2026-10-19", "2026-10-25"),
+        )
+        self.assertEqual(result["table"]["headers"], ["Сотрудник", "Отработано, ч"])
+        self.assertEqual(result["table"]["rows"], [
+            ["Synthetic Employee", "5.0"],
+            ["Общий итог", "5"],
+        ])
+        self.assertIn("Общий итог отработанного времени: 5 ч.", result["summary"])
+        self.assertTrue(result["summary_only"])
+        self.assertNotIn("assistant-five", repr(result["table"]))
+        self.assertNotIn("смен", result["summary"].casefold())
+        provider.assert_not_called()
+
+        from assistant_ui import result_table, result_text
+        headers, rows = result_table(result)
+        self.assertEqual(headers, ["Сотрудник", "Отработано, ч"])
+        self.assertEqual(rows, result["table"]["rows"])
+        rendered = result_text(result)
+        self.assertIn("2026-10-19 — 2026-10-25", rendered)
+        self.assertIn("Общий итог отработанного времени: 5 ч.", rendered)
+        self.assertNotIn("assistant-five", rendered)
+
+        override = self.post("command", dict(
+            text=("Покажи, сколько часов отработал каждый сотрудник с 20.10.2026 по 22.10.2026. "
+                  "Только итог по каждому и общий итог, без списка всех смен"),
+            operation_id=str(uuid.uuid4()),
+            context=context,
+        ))
+        self.assertEqual(override.status_code, 200, override.get_json())
+        override_result = override.get_json()["result"]
+        self.assertEqual(
+            (override_result["plan"]["date_from"], override_result["plan"]["date_to"]),
+            ("2026-10-20", "2026-10-22"),
+        )
+        self.assertEqual(override_result["table"]["rows"], [["Общий итог", "0"]])
+        provider.assert_not_called()
+
+    def test_explicit_dates_override_followup_period_in_european_format(self):
+        context = dict(
+            plan=plan("transport_check", date_from="2026-10-19", date_to="2026-10-25"),
+            pending="",
+        )
+        parsed = assistant.recognized_read_command(
+            "Покажи, сколько часов отработал каждый сотрудник с 20.10.2026 по 22.10.2026",
+            context,
+        )
+        self.assertEqual(parsed["purpose"], "hours_summary")
+        self.assertEqual((parsed["date_from"], parsed["date_to"]), ("2026-10-20", "2026-10-22"))
+
     def test_general_transport_router_documents_real_capability_and_requires_a_tool(self):
         with patch("assistant_api.requests.post", return_value=self.response(plan("transport_check"))) as provider:
             response = self.post("command", dict(text="Сверь цены выезда с текущим справочником за октябрь 2026",
