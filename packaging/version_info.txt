@@ -6,9 +6,9 @@ VSVersionInfo(
     kids=[
         StringFileInfo([StringTable("040904B0", [
             StringStruct("FileDescription", "SmartReport incoming documents and object costs"),
-            StringStruct("FileVersion", "1.0.27.1"),
+            StringStruct("FileVersion", "1.0.28.1"),
             StringStruct("ProductName", "SmartReport"),
-            StringStruct("ProductVersion", "1.0.27-rc1"),
+            StringStruct("ProductVersion", "1.0.28-rc1"),
             StringStruct("OriginalFilename", "SmartReport.exe"),
         ])]),
         VarFileInfo([VarStruct("Translation", [1033, 1200])]),
