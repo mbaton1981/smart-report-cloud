@@ -588,11 +588,18 @@ class AssistantDialog(QDialog):
             self.append_message("SmartReport", clarification["question"])
             if self.choices:
                 self.clarification_choice.clear()
-                self.clarification_choice.addItems([" / ".join(choice.values()) for choice in self.choices])
+                self.clarification_choice.addItems([
+                    choice.get("label") or " / ".join(str(value) for key, value in choice.items() if key != "label")
+                    for choice in self.choices
+                ])
                 self.clarification_choice.setVisible(True)
                 self.choose_clarification.setVisible(True)
                 self.append_message("SmartReport", "\n".join(
-                    f"{index + 1}. " + " / ".join(choice.values()) for index, choice in enumerate(self.choices)))
+                    f"{index + 1}. " + (
+                        choice.get("label") or " / ".join(
+                            str(value) for key, value in choice.items() if key != "label"
+                        )
+                    ) for index, choice in enumerate(self.choices)))
             self.continue_selection.setVisible(clarification["field"] != "unsupported")
             self.state.setText("Нужен ответ. Выберите параметры и действие либо уточните текстовую команду.")
             if data["clarification"]["field"] == "scope":
@@ -729,7 +736,10 @@ class AssistantDialog(QDialog):
         self.append_message("Вы", text)
         if self.choices and text.isdecimal() and 1 <= int(text) <= len(self.choices):
             plan = self.context["plan"].copy()
-            plan.update(self.choices[int(text) - 1])
+            plan.update({
+                key: value for key, value in self.choices[int(text) - 1].items()
+                if key != "label"
+            })
             self.call("inspect", dict(plan=plan, operation_id=str(uuid.uuid4())))
         else:
             context = self.context or dict(plan=self.selection(), pending="")

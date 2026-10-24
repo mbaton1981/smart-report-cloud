@@ -53,7 +53,9 @@ TOOLS = [{
     "type": "function", "name": "request_clarification", "strict": True,
     "description": "Ask a specific question when a required parameter is missing or the action is unsupported.",
     "parameters": {"type": "object", "additionalProperties": False,
-                   "properties": {"field": {"type": "string", "enum": ["period", "scope", "object", "unsupported"]}},
+                   "properties": {"field": {"type": "string", "enum": [
+                       "period", "scope", "object", "report_type", "unsupported"
+                   ]}},
                    "required": ["field"]},
 }]
 TOOLS[1]["parameters"]["properties"]["selection"] = {
@@ -74,10 +76,120 @@ QUESTIONS = {
     "period": "За какой период? Укажите даты словами или выберите их сверху и нажмите «Продолжить с выбранными параметрами».",
     "scope": "Для всех сотрудников или одного? Оставьте поле сотрудника пустым для всех или введите точное ФИО.",
     "object": "По какому объекту? Назовите объект; если названия совпадают, укажите также фирму.",
+    "report_type": "Какой отчёт подготовить? Выберите один из вариантов ниже.",
     "unsupported": "Автоматическое выполнение этой операции не подключено. Поддерживаемые проверки, отчёты "
                    "и штатные формы перечислены в «Возможностях». Ничего не изменено и не отправлено; "
                    "неподдерживаемая операция не заменялась поиском смен.",
 }
+
+DATE_TOKEN = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})"
+REPORT_TYPE_CHOICES = (
+    dict(label="Отчёт по стоимости объекта (часы, OB и транспорт)", purpose="customer_pdf"),
+    dict(label="Журнал работ по объекту (смены и интервалы)", purpose="journal_pdf"),
+    dict(label="Зарплатный отчёт (сводка по сотрудникам)", purpose="payroll_pdf"),
+)
+
+
+def _parse_date_token(value):
+    try:
+        return date.fromisoformat(value) if "-" in value else datetime.strptime(value, "%d.%m.%Y").date()
+    except ValueError:
+        raise AssistantError("Укажите корректную дату или период.") from None
+
+
+def explicit_date_period(text):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    date_range = re.search(rf"\bс\s+({DATE_TOKEN})\s+(?:по|до)\s+({DATE_TOKEN})\b", normalized)
+    if date_range:
+        start, end = (_parse_date_token(value) for value in date_range.groups())
+        if start > end:
+            raise AssistantError("Начало периода должно быть не позже окончания.")
+        return start.isoformat(), end.isoformat()
+    single = re.search(rf"\b(?:за|на)\s+({DATE_TOKEN})\b", normalized)
+    if single:
+        selected = _parse_date_token(single.group(1)).isoformat()
+        return selected, selected
+    return None
+
+
+def _week_period(text):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    week = re.search(r"\b(текущ\w*|эт\w*|прошл\w*)\s+недел\w*\b|\b(this|last)\s+week\b", normalized)
+    if not week:
+        return None
+    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    start = today - timedelta(days=today.weekday())
+    if (week.group(1) or "").startswith("прошл") or week.group(2) == "last":
+        start -= timedelta(days=7)
+    return start.isoformat(), (start + timedelta(days=6)).isoformat()
+
+
+def _report_type_from_text(text):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    if re.search(r"\b(?:зарплат\w*|payroll|l[oö]ne\w*)", normalized):
+        return "payroll_pdf"
+    if re.search(r"\b(?:журнал\w*|дневник\w*|arbetsjournal)\b", normalized):
+        return "journal_pdf"
+    if re.search(r"\b(?:клиентск\w*|фактур\w*|сч[её]т\w*|стоимост\w*)", normalized):
+        return "customer_pdf"
+    return None
+
+
+def _report_choice_from_answer(text, choices):
+    normalized = " ".join(text.casefold().strip(" .!?").split())
+    if normalized.isdecimal() and 1 <= int(normalized) <= len(choices):
+        return choices[int(normalized) - 1]["purpose"]
+    return _report_type_from_text(normalized)
+
+
+def report_command(text, context, conn):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().strip(" .!?").split())
+    if not re.search(r"\b(?:отч[её]т\w*|pdf)\b", normalized) and not (
+        context and context["pending"] == "report_type"
+    ):
+        return None
+
+    previous = context["plan"] if context else {}
+    selected_dates = explicit_date_period(text) or _week_period(text)
+    if selected_dates is None and previous:
+        selected_dates = (previous["date_from"], previous["date_to"])
+    if selected_dates is None:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday())
+        selected_dates = (start.isoformat(), (start + timedelta(days=6)).isoformat())
+    base = dict(
+        purpose=previous.get("purpose", "search"),
+        date_from=selected_dates[0], date_to=selected_dates[1],
+        employee=previous.get("employee", ""), company=previous.get("company", ""),
+        object_name=previous.get("object_name", ""),
+    )
+
+    purpose = _report_choice_from_answer(text, REPORT_TYPE_CHOICES) if (
+        context and context["pending"] == "report_type"
+    ) else _report_type_from_text(text)
+
+    if not base["object_name"]:
+        objects = conn.execute("SELECT company,name FROM meta_objects ORDER BY company,name").fetchall()
+        mentioned = [row for row in objects if row["name"].casefold() in normalized]
+        if len(mentioned) == 1:
+            base.update(company=mentioned[0]["company"], object_name=mentioned[0]["name"])
+    if not base["employee"]:
+        employees = conn.execute("SELECT name FROM meta_employees ORDER BY name").fetchall()
+        mentioned = [row["name"] for row in employees if row["name"].casefold() in normalized]
+        if len(mentioned) == 1:
+            base["employee"] = mentioned[0]
+
+    if purpose is None:
+        object_report = bool(base["object_name"] or re.search(r"\bобъект\w*\b", normalized))
+        choices = REPORT_TYPE_CHOICES[:2] if object_report else REPORT_TYPE_CHOICES
+        raise AssistantQuestion(
+            "report_type",
+            question="Какой вариант нужен? Выберите отчёт по стоимости, журнал работ или зарплатную сводку.",
+            choices=list(choices),
+            plan=validate_plan(base),
+        )
+    base["purpose"] = purpose
+    return validate_plan(base)
 
 
 class AssistantError(ValueError):
@@ -183,13 +295,13 @@ def validate_plan(plan):
 
 def transport_command(text, context=None):
     text = " ".join(strip_no_change_suffix(text).split())
-    date_token = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})"
     match = re.fullmatch(
         rf"(?:(?:а\s+)?теперь\s+)?(?:(?:проверь(?:те)?|проверить)\s+)?"
         rf"(?:клиентский\s+)?транспорт"
         rf"(?:\s+(?:за|на)\s+(?P<period>текущ\w*\s+недел\w*|эт\w*\s+недел\w*|"
         rf"прошл\w*\s+недел\w*|тот\s+же\s+период|этот\s+же\s+период|этот\s+период)"
-        rf"|\s+с\s+(?P<start>{date_token})\s+(?:по|до)\s+(?P<end>{date_token}))?"
+        rf"|\s+(?:за|на)\s+(?P<single_date>{DATE_TOKEN})"
+        rf"|\s+с\s+(?P<start>{DATE_TOKEN})\s+(?:по|до)\s+(?P<end>{DATE_TOKEN}))?"
         rf"(?:,?\s+(?:для|у)\s+(?P<scope>всех\s+сотрудников|каждого\s+сотрудника|"
         rf"одного\s+сотрудника|сотрудника\s+(?P<name>[^,\n]+)))?"
         rf"[.!?]?",
@@ -204,11 +316,13 @@ def transport_command(text, context=None):
         if match["period"].casefold().startswith("прошл"):
             start -= timedelta(days=7)
         begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
+    elif match["single_date"]:
+        selected = _parse_date_token(match["single_date"]).isoformat()
+        begin = end = selected
     elif match["start"]:
         try:
             begin, end = (
-                date.fromisoformat(value).isoformat() if "-" in value
-                else datetime.strptime(value, "%d.%m.%Y").date().isoformat()
+                _parse_date_token(value).isoformat()
                 for value in (match["start"], match["end"])
             )
         except ValueError:
@@ -222,7 +336,8 @@ def transport_command(text, context=None):
                               company=previous.get("company", ""), object_name=previous.get("object_name", "")))
     if match["scope"] and match["scope"].casefold() == "одного сотрудника":
         raise AssistantQuestion("scope", plan=plan)
-    if (not match["start"] and not (match["period"] and "недел" in match["period"].casefold())
+    if (not match["start"] and not match["single_date"]
+            and not (match["period"] and "недел" in match["period"].casefold())
             and not context):
         raise AssistantQuestion("period", plan=plan)
     return plan
@@ -268,26 +383,12 @@ def recognized_read_command(text, context=None):
         return None
 
     previous = context["plan"] if context else {}
-    week = re.search(r"\b(текущ\w*|эт\w*|прошл\w*)\s+недел\w*\b|\b(this|last)\s+week\b", normalized)
-    date_token = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})"
-    date_range = re.search(
-        rf"\bс\s+({date_token})\s+(?:по|до)\s+({date_token})\b", normalized)
-    if date_range:
-        try:
-            begin, end = (
-                date.fromisoformat(value).isoformat() if "-" in value
-                else datetime.strptime(value, "%d.%m.%Y").date().isoformat()
-                for value in date_range.groups()
-            )
-        except ValueError:
-            raise AssistantError("Укажите корректный период.") from None
-    elif week:
-        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
-        start = today - timedelta(days=today.weekday())
-        last_week = (week.group(1) or "").startswith("прошл") or week.group(2) == "last"
-        if last_week:
-            start -= timedelta(days=7)
-        begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
+    date_period = explicit_date_period(normalized)
+    week_period = _week_period(normalized)
+    if date_period:
+        begin, end = date_period
+    elif week_period:
+        begin, end = week_period
     elif previous:
         begin, end = previous["date_from"], previous["date_to"]
     else:
@@ -301,7 +402,7 @@ def recognized_read_command(text, context=None):
             r"\b(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|все\s+сотрудники)\b", normalized
         ) else previous.get("employee", ""),
         company=previous.get("company", ""), object_name=previous.get("object_name", "")))
-    if not (week or date_range or previous):
+    if not (date_period or week_period or previous):
         raise AssistantQuestion("period", plan=plan)
     return plan
 
@@ -332,8 +433,11 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
     text = strip_no_change_suffix(text)
     safe_context = validate_context(context)
     normalized = " ".join(text.casefold().strip(" .!?").split())
+    date_period = explicit_date_period(text)
     try:
-        known_plan = transport_command(text, safe_context)
+        known_plan = report_command(text, safe_context, conn)
+        if not known_plan:
+            known_plan = transport_command(text, safe_context)
         if not known_plan:
             known_plan = recognized_read_command(text, safe_context)
     except AssistantQuestion as question:
@@ -376,6 +480,7 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
         "Object/company/employee filters may be literal partial names from the user's message; "
         "SmartReport resolves them locally and asks if ambiguous. Never invent names. "
         "For missing parameters call request_clarification with the specific field; "
+        "For an ambiguous report request use report_type and offer the available human-readable report choices. "
         "for unsupported actions use field unsupported. Never return free text instead of a tool. "
         "Current week means Monday through Sunday inclusive. No employee filter means all employees; "
         "do not ask for an employee unless the user explicitly asks for one without identifying them. "
@@ -409,13 +514,19 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
             selection = clarification.get("selection")
             if selection is not None:
                 selection = validate_plan(selection)
-            raise AssistantQuestion(clarification["field"], plan=selection)
+                if date_period:
+                    selection["date_from"], selection["date_to"] = date_period
+            choices = list(REPORT_TYPE_CHOICES if clarification["field"] == "report_type" else ())
+            raise AssistantQuestion(clarification["field"], choices=choices, plan=selection)
         if len(calls) == 1 and calls[0].get("name") == "run_workflow":
             workflow = json.loads(calls[0]["arguments"])
             if (not isinstance(workflow, dict) or set(workflow) != {"steps"} or
                     not isinstance(workflow["steps"], list) or not 2 <= len(workflow["steps"]) <= 4):
                 raise AssistantError("Последовательность должна содержать от двух до четырёх проверок или отчётов.")
             plans = [validate_plan(step) for step in workflow["steps"]]
+            if date_period:
+                for step in plans:
+                    step["date_from"], step["date_to"] = date_period
             if any(step["purpose"] in NATIVE_ACTIONS for step in plans):
                 raise AssistantError("Редактирование и открытие финансовых форм выполняются отдельным действием, не цепочкой.")
             finish(conn, actor, operation, "text", "routed")
@@ -424,6 +535,8 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
             raise AssistantError("Помощник не выбрал поддерживаемую функцию. Выберите действие кнопкой ниже; "
                                  "период и сотрудника можно задать в полях над кнопками.")
         plan = validate_plan(json.loads(calls[0]["arguments"]))
+        if date_period:
+            plan["date_from"], plan["date_to"] = date_period
         if re.match(r"проверь(?:те)?\s+транспорт\b", normalized) and plan["purpose"] in {"search", "check", "explain"}:
             plan["purpose"] = "transport_check"
         finish(conn, actor, operation, "text", "routed")
@@ -440,7 +553,9 @@ def validate_context(context):
         return None
     if not isinstance(context, dict) or set(context) != {"plan", "pending"}:
         raise AssistantError("Контекст диалога повреждён. Начните новый диалог.")
-    if not isinstance(context["pending"], str) or context["pending"] not in {"", "period", "scope", "object", "unsupported"}:
+    if not isinstance(context["pending"], str) or context["pending"] not in {
+        "", "period", "scope", "object", "report_type", "unsupported"
+    }:
         raise AssistantError("Неизвестное уточнение диалога.")
     return dict(plan=validate_plan(context["plan"]).copy(), pending=context["pending"])
 

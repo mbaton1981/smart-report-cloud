@@ -372,6 +372,89 @@ class AssistantApiTests(unittest.TestCase):
         with self.assertRaises(assistant.AssistantError):
             assistant.transport_command("Проверь транспорт с 2026-99-19 по 2026-10-25")
 
+    def test_one_day_period_is_recognized_by_read_transport_and_model_routes(self):
+        selection = plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25")
+        context = dict(plan=selection, pending="")
+        hours = assistant.recognized_read_command(
+            "Покажи часы по каждому сотруднику за 21.10.2026", context)
+        self.assertEqual((hours["date_from"], hours["date_to"]), ("2026-10-21", "2026-10-21"))
+        transport = assistant.transport_command("Проверь транспорт за 21.10.2026", context)
+        self.assertEqual((transport["date_from"], transport["date_to"]), ("2026-10-21", "2026-10-21"))
+
+        with patch("assistant_api.requests.post", return_value=self.response(
+                plan("search", date_from="2026-10-01", date_to="2026-10-31"))) as provider:
+            response = self.post("command", dict(
+                text="Покажи смены за 21.10.2026", operation_id=str(uuid.uuid4()), context=context))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        selected = response.get_json()["result"]["plan"]
+        self.assertEqual((selected["date_from"], selected["date_to"]), ("2026-10-21", "2026-10-21"))
+        self.assertEqual(provider.call_count, 1)
+
+        with patch("assistant_api.requests.post") as provider:
+            invalid = self.post("command", dict(
+                text="Покажи смены за 32.10.2026", operation_id=str(uuid.uuid4()), context=context))
+        self.assertEqual(invalid.status_code, 400)
+        provider.assert_not_called()
+
+    def test_ambiguous_report_offers_human_choices_and_preserves_single_day_selection(self):
+        self.fixture_shift()
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", dict(
+                text="Сделай отчёт по объекту Hotel за 21.10.2026",
+                operation_id=str(uuid.uuid4())))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        clarification = response.get_json()["clarification"]
+        self.assertEqual(clarification["field"], "report_type")
+        self.assertIn("Какой вариант нужен?", clarification["question"])
+        self.assertEqual(
+            (clarification["plan"]["date_from"], clarification["plan"]["date_to"]),
+            ("2026-10-21", "2026-10-21"),
+        )
+        self.assertEqual(clarification["plan"]["object_name"], "Hotel")
+        self.assertEqual(
+            [choice["label"] for choice in clarification["choices"]],
+            [
+                "Отчёт по стоимости объекта (часы, OB и транспорт)",
+                "Журнал работ по объекту (смены и интервалы)",
+            ],
+        )
+        provider.assert_not_called()
+
+        selected = clarification["plan"] | {
+            key: value for key, value in clarification["choices"][0].items() if key != "label"
+        }
+        with patch("assistant_api.requests.post") as provider:
+            result = self.post("inspect", dict(plan=selected, operation_id=str(uuid.uuid4())))
+        self.assertEqual(result.status_code, 200, result.get_json())
+        self.assertEqual(result.get_json()["result"]["plan"]["purpose"], "customer_pdf")
+        self.assertEqual(result.get_json()["result"]["plan"]["object_name"], "Hotel")
+        self.assertEqual((result.get_json()["result"]["plan"]["date_from"],
+                          result.get_json()["result"]["plan"]["date_to"]),
+                         ("2026-10-21", "2026-10-21"))
+        provider.assert_not_called()
+
+    def test_report_type_choices_render_as_labels_and_remove_display_fields_before_inspection(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        clarification = dict(
+            field="report_type", question="Какой отчёт подготовить?",
+            choices=[dict(label="Журнал работ по объекту", purpose="journal_pdf")],
+            plan=plan(),
+        )
+        dialog.received(dict(clarification=clarification))
+        self.assertEqual(dialog.clarification_choice.itemText(0), "Журнал работ по объекту")
+        self.assertNotIn("journal_pdf", dialog.output.toPlainText())
+        dialog.input.setPlainText("1")
+        with patch.object(RequestWorker, "start"):
+            dialog.command()
+        self.assertEqual(dialog.worker.path, "inspect")
+        self.assertEqual(dialog.worker.payload["plan"]["purpose"], "journal_pdf")
+        self.assertNotIn("label", dialog.worker.payload["plan"])
+
     def test_no_change_suffix_does_not_hide_hours_or_anomaly_intent(self):
         self.fixture_shift()
         with patch("assistant_api.requests.post") as provider, patch("assistant_api.datetime", wraps=datetime) as clock:
