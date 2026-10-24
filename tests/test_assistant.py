@@ -970,6 +970,66 @@ class AssistantApiTests(unittest.TestCase):
         result = self.post("inspect", dict(plan=selected, operation_id=str(uuid.uuid4()))).get_json()["result"]
         self.assertEqual(result["plan"]["object_name"], "Hotel Two")
 
+    def test_customer_report_choices_include_all_active_and_period_work_objects_only(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,markning,rate,transport_rate,is_active) "
+                "VALUES('Choice Firm',?,?,520,450,1)",
+                [(f"Active {index:02d}", f"active-{index}") for index in range(35)],
+            )
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,markning,rate,transport_rate,is_active) "
+                "VALUES(?,?,?,?,?,?)",
+                [
+                    ("Archive Firm", "Archived Work", "archive-work", 520, 450, 0),
+                    ("Archive Firm", "Archived OB", "archive-ob", 520, 450, 0),
+                    ("Archive Firm", "Archived Outside Period", "archive-outside", 520, 450, 0),
+                    ("Archive Firm", "Archived Deleted", "archive-deleted", 520, 450, 0),
+                    ("Service Firm", "Arbetstidsförkortning", "p1000", 0, 0, 1),
+                    ("Service Firm", "Sjuk", "p1001", 0, 0, 1),
+                    ("Service Firm", "Semestertimmar", "p1002", 0, 0, 1),
+                    ("Service Firm", "Holiday", "p1004", 0, 0, 1),
+                    ("Inactive Firm", "Inactive Without Work", "inactive", 520, 450, 0),
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO incoming_submissions
+                   (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                    submission_type,is_deleted,created_at,updated_at)
+                   VALUES(?,?,?,'Synthetic Employee',?,?,4,520,0,?,?,'2026-10-15','2026-10-15')""",
+                [
+                    ("archive-work", "archive-work", "2026-10-13", "Archive Firm", "Archived Work", "work", 0),
+                    ("archive-ob", "archive-ob", "2026-10-14", "Archive Firm", "Archived OB", "ob", 0),
+                    ("archive-outside", "archive-outside", "2026-10-19", "Archive Firm",
+                     "Archived Outside Period", "work", 0),
+                    ("archive-deleted", "archive-deleted", "2026-10-13", "Archive Firm",
+                     "Archived Deleted", "work", 1),
+                ],
+            )
+            conn.commit()
+            context = dict(
+                plan=plan("search", employee="Synthetic Employee",
+                          date_from="2026-10-12", date_to="2026-10-18"),
+                pending="report_type",
+            )
+            selected = assistant.report_command("1", context, conn)
+            self.assertEqual(selected["purpose"], "customer_pdf")
+            self.assertEqual(selected["employee"], "")
+            with self.assertRaises(assistant.AssistantQuestion) as raised:
+                assistant.resolve_selection(conn, selected)
+
+        question = raised.exception
+        choices = {(choice["company"], choice["object_name"]) for choice in question.choices}
+        self.assertGreater(len(choices), 30)
+        self.assertIn(("Choice Firm", "Active 34"), choices)
+        self.assertIn(("Archive Firm", "Archived Work"), choices)
+        self.assertIn(("Archive Firm", "Archived OB"), choices)
+        self.assertNotIn(("Archive Firm", "Archived Outside Period"), choices)
+        self.assertNotIn(("Archive Firm", "Archived Deleted"), choices)
+        self.assertNotIn(("Inactive Firm", "Inactive Without Work"), choices)
+        self.assertFalse(any(company == "Service Firm" for company, _ in choices))
+        self.assertIn(str(len(choices)), question.args[0])
+
     def test_integrated_conversation_passes_only_selection_and_preserves_report_follow_up(self):
         self.fixture_shift()
         context = dict(plan=plan("customer_pdf", company="Renatur", object_name="Hotel"), pending="object")

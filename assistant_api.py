@@ -779,6 +779,30 @@ def _employee_name_similarity(requested, candidate):
     return min(similarities)
 
 
+def _report_object_choices(conn, plan):
+    rows = conn.execute(
+        """SELECT DISTINCT o.company, o.name
+           FROM meta_objects AS o
+           WHERE LOWER(COALESCE(o.markning, '')) NOT IN ('p1000', 'p1001', 'p1002', 'p1004')
+             AND (
+                 COALESCE(o.is_active, 1) = 1
+                 OR EXISTS (
+                     SELECT 1
+                     FROM incoming_submissions AS s
+                     WHERE s.company = o.company
+                       AND s.object_name = o.name
+                       AND s.date BETWEEN ? AND ?
+                       AND s.submission_type IN ('work', 'ob')
+                       AND COALESCE(s.is_deleted, 0) = 0
+                 )
+             )
+             AND (? = '' OR o.company = ?)
+           ORDER BY o.company, o.name""",
+        (plan["date_from"], plan["date_to"], plan["company"], plan["company"]),
+    ).fetchall()
+    return [dict(company=row["company"], object_name=row["name"]) for row in rows]
+
+
 def resolve_selection(conn, plan):
     plan = plan.copy()
     if plan["employee"]:
@@ -828,9 +852,16 @@ def resolve_selection(conn, plan):
                                         choices=[dict(company=firm) for firm in firms[:30]], plan=plan)
             plan["company"] = firms[0]
     if plan["purpose"] in OBJECT_ACTIONS and not plan["object_name"]:
-        rows = conn.execute("SELECT company,name FROM meta_objects ORDER BY company,name").fetchall()
+        choices = _report_object_choices(conn, plan)
+        count = len(choices)
+        question = (
+            f"Выберите объект из списка: {count} рабочих объектов. "
+            "Архивные объекты с отработанными часами за этот период включены."
+            if count else
+            "Нет доступных рабочих объектов с учётом выбранного периода. Проверьте период."
+        )
         raise AssistantQuestion("object", plan=plan,
-                                choices=[dict(company=row["company"], object_name=row["name"]) for row in rows[:30]])
+                                question=question, choices=choices)
     if plan["purpose"] in {"employee_card", "accountant_export"} and not plan["employee"]:
         raise AssistantQuestion("scope", question="Для какого сотрудника открыть карточку или данные бухгалтеру?",
                                 plan=plan, choices=[dict(employee=row["name"]) for row in conn.execute(
