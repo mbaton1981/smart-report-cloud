@@ -5,7 +5,6 @@ import sys
 import tempfile
 import unittest
 import uuid
-from datetime import date
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -4428,7 +4427,7 @@ class CatalogSyncTests(unittest.TestCase):
             [holiday_object_name],
         )
 
-        shift_date = date.today().isoformat()
+        shift_date = "2026-10-23"
         invalid_work_submission = self.server_client.post("/submit-shift", json={
             "request_id": str(uuid.uuid4()),
             "date": shift_date,
