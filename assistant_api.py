@@ -182,35 +182,48 @@ def validate_plan(plan):
 
 
 def transport_command(text, context=None):
-    text = strip_no_change_suffix(text)
+    text = " ".join(strip_no_change_suffix(text).split())
+    date_token = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})"
     match = re.fullmatch(
-        r"(?:проверь(?:те)?|проверить)\s+(?:клиентский\s+)?транспорт"
-        r"(?:\s+(?:за|на)\s+(?P<week>текущую неделю|эту неделю|этой неделе|прошлую неделю|прошлой неделе|тот же период)"
-        r"|\s+с\s+(?P<start>\d{4}-\d{2}-\d{2})\s+по\s+(?P<end>\d{4}-\d{2}-\d{2}))?"
-        r"(?:,?\s+(?:для|у)\s+(?P<scope>всех сотрудников|одного сотрудника|сотрудника\s+(?P<name>[^,\n]+)))?"
-        r"[.!?]?",
-        " ".join(text.strip().split()), re.IGNORECASE)
+        rf"(?:(?:а\s+)?теперь\s+)?(?:(?:проверь(?:те)?|проверить)\s+)?"
+        rf"(?:клиентский\s+)?транспорт"
+        rf"(?:\s+(?:за|на)\s+(?P<period>текущ\w*\s+недел\w*|эт\w*\s+недел\w*|"
+        rf"прошл\w*\s+недел\w*|тот\s+же\s+период|этот\s+же\s+период|этот\s+период)"
+        rf"|\s+с\s+(?P<start>{date_token})\s+(?:по|до)\s+(?P<end>{date_token}))?"
+        rf"(?:,?\s+(?:для|у)\s+(?P<scope>всех\s+сотрудников|каждого\s+сотрудника|"
+        rf"одного\s+сотрудника|сотрудника\s+(?P<name>[^,\n]+)))?"
+        rf"[.!?]?",
+        text.strip(), re.IGNORECASE)
     if match is None:
         return None
     previous = context["plan"] if context else {}
     today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
     monday = today - timedelta(days=today.weekday())
-    if match["week"] and "недел" in match["week"]:
+    if match["period"] and "недел" in match["period"].casefold():
         start = monday
-        if match["week"].casefold().startswith("прошл"):
+        if match["period"].casefold().startswith("прошл"):
             start -= timedelta(days=7)
         begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
     elif match["start"]:
-        begin, end = match["start"], match["end"]
+        try:
+            begin, end = (
+                date.fromisoformat(value).isoformat() if "-" in value
+                else datetime.strptime(value, "%d.%m.%Y").date().isoformat()
+                for value in (match["start"], match["end"])
+            )
+        except ValueError:
+            raise AssistantError("Укажите корректный период.") from None
     else:
         begin = previous.get("date_from", monday.isoformat())
         end = previous.get("date_to", (monday + timedelta(days=6)).isoformat())
     plan = validate_plan(dict(purpose="transport_check", date_from=begin, date_to=end,
-                              employee=(match["name"] or "").strip() if match["scope"] else previous.get("employee", ""),
+                              employee=(match["name"] or "").strip() if match["name"] else
+                              "" if match["scope"] else previous.get("employee", ""),
                               company=previous.get("company", ""), object_name=previous.get("object_name", "")))
     if match["scope"] and match["scope"].casefold() == "одного сотрудника":
         raise AssistantQuestion("scope", plan=plan)
-    if not match["start"] and not (match["week"] and "недел" in match["week"]) and not context:
+    if (not match["start"] and not (match["period"] and "недел" in match["period"].casefold())
+            and not context):
         raise AssistantQuestion("period", plan=plan)
     return plan
 
@@ -227,22 +240,31 @@ def recognized_read_command(text, context=None):
     text = strip_no_change_suffix(text)
     normalized = " ".join(text.casefold().strip(" .!?").split())
     hours_request = re.fullmatch(
-        r"(?:покажи\s*,?\s*)?(?:кто\s+сколько\s+(?:отработал|работал)"
+        r"(?:(?:а\s+)?(?:теперь\s+)?)?(?:покажи\s*,?\s*)?"
+        r"(?:кто\s+сколько\s+(?:отработал|работал)"
         r"|сколько\s+час(?:ов|а)?\s+(?:отработал|работал)\s+"
-        r"(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|сотрудники))"
+        r"(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|сотрудники)"
+        r"|(?:отработанн\w*\s+)?час(?:ы|ов|а)\s+(?:по\s+каждому\s+сотруднику|"
+        r"каждого\s+сотрудника|всех\s+сотрудников))"
         r"(?:\s+.+)?",
         normalized,
     )
+    hours_request = bool(hours_request or (
+        re.search(r"\bчас(?:ы|ов|а)\b", normalized) and
+        re.search(r"\b(?:по\s+каждому\s+сотруднику|каждого\s+сотрудника|всех\s+сотрудников)\b", normalized)
+    ))
     if hours_request:
         purpose = "hours_summary"
-    elif re.search(r"\bдубл\w*", normalized) or re.search(
-            r"\b(?:пропущен|отсутств|без|не\s+задан)\w*\s+ставк\w*", normalized):
+    elif (re.search(r"\bдубл\w*", normalized) or re.search(
+            r"\b(?:пропущен|отсутств|без|не\s+задан)\w*\s+ставк\w*", normalized) or
+          re.search(r"\b(?:проблем\w*|ошибк\w*)\s+(?:со?\s+)?ставк\w*", normalized)):
         purpose = "anomalies"
     else:
         return None
 
-    if not hours_request and re.search(
-            r"\b(?:объект|фирм|компан|сотрудник|для\s+(?!всех\s+сотрудник))", normalized):
+    if re.search(r"\b(?:объект|фирм|компан)\b", normalized) or (
+            not hours_request and re.search(
+                r"\b(?:сотрудник|для\s+(?!всех\s+сотрудник))", normalized)):
         return None
 
     previous = context["plan"] if context else {}
@@ -528,6 +550,7 @@ def inspect(conn, plan, *, begin_snapshot=True):
         row["entry_type"] = row["submission_type"]
         prices = row_prices(row)
         warnings = []
+        catalog_rate = None
         if row["entry_type"] in ("work", "ob"):
             if prices["base"] is None:
                 warnings.append("Клиентская ставка не задана")
@@ -542,6 +565,7 @@ def inspect(conn, plan, *, begin_snapshot=True):
             if len(objects) != 1:
                 warnings.append("Нет однозначной связи фирмы и объекта")
             else:
+                catalog_rate = objects[0]["rate"]
                 if prices["base"] != objects[0]["rate"]:
                     warnings.append("Сохранённая ставка отличается от текущего справочника; это не обязательно ошибка")
                 if prices["travel"] != objects[0]["transport_rate"]:
@@ -556,7 +580,8 @@ def inspect(conn, plan, *, begin_snapshot=True):
         records.append(dict(id=row["sync_id"], date=row["date"], employee=row["employee"],
                             company=row["company"], object_name=row["object_name"],
                             entry_type=row["entry_type"], hours=row["hours"],
-                            customer_rate=prices["base"], travel_rate=prices["travel"],
+                            customer_rate=prices["base"], catalog_rate=catalog_rate,
+                            travel_rate=prices["travel"],
                             trips=row["transport"], price_source=prices.get("source") or "Не указано",
                             fixed=bool(prices.get("fixed")), intervals=[dict(t) for t in times],
                             prices=prices, start_time=row.get("start_time"), end_time=row.get("end_time"),
@@ -588,10 +613,16 @@ def inspect(conn, plan, *, begin_snapshot=True):
         result["summary"] = f"Сотрудников: {len(totals)}. Отработано: " + str(
             sum((values[0] for values in totals.values()), Decimal("0"))) + " ч. OB входит в отработанное время."
     elif plan["purpose"] == "anomalies":
+        result["checked_count"] = len(records)
         missing = [r for r in records if r["entry_type"] in {"work", "ob"} and r["customer_rate"] is None and not r["fixed"]]
-        result["summary"] = f"Проверено {len(records)} записей. Без ставки: {len(missing)}; " \
-                            f"возможные дубли: {len(repeated)} записей. Автоматического удаления и замены цен нет."
-        result["records"] = [r for r in records if r in missing or r["duplicate"]]
+        changed_rates = [r for r in records if r["entry_type"] in {"work", "ob"} and not r["fixed"]
+                         and r["customer_rate"] is not None and r["catalog_rate"] is not None
+                         and r["customer_rate"] != r["catalog_rate"]]
+        result["summary"] = (f"Проверено {len(records)} записей. Без клиентской ставки: {len(missing)}; "
+                             f"ставка отличается от справочника: {len(changed_rates)}; "
+                             f"возможные дубли: {len(repeated)} записей. "
+                             "Отличие ставки требует проверки; автоматического удаления и замены цен нет.")
+        result["records"] = [r for r in records if r in missing or r in changed_rates or r["duplicate"]]
     result["context"] = dict(plan=plan, pending="")
     return result
 

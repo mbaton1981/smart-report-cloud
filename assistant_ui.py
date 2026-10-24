@@ -29,6 +29,13 @@ class AssistantClientError(ValueError):
     pass
 
 
+CANDIDATE_READ_ACTIONS = frozenset({
+    "search", "hours_summary", "check", "anomalies", "transport_check", "explain",
+    "employees", "objects", "payroll_pdf", "customer_pdf", "journal_pdf",
+})
+CANDIDATE_REQUESTS = frozenset({"status", "capabilities", "command", "inspect", "transcribe"})
+
+
 def request_api(path, payload=None, audio=None, database=None):
     base = desktop_auth.server_url().rstrip("/")
     parsed = urlsplit(base)
@@ -108,6 +115,17 @@ def result_text(result):
                       "В проверенных полях расхождений не найдено." if t["checked"] else
                       "Нет записей, для которых выполнена проверка транспорта.",
                       t["limits"]])
+    elif plan["purpose"] == "anomalies":
+        checked = result.get("checked_count")
+        if checked is not None:
+            lines[2] = f"Проверено записей: {checked}."
+        lines.append("Искались возможные дубли, смены без клиентской ставки и сохранённые ставки, "
+                     "отличающиеся от справочника. "
+                     "Проверены только серверные записи выбранного периода и фильтров.")
+        lines.append("Требующие внимания записи перечислены в таблице." if result["records"] else
+                     "Дублей и проблем со ставками в проверенном охвате не найдено.")
+        lines.append("Автоматического удаления и замены цен нет.")
+        lines.append(result["notice"])
     else:
         lines.append("Проверены сохранённые ставки, связь фирмы и объекта, время и возможные дубликаты."
                      if plan["purpose"] == "check" else "Показаны сохранённые записи выбранного периода.")
@@ -118,11 +136,14 @@ def result_text(result):
             subtotal = sum((Decimal(str(value)) for value in known), Decimal("0"))
             lines.append(f'Подытог известных базовых стоимостей без OB: {subtotal:,.2f} SEK '
                          f'({len(known)} записей; остальные не включены).')
-        lines.append("Это не итог фактуры: OB, Fast pris и условия договора проверяйте в штатном отчёте.")
+        if plan["purpose"] in {"check", "explain"}:
+            lines.append("Это не итог фактуры: OB, Fast pris и условия договора проверяйте в штатном отчёте.")
         lines.append(result["notice"])
     lines.append(result["source"])
     if not result["records"]:
-        lines.append("По выбранным фильтрам на сервере записей нет. Это не проверка других профилей или несинхронизированных данных.")
+        if plan["purpose"] != "anomalies":
+            lines.append("По выбранным фильтрам на сервере записей нет. "
+                         "Это не проверка других профилей или несинхронизированных данных.")
     return "\n".join(lines)
 
 
@@ -137,6 +158,8 @@ def result_table(result):
         headers.insert(6, "Справочник, SEK/выезд")
     else:
         headers.insert(4, "Ставка, SEK/ч")
+        if result["plan"]["purpose"] in {"check", "anomalies"}:
+            headers.insert(5, "Ставка справочника, SEK/ч")
     rows = []
     for r in result["records"]:
         cells = [r["date"], r["employee"], f'{r["company"]} / {r["object_name"]}',
@@ -149,6 +172,9 @@ def result_table(result):
             cells.insert(6, "Не определена" if rate is None else f"{rate:g}")
         else:
             cells.insert(4, "Не задана" if r["customer_rate"] is None else f'{r["customer_rate"]:g}')
+            if result["plan"]["purpose"] in {"check", "anomalies"}:
+                rate = r.get("catalog_rate")
+                cells.insert(5, "Не определена" if rate is None else f"{rate:g}")
         rows.append(cells)
     return headers, rows
 
@@ -333,6 +359,8 @@ class AssistantDialog(QDialog):
         actions = QHBoxLayout()
         self.action_choice = QComboBox()
         for key, (title, mode) in CAPABILITIES.items():
+            if self.assistant_candidate and key not in CANDIDATE_READ_ACTIONS:
+                continue
             self.action_choice.addItem(title, key)
         actions.addWidget(self.action_choice)
         run_action = QPushButton("Подготовить выбранное действие")
@@ -421,6 +449,9 @@ class AssistantDialog(QDialog):
             self.native.hide()
             self.mail_button.hide()
             self.confirm_mail.hide()
+            self.native.setEnabled(False)
+            self.mail_button.setEnabled(False)
+            self.confirm_mail.setEnabled(False)
             self.diagnostics.hide()
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -478,6 +509,14 @@ class AssistantDialog(QDialog):
         self.call("capabilities")
 
     def call(self, path, payload=None, audio=None):
+        if self.assistant_candidate:
+            allowed = path in CANDIDATE_REQUESTS and not (path == "status" and payload is not None)
+            if path == "inspect":
+                allowed = allowed and isinstance(payload, dict) and isinstance(payload.get("plan"), dict) \
+                    and payload["plan"].get("purpose") in CANDIDATE_READ_ACTIONS
+            if not allowed:
+                self.failed("Это действие отключено в кандидате: доступны только чтение, проверки и предпросмотр PDF.")
+                return
         if self.audio is not None:
             self.state.setText("Сначала остановите запись голоса.")
             return
@@ -600,6 +639,10 @@ class AssistantDialog(QDialog):
             self.append_message("SmartReport", data["mail"]["notice"])
             self.diagnostic_output.setPlainText("Message-ID: " + data["mail"]["message_id"])
         elif "result" in data:
+            purpose = data["result"].get("plan", {}).get("purpose")
+            if self.assistant_candidate and purpose not in CANDIDATE_READ_ACTIONS:
+                self.failed("Этот раздел недоступен в кандидате. Здесь разрешены только чтение, проверки и отчёты.")
+                return
             self.clear_clarification()
             if not data.get("_workflow") and not data.get("_repeat"):
                 self.workflow_results = []
@@ -658,6 +701,9 @@ class AssistantDialog(QDialog):
             self.received(dict(result=self.workflow_results[index], _repeat=True))
 
     def quick_action(self, purpose):
+        if self.assistant_candidate and purpose not in CANDIDATE_READ_ACTIONS:
+            self.failed("В кандидате доступны только чтение, проверки и предпросмотр зарплатного/клиентского PDF.")
+            return
         if self.date_from.date() > self.date_to.date():
             self.failed("Начальная дата должна быть не позже конечной.")
             return
@@ -694,6 +740,9 @@ class AssistantDialog(QDialog):
         self.input.clear()
 
     def open_native(self):
+        if self.assistant_candidate:
+            self.state.setText("Открытие изменяющих разделов отключено в кандидате.")
+            return
         if not self.result or "native_action" not in self.result:
             return
         if self.audio is not None or self.worker and self.worker.isRunning():
@@ -735,6 +784,10 @@ class AssistantDialog(QDialog):
         self.call("status", dict(enabled=self.enabled.isChecked(), limit_usd=self.limit.value()))
 
     def report(self):
+        if self.assistant_candidate and (
+                not self.result or self.result["plan"]["purpose"] not in CANDIDATE_READ_ACTIONS):
+            self.state.setText("В кандидате доступны только отчёты и предпросмотр без сохранения изменений.")
+            return
         try:
             if self.result:
                 open_report(self.window, self.result)
@@ -747,6 +800,9 @@ class AssistantDialog(QDialog):
             QMessageBox.warning(self, "PDF не сформирован", message)
 
     def prepare_mail(self):
+        if self.assistant_candidate:
+            self.state.setText("Подготовка и отправка писем отключены в кандидате.")
+            return
         if self.worker and self.worker.isRunning():
             return
         dialog = QDialog(self)
@@ -794,6 +850,9 @@ class AssistantDialog(QDialog):
         self.call("mail/prepare", self.mail_data)
 
     def send_mail(self):
+        if self.assistant_candidate:
+            self.state.setText("Отправка писем отключена в кандидате.")
+            return
         if self.worker and self.worker.isRunning():
             return
         answer = QMessageBox.question(self, "Отправить конкретное письмо?", (

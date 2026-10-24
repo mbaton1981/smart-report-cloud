@@ -480,6 +480,74 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual(override_result["table"]["rows"], [["Общий итог", "0"]])
         provider.assert_not_called()
 
+    def test_transport_and_anomaly_followups_keep_context_and_explain_scope(self):
+        self.fixture_shift()
+        context = dict(
+            plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25"),
+            pending="",
+        )
+        with patch("assistant_api.requests.post") as provider:
+            transport = self.post("command", dict(
+                text="А теперь проверь транспорт за тот же период",
+                operation_id=str(uuid.uuid4()),
+                context=context,
+            ))
+            self.assertEqual(transport.status_code, 200, transport.get_json())
+            transport_result = transport.get_json()["result"]
+            self.assertEqual(transport_result["plan"]["purpose"], "transport_check")
+            self.assertEqual(
+                (transport_result["plan"]["date_from"], transport_result["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            self.assertIn("Проверено: 1; требуют внимания: 0", __import__(
+                "assistant_ui").result_text(transport_result))
+
+            clear = self.post("command", dict(
+                text="Найди дубли и проблемы со ставками за тот же период",
+                operation_id=str(uuid.uuid4()),
+                context=transport_result["context"],
+            ))
+            self.assertEqual(clear.status_code, 200, clear.get_json())
+            clear_result = clear.get_json()["result"]
+            self.assertEqual(clear_result["plan"]["purpose"], "anomalies")
+            self.assertEqual(clear_result["checked_count"], 1)
+            from assistant_ui import result_text
+            clear_text = result_text(clear_result)
+            self.assertIn("Дублей и проблем со ставками в проверенном охвате не найдено.", clear_text)
+            self.assertNotIn("записей нет", clear_text)
+            self.assertNotIn("assistant-five", clear_text)
+
+            with closing(self.server.get_db_connection()) as conn:
+                conn.execute("UPDATE meta_objects SET rate=600 WHERE company='Renatur' AND name='Hotel'")
+                conn.execute("""INSERT INTO incoming_submissions
+                    (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                     submission_type,created_at,updated_at)
+                    VALUES('assistant-duplicate','assistant-duplicate','2026-10-23',
+                           'Synthetic Employee','Renatur','Hotel',5,520,0,'work','2026-10-23','2026-10-23')""")
+                conn.commit()
+            issues = self.post("command", dict(
+                text="Найди дубли и проблемы со ставками за тот же период",
+                operation_id=str(uuid.uuid4()),
+                context=transport_result["context"],
+            ))
+            self.assertEqual(issues.status_code, 200, issues.get_json())
+            issue_result = issues.get_json()["result"]
+
+        self.assertEqual(issue_result["checked_count"], 2)
+        self.assertEqual(len(issue_result["records"]), 2)
+        self.assertIn("ставка отличается от справочника: 2", issue_result["summary"])
+        self.assertIn("возможные дубли: 2 записей", issue_result["summary"])
+        from assistant_ui import result_table, result_text
+        headers, rows = result_table(issue_result)
+        self.assertIn("Ставка справочника, SEK/ч", headers)
+        self.assertEqual(len(headers), len(rows[0]))
+        output = result_text(issue_result)
+        self.assertIn("Проверено записей: 2.", output)
+        self.assertIn("Требующие внимания записи перечислены в таблице.", output)
+        self.assertNotIn("assistant-duplicate", output)
+        self.assertNotIn("список смен", output.casefold())
+        provider.assert_not_called()
+
     def test_explicit_dates_override_followup_period_in_european_format(self):
         context = dict(
             plan=plan("transport_check", date_from="2026-10-19", date_to="2026-10-25"),
@@ -827,19 +895,25 @@ class AssistantApiTests(unittest.TestCase):
                 dialog.stop_recording()
                 self.assertEqual(dialog.worker.path, "transcribe")
                 audio_response = Mock(status_code=200, json=Mock(return_value={
-                    "text": "Проверь транспорт за текущую неделю"}))
+                    "text": "А теперь проверь транспорт за тот же период"}))
                 with patch("assistant_api.requests.post", return_value=audio_response):
                     dialog.worker.run()
                 dialog.finished()
-                self.assertEqual(dialog.input.toPlainText(), "Проверь транспорт за текущую неделю")
+                self.assertEqual(dialog.input.toPlainText(), "А теперь проверь транспорт за тот же период")
                 self.assertEqual(api.call_count, 2)  # Transcription did not execute a command.
-                with patch("assistant_api.datetime", wraps=datetime) as clock:
-                    clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
-                    dialog.send.click()
-                    dialog.worker.run()
+                previous_context = dialog.context.copy()
+                dialog.command()
+                self.assertEqual(dialog.worker.path, "command")
+                self.assertEqual(dialog.worker.payload["context"]["plan"], previous_context["plan"])
+                dialog.worker.run()
                 dialog.finished()
                 self.assertEqual(api.call_count, 3)
+                self.assertEqual(api.call_args.args[0], "command")
                 self.assertEqual(dialog.result["plan"]["purpose"], "transport_check")
+                self.assertEqual(
+                    (dialog.result["plan"]["date_from"], dialog.result["plan"]["date_to"]),
+                    (previous_context["plan"]["date_from"], previous_context["plan"]["date_to"]),
+                )
                 self.assertEqual(dialog.table.rowCount(), 1)
         self.assertEqual(before, self.business())
 
@@ -1016,6 +1090,39 @@ class AssistantUiTests(unittest.TestCase):
         self.assertFalse(dialog.confirm_mail.isEnabled())
         rendered = result_text(dict(plan=plan(), source="Test", notice="No changes", records=[]))
         self.assertIn("записей нет", rendered)
+
+    def test_connected_candidate_blocks_mutating_and_mail_capabilities(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+
+        CandidateWindow = type("CandidateWindow", (QWidget,), {"__module__": self.desktop.__name__})
+        window = CandidateWindow()
+        with patch.object(self.desktop, "ASSISTANT_CANDIDATE", True), patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(window)
+        self.addCleanup(dialog.close)
+        self.addCleanup(window.close)
+        self.assertTrue(dialog.assistant_candidate)
+        actions = {dialog.action_choice.itemData(i) for i in range(dialog.action_choice.count())}
+        self.assertIn("hours_summary", actions)
+        self.assertIn("transport_check", actions)
+        self.assertIn("customer_pdf", actions)
+        self.assertNotIn("catalog_preview", actions)
+        self.assertNotIn("directories", actions)
+        self.assertFalse(dialog.mail_button.isEnabled())
+        self.assertFalse(dialog.confirm_mail.isEnabled())
+        self.assertFalse(dialog.native.isEnabled())
+        self.assertTrue(dialog.mail_button.isHidden())
+        self.assertTrue(dialog.native.isHidden())
+
+        with patch.object(dialog, "call") as api:
+            dialog.prepare_mail()
+            dialog.send_mail()
+        self.assertIn("отключ", dialog.state.text())
+        self.assertEqual(api.call_count, 0)
+
+        dialog.quick_action("catalog_preview")
+        self.assertIn("только чтение", dialog.state.text())
+        self.assertFalse(dialog.pdf.isEnabled())
 
     def test_dialog_is_chat_with_private_diagnostics_and_context_followup(self):
         from assistant_ui import AssistantDialog, RequestWorker
