@@ -522,6 +522,9 @@ def strip_no_change_suffix(text):
 def recognized_read_command(text, context=None):
     text = strip_no_change_suffix(text)
     normalized = " ".join(text.casefold().strip(" .!?").split())
+    submission_check = bool(re.search(
+        r"\b(?:сдач\w*\s+час\w*|контрол\w*\s+сдач\w*)\b", normalized
+    ))
     hours_request = re.fullmatch(
         r"(?:(?:а\s+)?(?:теперь\s+)?)?(?:покажи\s*,?\s*)?"
         r"(?:кто\s+сколько\s+(?:отработал|работал)"
@@ -532,7 +535,7 @@ def recognized_read_command(text, context=None):
         r"(?:\s+.+)?",
         normalized,
     )
-    hours_request = bool(hours_request or (
+    hours_request = bool(submission_check or hours_request or (
         re.search(r"\bчас(?:ы|ов|а)\b", normalized) and
         re.search(r"\b(?:по\s+каждому\s+сотруднику|каждого\s+сотрудника|всех\s+сотрудников)\b", normalized)
     ) or re.match(r"^(?:(?:покажи|посчитай)\s+)?часы(?:\s|$)", normalized))
@@ -565,7 +568,14 @@ def recognized_read_command(text, context=None):
         begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
 
     employee_text = ""
-    if hours_request and not re.search(
+    if submission_check:
+        explicit_employee = re.search(
+            r"\b(?:для\s+)?сотрудник\w*\s+(.+?)(?=\s+(?:за|на|с|прошл\w*\s+недел\w*|"
+            r"текущ\w*\s+недел\w*)\b|$)",
+            text.strip(" .!?"), re.IGNORECASE)
+        if explicit_employee:
+            employee_text = explicit_employee.group(1).strip(" ,.")
+    elif hours_request and not re.search(
             r"\b(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|все\s+сотрудники)\b", normalized):
         employee_match = re.match(
             r"^(?:(?:а\s+)?теперь\s+)?(?:покажи\s*,?\s*)?часы(?:\s+(?P<name>.*))?$",
@@ -580,10 +590,13 @@ def recognized_read_command(text, context=None):
 
     plan = validate_plan(dict(
         purpose=purpose, date_from=begin, date_to=end,
-        employee="" if re.search(
+        employee=employee_text if submission_check else "" if re.search(
             r"\b(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|все\s+сотрудники)\b", normalized
         ) else employee_text or previous.get("employee", ""),
-        company=previous.get("company", ""), object_name=previous.get("object_name", "")))
+        company="" if submission_check else previous.get("company", ""),
+        object_name="" if submission_check else previous.get("object_name", "")))
+    if submission_check and not (date_period or week_period or previous):
+        raise AssistantQuestion("period", plan=plan)
     if not (date_period or week_period or previous):
         raise AssistantQuestion("period", plan=plan)
     return plan
@@ -599,13 +612,188 @@ def compact_hours_summary(result):
     table = result.get("table")
     if not isinstance(table, dict):
         return
-    rows = [[row[0], str(row[1])] for row in table["rows"]]
-    total = sum((Decimal(str(row[1])) for row in rows), Decimal("0"))
+    if "processed_records" in result:
+        result["summary_only"] = True
+        return
+    rows = [[row[0], str(row[1])] for row in table["rows"] if row[0] != "Общий итог"]
+    total = sum((Decimal(row[1]) for row in rows), Decimal("0"))
     total_text = format(total.normalize(), "f")
     rows.append(["Общий итог", total_text])
     result["table"] = dict(headers=["Сотрудник", "Отработано, ч"], rows=rows)
     result["summary"] = f"Сотрудников: {len(rows) - 1}. Общий итог отработанного времени: {total_text} ч."
     result["summary_only"] = True
+
+
+def submission_hours_summary(conn, plan):
+    profiles_by_key = {}
+    for profile in conn.execute("SELECT id,name,is_active FROM meta_employees"):
+        key = " ".join(str(profile["name"] or "").split()).casefold()
+        profiles_by_key.setdefault(key, []).append(profile)
+
+    filters = ["s.is_deleted=0", "s.date>=?", "s.date<=?"]
+    values = [plan["date_from"], plan["date_to"]]
+    employee_key = ""
+    if plan["employee"]:
+        employee_key = " ".join(plan["employee"].split()).casefold()
+        filters.append("normalize_employee_name(s.employee)=?")
+        values.append(employee_key)
+    if plan["company"]:
+        filters.append("s.company=?")
+        values.append(plan["company"])
+    if plan["object_name"]:
+        filters.append("s.object_name=?")
+        values.append(plan["object_name"])
+
+    totals = {}
+    processed = 0
+    query = (
+        "SELECT s.employee,s.submission_type,s.hours,s.date,s.company,s.object_name "
+        "FROM incoming_submissions s WHERE " + " AND ".join(filters) + " ORDER BY s.date,s.id"
+    )
+    cursor = conn.execute(query, values)
+    for raw in cursor:
+        processed += 1
+        name = str(raw["employee"] or "").strip()
+        key = " ".join(name.split()).casefold()
+        matches = profiles_by_key.get(key, [])
+        profile = matches[0] if len(matches) == 1 else None
+        if profile:
+            group_key = f"profile:{profile['id']}"
+            display_name = profile["name"]
+            link_status = "Неактивен в справочнике" if not profile["is_active"] else "Связан"
+            employee_id = profile["id"]
+        else:
+            group_key = f"unlinked:{key or '<имя отсутствует>'}"
+            display_name = name or "Имя сотрудника отсутствует"
+            link_status = ("Неоднозначная связь со справочником"
+                           if len(matches) > 1 else "Нет связи со справочником")
+            employee_id = None
+        employee_totals = totals.setdefault(group_key, {
+            "employee": display_name,
+            "employee_id": employee_id,
+            "link_status": link_status,
+            "work": Decimal("0"),
+            "ob": Decimal("0"),
+            "atf": Decimal("0"),
+            "sick": Decimal("0"),
+            "vacation": Decimal("0"),
+            "holiday": Decimal("0"),
+            "unknown": Decimal("0"),
+            "records": 0,
+        })
+        kind = str(raw["submission_type"] or "")
+        hours = Decimal(str(raw["hours"] or 0))
+        employee_totals["records"] += 1
+        if kind in {"work", "ob"}:
+            employee_totals[kind] += hours
+        elif kind in {"atf", "sick", "vacation", "holiday"}:
+            employee_totals[kind] += hours
+        else:
+            employee_totals["unknown"] += hours
+
+    duplicate_query = (
+        "SELECT s.date,s.employee,s.company,s.object_name,s.hours,s.submission_type,COUNT(*) AS copies "
+        "FROM incoming_submissions s WHERE " + " AND ".join(filters) +
+        " GROUP BY s.date,normalize_employee_name(s.employee),s.company,s.object_name,"
+        "s.hours,s.submission_type HAVING COUNT(*)>1 ORDER BY s.date,s.employee,s.company,s.object_name"
+    )
+    duplicate_groups = []
+    duplicate_records = 0
+    for raw in conn.execute(duplicate_query, values):
+        key = " ".join(str(raw["employee"] or "").split()).casefold()
+        matches = profiles_by_key.get(key, [])
+        employee = matches[0]["name"] if len(matches) == 1 else str(raw["employee"] or "Имя отсутствует")
+        copies = int(raw["copies"])
+        duplicate_records += copies
+        duplicate_groups.append({
+            "date": raw["date"],
+            "employee": employee,
+            "company": raw["company"] or "",
+            "object_name": raw["object_name"] or "",
+            "hours": str(raw["hours"] or 0),
+            "submission_type": raw["submission_type"] or "не указан",
+            "copies": copies,
+        })
+
+    totals_by_kind = {kind: sum((entry[kind] for entry in totals.values()), Decimal("0"))
+                      for kind in ("work", "ob", "atf", "sick", "vacation", "holiday", "unknown")}
+    overall_work = totals_by_kind["work"] + totals_by_kind["ob"]
+
+    def display(value):
+        return format(value.normalize(), "f") if value else "0"
+
+    rows = []
+    for entry in sorted(totals.values(), key=lambda item: (item["employee"].casefold(), item["employee_id"] or 0)):
+        rows.append([
+            entry["employee"], entry["link_status"],
+            display(entry["work"] + entry["ob"]), display(entry["work"]), display(entry["ob"]),
+            display(entry["atf"]), display(entry["sick"]), display(entry["vacation"]),
+            display(entry["holiday"]), display(entry["unknown"]), entry["records"],
+        ])
+    rows.append([
+        "Общий итог", "", display(overall_work), display(totals_by_kind["work"]),
+        display(totals_by_kind["ob"]), display(totals_by_kind["atf"]),
+        display(totals_by_kind["sick"]), display(totals_by_kind["vacation"]),
+        display(totals_by_kind["holiday"]), display(totals_by_kind["unknown"]), processed,
+    ])
+    employee_count = len(totals)
+    linked_count = sum(entry["employee_id"] is not None for entry in totals.values())
+    unlinked_names = sorted({entry["employee"] for entry in totals.values()
+                             if entry["employee_id"] is None}, key=str.casefold)
+    unknown_types = sorted({
+        str(row[0] or "не указан")
+        for row in conn.execute(
+            "SELECT DISTINCT s.submission_type FROM incoming_submissions s WHERE " +
+            " AND ".join(filters) + " AND COALESCE(s.submission_type,'') NOT IN "
+            "('work','ob','atf','sick','vacation','holiday')",
+            values,
+        )
+    }, key=str.casefold)
+    warnings = [
+        "Без достоверного графика или назначений нельзя определить, кто должен был сдать часы; "
+        "отсутствие записи не означает несдачу."
+    ]
+    if unlinked_names:
+        warnings.append("Нет однозначной связи со справочником сотрудников: " + ", ".join(unlinked_names) + ".")
+    if unknown_types:
+        warnings.append("Записи неизвестных типов включены в число обработанных, но не в рабочие часы: " +
+                        ", ".join(unknown_types) + ".")
+    if duplicate_groups:
+        warnings.append(
+            f"Возможные дубли: {len(duplicate_groups)} групп, затрагивают {duplicate_records} записей. "
+            "Они показаны отдельно и не вычтены из сумм."
+        )
+        warnings.extend(
+            f'{group["date"]}: {group["employee"]}, {group["company"]} / {group["object_name"]}, '
+            f'{group["submission_type"]}, {group["hours"]} ч — {group["copies"]} совпадающих записей.'
+            for group in duplicate_groups
+        )
+    summary = (
+        f'Период {plan["date_from"]} — {plan["date_to"]}: обработано записей {processed}; '
+        f'сотрудников/отдельных групп {employee_count} (связано со справочником {linked_count}); '
+        f'отработано {display(overall_work)} ч, включая OB {display(totals_by_kind["ob"])} ч. '
+        f'Остальные категории отдельно: ATF {display(totals_by_kind["atf"])}, '
+        f'больничные {display(totals_by_kind["sick"])}, отпуск {display(totals_by_kind["vacation"])}, '
+        f'праздничные {display(totals_by_kind["holiday"])} ч. '
+        'OB входит в отработанное время и не прибавляется повторно.'
+    )
+    return {
+        "table": {
+            "headers": [
+                "Сотрудник", "Связь со справочником", "Отработано, ч (OB включён)",
+                "Обычные часы, ч", "OB, ч (включены)", "ATF, ч", "Больничные, ч",
+                "Отпуск, ч", "Праздничные, ч", "Неизвестные типы, ч", "Записей",
+            ],
+            "rows": rows,
+        },
+        "summary": summary,
+        "processed_records": processed,
+        "employee_count": employee_count,
+        "linked_employee_count": linked_count,
+        "duplicate_groups": duplicate_groups,
+        "duplicate_record_count": duplicate_records,
+        "warnings": warnings,
+    }
 
 
 def select_plan(text, conn, actor, operation, post=None, context=None):
@@ -897,6 +1085,28 @@ def inspect(conn, plan, *, begin_snapshot=True):
                     "SELECT id,name,company FROM meta_objects WHERE name=? AND company=?",
                     (plan["object_name"], plan["company"])).fetchone())
         return result
+    if plan["purpose"] == "hours_summary":
+        result = submission_hours_summary(conn, plan)
+        employee = None
+        if plan["employee"]:
+            employee_row = conn.execute(
+                "SELECT id,name FROM meta_employees WHERE name=? COLLATE NOCASE",
+                (plan["employee"],),
+            ).fetchone()
+            employee = dict(employee_row) if employee_row else None
+        result.update({
+            "plan": plan,
+            "employee": employee,
+            "object": None,
+            "records": [],
+            "source": (
+                "Источник: серверная база SmartReport. Обработаны все неудалённые записи "
+                "выбранного периода без лимита 500; транспорт и расходы в часы не включаются."
+            ),
+            "notice": "\n".join(result.pop("warnings")),
+            "context": dict(plan=plan, pending=""),
+        })
+        return result
     employee = None
     if plan["employee"]:
         matches = conn.execute("SELECT id,name FROM meta_employees WHERE name=? COLLATE NOCASE",
@@ -981,17 +1191,6 @@ def inspect(conn, plan, *, begin_snapshot=True):
                        "Количество выездов и цена выезда — разные поля. Ничего не изменено.")
     if plan["purpose"] == "transport_check":
         result["transport"] = check_transport(conn, records)
-    elif plan["purpose"] == "hours_summary":
-        totals = {}
-        for row in records:
-            values = totals.setdefault(row["employee"], [Decimal("0"), Decimal("0"), 0])
-            values[0 if row["entry_type"] in {"work", "ob"} else 1] += Decimal(str(row["hours"]))
-            values[2] += 1
-        result["table"] = dict(headers=["Сотрудник", "Отработано, ч", "Другие виды часов, ч", "Записей"],
-                               rows=[[name, str(values[0]), str(values[1]), values[2]]
-                                     for name, values in sorted(totals.items())])
-        result["summary"] = f"Сотрудников: {len(totals)}. Отработано: " + str(
-            sum((values[0] for values in totals.values()), Decimal("0"))) + " ч. OB входит в отработанное время."
     elif plan["purpose"] == "anomalies":
         result["checked_count"] = len(records)
         missing = [r for r in records if r["entry_type"] in {"work", "ob"} and r["customer_rate"] is None and not r["fixed"]]

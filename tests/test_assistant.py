@@ -12,6 +12,7 @@ import unittest
 import wave
 from pathlib import Path
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 from reportlab.pdfgen.canvas import Canvas
 import requests
@@ -186,7 +187,10 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual((result["plan"]["date_from"], result["plan"]["date_to"]),
                          ("2026-10-21", "2026-10-21"))
         self.assertEqual(result["plan"]["purpose"], "hours_summary")
-        self.assertEqual(result["table"]["rows"], [["Andrii Piskun", "12.0", "0", 2]])
+        self.assertEqual(result["table"]["rows"][0][0], "Andrii Piskun")
+        self.assertEqual(result["table"]["rows"][0][2:5], ["12", "12", "0"])
+        self.assertEqual(result["table"]["rows"][0][-1], 2)
+        self.assertEqual(result["processed_records"], 2)
         provider.assert_called_once()
         self.assertEqual(before, self.business())
 
@@ -769,7 +773,8 @@ class AssistantApiTests(unittest.TestCase):
             self.assertEqual(result["plan"]["purpose"], "hours_summary")
             self.assertEqual((result["plan"]["date_from"], result["plan"]["date_to"]),
                              ("2026-10-19", "2026-10-25"))
-            self.assertEqual(len(result["records"]), 1)
+            self.assertEqual(result["records"], [])
+            self.assertEqual(result["processed_records"], 1)
 
             response = self.post("command", dict(text="Найди дубли и пропущенные ставки",
                                                  operation_id=str(uuid.uuid4()), context=context))
@@ -811,12 +816,13 @@ class AssistantApiTests(unittest.TestCase):
             (result["plan"]["date_from"], result["plan"]["date_to"]),
             ("2026-10-19", "2026-10-25"),
         )
-        self.assertEqual(result["table"]["headers"], ["Сотрудник", "Отработано, ч"])
-        self.assertEqual(result["table"]["rows"], [
-            ["Synthetic Employee", "5.0"],
-            ["Общий итог", "5"],
-        ])
-        self.assertIn("Общий итог отработанного времени: 5 ч.", result["summary"])
+        self.assertEqual(result["table"]["headers"][0:3],
+                         ["Сотрудник", "Связь со справочником", "Отработано, ч (OB включён)"])
+        self.assertEqual(result["table"]["rows"][0][0], "Synthetic Employee")
+        self.assertEqual(result["table"]["rows"][0][2], "5")
+        self.assertEqual(result["table"]["rows"][-1][0], "Общий итог")
+        self.assertEqual(result["table"]["rows"][-1][2], "5")
+        self.assertIn("обработано записей 1", result["summary"])
         self.assertTrue(result["summary_only"])
         self.assertNotIn("assistant-five", repr(result["table"]))
         self.assertNotIn("смен", result["summary"].casefold())
@@ -824,11 +830,12 @@ class AssistantApiTests(unittest.TestCase):
 
         from assistant_ui import result_table, result_text
         headers, rows = result_table(result)
-        self.assertEqual(headers, ["Сотрудник", "Отработано, ч"])
-        self.assertEqual(rows, result["table"]["rows"])
+        self.assertEqual(headers, result["table"]["headers"])
+        self.assertEqual(rows, [[str(value) for value in row] for row in result["table"]["rows"]])
         rendered = result_text(result)
         self.assertIn("2026-10-19 — 2026-10-25", rendered)
-        self.assertIn("Общий итог отработанного времени: 5 ч.", rendered)
+        self.assertIn("отработано 5 ч", rendered)
+        self.assertIn("нельзя определить, кто должен был сдать часы", rendered)
         self.assertNotIn("assistant-five", rendered)
 
         override = self.post("command", dict(
@@ -843,7 +850,8 @@ class AssistantApiTests(unittest.TestCase):
             (override_result["plan"]["date_from"], override_result["plan"]["date_to"]),
             ("2026-10-20", "2026-10-22"),
         )
-        self.assertEqual(override_result["table"]["rows"], [["Общий итог", "0"]])
+        self.assertEqual(override_result["table"]["rows"][-1][0], "Общий итог")
+        self.assertEqual(override_result["table"]["rows"][-1][2], "0")
         provider.assert_not_called()
 
     def test_transport_and_anomaly_followups_keep_context_and_explain_scope(self):
@@ -936,6 +944,157 @@ class AssistantApiTests(unittest.TestCase):
         self.assertIn("ARE SUPPORTED", body["instructions"])
         self.assertEqual(response.get_json()["result"]["plan"]["purpose"], "transport_check")
 
+    def test_submission_check_uses_previous_calendar_week_and_clears_team_filters(self):
+        self.fixture_shift()
+        context = dict(
+            plan=plan("hours_summary", date_from="2026-10-12", date_to="2026-10-18",
+                      employee="Synthetic Employee", company="Renatur", object_name="Hotel"),
+            pending="",
+        )
+        fixed_now = datetime(2026, 10, 26, 0, 30, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+            response = self.post("command", dict(
+                text="Проверь сдачу часов за прошлую неделю",
+                operation_id=str(uuid.uuid4()),
+                context=context,
+            ))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            result = response.get_json()["result"]
+            self.assertEqual(result["plan"]["purpose"], "hours_summary")
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            self.assertEqual(
+                (result["plan"]["employee"], result["plan"]["company"], result["plan"]["object_name"]),
+                ("", "", ""),
+            )
+            self.assertEqual(result["processed_records"], 1)
+            provider.assert_not_called()
+
+            employee_result = self.post("command", dict(
+                text="Проверь сдачу часов для сотрудника Synthetic Employee за прошлую неделю",
+                operation_id=str(uuid.uuid4()),
+                context=context,
+            ))
+            self.assertEqual(employee_result.status_code, 200, employee_result.get_json())
+            employee_plan = employee_result.get_json()["result"]["plan"]
+            self.assertEqual(employee_plan["employee"], "Synthetic Employee")
+            self.assertEqual(employee_plan["company"], "")
+            self.assertEqual(employee_plan["object_name"], "")
+            provider.assert_not_called()
+
+            missing_period = self.post("command", dict(
+                text="Проверь сдачу часов",
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(missing_period.status_code, 200, missing_period.get_json())
+            self.assertEqual(missing_period.get_json()["clarification"]["field"], "period")
+            provider.assert_not_called()
+
+    def test_submission_summary_separates_categories_unknown_profiles_and_duplicates(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.executemany(
+                "INSERT INTO meta_employees(name,is_active) VALUES(?,?)",
+                [
+                    ("Known Staff", 1),
+                    ("Inactive Staff", 0),
+                    ("Twin Name", 1),
+                    (" twin name ", 1),
+                ],
+            )
+
+            def add(sync_id, employee, hours, kind, *, object_name="Main", deleted=0, transport=0):
+                conn.execute(
+                    """INSERT INTO incoming_submissions
+                       (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                        submission_type,is_deleted,created_at,updated_at)
+                       VALUES(?,?, '2026-10-20',?,'Renatur',?,?,0,?,?,?,'2026-10-20','2026-10-20')""",
+                    (sync_id, sync_id, employee, object_name, hours, transport, kind, deleted),
+                )
+
+            add("summary-work-1", "Known Staff", 2.5, "work", transport=3)
+            add("summary-work-2", " known   staff ", 2.5, "work", transport=3)
+            add("summary-ob", "Known Staff", 1.5, "ob")
+            add("summary-atf", "Known Staff", 5, "atf")
+            add("summary-sick", "Known Staff", 2, "sick")
+            add("summary-vacation", "Known Staff", 3, "vacation")
+            add("summary-holiday", "Known Staff", 4, "holiday")
+            add("summary-transport", "Known Staff", 7, "transport")
+            add("summary-expense", "Known Staff", 99, "expense")
+            add("summary-inactive", "Inactive Staff", 6, "sick")
+            add("summary-unknown", "Ghost Staff", 8, "work")
+            add("summary-ambiguous", "Twin Name", 4, "work")
+            add("summary-deleted", "Known Staff", 100, "work", deleted=1)
+            conn.commit()
+
+        before = self.business()
+        response = self.post("inspect", dict(
+            plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25"),
+            operation_id=str(uuid.uuid4()),
+        ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["result"]
+        self.assertEqual(result["processed_records"], 12)
+        self.assertEqual(result["employee_count"], 4)
+        self.assertEqual(result["linked_employee_count"], 2)
+        self.assertEqual(result["duplicate_groups"], [{
+            "date": "2026-10-20",
+            "employee": "Known Staff",
+            "company": "Renatur",
+            "object_name": "Main",
+            "hours": "2.5",
+            "submission_type": "work",
+            "copies": 2,
+        }])
+        self.assertEqual(result["duplicate_record_count"], 2)
+        rows = {row[0]: row for row in result["table"]["rows"]}
+        self.assertEqual(rows["Known Staff"][2:10],
+                         ["6.5", "5", "1.5", "5", "2", "3", "4", "106"])
+        self.assertEqual(rows["Known Staff"][-1], 9)
+        self.assertEqual(rows["Inactive Staff"][1], "Неактивен в справочнике")
+        self.assertEqual(rows["Ghost Staff"][1], "Нет связи со справочником")
+        self.assertEqual(rows["Twin Name"][1], "Неоднозначная связь со справочником")
+        self.assertEqual(rows["Общий итог"][2:10],
+                         ["18.5", "17", "1.5", "5", "8", "3", "4", "106"])
+        self.assertEqual(rows["Общий итог"][-1], 12)
+        self.assertIn("нельзя определить, кто должен был сдать часы", result["notice"])
+        self.assertIn("Они показаны отдельно и не вычтены", result["notice"])
+        self.assertIn("expense, transport", result["notice"])
+        self.assertIn("2026-10-19 — 2026-10-25", result["summary"])
+        from assistant_ui import result_text
+        rendered = result_text(result)
+        self.assertIn("2 совпадающих записей", rendered)
+        self.assertNotIn("summary-work-1", rendered)
+        self.assertEqual(before, self.business())
+
+    def test_submission_summary_processes_more_than_500_rows_without_loss(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("INSERT INTO meta_employees(name) VALUES('Bulk Staff')")
+            conn.executemany(
+                """INSERT INTO incoming_submissions
+                   (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                    submission_type,created_at,updated_at)
+                   VALUES(?,?,'2026-10-20','Bulk Staff','Renatur',?,1,0,0,'work',
+                          '2026-10-20','2026-10-20')""",
+                [(f"bulk-{index}", f"bulk-{index}", f"Object {index}") for index in range(601)],
+            )
+            conn.commit()
+        before = self.business()
+        response = self.post("inspect", dict(
+            plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25"),
+            operation_id=str(uuid.uuid4()),
+        ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["result"]
+        self.assertEqual(result["processed_records"], 601)
+        self.assertEqual(result["employee_count"], 1)
+        self.assertEqual(result["table"]["rows"][0][2], "601")
+        self.assertEqual(result["table"]["rows"][-1][-1], 601)
+        self.assertIn("без лимита 500", result["source"])
+        self.assertEqual(before, self.business())
+
     def test_integrated_hours_summary_does_not_count_ob_twice_or_special_time_as_work(self):
         self.fixture_shift()
         with closing(self.server.get_db_connection()) as conn:
@@ -949,7 +1108,8 @@ class AssistantApiTests(unittest.TestCase):
         response = self.post("inspect", dict(plan=plan("hours_summary"), operation_id=str(uuid.uuid4())))
         self.assertEqual(response.status_code, 200, response.get_json())
         result = response.get_json()["result"]
-        self.assertEqual(result["table"]["rows"], [["Synthetic Employee", "5.0", "8.0", 2]])
+        self.assertEqual(result["table"]["rows"][0][2:9], ["5", "0", "5", "0", "0", "0", "8"])
+        self.assertEqual(result["table"]["rows"][0][-1], 2)
         self.assertIn("OB входит", result["summary"])
         self.assertEqual(before, self.business())
 
@@ -1105,7 +1265,7 @@ class AssistantApiTests(unittest.TestCase):
             self.assertIn("Выполнено шагов: 3", transcript)
             self.assertNotIn("Проверено: 1;", transcript)
             dialog.workflow_choice.setCurrentIndex(0)
-            self.assertEqual(dialog.table.horizontalHeaderItem(1).text(), "Отработано, ч")
+            self.assertEqual(dialog.table.horizontalHeaderItem(2).text(), "Отработано, ч (OB включён)")
             self.assertEqual(dialog.context["plan"]["purpose"], "hours_summary")
             self.assertTrue(dialog.result_heading.text().startswith("Кто сколько отработал"))
             preview = os.environ.get("SMARTREPORT_QA_ASSISTANT_PREVIEW")
