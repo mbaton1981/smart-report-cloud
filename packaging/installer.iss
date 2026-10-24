@@ -7,7 +7,7 @@
 #endif
 
 [Setup]
-AppId=SmartReport-UnifiedCandidate
+AppId=SmartReport-UnifiedDesktop
 AppName=SmartReport
 AppVersion={#AppVersion}
 AppPublisher=SmartReport

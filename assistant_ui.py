@@ -1,6 +1,7 @@
 """Optional director panel; network tasks never block the ordinary desktop workflow."""
 import io
 import base64
+from html import escape
 import json
 import os
 import sqlite3
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 import desktop_auth
+import desktop_theme
 from sync_dataset import HEADER, file_dataset, require_response_dataset
 from assistant_actions import CAPABILITIES, REPORT_ACTIONS
 from assistant_desktop import DesktopActionError, local_result, native_action
@@ -647,7 +649,19 @@ class AssistantDialog(QDialog):
     def append_message(self, role, text):
         cursor = self.output.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
-        cursor.insertText(("\n\n" if self.output.toPlainText() else "") + role + ":\n" + text)
+        if self.output.document().blockCount() > 1 or self.output.toPlainText():
+            cursor.insertHtml('<p style="margin:0; font-size:8pt">&nbsp;</p>')
+        label = {"Вы": "Вы", "SmartReport": "SmartReport"}.get(str(role), str(role))
+        background_color = "#313c4e" if label == "Вы" else "#2d3748"
+        background = desktop_theme.color(background_color).name()
+        body = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+        cursor.insertHtml(
+            f'<table width="100%" cellspacing="0" cellpadding="10" bgcolor="{background}">'
+            '<tr><td>'
+            f'<p style="margin:0 0 5px 0"><span style="font-size:12pt; font-weight:700">{escape(label)}</span></p>'
+            f'<p style="margin:0; font-size:10pt; font-weight:400">{body}</p>'
+            '</td></tr></table>'
+        )
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
 
