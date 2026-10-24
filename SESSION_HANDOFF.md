@@ -65,6 +65,51 @@
   открытом RC5. Перед установкой клиент нужно отдельно проверить/пересобрать,
   если потребуется устранить PDF-блокер или подтвердить метку в реальном PDF.
 
+## 24.10.2026 — инвентаризация SmartReport и точечная уборка
+
+- Новых копий, сборок или worktree не создавалось. Рабочий источник кода
+  остался в `C:\Users\mbato\.copilot\session-state\f35b117e-c633-42d1-8c5f-bfa5fede6a69\files\mail-automation`,
+  `main`, локальный HEAD `86a350f`.
+- Сохранены: установленная программа
+  `C:\Users\mbato\AppData\Local\Programs\SmartReport-1.0.19-rc1`
+  (PE `1.0.27-rc1`, 369.81 MB); активный кандидат RC5
+  `C:\Users\mbato\AppData\Local\Programs\SmartReport-Candidate-Connected-1.0.28-rc5`
+  (362.24 MB, PID 47772); RC4
+  `C:\Users\mbato\AppData\Local\Programs\SmartReport-Candidate-Connected-1.0.28-rc4`
+  (356.82 MB, release manifest commit `b4e7b8032a3c5d5c7b8e8d4bacebe8aa5ef8e28f`)
+  как единственная сохранённая кандидатская сборка для локального отката.
+- Актуальной копией локальной базы выбрана уже существующая
+  `C:\Users\mbato\AppData\Local\SmartReport\protected-recovery\assistant-ux-before-20261023\install-snapshot\local-before-install\smart_report.db`
+  (323,584 bytes). Read-only проверка: SQLite integrity `ok`, 30 таблиц,
+  10 смен, 5 OB-сегментов; логическое содержимое всех таблиц совпадает с
+  активным профилем `C:\Users\mbato\AppData\Local\SmartReport-1.0.9\smart_report.db`.
+  Файл в профиле не изменялся. Пустой `cloud_shifts` серверного снимка
+  `assistant-server-pre-report-context-fix` не является резервом смен.
+- Удалены только два неиспользуемых пакета-кандидата:
+  `SmartReport-Candidate-5ce5755` (356.8 MB) и
+  `SmartReport-Candidate-Connected-1.0.28-rc3` (356.8 MB); их работающих
+  процессов и пользовательских файлов в `backups`, `reports`, `salaries`
+  не было. Удалены промежуточные точные копии
+  `andrii-report-check-20261024-r1` — `r3`; они содержали один и тот же
+  SQLite-файл (SHA-256 `2D9B5DE0D0E897699ABE2DF15398EBAC837D6B6CDA416827656241BC3EF9D8F1`),
+  а `r4` уже содержит дневные записи двух объектов и проверочные PDF.
+- `andrii-report-check-20261024-r4` оставлена как отчетный fixture, не как
+  копия полной базы. Серверные и исторические restore-комплекты в
+  `protected-recovery` (всего около 2.94 GiB) не чистились: часть включает
+  зашифрованную конфигурацию, исходные bundle, manifests и архивы с
+  неустановленным происхождением/уникальным содержимым. Действующий комплект
+  OneDrive не затрагивался.
+- Отдельный архив
+  `assistant-rc5-workspace-backup-20261024T123711` (7.75 MB) сохранён:
+  manifest указывает на Desktop worktree `fix/local-mail-review-flow`,
+  HEAD `51587196ec0f866015674ee76a5c27e967eb44e0` и patch-файлы. Его отличия
+  от выбранного `main` не объединялись и не удалялись.
+- Установка, клиентские данные, рабочие ярлыки, ключи и сервер не менялись.
+  Число исторических restore-комплектов остаётся больше одного: безопасная
+  дальнейшая консолидация потребует отдельной сверки их restore-содержимого;
+  сомнительные файлы сохранены согласно правилу не удалять при неясном
+  назначении.
+
 ## 24.10.2026 — исторический этап: единый помощник, стенд без установки
 
 - Согласованная рабочая папка/ветка НЕ менялись:
