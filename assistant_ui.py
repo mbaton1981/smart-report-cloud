@@ -29,6 +29,9 @@ class AssistantClientError(ValueError):
     pass
 
 
+MAX_REPORT_PULL_CHANGES = 5000
+
+
 CANDIDATE_READ_ACTIONS = frozenset({
     "search", "hours_summary", "check", "anomalies", "transport_check", "explain",
     "employees", "objects", "payroll_pdf", "customer_pdf", "journal_pdf",
@@ -179,6 +182,190 @@ def result_table(result):
     return headers, rows
 
 
+def _report_local_selection(cursor, plan):
+    filters, values = ["date>=?", "date<=?"], [plan["date_from"], plan["date_to"]]
+    for name, value in (("employee", plan["employee"]), ("company", plan["company"]),
+                        ("object_name", plan["object_name"])):
+        if value:
+            filters.append(name + "=?")
+            values.append(value)
+    from customer_pricing import row_prices
+    has_segments = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ob_segments'"
+    ).fetchone()
+    local = {}
+    rows = cursor.execute("SELECT * FROM shifts WHERE " + " AND ".join(filters), values).fetchall()
+    for raw in rows:
+        row = dict(raw)
+        times = cursor.execute(
+            "SELECT start_time,end_time,hours FROM ob_segments WHERE shift_id=? "
+            "ORDER BY start_time,end_time,hours", (row["sync_id"],)
+        ).fetchall() if has_segments else []
+        local[row["sync_id"]] = dict(
+            hours=row["hours"], prices=row_prices(row), trips=row["transport"],
+            entry_type=row["entry_type"], start_time=row.get("start_time"),
+            end_time=row.get("end_time"), invoiced=bool(row["invoiced"]),
+            intervals=[dict(item) for item in times],
+        )
+    return local
+
+
+def _report_pull_changes(app, expected_ids, plan, records):
+    if not getattr(app, "ASSISTANT_CANDIDATE", False) or getattr(app, "ISOLATED_CANDIDATE", False):
+        raise AssistantClientError("Обновление кэша доступно только подключённому read-only кандидату.")
+    token = desktop_auth.current_token()
+    dataset = file_dataset(app.DB_FILE)
+    if not token or not dataset:
+        raise AssistantClientError("Нужен действующий вход администратора и согласованный набор данных.")
+    headers = {"Authorization": "Bearer " + token, HEADER: dataset}
+    try:
+        response = requests.get(
+            f"{app.CLOUD_URL.rstrip('/')}/sync/pull",
+            headers=headers, params={"since": 0}, timeout=(4, 20), allow_redirects=False,
+        )
+        require_response_dataset(response, dataset)
+        app.raise_for_sync_response(response)
+        payload = response.json()
+    except AssistantClientError:
+        raise
+    except (requests.RequestException, RuntimeError, ValueError) as error:
+        raise AssistantClientError(
+            "Безопасный серверный pull не выполнен; локальный кэш не изменён. " + str(error)
+        ) from None
+    if (not isinstance(payload, dict) or payload.get("ok") is not True
+            or not isinstance(payload.get("changes"), list)
+            or len(payload["changes"]) > MAX_REPORT_PULL_CHANGES):
+        raise AssistantClientError("Серверный pull имеет неверный формат или слишком большой объём; кэш не изменён.")
+
+    latest = {}
+    for item in payload["changes"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("sync_id"), str)
+                or item["sync_id"] not in expected_ids):
+            continue
+        try:
+            revision = (int(item.get("version")), int(item.get("change_seq")))
+        except (TypeError, ValueError):
+            raise AssistantClientError("Серверная запись имеет неверную версию; кэш не изменён.")
+        previous = latest.get(item["sync_id"])
+        if previous is None or revision > previous[0]:
+            latest[item["sync_id"]] = (revision, item)
+
+    if set(latest) != set(expected_ids):
+        raise AssistantClientError("Сервер не вернул все выбранные записи; локальный кэш не изменён.")
+    selected = [latest[identifier][1] for identifier in sorted(expected_ids)]
+    if any(item.get("deleted") for item in selected):
+        raise AssistantClientError("Выборка изменилась на сервере; повторите запрос. Локальный кэш не изменён.")
+    if not isinstance(records, list) or any(not isinstance(record, dict) or not record.get("id") for record in records):
+        raise AssistantClientError("Ответ помощника не содержит проверяемый список записей.")
+    expected_by_id = {record["id"]: record for record in records}
+    for item in selected:
+        record = expected_by_id[item["sync_id"]]
+        if (not isinstance(item.get("date"), str)
+                or item["date"] < plan["date_from"] or item["date"] > plan["date_to"]
+                or item.get("company") != plan["company"]
+                or item.get("object_name") != plan["object_name"]
+                or (plan["employee"] and item.get("employee") != plan["employee"])
+                or item.get("date") != record["date"] or item.get("employee") != record["employee"]
+                or item.get("company") != record["company"]
+                or item.get("object_name") != record["object_name"]):
+            raise AssistantClientError("Серверная выборка устарела; локальный кэш не изменён.")
+    return selected
+
+
+def _report_object_catalog_entry(app, result_object):
+    if not isinstance(result_object, dict):
+        raise AssistantClientError("Для клиентского PDF не определён объект.")
+    try:
+        payload = app.request_expense_api("GET", "/api/expense-objects?include_inactive=1")
+    except (requests.RequestException, RuntimeError, ValueError) as error:
+        raise AssistantClientError(
+            "Не удалось безопасно получить справочник объектов; локальный кэш не изменён. " + str(error)
+        ) from None
+    if not isinstance(payload, dict) or payload.get("ok") is not True or not isinstance(payload.get("objects"), list):
+        raise AssistantClientError("Сервер не вернул корректный справочник объектов; локальный кэш не изменён.")
+    try:
+        object_id = int(result_object["id"])
+    except (KeyError, TypeError, ValueError):
+        raise AssistantClientError("Ответ сервера не содержит однозначный объект; локальный кэш не изменён.")
+    matches = [
+        item for item in payload["objects"]
+        if isinstance(item, dict) and item.get("id") == object_id
+        and item.get("name") == result_object.get("name")
+        and item.get("company") == result_object.get("company")
+    ]
+    if len(matches) != 1 or not matches[0].get("sync_id"):
+        raise AssistantClientError("Объект нельзя однозначно связать со справочником; локальный кэш не изменён.")
+    return matches[0]
+
+
+def _refresh_report_cache(window, app, plan, result, local, remote, object_count):
+    missing_ids = set(remote) - set(local)
+    if (set(local) - set(remote)
+            or any(local[key] != remote[key] for key in set(local) & set(remote))
+            or (not missing_ids and local != remote)):
+        raise AssistantClientError(
+            "Локальные записи отличаются по существующим значениям. Обновление остановлено без изменений."
+        )
+    if object_count > 1:
+        raise AssistantClientError("Локальная связь фирмы и объекта неоднозначна; кэш не изменён.")
+    selected = _report_pull_changes(app, missing_ids, plan, result["records"]) if missing_ids else []
+    object_entry = None
+    if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"} and object_count == 0:
+        object_entry = _report_object_catalog_entry(app, result.get("object"))
+
+    conn = app.get_db_connection()
+    committed = False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        current = _report_local_selection(cursor, plan)
+        if current != local:
+            raise AssistantClientError("Кандидатский кэш изменился во время проверки; повторите создание PDF.")
+        if set(current) - set(remote) or any(current[key] != remote[key] for key in current):
+            raise AssistantClientError("Найдены локальные отличия; импорт выбранных записей отменён.")
+        for shift in selected:
+            if cursor.execute(
+                    "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? LIMIT 1", (shift["sync_id"],)
+            ).fetchone():
+                raise AssistantClientError("Для выбранной записи есть локальная операция; импорт остановлен.")
+            if shift.get("source") == "legacy":
+                collision = cursor.execute(
+                    "SELECT 1 FROM shifts WHERE date=? AND employee=? AND company=? AND object_name=? AND hours=? LIMIT 1",
+                    (shift["date"], shift["employee"], shift["company"], shift["object_name"], shift["hours"]),
+                ).fetchone()
+                if collision:
+                    raise AssistantClientError("Найдена несвязанная локальная запись; импорт остановлен.")
+        if object_entry:
+            if cursor.execute("SELECT COUNT(*) FROM companies WHERE name=?",
+                              (object_entry["company"],)).fetchone()[0] != 1:
+                raise AssistantClientError("Фирма отсутствует или неоднозначна в локальном справочнике; кэш не изменён.")
+            if cursor.execute("SELECT 1 FROM objects WHERE sync_id=? LIMIT 1",
+                              (object_entry["sync_id"],)).fetchone():
+                raise AssistantClientError("Связь объекта уже существует под другим названием; кэш не изменён.")
+            before_outbox = cursor.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0]
+            stats = app.merge_server_object_catalog(cursor, [object_entry])
+            after_outbox = cursor.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0]
+            if (stats["imported"] != 1 or stats["updated"] or stats["linked"] or stats["conflicts"]
+                    or stats["unresolved_legacy"] or after_outbox != before_outbox):
+                raise AssistantClientError("Объект не удалось безопасно добавить в кэш; все изменения отменены.")
+        for shift in selected:
+            window.apply_remote_shift(cursor, shift)
+        refreshed = _report_local_selection(cursor, plan)
+        if refreshed != remote:
+            raise AssistantClientError("Полученные данные не совпали с проверенной выборкой; все изменения отменены.")
+        if object_entry and cursor.execute(
+                "SELECT COUNT(*) FROM objects WHERE company=? AND name=?",
+                (object_entry["company"], object_entry["name"]),
+        ).fetchone()[0] != 1:
+            raise AssistantClientError("Локальная связь объекта не стала однозначной; все изменения отменены.")
+        conn.commit()
+        committed = True
+    finally:
+        if not committed:
+            conn.rollback()
+        conn.close()
+
+
 def open_report(window, result):
     plan = result["plan"]
     if plan["purpose"] not in REPORT_ACTIONS:
@@ -188,39 +375,38 @@ def open_report(window, result):
     conn = app.get_db_connection()
     try:
         conn.execute("PRAGMA query_only=ON")
-        filters, values = ["date>=?", "date<=?"], [plan["date_from"], plan["date_to"]]
         # Existing customer reports are whole-object documents, not a single worker subset.
         if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"} and plan["employee"]:
             raise AssistantClientError("Клиентский PDF включает весь объект. Повторите команду без фильтра сотрудника.")
-        for name, value in (("employee", plan["employee"]), ("company", plan["company"]), ("object_name", plan["object_name"])):
-            if value:
-                filters.append(name + "=?")
-                values.append(value)
-        from customer_pricing import row_prices
-        has_segments = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ob_segments'").fetchone()
-        local = {}
-        for raw in conn.execute("SELECT * FROM shifts WHERE " + " AND ".join(filters), values):
-            row = dict(raw)
-            times = conn.execute("SELECT start_time,end_time,hours FROM ob_segments WHERE shift_id=? ORDER BY start_time,end_time,hours",
-                                 (row["sync_id"],)).fetchall() if has_segments else []
-            local[row["sync_id"]] = dict(hours=row["hours"], prices=row_prices(row), trips=row["transport"],
-                                         entry_type=row["entry_type"], start_time=row.get("start_time"),
-                                         end_time=row.get("end_time"), invoiced=bool(row["invoiced"]),
-                                         intervals=[dict(t) for t in times])
+        local = _report_local_selection(conn.cursor(), plan)
         fields = ("hours", "prices", "trips", "entry_type", "start_time", "end_time", "invoiced", "intervals")
         remote = {r["id"]: {key: r[key] for key in fields} for r in result["records"]}
-        if local != remote:
-            raise AssistantClientError("Локальные записи отличаются от серверной выборки. Сначала синхронизируйте и повторите команду.")
+        object_count = 0
         if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"}:
             obj = result["object"]
             if obj is None:
                 raise AssistantClientError("Для клиентского PDF укажите точную фирму и объект.")
-            count = conn.execute("SELECT COUNT(*) FROM objects WHERE company=? AND name=?",
-                                 (obj["company"], obj["name"])).fetchone()[0]
-            if count != 1:
-                raise AssistantClientError("Нет однозначного локального объекта. Сначала синхронизируйте справочник.")
+            object_count = conn.execute("SELECT COUNT(*) FROM objects WHERE company=? AND name=?",
+                                        (obj["company"], obj["name"])).fetchone()[0]
     finally:
         conn.close()
+    needs_local_object = plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"} \
+        and object_count != 1
+    if local != remote or needs_local_object:
+        _refresh_report_cache(window, app, plan, result, local, remote, object_count)
+        conn = app.get_db_connection()
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            local = _report_local_selection(conn.cursor(), plan)
+            if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"}:
+                object_count = conn.execute("SELECT COUNT(*) FROM objects WHERE company=? AND name=?",
+                                            (result["object"]["company"], result["object"]["name"])).fetchone()[0]
+        finally:
+            conn.close()
+    if local != remote:
+        raise AssistantClientError("Локальные записи всё ещё отличаются от серверной выборки; PDF не сформирован.")
+    if plan["purpose"] in {"customer_pdf", "journal_pdf", "catalog_preview"} and object_count != 1:
+        raise AssistantClientError("Нет однозначного локального объекта; PDF не сформирован.")
     if plan["purpose"] == "payroll_pdf":
         if plan["company"] or plan["object_name"]:
             raise AssistantClientError("Зарплатная сводка поддерживает сотрудника и период, но не фильтр объекта. Ничего не сформировано.")

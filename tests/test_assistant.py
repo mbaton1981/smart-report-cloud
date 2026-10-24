@@ -1149,6 +1149,151 @@ class AssistantApiTests(unittest.TestCase):
         with self.assertRaisesRegex(AssistantClientError, "отличаются"):
             open_report(window, dict(plan=plan("payroll_pdf"), records=[record]))
 
+    def test_candidate_report_refresh_imports_only_missing_dataset_matched_rows(self):
+        from assistant_ui import _refresh_report_cache
+        from sync_dataset import HEADER, file_dataset
+
+        company, object_name = "Report Refresh Firm", "Report Refresh Hotel"
+        tomteboda_name = "Report Refresh Tomteboda"
+        sync_id, object_sync_id, tomteboda_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+        tomteboda_object_id = str(uuid.uuid4())
+        self._add_company(company)
+        quote = dict(version=1, company=company, object_name=object_name,
+                     date_from="2026-10-21", date_to="2026-10-21", source="test fixture",
+                     base=520, travel=450, ob={})
+        tomteboda_quote = dict(version=1, company=company, object_name=tomteboda_name,
+                               date_from="2026-10-21", date_to="2026-10-21", source="test fixture",
+                               base=520, travel=450, ob={"weekday_early_evening": 750})
+        tomteboda_segments = [
+            dict(segment_date="2026-10-21", start_time="16:00", end_time="18:00", hours=2,
+                 category="weekday_day", premium_percent=0, multiplier=1, base_rate=245.8,
+                 calculated_rate=245.8, amount=491.6),
+            dict(segment_date="2026-10-21", start_time="18:00", end_time="20:00", hours=2,
+                 category="weekday_early_evening", premium_percent=50, multiplier=1.5,
+                 base_rate=245.8, calculated_rate=368.7, amount=737.4),
+        ]
+        tomteboda_shift = dict(
+            id=tomteboda_id, sync_id=tomteboda_id, request_id=tomteboda_id, version=1, change_seq=2,
+            last_operation_id=None, deleted=False, source="desktop", date="2026-10-21",
+            employee="Synthetic Employee", company=company, object_name=tomteboda_name,
+            hours=4, rate=0, transport=1, comment="", submission_type="ob", record_type="ob",
+            invoiced=0, customer_pricing=tomteboda_quote, start_time="16:00", end_time="20:00",
+            ob_base_rate=245.8, ob_segments=tomteboda_segments,
+        )
+        shift = dict(
+            id=sync_id, sync_id=sync_id, request_id=sync_id, version=1, change_seq=3,
+            last_operation_id=None, deleted=False, source="desktop", date="2026-10-21",
+            employee="Synthetic Employee", company=company, object_name=object_name,
+            hours=8, rate=520, transport=1, comment="", submission_type="work",
+            record_type="work", invoiced=0, customer_pricing=quote,
+        )
+        record = dict(
+            id=sync_id, date="2026-10-21", employee="Synthetic Employee", company=company,
+            object_name=object_name, hours=8, prices=quote,
+            trips=1, entry_type="work", start_time=None, end_time=None, invoiced=False, intervals=[],
+        )
+        object_entry = dict(
+            id=73, sync_id=object_sync_id, name=object_name, markning="",
+            company=company, rate=520, transport_rate=450, is_active=1, sync_version=1,
+        )
+        selected = plan("customer_pdf", date_from="2026-10-21", date_to="2026-10-21",
+                        company=company, object_name=object_name)
+        result = dict(plan=selected, object=dict(id=73, name=object_name, company=company),
+                      records=[record])
+        with closing(self.desktop.get_db_connection()) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS sync_dataset(id INTEGER PRIMARY KEY,dataset_id TEXT)")
+            conn.execute("INSERT OR IGNORE INTO sync_dataset(id,dataset_id) VALUES(1,?)", (str(uuid.uuid4()),))
+            conn.execute("""INSERT INTO objects
+                (name,markning,company,rate,transport_rate,sync_id,server_id,is_active,sync_version)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (tomteboda_name, "", company, 520, 450, tomteboda_object_id, 72, 1, 1))
+            conn.execute("""INSERT INTO shifts
+                (date,employee,company,object_name,hours,rate,transport,comment,invoiced,
+                 sync_id,sync_version,entry_type,customer_pricing,work_rate_cache,
+                 work_transport_cache,start_time,end_time,ob_base_rate)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("2026-10-21", "Synthetic Employee", company, tomteboda_name, 4, 0, 1, "", 0,
+                 tomteboda_id, 1, "ob", json.dumps(tomteboda_quote), 520, 450, "16:00", "20:00", 245.8))
+            self.desktop.replace_ob_segments(conn.cursor(), tomteboda_id, tomteboda_segments)
+            conn.commit()
+        with closing(self.desktop.get_db_connection()) as conn:
+            before_tomteboda = tuple(conn.execute(
+                "SELECT * FROM shifts WHERE sync_id=?", (tomteboda_id,)
+            ).fetchone())
+            before_segments = [tuple(row) for row in conn.execute(
+                "SELECT * FROM ob_segments WHERE shift_id=? ORDER BY id", (tomteboda_id,)
+            )]
+        dataset = file_dataset(self.desktop.DB_FILE)
+        pull_response = Mock(
+            ok=True, status_code=200, headers={HEADER: dataset},
+            json=Mock(return_value={"ok": True, "changes": [tomteboda_shift, shift], "cursor": 3}),
+        )
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        with patch.object(self.desktop, "ASSISTANT_CANDIDATE", True), \
+                patch.object(self.desktop, "ISOLATED_CANDIDATE", False), \
+                patch("assistant_ui.desktop_auth.current_token", return_value="synthetic-token"), \
+                patch("assistant_ui.requests.get", return_value=pull_response) as pull, \
+                patch.object(self.desktop, "request_expense_api",
+                             return_value={"ok": True, "objects": [object_entry]}) as catalog:
+            _refresh_report_cache(window, self.desktop, selected, result, {}, {sync_id: {
+                "hours": 8, "prices": record["prices"], "trips": 1, "entry_type": "work",
+                "start_time": None, "end_time": None, "invoiced": False, "intervals": [],
+            }}, 0)
+
+        self.assertEqual(pull.call_count, 1)
+        self.assertEqual(pull.call_args.args[0], f"{self.desktop.CLOUD_URL.rstrip('/')}/sync/pull")
+        self.assertEqual(pull.call_args.kwargs["headers"][HEADER], dataset)
+        self.assertEqual(pull.call_args.kwargs["params"], {"since": 0})
+        catalog.assert_called_once_with("GET", "/api/expense-objects?include_inactive=1")
+        with closing(self.desktop.get_db_connection()) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM shifts WHERE sync_id=?", (sync_id,)).fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM objects WHERE sync_id=?", (object_sync_id,)).fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM object_sync_outbox").fetchone()[0], 0)
+            self.assertEqual(tuple(conn.execute(
+                "SELECT * FROM shifts WHERE sync_id=?", (tomteboda_id,)
+            ).fetchone()), before_tomteboda)
+            self.assertEqual([tuple(row) for row in conn.execute(
+                "SELECT * FROM ob_segments WHERE shift_id=? ORDER BY id", (tomteboda_id,)
+            )], before_segments)
+
+    def test_candidate_report_refresh_rejects_wrong_dataset_without_local_changes(self):
+        from assistant_ui import AssistantClientError, _refresh_report_cache
+        from sync_dataset import HEADER
+
+        company, object_name = "Report Wrong Dataset Firm", "Report Wrong Dataset Hotel"
+        sync_id = str(uuid.uuid4())
+        record = dict(
+            id=sync_id, date="2026-10-21", employee="Synthetic Employee", company=company,
+            object_name=object_name, hours=8, prices=dict(base=520, travel=450, ob={}),
+            trips=1, entry_type="work", start_time=None, end_time=None, invoiced=False, intervals=[],
+        )
+        selected = plan("customer_pdf", date_from="2026-10-21", date_to="2026-10-21",
+                        company=company, object_name=object_name)
+        result = dict(plan=selected, object=dict(id=74, name=object_name, company=company), records=[record])
+        with closing(self.desktop.get_db_connection()) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS sync_dataset(id INTEGER PRIMARY KEY,dataset_id TEXT)")
+            conn.execute("INSERT OR IGNORE INTO sync_dataset(id,dataset_id) VALUES(1,?)", (str(uuid.uuid4()),))
+            conn.commit()
+        pull_response = Mock(ok=True, status_code=200, headers={HEADER: str(uuid.uuid4())})
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        with patch.object(self.desktop, "ASSISTANT_CANDIDATE", True), \
+                patch.object(self.desktop, "ISOLATED_CANDIDATE", False), \
+                patch("assistant_ui.desktop_auth.current_token", return_value="synthetic-token"), \
+                patch("assistant_ui.requests.get", return_value=pull_response), \
+                patch.object(self.desktop, "request_expense_api") as catalog:
+            with self.assertRaisesRegex(AssistantClientError, "другому или прежнему"):
+                _refresh_report_cache(window, self.desktop, selected, result, {}, {
+                    sync_id: {
+                        "hours": 8, "prices": record["prices"], "trips": 1, "entry_type": "work",
+                        "start_time": None, "end_time": None, "invoiced": False, "intervals": [],
+                    }
+                }, 0)
+        catalog.assert_not_called()
+        with closing(self.desktop.get_db_connection()) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM shifts WHERE sync_id=?", (sync_id,)).fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM objects WHERE name=?", (object_name,)).fetchone()[0], 0)
+
     def test_voice_truncated_wav_and_invalid_pdf_controlled_without_external_calls(self):
         audio = BytesIO()
         with wave.open(audio, "wb") as wav:
