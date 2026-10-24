@@ -184,7 +184,7 @@ def validate_plan(plan):
 def transport_command(text, context=None):
     match = re.fullmatch(
         r"(?:проверь(?:те)?|проверить)\s+(?:клиентский\s+)?транспорт"
-        r"(?:\s+(?:за|на)\s+(?P<week>текущую неделю|эту неделю|этой неделе|прошлую неделю|прошлой неделе)"
+        r"(?:\s+(?:за|на)\s+(?P<week>текущую неделю|эту неделю|этой неделе|прошлую неделю|прошлой неделе|тот же период)"
         r"|\s+с\s+(?P<start>\d{4}-\d{2}-\d{2})\s+по\s+(?P<end>\d{4}-\d{2}-\d{2}))?"
         r"(?:,?\s+(?:для|у)\s+(?P<scope>всех сотрудников|одного сотрудника|сотрудника\s+(?P<name>[^,\n]+)))?"
         r"(?:,\s*ничего не изменяй)?[.!?]?",
@@ -194,7 +194,7 @@ def transport_command(text, context=None):
     previous = context["plan"] if context else {}
     today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
     monday = today - timedelta(days=today.weekday())
-    if match["week"]:
+    if match["week"] and "недел" in match["week"]:
         start = monday
         if match["week"].casefold().startswith("прошл"):
             start -= timedelta(days=7)
@@ -209,7 +209,7 @@ def transport_command(text, context=None):
                               company=previous.get("company", ""), object_name=previous.get("object_name", "")))
     if match["scope"] and match["scope"].casefold() == "одного сотрудника":
         raise AssistantQuestion("scope", plan=plan)
-    if not match["week"] and not match["start"] and not context:
+    if not match["start"] and not (match["week"] and "недел" in match["week"]) and not context:
         raise AssistantQuestion("period", plan=plan)
     return plan
 

@@ -350,6 +350,14 @@ class AssistantApiTests(unittest.TestCase):
             response = self.post("command", dict(text="Проверь транспорт за текущую неделю для одного сотрудника",
                                                  operation_id=str(uuid.uuid4())))
             self.assertEqual(response.get_json()["clarification"]["field"], "scope")
+            context = dict(plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25"), pending="")
+            response = self.post("command", dict(text="Проверь транспорт за тот же период",
+                                                 operation_id=str(uuid.uuid4()), context=context))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            reused = response.get_json()["result"]["plan"]
+            self.assertEqual(reused["purpose"], "transport_check")
+            self.assertEqual((reused["date_from"], reused["date_to"]), ("2026-10-19", "2026-10-25"))
+            self.assertEqual(reused["employee"], "")
             provider.assert_not_called()
         self.assertIsNone(assistant.transport_command("Проверь транспорт за текущую неделю и удали дубликаты"))
         self.assertIsNone(assistant.transport_command("Проверь транспорт по объекту Hotel"))
