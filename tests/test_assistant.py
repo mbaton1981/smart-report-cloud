@@ -6,9 +6,11 @@ import base64
 import json
 import os
 import sqlite3
+import tempfile
 import uuid
 import unittest
 import wave
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from reportlab.pdfgen.canvas import Canvas
@@ -1758,9 +1760,28 @@ class AssistantUiTests(unittest.TestCase):
     def test_chat_messages_are_separate_styled_blocks_and_keep_long_text_selectable(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtCore import Qt
-        from PyQt6.QtWidgets import QWidget
+        from PyQt6.QtWidgets import QApplication, QWidget
         import desktop_theme
 
+        application = QApplication.instance()
+        previous_theme = getattr(application, "_smartreport_theme", None)
+        previous_style = application.styleSheet()
+        settings = tempfile.TemporaryDirectory()
+        self.addCleanup(settings.cleanup)
+        manager = desktop_theme.ThemeManager(
+            application, "QWidget { color:#e2e8f0; background:#1e2229; }",
+            Path(settings.name) / "appearance.json",
+        )
+        application._smartreport_theme = manager
+
+        def restore_theme():
+            if previous_theme is None:
+                del application._smartreport_theme
+            else:
+                application._smartreport_theme = previous_theme
+            application.setStyleSheet(previous_style)
+
+        self.addCleanup(restore_theme)
         window = QWidget()
         with patch.object(RequestWorker, "start"):
             dialog = AssistantDialog(window)
@@ -1773,8 +1794,8 @@ class AssistantUiTests(unittest.TestCase):
             ("Вы", "Проверь транспорт за тот же период"),
             ("SmartReport", "Проверено 8 записей.\nПроблем не найдено."),
             ("Вы", "Выбери объект для полного отчёта"),
-            ("SmartReport", "Доступно 11 объектов:\n" + "\n".join(
-                f"{index}. Renatur / Объект {index}" for index in range(1, 12)
+            ("SmartReport", "Доступно 36 объектов:\n" + "\n".join(
+                f"{index}. Renatur / Объект {index}" for index in range(1, 37)
             )),
         ]
         for role, text in messages:
@@ -1782,10 +1803,13 @@ class AssistantUiTests(unittest.TestCase):
 
         rendered = dialog.output.toPlainText()
         html = dialog.output.toHtml()
+        dialog.resize(1000, 740)
+        dialog.show()
+        application.processEvents()
         lines = [line.strip() for line in rendered.splitlines()]
         self.assertEqual(lines.count("Вы"), 3)
         self.assertEqual(lines.count("SmartReport"), 3)
-        self.assertIn("11. Renatur / Объект 11", rendered)
+        self.assertIn("36. Renatur / Объект 36", rendered)
         self.assertEqual(html.count("<table"), len(messages))
         user_background = desktop_theme.color("#313c4e").name()
         assistant_background = desktop_theme.color("#2d3748").name()
@@ -1793,7 +1817,20 @@ class AssistantUiTests(unittest.TestCase):
         self.assertEqual(html.count(f'bgcolor="{assistant_background}"'), 3)
         self.assertIn("font-weight:700", html)
         self.assertIn("font-weight:400", html)
-        self.assertNotIn("<b>11. Renatur", html)
+        self.assertNotIn("<b>36. Renatur", html)
         self.assertTrue(dialog.output.isReadOnly())
         self.assertTrue(dialog.output.textInteractionFlags()
                         & Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.assertGreater(dialog.output.verticalScrollBar().maximum(), 0)
+        dialog.output.selectAll()
+        dialog.output.copy()
+        self.assertIn("36. Renatur / Объект 36", application.clipboard().text())
+
+        self.assertTrue(manager.toggle())
+        dark_html = dialog.output.toHtml()
+        self.assertIn('bgcolor="#313c4e"', dark_html)
+        self.assertIn('bgcolor="#2d3748"', dark_html)
+        self.assertTrue(manager.toggle())
+        light_html = dialog.output.toHtml()
+        self.assertIn('bgcolor="#e2ebf2"', light_html)
+        self.assertIn('bgcolor="#dce5ec"', light_html)

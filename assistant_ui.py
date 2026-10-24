@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from PyQt6.QtCore import QBuffer, QDate, QIODevice, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
+    QApplication, QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog, QDateEdit,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox,
 )
@@ -458,6 +458,7 @@ class AssistantDialog(QDialog):
         super().__init__(window)
         self.window, self.worker, self.result, self.audio = window, None, None, None
         self.context = None
+        self.chat_messages = []
         self.choices = []
         self.capability_data = []
         self.auto_report = False
@@ -611,6 +612,9 @@ class AssistantDialog(QDialog):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setMinimumHeight(150)
+        theme_manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+        if theme_manager is not None:
+            theme_manager.changed.connect(self.refresh_chat_theme)
         layout.addWidget(self.output)
         self.table = QTableWidget()
         self.table.setMinimumHeight(170)
@@ -647,6 +651,11 @@ class AssistantDialog(QDialog):
         self.call("status")
 
     def append_message(self, role, text):
+        message = (str(role), str(text))
+        self.chat_messages.append(message)
+        self._insert_chat_message(*message)
+
+    def _insert_chat_message(self, role, text):
         cursor = self.output.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         if self.output.document().blockCount() > 1 or self.output.toPlainText():
@@ -664,6 +673,15 @@ class AssistantDialog(QDialog):
         )
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
+
+    def refresh_chat_theme(self, _theme_name):
+        scrollbar = self.output.verticalScrollBar()
+        previous_value = scrollbar.value()
+        was_at_bottom = previous_value >= scrollbar.maximum()
+        self.output.clear()
+        for role, text in self.chat_messages:
+            self._insert_chat_message(role, text)
+        scrollbar.setValue(scrollbar.maximum() if was_at_bottom else previous_value)
 
     def new_conversation(self):
         if self.audio is not None or self.worker and self.worker.isRunning():
@@ -684,6 +702,7 @@ class AssistantDialog(QDialog):
         monday = today.addDays(1 - today.dayOfWeek())
         self.date_from.setDate(monday)
         self.date_to.setDate(monday.addDays(6))
+        self.chat_messages.clear()
         self.output.clear()
         self.table.setVisible(False)
         self.result_heading.clear()
