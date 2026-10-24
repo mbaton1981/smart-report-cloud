@@ -226,9 +226,17 @@ def report_command(text, context, conn):
     purpose = _report_choice_from_answer(text, REPORT_TYPE_CHOICES) if (
         context and context["pending"] == "report_type"
     ) else _report_type_from_text(text)
+    if purpose:
+        base["purpose"] = purpose
 
+    object_scope = re.search(
+        r"\bобъект\w*\s+(?P<name>.+?)(?=\s+(?:за|на)\s+|$)", normalized)
+    if object_scope and re.match(r"^(?:за|на)\s+", object_scope["name"]):
+        object_scope = None
     objects = conn.execute("SELECT company,name FROM meta_objects ORDER BY company,name").fetchall()
-    mentioned_objects = [row for row in objects if row["name"].casefold() in normalized]
+    mentioned_objects = [] if object_scope else [
+        row for row in objects if row["name"].casefold() in normalized
+    ]
     explicit_object_scope = False
     if mentioned_objects:
         explicit_object_scope = True
@@ -243,6 +251,53 @@ def report_command(text, context, conn):
                          for row in mentioned_objects[:30]],
                 plan=base,
             )
+    elif object_scope:
+        explicit_object_scope = True
+        object_query = object_scope["name"].strip()
+        base.update(company="", object_name="")
+        query_tokens = {
+            token for token in _normalized_name_tokens(object_query)
+            if token not in {"za", "na", "s", "po", "v", "dlya", "drugoi", "drugogo", "drugim"}
+        }
+        object_matches = []
+        if query_tokens:
+            for row in objects:
+                object_tokens = set(_normalized_name_tokens(row["name"]))
+                if query_tokens.issubset(object_tokens):
+                    object_matches.append((len(object_tokens - query_tokens), row))
+        if object_matches:
+            best_extra = min(extra for extra, _ in object_matches)
+            best_matches = [row for extra, row in object_matches if extra == best_extra]
+            if len(best_matches) == 1:
+                base.update(company=best_matches[0]["company"], object_name=best_matches[0]["name"])
+            else:
+                raise AssistantQuestion(
+                    "object", question="Какой объект выбрать?",
+                    choices=[dict(company=row["company"], object_name=row["name"])
+                             for row in best_matches[:10]],
+                    plan=base,
+                )
+        elif query_tokens:
+            overlaps = [
+                (len(query_tokens & set(_normalized_name_tokens(row["name"]))), row)
+                for row in objects
+            ]
+            best_overlap = max((count for count, _ in overlaps), default=0)
+            if best_overlap:
+                best_matches = [row for count, row in overlaps if count == best_overlap]
+                raise AssistantQuestion(
+                    "object", question="Какой объект вы имели в виду?",
+                    choices=[dict(company=row["company"], object_name=row["name"])
+                             for row in best_matches[:5]],
+                    plan=base,
+                )
+            raise AssistantQuestion(
+                "object", question=f"Не нашёл объект «{object_query}». Уточните его название или фирму.",
+                plan=base,
+            )
+        else:
+            raise AssistantQuestion("object", question="Назовите объект; при необходимости укажите фирму.",
+                                    plan=base)
     elif re.search(r"\bдруг\w*\s+объект\w*\b", normalized):
         explicit_object_scope = True
         base.update(company="", object_name="")

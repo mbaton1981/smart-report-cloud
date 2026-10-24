@@ -617,6 +617,103 @@ class AssistantApiTests(unittest.TestCase):
             self.assertEqual((employee_selection["date_from"], employee_selection["date_to"]),
                              ("2026-10-21", "2026-10-21"))
 
+    def test_report_partial_object_name_switches_context_and_keeps_period(self):
+        from customer_pricing import new_shift_pricing, store_pricing
+
+        object_name = "HOTEL Hazeliusbacken 20, på Djurgården"
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES('Renatur','Tomteboda ÄTA',520,450,1)"
+            )
+            conn.execute(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES(?,?,?,?,1)", ("Renatur", object_name, 520, 450)
+            )
+            conn.execute("INSERT INTO meta_employees(name) VALUES('Andrii Piskun')")
+            conn.execute("""INSERT INTO incoming_submissions
+                (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                 submission_type,created_at,updated_at)
+                VALUES('hotel-switch','hotel-switch','2026-10-21','Andrii Piskun','Renatur',?,8,520,1,
+                       'work','2026-10-21','2026-10-21')""", (object_name,))
+            row = dict(conn.execute(
+                "SELECT * FROM incoming_submissions WHERE sync_id='hotel-switch'").fetchone())
+            store_pricing(conn.cursor(), "incoming_submissions", row["sync_id"],
+                          new_shift_pricing(conn.cursor(), "incoming_submissions", row))
+            conn.commit()
+
+        context = dict(plan=plan(
+            "customer_pdf", company="Renatur", object_name="Tomteboda ÄTA",
+            date_from="2026-10-19", date_to="2026-10-25",
+        ), pending="")
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", dict(
+                text="Сделай отчёт по стоимости для объекта HOTEL Djurgården за тот же период",
+                operation_id=str(uuid.uuid4()), context=context,
+            ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["result"]
+        self.assertEqual(result["plan"]["purpose"], "customer_pdf")
+        self.assertEqual(result["plan"]["company"], "Renatur")
+        self.assertEqual(result["plan"]["object_name"], object_name)
+        self.assertEqual((result["plan"]["date_from"], result["plan"]["date_to"]),
+                         ("2026-10-19", "2026-10-25"))
+        self.assertEqual([row["object_name"] for row in result["records"]], [object_name])
+        provider.assert_not_called()
+
+    def test_partial_report_object_ambiguity_offers_only_matching_objects(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) VALUES(?,?,?,?,?)",
+                [("Renatur", "HOTEL North Djurgården", 520, 450, 1),
+                 ("Renatur", "HOTEL South Djurgården", 520, 450, 1),
+                 ("Other", "Tomteboda ÄTA", 520, 450, 1)],
+            )
+            conn.commit()
+            context = dict(plan=plan(
+                "customer_pdf", company="Renatur", object_name="Tomteboda ÄTA",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            with self.assertRaises(assistant.AssistantQuestion) as raised:
+                assistant.report_command(
+                    "Сделай отчёт по стоимости для объекта HOTEL Djurgården за тот же период",
+                    context, conn,
+                )
+        question = raised.exception
+        self.assertEqual(question.field, "object")
+        self.assertEqual(question.plan["purpose"], "customer_pdf")
+        self.assertEqual((question.plan["date_from"], question.plan["date_to"]),
+                         ("2026-10-19", "2026-10-25"))
+        self.assertEqual(
+            {choice["object_name"] for choice in question.choices},
+            {"HOTEL North Djurgården", "HOTEL South Djurgården"},
+        )
+
+    def test_unknown_explicit_report_object_never_reuses_previous_object(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES('Renatur','Tomteboda ÄTA',520,450,1)"
+            )
+            conn.commit()
+            context = dict(plan=plan(
+                "customer_pdf", company="Renatur", object_name="Tomteboda ÄTA",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            with self.assertRaises(assistant.AssistantQuestion) as raised:
+                assistant.report_command(
+                    "Сделай отчёт по стоимости для объекта Unknown Building за тот же период",
+                    context, conn,
+                )
+        question = raised.exception
+        self.assertEqual(question.field, "object")
+        self.assertIn("unknown building", str(question))
+        self.assertEqual(question.choices, [])
+        self.assertEqual(question.plan["purpose"], "customer_pdf")
+        self.assertEqual((question.plan["company"], question.plan["object_name"]), ("", ""))
+        self.assertEqual((question.plan["date_from"], question.plan["date_to"]),
+                         ("2026-10-19", "2026-10-25"))
+
     def test_report_type_choices_render_as_labels_and_remove_display_fields_before_inspection(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtWidgets import QWidget
