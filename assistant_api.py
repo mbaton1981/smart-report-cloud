@@ -480,7 +480,7 @@ def recognized_read_command(text, context=None):
     hours_request = bool(hours_request or (
         re.search(r"\bчас(?:ы|ов|а)\b", normalized) and
         re.search(r"\b(?:по\s+каждому\s+сотруднику|каждого\s+сотрудника|всех\s+сотрудников)\b", normalized)
-    ))
+    ) or re.match(r"^(?:(?:покажи|посчитай)\s+)?часы(?:\s|$)", normalized))
     if hours_request:
         purpose = "hours_summary"
     elif (re.search(r"\bдубл\w*", normalized) or re.search(
@@ -509,11 +509,25 @@ def recognized_read_command(text, context=None):
         start = today - timedelta(days=today.weekday())
         begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
 
+    employee_text = ""
+    if hours_request and not re.search(
+            r"\b(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|все\s+сотрудники)\b", normalized):
+        employee_match = re.match(
+            r"^(?:(?:а\s+)?теперь\s+)?(?:покажи\s*,?\s*)?часы(?:\s+(?P<name>.*))?$",
+            text.strip(" .!?"), re.IGNORECASE)
+        if employee_match and employee_match["name"]:
+            employee_text = re.split(
+                r"\s+(?:за|на|с)\s+", employee_match["name"], maxsplit=1, flags=re.IGNORECASE)[0]
+            employee_text = re.sub(
+                r"^по\s+(?:каждому\s+)?сотрудник\w*\s*", "", employee_text, flags=re.IGNORECASE).strip()
+            if not re.search(r"[a-zа-яё]", employee_text, re.IGNORECASE):
+                employee_text = ""
+
     plan = validate_plan(dict(
         purpose=purpose, date_from=begin, date_to=end,
         employee="" if re.search(
             r"\b(?:каждый\s+сотрудник|по\s+каждому\s+сотруднику|все\s+сотрудники)\b", normalized
-        ) else previous.get("employee", ""),
+        ) else employee_text or previous.get("employee", ""),
         company=previous.get("company", ""), object_name=previous.get("object_name", "")))
     if not (date_period or week_period or previous):
         raise AssistantQuestion("period", plan=plan)

@@ -161,9 +161,7 @@ class AssistantApiTests(unittest.TestCase):
             wav.writeframes(b"\0\0" * 1600)
         transcript = "Часы Андрей Пескун за 21 октября 26 года"
         transcription = Mock(status_code=200, json=Mock(return_value={"text": transcript}))
-        routing = self.response(plan("hours_summary", date_from="2026-10-21", date_to="2026-10-21",
-                                     employee="Андрей Пескун"))
-        with patch("assistant_api.requests.post", side_effect=[transcription, routing]) as provider:
+        with patch("assistant_api.requests.post", return_value=transcription) as provider:
             voice = self.server_client.post(self.base + "transcribe", data=audio.getvalue(),
                                             headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
             self.assertEqual(voice.status_code, 200, voice.get_json())
@@ -187,7 +185,7 @@ class AssistantApiTests(unittest.TestCase):
                          ("2026-10-21", "2026-10-21"))
         self.assertEqual(result["plan"]["purpose"], "hours_summary")
         self.assertEqual(result["table"]["rows"], [["Andrii Piskun", "12.0", "0", 2]])
-        self.assertEqual(provider.call_count, 2)
+        provider.assert_called_once()
         self.assertEqual(before, self.business())
 
     def test_ambiguous_russian_employee_name_offers_only_matching_choices(self):
@@ -487,36 +485,36 @@ class AssistantApiTests(unittest.TestCase):
         provider.assert_not_called()
 
     def test_explicit_short_year_and_russian_month_dates_override_context(self):
-            context = dict(plan=plan("transport_check", date_from="2026-10-19", date_to="2026-10-25"),
-                           pending="")
-            cases = {
-                "Покажи смены за 21.10.26": ("2026-10-21", "2026-10-21"),
-                "Покажи смены за 21 октября 26 года": ("2026-10-21", "2026-10-21"),
-                "Покажи смены с 19 по 25 октября 26 года": ("2026-10-19", "2026-10-25"),
-                "Покажи смены с 19 октября 2026 года по 25 октября 2026 года":
-                    ("2026-10-19", "2026-10-25"),
-            }
-            for text, expected in cases.items():
-                with self.subTest(text=text):
-                    self.assertEqual(assistant.explicit_date_period(text), expected)
+        context = dict(plan=plan("transport_check", date_from="2026-10-19", date_to="2026-10-25"),
+                       pending="")
+        cases = {
+            "Покажи смены за 21.10.26": ("2026-10-21", "2026-10-21"),
+            "Покажи смены за 21 октября 26 года": ("2026-10-21", "2026-10-21"),
+            "Покажи смены с 19 по 25 октября 26 года": ("2026-10-19", "2026-10-25"),
+            "Покажи смены с 19 октября 2026 года по 25 октября 2026 года":
+                ("2026-10-19", "2026-10-25"),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(assistant.explicit_date_period(text), expected)
 
-            reply = self.response(plan("hours_summary", date_from="2026-01-01", date_to="2026-01-31",
-                                       employee="Andrii Piskun"))
-            with closing(self.server.get_db_connection()) as conn:
-                conn.execute("INSERT INTO meta_employees(name) VALUES('Andrii Piskun')")
-                conn.commit()
-            with patch("assistant_api.requests.post", return_value=reply) as provider:
-                response = self.post("command", dict(
-                    text="Часы Андрей Пескун за 21 октября 26 года",
-                    operation_id=str(uuid.uuid4()), context=context,
-                ))
-            self.assertEqual(response.status_code, 200, response.get_json())
-            result_plan = response.get_json()["result"]["plan"]
-            self.assertEqual((result_plan["date_from"], result_plan["date_to"]),
-                             ("2026-10-21", "2026-10-21"))
-            self.assertEqual(result_plan["purpose"], "hours_summary")
-            self.assertEqual(result_plan["employee"], "Andrii Piskun")
-            provider.assert_called_once()
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("INSERT INTO meta_employees(name) VALUES('Andrii Piskun')")
+            conn.commit()
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", dict(
+                text="Часы Андрей Пескун за 21 октября 26 года",
+                operation_id=str(uuid.uuid4()), context=context,
+            ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        clarification = response.get_json()["clarification"]
+        result_plan = clarification["plan"]
+        self.assertEqual((result_plan["date_from"], result_plan["date_to"]),
+                         ("2026-10-21", "2026-10-21"))
+        self.assertEqual(result_plan["purpose"], "hours_summary")
+        self.assertEqual(result_plan["employee"], "Андрей Пескун")
+        self.assertEqual([choice["employee"] for choice in clarification["choices"]], ["Andrii Piskun"])
+        provider.assert_not_called()
 
     def test_ambiguous_report_offers_human_choices_and_preserves_single_day_selection(self):
         self.fixture_shift()
