@@ -214,6 +214,47 @@ def transport_command(text, context=None):
     return plan
 
 
+def recognized_read_command(text, context=None):
+    normalized = " ".join(text.casefold().strip(" .!?").split())
+    if re.search(r"\b(?:объект|фирм|компан|сотрудник|для\s+(?!всех\s+сотрудник))", normalized):
+        return None
+    if re.fullmatch(r"(?:покажи\s*,?\s*)?кто\s+сколько\s+(?:отработал|работал)(?:\s+.+)?", normalized):
+        purpose = "hours_summary"
+    elif re.search(r"\bдубл\w*", normalized) or re.search(
+            r"\b(?:пропущен|отсутств|без|не\s+задан)\w*\s+ставк\w*", normalized):
+        purpose = "anomalies"
+    else:
+        return None
+
+    previous = context["plan"] if context else {}
+    week = re.search(r"\b(текущ\w*|эт\w*|прошл\w*)\s+недел\w*\b|\b(this|last)\s+week\b", normalized)
+    date_range = re.search(
+        r"\bс\s+(\d{4}-\d{2}-\d{2})\s+по\s+(\d{4}-\d{2}-\d{2})\b", normalized)
+    if date_range:
+        begin, end = date_range.groups()
+    elif week:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday())
+        last_week = (week.group(1) or "").startswith("прошл") or week.group(2) == "last"
+        if last_week:
+            start -= timedelta(days=7)
+        begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
+    elif previous:
+        begin, end = previous["date_from"], previous["date_to"]
+    else:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday())
+        begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
+
+    plan = validate_plan(dict(
+        purpose=purpose, date_from=begin, date_to=end,
+        employee="" if "для всех сотрудников" in normalized else previous.get("employee", ""),
+        company=previous.get("company", ""), object_name=previous.get("object_name", "")))
+    if not (week or date_range or previous):
+        raise AssistantQuestion("period", plan=plan)
+    return plan
+
+
 def select_plan(text, conn, actor, operation, post=None, context=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
@@ -222,13 +263,16 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
     normalized = " ".join(text.casefold().strip(" .!?").split())
     try:
         known_plan = transport_command(text, safe_context)
-    except AssistantQuestion:
-        reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
-        finish(conn, actor, operation, "transport_check", "clarification")
+        if not known_plan:
+            known_plan = recognized_read_command(text, safe_context)
+    except AssistantQuestion as question:
+        purpose = question.plan["purpose"] if question.plan else "transport_check"
+        reserve(conn, actor, operation, purpose, 0, requires_provider=False)
+        finish(conn, actor, operation, purpose, "clarification")
         raise
     if known_plan:
-        reserve(conn, actor, operation, "transport_check", 0, requires_provider=False)
-        finish(conn, actor, operation, "transport_check", "routed")
+        reserve(conn, actor, operation, known_plan["purpose"], 0, requires_provider=False)
+        finish(conn, actor, operation, known_plan["purpose"], "routed")
         return known_plan
     # A byte per token is a conservative input bound; output includes reasoning tokens.
     instructions = (

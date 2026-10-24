@@ -356,6 +356,34 @@ class AssistantApiTests(unittest.TestCase):
         with self.assertRaises(assistant.AssistantError):
             assistant.transport_command("Проверь транспорт с 2026-99-19 по 2026-10-25")
 
+    def test_natural_weekly_hours_and_anomalies_keep_intent_and_period_without_model(self):
+        self.fixture_shift()
+        selection = plan("transport_check", date_from="2026-10-19", date_to="2026-10-25")
+        context = dict(plan=selection, pending="")
+        with patch("assistant_api.requests.post") as provider, \
+                patch("assistant_api.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+            response = self.post("command", dict(text="Покажи, кто сколько отработал за эту неделю",
+                                                 operation_id=str(uuid.uuid4())))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            result = response.get_json()["result"]
+            self.assertEqual(result["plan"]["purpose"], "hours_summary")
+            self.assertEqual((result["plan"]["date_from"], result["plan"]["date_to"]),
+                             ("2026-10-19", "2026-10-25"))
+            self.assertEqual(len(result["records"]), 1)
+
+            response = self.post("command", dict(text="Найди дубли и пропущенные ставки",
+                                                 operation_id=str(uuid.uuid4()), context=context))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            self.assertEqual(response.get_json()["result"]["plan"]["purpose"], "anomalies")
+            self.assertEqual(response.get_json()["result"]["plan"]["date_from"], "2026-10-19")
+
+            response = self.post("command", dict(text="Найди дубли и пропущенные ставки",
+                                                 operation_id=str(uuid.uuid4())))
+            self.assertEqual(response.get_json()["clarification"]["field"], "period")
+            self.assertEqual(response.get_json()["clarification"]["plan"]["purpose"], "anomalies")
+            provider.assert_not_called()
+
     def test_general_transport_router_documents_real_capability_and_requires_a_tool(self):
         with patch("assistant_api.requests.post", return_value=self.response(plan("transport_check"))) as provider:
             response = self.post("command", dict(text="Сверь цены выезда с текущим справочником за октябрь 2026",
