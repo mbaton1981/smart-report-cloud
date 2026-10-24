@@ -433,6 +433,70 @@ class AssistantApiTests(unittest.TestCase):
                          ("2026-10-21", "2026-10-21"))
         provider.assert_not_called()
 
+    def test_report_explicit_object_company_and_employee_override_context(self):
+        self.fixture_shift()
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES('Other Company','Tomteboda ÄTA',520,450,1)"
+            )
+            conn.execute("INSERT INTO meta_employees(name) VALUES('Previous Employee')")
+            conn.execute("INSERT INTO meta_employees(name) VALUES('New Employee')")
+            conn.commit()
+
+            context = dict(plan=plan(
+                "customer_pdf", company="Renatur", object_name="Hotel",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            selected = assistant.report_command(
+                "Отчёт по стоимости объекта Tomteboda ÄTA за 21.10.2026", context, conn
+            )
+            self.assertEqual(selected["company"], "Other Company")
+            self.assertEqual(selected["object_name"], "Tomteboda ÄTA")
+            self.assertEqual((selected["date_from"], selected["date_to"]),
+                             ("2026-10-21", "2026-10-21"))
+
+            context = dict(plan=plan(
+                "customer_pdf", company="Renatur", object_name="Hotel",
+                employee="Previous Employee",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            selected = assistant.report_command(
+                "Отчёт по стоимости объекта Tomteboda ÄTA за 21.10.2026", context, conn
+            )
+            self.assertEqual(selected["employee"], "")
+
+            context = dict(plan=plan(
+                "customer_pdf", company="Renatur", object_name="Hotel",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            other_object = assistant.report_command(
+                "Отчёт по стоимости по другому объекту за 21.10.2026", context, conn
+            )
+            self.assertEqual((other_object["company"], other_object["object_name"]), ("", ""))
+
+            context = dict(plan=plan(
+                "customer_pdf", company="Renatur", object_name="Hotel",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            company_selection = assistant.report_command(
+                "Отчёт по стоимости фирмы Other Company за 21.10.2026", context, conn
+            )
+            self.assertEqual(company_selection["company"], "Other Company")
+            self.assertEqual(company_selection["object_name"], "")
+
+            context = dict(plan=plan(
+                "payroll_pdf", employee="Previous Employee",
+                date_from="2026-10-19", date_to="2026-10-25",
+            ), pending="")
+            employee_selection = assistant.report_command(
+                "Зарплатный отчёт по сотруднику New Employee за 21.10.2026", context, conn
+            )
+            self.assertEqual(employee_selection["employee"], "New Employee")
+            self.assertEqual((employee_selection["company"], employee_selection["object_name"]), ("", ""))
+            self.assertEqual((employee_selection["date_from"], employee_selection["date_to"]),
+                             ("2026-10-21", "2026-10-21"))
+
     def test_report_type_choices_render_as_labels_and_remove_display_fields_before_inspection(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtWidgets import QWidget

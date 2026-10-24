@@ -168,16 +168,66 @@ def report_command(text, context, conn):
         context and context["pending"] == "report_type"
     ) else _report_type_from_text(text)
 
-    if not base["object_name"]:
-        objects = conn.execute("SELECT company,name FROM meta_objects ORDER BY company,name").fetchall()
-        mentioned = [row for row in objects if row["name"].casefold() in normalized]
-        if len(mentioned) == 1:
-            base.update(company=mentioned[0]["company"], object_name=mentioned[0]["name"])
-    if not base["employee"]:
-        employees = conn.execute("SELECT name FROM meta_employees ORDER BY name").fetchall()
-        mentioned = [row["name"] for row in employees if row["name"].casefold() in normalized]
-        if len(mentioned) == 1:
-            base["employee"] = mentioned[0]
+    objects = conn.execute("SELECT company,name FROM meta_objects ORDER BY company,name").fetchall()
+    mentioned_objects = [row for row in objects if row["name"].casefold() in normalized]
+    explicit_object_scope = False
+    if mentioned_objects:
+        explicit_object_scope = True
+        longest_name = max(len(row["name"]) for row in mentioned_objects)
+        mentioned_objects = [row for row in mentioned_objects if len(row["name"]) == longest_name]
+        if len(mentioned_objects) == 1:
+            base.update(company=mentioned_objects[0]["company"], object_name=mentioned_objects[0]["name"])
+        else:
+            raise AssistantQuestion(
+                "object", question="Какой объект выбрать? Укажите фирму и объект.",
+                choices=[dict(company=row["company"], object_name=row["name"])
+                         for row in mentioned_objects[:30]],
+                plan=base,
+            )
+    elif re.search(r"\bдруг\w*\s+объект\w*\b", normalized):
+        explicit_object_scope = True
+        base.update(company="", object_name="")
+    elif re.search(r"\b(?:фирм\w*|компан\w*)\b", normalized):
+        explicit_object_scope = True
+        companies = sorted({row["company"] for row in objects
+                            if row["company"].casefold() in normalized})
+        if companies:
+            longest_name = max(len(company) for company in companies)
+            companies = [company for company in companies if len(company) == longest_name]
+            if len(companies) == 1:
+                base["company"] = companies[0]
+                if base["object_name"] and not any(
+                    row["company"] == base["company"] and row["name"] == base["object_name"]
+                    for row in objects
+                ):
+                    base["object_name"] = ""
+            else:
+                raise AssistantQuestion(
+                    "object", question="Какую фирму выбрать?",
+                    choices=[dict(company=company) for company in companies[:30]],
+                    plan=base,
+                )
+        else:
+            base.update(company="", object_name="")
+
+    employees = conn.execute("SELECT name FROM meta_employees ORDER BY name").fetchall()
+    mentioned_employees = [row["name"] for row in employees if row["name"].casefold() in normalized]
+    explicit_employee_scope = False
+    if mentioned_employees:
+        explicit_employee_scope = True
+        longest_name = max(len(name) for name in mentioned_employees)
+        mentioned_employees = [name for name in mentioned_employees if len(name) == longest_name]
+        if len(mentioned_employees) == 1:
+            base["employee"] = mentioned_employees[0]
+        else:
+            raise AssistantQuestion(
+                "scope", question="Какого сотрудника выбрать?",
+                choices=[dict(employee=name) for name in mentioned_employees[:30]],
+                plan=base,
+            )
+    elif re.search(r"\bдруг\w*\s+сотрудник\w*\b", normalized):
+        explicit_employee_scope = True
+        base["employee"] = ""
 
     if purpose is None:
         object_report = bool(base["object_name"] or re.search(r"\bобъект\w*\b", normalized))
@@ -188,6 +238,10 @@ def report_command(text, context, conn):
             choices=list(choices),
             plan=validate_plan(base),
         )
+    if purpose in {"customer_pdf", "journal_pdf", "catalog_preview"} and not explicit_employee_scope:
+        base["employee"] = ""
+    if purpose == "payroll_pdf" and not explicit_object_scope:
+        base.update(company="", object_name="")
     base["purpose"] = purpose
     return validate_plan(base)
 
