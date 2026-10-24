@@ -182,12 +182,13 @@ def validate_plan(plan):
 
 
 def transport_command(text, context=None):
+    text = strip_no_change_suffix(text)
     match = re.fullmatch(
         r"(?:проверь(?:те)?|проверить)\s+(?:клиентский\s+)?транспорт"
         r"(?:\s+(?:за|на)\s+(?P<week>текущую неделю|эту неделю|этой неделе|прошлую неделю|прошлой неделе|тот же период)"
         r"|\s+с\s+(?P<start>\d{4}-\d{2}-\d{2})\s+по\s+(?P<end>\d{4}-\d{2}-\d{2}))?"
         r"(?:,?\s+(?:для|у)\s+(?P<scope>всех сотрудников|одного сотрудника|сотрудника\s+(?P<name>[^,\n]+)))?"
-        r"(?:,\s*ничего не изменяй)?[.!?]?",
+        r"[.!?]?",
         " ".join(text.strip().split()), re.IGNORECASE)
     if match is None:
         return None
@@ -214,7 +215,16 @@ def transport_command(text, context=None):
     return plan
 
 
+def strip_no_change_suffix(text):
+    return re.sub(
+        r"(?:[,;]|\s+)(?:ничего\s+не\s+(?:меняй(?:те)?|изменяй(?:те)?|менять|изменять)"
+        r"|не\s+(?:меняй(?:те)?|изменяй(?:те)?)\s+ничего)\s*[.!?]*$",
+        "", text.strip(), flags=re.IGNORECASE,
+    ).rstrip(" \t,;.!?")
+
+
 def recognized_read_command(text, context=None):
+    text = strip_no_change_suffix(text)
     normalized = " ".join(text.casefold().strip(" .!?").split())
     if re.search(r"\b(?:объект|фирм|компан|сотрудник|для\s+(?!всех\s+сотрудник))", normalized):
         return None
@@ -259,6 +269,7 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
         raise AssistantError("Введите команду длиной не более 8000 байт.")
+    text = strip_no_change_suffix(text)
     safe_context = validate_context(context)
     normalized = " ".join(text.casefold().strip(" .!?").split())
     try:

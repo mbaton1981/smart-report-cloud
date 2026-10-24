@@ -99,7 +99,8 @@ def use_data_dir_as_working_directory():
                 os.environ.pop(key, None)
             os.chdir(data)
             return True
-        if (install / "candidate_install.json").is_file() and "--diagnostic" not in sys.argv:
+        if (install / "candidate_install.json").is_file() and "--diagnostic" not in sys.argv \
+                and os.environ.get("SMARTREPORT_ASSISTANT_CANDIDATE") != "1":
             data = Path(os.environ["LOCALAPPDATA"]) / install.name
             marker = data / "candidate_profile.json"
             if not marker.is_file():

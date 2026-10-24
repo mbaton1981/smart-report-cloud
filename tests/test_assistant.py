@@ -339,10 +339,18 @@ class AssistantApiTests(unittest.TestCase):
             clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
             for text in ("Проверь транспорт на этой неделе для всех сотрудников",
                          "Проверьте клиентский транспорт за текущую неделю, ничего не изменяй.",
+                         "Проверь транспорт за тот же период, ничего не меняй",
+                         "Проверь транспорт за тот же период, ничего не меняйте.",
                          "Проверить транспорт за эту неделю",
                          "Проверь транспорт с 2026-10-19 по 2026-10-25 для сотрудника Synthetic Employee"):
                 with self.subTest(text=text):
-                    response = self.post("command", dict(text=text, operation_id=str(uuid.uuid4())))
+                    context = (dict(plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25"),
+                                    pending="")
+                               if "тот же период" in text else None)
+                    payload = dict(text=text, operation_id=str(uuid.uuid4()))
+                    if context is not None:
+                        payload["context"] = context
+                    response = self.post("command", payload)
                     self.assertEqual(response.status_code, 200, response.get_json())
                     chosen = response.get_json()["result"]["plan"]
                     self.assertEqual(chosen["purpose"], "transport_check")
@@ -363,6 +371,23 @@ class AssistantApiTests(unittest.TestCase):
         self.assertIsNone(assistant.transport_command("Проверь транспорт по объекту Hotel"))
         with self.assertRaises(assistant.AssistantError):
             assistant.transport_command("Проверь транспорт с 2026-99-19 по 2026-10-25")
+
+    def test_no_change_suffix_does_not_hide_hours_or_anomaly_intent(self):
+        self.fixture_shift()
+        with patch("assistant_api.requests.post") as provider, patch("assistant_api.datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+            for text, purpose in (
+                ("Покажи, кто сколько отработал за эту неделю, ничего не меняй", "hours_summary"),
+                ("Найди дубли и пропущенные ставки за эту неделю, ничего не меняй.", "anomalies"),
+            ):
+                with self.subTest(text=text):
+                    response = self.post("command", dict(text=text, operation_id=str(uuid.uuid4())))
+                    self.assertEqual(response.status_code, 200, response.get_json())
+                    result = response.get_json()["result"]
+                    self.assertEqual(result["plan"]["purpose"], purpose)
+                    self.assertEqual((result["plan"]["date_from"], result["plan"]["date_to"]),
+                                     ("2026-10-19", "2026-10-25"))
+            provider.assert_not_called()
 
     def test_natural_weekly_hours_and_anomalies_keep_intent_and_period_without_model(self):
         self.fixture_shift()

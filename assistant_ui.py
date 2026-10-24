@@ -248,14 +248,20 @@ class AssistantDialog(QDialog):
         self.capability_data = []
         self.auto_report = False
         self.workflow_results = []
-        self.database = getattr(sys.modules.get(window.__class__.__module__), "DB_FILE", None)
+        app_module = sys.modules.get(window.__class__.__module__)
+        self.assistant_candidate = bool(getattr(app_module, "ASSISTANT_CANDIDATE", False))
+        self.database = getattr(app_module, "DB_FILE", None)
         self.setWindowTitle("SmartReport — ИИ-помощник")
         self.resize(1000, 740)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
         self.setSizeGripEnabled(True)
         layout = QVBoxLayout(self)
-        notice = QLabel("SmartReport — рабочий помощник. Опишите задачу обычными словами.\n"
-                        "Период и выбранные объекты сохраняются в этом диалоге. Не вводите пароли и реквизиты.")
+        notice_text = ("Кандидат подключён к рабочему серверу: только чтение и подготовка PDF. "
+                       "Синхронизация, рабочие формы, изменения и отправка писем отключены."
+                       if self.assistant_candidate else
+                       "SmartReport — рабочий помощник. Опишите задачу обычными словами.\n"
+                       "Период и выбранные объекты сохраняются в этом диалоге. Не вводите пароли и реквизиты.")
+        notice = QLabel(notice_text)
         notice.setWordWrap(True)
         layout.addWidget(notice)
         self.diagnostics = QDialog(self)
@@ -289,8 +295,10 @@ class AssistantDialog(QDialog):
         self.diagnostic_output.setReadOnly(True)
         diagnostic_layout.addWidget(self.diagnostic_output)
         header = QHBoxLayout()
-        for text, action in (("Новый диалог", self.new_conversation), ("Возможности", self.show_capabilities),
-                             ("Диагностика и настройки", self.diagnostics.show)):
+        header_actions = [("Новый диалог", self.new_conversation), ("Возможности", self.show_capabilities)]
+        if not self.assistant_candidate:
+            header_actions.append(("Диагностика и настройки", self.diagnostics.show))
+        for text, action in header_actions:
             button = QPushButton(text)
             button.clicked.connect(action)
             header.addWidget(button)
@@ -373,6 +381,7 @@ class AssistantDialog(QDialog):
         mail = QPushButton("Подготовить письмо с PDF")
         mail.clicked.connect(self.prepare_mail)
         tools.addWidget(mail)
+        self.mail_button = mail
         layout.addLayout(row)
         layout.addLayout(tools)
         self.native = QPushButton("Открыть штатную форму")
@@ -408,6 +417,11 @@ class AssistantDialog(QDialog):
         self.confirm_mail.setEnabled(False)
         self.confirm_mail.clicked.connect(self.send_mail)
         layout.addWidget(self.confirm_mail)
+        if self.assistant_candidate:
+            self.native.hide()
+            self.mail_button.hide()
+            self.confirm_mail.hide()
+            self.diagnostics.hide()
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.stop_recording)

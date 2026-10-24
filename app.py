@@ -83,6 +83,7 @@ SALARIES_DIR = "salaries"
 # 🌐 Адрес облачного сервера на Render и ваш секретный ключ синхронизации
 CLOUD_URL = desktop_auth.server_url()
 ISOLATED_CANDIDATE = desktop_auth.isolated_candidate_mode()
+ASSISTANT_CANDIDATE = os.environ.get("SMARTREPORT_ASSISTANT_CANDIDATE") == "1"
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")  # только для тестов; в установщике ключа нет
 
 
@@ -2262,6 +2263,11 @@ class SmartReportApp(QMainWindow):
             version = os.environ.get("SMARTREPORT_CANDIDATE_VERSION") or "1.0.19-rc1"
             self.setWindowTitle(f"SmartReport {version} — изолированная база, без сервера")
             self.statusBar().showMessage("Локальный кандидат: синхронизация и почтовый перенос отключены.")
+        elif ASSISTANT_CANDIDATE:
+            self.setWindowTitle("SmartReport — кандидат помощника, только чтение")
+            self.statusBar().showMessage(
+                "Кандидат: рабочие формы и синхронизация отключены; разрешены чтение и подготовка PDF."
+            )
         self.resize(1240, 880)
         desktop_theme.ensure_theme(DARK_THEME_QSS)
         self._async_expense_reads = True
@@ -2278,7 +2284,7 @@ class SmartReportApp(QMainWindow):
         self.auto_sync_timer.timeout.connect(self.background_sync_with_cloud)
         self._sync_worker = None
         self._manual_sync_requested = False
-        if not ISOLATED_CANDIDATE:
+        if not ISOLATED_CANDIDATE and not ASSISTANT_CANDIDATE:
             self.auto_sync_timer.start(2000)
 
     def init_ui(self):
@@ -2297,6 +2303,8 @@ class SmartReportApp(QMainWindow):
         self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.tabs.currentChanged.connect(self.on_tab_changed)
         main_layout.addWidget(self.tabs)
+        if ASSISTANT_CANDIDATE:
+            self.tabs.setVisible(False)
 
         self.tab_hours = QWidget()
         self.tab_salary = QWidget()
@@ -3099,7 +3107,7 @@ class SmartReportApp(QMainWindow):
         return result
 
     def perform_sync_logic(self):
-        if ISOLATED_CANDIDATE:
+        if ISOLATED_CANDIDATE or ASSISTANT_CANDIDATE:
             raise RuntimeError("Синхронизация отключена в изолированном кандидате.")
         ensure_sync_dataset()
         headers = sync_headers()
@@ -3625,8 +3633,8 @@ class SmartReportApp(QMainWindow):
     def background_sync_with_cloud(self):
         if getattr(self, "_closing_after_sync", False):
             return
-        if ISOLATED_CANDIDATE:
-            self.statusBar().showMessage("Сохранено локально. Синхронизация в кандидате отключена.")
+        if ISOLATED_CANDIDATE or ASSISTANT_CANDIDATE:
+            self.statusBar().showMessage("Синхронизация отключена в кандидате.")
             self._manual_sync_requested = False
             return
         if self._sync_worker and self._sync_worker.isRunning():
@@ -11205,6 +11213,8 @@ if __name__ == "__main__":
             sys.exit(app.exec())
         window = SmartReportApp()
         window.show()
+        if ASSISTANT_CANDIDATE:
+            QTimer.singleShot(0, window.open_assistant)
         sys.exit(app.exec())
     except SystemExit:
         raise
