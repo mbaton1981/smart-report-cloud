@@ -140,6 +140,96 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual(response.get_json()["clarification"]["field"], "scope")
         self.assertNotIn("result", response.get_json())
 
+    def test_russian_voice_transcript_resolves_latin_employee_and_returns_day_hours(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("INSERT INTO meta_employees(name) VALUES('Andrii Piskun')")
+            conn.executemany("""INSERT INTO incoming_submissions
+                (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                 submission_type,created_at,updated_at)
+                VALUES(?,?, '2026-10-21','Andrii Piskun','Renatur',?, ?,520,0,'work',
+                       '2026-10-21','2026-10-21')""", [
+                ("voice-hotel", "voice-hotel", "HOTEL Hazeliusbacken 20", 8),
+                ("voice-tomteboda", "voice-tomteboda", "Tomteboda ÄTA", 4),
+            ])
+            conn.commit()
+        before = self.business()
+        audio = BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\0\0" * 1600)
+        transcript = "Часы Андрей Пескун за 21 октября 26 года"
+        transcription = Mock(status_code=200, json=Mock(return_value={"text": transcript}))
+        routing = self.response(plan("hours_summary", date_from="2026-10-21", date_to="2026-10-21",
+                                     employee="Андрей Пескун"))
+        with patch("assistant_api.requests.post", side_effect=[transcription, routing]) as provider:
+            voice = self.server_client.post(self.base + "transcribe", data=audio.getvalue(),
+                                            headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
+            self.assertEqual(voice.status_code, 200, voice.get_json())
+            self.assertEqual(voice.get_json()["text"], transcript)
+            response = self.post("command", dict(text=voice.get_json()["text"], operation_id=str(uuid.uuid4())))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        clarification = response.get_json()["clarification"]
+        self.assertEqual(clarification["field"], "scope")
+        self.assertEqual(clarification["plan"]["purpose"], "hours_summary")
+        self.assertEqual((clarification["plan"]["date_from"], clarification["plan"]["date_to"]),
+                         ("2026-10-21", "2026-10-21"))
+        self.assertEqual([choice["employee"] for choice in clarification["choices"]], ["Andrii Piskun"])
+        result_response = self.post(
+            "inspect",
+            dict(plan=clarification["plan"] | clarification["choices"][0], operation_id=str(uuid.uuid4())),
+        )
+        self.assertEqual(result_response.status_code, 200, result_response.get_json())
+        result = result_response.get_json()["result"]
+        self.assertEqual(result["plan"]["employee"], "Andrii Piskun")
+        self.assertEqual((result["plan"]["date_from"], result["plan"]["date_to"]),
+                         ("2026-10-21", "2026-10-21"))
+        self.assertEqual(result["plan"]["purpose"], "hours_summary")
+        self.assertEqual(result["table"]["rows"], [["Andrii Piskun", "12.0", "0", 2]])
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(before, self.business())
+
+    def test_ambiguous_russian_employee_name_offers_only_matching_choices(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.executemany("INSERT INTO meta_employees(name) VALUES(?)",
+                             [("Andrii Piskun",), ("Andriy Piskun",)])
+            conn.commit()
+        selected = plan("hours_summary", date_from="2026-10-21", date_to="2026-10-21",
+                        employee="Андрей Пескун")
+        with closing(self.server.get_db_connection()) as conn:
+            with self.assertRaises(assistant.AssistantQuestion) as raised:
+                assistant.resolve_selection(conn, selected)
+        question = raised.exception
+        self.assertEqual(question.field, "scope")
+        self.assertEqual({choice["employee"] for choice in question.choices},
+                         {"Andrii Piskun", "Andriy Piskun"})
+        self.assertEqual(question.plan, selected)
+        chosen = selected | question.choices[0]
+        response = self.post("inspect", dict(plan=chosen, operation_id=str(uuid.uuid4())))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["result"]["plan"]["purpose"], "hours_summary")
+        self.assertEqual(response.get_json()["result"]["plan"]["date_from"], "2026-10-21")
+        with closing(self.server.get_db_connection()) as conn:
+            with self.assertRaises(assistant.AssistantQuestion) as unmatched:
+                assistant.resolve_selection(conn, selected | {"employee": "No Such Person"})
+        self.assertEqual(unmatched.exception.choices, [])
+
+    def test_low_confidence_employee_fuzzy_match_requires_confirmation(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("INSERT INTO meta_employees(name) VALUES('Andrii Piskun')")
+            conn.commit()
+            with self.assertRaises(assistant.AssistantQuestion) as raised:
+                assistant.resolve_selection(
+                    conn,
+                    plan("hours_summary", employee="Andrei Peskun"),
+                )
+        self.assertEqual(
+            [choice["employee"] for choice in raised.exception.choices],
+            ["Andrii Piskun"],
+        )
+        self.assertEqual(raised.exception.plan["employee"], "Andrei Peskun")
+
     def test_budget_reservation_atomic_with_two_connections(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Barrier
@@ -395,6 +485,38 @@ class AssistantApiTests(unittest.TestCase):
                 text="Покажи смены за 32.10.2026", operation_id=str(uuid.uuid4()), context=context))
         self.assertEqual(invalid.status_code, 400)
         provider.assert_not_called()
+
+    def test_explicit_short_year_and_russian_month_dates_override_context(self):
+            context = dict(plan=plan("transport_check", date_from="2026-10-19", date_to="2026-10-25"),
+                           pending="")
+            cases = {
+                "Покажи смены за 21.10.26": ("2026-10-21", "2026-10-21"),
+                "Покажи смены за 21 октября 26 года": ("2026-10-21", "2026-10-21"),
+                "Покажи смены с 19 по 25 октября 26 года": ("2026-10-19", "2026-10-25"),
+                "Покажи смены с 19 октября 2026 года по 25 октября 2026 года":
+                    ("2026-10-19", "2026-10-25"),
+            }
+            for text, expected in cases.items():
+                with self.subTest(text=text):
+                    self.assertEqual(assistant.explicit_date_period(text), expected)
+
+            reply = self.response(plan("hours_summary", date_from="2026-01-01", date_to="2026-01-31",
+                                       employee="Andrii Piskun"))
+            with closing(self.server.get_db_connection()) as conn:
+                conn.execute("INSERT INTO meta_employees(name) VALUES('Andrii Piskun')")
+                conn.commit()
+            with patch("assistant_api.requests.post", return_value=reply) as provider:
+                response = self.post("command", dict(
+                    text="Часы Андрей Пескун за 21 октября 26 года",
+                    operation_id=str(uuid.uuid4()), context=context,
+                ))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            result_plan = response.get_json()["result"]["plan"]
+            self.assertEqual((result_plan["date_from"], result_plan["date_to"]),
+                             ("2026-10-21", "2026-10-21"))
+            self.assertEqual(result_plan["purpose"], "hours_summary")
+            self.assertEqual(result_plan["employee"], "Andrii Piskun")
+            provider.assert_called_once()
 
     def test_ambiguous_report_offers_human_choices_and_preserves_single_day_selection(self):
         self.fixture_shift()
@@ -1355,6 +1477,26 @@ class AssistantApiTests(unittest.TestCase):
 class AssistantUiTests(unittest.TestCase):
     setUpClass = classmethod(cards.EmployeeCardTests.setUpClass.__func__)
     tearDownClass = classmethod(cards.EmployeeCardTests.tearDownClass.__func__)
+
+    def test_employee_choice_continues_original_action_and_period_without_reentry(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        selected_plan = plan("hours_summary", date_from="2026-10-21", date_to="2026-10-21",
+                             employee="Андрей Пескун")
+        dialog.context = dict(plan=selected_plan, pending="scope")
+        dialog.choices = [dict(employee="Andrii Piskun")]
+        dialog.clarification_choice.clear()
+        dialog.clarification_choice.addItem("Andrii Piskun")
+        with patch.object(dialog, "call") as api:
+            dialog.choose_answer()
+        payload = api.call_args.args[1]
+        self.assertEqual(api.call_args.args[0], "inspect")
+        self.assertEqual(payload["plan"], selected_plan | {"employee": "Andrii Piskun"})
+        self.assertEqual(dialog.input.toPlainText(), "")
 
     def test_local_database_failure_leaves_assistant_open_and_does_not_claim_pdf_success(self):
         from assistant_ui import AssistantDialog, RequestWorker

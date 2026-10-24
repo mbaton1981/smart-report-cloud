@@ -1,6 +1,7 @@
 """Allowlisted director assistant. No SQL, credentials or financial writes from a model."""
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 from email.message import EmailMessage
@@ -82,7 +83,17 @@ QUESTIONS = {
                    "неподдерживаемая операция не заменялась поиском смен.",
 }
 
-DATE_TOKEN = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})"
+DATE_TOKEN = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{2,4})"
+_RUSSIAN_MONTH_PATTERN = (
+    r"январ(?:я|ь)|феврал(?:я|ь)|март(?:а)?|апрел(?:я|ь)|мая|июн(?:я|ь)|"
+    r"июл(?:я|ь)|август(?:а)?|сентябр(?:я|ь)|октябр(?:я|ь)|ноябр(?:я|ь)|декабр(?:я|ь)"
+)
+_RUSSIAN_MONTHS = {
+    "января": 1, "январь": 1, "февраля": 2, "февраль": 2, "марта": 3, "март": 3,
+    "апреля": 4, "апрель": 4, "мая": 5, "июня": 6, "июнь": 6, "июля": 7, "июль": 7,
+    "августа": 8, "август": 8, "сентября": 9, "сентябрь": 9, "октября": 10, "октябрь": 10,
+    "ноября": 11, "ноябрь": 11, "декабря": 12, "декабрь": 12,
+}
 REPORT_TYPE_CHOICES = (
     dict(label="Отчёт по стоимости объекта (часы, OB и транспорт)", purpose="customer_pdf"),
     dict(label="Журнал работ по объекту (смены и интервалы)", purpose="journal_pdf"),
@@ -92,8 +103,25 @@ REPORT_TYPE_CHOICES = (
 
 def _parse_date_token(value):
     try:
-        return date.fromisoformat(value) if "-" in value else datetime.strptime(value, "%d.%m.%Y").date()
+        if "-" in value:
+            return date.fromisoformat(value)
+        day, month, year = (int(part) for part in value.split("."))
+        if year < 100:
+            year += 2000 if year < 70 else 1900
+        return date(year, month, day)
     except ValueError:
+        raise AssistantError("Укажите корректную дату или период.") from None
+
+
+def _parse_russian_date(day, month, year=None):
+    if year is None:
+        year = datetime.now(ZoneInfo("Europe/Stockholm")).year
+    year = int(year)
+    if year < 100:
+        year += 2000 if year < 70 else 1900
+    try:
+        return date(year, _RUSSIAN_MONTHS[month.casefold()], int(day))
+    except (KeyError, ValueError):
         raise AssistantError("Укажите корректную дату или период.") from None
 
 
@@ -105,9 +133,40 @@ def explicit_date_period(text):
         if start > end:
             raise AssistantError("Начало периода должно быть не позже окончания.")
         return start.isoformat(), end.isoformat()
+    compact_russian_range = re.search(
+        rf"\bс\s+(?P<start_day>\d{{1,2}})\s+(?:по|до)\s+(?P<end_day>\d{{1,2}})\s+"
+        rf"(?P<month>{_RUSSIAN_MONTH_PATTERN})(?:\s+(?P<year>\d{{2,4}}))?"
+        r"(?:\s*(?:года?|г\.))?\b", normalized)
+    if compact_russian_range:
+        match = compact_russian_range.groupdict()
+        start = _parse_russian_date(match["start_day"], match["month"], match["year"])
+        end = _parse_russian_date(match["end_day"], match["month"], match["year"])
+        if start > end:
+            raise AssistantError("Начало периода должно быть не позже окончания.")
+        return start.isoformat(), end.isoformat()
+    russian_range = re.search(
+        rf"\bс\s+(?P<start_day>\d{{1,2}})\s+(?P<start_month>{_RUSSIAN_MONTH_PATTERN})"
+        rf"(?:\s+(?P<start_year>\d{{2,4}})(?:\s*(?:года?|г\.))?)?\s+(?:по|до)\s+"
+        rf"(?P<end_day>\d{{1,2}})\s+(?P<end_month>{_RUSSIAN_MONTH_PATTERN})"
+        rf"(?:\s+(?P<end_year>\d{{2,4}}))?(?:\s*(?:года?|г\.))?\b", normalized)
+    if russian_range:
+        match = russian_range.groupdict()
+        year = match["end_year"] or match["start_year"]
+        start = _parse_russian_date(match["start_day"], match["start_month"], match["start_year"] or year)
+        end = _parse_russian_date(match["end_day"], match["end_month"], year)
+        if start > end:
+            raise AssistantError("Начало периода должно быть не позже окончания.")
+        return start.isoformat(), end.isoformat()
     single = re.search(rf"\b(?:за|на)\s+({DATE_TOKEN})\b", normalized)
     if single:
         selected = _parse_date_token(single.group(1)).isoformat()
+        return selected, selected
+    russian_single = re.search(
+        rf"\b(?:за|на)\s+(?P<day>\d{{1,2}})\s+(?P<month>{_RUSSIAN_MONTH_PATTERN})"
+        rf"(?:\s+(?P<year>\d{{2,4}}))?(?:\s*(?:года?|г\.))?\b", normalized)
+    if russian_single:
+        match = russian_single.groupdict()
+        selected = _parse_russian_date(match["day"], match["month"], match["year"]).isoformat()
         return selected, selected
     return None
 
@@ -614,6 +673,43 @@ def validate_context(context):
     return dict(plan=validate_plan(context["plan"]).copy(), pending=context["pending"])
 
 
+_CYRILLIC_NAME_TRANSLATION = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+_EMPLOYEE_GIVEN_NAME_ALIASES = {
+    "andrei": "andrii",
+    "andrey": "andrii",
+    "andriy": "andrii",
+}
+
+
+def _normalized_name_tokens(value):
+    transliterated = value.casefold().translate(_CYRILLIC_NAME_TRANSLATION)
+    tokens = re.findall(r"[a-z0-9]+", transliterated)
+    if tokens:
+        tokens[0] = _EMPLOYEE_GIVEN_NAME_ALIASES.get(tokens[0], tokens[0])
+    return tokens
+
+
+def _employee_name_similarity(requested, candidate):
+    requested_tokens = _normalized_name_tokens(requested)
+    candidate_tokens = _normalized_name_tokens(candidate)
+    if (len(requested_tokens) < 2 or len(requested_tokens) != len(candidate_tokens) or
+            requested_tokens[0] != candidate_tokens[0]):
+        return 0.0
+    similarities = [
+        SequenceMatcher(None, requested_token, candidate_token).ratio()
+        for requested_token, candidate_token in zip(requested_tokens, candidate_tokens)
+    ]
+    if any(similarity < 0.8 for similarity in similarities):
+        return 0.0
+    return min(similarities)
+
+
 def resolve_selection(conn, plan):
     plan = plan.copy()
     if plan["employee"]:
@@ -621,10 +717,25 @@ def resolve_selection(conn, plan):
         needle = plan["employee"].casefold()
         exact = [row for row in rows if row["name"].casefold() == needle]
         matches = exact or [row for row in rows if needle in row["name"].casefold()]
-        if len(matches) != 1:
-            raise AssistantQuestion("scope", question="Какого сотрудника выбрать?" if matches else
-                                    "Такой сотрудник не найден. Выберите ФИО из справочника.",
-                                    choices=[dict(employee=row["name"]) for row in (matches or rows)[:30]], plan=plan)
+        fuzzy_needs_confirmation = False
+        if not matches:
+            scored = [
+                (similarity, row) for row in rows
+                if (similarity := _employee_name_similarity(plan["employee"], row["name"])) > 0
+            ]
+            if scored:
+                best_score = max(score for score, _ in scored)
+                matches = [row for score, row in scored if best_score - score < 0.08]
+                fuzzy_needs_confirmation = best_score < 0.9 or len(matches) > 1
+        if len(matches) != 1 or fuzzy_needs_confirmation:
+            if matches:
+                question = "Уточните, какого сотрудника выбрать:"
+                choices = [dict(employee=row["name"]) for row in matches[:5]]
+            else:
+                question = ("Не удалось сопоставить распознанное имя «" + plan["employee"] +
+                            "» со справочником. Проверьте ФИО или произнесите его ещё раз.")
+                choices = []
+            raise AssistantQuestion("scope", question=question, choices=choices, plan=plan)
         plan["employee"] = matches[0]["name"]
     if plan["object_name"] or plan["company"]:
         rows = conn.execute("SELECT id,name,company FROM meta_objects ORDER BY company,name,id").fetchall()
