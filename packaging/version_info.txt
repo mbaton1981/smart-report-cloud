@@ -8,7 +8,7 @@ VSVersionInfo(
             StringStruct("FileDescription", "SmartReport incoming documents and object costs"),
             StringStruct("FileVersion", "1.0.28.1"),
             StringStruct("ProductName", "SmartReport"),
-            StringStruct("ProductVersion", "1.0.28-rc1"),
+            StringStruct("ProductVersion", "1.0.28-rc2"),
             StringStruct("OriginalFilename", "SmartReport.exe"),
         ])]),
         VarFileInfo([VarStruct("Translation", [1033, 1200])]),

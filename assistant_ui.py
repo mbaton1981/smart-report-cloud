@@ -515,7 +515,8 @@ class AssistantDialog(QDialog):
                     self.received(dict(result=result, _workflow=True))
                 self.workflow_choice.setCurrentIndex(len(self.workflow_results) - 1)
             self.workflow_choice.setVisible(True)
-            self.append_message("SmartReport", "Шаги выполнены только для чтения. Результат каждого шага доступен в списке над перепиской.")
+            self.append_message("SmartReport", f'Выполнено шагов: {len(self.workflow_results)}. '
+                                     "Показан выбранный результат; переключите шаг в списке над перепиской.")
         elif "clarification" in data:
             self.result = None
             self.result_heading.clear()
@@ -608,7 +609,7 @@ class AssistantDialog(QDialog):
             self.employee.setText(plan["employee"])
             self.company.setText(plan["company"])
             self.object_name.setText(plan["object_name"])
-            if not data.get("_repeat"):
+            if not data.get("_repeat") and not data.get("_workflow"):
                 self.append_message("SmartReport", result_text(self.result))
             self.result_heading.setText(CAPABILITIES[plan["purpose"]][0] +
                                         f' · {plan["date_from"]} — {plan["date_to"]}' +
@@ -629,6 +630,9 @@ class AssistantDialog(QDialog):
             self.pdf.setText("Открыть штатный просмотр изменений…" if self.result["plan"]["purpose"] == "catalog_preview"
                              else "Создать / открыть PDF")
             self.state.setText("Готово. Результат получен из программы, не сочинён моделью. Данные не изменены.")
+            if data.get("_workflow"):
+                self.state.setText("Цепочка выполнена только для чтения; выбран результат шага. "
+                                   "Переключите шаг над перепиской.")
             self.native.setEnabled("native_action" in self.result)
             self.open_records.setEnabled(bool(self.result["records"]) and "table" not in self.result)
             self.auto_report = plan["purpose"] in REPORT_ACTIONS and not data.get("_repeat")

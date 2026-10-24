@@ -471,9 +471,13 @@ class AssistantApiTests(unittest.TestCase):
             dialog.received(dict(results=results))
             self.assertEqual(dialog.workflow_choice.count(), 3)
             self.assertEqual(dialog.result["plan"]["purpose"], "transport_check")
+            transcript = dialog.output.toPlainText()
+            self.assertIn("Выполнено шагов: 3", transcript)
+            self.assertNotIn("Проверено: 1;", transcript)
             dialog.workflow_choice.setCurrentIndex(0)
             self.assertEqual(dialog.table.horizontalHeaderItem(1).text(), "Отработано, ч")
             self.assertEqual(dialog.context["plan"]["purpose"], "hours_summary")
+            self.assertTrue(dialog.result_heading.text().startswith("Кто сколько отработал"))
             preview = os.environ.get("SMARTREPORT_QA_ASSISTANT_PREVIEW")
             if preview:
                 from pathlib import Path
@@ -486,6 +490,7 @@ class AssistantApiTests(unittest.TestCase):
             dialog.workflow_choice.setCurrentIndex(1)
             self.assertEqual(dialog.output.toPlainText(), history)
             self.assertEqual(dialog.table.rowCount(), 0)
+            self.assertTrue(dialog.result_heading.text().startswith("Дубли и смены без клиентской ставки"))
             dialog.workflow_choice.setCurrentIndex(0)
             dialog.received(dict(text="А теперь за прошлую неделю"))
             self.assertEqual(dialog.worker.path, "status")
