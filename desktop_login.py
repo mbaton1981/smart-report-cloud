@@ -71,7 +71,10 @@ class LoginDialog(QDialog):
 
 def ensure_login():
     """True, если клиент может работать: токен действует, сервер недоступен при сохранённом токене или задан тестовый ключ."""
-    if os.environ.get("SYNC_API_KEY") or os.environ.get("SMARTREPORT_TRIAL_MODE") == "1":
+    assistant_candidate = os.environ.get("SMARTREPORT_ASSISTANT_CANDIDATE") == "1"
+    if not assistant_candidate and (
+        os.environ.get("SYNC_API_KEY") or os.environ.get("SMARTREPORT_TRIAL_MODE") == "1"
+    ):
         return True
     url = desktop_auth.server_url()
     saved = desktop_auth.load_saved_token()

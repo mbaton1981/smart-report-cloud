@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -532,6 +532,28 @@ class AuthLoginTests(unittest.TestCase):
             with patch.object(auth, "check_token", return_value=False), patch.object(desktop_login.LoginDialog, "exec", return_value=0):
                 self.assertFalse(desktop_login.ensure_login())
             self.assertEqual(auth.load_saved_token(), "")
+
+    def test_assistant_candidate_requires_personal_login_even_with_shared_sync_key(self):
+        import desktop_login
+        from PyQt6.QtWidgets import QDialog
+
+        auth = self.desktop_auth
+        with tempfile.TemporaryDirectory() as data, patch.dict(os.environ, {
+            "SMARTREPORT_DATA_DIR": data,
+            "SMARTREPORT_CLOUD_URL": "https://server.example",
+            "SMARTREPORT_ASSISTANT_CANDIDATE": "1",
+            "SYNC_API_KEY": SYNC_KEY,
+            "SMARTREPORT_TRIAL_MODE": "1",
+        }):
+            dialog = Mock()
+            dialog.token = "personal-admin-token"
+            dialog.exec.return_value = QDialog.DialogCode.Accepted
+            with patch.object(desktop_login, "LoginDialog", return_value=dialog) as login_dialog, \
+                    patch.object(auth, "check_token", return_value=True):
+                self.assertTrue(desktop_login.ensure_login())
+            login_dialog.assert_called_once()
+            dialog.exec.assert_called_once()
+            self.assertEqual(auth.current_token(), "personal-admin-token")
 
     def test_server_url_prefers_environment_then_saved_setting_then_default(self):
         auth = self.desktop_auth
