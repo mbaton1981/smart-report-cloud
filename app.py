@@ -26,7 +26,10 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
     QTextEdit, QSplitter, QGraphicsView, QGraphicsScene, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool
+from PyQt6.QtCore import (
+    Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool,
+    QItemSelectionModel,
+)
 from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QImage, QPixmap
 from PyQt6.QtCore import QUrl
 
@@ -9763,9 +9766,122 @@ class SmartReportApp(QMainWindow):
             cursor.execute("SELECT name FROM companies ORDER BY name")
             rows = cursor.fetchall()
             conn.close()
-            self.table_companies.setRowCount(len(rows))
-            for row_idx, row in enumerate(rows):
-                self.table_companies.setItem(row_idx, 0, QTableWidgetItem(row[0]))
+            expected_rows = {
+                str(row[0]): ((str(row[0]),), (), ("",))
+                for row in rows
+            }
+            if self._catalog_table_matches(self.table_companies, expected_rows):
+                return
+            view_state = self._capture_catalog_table_view(self.table_companies)
+            table = self.table_companies
+            was_blocked = table.blockSignals(True)
+            was_enabled = table.updatesEnabled()
+            table.setUpdatesEnabled(False)
+            was_sorting = table.isSortingEnabled()
+            sort_column = table.horizontalHeader().sortIndicatorSection()
+            sort_order = table.horizontalHeader().sortIndicatorOrder()
+            table.setSortingEnabled(False)
+            try:
+                table.setRowCount(len(rows))
+                for row_idx, row in enumerate(rows):
+                    item = QTableWidgetItem(row[0])
+                    item.setData(Qt.ItemDataRole.UserRole, str(row[0]))
+                    table.setItem(row_idx, 0, item)
+            finally:
+                table.setSortingEnabled(was_sorting)
+                if was_sorting and sort_column >= 0:
+                    table.sortItems(sort_column, sort_order)
+                table.blockSignals(was_blocked)
+                table.setUpdatesEnabled(was_enabled)
+            self._restore_catalog_table_view(table, view_state)
+
+    @staticmethod
+    def _catalog_table_matches(table, expected_rows):
+        if table.rowCount() != len(expected_rows):
+            return False
+        actual_rows = {}
+        for row_index in range(table.rowCount()):
+            identity_item = table.item(row_index, 0)
+            if identity_item is None:
+                return False
+            identity = identity_item.data(Qt.ItemDataRole.UserRole)
+            expected = expected_rows.get(identity)
+            if identity is None or expected is None:
+                return False
+            values = []
+            tooltips = []
+            for column in range(table.columnCount()):
+                item = table.item(row_index, column)
+                if item is None:
+                    return False
+                values.append(item.text())
+                tooltips.append(item.toolTip())
+            metadata = tuple(
+                identity_item.data(Qt.ItemDataRole.UserRole + role_index + 1)
+                for role_index in range(len(expected[1]))
+            )
+            actual_rows[identity] = (tuple(values), metadata, tuple(tooltips))
+        return actual_rows == expected_rows
+
+    @staticmethod
+    def _capture_catalog_table_view(table):
+        selected_ids = []
+        for index in table.selectionModel().selectedRows():
+            item = table.item(index.row(), 0)
+            identity = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if identity is not None:
+                selected_ids.append(identity)
+        current_index = table.selectionModel().currentIndex()
+        current_item = table.item(current_index.row(), 0) if current_index.isValid() else None
+        current_id = current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+        return {
+            "selected_ids": selected_ids,
+            "current_id": current_id,
+            "current_column": current_index.column() if current_index.isValid() else 0,
+            "vertical_scroll": table.verticalScrollBar().value(),
+            "horizontal_scroll": table.horizontalScrollBar().value(),
+            "sorting": table.isSortingEnabled(),
+            "sort_column": table.horizontalHeader().sortIndicatorSection(),
+            "sort_order": table.horizontalHeader().sortIndicatorOrder(),
+        }
+
+    @staticmethod
+    def _restore_catalog_table_view(table, state):
+        if state["sorting"]:
+            table.setSortingEnabled(True)
+            if state["sort_column"] >= 0:
+                table.sortItems(state["sort_column"], state["sort_order"])
+        rows_by_id = {}
+        for row_index in range(table.rowCount()):
+            item = table.item(row_index, 0)
+            identity = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if identity is not None:
+                rows_by_id[identity] = row_index
+
+        selection_model = table.selectionModel()
+        selection_model.clearSelection()
+        current_row = rows_by_id.get(state["current_id"])
+        if current_row is not None:
+            current_column = min(state["current_column"], max(0, table.columnCount() - 1))
+            selection_model.setCurrentIndex(
+                table.model().index(current_row, current_column),
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+        for identity in state["selected_ids"]:
+            row_index = rows_by_id.get(identity)
+            if row_index is not None:
+                selection_model.select(
+                    table.model().index(row_index, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                )
+
+        def restore_scroll_position():
+            vertical = table.verticalScrollBar()
+            horizontal = table.horizontalScrollBar()
+            vertical.setValue(min(state["vertical_scroll"], vertical.maximum()))
+            horizontal.setValue(min(state["horizontal_scroll"], horizontal.maximum()))
+
+        QTimer.singleShot(0, restore_scroll_position)
 
     def delete_company(self):
         selected = self.table_companies.currentRow()
@@ -10103,17 +10219,6 @@ class SmartReportApp(QMainWindow):
     def load_objects_table(self):
         if self.table_objects.state() == QTableWidget.State.EditingState:
             return
-        selected_object_id = None
-        current_row = self.table_objects.currentRow()
-        if current_row >= 0:
-            selected_item = self.table_objects.item(current_row, 0)
-            if selected_item is not None:
-                selected_object_id = selected_item.data(Qt.ItemDataRole.UserRole)
-        try:
-            self.table_objects.cellChanged.disconnect(self.on_object_cell_changed)
-        except TypeError:
-            pass
-
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT is_active, COUNT(*) FROM objects GROUP BY is_active")
@@ -10131,46 +10236,79 @@ class SmartReportApp(QMainWindow):
         rows = cursor.fetchall()
         conn.close()
 
-        self.table_objects.clearSelection()
-        self.table_objects.setCurrentCell(-1, -1)
-        self.table_objects.setRowCount(len(rows))
-        for row_idx, row in enumerate(rows):
-            company_item = QTableWidgetItem(row[1] or "")
-            company_item.setData(Qt.ItemDataRole.UserRole, int(row[0]))
-            company_item.setData(Qt.ItemDataRole.UserRole + 1, int(row[9] or 0))
-            company_item.setData(Qt.ItemDataRole.UserRole + 2, row[7])
-            self.table_objects.setItem(row_idx, 0, company_item)
-            name_item = QTableWidgetItem(row[2])
-            mark_item = QTableWidgetItem(row[3] or "")
-            company_item.setFlags(company_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if not row[6] or not row[7]:
-                for item in (name_item, mark_item):
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table_objects.setItem(row_idx, 1, name_item)
-            self.table_objects.setItem(row_idx, 2, mark_item)
-            
-            rate_item = QTableWidgetItem(f"{row[4]:.2f}")
-            rate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            trans_item = QTableWidgetItem(f"{row[5]:.2f}")
-            trans_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            if not row[6] or not row[7]:
-                rate_item.setFlags(rate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                trans_item.setFlags(trans_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table_objects.setItem(row_idx, 3, rate_item)
-            self.table_objects.setItem(row_idx, 4, trans_item)
+        display_rows = {}
+        for row in rows:
             state_label = "В архиве" if not row[6] else "Активен" if row[7] else "Legacy: не связан"
-            state_item = QTableWidgetItem(state_label)
-            state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table_objects.setItem(row_idx, 5, state_item)
-            if not row[6]:
-                for column in range(self.table_objects.columnCount()):
-                    cell = self.table_objects.item(row_idx, column)
-                    desktop_theme.item_color(cell, "#A0AEC0", foreground=True)
-                    desktop_theme.item_color(cell, "#2D3748")
-            if selected_object_id is not None and int(row[0]) == int(selected_object_id):
-                self.table_objects.selectRow(row_idx)
+            display_rows[int(row[0])] = (
+                (
+                    row[1] or "", row[2] or "", row[3] or "", f"{row[4]:.2f}",
+                    f"{row[5]:.2f}", state_label,
+                ),
+                (int(row[9] or 0), row[7]),
+                ("", "", "", "", "", ""),
+            )
 
-        self.table_objects.cellChanged.connect(self.on_object_cell_changed)
+        if self._catalog_table_matches(self.table_objects, display_rows):
+            self.update_object_archive_action()
+            return
+
+        view_state = self._capture_catalog_table_view(self.table_objects)
+        try:
+            self.table_objects.cellChanged.disconnect(self.on_object_cell_changed)
+        except TypeError:
+            pass
+        table = self.table_objects
+        was_blocked = table.blockSignals(True)
+        was_enabled = table.updatesEnabled()
+        table.setUpdatesEnabled(False)
+        was_sorting = table.isSortingEnabled()
+        sort_column = table.horizontalHeader().sortIndicatorSection()
+        sort_order = table.horizontalHeader().sortIndicatorOrder()
+        table.setSortingEnabled(False)
+        try:
+            table.setRowCount(len(rows))
+            for row_idx, row in enumerate(rows):
+                values, metadata, _tooltips = display_rows[int(row[0])]
+                company_item = QTableWidgetItem(values[0])
+                company_item.setData(Qt.ItemDataRole.UserRole, int(row[0]))
+                company_item.setData(Qt.ItemDataRole.UserRole + 1, metadata[0])
+                company_item.setData(Qt.ItemDataRole.UserRole + 2, metadata[1])
+                table.setItem(row_idx, 0, company_item)
+                name_item = QTableWidgetItem(values[1])
+                mark_item = QTableWidgetItem(values[2])
+                company_item.setFlags(company_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if not row[6] or not row[7]:
+                    for item in (name_item, mark_item):
+                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(row_idx, 1, name_item)
+                table.setItem(row_idx, 2, mark_item)
+
+                rate_item = QTableWidgetItem(values[3])
+                rate_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                trans_item = QTableWidgetItem(values[4])
+                trans_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if not row[6] or not row[7]:
+                    rate_item.setFlags(rate_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    trans_item.setFlags(trans_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(row_idx, 3, rate_item)
+                table.setItem(row_idx, 4, trans_item)
+                state_item = QTableWidgetItem(values[5])
+                state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(row_idx, 5, state_item)
+                if not row[6]:
+                    for column in range(table.columnCount()):
+                        cell = table.item(row_idx, column)
+                        desktop_theme.item_color(cell, "#A0AEC0", foreground=True)
+                        desktop_theme.item_color(cell, "#2D3748")
+        finally:
+            table.setSortingEnabled(was_sorting)
+            if was_sorting and sort_column >= 0:
+                table.sortItems(sort_column, sort_order)
+            table.blockSignals(was_blocked)
+            table.setUpdatesEnabled(was_enabled)
+            table.cellChanged.connect(self.on_object_cell_changed)
+
+        self._restore_catalog_table_view(table, view_state)
         self.update_object_archive_action()
 
     def update_object_archive_action(self):
@@ -10248,12 +10386,8 @@ class SmartReportApp(QMainWindow):
         self.background_sync_with_cloud()
 
     def load_employees_table(self):
-        selected_employee_id = None
-        current_row = self.table_employees.currentRow()
-        if current_row >= 0:
-            selected_item = self.table_employees.item(current_row, 0)
-            if selected_item is not None:
-                selected_employee_id = selected_item.data(Qt.ItemDataRole.UserRole)
+        if self.table_employees.state() == QTableWidget.State.EditingState:
+            return
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT is_active, COUNT(*) FROM employees GROUP BY is_active")
@@ -10281,46 +10415,82 @@ class SmartReportApp(QMainWindow):
         except Exception:
             pass
 
-        self.table_employees.clearSelection()
-        self.table_employees.setCurrentCell(-1, -1)
-        self.table_employees.setRowCount(len(rows))
         from employee_cards_client import CardClient
         card_states, card_error = {}, ""
         try:
             card_states = {employee_sync_key(item["name"]): item for item in CardClient().employees()}
         except employee_cards.CardError as error:
             card_error = str(error)
-        for row_idx, row in enumerate(rows):
+
+        display_rows = {}
+        for row in rows:
             employee_id, name, rate, is_active = int(row[0]), row[1], row[2], bool(row[3])
             has_pin = pin_statuses.get(name.strip().lower(), None)
-            name_item = QTableWidgetItem(name)
-            name_item.setData(Qt.ItemDataRole.UserRole, employee_id)
-            self.table_employees.setItem(row_idx, 0, name_item)
-            self.table_employees.setItem(row_idx, 1, QTableWidgetItem(f"{rate:.2f}" if rate else "0.00"))
-
-            status_item = QTableWidgetItem("Активен" if is_active else "Неактивен")
-            self.table_employees.setItem(row_idx, 2, status_item)
+            state = card_states.get(employee_sync_key(name))
+            issues = (state["missing"] + state["warnings"]) if state else []
+            summary = ("Не хватает данных" if issues else "Данные заполнены") if state else "Карточка недоступна"
             pin_text = "Неизвестно" if has_pin is None else "Задан" if has_pin else "Не задан"
-            pin_item = QTableWidgetItem(pin_text)
-            if has_pin:
-                desktop_theme.item_color(pin_item, "#68D391", foreground=True)
-            elif has_pin is False:
-                desktop_theme.item_color(pin_item, "#F6AD55", foreground=True)
-            self.table_employees.setItem(row_idx, 3, pin_item)
-            if self.table_employees.columnCount() >= 5:
-                state = card_states.get(employee_sync_key(name))
-                issues = (state["missing"] + state["warnings"]) if state else []
-                summary = ("Не хватает данных" if issues else "Данные заполнены") if state else "Карточка недоступна"
-                card_item = QTableWidgetItem(summary)
-                card_item.setToolTip("\n".join(issues) if state else card_error or "Обновите справочник.")
-                self.table_employees.setItem(row_idx, 4, card_item)
-            if not is_active:
-                for column in range(self.table_employees.columnCount()):
-                    cell = self.table_employees.item(row_idx, column)
-                    desktop_theme.item_color(cell, "#A0AEC0", foreground=True)
-                    desktop_theme.item_color(cell, "#2D3748")
-            if selected_employee_id is not None and employee_id == int(selected_employee_id):
-                self.table_employees.selectRow(row_idx)
+            display_rows[employee_id] = (
+                (
+                    name, f"{rate:.2f}" if rate else "0.00",
+                    "Активен" if is_active else "Неактивен", pin_text, summary,
+                ),
+                (),
+                (
+                    "", "", "",
+                    "",
+                    "\n".join(issues) if state else card_error or "Обновите справочник.",
+                ),
+            )
+
+        if self._catalog_table_matches(self.table_employees, display_rows):
+            return
+
+        view_state = self._capture_catalog_table_view(self.table_employees)
+        table = self.table_employees
+        was_blocked = table.blockSignals(True)
+        was_enabled = table.updatesEnabled()
+        table.setUpdatesEnabled(False)
+        was_sorting = table.isSortingEnabled()
+        sort_column = table.horizontalHeader().sortIndicatorSection()
+        sort_order = table.horizontalHeader().sortIndicatorOrder()
+        table.setSortingEnabled(False)
+        try:
+            table.setRowCount(len(rows))
+            for row_idx, row in enumerate(rows):
+                employee_id, name, _rate, is_active = int(row[0]), row[1], row[2], bool(row[3])
+                values = display_rows[employee_id][0]
+                has_pin = pin_statuses.get(name.strip().lower(), None)
+                name_item = QTableWidgetItem(values[0])
+                name_item.setData(Qt.ItemDataRole.UserRole, employee_id)
+                table.setItem(row_idx, 0, name_item)
+                table.setItem(row_idx, 1, QTableWidgetItem(values[1]))
+
+                status_item = QTableWidgetItem(values[2])
+                table.setItem(row_idx, 2, status_item)
+                pin_item = QTableWidgetItem(values[3])
+                if has_pin:
+                    desktop_theme.item_color(pin_item, "#68D391", foreground=True)
+                elif has_pin is False:
+                    desktop_theme.item_color(pin_item, "#F6AD55", foreground=True)
+                table.setItem(row_idx, 3, pin_item)
+                if table.columnCount() >= 5:
+                    card_item = QTableWidgetItem(values[4])
+                    card_item.setToolTip(display_rows[employee_id][2][4])
+                    table.setItem(row_idx, 4, card_item)
+                if not is_active:
+                    for column in range(table.columnCount()):
+                        cell = table.item(row_idx, column)
+                        desktop_theme.item_color(cell, "#A0AEC0", foreground=True)
+                        desktop_theme.item_color(cell, "#2D3748")
+        finally:
+            table.setSortingEnabled(was_sorting)
+            if was_sorting and sort_column >= 0:
+                table.sortItems(sort_column, sort_order)
+            table.blockSignals(was_blocked)
+            table.setUpdatesEnabled(was_enabled)
+
+        self._restore_catalog_table_view(table, view_state)
         self.update_employee_status_action()
 
     def update_employee_status_action(self):

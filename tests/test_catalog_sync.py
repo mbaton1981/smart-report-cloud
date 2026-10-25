@@ -4024,6 +4024,167 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM employee_sync_outbox").fetchone()[0], 0)
         desktop_conn.close()
 
+    def test_catalog_refresh_preserves_scroll_and_selection_with_assistant_visibility(self):
+        from PyQt6.QtCore import QPoint, QPointF, QTimer, Qt
+        from PyQt6.QtGui import QWheelEvent
+        from PyQt6.QtTest import QSignalSpy, QTest
+
+        conn = self.desktop.get_db_connection()
+        employees = [(f"Scroll Employee {index:03d}", 450, 1) for index in range(80)]
+        employees.append(("Archived Scroll Employee", 450, 0))
+        objects = [
+            ("Renatur", f"Scroll Object {index:03d}", f"mark-{index:03d}", 520, 450, 1,
+             str(uuid.uuid4()), 10000 + index, 1)
+            for index in range(80)
+        ]
+        objects.append(
+            ("Renatur", "Archived Scroll Object", "archived-mark", 520, 450, 0,
+             str(uuid.uuid4()), 10100, 1)
+        )
+        conn.executemany(
+            "INSERT INTO employees (name,salary_rate,is_active) VALUES (?,?,?)", employees
+        )
+        conn.executemany("""
+            INSERT INTO objects (
+                company,name,markning,rate,transport_rate,is_active,sync_id,server_id,sync_version
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+        """, objects)
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+        window.resize(1200, 900)
+        window.table_employees.setMaximumHeight(220)
+        window.table_objects.setMaximumHeight(220)
+        response = SimpleNamespace(status_code=200, json=lambda: {"users": []})
+        try:
+            with patch.object(self.desktop.requests, "get", return_value=response), \
+                 patch("employee_cards_client.CardClient.employees", return_value=[]):
+                window.load_employees_table()
+                window.load_objects_table()
+                window.show()
+                self.qt_app.processEvents()
+                QTest.qWait(250)
+
+                def verify_refresh(table, refresh, identity_role, assistant_open):
+                    self.assertGreater(table.verticalScrollBar().maximum(), 0)
+                    middle = table.rowCount() // 2
+                    table.selectRow(middle)
+                    selected_item = table.item(middle, 0)
+                    selected_id = selected_item.data(identity_role)
+                    self.qt_app.processEvents()
+                    changes = QSignalSpy(table.model().dataChanged)
+
+                    for wheel_delta in (-120, 120):
+                        table.verticalScrollBar().setValue(
+                            table.verticalScrollBar().maximum() // 2
+                        )
+                        point = QPointF(table.viewport().rect().center())
+                        global_point = QPointF(table.viewport().mapToGlobal(point.toPoint()))
+                        for _ in range(30):
+                            event = QWheelEvent(
+                                point, global_point, QPoint(), QPoint(0, wheel_delta),
+                                Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False,
+                            )
+                            self.qt_app.sendEvent(table.viewport(), event)
+                        self.qt_app.processEvents()
+                        expected_scroll = table.verticalScrollBar().value()
+                        self.assertIn(expected_scroll, (0, table.verticalScrollBar().maximum()))
+                        timer = QTimer()
+                        timer.setSingleShot(True)
+                        timer.timeout.connect(refresh)
+                        timer.start(1500)
+                        QTest.qWait(1650)
+                        self.assertEqual(
+                            table.verticalScrollBar().value(), expected_scroll,
+                            f"scroll jumped with assistant_open={assistant_open}",
+                        )
+                        selected_rows = table.selectionModel().selectedRows()
+                        self.assertEqual(len(selected_rows), 1)
+                        current_item = table.item(selected_rows[0].row(), 0)
+                        self.assertEqual(current_item.data(identity_role), selected_id)
+                        timer.stop()
+                    self.assertEqual(len(changes), 0, "unchanged catalog rows were rebuilt")
+
+                role = self.desktop.Qt.ItemDataRole.UserRole
+                for assistant_open in (False, True):
+                    assistant = None
+                    if assistant_open:
+                        from assistant_ui import AssistantDialog, RequestWorker
+                        with patch.object(RequestWorker, "start"):
+                            assistant = AssistantDialog(window)
+                            assistant.show()
+                            self.qt_app.processEvents()
+                    verify_refresh(window.table_employees, window.load_employees_table, role, assistant_open)
+                    verify_refresh(window.table_objects, window.load_objects_table, role, assistant_open)
+                    if assistant is not None:
+                        assistant.close()
+                        assistant.deleteLater()
+                        self.qt_app.processEvents()
+
+                window.load_companies_table()
+                employees_table = window.table_employees
+                employees_table.verticalScrollBar().setValue(employees_table.verticalScrollBar().maximum())
+                employee_selected_id = employees_table.item(
+                    employees_table.selectionModel().selectedRows()[0].row(), 0
+                ).data(role)
+                desktop_conn = self.desktop.get_db_connection()
+                desktop_conn.execute(
+                    "UPDATE employees SET salary_rate = 475 WHERE id = ?", (employee_selected_id,)
+                )
+                desktop_conn.commit()
+                desktop_conn.close()
+                expected_scroll = employees_table.verticalScrollBar().value()
+                window.load_employees_table()
+                QTest.qWait(50)
+                self.assertEqual(employees_table.verticalScrollBar().value(), expected_scroll)
+                self.assertEqual(
+                    employees_table.item(
+                        employees_table.selectionModel().selectedRows()[0].row(), 0
+                    ).data(role),
+                    employee_selected_id,
+                )
+                selected_row = employees_table.selectionModel().selectedRows()[0].row()
+                self.assertEqual(employees_table.item(selected_row, 1).text(), "475.00")
+                active_employee_count = employees_table.rowCount()
+                window.show_inactive_employees_check.setChecked(True)
+                window.load_employees_table()
+                self.assertEqual(employees_table.rowCount(), active_employee_count + 1)
+                window.show_inactive_employees_check.setChecked(False)
+                window.load_employees_table()
+                self.assertEqual(employees_table.rowCount(), active_employee_count)
+
+                objects_table = window.table_objects
+                object_selected_row = objects_table.selectionModel().selectedRows()[0].row()
+                object_selected_id = objects_table.item(object_selected_row, 0).data(role)
+                desktop_conn = self.desktop.get_db_connection()
+                desktop_conn.execute(
+                    "UPDATE objects SET markning = 'updated-mark' WHERE id = ?", (object_selected_id,)
+                )
+                desktop_conn.commit()
+                desktop_conn.close()
+                expected_scroll = objects_table.verticalScrollBar().value()
+                window.load_objects_table()
+                QTest.qWait(50)
+                self.assertEqual(objects_table.verticalScrollBar().value(), expected_scroll)
+                selected_row = objects_table.selectionModel().selectedRows()[0].row()
+                self.assertEqual(objects_table.item(selected_row, 0).data(role), object_selected_id)
+                self.assertEqual(objects_table.item(selected_row, 2).text(), "updated-mark")
+                active_object_count = objects_table.rowCount()
+                window.show_archived_objects_check.setChecked(True)
+                window.load_objects_table()
+                self.assertEqual(objects_table.rowCount(), active_object_count + 1)
+                window.show_archived_objects_check.setChecked(False)
+                window.load_objects_table()
+                self.assertEqual(objects_table.rowCount(), active_object_count)
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_archive_filters_counts_stable_selection_and_action_state(self):
         desktop_conn = self.desktop.get_db_connection()
         desktop_conn.execute("DELETE FROM objects")
