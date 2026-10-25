@@ -990,7 +990,153 @@ class AssistantApiTests(unittest.TestCase):
                 operation_id=str(uuid.uuid4()),
             ))
             self.assertEqual(missing_period.status_code, 200, missing_period.get_json())
-            self.assertEqual(missing_period.get_json()["clarification"]["field"], "period")
+            missing_plan = missing_period.get_json()["result"]["plan"]
+            self.assertEqual(missing_plan["purpose"], "hours_summary")
+            self.assertEqual(
+                (missing_plan["date_from"], missing_plan["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            provider.assert_not_called()
+
+    def test_director_submission_status_counts_active_profiles_and_work_days(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE meta_employees SET is_active=0")
+            conn.executemany(
+                "INSERT INTO meta_employees(name,is_active) VALUES(?,?)",
+                [
+                    ("Multi Entry", 1),
+                    ("No Hours", 1),
+                    ("Transport Only", 1),
+                    ("Special Only", 1),
+                    ("Deleted Only", 1),
+                    ("Inactive History", 0),
+                ],
+            )
+
+            def add(sync_id, employee, hours, kind, *, day="2026-10-13", deleted=0,
+                    transport=0, name_variant=None):
+                conn.execute(
+                    """INSERT INTO incoming_submissions
+                       (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                        submission_type,is_deleted,created_at,updated_at)
+                       VALUES(?,?,?,?,'Renatur','Main',?,0,?,?,?,'2026-10-20','2026-10-20')""",
+                    (sync_id, sync_id, day, name_variant or employee, hours, transport, kind, deleted),
+                )
+
+            add("director-work", "Multi Entry", 5, "work")
+            add("director-ob", "Multi Entry", 3, "ob", name_variant=" multi   entry ")
+            add("director-transport", "Transport Only", 99, "transport", transport=4)
+            add("director-expense", "Transport Only", 80, "expense")
+            add("director-sick", "Special Only", 8, "sick")
+            add("director-deleted", "Deleted Only", 24, "work", deleted=1)
+            add("director-inactive", "Inactive History", 6, "work", day="2026-10-17")
+            add("director-unlinked", "Unknown Historical Name", 4, "work", day="2026-10-18")
+            conn.commit()
+
+        before = self.business()
+        context = dict(
+            plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25",
+                      employee="Multi Entry", company="Renatur", object_name="Main"),
+            pending="",
+        )
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+            response = self.post("command", dict(
+                text="Кто не внёс часы?",
+                operation_id=str(uuid.uuid4()),
+                context=context,
+            ))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            result = response.get_json()["result"]
+            self.assertEqual(result["plan"]["purpose"], "hours_summary")
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            self.assertEqual(
+                (result["plan"]["employee"], result["plan"]["company"], result["plan"]["object_name"]),
+                ("", "", ""),
+            )
+            self.assertEqual(result["employee_count"], 5)
+            self.assertEqual(result["submitted_employee_count"], 1)
+            self.assertEqual(result["employees_without_hours"], 4)
+            self.assertEqual(result["processed_records"], 4)
+            self.assertEqual(result["active_work_hours"], "8")
+            self.assertEqual(result["active_regular_hours"], "5")
+            self.assertEqual(result["active_ob_hours"], "3")
+            self.assertEqual(result["historical_employee_count"], 1)
+            self.assertEqual(result["unlinked_work_record_groups"], 1)
+            rows = {row[1]: row for row in result["table"]["rows"]}
+            self.assertEqual(rows["Multi Entry"],
+                             ["Внесли часы", "Multi Entry", "1 день, 8 часов", "5", "3"])
+            self.assertEqual(rows["No Hours"],
+                             ["Без внесённых часов", "No Hours", "0 дней, 0 часов", "0", "0"])
+            self.assertEqual(rows["Transport Only"][0], "Без внесённых часов")
+            self.assertEqual(rows["Special Only"][0], "Без внесённых часов")
+            self.assertEqual(rows["Deleted Only"][0], "Без внесённых часов")
+            self.assertEqual(rows["Inactive History"][0], "Исторические записи")
+            self.assertEqual(rows["Unknown Historical Name"][0],
+                             "Связь со справочником не установлена")
+            self.assertIn("Без внесённых часов: Deleted Only, No Hours, Special Only, Transport Only.",
+                          result["summary"])
+            self.assertIn("Итог по действующей команде: внесли 1, без часов 4, рабочих часов 8",
+                          result["summary"])
+            self.assertIn("Исторические записи отдельно: 1 сотрудник, 6 часов", result["summary"])
+            self.assertIn("1 группа записей без однозначной связи со справочником, 4 часа",
+                          result["summary"])
+            self.assertEqual(result["notice"], "Список без часов не учитывает отпуска и отсутствие работы.")
+            from assistant_ui import result_table, result_text
+            rendered = result_text(result)
+            headers, rendered_rows = result_table(result)
+            self.assertIn("Рабочие дни и часы", headers)
+            self.assertIn("1 день, 8 часов", str(rendered_rows))
+            self.assertNotIn("Unknown Historical Name", result["summary"])
+            provider.assert_not_called()
+        self.assertEqual(before, self.business())
+
+    def test_director_submission_status_explicit_period_and_current_week_notice(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE meta_employees SET is_active=0")
+            conn.execute("INSERT INTO meta_employees(name,is_active) VALUES('Week Staff',1)")
+            conn.execute(
+                """INSERT INTO incoming_submissions
+                   (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                    submission_type,created_at,updated_at)
+                   VALUES('week-current','week-current','2026-10-24','Week Staff','Renatur',
+                          'Main',8,0,0,'work','2026-10-24','2026-10-24')"""
+            )
+            conn.commit()
+
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+            current = self.post("command", dict(
+                text="Кто не сдал часы за эту неделю?",
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(current.status_code, 200, current.get_json())
+            result = current.get_json()["result"]
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            self.assertIn("Результат предварительный", result["notice"])
+            self.assertEqual(result["submitted_employee_count"], 1)
+
+            explicit = self.post("command", dict(
+                text="Кто не заполнил часы с 12 по 18 октября 2026 года?",
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(explicit.status_code, 200, explicit.get_json())
+            explicit_result = explicit.get_json()["result"]
+            self.assertEqual(
+                (explicit_result["plan"]["date_from"], explicit_result["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            self.assertEqual(explicit_result["submitted_employee_count"], 0)
+            self.assertEqual(explicit_result["employees_without_hours"], 1)
+            self.assertNotIn("Результат предварительный", explicit_result["notice"])
             provider.assert_not_called()
 
     def test_submission_summary_separates_categories_unknown_profiles_and_duplicates(self):

@@ -519,12 +519,19 @@ def strip_no_change_suffix(text):
     ).rstrip(" \t,;.!?")
 
 
+def is_submission_status_request(text):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    return bool(re.search(
+        r"\b(?:сдач\w*\s+час\w*|контрол\w*\s+сдач\w*|"
+        r"(?:кто\s+)?не\s+(?:вн[её]с\w*|заполн\w*|сдал\w*)\s+час\w*)\b",
+        normalized,
+    ))
+
+
 def recognized_read_command(text, context=None):
     text = strip_no_change_suffix(text)
     normalized = " ".join(text.casefold().strip(" .!?").split())
-    submission_check = bool(re.search(
-        r"\b(?:сдач\w*\s+час\w*|контрол\w*\s+сдач\w*)\b", normalized
-    ))
+    submission_check = is_submission_status_request(text)
     hours_request = re.fullmatch(
         r"(?:(?:а\s+)?(?:теперь\s+)?)?(?:покажи\s*,?\s*)?"
         r"(?:кто\s+сколько\s+(?:отработал|работал)"
@@ -560,6 +567,10 @@ def recognized_read_command(text, context=None):
         begin, end = date_period
     elif week_period:
         begin, end = week_period
+    elif submission_check:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday() + 7)
+        begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
     elif previous:
         begin, end = previous["date_from"], previous["date_to"]
     else:
@@ -595,10 +606,9 @@ def recognized_read_command(text, context=None):
         ) else employee_text or previous.get("employee", ""),
         company="" if submission_check else previous.get("company", ""),
         object_name="" if submission_check else previous.get("object_name", "")))
-    if submission_check and not (date_period or week_period or previous):
-        raise AssistantQuestion("period", plan=plan)
     if not (date_period or week_period or previous):
-        raise AssistantQuestion("period", plan=plan)
+        if not submission_check:
+            raise AssistantQuestion("period", plan=plan)
     return plan
 
 
@@ -624,11 +634,22 @@ def compact_hours_summary(result):
     result["summary_only"] = True
 
 
-def submission_hours_summary(conn, plan):
+def submission_hours_summary(conn, plan, *, director_status=False):
     profiles_by_key = {}
-    for profile in conn.execute("SELECT id,name,is_active FROM meta_employees"):
+    profiles = list(conn.execute("SELECT id,name,is_active FROM meta_employees"))
+    for profile in profiles:
         key = " ".join(str(profile["name"] or "").split()).casefold()
         profiles_by_key.setdefault(key, []).append(profile)
+    status_by_profile_id = {
+        profile["id"]: {
+            "profile": profile,
+            "work": Decimal("0"),
+            "ob": Decimal("0"),
+            "dates": set(),
+        }
+        for profile in profiles
+    }
+    status_by_unlinked_name = {}
 
     filters = ["s.is_deleted=0", "s.date>=?", "s.date<=?"]
     values = [plan["date_from"], plan["date_to"]]
@@ -646,6 +667,7 @@ def submission_hours_summary(conn, plan):
 
     totals = {}
     processed = 0
+    work_records_processed = 0
     query = (
         "SELECT s.employee,s.submission_type,s.hours,s.date,s.company,s.object_name "
         "FROM incoming_submissions s WHERE " + " AND ".join(filters) + " ORDER BY s.date,s.id"
@@ -686,10 +708,188 @@ def submission_hours_summary(conn, plan):
         employee_totals["records"] += 1
         if kind in {"work", "ob"}:
             employee_totals[kind] += hours
+            work_records_processed += 1
+            if profile:
+                profile_totals = status_by_profile_id[profile["id"]]
+                profile_totals[kind] += hours
+                profile_totals["dates"].add(raw["date"])
+            else:
+                unlinked = status_by_unlinked_name.setdefault(key or "<имя отсутствует>", {
+                    "employee": display_name,
+                    "work": Decimal("0"),
+                    "ob": Decimal("0"),
+                    "dates": set(),
+                })
+                unlinked[kind] += hours
+                unlinked["dates"].add(raw["date"])
         elif kind in {"atf", "sick", "vacation", "holiday"}:
             employee_totals[kind] += hours
         else:
             employee_totals["unknown"] += hours
+
+    if director_status:
+        selected_employee_key = " ".join(str(plan["employee"] or "").split()).casefold()
+        active_profiles = [
+            profile for profile in profiles
+            if profile["is_active"] and (
+                not selected_employee_key or
+                " ".join(str(profile["name"] or "").split()).casefold() == selected_employee_key
+            )
+        ]
+        inactive_profiles = [
+            profile for profile in profiles
+            if not profile["is_active"] and status_by_profile_id[profile["id"]]["dates"] and (
+                not selected_employee_key or
+                " ".join(str(profile["name"] or "").split()).casefold() == selected_employee_key
+            )
+        ]
+        active_profiles.sort(key=lambda profile: (profile["name"].casefold(), profile["id"]))
+        inactive_profiles.sort(key=lambda profile: (profile["name"].casefold(), profile["id"]))
+
+        def display(value):
+            return format(value.normalize(), "f") if value else "0"
+
+        def day_label(count):
+            mod100 = count % 100
+            if 11 <= mod100 <= 14:
+                return "дней"
+            return {1: "день", 2: "дня", 3: "дня", 4: "дня"}.get(count % 10, "дней")
+
+        def hour_label(value):
+            if value != value.to_integral_value():
+                return "ч"
+            count = int(value)
+            mod100 = count % 100
+            if 11 <= mod100 <= 14:
+                return "часов"
+            return {1: "час", 2: "часа", 3: "часа", 4: "часа"}.get(count % 10, "часов")
+
+        def employee_label(count):
+            mod100 = count % 100
+            if 11 <= mod100 <= 14:
+                return "сотрудников"
+            return {1: "сотрудник", 2: "сотрудника", 3: "сотрудника", 4: "сотрудника"}.get(
+                count % 10, "сотрудников"
+            )
+
+        def group_label(count):
+            mod100 = count % 100
+            if 11 <= mod100 <= 14:
+                return "групп"
+            return {1: "группа", 2: "группы", 3: "группы", 4: "группы"}.get(count % 10, "групп")
+
+        rows = []
+
+        def append_profile(profile, group):
+            entry = status_by_profile_id[profile["id"]]
+            days = len(entry["dates"])
+            hours = entry["work"] + entry["ob"]
+            day_text = f"{days} {day_label(days)}, {display(hours)} {hour_label(hours)}"
+            rows.append([
+                group, profile["name"], day_text,
+                display(entry["work"]), display(entry["ob"]),
+            ])
+
+        active_with_hours = []
+        active_without_hours = []
+        for profile in active_profiles:
+            if status_by_profile_id[profile["id"]]["dates"]:
+                active_with_hours.append(profile)
+            else:
+                active_without_hours.append(profile)
+        for profile in active_without_hours:
+            append_profile(profile, "Без внесённых часов")
+        for profile in active_with_hours:
+            append_profile(profile, "Внесли часы")
+        for profile in inactive_profiles:
+            append_profile(profile, "Исторические записи")
+        unlinked_rows = sorted(status_by_unlinked_name.values(),
+                               key=lambda item: item["employee"].casefold())
+        for entry in unlinked_rows:
+            hours = entry["work"] + entry["ob"]
+            days = len(entry["dates"])
+            rows.append([
+                "Связь со справочником не установлена", entry["employee"],
+                f"{days} {day_label(days)}, {display(hours)} {hour_label(hours)}",
+                display(entry["work"]), display(entry["ob"]),
+            ])
+
+        active_work = sum(
+            (status_by_profile_id[profile["id"]]["work"] +
+             status_by_profile_id[profile["id"]]["ob"] for profile in active_profiles),
+            Decimal("0"),
+        )
+        active_regular = sum(
+            (status_by_profile_id[profile["id"]]["work"] for profile in active_profiles),
+            Decimal("0"),
+        )
+        active_ob = sum(
+            (status_by_profile_id[profile["id"]]["ob"] for profile in active_profiles),
+            Decimal("0"),
+        )
+        submitted_count = len(active_with_hours)
+        missing_names = ", ".join(profile["name"] for profile in active_without_hours) or "нет"
+        summary_lines = [
+            f'Период: {plan["date_from"]} — {plan["date_to"]}.',
+            f"Без внесённых часов: {missing_names}.",
+            f"Внесли часы: {submitted_count} из {len(active_profiles)} действующих сотрудников; подробности и дни — в таблице.",
+            f"Итог по действующей команде: внесли {submitted_count}, без часов {len(active_without_hours)}, "
+            f"рабочих часов {display(active_work)} (обычные {display(active_regular)}, "
+            f"OB {display(active_ob)}, включён в общий итог один раз).",
+        ]
+        inactive_count = len(inactive_profiles)
+        if inactive_count:
+            inactive_hours = sum(
+                (status_by_profile_id[profile["id"]]["work"] +
+                 status_by_profile_id[profile["id"]]["ob"] for profile in inactive_profiles),
+                Decimal("0"),
+            )
+            summary_lines.append(
+                f"Исторические записи отдельно: {inactive_count} {employee_label(inactive_count)}, "
+                f"{display(inactive_hours)} "
+                f"{hour_label(inactive_hours)}; они не входят в итог действующей команды."
+            )
+        unlinked_hours = sum(
+            (entry["work"] + entry["ob"] for entry in unlinked_rows), Decimal("0")
+        )
+        if unlinked_rows:
+            summary_lines.append(
+                f"Не включены в итог действующей команды: {len(unlinked_rows)} "
+                f"{group_label(len(unlinked_rows))} записей без однозначной связи со справочником, "
+                f"{display(unlinked_hours)} {hour_label(unlinked_hours)}."
+            )
+
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        current_week_start = today - timedelta(days=today.weekday())
+        current_week_end = current_week_start + timedelta(days=6)
+        is_current_week = (
+            date.fromisoformat(plan["date_from"]) <= today <= date.fromisoformat(plan["date_to"])
+            or (plan["date_from"] == current_week_start.isoformat()
+                and plan["date_to"] == current_week_end.isoformat())
+        )
+        notice = "Список без часов не учитывает отпуска и отсутствие работы."
+        if is_current_week:
+            notice += " Результат предварительный: текущая неделя ещё не завершена."
+        return {
+            "table": {
+                "headers": ["Статус", "Сотрудник", "Рабочие дни и часы", "Обычные, ч", "OB, ч"],
+                "rows": rows,
+            },
+            "summary": "\n".join(summary_lines),
+            "processed_records": work_records_processed,
+            "employee_count": len(active_profiles),
+            "submitted_employee_count": submitted_count,
+            "employees_without_hours": len(active_without_hours),
+            "active_work_hours": display(active_work),
+            "active_regular_hours": display(active_regular),
+            "active_ob_hours": display(active_ob),
+            "historical_employee_count": inactive_count,
+            "unlinked_work_record_groups": len(unlinked_rows),
+            "unlinked_work_hours": display(unlinked_hours),
+            "duplicate_groups": [],
+            "duplicate_record_count": 0,
+            "warnings": [notice],
+        }
 
     duplicate_query = (
         "SELECT s.date,s.employee,s.company,s.object_name,s.hours,s.submission_type,COUNT(*) AS copies "
@@ -1057,7 +1257,7 @@ def resolve_selection(conn, plan):
     return plan
 
 
-def inspect(conn, plan, *, begin_snapshot=True):
+def inspect(conn, plan, *, begin_snapshot=True, director_status=False):
     plan = resolve_selection(conn, validate_plan(plan))
     conn.execute("PRAGMA query_only=ON")
     if begin_snapshot:
@@ -1086,23 +1286,28 @@ def inspect(conn, plan, *, begin_snapshot=True):
                     (plan["object_name"], plan["company"])).fetchone())
         return result
     if plan["purpose"] == "hours_summary":
-        result = submission_hours_summary(conn, plan)
+        result = submission_hours_summary(conn, plan, director_status=director_status)
         employee = None
         if plan["employee"]:
             employee_row = conn.execute(
-                "SELECT id,name FROM meta_employees WHERE name=? COLLATE NOCASE",
-                (plan["employee"],),
+                "SELECT id,name FROM meta_employees WHERE normalize_employee_name(name)=?",
+                (" ".join(plan["employee"].split()).casefold(),),
             ).fetchone()
             employee = dict(employee_row) if employee_row else None
+        source = (
+            "Источник: серверная база SmartReport; проверены все неудалённые рабочие записи типов work и OB "
+            "без лимита 500. Сотрудники берутся из действующего серверного справочника; транспорт, расходы "
+            "и служебные категории не засчитываются."
+            if director_status else
+            "Источник: серверная база SmartReport. Обработаны все неудалённые записи "
+            "выбранного периода без лимита 500; транспорт и расходы в часы не включаются."
+        )
         result.update({
             "plan": plan,
             "employee": employee,
             "object": None,
             "records": [],
-            "source": (
-                "Источник: серверная база SmartReport. Обработаны все неудалённые записи "
-                "выбранного периода без лимита 500; транспорт и расходы в часы не включаются."
-            ),
+            "source": source,
             "notice": "\n".join(result.pop("warnings")),
             "context": dict(plan=plan, pending=""),
         })
@@ -1447,7 +1652,9 @@ def register_assistant(app, connect, authenticate):
             if not isinstance(data, dict) or set(data) not in ({"text", "operation_id"}, {"text", "operation_id", "context"}):
                 raise AssistantError("Ожидаются текст и идентификатор операции.")
             plan = select_plan(data["text"], conn, actor, data["operation_id"], context=data.get("context"))
-            results = inspect_workflow(conn, plan["workflow"]) if "workflow" in plan else [inspect(conn, plan)]
+            status_request = is_submission_status_request(data["text"])
+            results = (inspect_workflow(conn, plan["workflow"]) if "workflow" in plan else
+                       [inspect(conn, plan, director_status=status_request)])
             if plan.get("purpose") == "hours_summary" and wants_hours_summary_only(data["text"]):
                 compact_hours_summary(results[0])
             conn.commit()
