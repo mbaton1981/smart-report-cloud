@@ -13,9 +13,9 @@ class InvoicedServerProtectionTests(unittest.TestCase):
     _add_company = transport.OBTransportTests._add_company
     submit = transport.OBTransportTests.submit
     records = transport.OBTransportTests.records
-    def _worker(self):
+    def _worker(self, failure=None):
         with patch.object(self.desktop, "SYNC_API_KEY", "isolated-sync-test-key"):
-            return catalog.CatalogSyncTests._worker(self)
+            return catalog.CatalogSyncTests._worker(self, failure=failure)
 
     def request_desktop_delete(self, sync_id):
         connection = self.desktop.get_db_connection()
@@ -101,6 +101,32 @@ class InvoicedServerProtectionTests(unittest.TestCase):
                 finally:
                     connection.close()
         self.assertEqual(self.records(), [])
+
+    def test_lost_delete_ack_keeps_local_row_until_server_tombstone_arrives(self):
+        import requests
+        self.submit("lost-delete-ack", "work", "Travel B", 1)
+        self._worker()
+        self.request_desktop_delete("lost-delete-ack")
+        with self.assertRaises(requests.ConnectionError):
+            self._worker(failure="lost_shift_ack")
+        connection = self.desktop.get_db_connection()
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM shifts WHERE sync_id='lost-delete-ack'").fetchone()[0], 1)
+            self.assertEqual(connection.execute(
+                "SELECT state FROM shift_sync_outbox WHERE sync_id='lost-delete-ack'").fetchone()[0], "pending")
+        finally:
+            connection.close()
+        self.assertEqual(self.records(), [])
+        self._worker()
+        connection = self.desktop.get_db_connection()
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM shifts WHERE sync_id='lost-delete-ack'").fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM shift_sync_outbox WHERE sync_id='lost-delete-ack'").fetchone()[0], 0)
+        finally:
+            connection.close()
 
     def test_rejected_stale_desktop_delete_restores_protected_row_and_stops_retrying(self):
         self.submit("closed-while-offline", "work", "Travel B", 1)
