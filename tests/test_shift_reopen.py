@@ -131,6 +131,40 @@ class ReopenShiftTests(unittest.TestCase):
         self.assertEqual(self.local_rows()["reopen-target"]["invoiced"], 0)
         self.assertFalse(self.server_rows()["reopen-target"]["is_deleted"])
 
+    def test_real_hours_tab_mouse_selection_enables_reopen_for_first_current_row(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        self.closed()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        self.addCleanup(window.deleteLater)
+        window.tab_hours = self.desktop.QWidget()
+        window.setCentralWidget(window.tab_hours)
+        window.load_dropdowns = lambda: None
+        with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}):
+            window.setup_hours_tab()
+            window.resize(1450, 1000)
+            window.show()
+            self.qt_app.processEvents()
+            self.assertEqual(window.table_shifts.currentRow(), -1)
+            item = window.table_shifts.item(0, 2)
+            QTest.mouseClick(window.table_shifts.viewport(), Qt.MouseButton.LeftButton,
+                             pos=window.table_shifts.visualItemRect(item).center())
+            self.assertEqual(window.table_shifts.currentRow(), 0)
+            self.assertTrue(window.reopen_shift_btn.isEnabled())
+            window.table_shifts.setCurrentCell(-1, -1)
+            self.assertFalse(window.reopen_shift_btn.isEnabled())
+            selection = window.table_shifts.selectionModel()
+            index = window.table_shifts.model().index(0, 2)
+            from PyQt6.QtCore import QItemSelectionModel
+            selection.select(index, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                             | QItemSelectionModel.SelectionFlag.Rows)
+            self.assertFalse(window.reopen_shift_btn.isEnabled())
+            selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+            self.assertEqual(window.table_shifts.currentRow(), 0)
+            self.assertTrue(window.reopen_shift_btn.isEnabled())
+
     def test_gui_offline_and_no_rights_leave_local_status_and_queue_unchanged(self):
         self.closed()
         before = self.local_rows()

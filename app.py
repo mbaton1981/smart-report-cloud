@@ -2562,6 +2562,7 @@ class SmartReportApp(QMainWindow):
         self.table_shifts.setAlternatingRowColors(True)
         self.table_shifts.cellDoubleClicked.connect(lambda *_: self.edit_shift())
         self.table_shifts.itemSelectionChanged.connect(self.update_reopen_shift_action)
+        self.table_shifts.currentCellChanged.connect(self.update_reopen_shift_action)
         layout.addWidget(self.table_shifts)
         self.load_shifts_history()
 
