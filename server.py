@@ -830,7 +830,7 @@ def enforce_dataset_boundary():
     if not expected:
         return None
     guarded = (
-        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/", "/api/admin/shifts/"))
+        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/", "/api/admin/shifts/", "/api/admin/analytics"))
         or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced"}
     )
     if guarded:
@@ -4604,6 +4604,37 @@ def serialize_submission(row, cursor=None):
             "ob_segments": segments,
         })
     return payload
+
+@app.route("/api/admin/analytics", methods=["GET"])
+def management_analytics():
+    if bearer_admin_user() is None:
+        return jsonify({"ok": False, "error": "Финансовая аналитика доступна только директору/администратору."}), 403
+    import analytics
+    conn = get_db_connection()
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        cursor = conn.cursor()
+        documents = cursor.execute("""
+            SELECT * FROM expense_documents d WHERE is_deleted=0
+            AND NOT EXISTS (SELECT 1 FROM expense_processing p WHERE p.document_id=d.id AND p.state='split')
+            AND (document_date IS NULL OR document_date='' OR (document_date>=? AND document_date<=?))
+            ORDER BY document_date,id
+        """, (request.args.get("start", ""), request.args.get("end", ""))).fetchall()
+        result = analytics.build(
+            cursor, request.args.get("start", ""), request.args.get("end", ""),
+            [serialize_expense_document(cursor, doc) for doc in documents],
+            company=request.args.get("company", ""), object_key=request.args.get("object_key", ""),
+        )
+        return jsonify({"ok": True, "analytics": result})
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception:
+        logging.exception("Management analytics calculation failed")
+        return jsonify({"ok": False, "error": "Не удалось рассчитать аналитику. Данные не изменены."}), 500
+    finally:
+        conn.close()
+
 
 @app.route('/api/admin/shifts/reopen', methods=['POST'])
 def reopen_selected_shift():

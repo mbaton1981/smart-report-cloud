@@ -2343,6 +2343,12 @@ class SmartReportApp(QMainWindow):
         self.setup_dagbok_tab()
         self.setup_reporting_pages()
         self.setup_sprav_tab()
+        if self.can_request_shift_reopen():
+            from analytics_ui import AnalyticsWidget
+            self.analytics_tab = AnalyticsWidget(
+                lambda parameters: request_expense_api("GET", "/api/admin/analytics", params=parameters), self,
+            )
+            self.tabs.addTab(self.analytics_tab, "Аналитика")
         
         self.load_dropdowns()
 
