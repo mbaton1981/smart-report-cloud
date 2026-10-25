@@ -4025,7 +4025,7 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.close()
 
     def test_catalog_refresh_preserves_scroll_and_selection_with_assistant_visibility(self):
-        from PyQt6.QtCore import QPoint, QPointF, QTimer, Qt
+        from PyQt6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt
         from PyQt6.QtGui import QWheelEvent
         from PyQt6.QtTest import QSignalSpy, QTest
 
@@ -4184,6 +4184,8 @@ class CatalogSyncTests(unittest.TestCase):
         finally:
             window.close()
             window.deleteLater()
+            self.qt_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.qt_app.processEvents()
 
     def test_periodic_sync_completion_chain_keeps_hidden_catalog_selection_offscreen(self):
         from PyQt6.QtCore import QTimer, Qt

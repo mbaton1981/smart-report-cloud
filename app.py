@@ -9860,6 +9860,7 @@ class SmartReportApp(QMainWindow):
 
         selection_model = table.selectionModel()
         selection_model.clearSelection()
+        selection_model.clearCurrentIndex()
         current_row = rows_by_id.get(state["current_id"])
         if current_row is not None:
             current_column = min(state["current_column"], max(0, table.columnCount() - 1))
