@@ -4185,6 +4185,127 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_periodic_sync_completion_chain_keeps_hidden_catalog_selection_offscreen(self):
+        from PyQt6.QtCore import QTimer, Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QScrollArea, QTabWidget
+
+        conn = self.desktop.get_db_connection()
+        conn.executemany(
+            "INSERT INTO employees (name,salary_rate,is_active) VALUES (?,450,1)",
+            [(f"Periodic Employee {index:03d}",) for index in range(80)],
+        )
+        conn.executemany("""
+            INSERT INTO objects (
+                company,name,markning,rate,transport_rate,is_active,sync_id,server_id,sync_version
+            ) VALUES ('Renatur',?,?,520,450,1,?,?,1)
+        """, [
+            (f"Periodic Object {index:03d}", f"mark-{index:03d}", str(uuid.uuid4()), 20000 + index)
+            for index in range(80)
+        ])
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+        window.tabs = QTabWidget()
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(window.tab_sprav)
+        window.tabs.addTab(scroll_area, "Справочники")
+        window.setCentralWidget(window.tabs)
+        window.resize(1600, 1000)
+        window.table_shifts = self.desktop.QTableWidget()
+        window.table_shifts.setColumnCount(15)
+        window.apply_shifts_filters = lambda: None
+        window._sync_worker = None
+        window._manual_sync_requested = False
+        success_result = (True, 0, 0, 0, 0, 0, "", "", "")
+        response = SimpleNamespace(status_code=200, json=lambda: {"users": []})
+
+        try:
+            with patch.object(self.desktop.requests, "get", return_value=response), \
+                 patch("employee_cards_client.CardClient.employees", return_value=[]):
+                window.load_employees_table()
+                window.load_objects_table()
+                window.load_companies_table()
+                window.show()
+                self.qt_app.processEvents()
+                QTest.qWait(250)
+                role = self.desktop.Qt.ItemDataRole.UserRole
+
+                def run_periodic_case(table, employee_list, assistant_open):
+                    self.assertGreater(table.rowCount(), 50)
+                    middle = table.rowCount() // 2
+                    table.selectRow(middle)
+                    selected_id = table.item(middle, 0).data(role)
+                    bar = table.verticalScrollBar()
+                    self.assertGreater(bar.maximum(), 0)
+                    bar.setValue(bar.maximum())
+                    self.qt_app.processEvents()
+                    selected_indexes = table.selectionModel().selectedRows()
+                    self.assertEqual(len(selected_indexes), 1)
+                    hidden_row = selected_indexes[0].row()
+                    self.assertEqual(table.item(hidden_row, 0).data(role), selected_id)
+                    selected_rect = table.visualRect(table.model().index(hidden_row, 0))
+                    self.assertFalse(
+                        table.viewport().rect().intersects(selected_rect),
+                        "The selected row must be outside the visible table viewport before refreshes.",
+                    )
+                    start_scroll = bar.value()
+                    ticks = {"count": 0}
+
+                    def complete_periodic_sync():
+                        ticks["count"] += 1
+                        window._on_sync_completed(*success_result)
+
+                    timer = QTimer(window)
+                    timer.setInterval(2000)
+                    timer.timeout.connect(complete_periodic_sync)
+                    timer.start()
+                    QTest.qWait(10250)
+                    timer.stop()
+                    self.qt_app.processEvents()
+
+                    self.assertGreaterEqual(ticks["count"], 5)
+                    self.assertEqual(
+                        bar.value(), start_scroll,
+                        f"Scroll moved during full sync refresh chain; assistant_open={assistant_open}, "
+                        f"employee_list={employee_list}",
+                    )
+                    selected_indexes = table.selectionModel().selectedRows()
+                    self.assertEqual(len(selected_indexes), 1)
+                    self.assertEqual(
+                        table.item(selected_indexes[0].row(), 0).data(role), selected_id,
+                    )
+                    selected_rect = table.visualRect(
+                        table.model().index(selected_indexes[0].row(), 0)
+                    )
+                    self.assertFalse(
+                        table.viewport().rect().intersects(selected_rect),
+                        "A sync refresh scrolled the still-selected row back into view.",
+                    )
+
+                for assistant_open in (False, True):
+                    assistant = None
+                    if assistant_open:
+                        from assistant_ui import AssistantDialog, RequestWorker
+                        with patch.object(RequestWorker, "start"):
+                            assistant = AssistantDialog(window)
+                            assistant.show()
+                            self.qt_app.processEvents()
+                    run_periodic_case(window.table_employees, True, assistant_open)
+                    run_periodic_case(window.table_objects, False, assistant_open)
+                    if assistant is not None:
+                        assistant.close()
+                        assistant.deleteLater()
+                        self.qt_app.processEvents()
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_archive_filters_counts_stable_selection_and_action_state(self):
         desktop_conn = self.desktop.get_db_connection()
         desktop_conn.execute("DELETE FROM objects")
