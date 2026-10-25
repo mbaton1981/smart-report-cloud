@@ -1,5 +1,13 @@
 # WORK_LOG — SmartReport (тестовая система)
 
+## 25.10.2026 — установщик и сборка 1.0.33 на OneDrive
+
+- `OneDrive\...\SmartReport  CostTracker App Test\installer\`: `SmartReport-Setup-1.0.33.exe`,
+  `SmartReport-1.0.33-build-win64.zip`, `SHA256SUMS.txt`, README; откат 1.0.32 в `rollback\`.
+- Собрано из проверенного dist, который побайтно равен рабочей установке.
+  Изолированная проверка установщиков 1.0.33 и 1.0.32 — passed;
+  синхронизация OneDrive подтверждена.
+
 ## 25.10.2026 — 1.0.33: колёсико не меняет значения полей
 
 - `input_safety.WheelGuard` (фильтр приложения): колёсико над закрытыми
