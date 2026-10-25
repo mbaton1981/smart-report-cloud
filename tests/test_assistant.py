@@ -1953,6 +1953,252 @@ class AssistantApiTests(unittest.TestCase):
             self.assertEqual(self.post("mail/prepare", payload).status_code, 400)
             smtp.assert_not_called()
 
+    def test_weekly_comparison_uses_calendar_periods_and_preserves_followups(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE meta_employees SET is_active=0")
+            conn.executemany(
+                "INSERT INTO meta_employees(name,is_active) VALUES(?,1)",
+                [
+                    ("Alpha Worker",), ("Beta Worker",), ("No Hours",),
+                    ("Ambiguous Worker",), ("Ambiguous  Worker",),
+                ],
+            )
+            conn.execute("INSERT INTO meta_employees(name,is_active) VALUES('Legacy Worker',0)")
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES(?,?,0,0,?)",
+                [
+                    ("Renatur", "Tomteboda", 1),
+                    ("Renatur", "Hotel", 1),
+                ],
+            )
+
+            def add(identifier, day, employee, hours, kind, company, object_name, deleted=0):
+                conn.execute(
+                    """INSERT INTO incoming_submissions
+                       (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                        submission_type,is_deleted,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,0,0,?,?, '2026-10-25','2026-10-25')""",
+                    (identifier, identifier, day, employee, company, object_name, hours, kind, deleted),
+                )
+
+            add("compare-a-work-1", "2026-10-19", "Alpha Worker", 4, "work", "Renatur", "Tomteboda")
+            add("compare-a-ob", "2026-10-19", "Alpha Worker", 2, "ob", "Renatur", "Tomteboda")
+            add("compare-a-work-2", "2026-10-20", "Alpha Worker", 3, "work", "Renatur", "Tomteboda")
+            add("compare-a-legacy", "2026-10-21", "Legacy Worker", 2, "ob", "Renatur", "Hotel")
+            add("compare-a-unlinked", "2026-10-22", "Unknown Worker", 1, "work", "Renatur", "")
+            add("compare-a-ambiguous", "2026-10-22", "Ambiguous Worker", 2, "work", "External", "Unknown")
+            add("compare-a-transport", "2026-10-20", "Beta Worker", 40, "transport", "Renatur", "Hotel")
+            add("compare-a-service", "2026-10-20", "Beta Worker", 8, "atf", "Renatur", "Hotel")
+            add("compare-a-deleted", "2026-10-20", "Beta Worker", 100, "work", "Renatur", "Hotel", 1)
+            add("compare-b-work", "2026-10-12", "Alpha Worker", 3, "work", "Renatur", "Tomteboda")
+            add("compare-b-ob", "2026-10-12", "Alpha Worker", 2, "ob", "Renatur", "Tomteboda")
+            add("compare-b-beta", "2026-10-13", "Beta Worker", 4, "work", "Renatur", "Hotel")
+            conn.commit()
+
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            state = {"context": None}
+
+            def ask(text):
+                payload = dict(text=text, operation_id=str(uuid.uuid4()))
+                if state["context"] is not None:
+                    payload["context"] = state["context"]
+                response = self.post("command", payload)
+                self.assertEqual(response.status_code, 200, response.get_json())
+                body = response.get_json()
+                self.assertNotIn("clarification", body, body)
+                state["context"] = body["result"]["context"]
+                return body["result"]
+
+            result = ask("Сравни эту неделю с прошлой")
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            self.assertEqual(
+                (state["context"]["comparison"]["date_from"], state["context"]["comparison"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            self.assertEqual(result["overall_work_hours"], "14")
+            self.assertEqual(result["comparison_work_hours"], "9")
+            self.assertEqual(result["comparison_difference_hours"], "5")
+            self.assertEqual(result["employees_with_hours"], 4)
+            self.assertEqual(result["comparison_employees_with_hours"], 2)
+            self.assertEqual(result["work_records_processed"], 9)
+            self.assertIn("Текущая неделя предварительная", result["summary"])
+            self.assertIn("разница (период 1 − период 2): +5 ч", result["summary"])
+
+            employee_rows = {
+                row[1]: row for row in result["table"]["rows"] if row[0] == "Сотрудник/группа"
+            }
+            self.assertEqual(employee_rows["Alpha Worker"][2:7], ["2", "9", "1", "5", "+4"])
+            self.assertEqual(employee_rows["Beta Worker"][2:7], ["0", "0", "1", "4", "-4"])
+            self.assertEqual(employee_rows["Legacy Worker"][7], "Неактивен в справочнике")
+            self.assertEqual(employee_rows["Ambiguous Worker"][7], "Неоднозначная связь со справочником")
+            self.assertEqual(result["object_count"], 4)
+            self.assertEqual(
+                sum(Decimal(row[3]) for row in result["table"]["rows"] if row[0] == "Объект"),
+                Decimal("14"),
+            )
+            self.assertEqual(
+                sum(Decimal(row[5]) for row in result["table"]["rows"] if row[0] == "Объект"),
+                Decimal("9"),
+            )
+            self.assertTrue(any(row[1] == "Renatur / Без объекта" for row in result["table"]["rows"]))
+
+            objects = ask("А по объектам?")
+            self.assertTrue(all(row[0] == "Объект" for row in objects["table"]["rows"]))
+            employees = ask("А по сотрудникам?")
+            self.assertTrue(all(row[0] == "Сотрудник/группа" for row in employees["table"]["rows"]))
+            selected_object = ask("А на Tomteboda?")
+            self.assertEqual(selected_object["plan"]["object_name"], "Tomteboda")
+            self.assertEqual(selected_object["overall_work_hours"], "9")
+            all_objects = ask("Снова по всем объектам")
+            self.assertEqual(all_objects["plan"]["object_name"], "")
+            self.assertEqual(all_objects["overall_work_hours"], "14")
+            team_status = ask("Кто не внёс часы?")
+            self.assertEqual(team_status["plan"]["employee"], "")
+            self.assertEqual(team_status["plan"]["company"], "")
+            self.assertEqual(team_status["plan"]["object_name"], "")
+            self.assertEqual(
+                (team_status["plan"]["date_from"], team_status["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            object_comparison = ask("Сравни часы на Tomteboda за эту и прошлую неделю")
+            self.assertEqual(object_comparison["plan"]["object_name"], "Tomteboda")
+            self.assertEqual(object_comparison["overall_work_hours"], "9")
+            explicit_status = ask("Кто не внёс часы за прошлую неделю?")
+            self.assertEqual(
+                (explicit_status["plan"]["date_from"], explicit_status["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            provider.assert_not_called()
+
+    def test_weekly_comparison_completed_explicit_dst_and_year_boundary_periods(self):
+        with patch("assistant_api.datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            completed = self.post("command", dict(
+                text="Сравни две последние завершённые недели", operation_id=str(uuid.uuid4()),
+            )).get_json()["result"]
+            self.assertEqual(
+                (completed["plan"]["date_from"], completed["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            self.assertEqual(
+                (completed["context"]["comparison"]["date_from"], completed["context"]["comparison"]["date_to"]),
+                ("2026-10-05", "2026-10-11"),
+            )
+            self.assertNotIn("предварительная", completed["summary"])
+            self.assertIn("Нет рабочих записей ни в одном из периодов.", completed["summary"])
+            self.assertNotIn("%", completed["summary"])
+            self.assertEqual(completed["employees_with_hours"], 0)
+
+            explicit = self.post("command", dict(
+                text=("Сравни часы с 23.03.2026 по 29.03.2026 и "
+                      "с 30.03.2026 по 05.04.2026"),
+                operation_id=str(uuid.uuid4()),
+            )).get_json()["result"]
+            self.assertEqual(
+                (explicit["plan"]["date_from"], explicit["plan"]["date_to"]),
+                ("2026-03-23", "2026-03-29"),
+            )
+            self.assertEqual(
+                (explicit["context"]["comparison"]["date_from"], explicit["context"]["comparison"]["date_to"]),
+                ("2026-03-30", "2026-04-05"),
+            )
+            self.assertNotIn("Длительность сравниваемых периодов различается", explicit["summary"])
+
+            different_lengths = self.post("command", dict(
+                text=("Сравни часы с 23.03.2026 по 29.03.2026 и "
+                      "с 30.03.2026 по 04.04.2026"),
+                operation_id=str(uuid.uuid4()),
+            )).get_json()["result"]
+            self.assertIn("Длительность сравниваемых периодов различается.", different_lengths["summary"])
+
+            clock.now.return_value = datetime(2027, 1, 4, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            year_boundary = self.post("command", dict(
+                text="Сравни эту неделю с прошлой", operation_id=str(uuid.uuid4()),
+            )).get_json()["result"]
+            self.assertEqual(
+                (year_boundary["plan"]["date_from"], year_boundary["plan"]["date_to"]),
+                ("2027-01-04", "2027-01-04"),
+            )
+            self.assertEqual(
+                (year_boundary["context"]["comparison"]["date_from"],
+                 year_boundary["context"]["comparison"]["date_to"]),
+                ("2026-12-28", "2026-12-28"),
+            )
+
+    def test_weekly_comparison_ambiguous_object_offers_choices_and_keeps_periods(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES(?,?,0,0,1)",
+                [("Firm A", "Tomteboda North"), ("Firm B", "Tomteboda South")],
+            )
+            conn.commit()
+        with patch("assistant_api.datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            response = self.post("command", dict(
+                text="Сравни часы на Tomteboda за эту и прошлую неделю",
+                operation_id=str(uuid.uuid4()),
+            ))
+            clarification = response.get_json()["clarification"]
+            self.assertEqual(clarification["field"], "weekly_object")
+            self.assertEqual(len(clarification["choices"]), 2)
+            self.assertEqual(
+                (clarification["context"]["plan"]["date_from"],
+                 clarification["context"]["comparison"]["date_from"]),
+                ("2026-10-19", "2026-10-12"),
+            )
+            chosen = clarification["choices"][0]
+            result = self.post("inspect", dict(
+                plan=clarification["plan"] | chosen,
+                context=clarification["context"],
+                operation_id=str(uuid.uuid4()),
+            )).get_json()["result"]
+            self.assertEqual(result["object"], None)
+            self.assertEqual(result["context"]["plan"]["object_name"], chosen["object_name"])
+            self.assertEqual(result["context"]["comparison"]["date_from"], "2026-10-12")
+
+    def test_weekly_comparison_processes_more_than_500_records(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("INSERT INTO meta_employees(name,is_active) VALUES('Bulk Worker',1)")
+            conn.execute(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES('Bulk Firm','Bulk Object',0,0,1)"
+            )
+            conn.executemany(
+                """INSERT INTO incoming_submissions
+                   (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                    submission_type,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,0,0,'work','2026-10-25','2026-10-25')""",
+                [
+                    (
+                        f"bulk-{index}", f"bulk-{index}",
+                        f"2026-10-{19 + index % 7:02d}", "Bulk Worker",
+                        "Bulk Firm", "Bulk Object", index + 1,
+                    )
+                    for index in range(501)
+                ],
+            )
+            conn.commit()
+        with patch("assistant_api.datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            response = self.post("command", dict(
+                text="Сравни эту неделю с прошлой", operation_id=str(uuid.uuid4()),
+            ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["result"]
+        self.assertEqual(result["processed_records"], 501)
+        self.assertEqual(result["work_records_processed"], 501)
+        self.assertEqual(result["overall_work_hours"], str(sum(range(1, 502))))
+        self.assertEqual(result["employees_with_hours"], 1)
+        employee_row = next(row for row in result["table"]["rows"] if row[0] == "Сотрудник/группа")
+        self.assertEqual(employee_row[2], "7")
+        self.assertEqual(employee_row[3], str(sum(range(1, 502))))
+
     def test_weekly_overview_followups_keep_period_and_reset_team_scope(self):
         with closing(self.server.get_db_connection()) as conn:
             conn.execute("UPDATE meta_employees SET is_active=0")
@@ -2284,6 +2530,46 @@ class AssistantUiTests(unittest.TestCase):
         self.assertEqual(payload["text"], "А за предыдущую неделю?")
         self.assertEqual(payload["context"]["plan"]["date_from"], "2026-10-19")
         self.assertEqual(payload["context"]["plan"]["object_name"], "Tomteboda ÄTA")
+
+    def test_comparison_context_survives_ui_followups_and_object_choice(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        selected = plan(
+            "hours_summary", date_from="2026-10-19", date_to="2026-10-25",
+            company="Renatur", object_name="",
+        )
+        comparison_context = dict(
+            plan=selected, pending="",
+            comparison=dict(date_from="2026-10-12", date_to="2026-10-18", view="overview"),
+        )
+        dialog.received(dict(result={
+            "plan": selected, "context": comparison_context, "records": [],
+            "table": {"headers": [], "rows": []}, "summary": "Сравнение",
+            "source": "Тестовый сервер", "notice": "",
+        }))
+        dialog.input.setPlainText("А по сотрудникам?")
+        with patch.object(dialog, "call") as api:
+            dialog.command()
+        self.assertEqual(api.call_args.args[1]["context"]["comparison"], comparison_context["comparison"])
+
+        pending_context = dict(
+            plan=selected, pending="weekly_object",
+            comparison=comparison_context["comparison"],
+        )
+        dialog.received(dict(clarification=dict(
+            field="weekly_object", question="Выберите объект.",
+            plan=selected, context=pending_context,
+            choices=[dict(company="Renatur", object_name="Tomteboda")],
+        )))
+        dialog.clarification_choice.setCurrentIndex(0)
+        with patch.object(dialog, "call") as api:
+            dialog.choose_answer()
+        self.assertEqual(api.call_args.args[0], "inspect")
+        self.assertEqual(api.call_args.args[1]["context"]["comparison"], comparison_context["comparison"])
+        self.assertEqual(api.call_args.args[1]["plan"]["object_name"], "Tomteboda")
 
     def test_connected_candidate_blocks_mutating_and_mail_capabilities(self):
         from assistant_ui import AssistantDialog, RequestWorker

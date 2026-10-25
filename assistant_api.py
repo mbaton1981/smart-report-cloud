@@ -365,10 +365,11 @@ class AssistantError(ValueError):
 
 
 class AssistantQuestion(AssistantError):
-    def __init__(self, field, *, question=None, choices=None, plan=None):
+    def __init__(self, field, *, question=None, choices=None, plan=None, context=None):
         self.field = field
         self.choices = choices or []
         self.plan = plan
+        self.context = context
         super().__init__(question or QUESTIONS[field])
 
 
@@ -532,6 +533,22 @@ def _weekly_summary_request_kind(text, context):
     normalized = " ".join(strip_no_change_suffix(text).casefold().split())
     if is_submission_status_request(text):
         return "status"
+    comparison_context = context and context.get("comparison")
+    if re.search(r"\bсравни\w*\b", normalized):
+        return "comparison"
+    if comparison_context:
+        if context["pending"] == "weekly_object":
+            return "comparison_object"
+        if re.search(r"\b(?:снова\s+)?по\s+всем\s+объект\w*\b", normalized):
+            return "comparison_all_objects"
+        if re.search(r"\b(?:по\s+объект\w*|объект\w*)\b", normalized):
+            return "comparison_objects"
+        if re.search(r"\b(?:по\s+сотрудник\w*|сотрудник\w*)\b", normalized):
+            return "comparison_employees"
+        if re.search(r"\b(?:предыдущ\w*|прошл\w*)\s+недел\w*\b", normalized):
+            return "comparison_previous_week"
+        if re.match(r"^(?:а\s+)?(?:на|по\s+объекту)\s+.+", normalized):
+            return "comparison_object"
     if re.search(r"\b(?:сводк\w*|ситуаци\w*)\b", normalized) or re.search(
             r"\bкак\s+(?:дела|обстоят\s+дела)\b", normalized):
         return "overview"
@@ -604,6 +621,66 @@ def _summary_object_candidates(conn, date_from, date_to):
     return sorted(candidates, key=lambda item: (item[1].casefold(), item[0].casefold()))
 
 
+def _comparison_periods(text, kind, context):
+    explicit_ranges = re.findall(
+        rf"\bс\s+({DATE_TOKEN})\s+(?:по|до)\s+({DATE_TOKEN})",
+        text, re.IGNORECASE,
+    )
+    if explicit_ranges:
+        if len(explicit_ranges) != 2:
+            raise AssistantError("Для сравнения укажите два периода в формате «с ДД.ММ.ГГГГ по ДД.ММ.ГГГГ».")
+        try:
+            periods = [
+                (_parse_date_token(start).isoformat(), _parse_date_token(end).isoformat())
+                for start, end in explicit_ranges
+            ]
+        except ValueError:
+            raise AssistantError("Укажите корректные даты обоих периодов.") from None
+        for start, end in periods:
+            validate_plan(dict(
+                purpose="hours_summary", date_from=start, date_to=end,
+                employee="", company="", object_name="",
+            ))
+        return tuple(periods)
+
+    if kind in {"comparison_objects", "comparison_employees", "comparison_all_objects",
+                "comparison_object", "comparison_previous_week"}:
+        comparison = context.get("comparison") if context else None
+        if not comparison:
+            raise AssistantError("Контекст сравнения не найден. Начните новый запрос сравнения.")
+        first = (context["plan"]["date_from"], context["plan"]["date_to"])
+        second = (comparison["date_from"], comparison["date_to"])
+        if kind == "comparison_previous_week":
+            return tuple(
+                ((date.fromisoformat(start) - timedelta(days=7)).isoformat(),
+                 (date.fromisoformat(end) - timedelta(days=7)).isoformat())
+                for start, end in (first, second)
+            )
+        return first, second
+
+    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    monday = today - timedelta(days=today.weekday())
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    completed_weeks = bool(re.search(
+        r"\b(?:две\s+последн\w*|две\s+последн\w*\s+заверш[её]нн\w*|"
+        r"две\s+заверш[её]нн\w*\s+недел\w*)\b", normalized,
+    ))
+    if completed_weeks:
+        first_start = monday - timedelta(days=7)
+        second_start = first_start - timedelta(days=7)
+        return (
+            (first_start.isoformat(), (first_start + timedelta(days=6)).isoformat()),
+            (second_start.isoformat(), (second_start + timedelta(days=6)).isoformat()),
+        )
+    first_end = today
+    second_start = monday - timedelta(days=7)
+    second_end = second_start + (today - monday)
+    return (
+        (monday.isoformat(), first_end.isoformat()),
+        (second_start.isoformat(), second_end.isoformat()),
+    )
+
+
 def _resolve_summary_object(conn, object_text, date_from, date_to, plan, question_kind):
     question_field = "weekly_object_staff" if question_kind == "object_staff" else "weekly_object"
     tokens = set(re.findall(
@@ -636,19 +713,92 @@ def _resolve_summary_object(conn, object_text, date_from, date_to, plan, questio
     best_score = min(match[0] for match in matches)
     best = [(company, name) for score, company, name in matches if score == best_score]
     if len(best) != 1:
+        choices = (
+            [
+                dict(company=company, object_name=name)
+                for company, name in sorted(best, key=lambda item: (item[0].casefold(), item[1].casefold()))[:30]
+            ]
+            if question_kind == "comparison" else []
+        )
         raise AssistantQuestion(
             question_field,
             question="Нашёл несколько подходящих объектов. Уточните фирму и точное название.",
+            choices=choices,
             plan=plan,
         )
     return best[0]
 
 
-def weekly_summary_command(text, context, conn):
+def weekly_summary_command(text, context, conn, routing_state=None):
     kind = _weekly_summary_request_kind(text, context)
     if kind is None:
         return None
+    if kind.startswith("comparison"):
+        periods = _comparison_periods(text, kind, context)
+        first_period, second_period = periods
+        if kind in {"comparison_objects", "comparison_employees", "comparison_all_objects",
+                    "comparison_object", "comparison_previous_week"}:
+            selected_view = {
+                "comparison": True,
+                "comparison_period": dict(date_from=second_period[0], date_to=second_period[1]),
+                "comparison_view": "overview",
+            }
+            previous = context["plan"]
+            plan = validate_plan(dict(
+                purpose="hours_summary", date_from=first_period[0], date_to=first_period[1],
+                employee="", company=previous["company"], object_name=previous["object_name"],
+            ))
+            if kind == "comparison_objects":
+                selected_view["comparison_view"] = "objects"
+            elif kind == "comparison_employees":
+                selected_view["comparison_view"] = "employees"
+            elif kind == "comparison_all_objects":
+                plan.update(company="", object_name="")
+            elif kind == "comparison_object":
+                object_match = re.search(
+                    r"\b(?:на|по\s+объекту)\s+(.+?)\s*[?.!,;]*$",
+                    strip_no_change_suffix(text), re.IGNORECASE,
+                )
+                object_text = object_match.group(1) if object_match else text.strip(" \t.,!?")
+                selected_company, selected_object = _resolve_summary_object(
+                    conn, object_text, min(first_period[0], second_period[0]),
+                    max(first_period[1], second_period[1]), plan, "comparison",
+                )
+                plan.update(company=selected_company, object_name=selected_object)
+            if routing_state is not None:
+                routing_state.update(selected_view)
+            return plan, "comparison"
+
+        plan = validate_plan(dict(
+            purpose="hours_summary", date_from=first_period[0], date_to=first_period[1],
+            employee="", company="", object_name="",
+        ))
+        if routing_state is not None:
+            routing_state.update({
+                "comparison": True,
+                "comparison_period": dict(date_from=second_period[0], date_to=second_period[1]),
+                "comparison_view": "overview",
+            })
+        object_match = re.search(
+            r"\b(?:на|по\s+объекту)\s+(.+?)(?=\s+(?:за|сравни|с)\b|[?.!,;]*$)",
+            strip_no_change_suffix(text), re.IGNORECASE,
+        )
+        if object_match:
+            selected_company, selected_object = _resolve_summary_object(
+                conn, object_match.group(1).strip(), min(first_period[0], second_period[0]),
+                max(first_period[1], second_period[1]), plan, "comparison",
+            )
+            plan.update(company=selected_company, object_name=selected_object)
+        return plan, "comparison"
+
     date_from, date_to = _summary_period(text, context, kind)
+    if (kind == "status" and context and context.get("comparison")
+            and not explicit_date_period(text) and not _week_period(text)):
+        periods = (
+            (context["plan"]["date_from"], context["plan"]["date_to"]),
+            (context["comparison"]["date_from"], context["comparison"]["date_to"]),
+        )
+        date_from, date_to = max(periods, key=lambda item: item[0])
     previous = context["plan"] if context and context["plan"]["purpose"] == "hours_summary" else {}
     plan = validate_plan(dict(
         purpose="hours_summary", date_from=date_from, date_to=date_to,
@@ -847,6 +997,13 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
     for profile in profiles:
         key = " ".join(str(profile["name"] or "").split()).casefold()
         profiles_by_key.setdefault(key, []).append(profile)
+    object_profiles_by_key = {}
+    for object_profile in conn.execute("SELECT id,company,name FROM meta_objects"):
+        object_key = (
+            str(object_profile["company"] or "").strip(),
+            str(object_profile["name"] or "").strip(),
+        )
+        object_profiles_by_key.setdefault(object_key, []).append(object_profile)
     status_by_profile_id = {
         profile["id"]: {
             "profile": profile,
@@ -910,19 +1067,36 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
             "holiday": Decimal("0"),
             "unknown": Decimal("0"),
             "records": 0,
+            "work_records": 0,
+            "dates": set(),
         })
         kind = str(raw["submission_type"] or "")
         hours = Decimal(str(raw["hours"] or 0))
         employee_totals["records"] += 1
         if kind in {"work", "ob"}:
             employee_totals[kind] += hours
+            employee_totals["work_records"] += 1
+            employee_totals["dates"].add(raw["date"])
             work_records_processed += 1
             object_key = (str(raw["company"] or "").strip(), str(raw["object_name"] or "").strip())
+            object_matches = object_profiles_by_key.get(object_key, [])
+            object_profile_id = object_matches[0]["id"] if len(object_matches) == 1 else None
+            normalized_object_key = json.dumps(
+                [value.casefold() for value in object_key], ensure_ascii=False,
+            )
             object_entry = object_totals.setdefault(object_key, {
                 "work": Decimal("0"), "ob": Decimal("0"), "records": 0,
+                "dates": set(),
+                "object_id": object_profile_id,
+                "group_key": (f"object:{object_profile_id}" if object_profile_id is not None
+                              else f"unlinked-object:{normalized_object_key}"),
+                "link_status": ("Связан" if object_profile_id is not None else
+                                "Неоднозначная связь с объектом" if object_matches else
+                                "Нет связи со справочником объектов"),
             })
             object_entry[kind] += hours
             object_entry["records"] += 1
+            object_entry["dates"].add(raw["date"])
             if profile:
                 profile_totals = status_by_profile_id[profile["id"]]
                 profile_totals[kind] += hours
@@ -940,6 +1114,58 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
             employee_totals[kind] += hours
         else:
             employee_totals["unknown"] += hours
+
+    if summary_view == "comparison_source":
+        def display(value):
+            return format(value.normalize(), "f") if value else "0"
+
+        comparison_employees = [
+            {
+                "group_key": key,
+                "employee": entry["employee"],
+                "employee_id": entry["employee_id"],
+                "link_status": entry["link_status"],
+                "work_hours": display(entry["work"]),
+                "ob_hours": display(entry["ob"]),
+                "hours": display(entry["work"] + entry["ob"]),
+                "days": len(entry["dates"]),
+                "records": entry["work_records"],
+            }
+            for key, entry in sorted(
+                totals.items(),
+                key=lambda item: (item[1]["employee"].casefold(), item[1]["employee_id"] or 0),
+            )
+            if entry["dates"]
+        ]
+        comparison_objects = [
+            {
+                "group_key": entry["group_key"],
+                "object_id": entry["object_id"],
+                "company": company,
+                "object_name": object_name,
+                "label": (f"{company} / {object_name}" if company and object_name else
+                          f"{company} / Без объекта" if company else object_name or "Без объекта"),
+                "link_status": entry["link_status"],
+                "work_hours": display(entry["work"]),
+                "ob_hours": display(entry["ob"]),
+                "hours": display(entry["work"] + entry["ob"]),
+                "records": entry["records"],
+            }
+            for (company, object_name), entry in sorted(
+                object_totals.items(), key=lambda item: (item[0][0].casefold(), item[0][1].casefold())
+            )
+        ]
+        employee_hours = sum((Decimal(item["hours"]) for item in comparison_employees), Decimal("0"))
+        object_hours = sum((Decimal(item["hours"]) for item in comparison_objects), Decimal("0"))
+        if employee_hours != object_hours:
+            raise AssistantError("Разбивки по сотрудникам и объектам не сходятся с рабочими часами.")
+        return {
+            "processed_records": processed,
+            "work_records_processed": work_records_processed,
+            "overall_work_hours": display(employee_hours),
+            "comparison_employees": comparison_employees,
+            "comparison_objects": comparison_objects,
+        }
 
     if director_status:
         selected_employee_key = " ".join(str(plan["employee"] or "").split()).casefold()
@@ -1393,6 +1619,169 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
     }
 
 
+def comparison_hours_summary(conn, plan, comparison_period, comparison_view="overview"):
+    first = submission_hours_summary(conn, plan, summary_view="comparison_source")
+    second_plan = dict(plan, date_from=comparison_period["date_from"], date_to=comparison_period["date_to"])
+    second = submission_hours_summary(conn, second_plan, summary_view="comparison_source")
+
+    def decimal(value):
+        return Decimal(str(value or "0"))
+
+    def display(value):
+        return format(value.normalize(), "f") if value else "0"
+
+    def delta_text(value):
+        return f"+{display(value)}" if value > 0 else display(value)
+
+    def merged(first_items, second_items):
+        first_by_key = {entry["group_key"]: entry for entry in first_items}
+        second_by_key = {entry["group_key"]: entry for entry in second_items}
+        rows = []
+        for key in first_by_key.keys() | second_by_key.keys():
+            left = first_by_key.get(key, {})
+            right = second_by_key.get(key, {})
+            rows.append((left, right))
+        return sorted(rows, key=lambda pair: (
+            str(pair[0].get("employee") or pair[0].get("label") or
+                pair[1].get("employee") or pair[1].get("label") or "").casefold(),
+            str(pair[0].get("group_key") or pair[1].get("group_key") or ""),
+        ))
+
+    employee_pairs = merged(first["comparison_employees"], second["comparison_employees"])
+    object_pairs = merged(first["comparison_objects"], second["comparison_objects"])
+    first_hours = decimal(first["overall_work_hours"])
+    second_hours = decimal(second["overall_work_hours"])
+    if sum((decimal(pair[0].get("hours")) for pair in employee_pairs), Decimal("0")) != first_hours:
+        raise AssistantError("Разбивка сотрудников первого периода не сходится с итогом.")
+    if sum((decimal(pair[1].get("hours")) for pair in employee_pairs), Decimal("0")) != second_hours:
+        raise AssistantError("Разбивка сотрудников второго периода не сходится с итогом.")
+    if sum((decimal(pair[0].get("hours")) for pair in object_pairs), Decimal("0")) != first_hours:
+        raise AssistantError("Разбивка объектов первого периода не сходится с итогом.")
+    if sum((decimal(pair[1].get("hours")) for pair in object_pairs), Decimal("0")) != second_hours:
+        raise AssistantError("Разбивка объектов второго периода не сходится с итогом.")
+    first_active = sum(
+        entry["link_status"] == "Связан" for entry in first["comparison_employees"]
+    )
+    second_active = sum(
+        entry["link_status"] == "Связан" for entry in second["comparison_employees"]
+    )
+    first_historical = sum(
+        entry["link_status"] == "Неактивен в справочнике" for entry in first["comparison_employees"]
+    )
+    second_historical = sum(
+        entry["link_status"] == "Неактивен в справочнике" for entry in second["comparison_employees"]
+    )
+    first_unlinked = len(first["comparison_employees"]) - first_active - first_historical
+    second_unlinked = len(second["comparison_employees"]) - second_active - second_historical
+
+    first_start, first_end = map(date.fromisoformat, (plan["date_from"], plan["date_to"]))
+    second_start, second_end = map(
+        date.fromisoformat, (comparison_period["date_from"], comparison_period["date_to"])
+    )
+    lines = [
+        f"Период 1: {first_start.isoformat()} — {first_end.isoformat()}.",
+        f"Период 2: {second_start.isoformat()} — {second_end.isoformat()}.",
+        f"Охват: {plan['company'] + ' / ' if plan['company'] else ''}"
+        f"{plan['object_name'] if plan['object_name'] else 'Все объекты'}.",
+        f"Рабочие часы: {display(first_hours)} ч и {display(second_hours)} ч; "
+        f"разница (период 1 − период 2): {delta_text(first_hours - second_hours)} ч.",
+        f"Сотрудники/группы с рабочими записями: {len(first['comparison_employees'])} и "
+        f"{len(second['comparison_employees'])} (действующие {first_active}/{second_active}; "
+        f"исторические {first_historical}/{second_historical}; "
+        f"без однозначной связи {first_unlinked}/{second_unlinked}).",
+        f"Рабочих записей обработано: {first['work_records_processed']} и "
+        f"{second['work_records_processed']}; OB включён в часы один раз.",
+    ]
+    if (first_end - first_start).days != (second_end - second_start).days:
+        lines.append("Длительность сравниваемых периодов различается.")
+    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    current_monday = today - timedelta(days=today.weekday())
+    if first_start == current_monday and first_end <= today:
+        lines.append("Текущая неделя предварительная; данные могут быть внесены позже.")
+    def change_line(label, pairs, *, increased):
+        names = [
+            left.get("label") or left.get("employee") or right.get("label") or right.get("employee")
+            for left, right in pairs
+            if (decimal(left.get("hours")) > decimal(right.get("hours"))) == increased
+            and decimal(left.get("hours")) != decimal(right.get("hours"))
+        ]
+        if not names:
+            return None
+        visible = ", ".join(map(str, names[:5]))
+        if len(names) > 5:
+            visible += f" и ещё {len(names) - 5} (в таблице)"
+        direction = "больше" if increased else "меньше"
+        return f"По {label} {direction}: {visible}."
+
+    if comparison_view == "overview":
+        lines.append(
+            f"В таблице — изменения по {len(object_pairs)} объектам и "
+            f"{len(employee_pairs)} сотрудникам/группам; строки показывают, где часов стало больше или меньше."
+        )
+    elif comparison_view == "objects":
+        lines.append(f"Изменение показано по каждому из {len(object_pairs)} объектов в таблице.")
+    else:
+        lines.append(f"Изменение показано по каждому из {len(employee_pairs)} сотрудников/групп в таблице.")
+    if not first["work_records_processed"] and not second["work_records_processed"]:
+        lines.append("Нет рабочих записей ни в одном из периодов.")
+    elif not first["work_records_processed"] or not second["work_records_processed"]:
+        lines.append("В одном из периодов рабочих записей нет.")
+    if comparison_view in {"overview", "objects"}:
+        lines.extend(filter(None, (
+            change_line("объектам", object_pairs, increased=True),
+            change_line("объектам", object_pairs, increased=False),
+        )))
+    if comparison_view in {"overview", "employees"}:
+        lines.extend(filter(None, (
+            change_line("сотрудникам/группам", employee_pairs, increased=True),
+            change_line("сотрудникам/группам", employee_pairs, increased=False),
+        )))
+    lines.append("Сравниваются только внесённые данные; это не вывод о причинах или фактической занятости.")
+
+    rows = []
+    if comparison_view != "employees":
+        for left, right in object_pairs:
+            row = left or right
+            left_hours, right_hours = decimal(left.get("hours")), decimal(right.get("hours"))
+            rows.append([
+                "Объект", row["label"], "—", display(left_hours), "—",
+                display(right_hours), delta_text(left_hours - right_hours), row["link_status"],
+            ])
+    if comparison_view != "objects":
+        for left, right in employee_pairs:
+            row = left or right
+            left_hours, right_hours = decimal(left.get("hours")), decimal(right.get("hours"))
+            rows.append([
+                "Сотрудник/группа", row["employee"],
+                str(left.get("days", 0)), display(left_hours),
+                str(right.get("days", 0)), display(right_hours),
+                delta_text(left_hours - right_hours), row["link_status"],
+            ])
+    result = {
+        "table": {
+            "headers": [
+                "Раздел", "Объект / сотрудник", "Дни периода 1", "Часы периода 1",
+                "Дни периода 2", "Часы периода 2", "Разница, ч", "Связь",
+            ],
+            "rows": rows,
+        },
+        "summary": "\n".join(lines),
+        "processed_records": first["processed_records"] + second["processed_records"],
+        "work_records_processed": (
+            first["work_records_processed"] + second["work_records_processed"]
+        ),
+        "employees_with_hours": len(first["comparison_employees"]),
+        "comparison_employees_with_hours": len(second["comparison_employees"]),
+        "overall_work_hours": display(first_hours),
+        "comparison_work_hours": display(second_hours),
+        "comparison_difference_hours": display(first_hours - second_hours),
+        "object_count": len(object_pairs),
+        "employee_group_count": len(employee_pairs),
+        "warnings": [],
+    }
+    return result
+
+
 def select_plan(text, conn, actor, operation, post=None, context=None, summary_view=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
@@ -1402,7 +1791,7 @@ def select_plan(text, conn, actor, operation, post=None, context=None, summary_v
     normalized = " ".join(text.casefold().strip(" .!?").split())
     date_period = explicit_date_period(text)
     try:
-        weekly_route = weekly_summary_command(text, safe_context, conn)
+        weekly_route = weekly_summary_command(text, safe_context, conn, summary_view)
         if weekly_route:
             known_plan, view = weekly_route
             if summary_view is not None:
@@ -1414,6 +1803,16 @@ def select_plan(text, conn, actor, operation, post=None, context=None, summary_v
         if not known_plan:
             known_plan = None if weekly_route else recognized_read_command(text, safe_context)
     except AssistantQuestion as question:
+        if summary_view and summary_view.get("comparison"):
+            question.context = dict(
+                plan=question.plan or safe_context["plan"],
+                pending=question.field,
+                comparison=dict(
+                    date_from=summary_view["comparison_period"]["date_from"],
+                    date_to=summary_view["comparison_period"]["date_to"],
+                    view=summary_view["comparison_view"],
+                ),
+            )
         purpose = question.plan["purpose"] if question.plan else "transport_check"
         reserve(conn, actor, operation, purpose, 0, requires_provider=False)
         finish(conn, actor, operation, purpose, "clarification")
@@ -1524,14 +1923,31 @@ def select_plan(text, conn, actor, operation, post=None, context=None, summary_v
 def validate_context(context):
     if context is None:
         return None
-    if not isinstance(context, dict) or set(context) != {"plan", "pending"}:
+    if not isinstance(context, dict) or set(context) not in (
+            {"plan", "pending"}, {"plan", "pending", "comparison"}):
         raise AssistantError("Контекст диалога повреждён. Начните новый диалог.")
     if not isinstance(context["pending"], str) or context["pending"] not in {
         "", "period", "scope", "object", "report_type", "unsupported",
         "weekly_object", "weekly_object_staff", "weekly_period", "weekly_scope"
     }:
         raise AssistantError("Неизвестное уточнение диалога.")
-    return dict(plan=validate_plan(context["plan"]).copy(), pending=context["pending"])
+    validated = dict(plan=validate_plan(context["plan"]).copy(), pending=context["pending"])
+    if "comparison" in context:
+        comparison = context["comparison"]
+        if not isinstance(comparison, dict) or set(comparison) != {"date_from", "date_to", "view"}:
+            raise AssistantError("Контекст сравнения повреждён. Начните новый запрос сравнения.")
+        comparison_plan = validate_plan(dict(
+            purpose="hours_summary", date_from=comparison["date_from"],
+            date_to=comparison["date_to"], employee="", company="", object_name="",
+        ))
+        if comparison["view"] not in {"overview", "objects", "employees"}:
+            raise AssistantError("Неизвестный вид сравнения.")
+        validated["comparison"] = dict(
+            date_from=comparison_plan["date_from"],
+            date_to=comparison_plan["date_to"],
+            view=comparison["view"],
+        )
+    return validated
 
 
 _CYRILLIC_NAME_TRANSLATION = str.maketrans({
@@ -1668,7 +2084,10 @@ def resolve_selection(conn, plan):
     return plan
 
 
-def inspect(conn, plan, *, begin_snapshot=True, director_status=False, summary_view="status"):
+def inspect(
+    conn, plan, *, begin_snapshot=True, director_status=False,
+    summary_view="status", comparison_period=None, comparison_view="overview",
+):
     plan = resolve_selection(conn, validate_plan(plan))
     conn.execute("PRAGMA query_only=ON")
     if begin_snapshot:
@@ -1697,9 +2116,14 @@ def inspect(conn, plan, *, begin_snapshot=True, director_status=False, summary_v
                     (plan["object_name"], plan["company"])).fetchone())
         return result
     if plan["purpose"] == "hours_summary":
-        result = submission_hours_summary(
-            conn, plan, director_status=director_status, summary_view=summary_view,
-        )
+        if summary_view == "comparison":
+            if not comparison_period:
+                raise AssistantError("Не заданы оба периода сравнения.")
+            result = comparison_hours_summary(conn, plan, comparison_period, comparison_view)
+        else:
+            result = submission_hours_summary(
+                conn, plan, director_status=director_status, summary_view=summary_view,
+            )
         employee = None
         if plan["employee"]:
             employee_row = conn.execute(
@@ -1720,9 +2144,23 @@ def inspect(conn, plan, *, begin_snapshot=True, director_status=False, summary_v
             "employee": employee,
             "object": None,
             "records": [],
-            "source": source,
+            "source": (
+                "Источник: серверная база SmartReport; два периода обработаны без лимита выборки. "
+                "В рабочие часы входят только неудалённые записи типов work и OB; OB учитывается один раз."
+                if summary_view == "comparison" else source
+            ),
             "notice": "\n".join(result.pop("warnings")),
-            "context": dict(plan=plan, pending=""),
+            "context": (
+                dict(
+                    plan=plan, pending="",
+                    comparison=dict(
+                        date_from=comparison_period["date_from"],
+                        date_to=comparison_period["date_to"],
+                        view=comparison_view,
+                    ),
+                )
+                if summary_view == "comparison" else dict(plan=plan, pending="")
+            ),
         })
         return result
     employee = None
@@ -2026,7 +2464,7 @@ def register_assistant(app, connect, authenticate):
         except AssistantQuestion as question:
             conn.rollback()
             return jsonify(ok=True, clarification=dict(field=question.field, question=str(question),
-                           choices=question.choices, plan=question.plan))
+                           choices=question.choices, plan=question.plan, context=question.context))
         except AssistantError as error:
             conn.rollback()
             return jsonify(ok=False, error=str(error)), 400
@@ -2073,7 +2511,9 @@ def register_assistant(app, connect, authenticate):
             results = (inspect_workflow(conn, plan["workflow"]) if "workflow" in plan else
                        [inspect(conn, plan, director_status=(
                            status_request or selected_summary_view.get("value") in {"overview", "object_staff"}
-                       ), summary_view=selected_summary_view.get("value", "status"))])
+                       ), summary_view=selected_summary_view.get("value", "status"),
+                           comparison_period=selected_summary_view.get("comparison_period"),
+                           comparison_view=selected_summary_view.get("comparison_view", "overview"))])
             if plan.get("purpose") == "hours_summary" and wants_hours_summary_only(data["text"]):
                 compact_hours_summary(results[0])
             conn.commit()
@@ -2088,11 +2528,19 @@ def register_assistant(app, connect, authenticate):
     def assistant_inspect():
         def action(conn, actor):
             data = request.get_json(silent=True)
-            if not isinstance(data, dict) or set(data) != {"plan", "operation_id"}:
+            if not isinstance(data, dict) or set(data) not in (
+                    {"plan", "operation_id"}, {"plan", "operation_id", "context"}):
                 raise AssistantError("Выберите действие, даты и сотрудника.")
             plan = validate_plan(data["plan"])
+            context = validate_context(data.get("context"))
             reserve(conn, actor, data["operation_id"], plan["purpose"], 0, requires_provider=False)
-            result = inspect(conn, plan)
+            comparison = context.get("comparison") if context else None
+            result = inspect(
+                conn, plan,
+                summary_view="comparison" if comparison else "status",
+                comparison_period=comparison,
+                comparison_view=comparison["view"] if comparison else "overview",
+            )
             conn.commit()
             conn.execute("PRAGMA query_only=OFF")
             finish(conn, actor, data["operation_id"], plan["purpose"], "read_completed")

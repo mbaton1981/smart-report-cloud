@@ -796,7 +796,9 @@ class AssistantDialog(QDialog):
             self.table.setVisible(False)
             clarification = data["clarification"]
             pending_plan = clarification.get("plan") or (self.context["plan"] if self.context else self.selection())
-            self.context = dict(plan=pending_plan, pending=clarification["field"])
+            self.context = clarification.get("context") or dict(
+                plan=pending_plan, pending=clarification["field"],
+            )
             self.choices = clarification.get("choices", [])
             self.clear_clarification()
             self.date_from.setDate(QDate.fromString(pending_plan["date_from"], "yyyy-MM-dd"))
@@ -885,7 +887,7 @@ class AssistantDialog(QDialog):
                             "Откройте раздел вручную; другие профили не использовались.")
                 return
             plan = self.result["plan"]
-            self.context = dict(plan=plan, pending="")
+            self.context = self.result.get("context") or dict(plan=plan, pending="")
             self.choices = []
             self.date_from.setDate(QDate.fromString(plan["date_from"], "yyyy-MM-dd"))
             self.date_to.setDate(QDate.fromString(plan["date_to"], "yyyy-MM-dd"))
@@ -959,11 +961,17 @@ class AssistantDialog(QDialog):
                 key: value for key, value in self.choices[int(text) - 1].items()
                 if key != "label"
             })
-            self.call("inspect", dict(plan=plan, operation_id=str(uuid.uuid4())))
+            self.call("inspect", dict(
+                plan=plan, operation_id=str(uuid.uuid4()), context=self.context,
+            ))
         else:
             context = self.context or dict(plan=self.selection(), pending="")
             if not context["pending"]:
-                context = dict(plan=self.selection(context["plan"]["purpose"]), pending="")
+                context = dict(
+                    context,
+                    plan=self.selection(context["plan"]["purpose"]),
+                    pending="",
+                )
             self.context = context
             self.call("command", dict(text=text, context=context, operation_id=str(uuid.uuid4())))
         self.input.clear()
