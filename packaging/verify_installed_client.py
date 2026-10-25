@@ -65,10 +65,16 @@ def stop_server():
 def client_env(profile, **extra):
     local = temp / profile / "AppData" / "Local"
     local.mkdir(parents=True, exist_ok=True)
+    profile_data = local / "SmartReport"
+    profile_data.mkdir(parents=True, exist_ok=True)
     env = {"SystemRoot": os.environ["SystemRoot"], "SystemDrive": os.environ["SystemDrive"], "COMPUTERNAME": "CLEAN-PC",
            "USERPROFILE": str(temp / profile), "LOCALAPPDATA": str(local), "APPDATA": str(temp / profile / "AppData" / "Roaming"),
            "TEMP": str(temp / "tmp"), "TMP": str(temp / "tmp"), "PATH": r"C:\Windows\System32;C:\Windows",
-           "QT_QPA_PLATFORM": "offscreen", "SMARTREPORT_CLOUD_URL": url, "PYTHONIOENCODING": "utf-8"}
+           "QT_QPA_PLATFORM": "offscreen", "SMARTREPORT_CLOUD_URL": url,
+           "SMARTREPORT_DATA_DIR": str(profile_data),
+           "SMARTREPORT_DB_FILE": str(profile_data / "smart_report.db"),
+           "SMARTREPORT_DOCUMENTS_DIR": str(profile_data / "documents"),
+           "PYTHONIOENCODING": "utf-8"}
     (temp / "tmp").mkdir(exist_ok=True)
     env.update(extra)
     return env
@@ -76,8 +82,10 @@ def client_env(profile, **extra):
 
 def run_client(exe, profile, action, case="case", **extra):
     out = temp / f"{profile}_{case}_{action}_{len(steps)}.json"
+    work = temp / profile / "work"
+    work.mkdir(parents=True, exist_ok=True)
     completed = subprocess.run([str(exe), "--diagnostic", action, "--case", case, "--work", str(temp / profile / "work"), "--out", str(out)],
-                               env=client_env(profile, **extra), capture_output=True, timeout=300)
+                               env=client_env(profile, **extra), capture_output=True, timeout=300, cwd=work)
     data = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {"error": "нет файла результата"}
     steps.append({"profile": profile, "action": action, "case": case, "exit_code": completed.returncode, "result": data})
     return completed.returncode, data
