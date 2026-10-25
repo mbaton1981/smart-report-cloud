@@ -13,6 +13,7 @@ import uuid
 import tempfile
 import mimetypes
 import hashlib
+from PyQt6 import sip
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -9877,6 +9878,8 @@ class SmartReportApp(QMainWindow):
                 )
 
         def restore_scroll_position():
+            if sip.isdeleted(table):
+                return
             vertical = table.verticalScrollBar()
             horizontal = table.horizontalScrollBar()
             vertical.setValue(min(state["vertical_scroll"], vertical.maximum()))
