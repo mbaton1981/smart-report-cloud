@@ -1210,7 +1210,7 @@ def apply_employee_sync_ack(cursor, event, result):
 
 def enqueue_shift_operation(cursor, sync_id, operation, base_version, payload, state=None):
     record_type = payload.get('record_type', RECORD_TYPE_WORK)
-    if record_type != RECORD_TYPE_WORK:
+    if record_type != RECORD_TYPE_WORK and not (operation == "delete" and state == "pending"):
         cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
         if operation == 'delete' and int(base_version) == 0:
             return
@@ -1557,9 +1557,17 @@ def compact_blocked_shift_operations(cursor, allowed_types=None):
         if local:
             if local['entry_type'] not in allowed_types:
                 continue
+            last = cursor.execute(
+                "SELECT operation FROM shift_sync_outbox WHERE sync_id=? AND state IN ('pending','blocked') "
+                "ORDER BY id DESC LIMIT 1", (sync_id,),
+            ).fetchone()
+            deleting = last is not None and last["operation"] == "delete"
             payload = shift_payload(local)
             cursor.execute("DELETE FROM shift_sync_outbox WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
-            enqueue_shift_operation(cursor, sync_id, 'upsert', local['sync_version'], payload, state='pending')
+            if not deleting or local["sync_version"] == 0:
+                enqueue_shift_operation(cursor, sync_id, 'upsert', local['sync_version'], payload, state='pending')
+            if deleting:
+                enqueue_shift_operation(cursor, sync_id, 'delete', local['sync_version'], payload, state='pending')
             released += 1
             continue
 
@@ -2670,6 +2678,11 @@ class SmartReportApp(QMainWindow):
         cursor.execute("SELECT * FROM shifts WHERE sync_id = ?", (sync_id,))
         local = cursor.fetchone()
         if shift.get('deleted'):
+            if shift.get("last_operation_id"):
+                cursor.execute(
+                    "DELETE FROM shift_sync_outbox WHERE sync_id=? AND operation_id=? AND operation='delete'",
+                    (sync_id, shift["last_operation_id"]),
+                )
             cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE sync_id = ? AND state IN ('pending', 'blocked')", (sync_id,))
             if ob_schema_ready(cursor):
                 cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
@@ -3286,7 +3299,12 @@ class SmartReportApp(QMainWindow):
                     result = results.get(change['operation_id'], {})
                     if result.get('ok'):
                         version = int(result.get('version', change['base_version'] + 1))
-                        cursor.execute("UPDATE shifts SET sync_version = ? WHERE sync_id = ?", (version, change['sync_id']))
+                        if change["operation"] == "delete":
+                            if ob_schema_ready(cursor):
+                                cursor.execute("DELETE FROM ob_segments WHERE shift_id=?", (change["sync_id"],))
+                            cursor.execute("DELETE FROM shifts WHERE sync_id=?", (change["sync_id"],))
+                        else:
+                            cursor.execute("UPDATE shifts SET sync_version = ? WHERE sync_id = ?", (version, change['sync_id']))
                         cursor.execute("DELETE FROM shift_sync_outbox WHERE operation_id = ?", (change['operation_id'],))
                         cursor.execute('''
                             UPDATE shift_sync_outbox SET base_version = ?
@@ -3300,12 +3318,15 @@ class SmartReportApp(QMainWindow):
                             "deleted": "смена уже удалена на сервере",
                             "stale_version": "на сервере есть более новая версия смены",
                             "missing_record": "серверная смена отсутствует для указанной версии",
+                            "invoiced": "выставленная запись защищена; сначала верните её в работу",
                         }
                         reason = reason_labels.get(
                             result.get("reason"), "сервер отклонил изменение смены"
                         )
                         sync_conflict_reasons[reason] = sync_conflict_reasons.get(reason, 0) + 1
                         cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE operation_id = ?", (change['operation_id'],))
+                        if change["operation"] == "delete" and result.get("current"):
+                            self.apply_remote_shift(cursor, result["current"])
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -9277,6 +9298,11 @@ class SmartReportApp(QMainWindow):
                 actual = cursor.execute("SELECT * FROM shifts WHERE id=?", (row["id"],)).fetchone()
                 if actual is None or dict(actual) != row:
                     raise ValueError("Записи изменились после просмотра. Обновите отчёт; статус не изменён.")
+                if cursor.execute(
+                    "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
+                    "AND state IN ('pending','blocked')", (row["sync_id"],),
+                ).fetchone():
+                    raise ValueError("Сначала дождитесь ответа сервера на запрос удаления записи.")
             for row in changed:
                 fixed = allocations.get(row["sync_id"])
                 if closed and fixed:
@@ -10771,6 +10797,11 @@ class SmartReportApp(QMainWindow):
             has_ob_schema = ob_schema_ready(cursor)
             cursor.execute("SELECT * FROM shifts ORDER BY id DESC LIMIT 200")
             rows = cursor.fetchall()
+            delete_states = {
+                row["sync_id"]: row["state"] for row in cursor.execute(
+                    "SELECT sync_id,state FROM shift_sync_outbox WHERE operation='delete' ORDER BY id"
+                )
+            }
 
             ob_segments_by_id = {}
             if has_ob_schema:
@@ -10783,6 +10814,11 @@ class SmartReportApp(QMainWindow):
             for row_idx, row in enumerate(rows):
                 is_inv = row["invoiced"] == 1
                 status_text = "✅ Выставлен" if is_inv else "⏳ В работе"
+                delete_state = delete_states.get(row["sync_id"])
+                if delete_state in ("pending", "blocked"):
+                    status_text += " · Удаление ожидает сервера"
+                elif delete_state == "conflict":
+                    status_text += " · Удаление отклонено"
 
                 entry_type = row["entry_type"] or RECORD_TYPE_WORK
                 has_start = bool("start_time" in row.keys() and row["start_time"])
@@ -10877,6 +10913,10 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM shifts WHERE id = ?", (local_id,))
         shift = cursor.fetchone()
+        deleting = shift is not None and cursor.execute(
+            "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
+            "AND state IN ('pending','blocked')", (shift["sync_id"],),
+        ).fetchone() is not None
         has_ob_schema = ob_schema_ready(cursor)
         stored_ob_segments = (get_ob_segments(cursor, shift["sync_id"])
                               if shift and has_ob_schema and shift["entry_type"] == RECORD_TYPE_OB else [])
@@ -10886,6 +10926,12 @@ class SmartReportApp(QMainWindow):
         companies = [row[0] for row in cursor.fetchall()]
         conn.close()
         if not shift:
+            return
+        if deleting:
+            QMessageBox.warning(self, "Запись ожидает удаления", "Сначала дождитесь ответа сервера на запрос удаления.")
+            return
+        if shift["invoiced"]:
+            QMessageBox.warning(self, "Запись защищена", "Сначала верните выставленную запись в работу.")
             return
         client_prices = row_prices(dict(shift))
 
@@ -11208,6 +11254,11 @@ class SmartReportApp(QMainWindow):
                 raise ValueError("Запись изменилась. Обновите историю перед редактированием.")
             if current["invoiced"]:
                 raise ValueError("Сначала верните выставленную запись в работу.")
+            if cursor.execute(
+                "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
+                "AND state IN ('pending','blocked')", (current["sync_id"],),
+            ).fetchone():
+                raise ValueError("Сначала дождитесь ответа сервера на запрос удаления записи.")
             sync_id = shift['sync_id'] or str(uuid.uuid4())
             if record_type != shift['entry_type']:
                 cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE sync_id = ? AND state = 'pending'", (sync_id,))
@@ -11304,6 +11355,17 @@ class SmartReportApp(QMainWindow):
             return
 
         shift_id = self.table_shifts.item(selected, 0).text()
+        conn = get_db_connection()
+        try:
+            shift = conn.execute("SELECT * FROM shifts WHERE id=?", (shift_id,)).fetchone()
+        finally:
+            conn.close()
+        if shift is None:
+            QMessageBox.warning(self, "Запись изменилась", "Обновите историю перед удалением.")
+            return
+        if shift["invoiced"]:
+            QMessageBox.warning(self, "Запись защищена", "Сначала верните выставленную запись в работу.")
+            return
         reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -11313,14 +11375,30 @@ class SmartReportApp(QMainWindow):
         try:
             cursor.execute("BEGIN IMMEDIATE")
             cursor.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,))
-            shift = cursor.fetchone()
+            current = cursor.fetchone()
+            if current is None or dict(current) != dict(shift):
+                raise ValueError("Запись изменилась. Обновите историю перед удалением.")
+            if current["invoiced"]:
+                raise ValueError("Сначала верните выставленную запись в работу.")
+            if cursor.execute(
+                "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
+                "AND state IN ('pending','blocked')", (current["sync_id"],),
+            ).fetchone():
+                raise ValueError("Удаление уже ожидает ответа сервера; запись пока сохранена.")
             if shift:
                 sync_id = shift['sync_id'] or str(uuid.uuid4())
-                enqueue_shift_operation(cursor, sync_id, 'delete', shift['sync_version'], shift_payload(shift))
-                if ob_schema_ready(cursor):
-                    cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
-                cursor.execute('DELETE FROM shifts WHERE id = ?', (shift_id,))
+                cursor.execute("UPDATE shifts SET sync_id=? WHERE id=?", (sync_id, shift_id))
+                if not shift["sync_version"] and not cursor.execute(
+                    "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='upsert' "
+                    "AND state IN ('pending','blocked')", (sync_id,),
+                ).fetchone():
+                    enqueue_shift_operation(cursor, sync_id, 'upsert', 0, shift_payload(shift), state="pending")
+                enqueue_shift_operation(cursor, sync_id, 'delete', shift['sync_version'], shift_payload(shift), state="pending")
             conn.commit()
+        except ValueError as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Удаление не выполнено", str(error))
+            return
         except Exception:
             conn.rollback()
             raise
@@ -11328,12 +11406,12 @@ class SmartReportApp(QMainWindow):
             conn.close()
 
         self.load_shifts_history()
-        if shift and shift['entry_type'] in (
-            RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_VACATION, RECORD_TYPE_HOLIDAY,
-        ):
-            self.background_sync_with_cloud()
-        elif shift:
-            QMessageBox.information(self, "Удалено локально", "Запись удалена из десктопной базы. Сервер не поддерживает синхронизацию удаления АТФ/больничного.")
+        QMessageBox.information(
+            self, "Ожидает подтверждения сервера",
+            "Запрос удаления сохранён в очереди. Запись пока остаётся в базе и таблице. "
+            "Удаление завершится только после подтверждения сервера; при отсутствии связи запрос будет повторён.",
+        )
+        self.background_sync_with_cloud()
 
 if __name__ == "__main__":
     try:

@@ -3261,6 +3261,10 @@ def delete_shift():
         if existing['is_deleted']:
             conn.rollback()
             return jsonify({"ok": True, "idempotent": True, "sync_id": sync_id, "version": existing['version']}), 200
+        if existing["invoiced"]:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Выставленная запись защищена; сначала верните её в работу.",
+                            "reason": "invoiced"}), 409
         if expected_version != existing['version']:
             conn.rollback()
             return jsonify({"ok": False, "error": "Смена уже изменена; обновите историю", "conflict": True, "current": serialize_submission(existing)}), 409
@@ -3312,6 +3316,7 @@ def delete_cloud_shift():
     cursor = conn.cursor()
 
     try:
+        cursor.execute("BEGIN IMMEDIATE")
         if isinstance(shift_id, str) and shift_id.startswith('submission:'):
             try:
                 submission_id = int(shift_id.split(':', 1)[1])
@@ -3334,6 +3339,10 @@ def delete_cloud_shift():
 
         if submission:
             if not submission['is_deleted']:
+                if submission["invoiced"]:
+                    conn.rollback()
+                    return jsonify({"ok": False, "error": "Выставленная запись защищена; сначала верните её в работу.",
+                                    "reason": "invoiced"}), 409
                 change_seq = next_change_sequence(cursor)
                 cursor.execute('''
                     UPDATE incoming_submissions
@@ -3352,6 +3361,10 @@ def delete_cloud_shift():
                 conn.close()
                 return jsonify({"ok": False, "error": "Удаление по полям неоднозначно; требуется стабильный ID"}), 409
             submission = matches[0]
+            if submission["invoiced"]:
+                conn.rollback()
+                return jsonify({"ok": False, "error": "Выставленная запись защищена; сначала верните её в работу.",
+                                "reason": "invoiced"}), 409
             change_seq = next_change_sequence(cursor)
             cursor.execute('''
                 UPDATE incoming_submissions
@@ -3372,6 +3385,8 @@ def delete_cloud_shift():
         conn.close()
         logger.error(f"Ошибка удаления смены на сервере: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        conn.close()
 
 @app.route('/check-employee-shifts', methods=['POST'])
 def check_employee_shifts():
@@ -4813,6 +4828,12 @@ def sync_push():
                 results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
                 continue
 
+            if operation == "delete" and existing and not existing["is_deleted"] and existing["invoiced"]:
+                results.append({
+                    "operation_id": operation_id, "ok": False, "conflict": True,
+                    "reason": "invoiced", "current": serialize_submission(existing),
+                })
+                continue
             if operation == "upsert" and not existing and submission_type in ("work", "ob") and not invoiced:
                 supplied_quote = json.loads(normalized["customer_pricing"]) if normalized.get("customer_pricing") else {}
                 if not supplied_quote or supplied_quote.get("source") == NEW_SHIFT_PRICE_SOURCE:
@@ -4823,7 +4844,8 @@ def sync_push():
 
             if operation == "upsert" and existing and existing["invoiced"]:
                 if any(normalized.get(key) != (existing[key] or "" if key == "comment" else existing[key]) for key in (
-                    "date", "employee", "company", "object_name", "hours", "rate", "transport", "comment", "submission_type"
+                    "date", "employee", "company", "object_name", "hours", "rate", "transport", "comment", "submission_type",
+                    "start_time", "end_time", "ob_base_rate",
                 )):
                     raise ValueError("Выставленная запись защищена; сначала верните её в работу.")
             if operation == "upsert" and normalized["invoiced"] and (not existing or not existing["invoiced"]):
