@@ -75,7 +75,7 @@ class ReopenShiftTests(unittest.TestCase):
         finally:
             c.close()
 
-    def gui_reopen(self, window, mode=None, role="admin"):
+    def gui_reopen(self, window, mode=None, role="admin", saved_role=None):
         def post(url, **kwargs):
             if mode == "offline":
                 raise self.desktop.requests.ConnectionError("isolated offline")
@@ -86,6 +86,7 @@ class ReopenShiftTests(unittest.TestCase):
                     return response.get_json()
             return Response()
         with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": role}), \
+                patch.object(self.desktop.desktop_auth, "saved_account_role", return_value=saved_role), \
                 patch.object(self.desktop.requests, "post", side_effect=post) as request, \
                 patch.object(self.desktop.QMessageBox, "question",
                              return_value=self.desktop.QMessageBox.StandardButton.Yes) as confirm, \
@@ -182,6 +183,19 @@ class ReopenShiftTests(unittest.TestCase):
         refused[2].assert_called_once()
         refused[3].assert_not_called()
         self.assertEqual(self.local_rows(), before)
+
+    def test_offline_cached_director_can_request_but_cannot_change_status_without_server(self):
+        self.closed()
+        window = self.window()
+        before = self.local_rows()
+        request, _, warning, info = self.gui_reopen(window, mode="offline", role="", saved_role="admin")
+        request.assert_called_once()
+        self.assertIn("Связь прервана", warning.call_args.args[2])
+        info.assert_not_called()
+        self.assertEqual(self.local_rows(), before)
+        denied = self.gui_reopen(window, role="employee", saved_role="admin")
+        denied[0].assert_not_called()
+        self.assertIn("директору", denied[2].call_args.args[2])
 
     def test_server_role_and_stale_version_enforced(self):
         row = self.closed()

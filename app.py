@@ -2477,7 +2477,7 @@ class SmartReportApp(QMainWindow):
         edit_shift_btn.clicked.connect(self.edit_shift)
         self.reopen_shift_btn = QPushButton("Вернуть в работу")
         self.reopen_shift_btn.setToolTip("Вернуть только выбранную выставленную смену после подтверждения сервера")
-        self.reopen_shift_btn.setVisible(desktop_auth.current_user().get("role") == "admin")
+        self.reopen_shift_btn.setVisible(self.can_request_shift_reopen())
         self.reopen_shift_btn.setEnabled(False)
         self.reopen_shift_btn.clicked.connect(self.reopen_selected_shift)
 
@@ -10913,18 +10913,22 @@ class SmartReportApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
 
+    def can_request_shift_reopen(self):
+        role = desktop_auth.current_user().get("role") or desktop_auth.saved_account_role()
+        return role == "admin"
+
     def update_reopen_shift_action(self):
         if not hasattr(self, "reopen_shift_btn"):
             return
         selected = self.table_shifts.currentRow()
         status = self.table_shifts.item(selected, 11) if selected >= 0 else None
         self.reopen_shift_btn.setEnabled(
-            desktop_auth.current_user().get("role") == "admin"
+            self.can_request_shift_reopen()
             and status is not None and "Выставлен" in status.text()
         )
 
     def reopen_selected_shift(self):
-        if desktop_auth.current_user().get("role") != "admin":
+        if not self.can_request_shift_reopen():
             QMessageBox.warning(self, "Доступ запрещён", "Возврат в работу доступен только директору/администратору.")
             return
         selected = self.table_shifts.currentRow()
