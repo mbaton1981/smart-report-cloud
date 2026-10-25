@@ -1522,14 +1522,6 @@ class CatalogSyncTests(unittest.TestCase):
             ('2026-10-31', 'Excluded', 'Invoice work', 8, 0, 0, 'atf'),
             ('2026-10-31', 'Excluded', 'Invoice work', 8, 0, 0, 'sick'),
         ))
-        ob_id = str(uuid.uuid4())
-        result = self.desktop.calculate_work_interval('2026-10-31', '18:00', '19:00', 400)
-        desktop_conn.execute("""
-            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
-                                entry_type,sync_id,start_time,end_time,ob_base_rate)
-            VALUES ('2026-10-31','Alice','Renatur','Invoice work',1,0,0,0,'ob',?,'18:00','19:00',400)
-        """, (ob_id,))
-        self.desktop.replace_ob_segments(desktop_conn.cursor(), ob_id, result['segments'])
         desktop_conn.commit()
         original_shifts = [tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')]
         desktop_conn.close()
@@ -1544,15 +1536,15 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual([row[0] for row in report['rows']], ['Alice', 'Bob'])
             self.assertEqual([row[1] for row in report['rows']], [5, 1])
             self.assertEqual([row[3] for row in report['rows']], [2, 1])
-            self.assertEqual(report['rows'][0][4], 1)
-            self.assertAlmostEqual(report['rows'][0][5], result['total_amount'])
+            self.assertEqual(report['rows'][0][4], 0)
+            self.assertIsNone(report['rows'][0][5])
             summary = {
                 window.invoice_summary_table.item(index, 0).text():
                 window.invoice_summary_table.item(index, 1).text()
                 for index in range(window.invoice_summary_table.rowCount())
             }
             self.assertEqual(summary['Totalt att fakturera exkl. moms'], '3,450.00 kr')
-            self.assertEqual(summary['OB-tillägg'], '800.00 kr (segmentbelopp)')
+            self.assertEqual(summary['OB-tillägg'], '0.00 kr')
             self.assertEqual(report['totals']['invoice_total'], 3450)
             self.assertEqual(
                 report['ob_rule_descriptions'],
@@ -1581,7 +1573,12 @@ class CatalogSyncTests(unittest.TestCase):
                     self.assertEqual(pdf_row[1:6], [window.table_invoice.item(row_index, column).text() for column in range(1, 6)])
                     self.assertEqual(pdf_row[6:8], [window.table_invoice.item(row_index, column).text() for column in (6, 7)])
                     self.assertEqual(pdf_row[8].getPlainText(), window.table_invoice.item(row_index, 8).text())
-                    self.assertEqual(pdf_row[9].getPlainText(), window.table_invoice.item(row_index, 9).text())
+                    expected_status = (
+                        "Pågående"
+                        if window.table_invoice.item(row_index, 9).text() == "⏳ В работе"
+                        else window.table_invoice.item(row_index, 9).text()
+                    )
+                    self.assertEqual(pdf_row[9].getPlainText(), expected_status)
                 summary_group = story[-1]
                 pdf_summary = next(
                     flow for flow in summary_group._content
@@ -1659,6 +1656,7 @@ class CatalogSyncTests(unittest.TestCase):
                 pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(str(generated_pdfs[0])).pages)
                 self.assertIn('Varav OB1 (18:00–20:00)', pdf_text)
                 self.assertIn('Varav OB2 (20:00–24:00)', pdf_text)
+                self.assertIn('Pågående', pdf_text)
                 critical.assert_not_called()
         finally:
             window.close()
@@ -1705,9 +1703,8 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual(report['totals']['ob_categories']['weekday_late_evening_night'], 1)
             self.assertEqual(report['totals']['work_amount'], 3400)
             self.assertEqual(report['totals']['transport_amount'], 150)
-            self.assertEqual(report['totals']['invoice_total'], 3550)
-            self.assertEqual(report['totals']['ob_amount'], 920)
-            self.assertNotEqual(report['totals']['invoice_total'], 3550 + 770)
+            self.assertIsNone(report['totals']['invoice_total'])
+            self.assertIsNone(report['totals']['ob_amount'])
             self.assertEqual(window.table_invoice.columnCount(), 10)
             self.assertNotIn('18:00', '\n'.join(
                 window.table_invoice.item(row, column).text()
@@ -1720,12 +1717,182 @@ class CatalogSyncTests(unittest.TestCase):
                 for row in range(window.invoice_summary_table.rowCount())
             }
             self.assertEqual(summary['Arbetade timmar totalt'], '17.0 tim')
-            self.assertEqual(summary['Varav utan OB'], 'Ej fastställbart')
+            self.assertEqual(summary['Varav utan OB'], '12.0 tim')
             self.assertEqual(summary['Varav OB1 (18:00–20:00)'], '4.0 tim')
             self.assertEqual(summary['Varav OB2 (20:00–24:00)'], '1.0 tim')
-            self.assertIn('möjlig överlappning kan inte fastställas', window.invoice_summary_note.text())
-            self.assertIn('inte en verifierad premie', window.invoice_summary_note.text())
-            self.assertIn('ingår inte i totalsumman', window.invoice_summary_note.text())
+            self.assertIn('Ставка/правило OB не определены', window.invoice_summary_note.text())
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_report_separates_work_ob_and_hotel_hours_without_guessing_ob_price(self):
+        desktop_conn = self.desktop.get_db_connection()
+        object_ids = {
+            "Tomteboda ÄTA": desktop_conn.execute(
+                "SELECT id FROM objects WHERE company='Renatur' AND name='Tomteboda ÄTA'"
+            ).fetchone()[0]
+        }
+        desktop_conn.execute(
+            "UPDATE objects SET rate=500, transport_rate=450 WHERE id=?",
+            (object_ids["Tomteboda ÄTA"],),
+        )
+        object_ids["HOTEL Djurgården"] = desktop_conn.execute("""
+                INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+                VALUES ('Renatur',?,?,?,450,?,1)
+            """, ('HOTEL Djurgården', 'p1041', 520, str(uuid.uuid4()))).lastrowid
+
+        desktop_conn.executemany("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+            VALUES ('2026-10-21','Andrii Piskun','Renatur',?,?,400,0,0,'work')
+        """, (
+            ('Tomteboda ÄTA', 4),
+            ('HOTEL Djurgården', 8),
+        ))
+        desktop_conn.execute(
+            "INSERT INTO employees (name,salary_rate,is_active) VALUES ('Andrii Piskun',400,1)"
+        )
+        ob_id = str(uuid.uuid4())
+        ob_result = self.desktop.calculate_work_interval(
+            '2026-10-21', '16:00', '20:00', 400
+        )
+        desktop_conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                                entry_type,sync_id,start_time,end_time,ob_base_rate)
+            VALUES ('2026-10-21','Andrii Piskun','Renatur','Tomteboda ÄTA',4,0,0,0,
+                    'ob',?,'16:00','20:00',400)
+        """, (ob_id,))
+        self.desktop.replace_ob_segments(desktop_conn.cursor(), ob_id, ob_result['segments'])
+        desktop_conn.commit()
+        original_shifts = [tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')]
+        daily_hours = desktop_conn.execute("""
+            SELECT SUM(hours) FROM shifts
+            WHERE date='2026-10-21' AND employee='Andrii Piskun' AND entry_type='work'
+        """).fetchone()[0]
+        desktop_conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        salary_window = None
+        try:
+            window.inv_comp_cb.setCurrentText('Renatur')
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_ids['Tomteboda ÄTA']))
+            report = window.generate_invoice()
+            self.assertEqual(daily_hours, 12)
+            self.assertEqual([row[0] for row in report['rows']], ['Andrii Piskun'])
+            self.assertEqual(report['totals']['hours'], 4)
+            self.assertEqual(report['totals']['without_ob_hours'], 2)
+            self.assertEqual(report['totals']['ob_categories']['weekday_early_evening'], 2)
+            self.assertEqual(report['totals']['work_amount'], 2000)
+            self.assertIsNone(report['totals']['ob_amount'])
+            self.assertIsNone(report['totals']['invoice_total'])
+            self.assertIn('Ставка/правило OB не определены', window.invoice_summary_note.text())
+            self.assertNotIn('1,229', window.invoice_summary_note.text())
+            summary = {
+                window.invoice_summary_table.item(row, 0).text():
+                window.invoice_summary_table.item(row, 1).text()
+                for row in range(window.invoice_summary_table.rowCount())
+            }
+            self.assertEqual(summary['Arbetade timmar totalt'], '4.0 tim')
+            self.assertEqual(summary['Varav utan OB'], '2.0 tim')
+            self.assertEqual(summary['Varav OB1 (18:00–20:00)'], '2.0 tim')
+            self.assertEqual(summary['Arbete'], '2,000.00 kr')
+            self.assertEqual(summary['OB-tillägg'], 'Не определено')
+            self.assertEqual(summary['Totalt att fakturera exkl. moms'], 'Не определено')
+
+            with patch.object(self.desktop, 'REPORTS_DIR', str(Path(self._case.name) / 'reports')), \
+                 patch.object(self.desktop.SimpleDocTemplate, 'build') as build, \
+                 patch.object(self.desktop.QMessageBox, 'warning') as warning:
+                window.export_invoice_to_pdf()
+                build.assert_not_called()
+                self.assertTrue(any('Ставка/правило OB не определены' in str(call) for call in warning.call_args_list))
+
+            salary_window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+            self.desktop.QMainWindow.__init__(salary_window)
+            salary_window.tab_salary = self.desktop.QWidget()
+            salary_window.setup_salary_tab()
+            salary_window.sal_date_from.setDate(self.desktop.QDate(2026, 10, 21))
+            salary_window.sal_date_to.setDate(self.desktop.QDate(2026, 10, 21))
+            salary_window.load_salary_table_template()
+            self.assertEqual(salary_window.sal_summary_hours_lbl.text(), '<b>Рабочие часы: 12.0</b>')
+
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(
+                [tuple(row) for row in desktop_conn.execute('SELECT * FROM shifts ORDER BY id')],
+                original_shifts,
+            )
+            desktop_conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
+            if salary_window is not None:
+                salary_window.close()
+                salary_window.deleteLater()
+
+    def test_invoice_report_warns_instead_of_returning_zero_for_missing_object_rate(self):
+        desktop_conn = self.desktop.get_db_connection()
+        object_id = desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Renatur','Rate missing test','p1042',0,450,?,1)
+        """, (str(uuid.uuid4()),)).lastrowid
+        desktop_conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+            VALUES ('2026-10-21','Rate test','Renatur','Rate missing test',4,400,0,0,'work')
+        """)
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            window.inv_comp_cb.setCurrentText('Renatur')
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_id))
+            report = window.generate_invoice()
+            self.assertIsNone(report['prepared_rows'][0]['rate'])
+            self.assertIsNone(report['totals']['work_amount'])
+            self.assertIsNone(report['totals']['invoice_total'])
+            self.assertIn('Ставка объекта не определена', window.invoice_summary_note.text())
+            self.assertEqual(window.invoice_summary_table.item(4, 1).text(), 'Не определено')
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_report_does_not_infer_zero_ob_when_segment_schema_is_missing(self):
+        desktop_conn = self.desktop.get_db_connection()
+        object_id = desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Renatur','OB schema missing test','p1043',500,450,?,1)
+        """, (str(uuid.uuid4()),)).lastrowid
+        desktop_conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+            VALUES ('2026-10-21','OB schema test','Renatur','OB schema missing test',4,400,0,0,'work')
+        """)
+        desktop_conn.execute("DROP TABLE ob_segments")
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            window.inv_comp_cb.setCurrentText('Renatur')
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_id))
+            report = window.generate_invoice()
+            self.assertEqual(report['totals']['hours'], 4)
+            self.assertIsNone(report['totals']['without_ob_hours'])
+            self.assertIsNone(report['totals']['ob_categories']['weekday_early_evening'])
+            self.assertIsNone(report['totals']['ob_amount'])
+            self.assertIsNone(report['totals']['invoice_total'])
+            self.assertIn('отсутствуют сохранённые сегменты OB', window.invoice_summary_note.text())
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertIsNone(desktop_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ob_segments'"
+            ).fetchone())
+            desktop_conn.close()
         finally:
             window.close()
             window.deleteLater()
