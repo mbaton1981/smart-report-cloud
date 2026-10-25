@@ -18,6 +18,26 @@ $manifest = Join-Path $build "release-manifest.json"
 @{version=$Version; commit=$commit; built_at=(Get-Date).ToUniversalTime().ToString("o")} |
     ConvertTo-Json | Set-Content -Encoding UTF8 $manifest
 $env:SMARTREPORT_BUILD_MANIFEST = $manifest
+$versionMatch = [regex]::Match($Version, '^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)(?:[-+][0-9A-Za-z.-]+)?$')
+if (-not $versionMatch.Success) { throw "Invalid application version: $Version" }
+$fileTuple = "$($versionMatch.Groups['major'].Value), $($versionMatch.Groups['minor'].Value), $($versionMatch.Groups['patch'].Value), 0"
+$fileVersion = "$($versionMatch.Groups['major'].Value).$($versionMatch.Groups['minor'].Value).$($versionMatch.Groups['patch'].Value).0"
+$versionInfo = Get-Content -Raw (Join-Path $PSScriptRoot "version_info.txt")
+$versionInfo = [regex]::Replace($versionInfo, 'filevers=\([^)]+\), prodvers=\([^)]+\)', {
+    param($match)
+    "filevers=($fileTuple), prodvers=($fileTuple)"
+})
+$versionInfo = [regex]::Replace($versionInfo, '(StringStruct\("FileVersion",\s*")[^"]+("\))', {
+    param($match)
+    "$($match.Groups[1].Value)$fileVersion$($match.Groups[2].Value)"
+})
+$versionInfo = [regex]::Replace($versionInfo, '(StringStruct\("ProductVersion",\s*")[^"]+("\))', {
+    param($match)
+    "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)"
+})
+$versionInfoPath = Join-Path $build "version_info.txt"
+$versionInfo | Set-Content -Encoding UTF8 $versionInfoPath
+$env:SMARTREPORT_VERSION_INFO = $versionInfoPath
 $env:PYTHONIOENCODING = "utf-8"
 & $BuildPython -m PyInstaller --noconfirm --clean --distpath "$build\dist" --workpath "$build\work" "$PSScriptRoot\smartreport.spec"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибкой" }

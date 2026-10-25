@@ -18,6 +18,7 @@ for package in ("rapidocr_onnxruntime", "onnxruntime", "tzdata"):
 icon = os.path.join(root, "Logo.ico")
 if os.path.exists(icon):
     datas.append((icon, "."))
+version_info = os.environ.get("SMARTREPORT_VERSION_INFO", os.path.join(SPECPATH, "version_info.txt"))
 
 a = Analysis(
     [os.path.join(root, "app.py")],
@@ -31,6 +32,6 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [], exclude_binaries=True, name="SmartReport",
     console=False, icon=icon if os.path.exists(icon) else None,
-    version=os.path.join(SPECPATH, "version_info.txt"),
+    version=version_info,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="SmartReport", strip=False, upx=False)
