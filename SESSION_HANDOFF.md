@@ -1,5 +1,96 @@
 # Handoff
 
+## 25.10.2026, 22:45 — день завершён, безопасная уборка (читать первым)
+
+- **Завтра первым делом:** обычная установка и первый запуск на новом
+  компьютере **без заранее подготовленного профиля**. Сегодня этот сценарий
+  не проверяли и разработку не продолжали. Прежние успешные изолированные
+  проверки использовали явно заданный временный профиль; они не подтверждают
+  готовность первого запуска «с нуля». Текущее ограничение установщика:
+  ярлыки не создаются, приложение требует явный путь рабочего профиля.
+  Завтра сначала проверить обычный пользовательский путь, не подставляя
+  заранее рабочий профиль и не используя реальные базы для теста.
+- **Рабочая версия — 1.0.33**, EXE:
+  `C:\Users\mbato\AppData\Local\Programs\SmartReport-1.0.30-rc1\SmartReport.exe`,
+  SHA-256 `2CA7AEF14B46A444AD1CE7E1F2817D3A31E342C5D295F8D260A4BBA1BAF0A42F`.
+  SmartReport (PID 4672) закрыт штатно через CloseMainWindow, процесс завершён.
+  Рабочие профиль `C:\Users\mbato\AppData\Local\SmartReport-1.0.9`,
+  базы, справочники, баланс, авторизация и ярлыки не менялись.
+  При уборке хеши всех 1340 файлов рабочей установки и профиля до/после
+  совпали. Переключение темы пользователем, отмеченное ниже, сохранено.
+- **Сервер оставлен работающим для сотрудников:** Render
+  `https://smart-report-server.onrender.com/`, последний известный Live
+  `3d9391a`, Auto-Deploy выключен; сегодня при завершении HTTP 200.
+  Новых сборок, установки и deploy в этой задаче не было.
+- **Исходники и main:** единственный main-checkout —
+  `C:\Users\mbato\.copilot\session-state\f35b117e-c633-42d1-8c5f-bfa5fede6a69\files\mail-automation`.
+  Перед передачей `main = origin/main` на `a37e67b`, поверх — этот
+  handoff-коммит. Код исправления колёсика — `f24c71d`.
+  Точный принятый исходник установленной 1.0.33 сохранён отдельно:
+  `C:\Users\mbato\AppData\Local\SmartReport\build\out\wheel-guard-release\source`;
+  исходник отката 1.0.32 —
+  `C:\Users\mbato\AppData\Local\SmartReport\build\out\analytics-release\source`.
+  Состав выпусков отличается от HEAD: не собирать вслепую из main.
+- **Дистрибутивы сохранены на OneDrive**, корень:
+  `C:\Users\mbato\OneDrive\Рабочий стол\SmartReport  CostTracker App Test\installer\`.
+  В корне ровно `SmartReport-Setup-1.0.33.exe`,
+  `SmartReport-1.0.33-build-win64.zip`, `README-1.0.33.txt`, `SHA256SUMS.txt`;
+  в `rollback\` — `SmartReport-Setup-1.0.32.exe`,
+  `SmartReport-1.0.32-build-win64.zip`, `SHA256SUMS.txt`.
+  SHA-256 четырёх двоичных файлов повторно совпали с опубликованными ниже.
+  Перед удалением локальных дубликатов проверено содержимое обоих ZIP:
+  по 1309 файлов, каждый побайтно соответствует своему распакованному dist.
+  Инструкции и суммы сохранены; Проводник после уборки показывает
+  «Always available on this device». Ранее Cloud Files API подтвердил
+  InSyncState=1; файлы дистрибутивов с тех пор не изменялись.
+- **Удалено только подтверждённое, всего 1 344 415 083 байта (1,25 ГиБ):**
+  - `...\build\out\wheel-guard-release\work` — промежуточные файлы PyInstaller;
+  - `...\build\out\wheel-guard-release\{dist,installer}` и
+    `...\build\out\analytics-release\{dist,installer}` — локальные распакованные
+    копии и дубликаты установщиков/ZIP, уже сверенные с OneDrive;
+  - `...\build\out\wheel-guard-release\app.patch` — применённый патч;
+  - в текущем сеансе
+    `C:\Users\mbato\.copilot\session-state\0e30a19a-ad66-4e96-b364-9b0c4c069643\files\wheel-check\`
+    из `run-before`, `run-after`, `run-staging` удалены только тестовые
+    `smart_report.db` и пустые `profile`, `documents`;
+  - пустые каталоги собственных импорт-тестов в `%TEMP%`:
+    `smartreport-sync-import-7dr4yrxq`, `smartreport-sync-import-9q_daedm`.
+  Старые ссылки ниже на локальные `dist`/`installer` — исторические:
+  теперь пользоваться дистрибутивами OneDrive, а исходниками — `source`.
+- **Оставлено намеренно:** оба `source`, манифесты и журналы сборок;
+  в `wheel-check` — сценарии, JSON-отчёты, снимки экрана, результаты обеих
+  проверок установщика. Python venv, Inno Setup и зависимости не удалялись.
+  Старые каталоги `candidate-1.0.31-rc1`, `protected-shifts-hotfix`,
+  `reopen-shift-hotfix`, защитные копии и старые временные каталоги других
+  проверок оставлены: необходимость их удаления не подтверждена.
+  Локальный откат рабочей установки сохранён:
+  `C:\Users\mbato\AppData\Local\SmartReport\protected-recovery\installed-1.0.32-rollback-20261025T205634Z`.
+- **Остальные незавершённые задачи сохранены отдельно, не смешаны с main:**
+  `fix/local-mail-review-flow` @ `3da8c26` (почта, проверка счетов, OB),
+  `wip/stash-mail-two-inboxes-20261025` @ `c2642ad`,
+  `fix/full-document-backup` @ `dca9f9d`,
+  `fix/invoice-document-guards` @ `e017b1d`,
+  `feature/mail-two-inboxes` @ `4ce094d`,
+  `feature/isolated-mail-automation` @ `2acdac0` — все доступны в origin.
+  Stash также оставлен. Для них после задачи первого запуска отдельно
+  определить объём переноса; автоматически ничего не сливать.
+  WIP-checkout:
+  `C:\Users\mbato\OneDrive\Рабочий стол\SmartReport  CostTracker App Test`.
+  Вложенный `smart-report-cloud-ob-worktree` чистый, не менялся; это
+  отдельный клон, отображающийся как untracked-каталог родительского Git.
+  Ветки и prunable-записи worktree не удалялись, история не переписывалась.
+- **Сохранность перед выключением:** до уборки текущих правок в исходниках
+  не было; вызвана команда Save All в единственном открытом окне VS Code.
+  После уборки повторно проверены все открытые окна: одно окно проекта,
+  «Группа редакторов 1 (пусто)», редакторских буферов и hot-exit backup-файлов
+  нет. Окно остаётся на OneDrive/WIP-checkout, его ветка не переключалась;
+  завтра main открывать по точному пути выше.
+  main, WIP и вложенный клон чистые (кроме известного untracked-каталога
+  отдельного клона в WIP); у локальных рабочих веток нет коммитов,
+  отсутствующих в remote refs. Новых WIP-коммитов не требуется.
+  Процессов SmartReport/Python после штатного закрытия нет, тестовые
+  серверы не запущены; чужие терминалы и процессы VS Code не завершались.
+
 ## 25.10.2026, ночь — установщик и сборка 1.0.33 на OneDrive (читать первым)
 
 - **Назначенное место** (по WORK_LOG; папка в `.gitignore`, синхронизируется
