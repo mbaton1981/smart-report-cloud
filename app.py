@@ -42,7 +42,7 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
-from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing
+from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing, reopen_invoiced_shifts
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
@@ -2475,10 +2475,16 @@ class SmartReportApp(QMainWindow):
         edit_shift_btn.setObjectName("editShiftButton")
         edit_shift_btn.setToolTip("Изменить выбранную смену")
         edit_shift_btn.clicked.connect(self.edit_shift)
+        self.reopen_shift_btn = QPushButton("Вернуть в работу")
+        self.reopen_shift_btn.setToolTip("Вернуть только выбранную выставленную смену после подтверждения сервера")
+        self.reopen_shift_btn.setVisible(desktop_auth.current_user().get("role") == "admin")
+        self.reopen_shift_btn.setEnabled(False)
+        self.reopen_shift_btn.clicked.connect(self.reopen_selected_shift)
 
         btn_row.addWidget(refresh_shifts_btn)
         btn_row.addWidget(sync_cloud_btn)
         btn_row.addWidget(edit_shift_btn)
+        btn_row.addWidget(self.reopen_shift_btn)
         btn_row.addStretch()
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
@@ -2555,6 +2561,7 @@ class SmartReportApp(QMainWindow):
         self.table_shifts.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_shifts.setAlternatingRowColors(True)
         self.table_shifts.cellDoubleClicked.connect(lambda *_: self.edit_shift())
+        self.table_shifts.itemSelectionChanged.connect(self.update_reopen_shift_action)
         layout.addWidget(self.table_shifts)
         self.load_shifts_history()
 
@@ -2715,6 +2722,11 @@ class SmartReportApp(QMainWindow):
                 return
 
         remote_version = int(shift.get('version', 1))
+        if local and local["invoiced"] and not shift.get("invoiced") and remote_version > local["sync_version"]:
+            cursor.execute(
+                "DELETE FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' AND state='conflict'",
+                (sync_id,),
+            )
         if local and remote_version > local["sync_version"] and shift.get("last_operation_id"):
             cursor.execute("""DELETE FROM shift_sync_outbox
                 WHERE sync_id=? AND operation_id=? AND state='pending'""",
@@ -9307,11 +9319,8 @@ class SmartReportApp(QMainWindow):
                 fixed = allocations.get(row["sync_id"])
                 if closed and fixed:
                     store_pricing(cursor, "shifts", row["sync_id"], fixed_quote(row, fixed))
-                elif not closed and row_prices(row).get("fixed"):
-                    quote = json.loads(row["customer_pricing"])
-                    quote.pop("fixed")
-                    cursor.execute("UPDATE shifts SET invoiced=0 WHERE id=?", (row["id"],))
-                    store_pricing(cursor, "shifts", row["sync_id"], quote)
+            if not closed:
+                reopen_invoiced_shifts(cursor, "shifts", selected)
             ids = tuple(row["id"] for row in changed)
             marks = ",".join("?" for _ in ids)
             cursor.execute(f"UPDATE shifts SET invoiced=? WHERE id IN ({marks})", (int(closed), *ids))
@@ -10899,8 +10908,146 @@ class SmartReportApp(QMainWindow):
                     self.table_shifts.setItem(row_idx, col_idx, it)
             self.load_dropdowns()
             self.apply_shifts_filters()
+            self.update_reopen_shift_action()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")
+
+    def update_reopen_shift_action(self):
+        if not hasattr(self, "reopen_shift_btn"):
+            return
+        selected = self.table_shifts.currentRow()
+        status = self.table_shifts.item(selected, 11) if selected >= 0 else None
+        self.reopen_shift_btn.setEnabled(
+            desktop_auth.current_user().get("role") == "admin"
+            and status is not None and "Выставлен" in status.text()
+        )
+
+    def reopen_selected_shift(self):
+        if desktop_auth.current_user().get("role") != "admin":
+            QMessageBox.warning(self, "Доступ запрещён", "Возврат в работу доступен только директору/администратору.")
+            return
+        selected = self.table_shifts.currentRow()
+        if selected < 0:
+            QMessageBox.warning(self, "Выберите смену", "Выделите выставленную смену в истории.")
+            return
+        local_id = self.table_shifts.item(selected, 0).text()
+        conn = get_db_connection()
+        try:
+            row = conn.execute("SELECT * FROM shifts WHERE id=?", (local_id,)).fetchone()
+            if row is None:
+                raise ValueError("Запись не найдена. Обновите историю.")
+            row = dict(row)
+            if not row["invoiced"]:
+                raise ValueError("Смена уже в работе. Повторный возврат не нужен.")
+            if conn.execute(
+                "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? "
+                "AND (state IN ('pending','blocked') OR operation<>'delete')", (row["sync_id"],),
+            ).fetchone():
+                raise ValueError("Есть несогласованные изменения этой смены. Сначала завершите обмен и проверьте конфликт.")
+            if not row["sync_id"] or row["sync_version"] < 1:
+                raise ValueError("Смена ещё не согласована с сервером. Сначала завершите обмен.")
+            fixed = row_prices(row).get("fixed")
+            if fixed and set(fixed["members"]) != {row["sync_id"]}:
+                reply = QMessageBox.question(
+                    self, "Связанный Fast pris",
+                    "Эта смена входит в связанный Fast pris. Отдельно открыть её нельзя; "
+                    "возврат всего состава выполняется в отчёте. Никакие смены сейчас не изменятся.\n"
+                    "Перейти к соответствующему отчёту?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    target = conn.execute(
+                        "SELECT id FROM objects WHERE sync_id=?", (fixed["object_sync_id"],),
+                    ).fetchone()
+                    if target is None:
+                        raise ValueError("Объект связанного Fast pris не найден в справочнике. Откройте исходный отчёт вручную.")
+                    self.inv_comp_cb.setCurrentText(row["company"])
+                    self.inv_date_from.setDate(QDate.fromString(fixed["date_from"], "yyyy-MM-dd"))
+                    self.inv_date_to.setDate(QDate.fromString(fixed["date_to"], "yyyy-MM-dd"))
+                    self.load_invoice_objects(row["company"])
+                    target_index = self.inv_obj_cb.findData(target["id"])
+                    if target_index < 0:
+                        raise ValueError("Объект связанного Fast pris недоступен в отчёте. Проверьте выбранную фирму.")
+                    self.inv_obj_cb.setCurrentIndex(target_index)
+                    self.tabs.setCurrentWidget(self.tab_invoice)
+                return
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Возврат не выполнен", str(error))
+            return
+        finally:
+            conn.close()
+        reply = QMessageBox.question(
+            self, "Вернуть смену в работу?",
+            f"{row['employee']}\n{row['date']} · {row['company']} / {row['object_name']}\n"
+            f"{row['hours']:g} ч\n\nБудет открыта только эта смена. Остальные записи и сохранённые "
+            "документы не изменятся. Прежний запрос удаления повторён не будет.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            response = requests.post(
+                f"{CLOUD_URL}/api/admin/shifts/reopen", headers=sync_headers(),
+                json={"sync_id": row["sync_id"], "version": row["sync_version"],
+                      "operation_id": str(uuid.uuid4())}, timeout=8,
+            )
+            if response.status_code != 200:
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = None
+                detail = data.get("error") if isinstance(data, dict) else None
+                raise ValueError(detail or f"Сервер не подтвердил возврат: HTTP {response.status_code}.")
+            result = response.json()
+            remote = result.get("shift") if isinstance(result, dict) else None
+            if (not isinstance(remote, dict) or not result.get("ok") or remote.get("sync_id") != row["sync_id"]
+                    or remote.get("invoiced") or remote.get("deleted")
+                    or not isinstance(remote.get("version"), int) or remote["version"] < row["sync_version"]):
+                raise ValueError("Сервер не подтвердил возврат выбранной смены. Обновите данные.")
+            conn = get_db_connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                current = cursor.execute("SELECT * FROM shifts WHERE id=?", (local_id,)).fetchone()
+                if current is None:
+                    raise ValueError("Локальная запись изменилась. Сервер ответил; обновите историю.")
+                if cursor.execute(
+                    "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? "
+                    "AND (state IN ('pending','blocked') OR operation<>'delete')", (row["sync_id"],),
+                ).fetchone():
+                    raise ValueError("Появились локальные изменения. Сервер ответил; дождитесь сверки, прежнее удаление не повторяйте.")
+                cursor.execute(
+                    "DELETE FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' AND state='conflict'",
+                    (row["sync_id"],),
+                )
+                self.apply_remote_shift(cursor, remote)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        except requests.RequestException:
+            QMessageBox.warning(
+                self, "Нет подтверждения сервера",
+                "Связь прервана. Локальный статус не изменён; возврат не поставлен в очередь. "
+                "Обновите данные после восстановления связи, чтобы проверить состояние сервера.",
+            )
+            return
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Возврат не выполнен", str(error))
+            return
+        self.load_shifts_history()
+        for index in range(self.table_shifts.rowCount()):
+            if self.table_shifts.item(index, 0).text() == str(local_id):
+                self.table_shifts.selectRow(index)
+                break
+        QMessageBox.information(
+            self, "Смена в работе",
+            "Сервер подтвердил возврат одной смены. Исторические цены сохранены. "
+            "Для удаления понадобится новое явное действие.",
+        )
 
     def edit_shift(self):
         selected = self.table_shifts.currentRow()

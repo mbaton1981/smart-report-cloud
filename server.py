@@ -26,7 +26,7 @@ from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
 from web_login_throttle import SQLiteLoginThrottle
 from object_reports import register_object_reports
-from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices
+from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices, reopen_invoiced_shifts
 from fixed_pricing import validate_fixed_storage
 import payroll_history
 import employee_cards
@@ -830,7 +830,7 @@ def enforce_dataset_boundary():
     if not expected:
         return None
     guarded = (
-        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/"))
+        request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/", "/api/admin/shifts/"))
         or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced"}
     )
     if guarded:
@@ -4604,6 +4604,57 @@ def serialize_submission(row, cursor=None):
             "ob_segments": segments,
         })
     return payload
+
+@app.route('/api/admin/shifts/reopen', methods=['POST'])
+def reopen_selected_shift():
+    if bearer_admin_user() is None:
+        return jsonify({"ok": False, "error": "Возврат в работу доступен только директору/администратору."}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Ожидается объект запроса."}), 400
+    sync_id = str(data.get("sync_id") or "").strip()
+    operation_id = str(data.get("operation_id") or "").strip()
+    if not sync_id or not operation_id or len(sync_id) > 100 or len(operation_id) > 100:
+        return jsonify({"ok": False, "error": "Требуются ID записи и операции."}), 400
+    conn = get_db_connection()
+    try:
+        version = data.get("version")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("Некорректная версия записи.")
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        row = cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id=?", (sync_id,)).fetchone()
+        if row is None or row["is_deleted"]:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Смена не найдена или уже удалена."}), 404
+        if row["last_operation_id"] == operation_id and not row["invoiced"]:
+            conn.rollback()
+            return jsonify({"ok": True, "changed": False, "shift": serialize_submission(row, cursor)})
+        if row["version"] != version:
+            conn.rollback()
+            return jsonify({"ok": False, "error": "Запись изменилась на сервере. Обновите данные и повторите."}), 409
+        if row["submission_type"] not in ("work", "ob"):
+            raise ValueError("Возврат в работу применяется только к рабочей или OB-смене.")
+        changed = reopen_invoiced_shifts(cursor, "incoming_submissions", [row])
+        if changed:
+            cursor.execute("""
+                UPDATE incoming_submissions SET version=version+1,change_seq=?,last_operation_id=?,
+                    updated_at=?,desktop_acked=0 WHERE sync_id=?
+            """, (next_change_sequence(cursor), operation_id, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), sync_id))
+        current = cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id=?", (sync_id,)).fetchone()
+        result = serialize_submission(current, cursor)
+        conn.commit()
+        return jsonify({"ok": True, "changed": bool(changed), "shift": result})
+    except (ValueError, TypeError) as error:
+        conn.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 409
+    except Exception:
+        conn.rollback()
+        logger.exception("Ошибка возврата смены в работу")
+        return jsonify({"ok": False, "error": "Сервер не подтвердил возврат в работу. Обновите данные."}), 500
+    finally:
+        conn.close()
+
 
 @app.route('/sync/pull', methods=['GET'])
 def sync_pull():

@@ -2,7 +2,8 @@
 from datetime import date, datetime, timezone
 import json
 import math
-from fixed_pricing import parse_fixed
+from fixed_pricing import parse_fixed, report_agreements, validate_fixed_storage
+import payroll_history
 
 
 CATALOG_PRICE_SOURCE = "Цены справочника объекта (применены пользователем)"
@@ -183,6 +184,45 @@ def store_pricing(cursor, table, sync_id, value, *, from_sync=False):
     """, (sync_id, current, encoded, datetime.now(timezone.utc).isoformat()))
     cursor.execute(f"UPDATE {table} SET customer_pricing=? WHERE sync_id=?", (encoded, sync_id))
     return True
+
+
+def reopen_invoiced_shifts(cursor, table, rows):
+    """Apply the same explicit reopening to a report or its complete selected package."""
+    if table not in ("shifts", "incoming_submissions"):
+        raise ValueError("Unsupported pricing table")
+    rows = [dict(row) for row in rows]
+    for row in rows:
+        row.setdefault("entry_type", row.get("submission_type"))
+    groups, _ = report_agreements({"journal_rows": rows})
+    selected = {row["sync_id"] for row in rows}
+    if any(not set(fixed["members"]) <= selected for fixed in groups.values()):
+        raise ValueError(
+            "Fast pris возвращается в работу только целиком. Выбранная смена связана с другими "
+            "записями; откройте соответствующий отчёт и выберите весь подтверждённый состав."
+        )
+    if groups:
+        validate_fixed_storage(cursor, table, set(groups))
+    _, _, periods = payroll_history.state(payroll_history.events(cursor))
+    for row in rows:
+        for (employee, start, end), period in periods.items():
+            if employee == row["employee"] and start <= row["date"] <= end and period["status"] == "closed":
+                raise ValueError(
+                    f"Зарплатный период {start} — {end} для {employee} остаётся закрытым. "
+                    "Смена не возвращена в работу; нужна отдельная корректировка закрытого периода."
+                )
+    changed = [row for row in rows if row["invoiced"]]
+    for row in changed:
+        cursor.execute(f"UPDATE {table} SET invoiced=0 WHERE sync_id=?", (row["sync_id"],))
+        if row_prices(row).get("fixed"):
+            quote = json.loads(row["customer_pricing"])
+            quote.pop("fixed")
+            store_pricing(cursor, table, row["sync_id"], quote)
+        if table == "shifts":
+            cursor.execute(
+                "DELETE FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' AND state='conflict'",
+                (row["sync_id"],),
+            )
+    return changed
 
 
 def row_prices(row):
