@@ -1,5 +1,68 @@
 # Handoff
 
+## 25.10.2026, конец дня — итоговое состояние (читать первым)
+
+- **main = origin/main**; основа этого раздела — `7243b28`, а
+  handoff-коммит лежит сверху. Fast-forward не требовался, расхождений нет.
+  Единственный checkout `main` — worktree
+  `C:\Users\mbato\.copilot\session-state\f35b117e-c633-42d1-8c5f-bfa5fede6a69\files\mail-automation`.
+  Продолжать работу только здесь.
+- **Завершено:** вкладка «Аналитика» опубликована и установлена
+  (подробности — разделы ниже). Новых функций, сборок, deploy и уборки
+  сегодня не было; программа, профиль, справочники, баланс и БД не менялись.
+- **Рабочая программа — 1.0.32 / FileVersion 1.0.32.0**, единственная
+  рабочая установка:
+  `C:\Users\mbato\AppData\Local\Programs\SmartReport-1.0.30-rc1\SmartReport.exe`
+  (имя папки историческое), SHA-256
+  `525FCD4B570F837D569B18DE7FF85FCB6BBF21AC32B4B23503E6CE76667C8765`,
+  12 952 717 байт. Совпадает с проверенной сборкой; переустановка не нужна.
+  Профиль `C:\Users\mbato\AppData\Local\SmartReport-1.0.9`.
+- **Ярлыки проверены и одинаковы:**
+  `C:\Users\mbato\OneDrive\Рабочий стол\SmartReport.lnk` и
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\SmartReport\SmartReport.lnk`
+  → powershell `launch_existing_profile.ps1` из той же папки,
+  `-ProfileRoot ...\SmartReport-1.0.9 -ExecutablePath ...\SmartReport.exe` (1.0.32).
+  Устаревших ссылок нет, поэтому ярлыки не менялись. Описание ярлыка содержит
+  «1.0.30-rc1» — это только название папки. Отдельный ярлык
+  `SmartReport — резервная копия OneDrive.lnk` открывает инструмент
+  резервного копирования (`portable_backup_gui.py` в этом main), не клиент;
+  его не трогали. Клиент PID 33964 из этого EXE уже работал (Responding), поэтому
+  повторный запуск ярлыков сегодня не делали: launcher отказывает при открытом
+  клиенте, а оба ярлыка проверены запуском ранее 25.10.
+- **Сервер:** Render `smart-report-server` Live на
+  `3d9391a3b4e05ce33af6122476c65b6421660f3c`, deploy `dep-dbf5ia7b9u1s73bmvs40`;
+  Auto-Deploy выключен, поэтому push этого handoff не разворачивается.
+  Главная страница отвечает HTTP 200; capabilities без dataset возвращают
+  ожидаемый 409.
+- **Незавершённая работа сохранена отдельно и отправлена в origin (в main
+  не сливалась):**
+  - `fix/local-mail-review-flow` @ `3da8c2686092e7e4e6c6dfa62f09a27bb12122ed` —
+    WIP-коммит бывших незакоммиченных WORK_LOG.md/app.py (детализация
+    OB-часов в счёте, правки окна проверки счёта)/tests/test_catalog_sync.py
+    поверх 12 локальных коммитов почты/счетов. Checkout:
+    `C:\Users\mbato\OneDrive\Рабочий стол\SmartReport  CostTracker App Test`.
+    Ветка разошлась с main (126/13 уникальных коммитов) и не вошла в 1.0.32;
+    её содержимое и цели нужно проверить отдельно и не сливать вслепую.
+  - `wip/stash-mail-two-inboxes-20261025` @ `c2642ad` — копия
+    `stash@{0}` (snapshot на feature/mail-two-inboxes, включая untracked);
+    сам stash остаётся на месте.
+  - Ранее только локальные: `fix/full-document-backup` @ `dca9f9d`,
+    `fix/invoice-document-guards` @ `e017b1d`, `feature/mail-two-inboxes` @
+    `4ce094d`; `feature/isolated-mail-automation` @ `2acdac0` догнан на origin.
+  - После сохранения нет локальных веток с коммитами, отсутствующими в origin.
+- **Вложенный каталог**
+  `...\SmartReport  CostTracker App Test\smart-report-cloud-ob-worktree` — отдельный
+  клон того же GitHub-репозитория (не submodule; в родительском checkout
+  неотслеживаемый). Он чистый: `main` отстаёт на 3, локальных коммитов и
+  stash нет. Назначение не подтверждено, поэтому каталог не менялся.
+- Прочие worktree `unified-release`, `server_release_worktree` и
+  `object_report ... server_worktree` помечены Git как prunable (их каталоги
+  отсутствуют); ветки на месте. `git worktree prune` не выполнялся.
+- **Следующий шаг:** открыть VS Code на main-checkout выше. Затем решить
+  отдельно, что из `fix/local-mail-review-flow` переносить в main
+  (через новую ветку от актуального main, тесты в изолированной среде). Рабочие
+  базы, профиль, баланс и справочники без отдельного запроса не трогать.
+
 ## 25.10.2026 — короткая передача для НОВОГО чата
 
 - **Рабочий checkout — main**, путь:
