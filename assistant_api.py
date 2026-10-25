@@ -528,6 +528,213 @@ def is_submission_status_request(text):
     ))
 
 
+def _weekly_summary_request_kind(text, context):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    if is_submission_status_request(text):
+        return "status"
+    if re.search(r"\b(?:сводк\w*|ситуаци\w*)\b", normalized) or re.search(
+            r"\bкак\s+(?:дела|обстоят\s+дела)\b", normalized):
+        return "overview"
+    if re.search(r"\b(?:покажи\s+снова\s+)?по\s+всем\s+объект\w*\b", normalized):
+        return "all_objects"
+    if re.search(r"\bкто\s+там\s+работал\b", normalized):
+        return "object_staff"
+    if context and context["plan"]["purpose"] == "hours_summary":
+        if re.search(r"\b(?:предыдущ\w*|прошл\w*)\s+недел\w*\b", normalized):
+            return "previous_week"
+        if re.match(r"^(?:а\s+)?(?:на|по\s+объекту)\s+.+", normalized):
+            return "overview"
+    if context and context["pending"] in {"weekly_object", "weekly_object_staff"}:
+        return context["pending"]
+    if context and context["pending"] == "weekly_period":
+        return "weekly_period"
+    if context and context["pending"] == "weekly_scope":
+        if re.search(r"\b(?:вся\s+команд\w*|по\s+всем\s+объект\w*)\b", normalized):
+            return "all_objects"
+        return "weekly_object"
+    if re.match(r"^(?:а\s+)?(?:на|по\s+объекту)\s+.+", normalized):
+        return "overview"
+    if re.search(r"\b(?:предыдущ\w*|прошл\w*)\s+недел\w*\b", normalized):
+        return "previous_week"
+    return None
+
+
+def _summary_period(text, context, kind):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    previous = context["plan"] if context and context["plan"]["purpose"] == "hours_summary" else {}
+    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    monday = today - timedelta(days=today.weekday())
+    explicit = explicit_date_period(text)
+    if explicit:
+        return explicit
+    if re.search(r"\b(?:текущ\w*|эт\w*|за)\s+недел\w*\b", normalized):
+        return monday.isoformat(), today.isoformat()
+    if re.search(r"\b(?:прошл\w*|предыдущ\w*)\s+недел\w*\b", normalized):
+        if (previous and kind in {"previous_week", "weekly_object", "weekly_object_staff", "weekly_period"}
+                and kind != "status"):
+            selected_start = date.fromisoformat(previous["date_from"])
+            start = selected_start - timedelta(days=selected_start.weekday() + 7)
+        else:
+            start = monday - timedelta(days=7)
+        return start.isoformat(), (start + timedelta(days=6)).isoformat()
+    if previous and kind in {"all_objects", "object_staff", "overview", "status",
+                             "weekly_object", "weekly_object_staff", "weekly_period"}:
+        return previous["date_from"], previous["date_to"]
+    if kind == "status":
+        start = monday - timedelta(days=7)
+        return start.isoformat(), (start + timedelta(days=6)).isoformat()
+    return monday.isoformat(), today.isoformat()
+
+
+def _summary_object_candidates(conn, date_from, date_to):
+    candidates = {
+        (str(row["company"] or "").strip(), str(row["name"] or "").strip())
+        for row in conn.execute("SELECT company,name FROM meta_objects")
+        if str(row["name"] or "").strip()
+    }
+    candidates.update(
+        (str(row["company"] or "").strip(), str(row["object_name"] or "").strip())
+        for row in conn.execute(
+            "SELECT DISTINCT company,object_name FROM incoming_submissions "
+            "WHERE is_deleted=0 AND date>=? AND date<=? AND TRIM(COALESCE(object_name,''))<>''",
+            (date_from, date_to),
+        )
+        if str(row["object_name"] or "").strip()
+    )
+    return sorted(candidates, key=lambda item: (item[1].casefold(), item[0].casefold()))
+
+
+def _resolve_summary_object(conn, object_text, date_from, date_to, plan, question_kind):
+    question_field = "weekly_object_staff" if question_kind == "object_staff" else "weekly_object"
+    tokens = set(re.findall(
+        r"[a-z0-9]+", object_text.casefold().translate(_CYRILLIC_NAME_TRANSLATION),
+    ))
+    if not tokens:
+        raise AssistantQuestion(
+            question_field, question="Какой объект показать? Назовите его точное название.",
+            plan=plan,
+        )
+    matches = []
+    for company, name in _summary_object_candidates(conn, date_from, date_to):
+        name_tokens = set(re.findall(
+            r"[a-z0-9]+", name.casefold().translate(_CYRILLIC_NAME_TRANSLATION),
+        ))
+        company_tokens = set(re.findall(
+            r"[a-z0-9]+", company.casefold().translate(_CYRILLIC_NAME_TRANSLATION),
+        ))
+        available = name_tokens | company_tokens
+        if tokens <= name_tokens:
+            matches.append((len(name_tokens - tokens), company, name))
+        elif tokens & name_tokens and tokens <= available:
+            matches.append((len(available - tokens), company, name))
+    if not matches:
+        raise AssistantQuestion(
+            question_field,
+            question=f"Не нашёл объект «{object_text}». Укажите точное название из справочника.",
+            plan=plan,
+        )
+    best_score = min(match[0] for match in matches)
+    best = [(company, name) for score, company, name in matches if score == best_score]
+    if len(best) != 1:
+        raise AssistantQuestion(
+            question_field,
+            question="Нашёл несколько подходящих объектов. Уточните фирму и точное название.",
+            plan=plan,
+        )
+    return best[0]
+
+
+def weekly_summary_command(text, context, conn):
+    kind = _weekly_summary_request_kind(text, context)
+    if kind is None:
+        return None
+    date_from, date_to = _summary_period(text, context, kind)
+    previous = context["plan"] if context and context["plan"]["purpose"] == "hours_summary" else {}
+    plan = validate_plan(dict(
+        purpose="hours_summary", date_from=date_from, date_to=date_to,
+        employee="", company="", object_name="",
+    ))
+
+    if kind == "status":
+        explicit_employee = re.search(
+            r"\b(?:для\s+)?сотрудник\w*\s+(.+?)(?=\s+(?:за|на|с|прошл\w*\s+недел\w*|"
+            r"предыдущ\w*\s+недел\w*|текущ\w*\s+недел\w*)\b|$)",
+            text.strip(" .!?"), re.IGNORECASE,
+        )
+        if explicit_employee:
+            plan["employee"] = explicit_employee.group(1).strip(" ,.")
+        return plan, "status"
+
+    selected_company = selected_object = ""
+    if kind == "previous_week" and not previous:
+        raise AssistantQuestion(
+            "weekly_scope",
+            question="Показать всю команду или конкретный объект за прошлую неделю?",
+            plan=plan,
+        )
+    if kind == "previous_week":
+        kind = "overview"
+    if kind == "weekly_scope":
+        kind = "overview"
+    if kind in {"weekly_object", "weekly_object_staff"}:
+        kind = "overview" if kind == "weekly_object" else "object_staff"
+        object_text = text.strip(" \t.,!?")
+        selected_company, selected_object = _resolve_summary_object(
+            conn, object_text, date_from, date_to, plan, kind,
+        )
+    elif kind == "weekly_period":
+        kind = "overview"
+        selected_company = previous.get("company", "")
+        selected_object = previous.get("object_name", "")
+        plan.update(company=selected_company, object_name=selected_object)
+        return plan, kind
+    elif kind == "all_objects" or re.search(
+            r"\b(?:покажи\s+снова\s+)?по\s+всем\s+объект\w*\b", text, re.IGNORECASE):
+        kind = "overview"
+        return plan, kind
+    elif kind == "object_staff":
+        selected_company = previous.get("company", "")
+        selected_object = previous.get("object_name", "")
+        if not selected_object:
+            plan["date_from"], plan["date_to"] = date_from, date_to
+            raise AssistantQuestion(
+                "weekly_object_staff",
+                question="Какой объект показать? Назовите его точное название.",
+                plan=plan,
+            )
+    else:
+        object_match = re.search(
+            r"\b(?:на|по\s+объекту)\s+(.+?)\s*[?.!,;]*$",
+            strip_no_change_suffix(text), re.IGNORECASE,
+        )
+        if object_match:
+            object_text = re.split(
+                r"\s+(?:за|с)\s+", object_match.group(1).strip(), maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+            selected_company, selected_object = _resolve_summary_object(
+                conn, object_text, date_from, date_to, plan, "overview",
+            )
+            if not previous and not explicit_date_period(text) and not re.search(
+                    r"\b(?:прошл\w*|предыдущ\w*|текущ\w*|эт\w*)\s+недел\w*\b",
+                    text.casefold()):
+                plan.update(company=selected_company, object_name=selected_object)
+                raise AssistantQuestion(
+                    "weekly_period",
+                    question="За какой период показать объект: текущую или прошлую неделю?",
+                    plan=plan,
+                )
+        elif kind == "previous_week":
+            selected_company = previous.get("company", "")
+            selected_object = previous.get("object_name", "")
+        elif previous and kind == "overview":
+            selected_company = previous.get("company", "")
+            selected_object = previous.get("object_name", "")
+
+    plan.update(company=selected_company, object_name=selected_object)
+    return plan, kind
+
+
 def recognized_read_command(text, context=None):
     text = strip_no_change_suffix(text)
     normalized = " ".join(text.casefold().strip(" .!?").split())
@@ -634,7 +841,7 @@ def compact_hours_summary(result):
     result["summary_only"] = True
 
 
-def submission_hours_summary(conn, plan, *, director_status=False):
+def submission_hours_summary(conn, plan, *, director_status=False, summary_view="status"):
     profiles_by_key = {}
     profiles = list(conn.execute("SELECT id,name,is_active FROM meta_employees"))
     for profile in profiles:
@@ -666,6 +873,7 @@ def submission_hours_summary(conn, plan, *, director_status=False):
         values.append(plan["object_name"])
 
     totals = {}
+    object_totals = {}
     processed = 0
     work_records_processed = 0
     query = (
@@ -709,6 +917,12 @@ def submission_hours_summary(conn, plan, *, director_status=False):
         if kind in {"work", "ob"}:
             employee_totals[kind] += hours
             work_records_processed += 1
+            object_key = (str(raw["company"] or "").strip(), str(raw["object_name"] or "").strip())
+            object_entry = object_totals.setdefault(object_key, {
+                "work": Decimal("0"), "ob": Decimal("0"), "records": 0,
+            })
+            object_entry[kind] += hours
+            object_entry["records"] += 1
             if profile:
                 profile_totals = status_by_profile_id[profile["id"]]
                 profile_totals[kind] += hours
@@ -792,15 +1006,192 @@ def submission_hours_summary(conn, plan, *, director_status=False):
 
         active_with_hours = []
         active_without_hours = []
+        active_ambiguous = []
         for profile in active_profiles:
-            if status_by_profile_id[profile["id"]]["dates"]:
+            profile_key = " ".join(str(profile["name"] or "").split()).casefold()
+            ambiguous_record = (
+                len(profiles_by_key.get(profile_key, [])) > 1
+                and bool(status_by_unlinked_name.get(profile_key, {}).get("dates"))
+            )
+            if ambiguous_record:
+                active_ambiguous.append(profile)
+            elif status_by_profile_id[profile["id"]]["dates"]:
                 active_with_hours.append(profile)
             else:
                 active_without_hours.append(profile)
+        if summary_view in {"overview", "object_staff"}:
+            summary_rows = []
+
+            def append_summary_row(group, name, entry):
+                regular, ob = entry["work"], entry["ob"]
+                hours = regular + ob
+                days = len(entry["dates"])
+                summary_rows.append([
+                    group, name, f"{days} {day_label(days)}, {display(hours)} {hour_label(hours)}",
+                    display(regular), display(ob), display(hours),
+                ])
+
+            if summary_view == "overview":
+                for profile in active_without_hours:
+                    summary_rows.append([
+                        "Без внесённых часов", profile["name"], "0 дней, 0 часов", "0", "0", "0",
+                    ])
+            for profile in active_ambiguous:
+                summary_rows.append([
+                    "Неоднозначная связь",
+                    f"{profile['name']} (профиль {profile['id']})",
+                    "Часы нельзя связать однозначно", "—", "—", "—",
+                ])
+            for profile in active_with_hours:
+                append_summary_row("Действующий сотрудник", profile["name"],
+                                   status_by_profile_id[profile["id"]])
+            for profile in inactive_profiles:
+                append_summary_row("Исторические записи", profile["name"],
+                                   status_by_profile_id[profile["id"]])
+            unlinked_rows = sorted(status_by_unlinked_name.values(),
+                                   key=lambda item: item["employee"].casefold())
+            for entry in unlinked_rows:
+                append_summary_row("Нет однозначной связи", entry["employee"], entry)
+
+            object_breakdown = []
+            for (company, object_name), entry in sorted(
+                    object_totals.items(), key=lambda item: (item[0][0].casefold(), item[0][1].casefold())):
+                label = object_name or "Без объекта"
+                if company:
+                    label = f"{company} / {label}"
+                object_breakdown.append({
+                    "company": company, "object_name": object_name, "label": label,
+                    "work_hours": display(entry["work"]), "ob_hours": display(entry["ob"]),
+                    "hours": display(entry["work"] + entry["ob"]), "records": entry["records"],
+                })
+            if summary_view == "overview":
+                object_rows = [
+                    [
+                        "Объект", entry["label"], f'{entry["records"]} записей',
+                        entry["work_hours"], entry["ob_hours"], entry["hours"],
+                    ]
+                    for entry in object_breakdown
+                ]
+                summary_rows = object_rows + summary_rows
+
+            all_regular = sum(
+                (entry["work"] for entry in status_by_profile_id.values()), Decimal("0")
+            ) + sum((entry["work"] for entry in unlinked_rows), Decimal("0"))
+            all_ob = sum(
+                (entry["ob"] for entry in status_by_profile_id.values()), Decimal("0")
+            ) + sum((entry["ob"] for entry in unlinked_rows), Decimal("0"))
+            all_work = all_regular + all_ob
+            object_total = sum(
+                (entry["work"] + entry["ob"] for entry in object_totals.values()), Decimal("0")
+            )
+            if object_total != all_work:
+                raise AssistantError("Итоги по объектам не сходятся с итогом рабочих часов; сводка остановлена.")
+
+            active_work = sum(
+                (status_by_profile_id[profile["id"]]["work"] +
+                 status_by_profile_id[profile["id"]]["ob"] for profile in active_profiles),
+                Decimal("0"),
+            )
+            historical_work = sum(
+                (status_by_profile_id[profile["id"]]["work"] +
+                 status_by_profile_id[profile["id"]]["ob"] for profile in inactive_profiles),
+                Decimal("0"),
+            )
+            unlinked_work = sum(
+                (entry["work"] + entry["ob"] for entry in unlinked_rows), Decimal("0"),
+            )
+            today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+            week_start = today - timedelta(days=today.weekday())
+            week_end = week_start + timedelta(days=6)
+            selected_start = date.fromisoformat(plan["date_from"])
+            selected_end = date.fromisoformat(plan["date_to"])
+            preliminary = selected_start <= week_end and selected_end >= week_start
+            scope = (
+                f"Объект: {plan['company']} / {plan['object_name']}."
+                if plan["object_name"] else "Охват: Все объекты."
+            )
+            summary_lines = [f"Период: {plan['date_from']} — {plan['date_to']}. {scope}"]
+            if summary_view == "overview":
+                missing_names = ", ".join(profile["name"] for profile in active_without_hours) or "нет"
+                summary_lines.extend([
+                    f"Без внесённых часов: {missing_names}.",
+                    f"Внесли часы: {len(active_with_hours)} из {len(active_profiles)} действующих сотрудников.",
+                    f"Рабочих часов всего: {display(all_work)}; обычные {display(all_regular)}, "
+                    f"OB {display(all_ob)} (OB уже включён в итог).",
+                    f"Обработано записей: {processed}, рабочих записей work/OB: {work_records_processed}; "
+                    f"действующих сотрудников в справочнике: {len(active_profiles)}.",
+                ])
+                if active_ambiguous:
+                    summary_lines.append(
+                        f"Неоднозначная связь со справочником: {len(active_ambiguous)} профилей; "
+                        "их нельзя точно отнести к списку с часами или без часов."
+                    )
+                if historical_work or unlinked_work:
+                    summary_lines.append(
+                        f"В общий итог также входят исторические часы {display(historical_work)} "
+                        f"и часы без однозначной связи {display(unlinked_work)}."
+                    )
+                summary_lines.append("Часы по объектам (обычные + OB):")
+                if object_breakdown:
+                    summary_lines.extend(
+                        f"• {entry['label']}: {entry['hours']} ч "
+                        f"(обычные {entry['work_hours']}, OB {entry['ob_hours']})"
+                        for entry in object_breakdown[:10]
+                    )
+                    if len(object_breakdown) > 10:
+                        summary_lines.append(
+                            f"Полный список объектов ({len(object_breakdown)}) показан в таблице."
+                        )
+                else:
+                    summary_lines.append("За период рабочих записей нет.")
+            else:
+                summary_lines.append(
+                    f"Работали: {len(summary_rows)} сотрудников; отработано {display(all_work)} ч "
+                    "(обычные + OB, без двойного учёта)."
+                )
+            summary_lines.append(
+                "Статистика внесённых данных; список без часов не учитывает отпуска и отсутствие работы. "
+                "Наличие записи не означает, что сотрудник заполнил весь период."
+            )
+            if preliminary:
+                summary_lines.append("Текущая неделя — результат предварительный.")
+            return {
+                "table": {
+                    "headers": [
+                        "Раздел", "Объект / сотрудник", "Записи / дни и часы",
+                        "Обычные, ч", "OB, ч", "Итого, ч",
+                    ],
+                    "rows": summary_rows,
+                },
+                "summary": "\n".join(summary_lines),
+                "processed_records": processed,
+                "work_records_processed": work_records_processed,
+                "employee_count": len(active_profiles),
+                "employees_with_hours": len(active_with_hours),
+                "employees_without_hours": len(active_without_hours),
+                "employees_with_ambiguous_records": len(active_ambiguous),
+                "overall_work_hours": display(all_work),
+                "active_work_hours": display(active_work),
+                "historical_work_hours": display(historical_work),
+                "unlinked_work_hours": display(unlinked_work),
+                "object_breakdown": object_breakdown,
+                "object_count": len(object_breakdown),
+                "duplicate_groups": [],
+                "duplicate_record_count": 0,
+                "warnings": [
+                    "Без графика нельзя определить, кто обязан был сдать часы; отсутствие записи этого не доказывает."
+                ],
+            }
         for profile in active_without_hours:
             append_profile(profile, "Без внесённых часов")
         for profile in active_with_hours:
             append_profile(profile, "Внесли часы")
+        for profile in active_ambiguous:
+            rows.append([
+                "Неоднозначная связь",
+                f'{profile["name"]} (профиль {profile["id"]})',
+                "Часы нельзя связать однозначно", "—", "—",
+            ])
         for profile in inactive_profiles:
             append_profile(profile, "Исторические записи")
         unlinked_rows = sorted(status_by_unlinked_name.values(),
@@ -837,6 +1228,11 @@ def submission_hours_summary(conn, plan, *, director_status=False):
             f"рабочих часов {display(active_work)} (обычные {display(active_regular)}, "
             f"OB {display(active_ob)}, включён в общий итог один раз).",
         ]
+        if active_ambiguous:
+            summary_lines.append(
+                f"Неоднозначная связь со справочником: {len(active_ambiguous)} профилей; "
+                "их нельзя точно отнести к списку с часами или без часов."
+            )
         inactive_count = len(inactive_profiles)
         if inactive_count:
             inactive_hours = sum(
@@ -880,6 +1276,7 @@ def submission_hours_summary(conn, plan, *, director_status=False):
             "employee_count": len(active_profiles),
             "submitted_employee_count": submitted_count,
             "employees_without_hours": len(active_without_hours),
+            "employees_with_ambiguous_records": len(active_ambiguous),
             "active_work_hours": display(active_work),
             "active_regular_hours": display(active_regular),
             "active_ob_hours": display(active_ob),
@@ -996,7 +1393,7 @@ def submission_hours_summary(conn, plan, *, director_status=False):
     }
 
 
-def select_plan(text, conn, actor, operation, post=None, context=None):
+def select_plan(text, conn, actor, operation, post=None, context=None, summary_view=None):
     post = post or requests.post
     if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 8000:
         raise AssistantError("Введите команду длиной не более 8000 байт.")
@@ -1005,11 +1402,17 @@ def select_plan(text, conn, actor, operation, post=None, context=None):
     normalized = " ".join(text.casefold().strip(" .!?").split())
     date_period = explicit_date_period(text)
     try:
-        known_plan = report_command(text, safe_context, conn)
+        weekly_route = weekly_summary_command(text, safe_context, conn)
+        if weekly_route:
+            known_plan, view = weekly_route
+            if summary_view is not None:
+                summary_view["value"] = view
+        else:
+            known_plan = report_command(text, safe_context, conn)
         if not known_plan:
-            known_plan = transport_command(text, safe_context)
+            known_plan = None if weekly_route else transport_command(text, safe_context)
         if not known_plan:
-            known_plan = recognized_read_command(text, safe_context)
+            known_plan = None if weekly_route else recognized_read_command(text, safe_context)
     except AssistantQuestion as question:
         purpose = question.plan["purpose"] if question.plan else "transport_check"
         reserve(conn, actor, operation, purpose, 0, requires_provider=False)
@@ -1124,7 +1527,8 @@ def validate_context(context):
     if not isinstance(context, dict) or set(context) != {"plan", "pending"}:
         raise AssistantError("Контекст диалога повреждён. Начните новый диалог.")
     if not isinstance(context["pending"], str) or context["pending"] not in {
-        "", "period", "scope", "object", "report_type", "unsupported"
+        "", "period", "scope", "object", "report_type", "unsupported",
+        "weekly_object", "weekly_object_staff", "weekly_period", "weekly_scope"
     }:
         raise AssistantError("Неизвестное уточнение диалога.")
     return dict(plan=validate_plan(context["plan"]).copy(), pending=context["pending"])
@@ -1221,11 +1625,18 @@ def resolve_selection(conn, plan):
     if plan["object_name"] or plan["company"]:
         rows = conn.execute("SELECT id,name,company FROM meta_objects ORDER BY company,name,id").fetchall()
         candidates = [row for row in rows if
-                      (not plan["company"] or plan["company"].casefold() in row["company"].casefold()) and
+                      (not plan["company"] or plan["company"].casefold() in str(row["company"] or "").casefold()) and
                       (not plan["object_name"] or plan["object_name"].casefold() in row["name"].casefold())]
         exact = [row for row in candidates if row["name"].casefold() == plan["object_name"].casefold()
-                 and (not plan["company"] or row["company"].casefold() == plan["company"].casefold())]
+                 and (not plan["company"] or str(row["company"] or "").casefold() == plan["company"].casefold())]
         matches = exact or candidates
+        if not matches and plan["purpose"] == "hours_summary" and plan["object_name"]:
+            matches = conn.execute(
+                "SELECT NULL AS id, object_name AS name, company FROM incoming_submissions "
+                "WHERE is_deleted=0 AND object_name=? AND (?='' OR company=?) "
+                "GROUP BY company,object_name",
+                (plan["object_name"], plan["company"], plan["company"]),
+            ).fetchall()
         if plan["object_name"] or plan["purpose"] in OBJECT_ACTIONS:
             if len(matches) != 1:
                 raise AssistantQuestion("object", question="Какой объект выбрать? Укажите фирму и объект."
@@ -1257,7 +1668,7 @@ def resolve_selection(conn, plan):
     return plan
 
 
-def inspect(conn, plan, *, begin_snapshot=True, director_status=False):
+def inspect(conn, plan, *, begin_snapshot=True, director_status=False, summary_view="status"):
     plan = resolve_selection(conn, validate_plan(plan))
     conn.execute("PRAGMA query_only=ON")
     if begin_snapshot:
@@ -1286,7 +1697,9 @@ def inspect(conn, plan, *, begin_snapshot=True, director_status=False):
                     (plan["object_name"], plan["company"])).fetchone())
         return result
     if plan["purpose"] == "hours_summary":
-        result = submission_hours_summary(conn, plan, director_status=director_status)
+        result = submission_hours_summary(
+            conn, plan, director_status=director_status, summary_view=summary_view,
+        )
         employee = None
         if plan["employee"]:
             employee_row = conn.execute(
@@ -1651,10 +2064,16 @@ def register_assistant(app, connect, authenticate):
             data = request.get_json(silent=True)
             if not isinstance(data, dict) or set(data) not in ({"text", "operation_id"}, {"text", "operation_id", "context"}):
                 raise AssistantError("Ожидаются текст и идентификатор операции.")
-            plan = select_plan(data["text"], conn, actor, data["operation_id"], context=data.get("context"))
+            selected_summary_view = {}
+            plan = select_plan(
+                data["text"], conn, actor, data["operation_id"], context=data.get("context"),
+                summary_view=selected_summary_view,
+            )
             status_request = is_submission_status_request(data["text"])
             results = (inspect_workflow(conn, plan["workflow"]) if "workflow" in plan else
-                       [inspect(conn, plan, director_status=status_request)])
+                       [inspect(conn, plan, director_status=(
+                           status_request or selected_summary_view.get("value") in {"overview", "object_staff"}
+                       ), summary_view=selected_summary_view.get("value", "status"))])
             if plan.get("purpose") == "hours_summary" and wants_hours_summary_only(data["text"]):
                 compact_hours_summary(results[0])
             conn.commit()

@@ -1035,7 +1035,7 @@ class AssistantApiTests(unittest.TestCase):
 
         before = self.business()
         context = dict(
-            plan=plan("hours_summary", date_from="2026-10-19", date_to="2026-10-25",
+            plan=plan("hours_summary", date_from="2026-10-12", date_to="2026-10-18",
                       employee="Multi Entry", company="Renatur", object_name="Main"),
             pending="",
         )
@@ -1239,6 +1239,23 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual(result["table"]["rows"][0][2], "601")
         self.assertEqual(result["table"]["rows"][-1][-1], 601)
         self.assertIn("без лимита 500", result["source"])
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock:
+            clock.now.return_value = fixed_now
+            weekly = self.post("command", dict(
+                text="Сводка за неделю",
+                operation_id=str(uuid.uuid4()),
+            ))
+        self.assertEqual(weekly.status_code, 200, weekly.get_json())
+        weekly_result = weekly.get_json()["result"]
+        self.assertEqual(weekly_result["processed_records"], 601)
+        self.assertEqual(weekly_result["work_records_processed"], 601)
+        self.assertEqual(weekly_result["overall_work_hours"], "601")
+        self.assertEqual(weekly_result["object_count"], 601)
+        self.assertEqual(sum(int(row["records"]) for row in weekly_result["object_breakdown"]), 601)
+        full_object_rows = [row for row in weekly_result["table"]["rows"] if row[0] == "Объект"]
+        self.assertEqual(len(full_object_rows), 601)
+        self.assertIn("Полный список объектов (601) показан в таблице.", weekly_result["summary"])
         self.assertEqual(before, self.business())
 
     def test_integrated_hours_summary_does_not_count_ob_twice_or_special_time_as_work(self):
@@ -1936,6 +1953,256 @@ class AssistantApiTests(unittest.TestCase):
             self.assertEqual(self.post("mail/prepare", payload).status_code, 400)
             smtp.assert_not_called()
 
+    def test_weekly_overview_followups_keep_period_and_reset_team_scope(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE meta_employees SET is_active=0")
+            conn.executemany(
+                "INSERT INTO meta_employees(name,is_active) VALUES(?,1)",
+                [("Alpha Worker",), ("Beta Worker",), ("No Hours",)],
+            )
+            conn.execute("INSERT INTO meta_employees(name,is_active) VALUES('Historical Worker',0)")
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate,is_active) "
+                "VALUES(?,?,0,0,?)",
+                [
+                    ("Renatur", "Tomteboda ÄTA", 1),
+                    ("Renatur", "Hotel", 1),
+                    ("Archive Firm", "Old Object", 0),
+                ],
+            )
+
+            def add(identifier, day, employee, hours, kind, company, object_name):
+                conn.execute(
+                    """INSERT INTO incoming_submissions
+                       (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                        submission_type,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,0,0,?,'2026-10-25','2026-10-25')""",
+                    (identifier, identifier, day, employee, company, object_name, hours, kind),
+                )
+
+            add("week-alpha-1", "2026-10-20", "Alpha Worker", 5, "work", "Renatur", "Tomteboda ÄTA")
+            add("week-alpha-ob", "2026-10-20", "Alpha Worker", 3, "ob", "Renatur", "Tomteboda ÄTA")
+            add("week-alpha-2", "2026-10-21", "Alpha Worker", 4, "work", "Renatur", "Tomteboda ÄTA")
+            add("week-beta", "2026-10-20", "Beta Worker", 2, "work", "Renatur", "Hotel")
+            add("week-historical", "2026-10-19", "Historical Worker", 2, "ob",
+                "Archive Firm", "Old Object")
+            add("week-unlinked", "2026-10-22", "Unknown Worker", 1, "work", "Renatur", "")
+            add("week-transport", "2026-10-20", "Beta Worker", 40, "transport", "Renatur", "Hotel")
+            conn.commit()
+
+        before = self.business()
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        context = None
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+
+            def ask(text):
+                payload = dict(text=text, operation_id=str(uuid.uuid4()))
+                if context is not None:
+                    payload["context"] = context
+                response = self.post("command", payload)
+                self.assertEqual(response.status_code, 200, response.get_json())
+                body = response.get_json()
+                self.assertNotIn("clarification", body, body)
+                return body["result"]
+
+            result = ask("Покажи ситуацию за неделю")
+            context = result["context"]
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-19", "2026-10-25"),
+            )
+            self.assertIn("Рабочих часов всего: 17", result["summary"])
+            self.assertIn("обычные 12, OB 5", result["summary"])
+            self.assertIn("Внесли часы: 2 из 3", result["summary"])
+            self.assertIn("Без внесённых часов: No Hours", result["summary"])
+            self.assertIn("Renatur / Tomteboda ÄTA: 12 ч", result["summary"])
+            self.assertIn("Renatur / Hotel: 2 ч", result["summary"])
+            self.assertIn("исторические часы 2", result["summary"])
+            self.assertIn("Текущая неделя — результат предварительный", result["summary"])
+            rows = {row[1]: row for row in result["table"]["rows"]}
+            self.assertEqual(rows["Alpha Worker"][2], "2 дня, 12 часов")
+            self.assertIn("Исторические записи", [row[0] for row in result["table"]["rows"]])
+            self.assertEqual(result["object_count"], 4)
+            self.assertEqual(sum(int(row["hours"]) for row in result["object_breakdown"]), 17)
+            self.assertEqual(result["processed_records"], 7)
+            self.assertEqual(result["work_records_processed"], 6)
+
+            object_result = ask("А на Tomteboda?")
+            context = object_result["context"]
+            self.assertEqual(object_result["plan"]["object_name"], "Tomteboda ÄTA")
+            self.assertIn("Объект: Renatur / Tomteboda ÄTA", object_result["summary"])
+            self.assertEqual(object_result["overall_work_hours"], "12")
+
+            staff_result = ask("Кто там работал?")
+            context = staff_result["context"]
+            self.assertEqual(staff_result["plan"]["object_name"], "Tomteboda ÄTA")
+            self.assertEqual([row[1] for row in staff_result["table"]["rows"]], ["Alpha Worker"])
+            self.assertEqual(staff_result["table"]["rows"][0][2], "2 дня, 12 часов")
+
+            previous = ask("А за предыдущую неделю?")
+            context = previous["context"]
+            self.assertEqual(
+                (previous["plan"]["date_from"], previous["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            self.assertEqual(previous["plan"]["object_name"], "Tomteboda ÄTA")
+            self.assertEqual(previous["overall_work_hours"], "0")
+
+            team_status = ask("Кто не внёс часы?")
+            context = team_status["context"]
+            self.assertEqual(team_status["plan"]["employee"], "")
+            self.assertEqual(team_status["plan"]["company"], "")
+            self.assertEqual(team_status["plan"]["object_name"], "")
+            self.assertEqual(
+                (team_status["plan"]["date_from"], team_status["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+
+            all_objects = ask("Покажи снова по всем объектам")
+            context = all_objects["context"]
+            self.assertEqual(all_objects["plan"]["object_name"], "")
+            self.assertEqual(
+                (all_objects["plan"]["date_from"], all_objects["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            missing = ask("Кто не внёс часы?")
+            self.assertEqual(missing["plan"]["object_name"], "")
+            self.assertEqual(missing["plan"]["company"], "")
+            self.assertEqual(
+                (missing["plan"]["date_from"], missing["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            provider.assert_not_called()
+        self.assertEqual(before, self.business())
+
+    def test_weekly_summary_ambiguous_object_requests_clarification(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.executemany(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate) VALUES(?,?,0,0)",
+                [("Firm One", "Bridge"), ("Firm Two", "Bridge")],
+            )
+            conn.commit()
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+            response = self.post("command", dict(
+                text="А на Bridge?",
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(response.status_code, 200, response.get_json())
+            clarification = response.get_json()["clarification"]
+            self.assertEqual(clarification["field"], "weekly_object")
+            self.assertIn("несколько подходящих", clarification["question"])
+            self.assertEqual(clarification["choices"], [])
+            selected = self.post("command", dict(
+                text="Firm One Bridge",
+                context=dict(plan=clarification["plan"], pending=clarification["field"]),
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(selected.status_code, 200, selected.get_json())
+            self.assertEqual(selected.get_json()["result"]["plan"]["company"], "Firm One")
+            self.assertEqual(selected.get_json()["result"]["plan"]["object_name"], "Bridge")
+            provider.assert_not_called()
+
+    def test_weekly_summary_object_period_clarification_preserves_object(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute(
+                "INSERT INTO meta_objects(company,name,rate,transport_rate) VALUES('Firm One','Site Alpha',0,0)"
+            )
+            conn.commit()
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+            first = self.post("command", dict(text="А на Site Alpha?", operation_id=str(uuid.uuid4())))
+            self.assertEqual(first.status_code, 200, first.get_json())
+            clarification = first.get_json()["clarification"]
+            self.assertEqual(clarification["field"], "weekly_period")
+            self.assertEqual(clarification["plan"]["object_name"], "Site Alpha")
+            continued = self.post("command", dict(
+                text="За прошлую неделю",
+                context=dict(plan=clarification["plan"], pending=clarification["field"]),
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(continued.status_code, 200, continued.get_json())
+            result = continued.get_json()["result"]
+            self.assertEqual(result["plan"]["object_name"], "Site Alpha")
+            self.assertEqual(result["plan"]["company"], "Firm One")
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            provider.assert_not_called()
+
+    def test_weekly_summary_missing_scope_asks_once_then_uses_team(self):
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock, patch("assistant_api.requests.post") as provider:
+            clock.now.return_value = fixed_now
+            first = self.post("command", dict(
+                text="А за предыдущую неделю?",
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(first.status_code, 200, first.get_json())
+            clarification = first.get_json()["clarification"]
+            self.assertEqual(clarification["field"], "weekly_scope")
+            self.assertIn("всю команду", clarification["question"])
+            continued = self.post("command", dict(
+                text="Вся команда",
+                context=dict(plan=clarification["plan"], pending=clarification["field"]),
+                operation_id=str(uuid.uuid4()),
+            ))
+            self.assertEqual(continued.status_code, 200, continued.get_json())
+            result = continued.get_json()["result"]
+            self.assertIn("Все объекты", result["summary"])
+            self.assertEqual(
+                (result["plan"]["date_from"], result["plan"]["date_to"]),
+                ("2026-10-12", "2026-10-18"),
+            )
+            provider.assert_not_called()
+
+    def test_weekly_summary_does_not_mark_ambiguous_profiles_as_missing(self):
+        with closing(self.server.get_db_connection()) as conn:
+            conn.execute("UPDATE meta_employees SET is_active=0")
+            conn.executemany(
+                "INSERT INTO meta_employees(name,is_active) VALUES(?,1)",
+                [("Twin Worker",), (" twin worker ",)],
+            )
+            conn.execute(
+                """INSERT INTO incoming_submissions
+                   (sync_id,request_id,date,employee,company,object_name,hours,rate,transport,
+                    submission_type,created_at,updated_at)
+                   VALUES('ambiguous-worker','ambiguous-worker','2026-10-20','twin   worker',
+                          'Renatur','Main',4,0,0,'work','2026-10-20','2026-10-20')"""
+            )
+            conn.commit()
+        fixed_now = datetime(2026, 10, 25, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+        with patch("assistant_api.datetime") as clock:
+            clock.now.return_value = fixed_now
+            response = self.post("command", dict(
+                text="Сводка за неделю",
+                operation_id=str(uuid.uuid4()),
+            ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()["result"]
+        self.assertEqual(result["employee_count"], 2)
+        self.assertEqual(result["employees_with_hours"], 0)
+        self.assertEqual(result["employees_without_hours"], 0)
+        self.assertEqual(result["employees_with_ambiguous_records"], 2)
+        ambiguous = [row for row in result["table"]["rows"] if row[0] == "Неоднозначная связь"]
+        self.assertEqual(len(ambiguous), 2)
+        self.assertIn("Без внесённых часов: нет.", result["summary"])
+
+    def test_weekly_summary_calendar_periods_cross_year_and_stockholm_dst(self):
+        for fixed_now, expected in (
+            (datetime(2027, 1, 3, 12, tzinfo=ZoneInfo("Europe/Stockholm")),
+             ("2026-12-28", "2027-01-03")),
+            (datetime(2027, 3, 29, 0, 30, tzinfo=ZoneInfo("Europe/Stockholm")),
+             ("2027-03-29", "2027-03-29")),
+        ):
+            with patch("assistant_api.datetime") as clock:
+                clock.now.return_value = fixed_now
+                self.assertEqual(assistant._summary_period("Сводка за неделю", None, "overview"), expected)
+
 
 class AssistantUiTests(unittest.TestCase):
     setUpClass = classmethod(cards.EmployeeCardTests.setUpClass.__func__)
@@ -1987,6 +2254,36 @@ class AssistantUiTests(unittest.TestCase):
         self.assertFalse(dialog.confirm_mail.isEnabled())
         rendered = result_text(dict(plan=plan(), source="Test", notice="No changes", records=[]))
         self.assertIn("записей нет", rendered)
+
+    def test_weekly_summary_command_and_followup_keep_displayed_context(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+
+        dialog.input.setPlainText("Сводка за неделю")
+        with patch.object(dialog, "call") as api:
+            dialog.command()
+        self.assertEqual(api.call_args.args[0], "command")
+        self.assertEqual(api.call_args.args[1]["text"], "Сводка за неделю")
+        self.assertEqual(api.call_args.args[1]["context"]["plan"]["employee"], "")
+
+        selected = plan(
+            "hours_summary", date_from="2026-10-19", date_to="2026-10-25",
+            company="Renatur", object_name="Tomteboda ÄTA",
+        )
+        dialog.received(dict(result={
+            "plan": selected, "records": [], "table": {"headers": [], "rows": []},
+            "summary": "Тестовая сводка", "source": "Тестовый сервер", "notice": "",
+        }))
+        dialog.input.setPlainText("А за предыдущую неделю?")
+        with patch.object(dialog, "call") as api:
+            dialog.command()
+        payload = api.call_args.args[1]
+        self.assertEqual(payload["text"], "А за предыдущую неделю?")
+        self.assertEqual(payload["context"]["plan"]["date_from"], "2026-10-19")
+        self.assertEqual(payload["context"]["plan"]["object_name"], "Tomteboda ÄTA")
 
     def test_connected_candidate_blocks_mutating_and_mail_capabilities(self):
         from assistant_ui import AssistantDialog, RequestWorker
