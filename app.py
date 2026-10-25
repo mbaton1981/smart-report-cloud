@@ -48,6 +48,7 @@ import payroll_history
 import payroll_ui
 import employee_cards
 import desktop_theme
+import input_safety
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -2532,6 +2533,11 @@ class SmartReportApp(QMainWindow):
             filter_select_row.addWidget(filter_combo, 1)
 
         filter_layout.addLayout(filter_date_row)
+        self.shift_period_warning = QLabel(input_safety.PERIOD_WARNING)
+        self.shift_period_warning.setWordWrap(True)
+        desktop_theme.apply_style(self.shift_period_warning, "color: #f6ad55; font-weight: bold;")
+        self.shift_period_warning.setVisible(False)
+        filter_layout.addWidget(self.shift_period_warning)
         filter_layout.addLayout(filter_select_row)
         c_layout.addLayout(filter_layout)
 
@@ -2633,6 +2639,9 @@ class SmartReportApp(QMainWindow):
     def apply_shifts_filters(self):
         d_from = self.filter_date_from.text().strip()
         d_to = self.filter_date_to.text().strip()
+        warning = getattr(self, "shift_period_warning", None)
+        if warning is not None:
+            warning.setVisible(input_safety.period_reversed(d_from, d_to))
         
         emp_val = self.filter_emp.currentText()
         comp_val = self.filter_comp.currentText()
@@ -3735,7 +3744,7 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(calc_btn)
 
         preview_salary_pdf_btn = QPushButton("Предпросмотр PDF")
-        preview_salary_pdf_btn.clicked.connect(lambda: payroll_ui.preview(self, sys.modules[__name__]))
+        preview_salary_pdf_btn.clicked.connect(self.preview_salary_pdf)
         period_layout.addWidget(preview_salary_pdf_btn)
         export_salary_pdf_btn = QPushButton("🖨 Экспорт зарплат в PDF")
         export_salary_pdf_btn.setObjectName("secondaryAction")
@@ -3743,7 +3752,12 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(export_salary_pdf_btn)
         period_layout.addStretch()
         card_layout.addLayout(period_layout)
-        self.sal_unknown_ob_button = QPushButton("OB не определён — показать записи…")
+        self.sal_period_warning = QLabel(input_safety.PERIOD_WARNING)
+        self.sal_period_warning.setWordWrap(True)
+        desktop_theme.apply_style(self.sal_period_warning, "color: #f6ad55; font-weight: bold;")
+        self.sal_period_warning.setVisible(False)
+        card_layout.addWidget(self.sal_period_warning)
+        self.sal_unknown_ob_button =  QPushButton("OB не определён — показать записи…")
         self.sal_unknown_ob_button.clicked.connect(lambda: payroll_ui.show_unknown_ob(self, sys.modules[__name__]))
         card_layout.addWidget(self.sal_unknown_ob_button)
         self.sal_norm_label = QLabel()
@@ -3864,7 +3878,24 @@ class SmartReportApp(QMainWindow):
             return
         self.table_salary.schedule_layout()
 
+    def salary_period_reversed(self, notify=False):
+        reversed_period = input_safety.period_reversed(self.sal_date_from.text(), self.sal_date_to.text())
+        warning = getattr(self, "sal_period_warning", None)
+        if warning is not None:
+            warning.setVisible(reversed_period)
+        if reversed_period and notify:
+            QMessageBox.warning(self, "Период зарплаты", input_safety.PERIOD_WARNING)
+        return reversed_period
+
+    def preview_salary_pdf(self):
+        if SmartReportApp.salary_period_reversed(self, notify=True):
+            return
+        return payroll_ui.preview(self, sys.modules[__name__])
+
     def load_salary_table_template(self):
+        if SmartReportApp.salary_period_reversed(self):
+            self.table_salary.setRowCount(0)
+            return
         if payroll_ui.management_mode(self):
             return payroll_ui.render(self, sys.modules[__name__])
         conn = get_db_connection()
@@ -4145,6 +4176,8 @@ class SmartReportApp(QMainWindow):
         self.load_salary_table_template()
 
     def export_salary_to_pdf(self):
+        if SmartReportApp.salary_period_reversed(self, notify=True):
+            return
         if payroll_ui.management_mode(self):
             return payroll_ui.export(self, sys.modules[__name__])
         try:
@@ -11607,6 +11640,7 @@ if __name__ == "__main__":
                 sys.exit(1)
             sys.exit(0)
         app = QApplication(sys.argv)
+        input_safety.install_wheel_guard(app)
         desktop_theme.ensure_theme(DARK_THEME_QSS)
         resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         icon_path = next((p for p in (resource_dir / "Logo.ico", Path("logo.ico")) if p.exists()), None)
