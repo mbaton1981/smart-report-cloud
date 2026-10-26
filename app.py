@@ -8339,13 +8339,21 @@ class SmartReportApp(QMainWindow):
         self.load_companies_into_combobox(self.inv_comp_cb)
         
         self.inv_obj_cb = QComboBox()
+        self.inv_show_archived = QCheckBox("Показать архивные")
+        self.inv_show_archived.setObjectName("invoice_show_archived")
         self.load_invoice_objects(self.inv_comp_cb.currentText())
         self.inv_comp_cb.currentTextChanged.connect(self.load_invoice_objects)
+        self.inv_show_archived.toggled.connect(
+            lambda _checked: self.load_invoice_objects(self.inv_comp_cb.currentText())
+        )
 
         card_layout.addRow("Период с:", self.inv_date_from)
         card_layout.addRow("Период по:", self.inv_date_to)
         card_layout.addRow("Фирма:", self.inv_comp_cb)
-        card_layout.addRow("Объект:", self.inv_obj_cb)
+        object_row = QHBoxLayout()
+        object_row.addWidget(self.inv_obj_cb, stretch=1)
+        object_row.addWidget(self.inv_show_archived)
+        card_layout.addRow("Объект:", object_row)
 
         fast_pris_box = QHBoxLayout()
         self.fast_pris_check = QCheckBox("📌 Фиксированная цена за объект (Fast pris)")
@@ -8445,31 +8453,48 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(self.invoice_ob_rules_lbl)
 
     def load_invoice_objects(self, company):
+        show_archived = self.inv_show_archived.isChecked()
         conn = get_db_connection()
+        has_status = any(column[1] == "is_active" for column in conn.execute("PRAGMA table_info(objects)"))
+        status_sql = "is_active" if has_status else "1"
         rows = conn.execute(
-            "SELECT id, name, markning, sync_id FROM objects WHERE company = ? ORDER BY name, id",
-            (company,),
+            f"SELECT id, name, markning, sync_id, {status_sql} AS is_active FROM objects "
+            f"WHERE company = ? AND ({status_sql} = 1 OR ? = 1) ORDER BY name, id",
+            (company, int(show_archived)),
         ).fetchall()
         conn.close()
-        items = [
-            (f"{row['markning']} | {row['name']}" if row['markning'] else row['name'],
-             int(row['id']), row['sync_id'])
-            for row in rows
-        ]
+        items = []
+        for row in rows:
+            display = f"{row['markning']} | {row['name']}" if row['markning'] else row['name']
+            if not row['is_active']:
+                display += " [Архив]"
+            items.append((display, int(row['id']), row['sync_id']))
         if not desktop_ui.combo_items_need_refresh(self.inv_obj_cb, items):
             return
         selected_id = self.inv_obj_cb.currentData()
         blocked = self.inv_obj_cb.blockSignals(True)
         self.inv_obj_cb.clear()
-        for row in rows:
-            display = f"{row['markning']} | {row['name']}" if row['markning'] else row['name']
-            self.inv_obj_cb.addItem(display, int(row['id']))
-            self.inv_obj_cb.setItemData(self.inv_obj_cb.count() - 1, row['sync_id'], Qt.ItemDataRole.UserRole + 1)
-        if selected_id is not None:
-            self.inv_obj_cb.setCurrentIndex(self.inv_obj_cb.findData(selected_id))
-        else:
-            self.inv_obj_cb.setCurrentIndex(-1)
+        for display, object_id, sync_id in items:
+            self.inv_obj_cb.addItem(display, object_id)
+            self.inv_obj_cb.setItemData(self.inv_obj_cb.count() - 1, sync_id, Qt.ItemDataRole.UserRole + 1)
+        selected_index = self.inv_obj_cb.findData(selected_id) if selected_id is not None else -1
+        self.inv_obj_cb.setCurrentIndex(selected_index)
         self.inv_obj_cb.blockSignals(blocked)
+        if selected_id is not None and selected_index < 0:
+            self._clear_invoice_preview()
+
+    def _clear_invoice_preview(self):
+        """Selected object is no longer listed: drop its stale preview without picking another object."""
+        if not hasattr(self, "invoice_summary_table"):
+            return
+        self._reset_fast_pris_draft()
+        self.table_invoice.setRowCount(0)
+        self.invoice_summary_table.clearContents()
+        self.invoice_summary_note.setText("Выберите объект и нажмите «Просмотр сводки и журнала».")
+        self.invoice_status_note.clear()
+        if hasattr(self, "table_dagbok"):
+            self._render_dagbok_report({"journal_rows": [], "journal_segments": {}})
+        self._invoice_report = None
 
     def setup_reporting_pages(self):
         layout = self.tab_invoice.layout()
@@ -11038,10 +11063,12 @@ class SmartReportApp(QMainWindow):
                 )
                 if reply == QMessageBox.StandardButton.Yes:
                     target = conn.execute(
-                        "SELECT id FROM objects WHERE sync_id=?", (fixed["object_sync_id"],),
+                        "SELECT * FROM objects WHERE sync_id=?", (fixed["object_sync_id"],),
                     ).fetchone()
                     if target is None:
                         raise ValueError("Объект связанного Fast pris не найден в справочнике. Откройте исходный отчёт вручную.")
+                    if "is_active" in target.keys() and not target["is_active"]:
+                        self.inv_show_archived.setChecked(True)
                     self.inv_comp_cb.setCurrentText(row["company"])
                     self.inv_date_from.setDate(QDate.fromString(fixed["date_from"], "yyyy-MM-dd"))
                     self.inv_date_to.setDate(QDate.fromString(fixed["date_to"], "yyyy-MM-dd"))

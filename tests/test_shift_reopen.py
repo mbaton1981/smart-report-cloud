@@ -332,6 +332,7 @@ class ReopenShiftTests(unittest.TestCase):
         window.inv_date_to = self.desktop.QDateEdit()
         window.inv_obj_cb = self.desktop.QComboBox()
         window.inv_obj_cb.addItem("Travel B", object_id)
+        window.inv_show_archived = self.desktop.QCheckBox()
         window.load_invoice_objects = lambda company: None
         window.tab_invoice = self.desktop.QWidget()
         window.tabs = self.desktop.QTabWidget()

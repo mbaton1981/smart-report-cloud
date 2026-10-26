@@ -1538,9 +1538,10 @@ class CatalogSyncTests(unittest.TestCase):
             window.deleteLater()
 
     def test_invoice_catalog_change_waits_until_popup_closes(self):
-        from PyQt6.QtWidgets import QComboBox
+        from PyQt6.QtWidgets import QCheckBox, QComboBox
         combo = QComboBox()
-        host = SimpleNamespace(inv_obj_cb=combo)
+        host = SimpleNamespace(inv_obj_cb=combo, inv_show_archived=QCheckBox(),
+                               _clear_invoice_preview=lambda: None)
         refresh = lambda company="Privat": self.desktop.SmartReportApp.load_invoice_objects(host, company)
         refresh()
         combo.setCurrentIndex(0)
@@ -1615,6 +1616,67 @@ class CatalogSyncTests(unittest.TestCase):
             desktop_conn.close()
             window.load_dropdowns()
             self.assertEqual(window.inv_obj_cb.currentIndex(), -1)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_archived_objects_are_display_filter_only(self):
+        conn = self.desktop.get_db_connection()
+        active_id = conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Renatur','ZZ active invoice','zz-active',520,450,?,1)
+        """, (str(uuid.uuid4()),)).lastrowid
+        archived_id = conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Renatur','ZZ archived invoice','zz-old',520,450,?,0)
+        """, (str(uuid.uuid4()),)).lastrowid
+        conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,is_active)
+            VALUES ('Privat','ZZ other company archive','zz-privat',520,450,?,0)
+        """, (str(uuid.uuid4()),))
+        conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,entry_type)
+            VALUES ('2026-10-05','Alice','Renatur','ZZ archived invoice',7,400,0,0,'work')
+        """)
+        self._confirm_fixture_customer_prices(conn)
+        conn.commit()
+        catalog_before = [tuple(row) for row in conn.execute("SELECT id,is_active FROM objects ORDER BY id")]
+        conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        try:
+            texts = lambda: [window.inv_obj_cb.itemText(i) for i in range(window.inv_obj_cb.count())]
+            self.assertFalse(window.inv_show_archived.isChecked())
+            window.inv_comp_cb.setCurrentText('Renatur')
+            self.assertGreaterEqual(window.inv_obj_cb.findData(active_id), 0)
+            self.assertEqual(window.inv_obj_cb.findData(archived_id), -1)
+            self.assertFalse(any('[Архив]' in text for text in texts()))
+            window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(active_id))
+            window.inv_show_archived.setChecked(True)
+            self.assertEqual(window.inv_obj_cb.currentData(), active_id)
+            archived_index = window.inv_obj_cb.findData(archived_id)
+            self.assertIn('[Архив]', window.inv_obj_cb.itemText(archived_index))
+            self.assertFalse(any('zz-privat' in text for text in texts()))
+            window.inv_obj_cb.setCurrentIndex(archived_index)
+            with patch.object(self.desktop.QMessageBox, 'warning') as warning:
+                report = window.generate_invoice()
+            warning.assert_not_called()
+            self.assertEqual([row[0] for row in report['rows']], ['Alice'])
+            self.assertEqual(report['rows'][0][1], 7)
+            self.assertGreater(window.table_invoice.rowCount(), 0)
+            window.inv_show_archived.setChecked(False)
+            self.assertEqual(window.inv_obj_cb.currentIndex(), -1)
+            self.assertIsNone(window.inv_obj_cb.currentData())
+            self.assertEqual(window.table_invoice.rowCount(), 0)
+            self.assertIsNone(window._invoice_report)
+            conn = self.desktop.get_db_connection()
+            self.assertEqual(
+                [tuple(row) for row in conn.execute("SELECT id,is_active FROM objects ORDER BY id")],
+                catalog_before,
+            )
+            conn.close()
         finally:
             window.close()
             window.deleteLater()
