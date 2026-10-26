@@ -2318,12 +2318,12 @@ class SmartReportApp(QMainWindow):
         self.tab_dagbok = QWidget()
         self.tab_sprav = QWidget()
         
-        self.tabs.addTab(self.tab_hours, "📝 Ввод часов")
-        self.tabs.addTab(self.tab_salary, "💰 Зарплата")
-        self.tabs.addTab(self.tab_balance, "⚖️ Баланс")
+        self.tabs.addTab(self.tab_hours, "Ввод часов")
+        self.tabs.addTab(self.tab_salary, "Зарплата")
+        self.tabs.addTab(self.tab_balance, "Баланс")
         self.tabs.addTab(self.tab_expenses, "Расходы")
-        self.tabs.addTab(self.tab_invoice, "📄 Отчёты и фактурирование")
-        self.tabs.addTab(self.tab_sprav, "📚 Справочники")
+        self.tabs.addTab(self.tab_invoice, "Отчёты и фактурирование")
+        self.tabs.addTab(self.tab_sprav, "Справочники")
 
         self.setup_hours_tab()
         self.setup_salary_tab()
@@ -2360,6 +2360,9 @@ class SmartReportApp(QMainWindow):
             self.tabs.insertTab(index, scroll_area, title)
         self.tabs.blockSignals(blocked)
         self.tabs.setCurrentIndex(current_tab)
+        desktop_theme.install_tab_icons(self.tabs, dict(enumerate(
+            ("hours", "salary", "balance", "expenses", "reports", "catalogs", "analytics")
+        )))
 
     def on_tab_changed(self, index):
         self.load_dropdowns(refresh_tables=False)

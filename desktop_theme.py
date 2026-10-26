@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import re
 
-from PyQt6.QtCore import QIODevice, QObject, QSaveFile, QSignalBlocker, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFontDatabase, QPainter, QPixmap
+from PyQt6.QtCore import QIODevice, QObject, QPointF, QRectF, QSaveFile, QSignalBlocker, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QBrush, QColor, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+)
 from PyQt6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton
 
 COLORS = {
@@ -67,19 +69,122 @@ def item_color(item, value, *, foreground=False):
         item.setBackground(color(value))
 
 
-def _logo():
-    pixmap = QPixmap(36, 36)
+def _canvas(size, scale=3):
+    pixmap = QPixmap(size * scale, size * scale)
+    pixmap.setDevicePixelRatio(scale)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    return pixmap, painter
+
+
+def _logo():
+    pixmap, painter = _canvas(32)
+    gradient = QLinearGradient(0, 0, 32, 32)
+    gradient.setColorAt(0, QColor("#4f86b5"))
+    gradient.setColorAt(1, QColor("#36628a"))
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#52718a"))
-    painter.drawRoundedRect(0, 0, 36, 36, 8, 8)
-    painter.setBrush(QColor("#eaf2f8"))
-    for x, y, height in ((9, 21, 7), (16, 15, 13), (23, 8, 20)):
-        painter.drawRoundedRect(x, y, 4, height, 1, 1)
+    painter.setBrush(gradient)
+    painter.drawRoundedRect(QRectF(0, 0, 32, 32), 8, 8)
+    painter.setBrush(QColor("#f3f8fc"))
+    for x, y, height in ((8, 18.5, 6.5), (14.25, 13, 12), (20.5, 7.5, 17.5)):
+        painter.drawRoundedRect(QRectF(x, y, 3.5, height), 1.5, 1.5)
     painter.end()
     return pixmap
+
+
+def line_icon(name, stroke, size=18):
+    """Simple stroked icons in one style for tabs and the theme switch."""
+    pixmap, painter = _canvas(size)
+    painter.scale(size / 24, size / 24)
+    pen = QPen(QColor(stroke), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    line = lambda *points: painter.drawLine(QPointF(*points[:2]), QPointF(*points[2:]))
+    if name == "hours":
+        painter.drawEllipse(QPointF(12, 12), 8.5, 8.5)
+        line(12, 7.5, 12, 12)
+        line(12, 12, 15.5, 14)
+    elif name == "salary":
+        painter.drawRoundedRect(QRectF(3.5, 6.5, 17, 12), 2.5, 2.5)
+        line(3.5, 10, 20.5, 10)
+        line(14.5, 14.5, 17, 14.5)
+    elif name == "balance":
+        line(12, 4.5, 12, 19.5)
+        line(8, 19.5, 16, 19.5)
+        line(5, 7.5, 19, 7.5)
+        for x in (5, 19):
+            path = QPainterPath(QPointF(x - 3, 13.5))
+            path.lineTo(x, 7.5)
+            path.lineTo(x + 3, 13.5)
+            path.arcTo(QRectF(x - 3, 11, 6, 5), 180, 180)
+            painter.drawPath(path)
+    elif name == "expenses":
+        path = QPainterPath(QPointF(6, 3.5))
+        path.lineTo(18, 3.5)
+        path.lineTo(18, 20.5)
+        for index, x in enumerate((16, 14, 12, 10, 8, 6)):
+            path.lineTo(x, 19 if index % 2 == 0 else 20.5)
+        path.closeSubpath()
+        painter.drawPath(path)
+        line(9, 8.5, 15, 8.5)
+        line(9, 12.5, 15, 12.5)
+    elif name == "reports":
+        path = QPainterPath(QPointF(6, 3.5))
+        path.lineTo(14, 3.5)
+        path.lineTo(18.5, 8)
+        path.lineTo(18.5, 20.5)
+        path.lineTo(6, 20.5)
+        path.closeSubpath()
+        painter.drawPath(path)
+        line(14, 3.5, 14, 8)
+        line(14, 8, 18.5, 8)
+        line(9, 13, 15.5, 13)
+        line(9, 16.5, 13.5, 16.5)
+    elif name == "catalogs":
+        painter.drawRoundedRect(QRectF(5, 3.5, 14, 17), 2, 2)
+        line(8.5, 3.5, 8.5, 20.5)
+        line(11.5, 8.5, 16, 8.5)
+        line(11.5, 12, 16, 12)
+    elif name == "analytics":
+        line(4, 20, 20, 20)
+        for x, top in ((7, 13), (12, 8), (17, 4.5)):
+            line(x, 17, x, top)
+    elif name == "sun":
+        painter.drawEllipse(QPointF(12, 12), 4, 4)
+        for index in range(8):
+            painter.save()
+            painter.translate(12, 12)
+            painter.rotate(index * 45)
+            line(0, -7, 0, -9)
+            painter.restore()
+    elif name == "moon":
+        path = QPainterPath()
+        path.addEllipse(QPointF(12, 12), 8, 8)
+        cut = QPainterPath()
+        cut.addEllipse(QPointF(16.5, 8), 7, 7)
+        painter.drawPath(path.subtracted(cut))
+    painter.end()
+    return QIcon(pixmap)
+
+
+TAB_ICON_COLORS = {"dark": "#9fbbd3", "light": "#4a7398"}
+
+
+def install_tab_icons(tabs, names):
+    """names: tab index -> icon name; icons follow the current theme."""
+    manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+    tabs.setIconSize(QSize(18, 18))
+
+    def refresh(theme_name):
+        for index, name in names.items():
+            if index < tabs.count():
+                tabs.setTabIcon(index, line_icon(name, TAB_ICON_COLORS.get(theme_name, TAB_ICON_COLORS["dark"])))
+
+    refresh(current_theme())
+    if manager is not None:
+        manager.changed.connect(refresh)
+        tabs.destroyed.connect(lambda *_: manager.changed.disconnect(refresh))
 
 
 EXTRA = """
@@ -111,16 +216,39 @@ QScrollBar:horizontal { background-color: #242933; height: 12px; margin: 0; }
 QScrollBar::handle { background-color: #4a5568; border-radius: 5px; min-width: 24px; min-height: 24px; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QStatusBar { background-color: #242933; color: #a0aec0; border-top: 1px solid #323946; }
-QFrame#smartreportHeader { background-color: #242933; border: 1px solid #323946; border-radius: 8px; }
+QFrame#smartreportHeader { background-color: #252b34; border: 1px solid #2f3642; border-radius: 10px; }
+QPushButton#themeToggle {
+    background-color: #2c3440; color: #d5dee8; border: 1px solid #3a4452;
+    border-radius: 15px; padding: 5px 14px 5px 10px; font-weight: 600;
+}
+QPushButton#themeToggle:hover { background-color: #343e4c; border-color: #4f86b5; }
+QTabBar::tab {
+    background-color: transparent; color: #a3b1c2; border: none;
+    border-bottom: 3px solid transparent; padding: 9px 16px 8px 12px; margin-right: 2px;
+    font-weight: 600;
+}
+QTabBar::tab:hover { background-color: #2a313c; color: #e6edf5; border-radius: 6px; }
+QTabBar::tab:selected {
+    background-color: #2b3a4c; color: #ffffff; border-bottom: 3px solid #5a9bd5;
+    border-top-left-radius: 6px; border-top-right-radius: 6px;
+}
 QComboBox::down-arrow, QDateEdit::down-arrow {
     image: url("__DARK_CHEVRON__"); width: 12px; height: 8px; border: none;
 }
 QPushButton#successAction { background-color: #276749; color: #ffffff; border-color: #38a169; }
 QPushButton#successAction:disabled { background-color: #252b35; color: #718096; border-color: #323946; }
-QLabel#smartreportBrand { font-size: 16px; font-weight: 600; }
-QLabel#smartreportCaption { color: #a0aec0; font-size: 12px; }
+QLabel#smartreportBrand { font-size: 18px; font-weight: 600; color: #eef3f8; }
+QLabel#smartreportCaption { color: #8e9db0; font-size: 12px; }
 """
 LIGHT_EXTRA = """
+QFrame#smartreportHeader { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 10px; }
+QLabel#smartreportBrand { color: #1f3447; }
+QLabel#smartreportCaption { color: #6d8193; }
+QPushButton#themeToggle { background-color: #f2f6f9; color: #2c4052; border: 1px solid #d3dee7; }
+QPushButton#themeToggle:hover { background-color: #e8f0f6; border-color: #4a7398; }
+QTabBar::tab { background-color: transparent; color: #4f6577; border-bottom: 3px solid transparent; }
+QTabBar::tab:hover { background-color: #e6edf3; color: #1f3447; }
+QTabBar::tab:selected { background-color: #ffffff; color: #17324a; border-bottom: 3px solid #3d78ad; }
 QPushButton#primaryAction { background-color: #52718a; color: #ffffff; border-color: #52718a; }
 QPushButton#primaryAction:hover { background-color: #45647d; color: #ffffff; }
 QPushButton#primaryAction:disabled { background-color: #e8edf1; color: #657888; border-color: #ccd8e1; }
@@ -235,13 +363,20 @@ class ThemeToggle(QPushButton):
         super().__init__()
         self.setObjectName("themeToggle")
         self.setAccessibleName("Переключить светлую и тёмную тему")
-        self.setToolTip("Смена без перезапуска. Выбор сохраняется для этого профиля.")
+        self.setIconSize(QSize(16, 16))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clicked.connect(manager.toggle)
         manager.changed.connect(self.update_name)
         self.update_name(manager.name)
 
     def update_name(self, name):
-        self.setText("Светлая тема" if name == "dark" else "Тёмная тема")
+        target = "light" if name == "dark" else "dark"
+        self.setText("Светлая" if target == "light" else "Тёмная")
+        self.setIcon(line_icon("sun" if target == "light" else "moon", "#f2c46d" if name == "dark" else "#4a7398", 16))
+        self.setToolTip(
+            ("Включить светлую тему" if target == "light" else "Включить тёмную тему")
+            + ". Без перезапуска; выбор сохраняется для этого профиля."
+        )
 
 
 def header(parent=None):
@@ -250,7 +385,8 @@ def header(parent=None):
     panel = QFrame(parent)
     panel.setObjectName("smartreportHeader")
     row = QHBoxLayout(panel)
-    row.setContentsMargins(12, 8, 12, 8)
+    row.setContentsMargins(14, 8, 14, 8)
+    row.setSpacing(10)
     icon = QLabel()
     icon.setPixmap(_logo())
     icon.setAccessibleName("Логотип SmartReport")
@@ -259,7 +395,7 @@ def header(parent=None):
     brand.setObjectName("smartreportBrand")
     row.addWidget(brand)
     toggle = ThemeToggle(manager)
-    row.addSpacing(16)
+    row.addSpacing(12)
     row.addWidget(toggle)
     row.addStretch()
     caption = QLabel("Смены · Расходы · Отчёты")

@@ -92,7 +92,7 @@ class DesktopThemeTests(unittest.TestCase):
         self.assertGreater(button.geometry().left(), brand.geometry().right())
         button.click()
         self.assertEqual(self.manager.name, "dark")
-        self.assertEqual(button.text(), "Светлая тема")
+        self.assertEqual(button.text(), "Светлая")
         panel.deleteLater()
         self.application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.assertTrue(self.manager.toggle())
