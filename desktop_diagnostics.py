@@ -534,8 +534,7 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
                 capture("hotel-october-journal")
                 row = next(row for row in report["journal_rows"] if row["id"] == 111)
                 review = app_module.JournalTranslationDialog(
-                    [(row, app_module.translate_to_swedish(row["comment"], allow_network=False),
-                      "Manual review UI acceptance")], window,
+                    [(row, "", "Manual review UI acceptance")], window,
                 )
 
                 def review_translation():

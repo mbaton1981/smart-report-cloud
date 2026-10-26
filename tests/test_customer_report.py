@@ -50,6 +50,27 @@ class CustomerReportTests(unittest.TestCase):
 
         self.patcher = patch.object(self.desktop, "get_db_connection", connection)
         self.patcher.start()
+        import swedish_translation
+        self.translation = swedish_translation
+        swedish_translation.clear_cache()
+        self.translator_calls = []
+        self.fake_translations = {}
+
+        def fake_request(items, database):
+            self.translator_calls.append([text for _, text in items])
+            if isinstance(self.fake_translations, Exception):
+                raise self.fake_translations
+            missing = [text for _, text in items if text not in self.fake_translations]
+            if missing:
+                raise swedish_translation.TranslationError("Нет связи с сервером перевода.")
+            return {identifier: self.fake_translations[text] for identifier, text in items}
+
+        self.translator = patch.object(swedish_translation, "_request", side_effect=fake_request)
+        self.translator.start()
+        question = patch.object(self.desktop.QMessageBox, "question",
+                                side_effect=AssertionError("Unexpected confirmation"))
+        question.start()
+        self.addCleanup(question.stop)
         self.window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(self.window)
         self.window.tab_invoice = self.desktop.QWidget()
@@ -64,6 +85,8 @@ class CustomerReportTests(unittest.TestCase):
     def tearDown(self):
         self.window.close()
         self.window.deleteLater()
+        self.translator.stop()
+        self.translation.clear_cache()
         self.patcher.stop()
         self.conn.close()
 
@@ -227,9 +250,9 @@ class CustomerReportTests(unittest.TestCase):
             report = self.window.generate_invoice()
             journal = self.pdf(report).pages[-1].extract_text()
             self.assertIn("<A> & B", journal)
-            self.assertEqual(self.window._journal_description_swedish("Демонтаж окон"), "demontering av fönster")
-            with self.assertRaisesRegex(ValueError, "översättas"):
-                self.window._journal_description_swedish("Неизвестноеслово")
+            for text in ("Демонтаж окон", "Неизвестноеслово", "Демонтаж холодильных камер"):
+                with self.subTest(text=text), self.assertRaisesRegex(ValueError, "översättas"):
+                    self.window._journal_description_swedish(text)
 
     def test_unified_pages_share_filters_and_keep_journal_export(self):
         self.window.setup_reporting_pages()
@@ -356,14 +379,134 @@ class CustomerReportTests(unittest.TestCase):
         self.assertEqual(report["totals"]["work_amount"], 11440)
         self.assertEqual(report["totals"]["transport_amount"], 1350)
         self.assertEqual(report["totals"]["invoice_total"], 12790)
-        with patch("requests.sessions.Session.request", side_effect=AssertionError("No network")), \
-                patch.object(self.desktop.JournalTranslationDialog, "exec", side_effect=AssertionError("Known translations")):
-            translated = self.window._collect_journal_translations(report)
+        with patch("requests.sessions.Session.request", side_effect=AssertionError("No network")):
+            self.fake_translations = {
+                "Демонтаж,дверей и внутренних окон комнат": "Demontering av dörrar och invändiga fönster i rummen",
+                "Демонтаж кухонных витяжок,демонтаж вентиляции и водяных труб":
+                    "Demontering av köksfläktar, ventilation och vattenrör",
+                "Демонтаж вентиляциии": "Demontering av ventilation",
+            }
+            shown = []
+
+            def review(dialog):
+                shown.append(dialog.table.rowCount())
+                self.assertFalse(dialog.retry_button.isEnabled())
+                dialog.accept()
+                return dialog.result()
+
+            with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+                translated = self.window._collect_journal_translations(report)
+        self.assertEqual(shown, [3])
         text = "\n".join(page.extract_text() for page in self.pdf({**report, "journal_translations": translated}).pages)
         self.assertIn("dörrar och invändiga fönster i rummen", text)
+        self.assertIn("köksfläktar, ventilation och vattenrör", text)
         for day, _, _ in descriptions:
             self.assertIn(day, text)
         self.assertEqual(list(self.conn.iterdump()), before)
+
+    def test_known_mixed_examples_are_translated_whole_not_by_dictionary(self):
+        self.shift(comment="Демонтаж холодильных камер")
+        self.shift(day="2026-10-22", comment="Демонтаж труб отопления")
+        before = list(self.conn.iterdump())
+        report = self.window.generate_invoice()
+        self.fake_translations = {
+            "Демонтаж холодильных камер": "Demontering av kylrum",
+            "Демонтаж труб отопления": "Demontering av värmerör",
+        }
+        seen = []
+
+        def review(dialog):
+            for number in (1, 2):
+                seen.append(dialog.findChild(self.desktop.QTextEdit, "journal_translation_" + str(number)).toPlainText())
+            self.assertIn("Перевод ИИ", dialog.table.item(0, 0).text())
+            self.assertIn("проверьте смысл", dialog.table.item(0, 0).text())
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translated = self.window._collect_journal_translations(report)
+        self.assertEqual(seen, ["Demontering av kylrum", "Demontering av värmerör"])
+        self.assertEqual(self.translator_calls, [["Демонтаж холодильных камер", "Демонтаж труб отопления"]])
+        self.assertEqual(translated, {"1": "Demontering av kylrum", "2": "Demontering av värmerör"})
+        journal = self.pdf({**report, "journal_translations": translated}).pages[-1].extract_text()
+        self.assertIn("Demontering av kylrum", journal)
+        self.assertIn("Demontering av värmerör", journal)
+        self.assertNotIn("холодильных", journal)
+        self.assertEqual(list(self.conn.iterdump()), before)
+        self.assertFalse(hasattr(self.desktop, "translate_to_swedish"))
+
+    def test_translator_failure_then_retry_keeps_manual_edits_and_record_binding(self):
+        self.shift(comment="Монтаж вентиляции и уборка")
+        self.shift(day="2026-10-22", comment="Демонтаж плитки 12 м2")
+        self.shift(day="2026-10-23", comment="Монтаж вентиляции и уборка")
+        report = self.window.generate_invoice()
+
+        def review(dialog):
+            editors = [dialog.findChild(self.desktop.QTextEdit, "journal_translation_" + str(n)) for n in (1, 2, 3)]
+            self.assertEqual([editor.toPlainText() for editor in editors], ["", "", ""])
+            self.assertIn("Ошибка перевода: Нет связи", dialog.table.item(0, 0).text())
+            self.assertIn("введите текст вручную", dialog.table.item(1, 0).text())
+            self.assertTrue(dialog.retry_button.isEnabled())
+            editors[1].setPlainText("Rivning av kakel 12 m²")
+            self.fake_translations = {"Монтаж вентиляции и уборка": "Montering av ventilation och städning"}
+            dialog.retry_button.click()
+            self.assertEqual([editor.toPlainText() for editor in editors], [
+                "Montering av ventilation och städning", "Rivning av kakel 12 m²",
+                "Montering av ventilation och städning"])
+            self.assertFalse(dialog.retry_button.isEnabled())
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translated = self.window._collect_journal_translations(report)
+        self.assertEqual(translated, {"1": "Montering av ventilation och städning", "2": "Rivning av kakel 12 m²",
+                                      "3": "Montering av ventilation och städning"})
+        self.assertEqual(self.translator_calls[-1], ["Монтаж вентиляции и уборка"])
+
+    def test_doubtful_translation_is_flagged_not_cached_and_needs_confirmation(self):
+        self.shift(comment="Монтаж 12 радиаторов DN20")
+        report = self.window.generate_invoice()
+        self.fake_translations = {"Монтаж 12 радиаторов DN20": "Montering av radiatorer"}
+        answers = iter([self.desktop.QMessageBox.StandardButton.No, self.desktop.QMessageBox.StandardButton.Yes])
+
+        def review(dialog):
+            self.assertIn("Требует проверки", dialog.table.item(0, 0).text())
+            self.assertIn("12", dialog.table.item(0, 0).text())
+            self.assertIn("DN20", dialog.table.item(0, 0).text())
+            self.assertTrue(dialog.retry_button.isEnabled())
+            with patch.object(self.desktop.QMessageBox, "question", side_effect=lambda *a: next(answers)) as question:
+                dialog.accept()
+                self.assertNotEqual(dialog.result(), self.desktop.QDialog.DialogCode.Accepted)
+                self.assertEqual(dialog.translations, {})
+                dialog.accept()
+            self.assertIn("DN20", question.call_args.args[2])
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translated = self.window._collect_journal_translations(report)
+        self.assertEqual(translated, {"1": "Montering av radiatorer"})
+        self.assertEqual(self.translation._cache, {})
+
+    def test_mixed_language_and_swedish_rows_route_correctly(self):
+        self.shift(comment="Montering av dörrar")
+        self.shift(day="2026-10-22", comment="Монтаж and painting")
+        self.shift(day="2026-10-23", comment="Demontering av холодильных камер")
+        report = self.window.generate_invoice()
+        self.fake_translations = {
+            "Монтаж and painting": "Montering och målning",
+            "Demontering av холодильных камер": "Demontering av kylrum",
+        }
+
+        def review(dialog):
+            self.assertEqual(dialog.table.rowCount(), 2)
+            self.assertIsNone(dialog.findChild(self.desktop.QTextEdit, "journal_translation_1"))
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translated = self.window._collect_journal_translations(report)
+        self.assertEqual(translated, {"1": "Montering av dörrar", "2": "Montering och målning",
+                                      "3": "Demontering av kylrum"})
 
     def test_manual_review_identifies_record_and_only_changes_pdf_translation(self):
         self.shift(comment="Неизвестноеслово <A>")

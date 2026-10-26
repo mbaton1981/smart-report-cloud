@@ -1686,110 +1686,46 @@ def parse_float(val_str, default=0.0):
     except ValueError:
         return default
 
-def translate_to_swedish(text, *, allow_network=True):
-    if not text or not str(text).strip():
-        return ""
-    
-    raw_text = str(text).strip()
-    
-    if allow_network:
-        try:
-            url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(raw_text)}&langpair=ru|sv"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                if data and "responseData" in data and data["responseData"].get("translatedText"):
-                    translated = data["responseData"]["translatedText"]
-                    if "MYMEMORY WARNING" not in translated:
-                        return translated
-        except Exception:
-            pass
-    
-    t = raw_text.lower()
-    if not allow_network:
-        for original, translated in (
-            ("внутренних окон комнат", "invändiga fönster i rummen"),
-            ("коробов вентиляции", "ventilationskanaler"),
-            ("кухонных витяжок", "köksfläktar"),
-            ("кухонных вытяжек", "köksfläktar"),
-            ("водяных труб", "vattenrör"),
-            ("демонтаж,", "demontering av "),
-            ("демонтаж", "demontering av"),
-        ):
-            t = t.replace(original, translated)
-        import re
-        t = re.sub(r"([,;:])", r" \1 ", t)
-    replacements = {
-        "гипсокартон": "gips", "гипсу": "gips", "картон": "kartong",
-        "вентиляц": "ventilation", "электрик": "elarbete", "проводк": "eldragning",
-        "розетк": "vägguttag", "демонтаж": "rivning", "демонт": "rivning",
-        "монтаж": "montering", "монт": "montering", "покраск": "målning",
-        "красил": "målade", "краск": "färg", "утеплен": "isolering",
-        "изоляц": "isolering", "установк": "installation", "шпаклев": "spackling",
-        "шпатлев": "spackling", "уборк": "städning", "убирал": "städade",
-        "ремонт": "renovering", "стен": "väggar", "потолк": "tak",
-        "пол": "golv", "окн": "fönster", "окон": "fönster", "двер": "dörrar", "плитк": "kakel",
-        "замен": "byte", "стяжк": "avjämningsmassa", "работ": "arbeten",
-        "мусор": "avfall", "доставк": "leverans"
-    }
-    words = t.split()
-    translated_words = []
-    for word in words:
-        clean_w = word.strip(".,;:!?()[]{}\"'")
-        if not allow_network and clean_w == "и":
-            translated_words.append("och")
-            continue
-        matched = False
-        for ru_root, se_word in replacements.items():
-            if ru_root in clean_w:
-                result_word = se_word
-                if word and word[0].isupper():
-                    result_word = result_word.capitalize()
-                translated_words.append(result_word)
-                matched = True
-                break
-        if not matched:
-            translated_words.append(word)
-    result = " ".join(translated_words)
-    if not allow_network:
-        result = result.replace(" ,", ",").replace(" ;", ";").replace(" :", ":")
-    return result
-
-
 class JournalTranslationDialog(QDialog):
-    def __init__(self, pending, parent=None):
+    """Per-record review of PDF translations.
+
+    pending: (row, suggestion, status[, flagged]). retry(rows) returns entries of the
+    same shape for the given rows; it is offered for failed or doubtful records.
+    """
+
+    def __init__(self, pending, parent=None, retry=None):
         super().__init__(parent)
         self.setWindowTitle("Проверка перевода описаний для PDF")
         self.resize(1150, 600)
         self.translations = {}
         self._editors = []
+        self._retry = retry
+        self._machine = {}
+        self._flagged = {}
         layout = QVBoxLayout(self)
         notice = QLabel(
-            "Не удалось полностью перевести указанные записи. Проверьте или введите шведский текст справа.\n"
+            "Перевод выполнен ИИ через сервер SmartReport. Автоматически проверяются только пустой текст, "
+            "кириллица, числа и обозначения — смысл проверьте сами и при необходимости исправьте текст справа.\n"
             "Исправления используются только в этом PDF. Исходные описания, смены и база не изменяются."
         )
         notice.setWordWrap(True)
         layout.addWidget(notice)
-        table = QTableWidget(len(pending), 3)
-        table.setHorizontalHeaderLabels(["Запись / дата / сотрудник / объект", "Исходное описание (без изменений)", "Перевод на шведский для PDF"])
+        self.table = table = QTableWidget(len(pending), 3)
+        table.setHorizontalHeaderLabels(["Запись / дата / сотрудник / объект / статус", "Исходное описание (без изменений)", "Перевод на шведский для PDF"])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.setWordWrap(True)
-        for index, (row, suggestion, error) in enumerate(pending):
-            context = (
-                f"№{row['id']} · {row['date']}\n{row['employee']}\n"
-                f"{row['object_name']}\nID: {row['sync_id']}"
-            )
-            for column, text in enumerate((context, row["comment"] or "")):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip(error if column == 0 else text)
-                table.setItem(index, column, item)
+        for index, entry in enumerate(pending):
+            row = entry[0]
+            item = QTableWidgetItem(row["comment"] or "")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            item.setToolTip(row["comment"] or "")
+            table.setItem(index, 1, item)
             editor = QTextEdit()
             editor.setObjectName("journal_translation_" + str(row["id"]))
-            editor.setPlainText(suggestion)
             table.setCellWidget(index, 2, editor)
             table.setRowHeight(index, 130)
             self._editors.append((row, editor))
+            self._show_entry(index, entry)
         layout.addWidget(table)
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
@@ -1797,23 +1733,77 @@ class JournalTranslationDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Использовать перевод и создать PDF")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        self.retry_button = buttons.addButton("🔄 Повторить перевод", QDialogButtonBox.ButtonRole.ActionRole)
+        self.retry_button.setObjectName("journal_translation_retry")
+        self.retry_button.clicked.connect(self.retry_translation)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._update_retry()
+
+    def _show_entry(self, index, entry):
+        row, suggestion, status = entry[:3]
+        flagged = entry[3] if len(entry) > 3 else True
+        context = (
+            f"№{row['id']} · {row['date']}\n{row['employee']}\n"
+            f"{row['object_name']}\nID: {row['sync_id']}\n{status}"
+        )
+        item = QTableWidgetItem(context)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        item.setToolTip(status)
+        if flagged:
+            item.setBackground(QColor("#fff3cd"))
+            item.setForeground(QColor("#5c4400"))
+        self.table.setItem(index, 0, item)
+        self._editors[index][1].setPlainText(suggestion)
+        self._machine[row["sync_id"]] = suggestion
+        self._flagged[row["sync_id"]] = flagged
+
+    def _retry_rows(self):
+        return [
+            (index, row) for index, (row, editor) in enumerate(self._editors)
+            if self._flagged[row["sync_id"]]
+            and editor.toPlainText().strip() == (self._machine[row["sync_id"]] or "").strip()
+        ]
+
+    def _update_retry(self):
+        self.retry_button.setVisible(self._retry is not None)
+        self.retry_button.setEnabled(bool(self._retry and self._retry_rows()))
+
+    def retry_translation(self):
+        targets = self._retry_rows()
+        if not self._retry or not targets:
+            return
+        entries = self._retry([row for _, row in targets])
+        for (index, _), entry in zip(targets, entries):
+            self._show_entry(index, entry)
+        self.error_label.clear()
+        self._update_retry()
 
     def accept(self):
-        import re
+        import swedish_translation
         translations = {}
+        doubtful = []
         for row, editor in self._editors:
             text = editor.toPlainText().strip()
-            if not text or re.search(r"[\u0400-\u04ff]", text):
+            if not text or swedish_translation.CYRILLIC.search(text):
                 self.error_label.setText(
                     f"Запись №{row['id']} · {row['date']} · {row['employee']}: "
                     "введите непустой перевод на шведском; в тексте осталась кириллица или поле пустое."
                 )
                 editor.setFocus()
                 return
+            problems = swedish_translation.translation_problems(row["comment"] or "", text)
+            if problems:
+                doubtful.append(f"№{row['id']} · {row['date']}: " + "; ".join(problems))
             translations[row["sync_id"]] = text
+        if doubtful and QMessageBox.question(
+            self, "Проверка перевода",
+            "В переводе не найдены данные из исходного описания:\n\n" + "\n".join(doubtful)
+            + "\n\nИспользовать перевод в PDF без исправления?",
+        ) != QMessageBox.StandardButton.Yes:
+            self.error_label.setText("Исправьте перевод отмеченных записей или подтвердите его.")
+            return
         self.translations = translations
         super().accept()
 
@@ -9030,12 +9020,9 @@ class SmartReportApp(QMainWindow):
     @staticmethod
     def _journal_description_swedish(text):
         import re
-        translated = (
-            translate_to_swedish(text, allow_network=False)
-            if re.search(r"[\u0400-\u04ff]", text) else text
-        )
-        # Latin script alone does not establish Swedish. Unknown vocabulary,
-        # including English/transliteration, goes to the existing per-record review.
+        # Accepts only text already verifiable as Swedish; everything else is translated
+        # as a whole by the server and reviewed per record. No word-by-word dictionary.
+        translated = text
         known_swedish = set((
             "av och i på med till för från utan samt vid efter före mellan under över "
             "arbete arbeten elarbete eldragning montering demontering rivning installation "
@@ -9063,15 +9050,43 @@ class SmartReportApp(QMainWindow):
         for row in report["journal_rows"]:
             text = row["comment"] or ""
             try:
-                translations[row["sync_id"]] = self._journal_description_swedish(text)
-            except ValueError as error:
-                pending.append((row, translate_to_swedish(text, allow_network=False), str(error)))
+                translations[row["sync_id"]] = SmartReportApp._journal_description_swedish(text)
+            except ValueError:
+                pending.append(row)
         if pending:
-            dialog = JournalTranslationDialog(pending, self)
+            entries = SmartReportApp._machine_translate_rows(self, pending)
+            dialog = JournalTranslationDialog(
+                entries, self, retry=lambda rows: SmartReportApp._machine_translate_rows(self, rows),
+            )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
             translations.update(dialog.translations)
         return translations
+
+    def _machine_translate_rows(self, rows):
+        import swedish_translation
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.statusBar().showMessage("Перевод описаний на шведский через сервер SmartReport…")
+            QApplication.processEvents()
+            results = swedish_translation.translate_texts([row["comment"] or "" for row in rows], DB_FILE)
+        except swedish_translation.TranslationError as error:
+            reason = "Ошибка перевода: " + str(error) + " Повторите перевод или введите текст вручную."
+            return [(row, "", reason, True) for row in rows]
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+        entries = []
+        for row in rows:
+            source = (row["comment"] or "").strip()
+            swedish, cached = results[source]
+            problems = swedish_translation.translation_problems(source, swedish)
+            if problems:
+                status = "Требует проверки: " + "; ".join(problems) + "."
+            else:
+                status = "Перевод ИИ" + (" (из этого сеанса)" if cached else "") + ": проверьте смысл."
+            entries.append((row, swedish, status, bool(problems)))
+        return entries
 
     def _apply_catalog_prices(self, report, selected_ids, *, replace_confirmed=False):
         selected = [row for row in report["journal_rows"] if row["sync_id"] in selected_ids]
