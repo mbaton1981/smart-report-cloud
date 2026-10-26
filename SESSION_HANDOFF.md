@@ -1,6 +1,30 @@
 # Handoff
 
-## 26.10.2026, ~17:30 — 1.0.35: визуальное обновление верхней панели и вкладок (читать первым)
+## 26.10.2026, ~17:35 — 1.0.36 = оформление + принятые фиксы main (читать первым)
+
+- 1.0.35 не включала уже принятые клиентские фиксы main `1e90b70`
+  (clearCurrentIndex при восстановлении выбора таблицы) и `ff5ac68`
+  (`sip.isdeleted` — отложенная прокрутка после удаления таблицы). Это не
+  серверные фиксы, как ошибочно записано ниже, а 4 строки в `app.py`.
+- **Рабочая версия — 1.0.36** (FileVersion 1.0.36.0), тот же EXE
+  `C:\Users\mbato\AppData\Local\Programs\SmartReport-1.0.30-rc1\SmartReport.exe`,
+  SHA-256 `1584E6345E6A742AC86ECA3675BDE192E5DBCE43D313C94D63146B1706F19413`.
+  Исходник: `C:\Users\mbato\AppData\Local\SmartReport\build\out\ui-polish-1.0.36\source`
+  = исходник 1.0.35 + `app.py` из main `5b6382c` (разница ровно эти 4 строки)
+  + version_info 1.0.36. Остальные расхождения с main — только непринятая
+  функция 1.0.31 `51cba11` (сравнение недель: `assistant_ui.py`/`assistant_api.py`)
+  и серверный код; в клиент не включены.
+  Заменены только `SmartReport.exe`, `_internal\base_library.zip`, `_internal\release-manifest.json`.
+- Проверки: `tests.test_desktop_theme` + `tests.test_catalog_sync` — 103 OK.
+  Оба ярлыка (OneDrive «Рабочий стол» и «Пуск», `-ProfileRoot SmartReport-1.0.9`)
+  по очереди открыли этот EXE 1.0.36.0 одним процессом, 7 вкладок выбираются,
+  данные профиля видны. Клиент оставлен открытым (запуск через «Пуск»).
+  Снимки `installed-desktop-1.0.36.png`, `installed-start-1.0.36.png` в папке visual-check (см. ниже).
+- Откат: на 1.0.35 — `C:\Users\mbato\AppData\Local\SmartReport\protected-recovery\installed-1.0.35-rollback-20261026T173150`;
+  на 1.0.34 — `...\installed-1.0.34-rollback-20261026T172613` (3 файла + `rollback.json`).
+- Сервер (Render `c766c8a`), справочники, баланс, профиль и дистрибутив OneDrive (1.0.33) не менялись.
+
+## 26.10.2026, ~17:30 — 1.0.35: визуальное обновление верхней панели и вкладок (заменена 1.0.36)
 
 - **Изменено (только оформление, `desktop_theme.py` + названия/иконки вкладок в `app.py`):**
   чёткий логотип (тот же значок со столбиками, мягкий синий градиент, HiDPI);
