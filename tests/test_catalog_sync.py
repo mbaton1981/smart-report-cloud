@@ -1464,6 +1464,108 @@ class CatalogSyncTests(unittest.TestCase):
             combo.close()
             combo.deleteLater()
 
+    def test_catalog_popups_keep_scroll_highlight_and_uncommitted_selection(self):
+        from PyQt6.QtCore import QTimer, Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QComboBox
+
+        conn = self.desktop.get_db_connection()
+        try:
+            conn.executemany(
+                "INSERT INTO objects (company,name,markning,rate,is_active) VALUES (?,?,?,?,1)",
+                [(company, f"ZZ popup {i:03d}", f"test-{i}", 520)
+                 for company in ("Privat", "Renatur") for i in range(65)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_invoice = self.desktop.QWidget()
+        window.setup_invoice_tab()
+        window.setCentralWidget(window.tab_invoice)
+        window.resize(1100, 850)
+        for name in ("emp_cb", "comp_cb", "obj_cb", "filter_emp", "filter_comp", "filter_obj"):
+            setattr(window, name, QComboBox(window))
+        window.load_dropdowns(refresh_tables=False)
+        window.show()
+        try:
+            for company in ("Privat", "Renatur"):
+                window.inv_comp_cb.setCurrentText(company)
+                window.comp_cb.setCurrentText(company)
+                window.load_dropdowns(refresh_tables=False)
+                for combo_name in ("inv_obj_cb", "obj_cb", "inv_comp_cb", "comp_cb",
+                                   "emp_cb", "filter_emp", "filter_comp", "filter_obj"):
+                    combo = getattr(window, combo_name)
+                    with self.subTest(company=company, combo=combo_name):
+                        self.assertGreater(combo.count(), 0)
+                        combo.setStyleSheet("QComboBox { combobox-popup: 0; }")
+                        combo.setMaxVisibleItems(6)
+                        combo.setCurrentIndex(0)
+                        before = combo.currentText()
+                        resets, activated = [], []
+                        combo.model().modelReset.connect(lambda: resets.append(True))
+                        combo.activated.connect(activated.append)
+                        combo.showPopup()
+                        self.qt_app.processEvents()
+                        view = combo.view()
+                        last = combo.model().index(combo.count() - 1, 0)
+                        view.setCurrentIndex(last)
+                        view.scrollTo(last, view.ScrollHint.PositionAtBottom)
+                        self.qt_app.processEvents()
+                        scroll = view.verticalScrollBar().value()
+                        timer = QTimer()
+                        timer.timeout.connect(lambda: window.load_dropdowns(refresh_tables=False))
+                        timer.start(50)
+                        try:
+                            QTest.qWait(180)
+                        finally:
+                            timer.stop()
+                        self.assertTrue(view.isVisible())
+                        self.assertEqual(resets, [])
+                        self.assertEqual(activated, [])
+                        self.assertEqual(view.currentIndex(), last)
+                        self.assertEqual(view.verticalScrollBar().value(), scroll)
+                        self.assertEqual(combo.currentText(), before)
+                        QTest.keyClick(view, Qt.Key.Key_Escape)
+                        self.assertEqual(combo.currentText(), before)
+                        combo.showPopup()
+                        QTest.keyClick(combo.view(), Qt.Key.Key_End)
+                        QTest.keyClick(combo.view(), Qt.Key.Key_Return)
+                        self.assertEqual(combo.currentIndex(), combo.count() - 1)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_invoice_catalog_change_waits_until_popup_closes(self):
+        from PyQt6.QtWidgets import QComboBox
+        combo = QComboBox()
+        host = SimpleNamespace(inv_obj_cb=combo)
+        refresh = lambda company="Privat": self.desktop.SmartReportApp.load_invoice_objects(host, company)
+        refresh()
+        combo.setCurrentIndex(0)
+        chosen_id = combo.currentData()
+        try:
+            combo.show()
+            combo.showPopup()
+            self.qt_app.processEvents()
+            count = combo.count()
+            conn = self.desktop.get_db_connection()
+            conn.execute("INSERT INTO objects (company,name,is_active) VALUES ('Privat','ZZ deferred',1)")
+            conn.commit()
+            conn.close()
+            refresh()
+            self.assertEqual(combo.count(), count)
+            combo.hidePopup()
+            refresh()
+            self.assertEqual(combo.count(), count + 1)
+            self.assertEqual(combo.currentData(), chosen_id)
+            refresh("Renatur")
+            self.assertEqual(combo.currentIndex(), -1)
+        finally:
+            combo.close()
+            combo.deleteLater()
+
     def test_invoice_object_selection_survives_dropdown_refresh(self):
         sync_id = str(uuid.uuid4())
         desktop_conn = self.desktop.get_db_connection()
@@ -3947,19 +4049,11 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(tuple(local_profile), (450, 0))
         self.assertEqual(local_history, 1)
 
-        class EmployeeCombo:
-            def __init__(self):
-                self.items = []
-
-            def clear(self):
-                self.items.clear()
-
-            def addItem(self, item):
-                self.items.append(item)
-
-        combo = EmployeeCombo()
+        from PyQt6.QtWidgets import QComboBox
+        combo = QComboBox()
+        self.addCleanup(combo.deleteLater)
         self.desktop.SmartReportApp.load_dropdowns(SimpleNamespace(emp_cb=combo))
-        self.assertNotIn(employee_name, combo.items)
+        self.assertEqual(combo.findText(employee_name), -1)
         server_conn = self.server.get_db_connection()
         server_profile = server_conn.execute(
             "SELECT salary_rate, is_active FROM meta_employees WHERE id = ?", (profile_id,)
@@ -3987,9 +4081,8 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 1)
         self.assertEqual(desktop_conn.execute("SELECT COUNT(*) FROM employee_sync_outbox").fetchone()[0], 0)
         desktop_conn.close()
-        combo = EmployeeCombo()
         self.desktop.SmartReportApp.load_dropdowns(SimpleNamespace(emp_cb=combo))
-        self.assertNotIn(employee_name, combo.items)
+        self.assertEqual(combo.findText(employee_name), -1)
         server_conn = self.server.get_db_connection()
         self.assertEqual(tuple(server_conn.execute(
             "SELECT salary_rate, is_active FROM meta_employees WHERE id = ?", (profile_id,)

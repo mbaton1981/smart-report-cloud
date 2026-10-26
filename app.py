@@ -67,6 +67,7 @@ from expense_documents import (
     invoice_context, due_date_issues, due_date_edit,
 )
 from desktop_ui import ReportTable as QTableWidget
+import desktop_ui
 
 import desktop_auth
 
@@ -8444,15 +8445,22 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(self.invoice_ob_rules_lbl)
 
     def load_invoice_objects(self, company):
-        selected_id = self.inv_obj_cb.currentData()
-        blocked = self.inv_obj_cb.blockSignals(True)
-        self.inv_obj_cb.clear()
         conn = get_db_connection()
         rows = conn.execute(
             "SELECT id, name, markning, sync_id FROM objects WHERE company = ? ORDER BY name, id",
             (company,),
         ).fetchall()
         conn.close()
+        items = [
+            (f"{row['markning']} | {row['name']}" if row['markning'] else row['name'],
+             int(row['id']), row['sync_id'])
+            for row in rows
+        ]
+        if not desktop_ui.combo_items_need_refresh(self.inv_obj_cb, items):
+            return
+        selected_id = self.inv_obj_cb.currentData()
+        blocked = self.inv_obj_cb.blockSignals(True)
+        self.inv_obj_cb.clear()
         for row in rows:
             display = f"{row['markning']} | {row['name']}" if row['markning'] else row['name']
             self.inv_obj_cb.addItem(display, int(row['id']))
@@ -9469,9 +9477,6 @@ class SmartReportApp(QMainWindow):
 
     def load_objects_for_company(self, comp_name, obj_cb, record_type=None, archived_object_name=None):
         selected_name = obj_cb.currentData() or archived_object_name
-        obj_cb.clear()
-        if not comp_name:
-            return False
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
@@ -9480,7 +9485,7 @@ class SmartReportApp(QMainWindow):
             FROM objects
             WHERE company = ? AND (is_active = 1 OR (? = 1 AND name = ?))
             ORDER BY name
-        """, (comp_name, int(archived_object_name is not None), archived_object_name or ""))
+        """, (comp_name or "", int(archived_object_name is not None), archived_object_name or ""))
         rows = cursor.fetchall()
         conn.close()
         if record_type in SPECIAL_OBJECTS:
@@ -9490,7 +9495,7 @@ class SmartReportApp(QMainWindow):
                 if matches_special_object(row[0], row[1], reference)
             ]
             if len(rows) != 1:
-                return False
+                rows = []
         elif record_type == RECORD_TYPE_WORK:
             rows = [
                 row for row in rows
@@ -9499,11 +9504,17 @@ class SmartReportApp(QMainWindow):
                     for reference in SPECIAL_OBJECTS.values()
                 )
             ]
+        items = []
         for row in rows:
             name, mark, rate, tr_rate, is_active = row[0], row[1], row[2], row[3], bool(row[4])
             display = f"{mark} | {name} ({rate} kr/ч, тр: {tr_rate})" if mark else f"{name} ({rate} kr/ч)"
             if not is_active:
                 display += " — В архиве"
+            items.append((display, name))
+        if not desktop_ui.combo_items_need_refresh(obj_cb, items):
+            return bool(rows)
+        obj_cb.clear()
+        for display, name in items:
             obj_cb.addItem(display, userData=name)
         if selected_name:
             selected_index = obj_cb.findData(selected_name)
@@ -9822,14 +9833,16 @@ class SmartReportApp(QMainWindow):
         layout.addWidget(obj_card, stretch=1)
 
     def load_companies_into_combobox(self, cb):
-        current_val = cb.currentText()
-        signals_blocked = cb.blockSignals(True)
-        cb.clear()
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM companies ORDER BY name")
         rows = cursor.fetchall()
         conn.close()
+        if not desktop_ui.combo_items_need_refresh(cb, [(row[0],) for row in rows]):
+            return
+        current_val = cb.currentText()
+        signals_blocked = cb.blockSignals(True)
+        cb.clear()
         for row in rows:
             cb.addItem(row[0])
         if current_val:
@@ -10234,10 +10247,15 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
 
         if hasattr(self, 'emp_cb'):
-            self.emp_cb.clear()
             cursor.execute("SELECT name FROM employees WHERE is_active = 1 ORDER BY name")
-            for row in cursor.fetchall():
-                self.emp_cb.addItem(row[0])
+            people = [row[0] for row in cursor.fetchall()]
+            if desktop_ui.combo_items_need_refresh(self.emp_cb, [(name,) for name in people]):
+                selected = self.emp_cb.currentText()
+                self.emp_cb.clear()
+                self.emp_cb.addItems(people)
+                index = self.emp_cb.findText(selected)
+                if index >= 0:
+                    self.emp_cb.setCurrentIndex(index)
 
         if hasattr(self, 'bal_emp_cb'):
             cursor.execute("SELECT name FROM employees ORDER BY name")
@@ -10257,41 +10275,41 @@ class SmartReportApp(QMainWindow):
                 finally:
                     self.bal_emp_cb.blockSignals(blocked)
 
-        if hasattr(self, 'filter_emp'):
+        if hasattr(self, 'filter_emp') and not self.filter_emp.view().isVisible():
             curr_emp = self.filter_emp.currentText()
-            self.filter_emp.clear()
-            self.filter_emp.addItem("-- Все сотрудники --")
             cursor.execute("SELECT name FROM employees ORDER BY name")
-            for row in cursor.fetchall():
-                self.filter_emp.addItem(row[0])
-            idx = self.filter_emp.findText(curr_emp)
-            if idx >= 0:
-                self.filter_emp.setCurrentIndex(idx)
+            items = ["-- Все сотрудники --"] + [row[0] for row in cursor.fetchall()]
+            if desktop_ui.combo_items_need_refresh(self.filter_emp, [(name,) for name in items]):
+                self.filter_emp.clear()
+                self.filter_emp.addItems(items)
+                idx = self.filter_emp.findText(curr_emp)
+                if idx >= 0:
+                    self.filter_emp.setCurrentIndex(idx)
 
-        if hasattr(self, 'filter_comp'):
+        if hasattr(self, 'filter_comp') and not self.filter_comp.view().isVisible():
             curr_comp = self.filter_comp.currentText()
-            self.filter_comp.clear()
-            self.filter_comp.addItem("-- Все фирмы --")
             cursor.execute("SELECT name FROM companies ORDER BY name")
-            for row in cursor.fetchall():
-                self.filter_comp.addItem(row[0])
-            idx = self.filter_comp.findText(curr_comp)
-            if idx >= 0:
-                self.filter_comp.setCurrentIndex(idx)
+            items = ["-- Все фирмы --"] + [row[0] for row in cursor.fetchall()]
+            if desktop_ui.combo_items_need_refresh(self.filter_comp, [(name,) for name in items]):
+                self.filter_comp.clear()
+                self.filter_comp.addItems(items)
+                idx = self.filter_comp.findText(curr_comp)
+                if idx >= 0:
+                    self.filter_comp.setCurrentIndex(idx)
 
-        if hasattr(self, 'filter_obj'):
+        if hasattr(self, 'filter_obj') and not self.filter_obj.view().isVisible():
             curr_obj = self.filter_obj.currentText()
-            self.filter_obj.clear()
-            self.filter_obj.addItem("-- Все объекты --")
             cursor.execute("SELECT name FROM objects WHERE is_active = 1 ORDER BY name")
-            for row in cursor.fetchall():
-                self.filter_obj.addItem(row[0])
-            idx = self.filter_obj.findText(curr_obj)
-            if idx >= 0:
-                self.filter_obj.setCurrentIndex(idx)
+            items = ["-- Все объекты --"] + [row[0] for row in cursor.fetchall()]
+            if desktop_ui.combo_items_need_refresh(self.filter_obj, [(name,) for name in items]):
+                self.filter_obj.clear()
+                self.filter_obj.addItems(items)
+                idx = self.filter_obj.findText(curr_obj)
+                if idx >= 0:
+                    self.filter_obj.setCurrentIndex(idx)
 
         for cb in [getattr(self, 'comp_cb', None), getattr(self, 'inv_comp_cb', None), getattr(self, 'dag_comp_cb', None), getattr(self, 'new_obj_comp_cb', None)]:
-            if cb:
+            if cb is not None:
                 self.load_companies_into_combobox(cb)
 
         if hasattr(self, 'obj_cb') and hasattr(self, 'comp_cb'):

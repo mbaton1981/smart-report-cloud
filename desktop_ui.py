@@ -5,6 +5,20 @@ from PyQt6.QtGui import QFontMetrics, QTextDocument, QTextOption
 from PyQt6.QtWidgets import QHeaderView, QStyledItemDelegate, QTableWidget
 
 
+def combo_items_need_refresh(combo, items):
+    """Items contain display text, followed by consecutive UserRole values."""
+    if combo.view().isVisible():
+        return False
+    if combo.count() != len(items):
+        return True
+    return any(
+        combo.itemText(index) != item[0]
+        or any(combo.itemData(index, Qt.ItemDataRole.UserRole + offset) != value
+               for offset, value in enumerate(item[1:]))
+        for index, item in enumerate(items)
+    )
+
+
 def column_role(title):
     label = " ".join(title.casefold().split())
     if re.search(r"сотруд|фио|anställd|фирм|объект|поставщик|описан|коммент|помет|примеч|категор|специфик|specifikation|детализ|sammanfatt|назначение", label):
