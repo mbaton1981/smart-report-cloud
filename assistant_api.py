@@ -18,6 +18,7 @@ import smtplib
 import ssl
 import uuid
 import wave
+import unicodedata
 
 import requests
 from flask import jsonify, request
@@ -29,6 +30,7 @@ from assistant_actions import CAPABILITIES, NATIVE_ACTIONS, OBJECT_ACTIONS, capa
 import swedish_translation
 
 MODEL = "gpt-5-mini"
+VOICE_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 MAX_OUTPUT = 1024
 INPUT_MICRO_USD = Decimal("0.25")
 OUTPUT_MICRO_USD = Decimal("2")
@@ -463,10 +465,34 @@ def validate_plan(plan):
     return plan
 
 
+def expense_command(text, context=None):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    if not re.search(r"\bрасход\w*\b", normalized) or re.search(
+            r"\b(?:объект\w*|сотрудник\w*|документ\w*|фактур\w*|сч[её]т\w*)\b", normalized):
+        return None
+    previous = context["plan"] if context else {}
+    date_period = explicit_date_period(normalized)
+    week_period = _week_period(normalized)
+    if date_period:
+        begin, end = date_period
+    elif week_period:
+        begin, end = week_period
+    elif previous:
+        begin, end = previous["date_from"], previous["date_to"]
+    else:
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start = today - timedelta(days=today.weekday())
+        begin, end = start.isoformat(), (start + timedelta(days=6)).isoformat()
+    return validate_plan(dict(
+        purpose="expenses", date_from=begin, date_to=end,
+        employee="", company="", object_name="",
+    ))
+
+
 def transport_command(text, context=None):
     text = " ".join(strip_no_change_suffix(text).split())
     match = re.fullmatch(
-        rf"(?:(?:а\s+)?теперь\s+)?(?:(?:проверь(?:те)?|проверить)\s+)?"
+        rf"(?:(?:а\s+)?теперь\s+|а\s+)?(?:(?:проверь(?:те)?|проверить)\s+)?"
         rf"(?:клиентский\s+)?транспорт"
         rf"(?:\s+(?:за|на)\s+(?P<period>текущ\w*\s+недел\w*|эт\w*\s+недел\w*|"
         rf"прошл\w*\s+недел\w*|тот\s+же\s+период|этот\s+же\s+период|этот\s+период)"
@@ -684,9 +710,7 @@ def _comparison_periods(text, kind, context):
 
 def _resolve_summary_object(conn, object_text, date_from, date_to, plan, question_kind):
     question_field = "weekly_object_staff" if question_kind == "object_staff" else "weekly_object"
-    tokens = set(re.findall(
-        r"[a-z0-9]+", object_text.casefold().translate(_CYRILLIC_NAME_TRANSLATION),
-    ))
+    tokens = set(_normalized_name_tokens(object_text))
     if not tokens:
         raise AssistantQuestion(
             question_field, question="Какой объект показать? Назовите его точное название.",
@@ -694,36 +718,49 @@ def _resolve_summary_object(conn, object_text, date_from, date_to, plan, questio
         )
     matches = []
     for company, name in _summary_object_candidates(conn, date_from, date_to):
-        name_tokens = set(re.findall(
-            r"[a-z0-9]+", name.casefold().translate(_CYRILLIC_NAME_TRANSLATION),
-        ))
-        company_tokens = set(re.findall(
-            r"[a-z0-9]+", company.casefold().translate(_CYRILLIC_NAME_TRANSLATION),
-        ))
+        name_tokens = set(_normalized_name_tokens(name))
+        company_tokens = set(_normalized_name_tokens(company))
         available = name_tokens | company_tokens
         if tokens <= name_tokens:
-            matches.append((len(name_tokens - tokens), company, name))
+            matches.append((1.0, len(name_tokens - tokens), company, name))
         elif tokens & name_tokens and tokens <= available:
-            matches.append((len(available - tokens), company, name))
+            matches.append((1.0, len(available - tokens), company, name))
+        else:
+            similarity = _entity_name_similarity(object_text, name)
+            if similarity >= 0.52:
+                matches.append((similarity, 0, company, name))
     if not matches:
+        candidates = _summary_object_candidates(conn, date_from, date_to)
+        scored = sorted(
+            ((_entity_name_similarity(object_text, name), company, name)
+             for company, name in candidates),
+            key=lambda item: (-item[0], item[1].casefold(), item[2].casefold()),
+        )
+        best_score = scored[0][0] if scored else 0
+        choices = [
+            dict(company=company, object_name=name)
+            for score, company, name in scored
+            if score >= 0.52 and best_score - score <= 0.12
+        ][:5]
         raise AssistantQuestion(
             question_field,
-            question=f"Не нашёл объект «{object_text}». Укажите точное название из справочника.",
+            question=(f"Не удалось точно распознать объект «{object_text}». Выберите подходящее название:"
+                      if choices else f"Не нашёл объект «{object_text}». Укажите точное название из справочника."),
+            choices=choices,
             plan=plan,
         )
-    best_score = min(match[0] for match in matches)
-    best = [(company, name) for score, company, name in matches if score == best_score]
-    if len(best) != 1:
-        choices = (
-            [
-                dict(company=company, object_name=name)
-                for company, name in sorted(best, key=lambda item: (item[0].casefold(), item[1].casefold()))[:30]
-            ]
-            if question_kind == "comparison" else []
-        )
+    best_score = max(match[0] for match in matches)
+    best = [(company, name) for score, _, company, name in matches if best_score - score < 0.08]
+    exact_match = best_score == 1.0 and len(best) == 1
+    if len(best) != 1 or not exact_match:
+        choices = [
+            dict(company=company, object_name=name)
+            for company, name in sorted(best, key=lambda item: (item[0].casefold(), item[1].casefold()))[:5]
+        ]
         raise AssistantQuestion(
             question_field,
-            question="Нашёл несколько подходящих объектов. Уточните фирму и точное название.",
+            question=("Нашёл несколько подходящих объектов. Уточните фирму и точное название."
+                      if len(best) > 1 else "Распознанное название похоже на этот объект. Подтвердите выбор:"),
             choices=choices,
             plan=plan,
         )
@@ -1802,6 +1839,8 @@ def select_plan(text, conn, actor, operation, post=None, context=None, summary_v
         if not known_plan:
             known_plan = None if weekly_route else transport_command(text, safe_context)
         if not known_plan:
+            known_plan = None if weekly_route else expense_command(text, safe_context)
+        if not known_plan:
             known_plan = None if weekly_route else recognized_read_command(text, safe_context)
     except AssistantQuestion as question:
         if summary_view and summary_view.get("comparison"):
@@ -1850,6 +1889,8 @@ def select_plan(text, conn, actor, operation, post=None, context=None, summary_v
         "Reuse context dates/person/object for 'same period', 'this object', 'now for another'. "
         "For an unspecified OTHER object ask object, do not reuse the previous one. "
         "A short answer to a pending question completes the previous action, not a new search. "
+        "When the user corrects themselves (for example 'нет, лучше' or 'я имею в виду'), use the final "
+        "corrected request only; do not combine retracted actions. Never infer or repair dates, hours, or amounts. "
         "Object/company/employee filters may be literal partial names from the user's message; "
         "SmartReport resolves them locally and asks if ambiguous. Never invent names. "
         "For missing parameters call request_clarification with the specific field; "
@@ -1953,39 +1994,36 @@ def validate_context(context):
 
 _CYRILLIC_NAME_TRANSLATION = str.maketrans({
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
     "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
     "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
     "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
 })
-_EMPLOYEE_GIVEN_NAME_ALIASES = {
-    "andrei": "andrii",
-    "andrey": "andrii",
-    "andriy": "andrii",
-}
 
 
 def _normalized_name_tokens(value):
-    transliterated = value.casefold().translate(_CYRILLIC_NAME_TRANSLATION)
+    normalized = unicodedata.normalize("NFKD", str(value).casefold())
+    normalized = "".join(character for character in normalized
+                         if not unicodedata.combining(character))
+    transliterated = normalized.translate(_CYRILLIC_NAME_TRANSLATION)
     tokens = re.findall(r"[a-z0-9]+", transliterated)
-    if tokens:
-        tokens[0] = _EMPLOYEE_GIVEN_NAME_ALIASES.get(tokens[0], tokens[0])
     return tokens
 
 
 def _employee_name_similarity(requested, candidate):
     requested_tokens = _normalized_name_tokens(requested)
     candidate_tokens = _normalized_name_tokens(candidate)
-    if (len(requested_tokens) < 2 or len(requested_tokens) != len(candidate_tokens) or
-            requested_tokens[0] != candidate_tokens[0]):
+    if len(requested_tokens) < 2 or len(candidate_tokens) < 2:
         return 0.0
-    similarities = [
-        SequenceMatcher(None, requested_token, candidate_token).ratio()
-        for requested_token, candidate_token in zip(requested_tokens, candidate_tokens)
-    ]
-    if any(similarity < 0.8 for similarity in similarities):
+    return SequenceMatcher(None, " ".join(requested_tokens), " ".join(candidate_tokens)).ratio()
+
+
+def _entity_name_similarity(requested, candidate):
+    requested_tokens = _normalized_name_tokens(requested)
+    candidate_tokens = _normalized_name_tokens(candidate)
+    if not requested_tokens or not candidate_tokens:
         return 0.0
-    return min(similarities)
+    return SequenceMatcher(None, " ".join(requested_tokens), " ".join(candidate_tokens)).ratio()
 
 
 def _report_object_choices(conn, plan):
@@ -2027,8 +2065,9 @@ def resolve_selection(conn, plan):
             ]
             if scored:
                 best_score = max(score for score, _ in scored)
-                matches = [row for score, row in scored if best_score - score < 0.08]
-                fuzzy_needs_confirmation = best_score < 0.9 or len(matches) > 1
+                matches = [row for score, row in scored
+                           if score >= 0.52 and best_score - score < 0.12][:5]
+                fuzzy_needs_confirmation = True
         if len(matches) != 1 or fuzzy_needs_confirmation:
             if matches:
                 question = "Уточните, какого сотрудника выбрать:"
@@ -2047,6 +2086,20 @@ def resolve_selection(conn, plan):
         exact = [row for row in candidates if row["name"].casefold() == plan["object_name"].casefold()
                  and (not plan["company"] or str(row["company"] or "").casefold() == plan["company"].casefold())]
         matches = exact or candidates
+        fuzzy_needs_confirmation = False
+        if not matches and plan["object_name"]:
+            scoped_rows = rows
+            if plan["company"]:
+                scoped_rows = [row for row in rows if
+                               _entity_name_similarity(plan["company"], str(row["company"] or "")) >= 0.52]
+            scored = [
+                (similarity, row) for row in scoped_rows
+                if (similarity := _entity_name_similarity(plan["object_name"], row["name"])) >= 0.52
+            ]
+            if scored:
+                best_score = max(score for score, _ in scored)
+                matches = [row for score, row in scored if best_score - score < 0.12][:5]
+                fuzzy_needs_confirmation = True
         if not matches and plan["purpose"] == "hours_summary" and plan["object_name"]:
             matches = conn.execute(
                 "SELECT NULL AS id, object_name AS name, company FROM incoming_submissions "
@@ -2055,11 +2108,14 @@ def resolve_selection(conn, plan):
                 (plan["object_name"], plan["company"], plan["company"]),
             ).fetchall()
         if plan["object_name"] or plan["purpose"] in OBJECT_ACTIONS:
-            if len(matches) != 1:
-                raise AssistantQuestion("object", question="Какой объект выбрать? Укажите фирму и объект."
-                                        if matches else "Объект не найден. Выберите его из справочника.",
+            if len(matches) != 1 or fuzzy_needs_confirmation:
+                question = ("Похоже на несколько объектов. Выберите точное название и фирму."
+                            if len(matches) > 1 else "Название похоже на объект. Подтвердите выбор."
+                            if fuzzy_needs_confirmation else "Какой объект выбрать? Укажите фирму и объект."
+                            if matches else "Объект не найден. Выберите его из справочника.")
+                raise AssistantQuestion("object", question=question,
                                         choices=[dict(company=row["company"], object_name=row["name"])
-                                                 for row in (matches or rows)[:30]], plan=plan)
+                                                 for row in (matches or rows)[:5]], plan=plan)
             plan.update(company=matches[0]["company"], object_name=matches[0]["name"])
         else:
             firms = sorted({row["company"] for row in candidates})
@@ -2317,8 +2373,29 @@ def check_transport(conn, records):
                        "и выплаты сотрудникам здесь не проверяются. Данные не изменены.")
 
 
-def transcribe(audio, conn, actor, operation, post=None):
+def _validate_transcription_terms(terms):
+    if terms is None:
+        return []
+    if not isinstance(terms, list) or len(terms) > 6:
+        raise AssistantError("Для подсказки распознавания передайте не более шести названий.")
+    result = []
+    seen = set()
+    for term in terms:
+        if not isinstance(term, str) or not term.strip() or len(term) > 200:
+            raise AssistantError("Подсказка распознавания содержит неверное название.")
+        name = " ".join(term.split())
+        key = name.casefold()
+        if key not in seen:
+            result.append(name)
+            seen.add(key)
+    if sum(map(len, result)) > 600:
+        raise AssistantError("Слишком длинная подсказка распознавания.")
+    return result
+
+
+def transcribe(audio, conn, actor, operation, post=None, terms=None):
     post = post or requests.post
+    terms = _validate_transcription_terms(terms)
     try:
         with wave.open(io.BytesIO(audio), "rb") as wav:
             frames = wav.getnframes()
@@ -2331,9 +2408,17 @@ def transcribe(audio, conn, actor, operation, post=None):
         raise AssistantError("Неверный формат голосовой записи.") from None
     reserve(conn, actor, operation, "voice", 100000)
     try:
+        prompt = (
+            "Русская речь. Транскрибируй дословно, сохраняя отрицания, паузы и самокоррекции. "
+            "Не переводи слова и не дополняй фразу. Названия из текущего контекста: "
+            + "; ".join(terms)
+            if terms else
+            "Русская речь. Транскрибируй дословно, сохраняя отрицания, паузы и самокоррекции. "
+            "Не переводи слова и не дополняй фразу."
+        )
         response = post("https://api.openai.com/v1/audio/transcriptions",
                         headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]},
-                        data={"model": "gpt-4o-mini-transcribe"},
+                        data={"model": VOICE_TRANSCRIPTION_MODEL, "language": "ru", "prompt": prompt},
                         files={"file": ("command.wav", audio, "audio/wav")},
                         timeout=(10, 60), allow_redirects=False)
         if response.status_code != 200:
@@ -2343,7 +2428,7 @@ def transcribe(audio, conn, actor, operation, post=None):
             raise AssistantError("Ответ распознавания слишком длинный.")
         finish(conn, actor, operation, "voice", "transcribed")
         return text
-    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+    except (requests.RequestException, ValueError, KeyError, TypeError, AssistantError) as error:
         finish(conn, actor, operation, "voice", "failed")
         if isinstance(error, AssistantError):
             raise
@@ -2644,8 +2729,24 @@ def register_assistant(app, connect, authenticate):
 
     @app.route("/api/assistant/transcribe", methods=["POST"])
     def assistant_transcribe():
-        return handle(lambda conn, actor: jsonify(ok=True, text=transcribe(
-            request.get_data(), conn, actor, request.headers.get("X-Operation-ID"))))
+        def action(conn, actor):
+            if request.mimetype == "multipart/form-data":
+                if set(request.files) != {"file"} or set(request.form) - {"terms"}:
+                    raise AssistantError("Передайте WAV-файл и только названия текущего контекста.")
+                upload = request.files["file"]
+                audio = upload.read()
+                try:
+                    terms = json.loads(request.form.get("terms", "[]"))
+                except ValueError:
+                    raise AssistantError("Список названий для распознавания повреждён.") from None
+            else:
+                audio = request.get_data()
+                terms = None
+            text = transcribe(
+                audio, conn, actor, request.headers.get("X-Operation-ID"), terms=terms,
+            )
+            return jsonify(ok=True, text=text)
+        return handle(action)
 
     @app.route("/api/assistant/translate", methods=["POST"])
     def assistant_translate():

@@ -273,7 +273,57 @@ class AssistantApiTests(unittest.TestCase):
                                            headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
         self.assertEqual(good.get_json()["text"], "Покажи отчёт")
         self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.kwargs["data"]["model"], assistant.VOICE_TRANSCRIPTION_MODEL)
+        self.assertEqual(post.call_args.kwargs["data"]["language"], "ru")
+        self.assertIn("самокоррекции", post.call_args.kwargs["data"]["prompt"])
         self.assertEqual(self.business()["incoming_submissions"], [])
+
+    def test_voice_context_terms_use_multipart_and_are_limited_to_names(self):
+        audio = BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x10\x00" * 1600)
+        provider = Mock(status_code=200, json=Mock(return_value={"text": "часы за прошлую неделю"}))
+        with patch("assistant_api.requests.post", return_value=provider) as post:
+            response = self.server_client.post(
+                self.base + "transcribe",
+                data={
+                    "terms": json.dumps(["Tomteboda ÄTA", "Renatur"], ensure_ascii=False),
+                    "file": (BytesIO(audio.getvalue()), "command.wav", "audio/wav"),
+                },
+                headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())},
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["text"], "часы за прошлую неделю")
+        data = post.call_args.kwargs["data"]
+        self.assertEqual(data["language"], "ru")
+        self.assertIn("Tomteboda ÄTA", data["prompt"])
+        self.assertIn("Renatur", data["prompt"])
+        self.assertNotIn("2026", data["prompt"])
+        self.assertEqual(post.call_args.kwargs["files"]["file"][2], "audio/wav")
+
+    def test_transcription_server_error_is_not_recorded_as_success(self):
+        audio = BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x10\x00" * 1600)
+        provider = Mock(status_code=503, json=Mock(return_value={"error": "unavailable"}))
+        operation = str(uuid.uuid4())
+        with patch("assistant_api.requests.post", return_value=provider):
+            response = self.server_client.post(
+                self.base + "transcribe", data=audio.getvalue(),
+                headers=self.headers() | {"X-Operation-ID": operation},
+            )
+        self.assertEqual(response.status_code, 400)
+        with closing(self.server.get_db_connection()) as conn:
+            row = conn.execute(
+                "SELECT state FROM assistant_requests WHERE operation_id=?", (operation,)
+            ).fetchone()
+        self.assertEqual(row["state"], "failed")
 
     def mail(self):
         stream = BytesIO()
@@ -373,6 +423,29 @@ class AssistantApiTests(unittest.TestCase):
         self.assertNotIn("assistant-five", repr(rows))
         with closing(self.server.get_db_connection()) as conn:
             self.assertEqual(assistant.status(conn)["reserved_usd"], 0)
+
+    def test_voice_followups_keep_period_and_expense_request_is_routed_directly(self):
+        context = dict(plan=plan(
+            "hours_summary", date_from="2026-10-19", date_to="2026-10-25",
+            employee="Synthetic Employee", object_name="Hotel", company="Renatur",
+        ))
+        transport = assistant.transport_command("А транспорт за тот же период?", context)
+        self.assertEqual(transport["purpose"], "transport_check")
+        self.assertEqual((transport["date_from"], transport["date_to"]), ("2026-10-19", "2026-10-25"))
+        self.assertEqual(transport["employee"], "Synthetic Employee")
+        self.assertEqual(transport["object_name"], "Hotel")
+        expenses = assistant.expense_command("Покажи расходы за тот же период", context)
+        self.assertEqual(expenses["purpose"], "expenses")
+        self.assertEqual((expenses["date_from"], expenses["date_to"]), ("2026-10-19", "2026-10-25"))
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", dict(
+                text="Покажи расходы за тот же период",
+                context=context | {"pending": ""},
+                operation_id=str(uuid.uuid4()),
+            ))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["result"]["plan"], expenses)
+        provider.assert_not_called()
 
     def test_transport_mismatch_missing_quantity_fixed_and_closed_are_not_repriced(self):
         self.fixture_shift()
@@ -1620,10 +1693,19 @@ class AssistantApiTests(unittest.TestCase):
             dialog.date_from.setDate(QDate(2026, 10, 19))
             dialog.date_to.setDate(QDate(2026, 10, 25))
 
-            def local_api(path, payload=None, audio=None, database=None):
+            def local_api(path, payload=None, audio=None, database=None, audio_terms=None):
                 if audio is not None:
-                    reply = self.server_client.post(self.base + path, data=audio,
-                        headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
+                    if audio_terms is None:
+                        reply = self.server_client.post(self.base + path, data=audio,
+                            headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
+                    else:
+                        reply = self.server_client.post(
+                            self.base + path, data={
+                                "terms": json.dumps(audio_terms, ensure_ascii=False),
+                                "file": (BytesIO(audio), "command.wav", "audio/wav"),
+                            },
+                            headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())},
+                        )
                 else:
                     reply = self.post(path, payload)
                 self.assertEqual(reply.status_code, 200, reply.get_json())
@@ -1649,6 +1731,7 @@ class AssistantApiTests(unittest.TestCase):
                     dialog.worker.run()
                 dialog.finished()
                 self.assertEqual(dialog.input.toPlainText(), "А теперь проверь транспорт за тот же период")
+                self.assertIn("почти беззвучная", dialog.state.text())
                 self.assertEqual(api.call_count, 2)  # Transcription did not execute a command.
                 previous_context = dialog.context.copy()
                 dialog.command()
@@ -1665,6 +1748,30 @@ class AssistantApiTests(unittest.TestCase):
                 )
                 self.assertEqual(dialog.table.rowCount(), 1)
         self.assertEqual(before, self.business())
+
+    def test_voice_transcript_appends_and_cancel_preserves_typed_text(self):
+        from assistant_ui import AssistantDialog
+        from PyQt6.QtWidgets import QWidget
+        with patch("assistant_ui.RequestWorker.start"):
+            dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            dialog.input.setPlainText("Покажи часы за прошлую неделю")
+            dialog.received({"text": "А транспорт за тот же период?"})
+            self.assertEqual(
+                dialog.input.toPlainText(),
+                "Покажи часы за прошлую неделю\nА транспорт за тот же период?",
+            )
+            self.assertIn("добавлен", dialog.state.text())
+            dialog.audio = Mock()
+            dialog.buffer = Mock()
+            dialog.cancel_recording()
+            self.assertEqual(
+                dialog.input.toPlainText(),
+                "Покажи часы за прошлую неделю\nА транспорт за тот же период?",
+            )
+            self.assertIn("отменена", dialog.state.text())
+            self.assertFalse(dialog.voice_cancel.isVisible())
 
     def test_actual_saved_prices_five_hours_2600_and_no_transport(self):
         self.fixture_shift()
@@ -1930,6 +2037,15 @@ class AssistantApiTests(unittest.TestCase):
                 self.assertTrue(request_api("status", database=database)["ok"])
                 provider.assert_called_once()
                 self.assertEqual(provider.call_args.kwargs["headers"][HEADER], file_dataset(database))
+                request_api(
+                    "transcribe", audio=b"synthetic WAV", database=database,
+                    audio_terms=["Tomteboda ÄTA"],
+                )
+                self.assertEqual(provider.call_count, 2)
+                kwargs = provider.call_args.kwargs
+                self.assertNotIn("Content-Type", kwargs["headers"])
+                self.assertEqual(kwargs["data"], {"terms": '["Tomteboda ÄTA"]'})
+                self.assertEqual(kwargs["files"]["file"][0:1], ("command.wav",))
 
     def test_mail_expired_disabled_and_mismatched_dataset_are_rejected(self):
         from sync_dataset import HEADER
@@ -2340,7 +2456,11 @@ class AssistantApiTests(unittest.TestCase):
             clarification = response.get_json()["clarification"]
             self.assertEqual(clarification["field"], "weekly_object")
             self.assertIn("несколько подходящих", clarification["question"])
-            self.assertEqual(clarification["choices"], [])
+            self.assertEqual(
+                clarification["choices"],
+                [{"company": "Firm One", "object_name": "Bridge"},
+                 {"company": "Firm Two", "object_name": "Bridge"}],
+            )
             selected = self.post("command", dict(
                 text="Firm One Bridge",
                 context=dict(plan=clarification["plan"], pending=clarification["field"]),

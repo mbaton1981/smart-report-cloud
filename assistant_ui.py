@@ -3,10 +3,13 @@ import io
 import base64
 from html import escape
 import json
+import math
 import os
 import sqlite3
+import struct
 from pathlib import Path
 import sys
+import time
 import uuid
 import wave
 from decimal import Decimal
@@ -17,7 +20,7 @@ from PyQt6.QtCore import QBuffer, QDate, QIODevice, QSignalBlocker, QThread, QTi
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog, QDateEdit,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox, QProgressBar,
 )
 
 import desktop_auth
@@ -41,7 +44,7 @@ CANDIDATE_READ_ACTIONS = frozenset({
 CANDIDATE_REQUESTS = frozenset({"status", "capabilities", "command", "inspect", "transcribe"})
 
 
-def request_api(path, payload=None, audio=None, database=None):
+def request_api(path, payload=None, audio=None, database=None, audio_terms=None):
     base = desktop_auth.server_url().rstrip("/")
     parsed = urlsplit(base)
     if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}):
@@ -56,12 +59,20 @@ def request_api(path, payload=None, audio=None, database=None):
     if not dataset:
         raise AssistantClientError("Нет идентификатора набора данных текущей базы. Сначала выполните штатную синхронизацию.")
     headers = {"Authorization": "Bearer " + token, HEADER: dataset}
+    request_data = None
+    files = None
     if audio is not None:
-        headers.update({"Content-Type": "audio/wav", "X-Operation-ID": str(uuid.uuid4())})
+        headers["X-Operation-ID"] = str(uuid.uuid4())
+        if audio_terms is None:
+            headers["Content-Type"] = "audio/wav"
+            request_data = audio
+        else:
+            request_data = {"terms": json.dumps(audio_terms, ensure_ascii=False)}
+            files = {"file": ("command.wav", audio, "audio/wav")}
     try:
         response = requests.request("POST" if payload is not None or audio is not None else "GET",
                                     base + "/api/assistant/" + path, headers=headers, json=payload,
-                                    data=audio, timeout=(10, 75), allow_redirects=False)
+                                    data=request_data, files=files, timeout=(10, 75), allow_redirects=False)
         require_response_dataset(response, dataset)
         if response.status_code in (404, 405):
             raise AssistantClientError("На сервере ещё нет помощника. Обычная программа работает; требуется обновление сервера.")
@@ -86,14 +97,17 @@ class RequestWorker(QThread):
     ready = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, path, payload=None, audio=None, parent=None, database=None):
+    def __init__(self, path, payload=None, audio=None, parent=None, database=None, audio_terms=None):
         super().__init__(parent)
         self.path, self.payload, self.audio = path, payload, audio
         self.database = database
+        self.audio_terms = audio_terms
 
     def run(self):
         try:
-            self.ready.emit(request_api(self.path, self.payload, self.audio, self.database))
+            self.ready.emit(request_api(
+                self.path, self.payload, self.audio, self.database, self.audio_terms,
+            ))
         except AssistantClientError as error:
             self.failed.emit(str(error))
 
@@ -457,6 +471,8 @@ class AssistantDialog(QDialog):
     def __init__(self, window):
         super().__init__(window)
         self.window, self.worker, self.result, self.audio = window, None, None, None
+        self.recording_started_at = None
+        self.voice_warning = ""
         self.context = None
         self.chat_messages = []
         self.choices = []
@@ -587,9 +603,17 @@ class AssistantDialog(QDialog):
         self.send = QPushButton("Отправить")
         self.send.clicked.connect(self.command)
         row.addWidget(self.send)
-        self.voice = QPushButton("Записать голос (до 60 с)")
+        self.voice = QPushButton("Записать голос")
         self.voice.clicked.connect(self.record)
         row.addWidget(self.voice)
+        self.voice_stop = QPushButton("Остановить и распознать")
+        self.voice_stop.setVisible(False)
+        self.voice_stop.clicked.connect(self.stop_recording)
+        row.addWidget(self.voice_stop)
+        self.voice_cancel = QPushButton("Отменить запись")
+        self.voice_cancel.setVisible(False)
+        self.voice_cancel.clicked.connect(self.cancel_recording)
+        row.addWidget(self.voice_cancel)
         tools = QHBoxLayout()
         self.pdf = QPushButton("Создать / открыть PDF")
         self.pdf.setEnabled(False)
@@ -600,6 +624,20 @@ class AssistantDialog(QDialog):
         tools.addWidget(mail)
         self.mail_button = mail
         layout.addLayout(row)
+        voice_status = QHBoxLayout()
+        self.microphone_label = QLabel()
+        self.microphone_label.setAccessibleName("Выбранный микрофон")
+        self.refresh_microphone_label()
+        voice_status.addWidget(self.microphone_label)
+        self.voice_level = QProgressBar()
+        self.voice_level.setRange(0, 100)
+        self.voice_level.setTextVisible(False)
+        self.voice_level.setAccessibleName("Уровень звука микрофона")
+        voice_status.addWidget(self.voice_level, 1)
+        self.recording_time = QLabel("00:00 / 01:00")
+        self.recording_time.setAccessibleName("Длительность записи")
+        voice_status.addWidget(self.recording_time)
+        layout.addLayout(voice_status)
         layout.addLayout(tools)
         self.native = QPushButton("Открыть штатную форму")
         self.native.setEnabled(False)
@@ -646,9 +684,16 @@ class AssistantDialog(QDialog):
             self.confirm_mail.setEnabled(False)
             self.diagnostics.hide()
         self.timer = QTimer(self)
-        self.timer.setSingleShot(True)
-        self.timer.timeout.connect(self.stop_recording)
+        self.timer.setInterval(100)
+        self.timer.timeout.connect(self.update_recording_status)
         self.call("status")
+
+    def refresh_microphone_label(self):
+        from PyQt6.QtMultimedia import QMediaDevices
+        device = QMediaDevices.defaultAudioInput()
+        self.microphone_label.setText(
+            "Микрофон: " + (device.description() if not device.isNull() else "не найден")
+        )
 
     def append_message(self, role, text):
         message = (str(role), str(text))
@@ -727,7 +772,7 @@ class AssistantDialog(QDialog):
     def show_capabilities(self):
         self.call("capabilities")
 
-    def call(self, path, payload=None, audio=None):
+    def call(self, path, payload=None, audio=None, audio_terms=None):
         if self.assistant_candidate:
             allowed = path in CANDIDATE_REQUESTS and not (path == "status" and payload is not None)
             if path == "inspect":
@@ -747,7 +792,9 @@ class AssistantDialog(QDialog):
         self.native.setEnabled(False)
         self.open_records.setEnabled(False)
         self.workflow_choice.setEnabled(False)
-        self.worker = RequestWorker(path, payload, audio, self, database=self.database)
+        self.worker = RequestWorker(
+            path, payload, audio, self, database=self.database, audio_terms=audio_terms,
+        )
         self.worker.ready.connect(self.received)
         self.worker.failed.connect(self.failed)
         self.worker.finished.connect(self.finished)
@@ -756,6 +803,7 @@ class AssistantDialog(QDialog):
     def finished(self):
         if self.worker is not None:
             self.worker.audio = None
+            self.worker.audio_terms = None
         self.send.setEnabled(True)
         self.voice.setEnabled(True)
         self.workflow_choice.setEnabled(True)
@@ -843,8 +891,19 @@ class AssistantDialog(QDialog):
             self.state.setText("Помощник готов. Опишите задачу." if s["enabled"] else
                                "Помощник выключен. Включить можно в диагностике и настройках.")
         elif "text" in data:
-            self.input.setPlainText(data["text"])
-            self.state.setText("Речь распознана. Проверьте ФИО, даты и числа, затем нажмите «Отправить».")
+            transcript = data["text"]
+            if not isinstance(transcript, str) or not transcript.strip():
+                self.failed("Распознавание вернуло пустой текст. Проверьте микрофон и попробуйте ещё раз.")
+                return
+            transcript = transcript.strip()
+            current = self.input.toPlainText()
+            self.input.setPlainText(current.rstrip() + ("\n" if current.strip() else "") + transcript)
+            warning = (self.voice_warning + " ") if self.voice_warning else ""
+            self.state.setText(
+                warning + "Речь распознана и добавлена в поле. Проверьте ФИО, даты и числа, "
+                "исправьте при необходимости и нажмите «Отправить»."
+            )
+            self.voice_warning = ""
         elif "actions" in data:
             names = {"search": "Поиск смен", "check": "Проверка данных", "transport_check": "Проверка транспорта",
                      "text": "Текстовая команда", "voice": "Голос", "settings": "Настройки"}
@@ -1130,14 +1189,20 @@ class AssistantDialog(QDialog):
             self.buffer = QBuffer(self)
             self.buffer.open(QIODevice.OpenModeFlag.ReadWrite)
             self.audio = QAudioSource(device, fmt, self)
+            self.audio.setNotifyInterval(100)
             self.audio.start(self.buffer)
             if self.audio.error().value:
                 raise AssistantClientError("Нет доступа к микрофону. Проверьте разрешение Windows.")
-            self.voice.setText("Остановить и распознать")
+            self.recording_started_at = time.monotonic()
+            self.voice.setEnabled(False)
+            self.voice_stop.setVisible(True)
+            self.voice_cancel.setVisible(True)
+            self.voice_level.setValue(0)
+            self.recording_time.setText("00:00 / 01:00")
             self.send.setEnabled(False)
-            self.state.setText("Идёт запись. После остановки аудио будет отправлено OpenAI; до 60 секунд.")
-            self.timer.start(59000)
-        except (ImportError, AssistantClientError) as error:
+            self.state.setText("Идёт запись. Остановите её для распознавания или отмените без отправки.")
+            self.timer.start()
+        except (ImportError, AssistantClientError, RuntimeError) as error:
             if self.audio is not None:
                 self.audio.stop()
                 self.audio.deleteLater()
@@ -1145,7 +1210,63 @@ class AssistantDialog(QDialog):
             if hasattr(self, "buffer"):
                 self.buffer.close()
             self.send.setEnabled(True)
-            self.state.setText(str(error))
+            self.state.setText(
+                str(error) if isinstance(error, AssistantClientError) else
+                "Не удалось начать запись. Проверьте подключение микрофона и разрешение Windows."
+            )
+
+    def update_recording_status(self):
+        if self.audio is None:
+            return
+        elapsed = max(0, int(time.monotonic() - self.recording_started_at))
+        self.recording_time.setText(f"{elapsed // 60:02d}:{elapsed % 60:02d} / 01:00")
+        raw = bytes(self.buffer.data())[-6400:]
+        if raw:
+            samples = [sample[0] for sample in struct.iter_unpack("<h", raw[:len(raw) // 2 * 2])]
+            if samples:
+                peak = max(abs(sample) for sample in samples)
+                rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+                db = 20 * math.log10(max(rms, 1) / 32768)
+                self.voice_level.setValue(max(0, min(100, int((db + 60) * 100 / 60))))
+                self.voice_level.setToolTip(f"Уровень: RMS {db:.0f} dBFS; пик {peak / 32768:.2f}")
+        if elapsed >= 59:
+            self.stop_recording()
+
+    def voice_context_terms(self):
+        terms = [
+            self.employee.text().strip(),
+            self.company.text().strip(),
+            self.object_name.text().strip(),
+        ]
+        if self.context and isinstance(self.context.get("plan"), dict):
+            plan = self.context["plan"]
+            terms.extend((plan.get("employee", ""), plan.get("company", ""), plan.get("object_name", "")))
+        return list(dict.fromkeys(value for value in terms if value))[:6]
+
+    def _finish_recording_controls(self):
+        self.voice.setEnabled(True)
+        self.voice_stop.setVisible(False)
+        self.voice_cancel.setVisible(False)
+        self.voice_level.setValue(0)
+
+    def _discard_recording(self):
+        self.timer.stop()
+        if self.audio is not None:
+            self.audio.stop()
+            self.audio.deleteLater()
+            self.audio = None
+        if hasattr(self, "buffer"):
+            self.buffer.close()
+            self.buffer.deleteLater()
+        self.recording_started_at = None
+        self._finish_recording_controls()
+
+    def cancel_recording(self):
+        if self.audio is None:
+            return
+        self._discard_recording()
+        self.send.setEnabled(True)
+        self.state.setText("Запись отменена и не отправлена. Уже набранный текст сохранён.")
 
     def stop_recording(self):
         if self.audio is None:
@@ -1157,18 +1278,33 @@ class AssistantDialog(QDialog):
         raw = bytes(self.buffer.data())
         self.buffer.close()
         self.buffer.deleteLater()
-        self.voice.setText("Записать голос (до 60 с)")
+        self.recording_started_at = None
+        self._finish_recording_controls()
         if not raw or len(raw) > 1920000:
-            self.failed("Запись пуста или слишком длинная. Используйте текст или запишите ещё раз.")
-            self.finished()
+            self.send.setEnabled(True)
+            self.state.setText(
+                "Запись пуста или длилась слишком долго. Проверьте, что микрофон выбран и разрешён, "
+                "затем запишите фразу короче минуты."
+            )
             return
+        sample_count = len(raw) // 2
+        samples = [sample[0] for sample in struct.iter_unpack("<h", raw[:sample_count * 2])]
+        peak = max((abs(sample) for sample in samples), default=0)
+        rms = math.sqrt(sum(sample * sample for sample in samples) / max(1, len(samples)))
+        self.voice_warning = ""
+        if rms < 100:
+            self.voice_warning = (
+                "Запись почти беззвучная: проверьте микрофон, расстояние и разрешение Windows."
+            )
+        elif peak >= 32760:
+            self.voice_warning = "В записи возможны перегрузка и искажения; проверьте микрофон."
         stream = io.BytesIO()
         with wave.open(stream, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(16000)
             wav.writeframes(raw)
-        self.call("transcribe", audio=stream.getvalue())
+        self.call("transcribe", audio=stream.getvalue(), audio_terms=self.voice_context_terms())
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
@@ -1176,10 +1312,7 @@ class AssistantDialog(QDialog):
             event.ignore()
             return
         if self.audio is not None:
-            self.timer.stop()
-            self.audio.stop()
-            self.audio.deleteLater()
-            self.audio = None
+            self._discard_recording()
         super().closeEvent(event)
 
 
