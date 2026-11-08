@@ -151,6 +151,184 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("3 входящих вне периода", host.exp_api_status_lbl.text())
         self.assertIn("Измените период", host.exp_api_status_lbl.text())
 
+    def test_expense_register_state_colors_follow_saved_state_and_both_themes(self):
+        import tempfile
+        from pathlib import Path
+
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage, QPainter
+        from PyQt6.QtWidgets import QCheckBox, QComboBox, QLabel
+
+        from desktop_theme import BACKGROUND_ROLE, ThemeManager
+
+        documents = [
+            {"id": "unassigned", "verification_status": "requires_review",
+             "gross_amount": "125.00", "currency_code": "SEK", "allocations": []},
+            {"id": "distributed", "verification_status": "requires_review",
+             "gross_amount": "125.00", "currency_code": "SEK",
+             "allocations": [{"destination": "company", "object_id": None,
+                              "gross_amount": "125.00"}],
+             "unallocated_gross": "0.00"},
+            {"id": "accounted", "verification_status": "confirmed",
+             "gross_amount": "125.00", "currency_code": "SEK",
+             "allocations": [{"destination": "object", "object_id": 1,
+                              "gross_amount": "125.00"}],
+             "unallocated_gross": "0.00"},
+            {"id": "later", "verification_status": "later",
+             "gross_amount": "125.00", "currency_code": "SEK", "allocations": []},
+            {"id": "ignored", "verification_status": "ignored",
+             "gross_amount": "125.00", "currency_code": "SEK", "allocations": []},
+            {"id": "error", "verification_status": "requires_review",
+             "sync_state": "conflict", "sync_error": "Synthetic transfer error",
+             "gross_amount": "125.00", "currency_code": "SEK",
+             "allocations": [{"destination": "object", "object_id": 1,
+                              "gross_amount": "125.00"}],
+             "unallocated_gross": "0.00"},
+            {"id": "pending", "verification_status": "requires_review",
+             "sync_state": "pending", "gross_amount": "125.00", "currency_code": "SEK",
+             "allocations": [{"destination": "company", "object_id": None,
+                              "gross_amount": "125.00"}],
+             "unallocated_gross": "0.00"},
+        ]
+        table = self.desktop.QTableWidget(0, 8)
+        table.setItemDelegate(self.desktop.desktop_ui.ExpenseRegisterTableDelegate(table))
+        table.setFixedSize(1100, 150)
+        table.setAlternatingRowColors(True)
+        table.show()
+        self.addCleanup(table.close)
+        self.addCleanup(table.deleteLater)
+        host = SimpleNamespace(
+            _expense_document_snapshot=lambda *_args, **_kwargs: (documents, True),
+            _local_incoming_expense_documents=lambda *_args, **_kwargs: [],
+            exp_api_status_lbl=QLabel(),
+            exp_docs_state_counts_lbl=QLabel(),
+            exp_docs_gross_lbl=QLabel(),
+            exp_docs_vat_lbl=QLabel(),
+            exp_docs_net_lbl=QLabel(),
+            exp_docs_unallocated_lbl=QLabel(),
+            exp_docs_review_lbl=QLabel(),
+            exp_docs_state_legend_lbl=QLabel(),
+            exp_date_from=SimpleNamespace(text=lambda: "2026-11-01"),
+            exp_date_to=SimpleNamespace(text=lambda: "2026-11-30"),
+            exp_filter_object=QComboBox(),
+            exp_filter_unallocated=QCheckBox(),
+            exp_filter_status=QComboBox(),
+            table_supplier_documents=table,
+            _expense_money_label=self.desktop.SmartReportApp._expense_money_label,
+        )
+        host.exp_filter_object.addItem("Все объекты", None)
+        host.exp_filter_status.addItem("Все состояния", "all")
+        for name in (
+                "_expense_register_snapshot", "_expense_register_status_key",
+                "_expense_register_status_label", "_expense_register_row_tone",
+                "_expense_register_has_transfer_error", "_expense_register_is_unallocated",
+                "_expense_register_unallocated_amount", "_expense_distribution_label",
+                "_update_expense_register_legend"):
+            setattr(host, name, getattr(self.desktop.SmartReportApp, name))
+        host._expense_register_snapshot = lambda *_args, **_kwargs: (documents, True)
+
+        previous = getattr(self.qt_app, "_smartreport_theme", None)
+        previous_style = self.qt_app.styleSheet()
+        with tempfile.TemporaryDirectory() as temp:
+            manager = ThemeManager(
+                self.qt_app, self.desktop.DARK_THEME_QSS, Path(temp) / "appearance.json")
+            self.qt_app._smartreport_theme = manager
+            manager.changed.connect(
+                lambda *_: self.desktop.SmartReportApp._update_expense_register_legend(host))
+            self.addCleanup(manager.deleteLater)
+            self.addCleanup(
+                lambda: setattr(self.qt_app, "_smartreport_theme", previous)
+                if previous is not None else delattr(self.qt_app, "_smartreport_theme")
+                if hasattr(self.qt_app, "_smartreport_theme") else None)
+            self.addCleanup(
+                lambda: previous.apply() if previous is not None
+                else self.qt_app.setStyleSheet(previous_style))
+
+            expected = {
+                "light": {
+                    "unassigned": "#fff0cf", "distributed": "#e4f2ff",
+                    "accounted": "#e4efe9", "later": "#edf0f3",
+                    "ignored": "#edf0f3", "error": "#f1e5e5",
+                    "pending": "#e4f2ff", "selected": "#d6e5f0",
+                },
+                "dark": {
+                    "unassigned": "#4a3b24", "distributed": "#26394b",
+                    "accounted": "#1c4532", "later": "#30343b",
+                    "ignored": "#30343b", "error": "#632c2c",
+                    "pending": "#26394b", "selected": "#3182ce",
+                },
+            }
+
+            def row_for(identity):
+                return next(
+                    row for row in range(table.rowCount())
+                    if table.item(row, 0).text() == identity)
+
+            for theme_name in ("light", "dark"):
+                manager.name = theme_name
+                manager.apply()
+                self.desktop.SmartReportApp._update_expense_register_legend(host)
+                self.desktop.SmartReportApp.load_expense_documents(host)
+                self.qt_app.processEvents()
+
+                self.assertIn("Назначение не выбрано", host.exp_docs_state_legend_lbl.text())
+                self.assertIn("Распределено", host.exp_docs_state_legend_lbl.text())
+                self.assertIn("Ошибка передачи", host.exp_docs_state_legend_lbl.text())
+                for identity, color in expected[theme_name].items():
+                    if identity == "selected":
+                        continue
+                    row = row_for(identity)
+                    for column in range(1, table.columnCount()):
+                        item = table.item(row, column)
+                        wanted = color
+                        if identity == "error" and column == 7:
+                            wanted = expected[theme_name]["error"]
+                        elif identity == "error":
+                            wanted = expected[theme_name]["distributed"]
+                        self.assertEqual(item.background().color().name(), wanted,
+                                         (theme_name, identity, column))
+                        original_color = expected["dark"][identity]
+                        if identity == "error" and column == 7:
+                            original_color = expected["dark"]["error"]
+                        elif identity == "error":
+                            original_color = expected["dark"]["distributed"]
+                        self.assertEqual(item.data(BACKGROUND_ROLE).lower(), original_color)
+                self.assertIn("Ожидает подтверждения сервера",
+                              table.item(row_for("pending"), 7).text())
+                self.assertTrue(table.item(row_for("accounted"), 7).text().startswith("Учтён"))
+                self.assertNotIn("Оплачен", table.item(row_for("accounted"), 7).text())
+
+                selected_row = row_for("distributed")
+                table.selectRow(selected_row)
+                self.qt_app.processEvents()
+                image = QImage(table.size(), QImage.Format.Format_ARGB32)
+                image.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(image)
+                table.render(painter)
+                painter.end()
+                cell = table.visualItemRect(table.item(selected_row, 1))
+                selection_color = expected[theme_name]["selected"]
+                selected_pixels = sum(
+                    image.pixelColor(x, y).name() == selection_color
+                    for y in range(cell.top() + 2, cell.bottom() - 1)
+                    for x in range(cell.left() + 2, cell.right() - 1)
+                )
+                self.assertGreater(selected_pixels, 0, (theme_name, "selected row overlay"))
+
+            scroll = table.verticalScrollBar()
+            scroll.setValue(scroll.maximum())
+            self.assertGreater(scroll.value(), 0)
+            before_scroll = scroll.value()
+            accounted = documents[1]
+            accounted["verification_status"] = "confirmed"
+            self.desktop.SmartReportApp.load_expense_documents(host)
+            self.qt_app.processEvents()
+            refreshed_row = row_for("distributed")
+            self.assertEqual(
+                table.item(refreshed_row, 1).background().color().name(),
+                expected["dark"]["accounted"])
+            self.assertEqual(scroll.value(), before_scroll)
+
     def test_missing_fields_are_explicit_not_invented(self):
         from test_mail_automation import pdf
         self.store.add_pdf(pdf("No recognizable fields"), "unknown.pdf", {"fields": {}, "state": "failed"})

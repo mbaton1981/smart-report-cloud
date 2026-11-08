@@ -71,6 +71,14 @@ import desktop_ui
 
 import desktop_auth
 
+EXPENSE_REGISTER_ROW_COLORS = {
+    "unassigned": "#4a3b24",
+    "distributed": "#26394b",
+    "accounted": "#1c4532",
+    "neutral": "#30343b",
+}
+EXPENSE_REGISTER_TRANSFER_ERROR_COLOR = "#632c2c"
+
 try:
     desktop_auth.use_data_dir_as_working_directory()
 except desktop_auth.AuthError as error:
@@ -6688,6 +6696,15 @@ class SmartReportApp(QMainWindow):
         state_row.addWidget(self.exp_docs_state_counts_lbl, 1)
         page_layout.addLayout(state_row)
 
+        self.exp_docs_state_legend_lbl = QLabel()
+        self.exp_docs_state_legend_lbl.setWordWrap(True)
+        self.exp_docs_state_legend_lbl.setAccessibleName("Легенда цветов состояний расходов")
+        page_layout.addWidget(self.exp_docs_state_legend_lbl)
+        theme_manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+        if theme_manager is not None:
+            theme_manager.changed.connect(self._update_expense_register_legend)
+        self._update_expense_register_legend()
+
         totals_row = QHBoxLayout()
         for attribute, label in (
             ("exp_docs_gross_lbl", "Сумма с НДС"),
@@ -6719,6 +6736,8 @@ class SmartReportApp(QMainWindow):
         for column, width in {1: 95, 2: 155, 3: 125, 5: 125, 6: 105, 7: 205}.items():
             document_header.resizeSection(column, width)
         document_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table_supplier_documents.setItemDelegate(
+            desktop_ui.ExpenseRegisterTableDelegate(self.table_supplier_documents))
         self.table_supplier_documents.setAlternatingRowColors(True)
         self.table_supplier_documents.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_supplier_documents.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -7323,6 +7342,48 @@ class SmartReportApp(QMainWindow):
         }[key]
 
     @staticmethod
+    def _expense_register_row_tone(document):
+        status = SmartReportApp._expense_register_status_key(document)
+        if status in {"later", "ignored"}:
+            return "neutral"
+        if status == "accounted":
+            return "accounted"
+        for allocation in document.get("allocations") or []:
+            destination = allocation.get("destination")
+            if destination == "company" and allocation.get("object_id") is None:
+                return "distributed"
+            if destination == "object" and allocation.get("object_id") is not None:
+                return "distributed"
+        return "unassigned"
+
+    @staticmethod
+    def _expense_register_has_transfer_error(document):
+        return bool(document.get("sync_error")) or document.get("sync_state") in {
+            "conflict", "unverified",
+        }
+
+    def _update_expense_register_legend(self, *_):
+        if not hasattr(self, "exp_docs_state_legend_lbl"):
+            return
+        import html
+        text_color = desktop_theme.color("#e2e8f0").name()
+        labels = (
+            ("unassigned", "Назначение не выбрано", EXPENSE_REGISTER_ROW_COLORS["unassigned"]),
+            ("distributed", "Распределено · требует проверки", EXPENSE_REGISTER_ROW_COLORS["distributed"]),
+            ("accounted", "Учтено", EXPENSE_REGISTER_ROW_COLORS["accounted"]),
+            ("neutral", "Отложено / исключено", EXPENSE_REGISTER_ROW_COLORS["neutral"]),
+            ("error", "Ошибка передачи", EXPENSE_REGISTER_TRANSFER_ERROR_COLOR),
+        )
+        entries = []
+        for _key, label, dark_color in labels:
+            background = desktop_theme.color(dark_color).name()
+            entries.append(
+                f'<span style="background-color:{background};color:{text_color};'
+                f'padding:2px 5px;border-radius:3px">{html.escape(label)}</span>'
+            )
+        self.exp_docs_state_legend_lbl.setText("Цвета: " + " · ".join(entries))
+
+    @staticmethod
     def _expense_register_is_unallocated(document):
         if SmartReportApp._expense_register_status_key(document) == "ignored":
             return False
@@ -7480,6 +7541,8 @@ class SmartReportApp(QMainWindow):
                 status += f"; обработка: {processing.get('state')}"
                 if processing.get("errors"):
                     status += "; " + "; ".join(processing["errors"])
+            row_color = EXPENSE_REGISTER_ROW_COLORS[
+                self._expense_register_row_tone(document)]
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "Не указана",
@@ -7492,6 +7555,9 @@ class SmartReportApp(QMainWindow):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
+                desktop_theme.item_color(item, row_color)
+                if column == 7 and self._expense_register_has_transfer_error(document):
+                    desktop_theme.item_color(item, EXPENSE_REGISTER_TRANSFER_ERROR_COLOR)
                 if column == 1 and not document.get("document_date"):
                     item.setToolTip("Дата в документе не указана или не распознана.")
                 elif column == 2 and not document.get("supplier_name"):

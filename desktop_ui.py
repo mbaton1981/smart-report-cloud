@@ -1,8 +1,8 @@
 import re
 
 from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QTimer
-from PyQt6.QtGui import QFontMetrics, QTextDocument, QTextOption
-from PyQt6.QtWidgets import QHeaderView, QStyledItemDelegate, QTableWidget
+from PyQt6.QtGui import QBrush, QFontMetrics, QTextDocument, QTextOption
+from PyQt6.QtWidgets import QHeaderView, QStyle, QStyledItemDelegate, QTableWidget
 
 
 def combo_items_need_refresh(combo, items):
@@ -66,6 +66,13 @@ class TableDelegate(QStyledItemDelegate):
             QToolTip.showText(event.globalPos(), str(index.data(Qt.ItemDataRole.ToolTipRole) or index.data() or ""), view)
             return True
         return super().helpEvent(event, view, option, index)
+
+
+class ExpenseRegisterTableDelegate(TableDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if option.state & QStyle.StateFlag.State_Selected:
+            option.backgroundBrush = QBrush()
 
 
 class ReportTable(QTableWidget):
