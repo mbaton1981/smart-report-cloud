@@ -18,6 +18,37 @@ Totalt att betala (kronor) 1208"""
 
 
 class CostExtractionTests(unittest.TestCase):
+    def test_invoice_summary_with_period_column_and_rounding_is_extracted(self):
+        def cell(text, x, y):
+            return {"text": text, "x0": x, "x1": x + len(text) * 6,
+                    "y0": y, "y1": y + 10}
+
+        text = """Fakturanummer: 900123
+Fakturadatum: 2026-01-02
+Moms 25% Från 2026-01-01 till 2026-01-31 300.00 SEK
+Öresavrundning 0.50 SEK
+Totalt att betala 1,580.50 SEK
+Kvitton och fakturor"""
+        elements = [
+            cell("Fakturanummer", 20, 10), cell("900123", 150, 10),
+            cell("Fakturadatum", 20, 25), cell("2026-01-02", 150, 25),
+            cell("Moms 25%", 20, 80),
+            cell("Från 2026-01-01 till 2026-01-31", 150, 80),
+            cell("300.00 SEK", 450, 80),
+            cell("Öresavrundning", 20, 100), cell("0.50 SEK", 450, 100),
+            cell("Totalt att betala", 20, 120), cell("1,580.50 SEK", 450, 120),
+        ]
+        fields = parse_invoice_pages([{"page": 1, "text": text, "elements": elements}])
+        self.assertEqual(fields["document_type"], "invoice")
+        self.assertEqual(fields["invoice_number"], "900123")
+        self.assertEqual(fields["document_date"], "2026-01-02")
+        self.assertEqual(fields["net_amount"], "1280.00")
+        self.assertEqual(fields["vat_amount"], "300.00")
+        self.assertEqual(fields["gross_amount"], "1580.00")
+        self.assertEqual(fields["amount_due"], "1580.50")
+        self.assertEqual(fields["rounding_amount"], "0.50")
+        self.assertEqual(fields["field_sources"]["net_amount"][0]["kind"], "derived_from_stated_totals")
+
     def test_tax_amount_does_not_require_invoice_or_vat(self):
         fields = parse_invoice_pages([{"page": 1, "text": TAX_TEXT}])
         costs = fields["object_cost_fields"]
@@ -75,6 +106,102 @@ class DocumentActionTests(unittest.TestCase):
     def documents(self):
         return self.server_client.get("/api/expense-documents", headers={
             "X-Sync-Key": "isolated-sync-test-key"}).get_json()["documents"]
+
+    def test_rerecognition_only_fills_empty_fields_and_preserves_review_state(self):
+        document_id = 1
+        base = self.store.base(document_id)
+        revision, payload = self.store.latest(document_id)
+        base.update({
+            "document_type": "receipt",
+            "supplier_name": "Manually verified supplier",
+            "invoice_number": "MANUAL-123",
+            "document_date": "2026-10-21",
+            "net_amount": None,
+            "vat_amount": None,
+            "gross_amount": None,
+            "amount_due": None,
+            "rounding_amount": "0.50",
+            "raw_text": "Preserve existing extraction text",
+            "field_sources": {"supplier_name": [{"kind": "manual"}]},
+        })
+        payload.update({
+            "supplier_name": base["supplier_name"],
+            "invoice_number": base["invoice_number"],
+            "document_date": base["document_date"],
+            "net_amount": None,
+            "vat_amount": None,
+            "gross_amount": None,
+            "amount_due": None,
+            "rounding_amount": base["rounding_amount"],
+            "confirmed_type": "receipt",
+            "object_id": self.object_id,
+            "allocations": [{"destination": "object", "object_id": self.object_id,
+                             "gross_amount": "125.00"}],
+            "original_checked": True,
+        })
+        source_before = self.store.conn.execute(
+            "SELECT source_json FROM documents WHERE id=?", (document_id,)).fetchone()[0]
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=?",
+                                    (packed(base), document_id))
+            self.store.conn.execute(
+                "UPDATE revisions SET payload_json=? WHERE document_id=? AND revision=?",
+                (packed(payload), document_id, revision))
+        original_before = self.store.original(document_id).read_bytes()
+
+        recognized = {
+            "document_type": "invoice",
+            "supplier_name": "Different recognized supplier",
+            "invoice_number": "RECOGNIZED-456",
+            "document_date": "2026-11-06",
+            "net_amount": "200.00",
+            "vat_amount": "50.00",
+            "gross_amount": "250.00",
+            "amount_due": "250.50",
+            "rounding_amount": "0.50",
+            "currency_code": "SEK",
+            "field_sources": {"net_amount": [{"kind": "invoice_total"}]},
+            "object_cost_fields": {
+                "supplier_name": "Different recognized supplier",
+                "document_date": "2026-11-06",
+                "invoice_number": "RECOGNIZED-456",
+                "currency_code": "SEK",
+                "net_amount": "200.00",
+                "vat_amount": "50.00",
+                "gross_amount": "250.00",
+                "rounding_amount": "0.50",
+                "amount_due": "250.50",
+                "field_sources": {"net_amount": [{"kind": "invoice_total"}]},
+                "amount_candidates": [],
+            },
+        }
+        conflicts = self.store.record_recognition(
+            document_id, {"fields": recognized, "state": "requires_review"})
+
+        saved_base = self.store.base(document_id)
+        _, saved_payload = self.store.latest(document_id)
+        self.assertEqual(saved_base["document_type"], "receipt")
+        self.assertEqual(saved_base["supplier_name"], "Manually verified supplier")
+        self.assertEqual(saved_base["invoice_number"], "MANUAL-123")
+        self.assertEqual(saved_base["raw_text"], "Preserve existing extraction text")
+        self.assertEqual(saved_base["field_sources"]["supplier_name"], [{"kind": "manual"}])
+        self.assertEqual(saved_base["field_sources"]["net_amount"], [{"kind": "invoice_total"}])
+        self.assertEqual(saved_payload["net_amount"], "200.00")
+        self.assertEqual(saved_payload["vat_amount"], "50.00")
+        self.assertEqual(saved_payload["gross_amount"], "250.00")
+        self.assertEqual(saved_payload["amount_due"], "250.50")
+        self.assertEqual(saved_payload["rounding_amount"], "0.50")
+        self.assertEqual(saved_payload["confirmed_type"], "receipt")
+        self.assertEqual(saved_payload["object_id"], self.object_id)
+        self.assertEqual(saved_payload["allocations"], payload["allocations"])
+        self.assertTrue(saved_payload["original_checked"])
+        self.assertIn("document_type", {item["field"] for item in conflicts})
+        self.assertIn("supplier_name", {item["field"] for item in conflicts})
+        self.assertEqual(source_before, self.store.conn.execute(
+            "SELECT source_json FROM documents WHERE id=?", (document_id,)).fetchone()[0])
+        self.assertEqual(original_before, self.store.original(document_id).read_bytes())
+        self.assertIsNone(self.store.card(document_id))
+        self.assertIsNone(self.store.action(document_id)[1])
 
     def test_statuses_need_no_fields_preserve_pdf_history_and_dedup(self):
         self.tax()

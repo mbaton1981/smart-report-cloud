@@ -50,6 +50,23 @@ class IncomingDisplayTests(unittest.TestCase):
         window.selector.setCurrentIndex(window.selector.findData(document_id))
         self.assertEqual(window.inputs["supplier_name"].text(), recognized["supplier_name"])
 
+    def test_rerecognition_conflict_is_explained_without_replacing_saved_type(self):
+        base = self.store.base(1)
+        base["document_type"] = "receipt"
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1",
+                                    (json.dumps(base, ensure_ascii=False),))
+        conflicts = self.store.record_recognition(
+            1, {"fields": self.fields, "state": "requires_review"})
+        self.assertEqual(conflicts, [{
+            "field": "document_type", "current": "receipt", "recognized": "invoice",
+        }])
+        window = self.open_window()
+        self.assertIn("Тип документа: сохранено «Чек», распознано «Фактура».",
+                      window.classification.text())
+        self.assertIn("Существующие значения не изменены", window.classification.text())
+        self.assertEqual(self.store.base(1)["document_type"], "receipt")
+
     def test_manual_edits_and_status_survive_refresh_reopen_and_reimport(self):
         window = self.open_window()
         window.inputs["supplier_name"].setText("Manually checked supplier")

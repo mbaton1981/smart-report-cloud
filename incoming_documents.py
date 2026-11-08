@@ -217,9 +217,8 @@ class IncomingStore(OfflineReviewStore):
                 if key in costs:
                     payload[key] = costs[key]
             amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
-            rounding = parse_invoice_money(base.get("rounding_amount")) or Decimal(0)
             if all(value is not None for value in amounts) and base.get("document_type") != "tax_decision":
-                payload["gross_amount"] = decimal_text(sum(amounts) + rounding)
+                payload["gross_amount"] = decimal_text(sum(amounts))
         return revision, payload
 
     def provenance(self, document_id, payload=None):
@@ -244,9 +243,9 @@ class IncomingStore(OfflineReviewStore):
         current = payload or self.latest(document_id)[1]
         amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
         if all(value is not None for value in amounts):
-            total = decimal_text(sum(amounts) + (parse_invoice_money(base.get("rounding_amount")) or Decimal(0)))
+            total = decimal_text(sum(amounts))
             if current.get("gross_amount") == total and total != base.get("gross_amount"):
-                result["gross_amount"] = "Вычислено: нетто + НДС + указанное округление; сверьте итог оригинала"
+                result["gross_amount"] = "Вычислено: нетто + НДС; округление хранится отдельно"
         return result
 
     def issues(self, document_id, payload):
@@ -320,15 +319,68 @@ class IncomingStore(OfflineReviewStore):
     def record_recognition(self, document_id, result):
         fields = current_classification(result.get("fields") or {})
         fields["_recognition_state"] = result.get("state")
-        revision, _ = self.latest(document_id)
+        revision, current_payload = self.latest(document_id)
         if revision or self.card(document_id):
             raise ReviewError("Распознавание не заменяет сохранённые ручные исправления.")
-        initial = {**{key: fields.get(key) for key in EDITABLE},
-                   "confirmed_type": None, "object_id": None, "original_checked": False}
+        base = self.base(document_id)
+        merged_base = dict(base)
+        merged_payload = dict(current_payload)
+        conflicts = []
+        filled = set()
+
+        def missing(value):
+            return value in (None, "", "UNKNOWN")
+
+        for key in EDITABLE:
+            existing = current_payload.get(key)
+            if missing(existing) and not missing(base.get(key)):
+                existing = base[key]
+                merged_payload[key] = existing
+            recognized = fields.get(key)
+            if missing(existing) and not missing(recognized):
+                merged_payload[key] = recognized
+                merged_base[key] = recognized
+                filled.add(key)
+            elif not missing(existing) and not missing(recognized) and existing != recognized:
+                conflicts.append({"field": key, "current": existing, "recognized": recognized})
+
+        current_type = base.get("document_type")
+        recognized_type = fields.get("document_type")
+        if current_type in (None, "", "unclassified") and not missing(recognized_type):
+            merged_base["document_type"] = recognized_type
+        elif not missing(current_type) and not missing(recognized_type) and current_type != recognized_type:
+            conflicts.append({"field": "document_type", "current": current_type,
+                              "recognized": recognized_type})
+
+        for key, value in fields.items():
+            if key in EDITABLE or key in {
+                    "document_type", "field_sources", "review_reasons", "recognition_conflicts"}:
+                continue
+            if key == "object_cost_fields":
+                merged_base[key] = value
+                continue
+            if key == "_recognition_state" or missing(merged_base.get(key)) and not missing(value):
+                merged_base[key] = value
+
+        sources = dict(base.get("field_sources") or {})
+        for key in filled:
+            if key in (fields.get("field_sources") or {}):
+                sources[key] = fields["field_sources"][key]
+        if sources:
+            merged_base["field_sources"] = sources
+        merged_base["recognition_conflicts"] = conflicts
+        merged_base["review_reasons"] = list(fields.get("review_reasons") or [])
+        for conflict in conflicts:
+            merged_base["review_reasons"].append(
+                f"Повторное распознавание предложило {conflict['recognized']} для поля "
+                f"{conflict['field']}; сохранено прежнее значение {conflict['current']}."
+            )
         with self.conn:
-            self.conn.execute("UPDATE documents SET base_json=? WHERE id=?", (packed(fields), document_id))
+            self.conn.execute("UPDATE documents SET base_json=? WHERE id=?",
+                              (packed(merged_base), document_id))
             self.conn.execute("UPDATE revisions SET payload_json=? WHERE document_id=? AND revision=0",
-                              (packed(initial), document_id))
+                              (packed(merged_payload), document_id))
+        return conflicts
 
     def recognize_document(self, document_id, recognizer=None):
         from invoice_processing import recognize_invoice
@@ -337,7 +389,8 @@ class IncomingStore(OfflineReviewStore):
         except (OSError, ValueError, RuntimeError):
             result = {"fields": {}, "state": "failed",
                       "errors": ["recognition_failed_original_retained_manual_fields_available"]}
-        self.record_recognition(document_id, result)
+        result = dict(result)
+        result["conflicts"] = self.record_recognition(document_id, result)
         return result
 
     def reassign(self, document_id, object_id, expected_revision):

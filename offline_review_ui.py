@@ -650,6 +650,25 @@ class OfflineReviewWindow(QDialog):
             if payload.get("gross_amount") in (None, ""):
                 self.classification.setText(self.classification.text()
                                             + "\nСумма не определена — нужна проверка")
+            conflict_labels = {"document_type": "Тип документа", **LABELS}
+            conflict_lines = []
+            for conflict in base.get("recognition_conflicts") or []:
+                field = conflict.get("field")
+                label = conflict_labels.get(field, field)
+                current = conflict.get("current")
+                recognized = conflict.get("recognized")
+                if field == "document_type":
+                    current = TYPES.get(current, current)
+                    recognized = TYPES.get(recognized, recognized)
+                conflict_lines.append(
+                    f"{label}: сохранено «{current}», распознано «{recognized}»."
+                )
+            if conflict_lines:
+                self.classification.setText(
+                    self.classification.text() + "\nПовторное распознавание нашло отличия: "
+                    + " ".join(conflict_lines)
+                    + " Существующие значения не изменены; сверьте оригинал."
+                )
         if self.gallery and self.preview_document_id != self.document_id:
             self.gallery.hide()
             self.preview_layout.removeWidget(self.gallery)

@@ -223,7 +223,15 @@ def parse_document_text(text: str) -> dict[str, Any]:
         currency = "UNKNOWN"
 
     is_credit_note = bool(re.search(r"kreditfaktura|credit\s+note|credit\s+invoice", lower_text))
-    is_receipt = bool(re.search(r"kvitto|receipt|kassakvitto|\bkontantnota\b", lower_text))
+    has_invoice_identity = (
+        re.search(r"(?:fakturanummer|invoice\s*(?:number|no\.?))\s*:", full_text, re.IGNORECASE)
+        and re.search(r"(?:fakturadatum|faktureringsdatum|invoice\s*date)\s*:",
+                      full_text, re.IGNORECASE)
+    )
+    receipt_heading = any(re.fullmatch(
+        r"kvitto|receipt|kassakvitto|kontantnota", line, re.IGNORECASE) for line in lines[:3])
+    is_receipt = (receipt_heading or bool(re.search(
+        r"kvitto|receipt|kassakvitto|\bkontantnota\b", lower_text)) and not has_invoice_identity)
     reverse_charge = bool(re.search(r"omvänd\s+skattskyldighet|omvand\s+skattskyldighet|reverse\s+charge", lower_text))
     if non_invoice_type:
         invoice_number = None
@@ -479,7 +487,7 @@ def parse_invoice_pages(pages):
         "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
-        "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
+        "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
         "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Totalt",
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
@@ -594,10 +602,7 @@ def parse_invoice_pages(pages):
                     same_row_values = [other for other in cells if other["x0"] >= cell["x1"]
                                        and abs(other["y0"] - cell["y0"]) < row_tolerance
                                        and checked_value(key, other["text"]) is not None
-                                       and not any((is_caption(between) or (
-                                                       checked_value(key, between["text"]) is None
-                                                       and re.search(r"[A-Za-zÅÄÖåäö]", between["text"])
-                                                       and not re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", between["text"], re.IGNORECASE)))
+                                       and not any(is_caption(between)
                                                    and cell["x1"] <= between["x0"] < other["x0"]
                                                    and abs(between["y0"] - cell["y0"]) < row_tolerance for between in cells)]
                     right_headers = [other["x0"] for other in cells
@@ -683,6 +688,28 @@ def parse_invoice_pages(pages):
         if explicit_net + Decimal(fields["vat_amount"]) == Decimal(fields["gross_amount"]):
             fields["net_amount"] = decimal_text(explicit_net)
             field_sources["net_amount"] = field_sources.get("taxable_net_amount", []) + field_sources.get("exempt_net_amount", [])
+    amount_due = parse_decimal(fields.get("amount_due"))
+    rounding_amount = parse_decimal(fields.get("rounding_amount"))
+    derived_gross = False
+    if (fields.get("gross_amount") is None and amount_due is not None
+            and rounding_amount is not None and not fields.get("prepaid")
+            and field_sources.get("amount_due") and field_sources.get("rounding_amount")):
+        fields["gross_amount"] = decimal_text(amount_due - rounding_amount)
+        field_sources["gross_amount"] = [{
+            "kind": "derived_from_stated_totals",
+            "operation": "amount_due_minus_explicit_rounding",
+            "sources": field_sources["amount_due"] + field_sources["rounding_amount"],
+        }]
+        derived_gross = True
+    if (derived_gross and fields.get("net_amount") is None
+            and fields.get("vat_amount") is not None and field_sources.get("vat_amount")):
+        fields["net_amount"] = decimal_text(
+            Decimal(fields["gross_amount"]) - Decimal(fields["vat_amount"]))
+        field_sources["net_amount"] = [{
+            "kind": "derived_from_stated_totals",
+            "operation": "gross_minus_explicit_vat",
+            "sources": field_sources["gross_amount"] + field_sources["vat_amount"],
+        }]
     if (is_receipt and fields.get("net_amount") is None
             and fields.get("gross_amount") is not None and fields.get("vat_amount") is not None
             and field_sources.get("gross_amount") and field_sources.get("vat_amount")):
