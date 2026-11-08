@@ -69,9 +69,18 @@ class IncomingStore(OfflineReviewStore):
             amount = parse_invoice_money(raw)
             if raw not in (None, "") and (amount is None or not amount.is_finite()):
                 raise ReviewError("Некорректная сумма распределения.")
-            cleaned["allocations"].append({"object_id": part.get("object_id"),
+            object_id = part.get("object_id")
+            destination = part.get("destination") or ("object" if object_id is not None else "unselected")
+            if destination not in {"object", "company", "unselected"}:
+                raise ReviewError("Выберите общие расходы фирмы или объект.")
+            if destination == "company" and object_id is not None:
+                raise ReviewError("Общие расходы фирмы не должны быть привязаны к объекту.")
+            if destination == "object" and object_id is None:
+                raise ReviewError("Выберите объект для этой части.")
+            cleaned["allocations"].append({"destination": destination, "object_id": object_id,
                                            "gross_amount": decimal_text(amount)})
-        cleaned["object_id"] = (parts[0].get("object_id") if len(parts) == 1 else None)
+        cleaned["object_id"] = (cleaned["allocations"][0]["object_id"]
+                                if len(cleaned["allocations"]) == 1 else None)
         if payload.get("server_version") is not None:
             cleaned["server_version"] = payload["server_version"]
         return cleaned
@@ -94,7 +103,9 @@ class IncomingStore(OfflineReviewStore):
                 for key in EDITABLE:
                     if key in existing:
                         payload[key] = existing[key]
-                payload["allocations"] = [{"object_id": row.get("object_id"),
+                payload["allocations"] = [{"destination": row.get("destination") or
+                                           ("object" if row.get("object_id") is not None else "company"),
+                                           "object_id": row.get("object_id"),
                                            "gross_amount": row.get("gross_amount")}
                                           for row in existing.get("allocations", [])]
                 payload["object_id"] = (payload["allocations"][0]["object_id"]
@@ -174,6 +185,9 @@ class IncomingStore(OfflineReviewStore):
             raise ReviewError("Сервер ещё не поддерживает расходы объекта без платёжных условий. "
                               "Обновите соединение с сервером; черновик и PDF сохранены.")
         self._check_existing_register(document_id, reviewed)
+        if self.action(document_id)[1] is None:
+            action_revision, _ = self.action(document_id)
+            self.set_action(document_id, "expense", action_revision)
         card = self.card(document_id)
         if card is None:
             import uuid
@@ -244,14 +258,29 @@ class IncomingStore(OfflineReviewStore):
             problems.append("Подтвердите сверку оригинала.")
         parts = self.allocations(payload)
         ids = {row["id"] for row in self.objects()}
-        if not parts or any(part.get("object_id") not in ids for part in parts):
-            problems.append("Обязательно выберите объект для каждой части.")
+        destinations = []
+        for part in parts:
+            object_id = part.get("object_id")
+            destination = part.get("destination") or ("object" if object_id is not None else "unselected")
+            destinations.append(destination)
+            if destination == "company" and object_id is not None:
+                problems.append("Общие расходы фирмы не должны быть привязаны к объекту.")
+            elif destination == "object" and object_id not in ids:
+                problems.append("Выберите действующий объект для каждой части.")
+            elif destination not in {"company", "object"}:
+                problems.append("Выберите назначение каждой части: общие расходы фирмы или объект.")
+        if not parts:
+            problems.append("Распределите сумму на общие расходы фирмы или объект.")
+        if destinations.count("company") > 1:
+            problems.append("Объедините общую часть фирмы в одну строку.")
         amounts = [parse_invoice_money(part.get("gross_amount")) for part in parts]
         if any(amount is None or not amount.is_finite() or amount <= 0 for amount in amounts):
             problems.append("Укажите положительную сумму каждой части.")
         elif sum(amounts, Decimal(0)) != parse_invoice_money(payload.get("gross_amount")):
             problems.append("Сумма частей должна точно совпадать с общей суммой документа.")
-        if len({part.get("object_id") for part in parts}) != len(parts):
+        object_ids = [part.get("object_id") for part, destination in zip(parts, destinations)
+                      if destination == "object"]
+        if len(set(object_ids)) != len(object_ids):
             problems.append("Укажите каждый объект одной строкой.")
         for key in ("supplier_name", "document_date", "gross_amount", "currency_code"):
             if payload.get(key) in (None, "", "UNKNOWN"):
@@ -330,7 +359,8 @@ class IncomingStore(OfflineReviewStore):
         self._existing(card["client_id"], required=True)
         previous = payload["object_id"]
         payload["object_id"] = object_id
-        payload["allocations"] = [{"object_id": object_id, "gross_amount": payload["gross_amount"]}]
+        payload["allocations"] = [{"destination": "object", "object_id": object_id,
+                                   "gross_amount": payload["gross_amount"]}]
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             if self.latest(document_id)[0] != revision:
@@ -359,7 +389,7 @@ class IncomingStore(OfflineReviewStore):
                 return "Напоминание / требование оплаты — не новая покупка; перенос запрещён", False
             return {"ignore": "Не учитывать — PDF сохранён, расход не создан",
                     "later": "Разобрать позже — PDF сохранён, расход не создан",
-                    "expense": "Проверьте данные и выберите объект — расход ещё не создан"}.get(
+                    "expense": "Проверьте данные и выберите назначение — расход ещё не создан"}.get(
                         action, "Выберите действие — расход не создан"), False
         pending = self.host.incoming_delivery_pending(card["client_id"])
         if pending:
@@ -372,7 +402,13 @@ class IncomingStore(OfflineReviewStore):
         except ValueError:
             return "Обновите реестр для проверки сохранения", False
         if existing and existing.get("verification_status") == "confirmed":
-            return "Учтён на объекте", True
+            allocations = existing.get("allocations") or []
+            has_company = any(row.get("destination") == "company" for row in allocations)
+            has_object = any(row.get("destination") != "company" and row.get("object_id") is not None
+                             for row in allocations)
+            if has_company and has_object:
+                return "Учтён: общие расходы и объекты", True
+            return ("Учтён как общий расход фирмы" if has_company else "Учтён на объекте"), True
         return "Ожидает проверки в реестре", False
 
     @staticmethod
@@ -432,7 +468,11 @@ class IncomingStore(OfflineReviewStore):
             verification_status="confirmed",
             recognized_text=base.get("raw_text") or "",
             required_attachment_sha256=[card["sha256"]],
-            allocations=[{"destination": "object", **part} for part in self.allocations(payload)],
+            allocations=[{
+                **part,
+                "destination": part.get("destination") or
+                    ("object" if part.get("object_id") is not None else "unselected"),
+            } for part in self.allocations(payload)],
         )
         for key in ("amount_due", "settlement_status", "due_date"):
             payload.pop(key, None)

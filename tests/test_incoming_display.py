@@ -1,6 +1,7 @@
 import json
 import unittest
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_incoming_integration as integration
@@ -51,7 +52,6 @@ class IncomingDisplayTests(unittest.TestCase):
 
     def test_manual_edits_and_status_survive_refresh_reopen_and_reimport(self):
         window = self.open_window()
-        window.expense_button.click()
         window.inputs["supplier_name"].setText("Manually checked supplier")
         window.inputs["gross_amount"].setText("130.00")
         self.assertTrue(window.save_edits())
@@ -71,6 +71,46 @@ class IncomingDisplayTests(unittest.TestCase):
         window.inputs["supplier_name"].setText("Unsaved correction")
         self.background_refresh(window)
         self.assertEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
+
+    def test_main_register_projects_local_documents_before_confirmation_and_company_is_allocated(self):
+        host = SimpleNamespace(
+            _incoming_documents_root=lambda: self.store.root,
+            _local_incoming_expense_documents=lambda date_from=None, date_to=None:
+                self.desktop.SmartReportApp._local_incoming_expense_documents(
+                    host, date_from, date_to),
+            _expense_objects=self.host._expense_objects,
+            _expense_document_snapshot=lambda *_args, **_kwargs: ([], False),
+            exp_api_status_lbl=SimpleNamespace(setText=lambda _text: None),
+        )
+        documents, online = self.desktop.SmartReportApp._expense_register_snapshot(host)
+        self.assertFalse(online)
+        self.assertEqual(len(documents), 3)
+        pending = documents[0]
+        self.assertEqual(pending["verification_status"], "requires_review")
+        self.assertEqual(pending["incoming_document_id"], 1)
+        self.assertTrue(pending["has_original"])
+        self.assertEqual(
+            self.desktop.SmartReportApp._expense_register_status_key(pending), "requires_review")
+
+        action_revision, _action = self.store.action(1)
+        self.store.set_action(1, "later", action_revision)
+        documents, _online = self.desktop.SmartReportApp._expense_register_snapshot(host)
+        self.assertEqual(self.desktop.SmartReportApp._expense_register_status_key(documents[0]), "later")
+        action_revision, _action = self.store.action(1)
+        self.store.set_action(1, "ignore", action_revision)
+        documents, _online = self.desktop.SmartReportApp._expense_register_snapshot(host)
+        self.assertEqual(self.desktop.SmartReportApp._expense_register_status_key(documents[0]), "ignored")
+
+        company = {
+            "verification_status": "confirmed",
+            "allocation_basis": "gross",
+            "gross_amount": "125.00",
+            "allocations": [{
+                "destination": "company", "object_id": None, "gross_amount": "125.00",
+            }],
+            "unallocated_gross": "0.00",
+        }
+        self.assertFalse(self.desktop.SmartReportApp._expense_register_is_unallocated(company))
 
     def test_missing_fields_are_explicit_not_invented(self):
         from test_mail_automation import pdf
@@ -140,7 +180,6 @@ class IncomingDisplayTests(unittest.TestCase):
         from test_mail_automation import pdf
         self.store.add_pdf(pdf("Other document"), "other.pdf", {"fields": self.fields})
         window = self.open_window()
-        window.expense_button.click()
         window.inputs["supplier_name"].setText("Unsaved correction")
         other = window.selector.itemData(1)
         self.store.set_action(other, "later", 0)
@@ -167,7 +206,7 @@ class IncomingDisplayTests(unittest.TestCase):
         before = self.store.conn.execute("SELECT source_json,base_json FROM documents WHERE id=1").fetchone()
         history = self.store.history(1)
         window = self.open_window()
-        window.expense_button.click()
+
         self.assertFalse(window.transfer_button.isEnabled())
         self.assertIn("не новая покупка", window.selector.currentText())
         self.assertTrue(any("Напоминание" in issue for issue in self.store.issues(1, window.payload())))

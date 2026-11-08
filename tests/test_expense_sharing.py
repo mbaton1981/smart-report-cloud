@@ -51,19 +51,18 @@ class ExpenseSharingTests(unittest.TestCase):
         original = self.store.original(1).read_bytes()
         window = OfflineReviewWindow(self.store, integrated=True)
         try:
-            window.expense_button.click()
             self.assertEqual(window.inputs["gross_amount"].text(), "125.00")
             self.assertEqual(window.inputs["vat_amount"].text(), "25.00")
-            window.add_allocation({"object_id": projects[0], "gross_amount": "20.00"})
+            first = window.allocations.cellWidget(0, 0)
+            first.setCurrentIndex(first.findData(projects[0]))
+            window.allocations.item(0, 1).setText("20.00")
             self.assertTrue(window.save_edits())  # Partial distribution is a draft, not an expense.
             self.assertIsNone(self.store.card(1))
             self.assertTrue(self.store.issues(1, window.payload()))
             window.add_allocation({"object_id": projects[1], "gross_amount": "45.00"})
             window.add_allocation({"object_id": projects[2], "gross_amount": "60.00"})
             window.checked.setChecked(True)
-            with patch.object(self.desktop.QMessageBox, "question",
-                              return_value=self.desktop.QMessageBox.StandardButton.Yes):
-                window.confirm_transfer()
+            window.expense_button.click()
             self.assertIsNotNone(self.store.card(1))
             self.mode = "lost_ack"
             self.assertEqual(self.sync()["synced"], 0)
@@ -128,6 +127,62 @@ class ExpenseSharingTests(unittest.TestCase):
         self.assertEqual(pending["state"], "conflict")
         self.assertIsNotNone(pending["last_error"])
         self.assertEqual(len(self.documents()), 1)
+
+    def test_company_and_mixed_allocations_sync_once_and_analytics_keep_company_share_general(self):
+        projects = self.configure_incoming()
+        revision, company_payload = self.store.latest(1)
+        company_payload.update(original_checked=True, allocations=[{
+            "destination": "company", "object_id": None, "gross_amount": "125.00",
+        }])
+        revision = self.store.save(1, company_payload, revision)
+        self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+
+        revision, mixed_payload = self.store.latest(2)
+        mixed_payload.update(
+            supplier_name="Second isolated supplier",
+            document_date="2026-10-22",
+            original_checked=True,
+            allocations=[
+                {"destination": "company", "object_id": None, "gross_amount": "25.00"},
+                {"destination": "object", "object_id": projects[0], "gross_amount": "100.00"},
+            ],
+        )
+        revision = self.store.save(2, mixed_payload, revision)
+        self.store.transfer(2, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+
+        documents = self.documents()
+        self.assertEqual(len(documents), 2)
+        company_document = next(
+            document for document in documents
+            if document["client_id"] == self.store.card(1)["client_id"])
+        mixed_document = next(
+            document for document in documents
+            if document["client_id"] == self.store.card(2)["client_id"])
+        self.assertEqual(
+            {(part["destination"], part["object_id"]) for part in company_document["allocations"]},
+            {("company", None)},
+        )
+        self.assertEqual(
+            {(part["destination"], part["object_id"]) for part in mixed_document["allocations"]},
+            {("company", None), ("object", projects[0])},
+        )
+        self.assertEqual(company_document["unallocated_gross"], "0.00")
+        self.assertEqual(mixed_document["unallocated_gross"], "0.00")
+
+        import analytics
+        conn = self.server.get_db_connection()
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            report = analytics.build(conn.cursor(), "2026-10-01", "2026-10-31", documents)
+        finally:
+            conn.close()
+        rows = {row["key"]: row for row in report["rows"]}
+        self.assertEqual(report["totals"]["expenses"], 200)
+        self.assertEqual(rows["general"]["expenses"], 120)
+        self.assertEqual(rows[f"object:{projects[0]}"]["expenses"], 80)
 
     def test_update_queue_commit_crash_replays_same_revision_and_document(self):
         projects = self.configure_incoming()

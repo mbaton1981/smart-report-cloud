@@ -250,12 +250,10 @@ class IncomingIntegrationTests(unittest.TestCase):
             self.qt_app.processEvents()
             self.assertTrue(window.integrated)
             window.selector.setCurrentIndex(1)
-            self.assertFalse(window.transfer_button.isEnabled())
-            self.assertFalse(window.financial_panel.isVisible())
-            window.expense_button.click()
             self.assertTrue(window.transfer_button.isEnabled())
+            self.assertTrue(window.financial_panel.isVisible())
             self.assertFalse(window.receipt_paid.isVisible())
-            self.assertIsNone(window.object.currentData())
+            self.assertEqual(window.allocations.rowCount(), 1)
             window.close()
             widget.close()
 
@@ -285,7 +283,7 @@ class IncomingIntegrationTests(unittest.TestCase):
                 window = self.desktop.SmartReportApp()
                 window.auto_sync_timer.stop()
                 buttons = [button for button in window.findChildren(QPushButton)
-                           if button.text() == "Входящие документы"]
+                           if button.text() == "Открыть входящие"]
                 self.assertEqual(len(buttons), 1)
                 self.assertTrue(buttons[0].isHidden())
                 self.assertFalse((root / "incoming-documents").exists())

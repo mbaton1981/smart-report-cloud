@@ -1198,9 +1198,14 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         for item in raw_allocations:
             if not isinstance(item, dict):
                 raise ValueError("Некорректная строка распределения.")
-            destination = item.get("destination") or "unselected"
+            destination = item.get("destination") or (
+                "object" if item.get("object_id") is not None else "company")
             if destination not in {"object", "company", "unselected"}:
                 raise ValueError("Некорректное назначение расходов.")
+            if destination == "company" and item.get("object_id") is not None:
+                raise ValueError("Общие расходы фирмы не должны быть привязаны к объекту.")
+            if destination == "object" and item.get("object_id") is None:
+                raise ValueError("Для объектной части выберите объект.")
             for key in ("net_amount", "vat_amount"):
                 if item.get(key) not in (None, "") and parse_invoice_money(item[key]) is None:
                     raise ValueError("Некорректная сумма распределения.")
@@ -1222,6 +1227,13 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         if not isinstance(item, dict):
             raise ValueError("Некорректная строка распределения.")
         object_id = item.get("object_id")
+        destination = item.get("destination") or ("object" if object_id is not None else "company")
+        if destination not in {"object", "company", "unselected"}:
+            raise ValueError("Некорректное назначение расходов.")
+        if destination == "company" and object_id is not None:
+            raise ValueError("Общие расходы фирмы не должны быть привязаны к объекту.")
+        if destination == "object" and object_id is None and fields.get("verification_status") == "confirmed":
+            raise ValueError("Для объектной части выберите объект.")
         if object_id is not None:
             try:
                 object_id = int(object_id)
@@ -1248,6 +1260,7 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         if vat_amount is not None and allocated_gross and (vat_amount > allocated_gross if allocated_gross > 0 else vat_amount < allocated_gross):
             raise ValueError("НДС части не может превышать её сумму с НДС.")
         normalized.append({
+            "destination": destination,
             "object_id": object_id,
             "gross_amount": decimal_text(allocated_gross),
             "vat_amount": decimal_text(vat_amount),
@@ -1270,13 +1283,18 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         if allocated_gross == total_gross and not allocation_vat_unknown and allocated_vat != Decimal(total_vat):
             raise ValueError("При полном распределении суммы частей должны покрыть весь НДС документа.")
     if fields.get("usage") == "object_cost" and fields["verification_status"] == "confirmed":
-        if not normalized or any(item["object_id"] is None or Decimal(item["gross_amount"]) <= 0
-                                 for item in normalized):
-            raise ValueError("Для расхода выберите объекты и положительные суммы частей.")
+        if not normalized or any(
+                item["destination"] not in {"company", "object"}
+                or item["destination"] == "object" and item["object_id"] is None
+                or Decimal(item["gross_amount"]) <= 0 for item in normalized):
+            raise ValueError("Для расхода выберите общие расходы фирмы или объект и укажите положительные суммы частей.")
         if allocated_gross != total_gross:
             raise ValueError("Сумма частей должна точно совпадать с общей суммой документа.")
-        if len({item["object_id"] for item in normalized}) != len(normalized):
+        object_ids = [item["object_id"] for item in normalized if item["destination"] == "object"]
+        if len(set(object_ids)) != len(object_ids):
             raise ValueError("Укажите каждый объект одной строкой.")
+        if sum(item["destination"] == "company" for item in normalized) > 1:
+            raise ValueError("Объедините общую часть фирмы в одну строку.")
     if allocation_vat_unknown and fields["verification_status"] == "confirmed" and fields.get("usage") != "object_cost":
         fields["verification_status"] = "requires_review"
     return normalized

@@ -1101,7 +1101,8 @@ def net_invoice_issues(fields, allocations):
             total = values["net_amount"]
             if total is not None and amount and total and (amount > 0) != (total > 0):
                 issues.append(f"Строка {index}: знак суммы не соответствует фактуре.")
-        destination = row.get("destination")
+        destination = row.get("destination") or (
+            "object" if row.get("object_id") is not None else "company")
         if destination not in {"object", "company"} or destination == "object" and row.get("object_id") is None:
             issues.append(f"Строка {index}: выберите назначение расходов.")
         if row.get("ambiguous"):
@@ -1188,7 +1189,8 @@ def allocation_vat_from_items(pages, orders, invoice_net, invoice_vat):
 def normalize_net_allocations(allocations):
     grouped = {}
     for row in allocations:
-        destination = row.get("destination") or "unselected"
+        destination = row.get("destination") or (
+            "object" if row.get("object_id") is not None else "company")
         object_id = row.get("object_id") if destination == "object" else None
         category = str(row.get("expense_category") or "").strip()[:100]
         key = (destination, object_id, category)

@@ -112,15 +112,14 @@ class DocumentActionTests(unittest.TestCase):
         try:
             window.show()
             self.qt_app.processEvents()
-            self.assertFalse(window.financial_panel.isVisible())
+            self.assertTrue(window.financial_panel.isVisible())
             window.inputs["vat_amount"].setText("invalid unsaved financial text")
             with patch.object(self.store, "save", side_effect=AssertionError("Financial save forbidden")):
                 window.ignore_button.click()
                 window.later_button.click()
             self.assertEqual(self.store.action(1)[1], "later")
-            self.assertFalse(window.financial_panel.isVisible())
+            self.assertTrue(window.financial_panel.isVisible())
             window.inputs["vat_amount"].clear()
-            window.expense_button.click()
             self.qt_app.processEvents()
             self.assertTrue(window.financial_panel.isVisible())
             self.assertTrue(window.gallery.isVisible())
@@ -129,9 +128,9 @@ class DocumentActionTests(unittest.TestCase):
             self.assertEqual(window.inputs["document_date"].text(), "2026-10-12")
             self.assertEqual(window.inputs["invoice_number"].text(), "")
             self.assertEqual(window.inputs["vat_amount"].text(), "")
-            self.assertIsNone(window.object.currentData())
-            self.assertTrue(any("объект" in problem for problem in self.store.issues(1, window.payload())))
-            window.object.setCurrentIndex(window.object.findData(self.object_id))
+            self.assertTrue(any("назначение" in problem for problem in self.store.issues(1, window.payload())))
+            destination = window.allocations.cellWidget(0, 0)
+            destination.setCurrentIndex(destination.findData(self.object_id))
             window.checked.setChecked(True)
             self.assertEqual(self.store.issues(1, window.payload()), [])
             with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
@@ -162,7 +161,6 @@ class DocumentActionTests(unittest.TestCase):
         self.tax(TAX_TEXT.replace("Totalt att betala (kronor) 1208", "Totalt att betala (kronor) 1250"))
         window = OfflineReviewWindow(self.store, integrated=True)
         try:
-            window.expense_button.click()
             self.assertEqual(window.inputs["gross_amount"].text(), "")
             self.assertEqual(window.amount_choices.count(), 3)
             window.amount_choices.setCurrentIndex(window.amount_choices.findData("1250.00"))

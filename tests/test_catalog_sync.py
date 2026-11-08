@@ -1171,7 +1171,7 @@ class CatalogSyncTests(unittest.TestCase):
             main_titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
             self.assertEqual(main_titles.count("Расходы"), 1)
             self.assertNotIn("Материалы и расходы по объектам", main_titles)
-            self.assertEqual(window.table_supplier_documents.columnCount(), 7)
+            self.assertEqual(window.table_supplier_documents.columnCount(), 8)
             self.assertEqual(window.object_expenses_table.columnCount(), 7)
             self.assertEqual(window.object_expenses_object.currentIndex(), 0)
             server_conn = self.server.get_db_connection()
@@ -2665,7 +2665,7 @@ class CatalogSyncTests(unittest.TestCase):
             }])
             desktop_conn.close()
             self.assertEqual(window.table_supplier_documents.rowCount(), 1)
-            self.assertIn("Общие расходы фирмы", window.table_supplier_documents.item(0, 3).text())
+            self.assertIn("Общие расходы фирмы", window.table_supplier_documents.item(0, 4).text())
         finally:
             window.close()
             window.deleteLater()
@@ -2965,6 +2965,11 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertTrue(net_invoice_issues({**fields, "rounding_amount": "0.00"}, rows))
         self.assertTrue(net_invoice_issues({**fields, "vat_amount": None}, rows))
         self.assertTrue(net_invoice_issues(fields, [{**rows[0], "destination": "unselected"}]))
+        legacy_company = normalize_net_allocations([{
+            "net_amount": "3049.95", "vat_amount": "762.49",
+        }])
+        self.assertEqual(legacy_company[0]["destination"], "company")
+        self.assertIsNone(legacy_company[0]["object_id"])
         connection = self.server.get_db_connection()
         try:
             self.assertFalse(invoice_net_schema_ready(connection))
@@ -3297,6 +3302,9 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(fields["field_sources"]["rounding_amount"][0]["caption"], "Öresavr.")
         self.assertEqual(net_invoice_issues(fields, [{
             "destination": "company", "net_amount": "6490.50", "vat_amount": "1622.63",
+        }]), [])
+        self.assertEqual(net_invoice_issues(fields, [{
+            "net_amount": "6490.50", "vat_amount": "1622.63",
         }]), [])
         self.assertTrue(net_invoice_issues(
             {**fields, "rounding_amount": "0.00"},

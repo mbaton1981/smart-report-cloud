@@ -80,7 +80,6 @@ class ProposalIntegrationTests(unittest.TestCase):
         window = OfflineReviewWindow(self.store, integrated=True)
         self.addCleanup(window.close)
         window.selector.setCurrentIndex(window.selector.findData(document_id))
-        window.expense_button.click()
         return window, document_id, objects
 
     def test_explicit_apply_save_reopen_confirm_sync_lost_ack_one_original(self):
@@ -91,14 +90,13 @@ class ProposalIntegrationTests(unittest.TestCase):
         self.assertEqual(window.allocations.rowCount(), 3)
         self.assertIn("Объект неактивен", window.allocations.cellWidget(2, 0).currentText())
         window.checked.setChecked(True)
-        self.assertTrue(window.save_edits())
         self.assertIsNone(self.store.card(document_id))
-        window.select_document()
-        self.assertEqual(window.allocations.rowCount(), 3)
+        self.assertEqual(self.store.latest(document_id)[0], 0)
         self.assertEqual(window.inputs["gross_amount"].text(), "5286.00")
         self.assertEqual(window.inputs["net_amount"].text(), "4228.88")
-        revision, payload = self.store.latest(document_id)
-        self.store.transfer(document_id, revision)
+        window.expense_button.click()
+        self.assertIsNotNone(self.store.card(document_id))
+        revision = self.store.latest(document_id)[0]
         self.mode = "lost_ack"
         self.assertEqual(self.sync()["synced"], 0)
         self.assertEqual(self.sync()["synced"], 1, self.last_sync)

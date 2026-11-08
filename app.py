@@ -6670,12 +6670,30 @@ class SmartReportApp(QMainWindow):
         period_row.addWidget(self.exp_filter_unallocated)
         page_layout.addLayout(period_row)
 
+        state_row = QHBoxLayout()
+        state_row.addWidget(QLabel("Состояние:"))
+        self.exp_filter_status = QComboBox()
+        for label, key in (
+            ("Все состояния", "all"),
+            ("Требует проверки", "requires_review"),
+            ("Отложен", "later"),
+            ("Учтён", "accounted"),
+            ("Не учитывать", "ignored"),
+            ("Ошибка / передача", "transfer"),
+        ):
+            self.exp_filter_status.addItem(label, key)
+        state_row.addWidget(self.exp_filter_status)
+        self.exp_docs_state_counts_lbl = QLabel()
+        self.exp_docs_state_counts_lbl.setWordWrap(True)
+        state_row.addWidget(self.exp_docs_state_counts_lbl, 1)
+        page_layout.addLayout(state_row)
+
         totals_row = QHBoxLayout()
         for attribute, label in (
             ("exp_docs_gross_lbl", "Сумма с НДС"),
             ("exp_docs_vat_lbl", "Известный НДС"),
             ("exp_docs_net_lbl", "Сумма без НДС"),
-            ("exp_docs_unallocated_lbl", "Осталось распределить"),
+            ("exp_docs_unallocated_lbl", "К распределению, не входит в учтённое"),
             ("exp_docs_review_lbl", "Требуют проверки"),
         ):
             value = QLabel("—")
@@ -6691,16 +6709,16 @@ class SmartReportApp(QMainWindow):
         self.exp_api_status_lbl.setWordWrap(True)
         page_layout.addWidget(self.exp_api_status_lbl)
 
-        self.table_supplier_documents = QTableWidget(0, 7)
+        self.table_supplier_documents = QTableWidget(0, 8)
         self.table_supplier_documents.setHorizontalHeaderLabels([
-            "ID", "Дата", "Поставщик", "Объект / объекты", "Сумма с НДС",
-            "НДС", "Распределение / статус",
+            "ID", "Дата", "Поставщик", "№ документа", "Назначение / распределение",
+            "Сумма с НДС", "НДС", "Состояние",
         ])
         self.table_supplier_documents.setColumnHidden(0, True)
         document_header = self.table_supplier_documents.horizontalHeader()
-        for column, width in {1: 95, 2: 155, 4: 125, 5: 105, 6: 205}.items():
+        for column, width in {1: 95, 2: 155, 3: 125, 5: 125, 6: 105, 7: 205}.items():
             document_header.resizeSection(column, width)
-        document_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        document_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table_supplier_documents.setAlternatingRowColors(True)
         self.table_supplier_documents.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_supplier_documents.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -6713,10 +6731,11 @@ class SmartReportApp(QMainWindow):
         manual_button = QPushButton("Добавить вручную")
         manual_button.clicked.connect(self.open_manual_document_dialog)
         from incoming_documents import enabled as incoming_enabled
-        mail_button = QPushButton("Входящие документы")
+        mail_button = QPushButton("Открыть входящие")
+        mail_button.setToolTip("Неподтверждённые документы уже показаны в этом реестре.")
         mail_button.setVisible(incoming_enabled())
         mail_button.clicked.connect(self.open_incoming_documents)
-        edit_button = QPushButton("Изменить")
+        edit_button = QPushButton("Проверить документ")
         edit_button.clicked.connect(self.review_selected_document)
         reprocess_button = QPushButton("Распознать сохранённый оригинал")
         reprocess_button.clicked.connect(self.reprocess_selected_document)
@@ -6739,6 +6758,7 @@ class SmartReportApp(QMainWindow):
         self.exp_date_to.dateChanged.connect(self.load_expense_documents)
         self.exp_filter_object.currentIndexChanged.connect(self.load_expense_documents)
         self.exp_filter_unallocated.toggled.connect(self.load_expense_documents)
+        self.exp_filter_status.currentIndexChanged.connect(self.load_expense_documents)
 
     def open_mail_queue(self):
         QMessageBox.information(self, "Почта отключена", "Почтовое получение в интеграционный кандидат не включено.")
@@ -6781,7 +6801,16 @@ class SmartReportApp(QMainWindow):
         self.load_expense_documents()
         self.background_sync_with_cloud()
 
-    def open_incoming_documents(self):
+    def incoming_review_changed(self):
+        self.load_expense_documents()
+
+    def _incoming_documents_root(self):
+        profile = hashlib.sha256(
+            str(Path(DB_FILE).resolve()).casefold().encode("utf-8")
+        ).hexdigest()[:16]
+        return desktop_auth.app_data_dir() / "incoming-documents" / profile
+
+    def open_incoming_documents(self, document_id=None):
         from incoming_documents import enabled, open_incoming
         if not enabled():
             QMessageBox.information(self, "Входящие документы", "Функция выключена; фоновых запусков нет.")
@@ -6789,16 +6818,16 @@ class SmartReportApp(QMainWindow):
         viewer = getattr(self, "_incoming_viewer", None)
         if viewer is None:
             try:
-                profile = hashlib.sha256(str(Path(DB_FILE).resolve()).casefold().encode("utf-8")).hexdigest()[:16]
-                parent = desktop_auth.app_data_dir() / "incoming-documents"
-                parent.mkdir(parents=True, exist_ok=True)
-                viewer = open_incoming(self, parent / profile)
+                viewer = open_incoming(self, self._incoming_documents_root())
             except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
                 logging.exception("Не удалось открыть входящие документы")
                 QMessageBox.warning(self, "Входящие документы", str(error))
                 return
             self._incoming_viewer = viewer
             viewer.finished.connect(lambda: setattr(self, "_incoming_viewer", None))
+        if document_id is not None:
+            viewer.reload_documents()
+            viewer.selector.setCurrentIndex(max(0, viewer.selector.findData(document_id)))
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
@@ -7149,6 +7178,185 @@ class SmartReportApp(QMainWindow):
             )
         return merged, online
 
+    def _local_incoming_expense_documents(self, date_from=None, date_to=None):
+        from incoming_documents import IncomingStore, enabled as incoming_enabled
+        if not incoming_enabled():
+            return []
+        root = self._incoming_documents_root()
+        if not (root / "review.sqlite3").is_file():
+            return []
+        store = None
+        try:
+            store = IncomingStore(root, self)
+            object_names = {
+                int(item["id"]): str(item["name"])
+                for item in getattr(self, "_expense_objects", [])
+            }
+            documents = []
+            for record in store.documents():
+                document_id = int(record["id"])
+                revision, payload = store.latest(document_id)
+                document_date = payload.get("document_date")
+                if document_date and (
+                        date_from and document_date < date_from
+                        or date_to and document_date > date_to):
+                    continue
+                action = store.action(document_id)[1]
+                card = store.card(document_id)
+                parts = []
+                for part in store.allocations(payload):
+                    object_id = part.get("object_id")
+                    destination = part.get("destination") or (
+                        "object" if object_id is not None else "unselected")
+                    if object_id is not None:
+                        try:
+                            object_id = int(object_id)
+                        except (TypeError, ValueError):
+                            object_id = None
+                    parts.append({
+                        **part,
+                        "destination": destination,
+                        "object_id": object_id,
+                        "object_name": (
+                            "Общие расходы фирмы" if destination == "company" else
+                            object_names.get(object_id, "Объект не найден")
+                            if destination == "object" else "Назначение не выбрано"),
+                        "company_expense": destination == "company",
+                    })
+                gross = parse_decimal(payload.get("gross_amount"))
+                allocated_parts = [parse_decimal(part.get("gross_amount")) for part in parts]
+                allocated = (sum(allocated_parts, Decimal(0))
+                             if parts and all(value is not None for value in allocated_parts) else None)
+                remaining = (gross if not parts else gross - allocated
+                             if gross is not None and allocated is not None else None)
+                original_row = store.conn.execute(
+                    "SELECT filename FROM originals WHERE sha256=?", (record["sha256"],)
+                ).fetchone()
+                original_path = (
+                    store.root / "originals" / original_row["filename"] if original_row else None)
+                documents.append({
+                    **payload,
+                    "id": f"incoming:{document_id}",
+                    "client_id": card["client_id"] if card else f"incoming:{document_id}",
+                    "incoming_document_id": document_id,
+                    "incoming_revision": revision,
+                    "incoming_action": action,
+                    "incoming_local": True,
+                    "document_date": document_date,
+                    "allocations": parts,
+                    "net_amount": payload.get("net_amount"),
+                    "gross_amount": payload.get("gross_amount"),
+                    "vat_amount": payload.get("vat_amount"),
+                    "unallocated_gross": decimal_text(remaining),
+                    "verification_status": (
+                        "requires_review" if card or action not in ("ignore", "later") else
+                        "ignored" if action == "ignore" else "later"),
+                    "sync_state": "unverified" if card else None,
+                    "sync_error": (
+                        "Сохранение в общем реестре ещё не подтверждено."
+                        if card else None),
+                    "local_attachment_paths": (
+                        [str(original_path)] if original_path is not None and original_path.is_file() else []),
+                    "attachments": [],
+                    "has_original": original_row is not None,
+                })
+            return documents
+        except (OSError, sqlite3.Error, ValueError) as error:
+            logging.exception("Не удалось прочитать локальные входящие документы")
+            self.exp_api_status_lbl.setText(
+                f"Локальные входящие документы не загружены; проверьте профиль и базу. {error}")
+            return []
+        finally:
+            if store is not None:
+                store.close()
+
+    def _expense_register_snapshot(self, date_from=None, date_to=None, fresh=False):
+        documents, online = self._expense_document_snapshot(date_from, date_to, fresh)
+        positions = {
+            document.get("client_id"): index
+            for index, document in enumerate(documents) if document.get("client_id")
+        }
+        for incoming in self._local_incoming_expense_documents(date_from, date_to):
+            client_id = incoming.get("client_id")
+            if client_id in positions:
+                document = documents[positions[client_id]]
+                document["incoming_document_id"] = incoming["incoming_document_id"]
+                document["incoming_action"] = incoming["incoming_action"]
+                document["incoming_local"] = True
+                continue
+            documents.append(incoming)
+        return documents, online
+
+    @staticmethod
+    def _expense_register_status_key(document):
+        if document.get("sync_error") or document.get("sync_state") in (
+                "pending", "conflict", "unverified"):
+            return "transfer"
+        action = document.get("incoming_action")
+        if action == "ignore" or document.get("verification_status") in ("ignored", "not_to_account"):
+            return "ignored"
+        if action == "later" or document.get("verification_status") == "later":
+            return "later"
+        if document.get("verification_status") == "confirmed":
+            return "accounted"
+        return "requires_review"
+
+    @classmethod
+    def _expense_register_status_label(cls, document):
+        key = cls._expense_register_status_key(document)
+        if key == "transfer":
+            if document.get("sync_state") == "conflict":
+                return "Ошибка передачи: конфликт синхронизации"
+            if document.get("sync_error"):
+                return "Ошибка передачи: " + str(document["sync_error"])
+            if document.get("sync_state") == "unverified":
+                return "Передача не подтверждена сервером"
+            return "Ожидает подтверждения сервера"
+        return {
+            "requires_review": "Требует проверки",
+            "later": "Отложен",
+            "accounted": "Учтён",
+            "ignored": "Не учитывать",
+        }[key]
+
+    @staticmethod
+    def _expense_register_is_unallocated(document):
+        if SmartReportApp._expense_register_status_key(document) == "ignored":
+            return False
+        remaining = SmartReportApp._expense_register_unallocated_amount(document)
+        if remaining is not None:
+            return remaining != 0
+        return SmartReportApp._expense_register_status_key(document) != "accounted"
+
+    @staticmethod
+    def _expense_register_unallocated_amount(document):
+        net_basis = document.get("allocation_basis") == "net"
+        total = parse_decimal(document.get("net_amount" if net_basis else "gross_amount"))
+        allocations = document.get("allocations") or []
+        valid = [
+            item for item in allocations
+            if item.get("destination") in {"object", "company"}
+            and not (item.get("destination") == "object" and item.get("object_id") is None)
+        ]
+        incomplete = len(valid) != len(allocations)
+        if not allocations:
+            return total
+        if incomplete:
+            amounts = [parse_decimal(item.get("net_amount" if net_basis else "gross_amount"))
+                       for item in valid]
+            if total is None or any(amount is None for amount in amounts):
+                return None
+            return total - sum(amounts, Decimal(0))
+        remaining = parse_decimal(
+            document.get("unallocated_net" if net_basis else "unallocated_gross"))
+        if remaining is not None:
+            return remaining
+        amounts = [parse_decimal(item.get("net_amount" if net_basis else "gross_amount"))
+                   for item in valid]
+        if total is not None and all(amount is not None for amount in amounts):
+            return total - sum(amounts, Decimal(0))
+        return None
+
     @staticmethod
     def _expense_money_label(totals):
         return " · ".join(
@@ -7158,13 +7366,19 @@ class SmartReportApp(QMainWindow):
 
     @staticmethod
     def _expense_distribution_label(document):
-        gross = parse_decimal(document.get("gross_amount"))
-        net_basis = document.get("allocation_basis") == "net"
-        remaining = parse_decimal(document.get("unallocated_net" if net_basis else "unallocated_gross"))
         allocations = document.get("allocations") or []
         if not allocations:
             return "Не распределено"
-        if remaining is not None and remaining != 0:
+        if any(
+                item.get("destination") not in {"object", "company"}
+                or item.get("destination") == "object" and item.get("object_id") is None
+                for item in allocations):
+            return "Назначение не выбрано"
+        net_basis = document.get("allocation_basis") == "net"
+        remaining = SmartReportApp._expense_register_unallocated_amount(document)
+        if remaining is None:
+            return "Распределение не проверено"
+        if remaining != 0:
             return f"Частично; осталось {document['currency_code']} {remaining:,.2f}" + (" без НДС" if net_basis else " с НДС")
         if document.get("sync_state") == "conflict":
             return "Конфликт синхронизации"
@@ -7183,43 +7397,58 @@ class SmartReportApp(QMainWindow):
             return
         selected_filter = self.exp_filter_object.currentData()
         only_unallocated = self.exp_filter_unallocated.isChecked()
-        documents, _online = self._expense_document_snapshot(date_from, date_to)
-        filtered = []
+        status_filter = self.exp_filter_status.currentData()
+        documents, online = self._expense_register_snapshot(date_from, date_to)
+        base_filtered = []
         for document in documents:
             allocations = document.get("allocations") or []
             if selected_filter == "company" and not any(item.get("object_id") is None and item.get("destination", "company") == "company" for item in allocations):
                 continue
             if isinstance(selected_filter, int) and not any(item.get("object_id") == selected_filter for item in allocations):
                 continue
-            remaining = parse_decimal(document.get("unallocated_net" if document.get("allocation_basis") == "net" else "unallocated_gross"))
-            if only_unallocated and (remaining is None or remaining == 0):
+            if only_unallocated and not self._expense_register_is_unallocated(document):
                 continue
-            filtered.append(document)
+            base_filtered.append(document)
+        filtered = [
+            document for document in base_filtered
+            if status_filter == "all" or self._expense_register_status_key(document) == status_filter
+        ]
 
-        selected_client_id = None
+        selected_identity = None
         current_row = self.table_supplier_documents.currentRow()
         if current_row >= 0 and self.table_supplier_documents.item(current_row, 0):
             old_doc = self.table_supplier_documents.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
-            selected_client_id = old_doc.get("client_id") if isinstance(old_doc, dict) else None
+            if isinstance(old_doc, dict):
+                selected_identity = (old_doc.get("incoming_document_id") or
+                                     old_doc.get("client_id") or old_doc.get("id"))
+        vertical_scroll = self.table_supplier_documents.verticalScrollBar().value()
+        horizontal_scroll = self.table_supplier_documents.horizontalScrollBar().value()
         gross_totals, vat_totals, net_totals, unallocated_totals = {}, {}, {}, {}
-        reviews = 0
+        counts = {key: 0 for key in ("requires_review", "later", "accounted", "ignored", "transfer")}
+        for document in base_filtered:
+            key = self._expense_register_status_key(document)
+            counts[key] += 1
+        reviews = counts["requires_review"]
         for document in filtered:
             currency = str(document.get("currency_code") or "SEK")
-            if document.get("verification_status") == "confirmed":
+            if self._expense_register_status_key(document) == "accounted":
                 for field, totals in (("gross_amount", gross_totals), ("vat_amount", vat_totals), ("net_amount", net_totals)):
                     amount = parse_decimal(document.get(field))
                     if amount is not None:
                         totals[currency] = totals.get(currency, Decimal(0)) + amount
-            if document.get("verification_status") != "confirmed":
-                reviews += 1
-            remaining = parse_decimal(document.get("unallocated_gross"))
-            if remaining is not None and remaining != 0:
+            remaining = self._expense_register_unallocated_amount(document)
+            if remaining is not None and remaining != 0 and self._expense_register_status_key(document) != "ignored":
                 unallocated_totals[currency] = unallocated_totals.get(currency, Decimal(0)) + remaining
         self.exp_docs_gross_lbl.setText(self._expense_money_label(gross_totals))
         self.exp_docs_vat_lbl.setText(self._expense_money_label(vat_totals))
         self.exp_docs_net_lbl.setText(self._expense_money_label(net_totals))
         self.exp_docs_unallocated_lbl.setText(self._expense_money_label(unallocated_totals))
         self.exp_docs_review_lbl.setText(str(reviews))
+        self.exp_docs_state_counts_lbl.setText(
+            f"Показано {len(filtered)} из {len(base_filtered)} · "
+            f"Проверка: {counts['requires_review']} · Отложены: {counts['later']} · "
+            f"Учтены: {counts['accounted']} · Исключены: {counts['ignored']} · "
+            f"Ошибка / передача: {counts['transfer']}")
 
         self.table_supplier_documents.setCurrentCell(-1, -1)
         self.table_supplier_documents.setRowCount(len(filtered))
@@ -7227,15 +7456,18 @@ class SmartReportApp(QMainWindow):
         for row_index, document in enumerate(filtered):
             allocations = document.get("allocations") or []
             object_names = sorted({
-                item.get("object_name") or "Общие расходы фирмы"
+                item.get("object_name") or (
+                    "Общие расходы фирмы" if item.get("destination") == "company"
+                    else "Назначение не выбрано")
                 for item in allocations
             })
-            object_label = ", ".join(object_names) if object_names else "Не распределено"
+            object_label = ", ".join(object_names) if object_names else "Назначение не выбрано"
             currency = str(document.get("currency_code") or "SEK")
-            vat_text = f"{document['vat_amount']} {currency}" if document.get("vat_amount") is not None else "Неизвестно"
-            status = self._expense_distribution_label(document)
-            if document.get("sync_error"):
-                status += f"; {document['sync_error']}"
+            vat_text = f"{document['vat_amount']} {currency}" if document.get("vat_amount") is not None else "Не указан / не распознан"
+            status = self._expense_register_status_label(document)
+            distribution = self._expense_distribution_label(document)
+            if distribution:
+                status += f" · {distribution}"
             processing = document.get("processing") or {}
             if processing:
                 status += f"; обработка: {processing.get('state')}"
@@ -7243,21 +7475,55 @@ class SmartReportApp(QMainWindow):
                     status += "; " + "; ".join(processing["errors"])
             values = (
                 str(document.get("id") or document.get("client_id")),
-                document.get("document_date") or "—",
+                document.get("document_date") or "Не указана",
                 document.get("supplier_name") or "Не указан",
+                document.get("invoice_number") or "Не указан",
                 object_label,
-                f"{document['gross_amount']} {currency}" if document.get("gross_amount") is not None else "—",
+                f"{document['gross_amount']} {currency}" if document.get("gross_amount") is not None else "Не определена",
                 vat_text,
-                f"{status} · {document.get('verification_status', 'draft')}",
+                status,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
+                if column == 1 and not document.get("document_date"):
+                    item.setToolTip("Дата в документе не указана или не распознана.")
+                elif column == 2 and not document.get("supplier_name"):
+                    item.setToolTip("Поставщик не указан или не распознан.")
+                elif column == 3 and not document.get("invoice_number"):
+                    item.setToolTip("Номер документа отсутствует или не распознан.")
+                elif column == 5 and document.get("gross_amount") is None:
+                    item.setToolTip("Сумма не определена; проверьте оригинал.")
+                elif column == 6 and document.get("vat_amount") is None:
+                    item.setToolTip("НДС не указан или не распознан. Он не вычислялся автоматически.")
+                elif column == 7:
+                    item.setToolTip(status)
                 self.table_supplier_documents.setItem(row_index, column, item)
             self.table_supplier_documents.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
-            if document.get("client_id") == selected_client_id:
+            identity = (document.get("incoming_document_id") or
+                        document.get("client_id") or document.get("id"))
+            if identity == selected_identity:
                 restored_row = row_index
         if restored_row >= 0:
             self.table_supplier_documents.setCurrentCell(restored_row, 1)
+        self.table_supplier_documents.verticalScrollBar().setValue(vertical_scroll)
+        self.table_supplier_documents.horizontalScrollBar().setValue(horizontal_scroll)
+
+        if not filtered:
+            if not documents:
+                message = ("За выбранный период документов нет." if online else
+                           "Общий реестр недоступен. Проверьте подключение; локальные входящие показаны, если сохранены.")
+            elif not base_filtered:
+                message = "Документы за период есть, но их скрывают фильтр объекта или «Только нераспределённые»."
+            else:
+                message = (f"Документы за период есть, но их скрывает фильтр состояния "
+                           f"«{self.exp_filter_status.currentText()}».")
+            self.exp_api_status_lbl.setText(message)
+        elif restored_row < 0 and selected_identity is not None:
+            self.exp_api_status_lbl.setText(
+                f"Показано {len(filtered)} документов. Ранее выбранная запись скрыта текущим фильтром.")
+        elif online:
+            self.exp_api_status_lbl.setText(
+                f"Реестр обновлён. Учтённые суммы включают только подтверждённые сервером документы.")
 
     def load_object_expense_overview(self, *_):
         if not hasattr(self, "object_expenses_table"):
@@ -8229,7 +8495,11 @@ class SmartReportApp(QMainWindow):
     def review_selected_document(self, *_):
         document = self._selected_expense_document(self.table_supplier_documents)
         if document:
-            self._expense_document_review_dialog(document=document)
+            incoming_id = document.get("incoming_document_id")
+            if incoming_id is not None:
+                self.open_incoming_documents(incoming_id)
+            else:
+                self._expense_document_review_dialog(document=document)
 
     def review_selected_object_expense(self, *_):
         document = self._selected_expense_document(self.object_expenses_table)
@@ -8276,7 +8546,11 @@ class SmartReportApp(QMainWindow):
     def open_selected_document_original(self, *_):
         document = self._selected_expense_document(self.table_supplier_documents)
         if document:
-            self._open_expense_document_original(document)
+            incoming_id = document.get("incoming_document_id")
+            if incoming_id is not None and self._expense_register_status_key(document) != "accounted":
+                self.open_incoming_documents(incoming_id)
+            else:
+                self._open_expense_document_original(document)
 
     def open_selected_object_expense_original(self, *_):
         document = self._selected_expense_document(self.object_expenses_table)
