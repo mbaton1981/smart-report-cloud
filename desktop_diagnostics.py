@@ -19,6 +19,85 @@ def _require_local_server():
     return url
 
 
+def verify_voice_device_ram(app_module, work_dir, out_path):
+    """Exercise real microphone capture without a database, server or retained audio."""
+    from io import BytesIO
+    import struct
+    import wave
+    from unittest.mock import patch
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtMultimedia import QAudioDevice, QMediaDevices, QtAudio
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication, QMainWindow
+    from assistant_ui import AssistantDialog
+
+    application = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    window.show()
+    with patch("assistant_ui.RequestWorker.start"), patch("assistant_ui.QMessageBox.warning") as warning:
+        dialog = AssistantDialog(window)
+        dialog.finished()
+        dialog.show()
+        application.processEvents()
+        device = QMediaDevices.defaultAudioInput()
+        if device.isNull():
+            raise RuntimeError("No real microphone available; hardware verification did not pass")
+        try:
+            dialog.input.setPlainText("Synthetic unsent command")
+            with patch.object(dialog, "call") as api:
+                dialog.voice.click()
+                QTest.qWait(1200)
+                assert dialog.audio is not None, dialog.state.text()
+                assert dialog.audio.error() == QtAudio.Error.NoError
+                assert dialog.audio.state() in (QtAudio.State.ActiveState, QtAudio.State.IdleState)
+                assert dialog.timer.isActive() and dialog.recording_time.text() != "00:00 / 01:00"
+                assert dialog.isVisible() and window.isVisible()
+                assert not dialog.windowState() & Qt.WindowState.WindowMinimized
+                assert not window.windowState() & Qt.WindowState.WindowMinimized
+                dialog.voice_stop.click()
+                api.assert_called_once()
+                assert api.call_args.args == ("transcribe",)
+                with wave.open(BytesIO(api.call_args.kwargs["audio"]), "rb") as wav:
+                    channels, rate, frames = wav.getnchannels(), wav.getframerate(), wav.getnframes()
+                    assert channels == 1 and rate == 16000 and frames >= 8000
+                    samples = [sample[0] for sample in struct.iter_unpack("<h", wav.readframes(frames))]
+                    peak = max(abs(sample) for sample in samples)
+                    nonzero_samples = sum(sample != 0 for sample in samples)
+                api.reset_mock()
+                dialog.voice.click()
+                QTest.qWait(300)
+                assert dialog.audio is not None and dialog.buffer.size() > 0
+                dialog.voice_cancel.click()
+                api.assert_not_called()
+                assert dialog.audio is None and dialog.buffer is None and not dialog.timer.isActive()
+                assert dialog.input.toPlainText() == "Synthetic unsent command"
+                warning.assert_not_called()
+                with patch.object(QMediaDevices, "defaultAudioInput", return_value=QAudioDevice()):
+                    dialog.voice.click()
+                warning.assert_called_once()
+                assert dialog.isVisible() and window.isVisible()
+                assert dialog.voice.isEnabled() and dialog.send.isEnabled()
+                assert dialog.audio is None and dialog.buffer is None
+                api.assert_not_called()
+                dialog.voice.click()
+                QTest.qWait(300)
+                assert dialog.audio is not None
+                dialog.close()
+                assert dialog.audio is None and dialog.buffer is None
+                api.assert_not_called()
+            proof = dict(frozen=bool(getattr(sys, "frozen", False)), device=device.description(),
+                         real_capture=True, channels=channels, sample_rate=rate, frames=frames,
+                         peak=peak, nonzero_samples=nonzero_samples,
+                         stop=True, cancel=True, close_during_recording=True,
+                         unavailable_device_selector_simulated=True, retry=True,
+                         windows_not_hidden_or_minimized=True,
+                         database_opened=False, server_contacted=False, audio_retained=False)
+            Path(out_path).write_text(json.dumps(proof, ensure_ascii=False, indent=2), encoding="utf-8")
+        finally:
+            dialog.close()
+            window.close()
+
+
 def verify_pdf_save_ram(app_module, work_dir, out_path):
     """Exercise frozen PDF Save As without opening any database or server."""
     from io import BytesIO
@@ -1504,6 +1583,8 @@ def verify_new_shift_prices_ram(app_module, work_dir, out_path):
 
 
 def run(app_module, action, work_dir, case="case", out_path=None):
+    if action == "voice-device-ram":
+        return verify_voice_device_ram(app_module, work_dir, out_path)
     if action == "pdf-save-ram":
         return verify_pdf_save_ram(app_module, work_dir, out_path)
     if action == "theme-ram":

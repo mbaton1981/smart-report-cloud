@@ -1749,6 +1749,154 @@ class AssistantApiTests(unittest.TestCase):
                 self.assertEqual(dialog.table.rowCount(), 1)
         self.assertEqual(before, self.business())
 
+    def test_voice_start_stop_cancel_use_supported_qt6_api(self):
+        from assistant_ui import AssistantDialog
+        from PyQt6.QtMultimedia import QAudioDevice, QAudioSource, QtAudio
+        from PyQt6.QtWidgets import QWidget
+        device = Mock(spec_set=QAudioDevice)
+        device.isNull.return_value = False
+        device.isFormatSupported.return_value = True
+        device.description.return_value = "Synthetic microphone"
+        audio = Mock(spec_set=QAudioSource)
+        audio.error.return_value = QtAudio.Error.NoError
+        with patch("assistant_ui.RequestWorker.start"), \
+                patch("PyQt6.QtMultimedia.QMediaDevices.defaultAudioInput", return_value=device), \
+                patch("PyQt6.QtMultimedia.QAudioSource", return_value=audio), \
+                patch("assistant_ui.QMessageBox.warning") as warning:
+            dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            dialog.show()
+            dialog.input.setPlainText("Keep typed command")
+            with patch.object(dialog, "call") as api:
+                dialog.voice.click()
+                self.assertIs(dialog.audio, audio)
+                self.assertTrue(dialog.timer.isActive())
+                self.assertFalse(dialog.voice.isEnabled())
+                self.assertTrue(dialog.voice_stop.isVisible())
+                self.assertTrue(dialog.voice_cancel.isVisible())
+                dialog.buffer.write(b"\x01\x01" * 16000)
+                audio.stop.side_effect = lambda: dialog._recording_state_changed(QtAudio.State.StoppedState)
+                dialog.voice_stop.click()
+                self.assertIsNone(dialog.audio)
+                self.assertIsNone(dialog.buffer)
+                self.assertFalse(dialog.timer.isActive())
+                self.assertTrue(dialog.voice.isEnabled())
+                self.assertFalse(dialog.voice_stop.isVisible())
+                with wave.open(BytesIO(api.call_args.kwargs["audio"]), "rb") as wav:
+                    self.assertEqual((wav.getnchannels(), wav.getframerate(), wav.getnframes()), (1, 16000, 16000))
+                api.reset_mock()
+                dialog.voice.click()
+                dialog.voice_cancel.click()
+                api.assert_not_called()
+                self.assertEqual(dialog.input.toPlainText(), "Keep typed command")
+                self.assertIsNone(dialog.buffer)
+                self.assertFalse(dialog.timer.isActive())
+                warning.assert_not_called()
+
+    def test_voice_unavailable_microphone_restores_controls_and_reports_error(self):
+        from assistant_ui import AssistantDialog
+        from PyQt6.QtMultimedia import QAudioDevice, QAudioSource, QtAudio
+        from PyQt6.QtWidgets import QWidget
+        for failure in ("missing", "unsupported", "open", "runtime"):
+            with self.subTest(failure=failure):
+                device = Mock(spec_set=QAudioDevice)
+                device.isNull.return_value = failure == "missing"
+                device.isFormatSupported.return_value = failure != "unsupported"
+                device.description.return_value = "Synthetic microphone"
+                audio = Mock(spec_set=QAudioSource)
+                audio.error.return_value = QtAudio.Error.OpenError if failure == "open" else QtAudio.Error.NoError
+                if failure == "runtime":
+                    audio.start.side_effect = RuntimeError("Synthetic device failure")
+                with patch("assistant_ui.RequestWorker.start"), \
+                        patch("PyQt6.QtMultimedia.QMediaDevices.defaultAudioInput", return_value=device), \
+                        patch("PyQt6.QtMultimedia.QAudioSource", return_value=audio), \
+                        patch("assistant_ui.QMessageBox.warning") as warning:
+                    dialog = AssistantDialog(QWidget())
+                    self.addCleanup(dialog.close)
+                    dialog.finished()
+                    dialog.show()
+                    with self.assertLogs(level="ERROR"), patch.object(dialog, "call") as api:
+                        dialog.voice.click()
+                    self.assertTrue(dialog.isVisible())
+                    self.assertFalse(dialog.isMinimized())
+                    self.assertIsNone(dialog.audio)
+                    self.assertIsNone(dialog.buffer)
+                    self.assertFalse(dialog.timer.isActive())
+                    self.assertTrue(dialog.voice.isEnabled())
+                    self.assertTrue(dialog.send.isEnabled())
+                    self.assertFalse(dialog.voice_stop.isVisible())
+                    warning.assert_called_once()
+                    self.assertIn("микрофон", dialog.state.text().lower())
+                    api.assert_not_called()
+                    dialog.close()
+
+    def test_voice_async_device_failure_discards_and_allows_retry(self):
+        from assistant_ui import AssistantDialog
+        from PyQt6.QtMultimedia import QAudioDevice, QAudioSource, QtAudio
+        from PyQt6.QtWidgets import QWidget
+        device = Mock(spec_set=QAudioDevice)
+        device.isNull.return_value = False
+        device.isFormatSupported.return_value = True
+        device.description.return_value = "Synthetic microphone"
+        audio = Mock(spec_set=QAudioSource)
+        audio.error.return_value = QtAudio.Error.NoError
+        with patch("assistant_ui.RequestWorker.start"), \
+                patch("PyQt6.QtMultimedia.QMediaDevices.defaultAudioInput", return_value=device), \
+                patch("PyQt6.QtMultimedia.QAudioSource", return_value=audio), \
+                patch("assistant_ui.QMessageBox.warning") as warning:
+            dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            dialog.show()
+            dialog.input.setPlainText("Keep typed command")
+            with patch.object(dialog, "call") as api:
+                dialog.voice.click()
+                audio.error.return_value = QtAudio.Error.IOError
+                audio.stop.side_effect = lambda: dialog._recording_state_changed(QtAudio.State.StoppedState)
+                with self.assertLogs(level="ERROR"):
+                    dialog._recording_state_changed(QtAudio.State.StoppedState)
+                warning.assert_called_once()
+                self.assertTrue(dialog.isVisible())
+                self.assertIsNone(dialog.audio)
+                self.assertIsNone(dialog.buffer)
+                self.assertFalse(dialog.timer.isActive())
+                self.assertEqual(dialog.input.toPlainText(), "Keep typed command")
+                api.assert_not_called()
+                audio.error.return_value = QtAudio.Error.NoError
+                dialog.voice.click()
+                self.assertIs(dialog.audio, audio)
+                dialog.close()
+                self.assertIsNone(dialog.audio)
+                self.assertIsNone(dialog.buffer)
+                api.assert_not_called()
+
+    def test_voice_start_synchronous_error_signal_is_handled_once(self):
+        from assistant_ui import AssistantDialog
+        from PyQt6.QtMultimedia import QAudioDevice, QAudioSource, QtAudio
+        from PyQt6.QtWidgets import QWidget
+        device = Mock(spec_set=QAudioDevice)
+        device.isNull.return_value = False
+        device.isFormatSupported.return_value = True
+        device.description.return_value = "Synthetic microphone"
+        audio = Mock(spec_set=QAudioSource)
+        audio.error.return_value = QtAudio.Error.OpenError
+        with patch("assistant_ui.RequestWorker.start"), \
+                patch("PyQt6.QtMultimedia.QMediaDevices.defaultAudioInput", return_value=device), \
+                patch("PyQt6.QtMultimedia.QAudioSource", return_value=audio), \
+                patch("assistant_ui.QMessageBox.warning") as warning:
+            dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.finished()
+            audio.start.side_effect = lambda buffer: dialog._recording_state_changed(QtAudio.State.StoppedState)
+            with self.assertLogs(level="ERROR"):
+                dialog.voice.click()
+            warning.assert_called_once()
+            self.assertIsNone(dialog.audio)
+            self.assertIsNone(dialog.buffer)
+            self.assertTrue(dialog.voice.isEnabled())
+            self.assertFalse(dialog.timer.isActive())
+
     def test_voice_transcript_appends_and_cancel_preserves_typed_text(self):
         from assistant_ui import AssistantDialog
         from PyQt6.QtWidgets import QWidget

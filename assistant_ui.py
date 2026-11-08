@@ -3,6 +3,7 @@ import io
 import base64
 from html import escape
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -471,6 +472,7 @@ class AssistantDialog(QDialog):
     def __init__(self, window):
         super().__init__(window)
         self.window, self.worker, self.result, self.audio = window, None, None, None
+        self.buffer = None
         self.recording_started_at = None
         self.voice_warning = ""
         self.context = None
@@ -1178,8 +1180,9 @@ class AssistantDialog(QDialog):
         if self.audio is not None:
             return self.stop_recording()
         try:
-            from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
+            from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices, QtAudio
             device = QMediaDevices.defaultAudioInput()
+            self.refresh_microphone_label()
             fmt = QAudioFormat()
             fmt.setSampleRate(16000)
             fmt.setChannelCount(1)
@@ -1187,11 +1190,14 @@ class AssistantDialog(QDialog):
             if device.isNull() or not device.isFormatSupported(fmt):
                 raise AssistantClientError("Микрофон PCM mono 16 kHz недоступен. Используйте текстовую команду.")
             self.buffer = QBuffer(self)
-            self.buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+            if not self.buffer.open(QIODevice.OpenModeFlag.ReadWrite):
+                raise AssistantClientError("Не удалось подготовить запись. Повторите попытку или используйте текст.")
             self.audio = QAudioSource(device, fmt, self)
-            self.audio.setNotifyInterval(100)
+            self.audio.stateChanged.connect(self._recording_state_changed)
             self.audio.start(self.buffer)
-            if self.audio.error().value:
+            if self.audio is None:
+                return
+            if self.audio.error() != QtAudio.Error.NoError:
                 raise AssistantClientError("Нет доступа к микрофону. Проверьте разрешение Windows.")
             self.recording_started_at = time.monotonic()
             self.voice.setEnabled(False)
@@ -1202,18 +1208,29 @@ class AssistantDialog(QDialog):
             self.send.setEnabled(False)
             self.state.setText("Идёт запись. Остановите её для распознавания или отмените без отправки.")
             self.timer.start()
-        except (ImportError, AssistantClientError, RuntimeError) as error:
-            if self.audio is not None:
-                self.audio.stop()
-                self.audio.deleteLater()
-                self.audio = None
-            if hasattr(self, "buffer"):
-                self.buffer.close()
-            self.send.setEnabled(True)
-            self.state.setText(
+        except (ImportError, AssistantClientError, RuntimeError, OSError) as error:
+            logging.exception("Assistant microphone recording could not start")
+            self._recording_failed(
                 str(error) if isinstance(error, AssistantClientError) else
                 "Не удалось начать запись. Проверьте подключение микрофона и разрешение Windows."
             )
+
+    def _recording_failed(self, message):
+        self._discard_recording()
+        self.send.setEnabled(True)
+        self.state.setText(message)
+        QMessageBox.warning(self, "Запись голоса недоступна", message)
+
+    def _recording_state_changed(self, state):
+        from PyQt6.QtMultimedia import QtAudio
+        if self.audio is None or state != QtAudio.State.StoppedState:
+            return
+        error = self.audio.error()
+        logging.error("Assistant microphone stopped unexpectedly: %s", error.name)
+        self._recording_failed(
+            "Запись прервана: микрофон недоступен или отключён. Проверьте подключение и разрешение "
+            "Windows для настольных приложений. Запись не отправлена; набранный текст сохранён."
+        )
 
     def update_recording_status(self):
         if self.audio is None:
@@ -1252,12 +1269,14 @@ class AssistantDialog(QDialog):
     def _discard_recording(self):
         self.timer.stop()
         if self.audio is not None:
-            self.audio.stop()
-            self.audio.deleteLater()
+            audio = self.audio
             self.audio = None
-        if hasattr(self, "buffer"):
+            audio.stop()
+            audio.deleteLater()
+        if self.buffer is not None:
             self.buffer.close()
             self.buffer.deleteLater()
+            self.buffer = None
         self.recording_started_at = None
         self._finish_recording_controls()
 
@@ -1272,14 +1291,12 @@ class AssistantDialog(QDialog):
         if self.audio is None:
             return
         self.timer.stop()
-        self.audio.stop()
-        self.audio.deleteLater()
+        audio = self.audio
         self.audio = None
+        audio.stop()
+        audio.deleteLater()
         raw = bytes(self.buffer.data())
-        self.buffer.close()
-        self.buffer.deleteLater()
-        self.recording_started_at = None
-        self._finish_recording_controls()
+        self._discard_recording()
         if not raw or len(raw) > 1920000:
             self.send.setEnabled(True)
             self.state.setText(
