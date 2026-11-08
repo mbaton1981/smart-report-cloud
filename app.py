@@ -7179,6 +7179,7 @@ class SmartReportApp(QMainWindow):
         return merged, online
 
     def _local_incoming_expense_documents(self, date_from=None, date_to=None):
+        self._incoming_expense_documents_outside_period = 0
         from incoming_documents import IncomingStore, enabled as incoming_enabled
         if not incoming_enabled():
             return []
@@ -7198,8 +7199,9 @@ class SmartReportApp(QMainWindow):
                 revision, payload = store.latest(document_id)
                 document_date = payload.get("document_date")
                 if document_date and (
-                        date_from and document_date < date_from
-                        or date_to and document_date > date_to):
+                        (date_from and document_date < date_from)
+                        or (date_to and document_date > date_to)):
+                    self._incoming_expense_documents_outside_period += 1
                     continue
                 action = store.action(document_id)[1]
                 card = store.card(document_id)
@@ -7262,6 +7264,7 @@ class SmartReportApp(QMainWindow):
                 })
             return documents
         except (OSError, sqlite3.Error, ValueError) as error:
+            self._incoming_expense_documents_outside_period = 0
             logging.exception("Не удалось прочитать локальные входящие документы")
             self.exp_api_status_lbl.setText(
                 f"Локальные входящие документы не загружены; проверьте профиль и базу. {error}")
@@ -7444,11 +7447,15 @@ class SmartReportApp(QMainWindow):
         self.exp_docs_net_lbl.setText(self._expense_money_label(net_totals))
         self.exp_docs_unallocated_lbl.setText(self._expense_money_label(unallocated_totals))
         self.exp_docs_review_lbl.setText(str(reviews))
-        self.exp_docs_state_counts_lbl.setText(
+        state_summary = (
             f"Показано {len(filtered)} из {len(base_filtered)} · "
             f"Проверка: {counts['requires_review']} · Отложены: {counts['later']} · "
             f"Учтены: {counts['accounted']} · Исключены: {counts['ignored']} · "
             f"Ошибка / передача: {counts['transfer']}")
+        outside_period = getattr(self, "_incoming_expense_documents_outside_period", 0)
+        if outside_period:
+            state_summary += f" · Входящих вне выбранного периода: {outside_period}"
+        self.exp_docs_state_counts_lbl.setText(state_summary)
 
         self.table_supplier_documents.setCurrentCell(-1, -1)
         self.table_supplier_documents.setRowCount(len(filtered))
@@ -7510,8 +7517,16 @@ class SmartReportApp(QMainWindow):
 
         if not filtered:
             if not documents:
-                message = ("За выбранный период документов нет." if online else
-                           "Общий реестр недоступен. Проверьте подключение; локальные входящие показаны, если сохранены.")
+                if outside_period:
+                    message = (
+                        f"За выбранный период документов нет; {outside_period} входящих вне периода. "
+                        "Измените период, чтобы показать их.")
+                    if not online:
+                        message += " Общий реестр недоступен; проверьте подключение."
+                else:
+                    message = ("За выбранный период документов нет." if online else
+                               "Общий реестр недоступен. Проверьте подключение; "
+                               "локальные входящие показаны, если сохранены.")
             elif not base_filtered:
                 message = "Документы за период есть, но их скрывают фильтр объекта или «Только нераспределённые»."
             else:

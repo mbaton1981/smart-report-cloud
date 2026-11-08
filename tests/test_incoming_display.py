@@ -112,6 +112,45 @@ class IncomingDisplayTests(unittest.TestCase):
         }
         self.assertFalse(self.desktop.SmartReportApp._expense_register_is_unallocated(company))
 
+    def test_main_register_explains_local_documents_outside_the_selected_period(self):
+        from PyQt6.QtWidgets import QCheckBox, QComboBox, QLabel, QTableWidget
+
+        host = SimpleNamespace(
+            _incoming_documents_root=lambda: self.store.root,
+            _expense_objects=self.host._expense_objects,
+            _expense_document_snapshot=lambda *_args, **_kwargs: ([], False),
+            exp_api_status_lbl=QLabel(),
+            exp_docs_state_counts_lbl=QLabel(),
+            exp_docs_gross_lbl=QLabel(),
+            exp_docs_vat_lbl=QLabel(),
+            exp_docs_net_lbl=QLabel(),
+            exp_docs_unallocated_lbl=QLabel(),
+            exp_docs_review_lbl=QLabel(),
+            exp_date_from=SimpleNamespace(text=lambda: "2026-11-01"),
+            exp_date_to=SimpleNamespace(text=lambda: "2026-11-30"),
+            exp_filter_object=QComboBox(),
+            exp_filter_unallocated=QCheckBox(),
+            exp_filter_status=QComboBox(),
+            table_supplier_documents=QTableWidget(0, 8),
+            _expense_money_label=self.desktop.SmartReportApp._expense_money_label,
+        )
+        host.exp_filter_object.addItem("Все объекты", None)
+        host.exp_filter_status.addItem("Все состояния", "all")
+        host._local_incoming_expense_documents = lambda date_from=None, date_to=None: (
+            self.desktop.SmartReportApp._local_incoming_expense_documents(
+                host, date_from, date_to))
+        host._expense_register_snapshot = lambda date_from=None, date_to=None, fresh=False: (
+            self.desktop.SmartReportApp._expense_register_snapshot(
+                host, date_from, date_to, fresh))
+
+        self.desktop.SmartReportApp.load_expense_documents(host)
+
+        self.assertEqual(host.table_supplier_documents.rowCount(), 0)
+        self.assertIn("Входящих вне выбранного периода: 3",
+                      host.exp_docs_state_counts_lbl.text())
+        self.assertIn("3 входящих вне периода", host.exp_api_status_lbl.text())
+        self.assertIn("Измените период", host.exp_api_status_lbl.text())
+
     def test_missing_fields_are_explicit_not_invented(self):
         from test_mail_automation import pdf
         self.store.add_pdf(pdf("No recognizable fields"), "unknown.pdf", {"fields": {}, "state": "failed"})
