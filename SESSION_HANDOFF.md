@@ -43,8 +43,9 @@
   изменялись.
 - Код зафиксирован в `main`, commit `13a9da6ba6c29f88a7de35313417eb117c38ecc0`.
 - Код и handoff опубликованы в `origin/main`, head
-  `ff0f7d7bfb8ef7173f786945669984de87fa9508`. В Render вручную развёрнут
-  этот commit: deployment `dep-dbp4d361egvs73b16pvg` завершился
+  `0924abf` (изменения кода — commit `13a9da6`). В Render вручную развёрнут
+  commit `ff0f7d7bfb8ef7173f786945669984de87fa9508`: deployment
+  `dep-dbp4d361egvs73b16pvg` завершился
   `Deploy succeeded | Live`. Read-only `HEAD /` вернул HTTP 200; в deploy-логе
   видно резервное копирование облачной БД перед запуском. Рабочие категории
   вручную не менялись.
