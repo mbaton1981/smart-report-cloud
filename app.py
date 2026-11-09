@@ -223,6 +223,30 @@ SPECIAL_OBJECTS = {
     RECORD_TYPE_VACATION: ("Semestertimmar", "p1002"),
     RECORD_TYPE_HOLIDAY: (None, "p1004"),
 }
+SERVICE_TYPE_MARKINGS = {
+    RECORD_TYPE_ATF: "p1000",
+    RECORD_TYPE_SICK: "p1001",
+    RECORD_TYPE_VACATION: "p1002",
+    RECORD_TYPE_HOLIDAY: "p1004",
+}
+SERVICE_TYPE_DESCRIPTIONS = {
+    RECORD_TYPE_ATF: (
+        "АТФ: часы выделяются отдельно от обычной работы и клиентского счёта. "
+        "В сохранённой зарплатной истории участвуют в расчёте ATF/KLS по действующим параметрам."
+    ),
+    RECORD_TYPE_SICK: (
+        "Больничный: часы выделяются отдельно от обычной работы и клиентского счёта. "
+        "В сохранённой зарплатной истории участвуют в расчёте sick pay по действующим параметрам."
+    ),
+    RECORD_TYPE_VACATION: (
+        "Отпуск: часы выделяются отдельно от обычной работы и клиентского счёта. "
+        "Зарплатная история применяет действующую отпускную надбавку к обычной оплате."
+    ),
+    RECORD_TYPE_HOLIDAY: (
+        "Красные дни: часы выделяются отдельно от обычной работы и клиентского счёта. "
+        "В текущей зарплатной истории они отображаются отдельно и не получают отдельную оплату."
+    ),
+}
 
 
 def matches_special_object(object_name, marking, reference):
@@ -230,6 +254,40 @@ def matches_special_object(object_name, marking, reference):
     return marking == expected_marking and (
         expected_name is None or object_name == expected_name
     )
+
+
+def legacy_service_type(object_name, marking):
+    for service_type, reference in SPECIAL_OBJECTS.items():
+        if matches_special_object(object_name, marking, reference):
+            return service_type
+    return None
+
+
+def ensure_local_service_category_schema(cursor):
+    cursor.execute("CREATE TABLE IF NOT EXISTS service_category_aliases ("
+                   "sync_id TEXT NOT NULL, company TEXT NOT NULL, name TEXT NOT NULL, "
+                   "PRIMARY KEY (sync_id, company, name))")
+    cursor.execute("PRAGMA table_info(objects)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    for column_name, definition in (
+        ("service_type", "TEXT"),
+        ("service_builtin", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE objects ADD COLUMN {column_name} {definition}")
+    for service_type, (expected_name, marking) in SPECIAL_OBJECTS.items():
+        if expected_name is None:
+            cursor.execute(
+                "UPDATE objects SET service_type = ?, service_builtin = 1 "
+                "WHERE service_type IS NULL AND COALESCE(markning, '') = ?",
+                (service_type, marking),
+            )
+        else:
+            cursor.execute(
+                "UPDATE objects SET service_type = ?, service_builtin = 1 "
+                "WHERE service_type IS NULL AND name = ? AND COALESCE(markning, '') = ?",
+                (service_type, expected_name, marking),
+            )
 
 
 def swedish_public_holidays(year):
@@ -299,9 +357,12 @@ def ensure_local_object_sync_schema(conn):
         ("server_id", "INTEGER"),
         ("is_active", "INTEGER NOT NULL DEFAULT 1"),
         ("sync_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("service_type", "TEXT"),
+        ("service_builtin", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if column_name not in columns:
             cursor.execute(f"ALTER TABLE objects ADD COLUMN {column_name} {definition}")
+    ensure_local_service_category_schema(cursor)
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_sync_id ON objects(sync_id) WHERE sync_id IS NOT NULL")
 
     cursor.execute("PRAGMA index_list(objects)")
@@ -346,14 +407,18 @@ def ensure_local_object_sync_schema(conn):
                 server_id INTEGER,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 sync_version INTEGER NOT NULL DEFAULT 0,
+                service_type TEXT,
+                service_builtin INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(name, company)
             )
         """)
         conn.execute("""
             INSERT INTO objects_sync_migration (
-                id, name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+                id, name, markning, company, rate, transport_rate, sync_id, server_id,
+                is_active, sync_version, service_type, service_builtin
             )
-            SELECT id, name, markning, company, rate, transport_rate, sync_id, server_id, is_active, sync_version
+            SELECT id, name, markning, company, rate, transport_rate, sync_id, server_id,
+                   is_active, sync_version, service_type, service_builtin
             FROM objects
         """)
         conn.execute("DROP TABLE objects")
@@ -395,6 +460,8 @@ def init_db_once():
             server_id INTEGER,
             is_active INTEGER NOT NULL DEFAULT 1,
             sync_version INTEGER NOT NULL DEFAULT 0,
+            service_type TEXT,
+            service_builtin INTEGER NOT NULL DEFAULT 0,
             UNIQUE(name, company)
         )
     ''')
@@ -792,6 +859,18 @@ def enqueue_object_sync_event(cursor, object_id, operation, extra=None):
         sync_id = extra_payload.pop("sync_id", None)
     if row is None or not sync_id:
         raise ValueError("Объект legacy не сопоставлен с серверным ID; синхронизация заблокирована.")
+    service_type = row["service_type"] or legacy_service_type(
+        row["name"], row["markning"] or ""
+    )
+    service_builtin = bool(row["service_builtin"]) or (
+        row["service_type"] is None and service_type is not None
+    )
+    if row["service_type"] is None and service_type is not None:
+        cursor.execute(
+            "UPDATE objects SET service_type = ?, service_builtin = ? WHERE id = ?",
+            (service_type, int(service_builtin), int(row["id"])),
+        )
+        row = cursor.execute("SELECT * FROM objects WHERE id = ?", (int(row["id"]),)).fetchone()
     revision = int(row["sync_version"] or 0) + 1
     event = {
         "operation_id": str(uuid.uuid4()),
@@ -804,8 +883,17 @@ def enqueue_object_sync_event(cursor, object_id, operation, extra=None):
             "markning": str(row["markning"] or ""),
             "rate": float(row["rate"] or 0.0),
             "transport_rate": float(row["transport_rate"] or 0.0),
+            "service_type": service_type,
+            "service_builtin": int(service_builtin),
         },
     }
+    if service_type:
+        event["object"]["service_aliases"] = [
+            alias["name"] for alias in cursor.execute(
+                "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ? ORDER BY name",
+                (sync_id, row["company"] or ""),
+            ).fetchall()
+        ]
     if extra:
         event["object"].update(extra_payload)
     cursor.execute("""
@@ -838,6 +926,28 @@ def merge_server_object_catalog(cursor, remote_objects):
     def record_reason(bucket, reason):
         bucket[reason] = bucket.get(reason, 0) + 1
 
+    def merge_service_aliases(sync_id, company, aliases):
+        if not isinstance(aliases, list):
+            raise ValueError("Список прежних названий служебной категории имеет неверный формат.")
+        for alias in aliases:
+            name = str(alias or "").strip()
+            if not name or len(name) > 200:
+                raise ValueError("Некорректное прежнее название служебной категории.")
+            collision = cursor.execute(
+                "SELECT id FROM objects WHERE company = ? AND name = ? AND sync_id <> ?",
+                (company, name, sync_id),
+            ).fetchone()
+            alias_collision = cursor.execute(
+                "SELECT 1 FROM service_category_aliases WHERE company = ? AND name = ? AND sync_id <> ?",
+                (company, name, sync_id),
+            ).fetchone()
+            if collision or alias_collision:
+                raise ValueError("Прежнее название категории уже связано с другой записью.")
+            cursor.execute(
+                "INSERT OR IGNORE INTO service_category_aliases (sync_id, company, name) VALUES (?, ?, ?)",
+                (sync_id, company, name),
+            )
+
     remote_legacy_counts = {}
     for item in remote_objects:
         if not isinstance(item, dict) or str(item.get("sync_id") or "").strip():
@@ -860,6 +970,9 @@ def merge_server_object_catalog(cursor, remote_objects):
             sync_id = str(remote.get("sync_id") or "").strip() or None
             rate = float(remote.get("rate") or 0.0)
             transport_rate = float(remote.get("transport_rate") or 0.0)
+            service_type = str(remote.get("service_type") or "").strip() or None
+            service_builtin = int(bool(remote.get("service_builtin", 0)))
+            service_aliases = remote.get("service_aliases", [])
             active_value = remote.get("is_active", 1)
             if active_value not in (0, 1, False, True):
                 raise ValueError()
@@ -870,12 +983,15 @@ def merge_server_object_catalog(cursor, remote_objects):
         if (server_id <= 0 or not name or len(name) > 200 or not company or len(company) > 150
                 or len(markning) > 50 or server_revision < 0):
             raise ValueError("Некорректные поля серверного объекта.")
+        if service_type is not None and service_type not in SPECIAL_OBJECTS:
+            raise ValueError("Серверный объект содержит неизвестный тип служебной категории.")
         if not 0 <= rate <= 100000 or not 0 <= transport_rate <= 100000 or not math.isfinite(rate) or not math.isfinite(transport_rate):
             raise ValueError("Некорректные ставки серверного объекта.")
 
         if sync_id:
             local = cursor.execute(
-                "SELECT id, name, markning, company, rate, transport_rate, is_active, sync_version "
+                "SELECT id, name, markning, company, rate, transport_rate, is_active, sync_version, "
+                "service_type, service_builtin "
                 "FROM objects WHERE sync_id = ?",
                 (sync_id,),
             ).fetchone()
@@ -901,10 +1017,25 @@ def merge_server_object_catalog(cursor, remote_objects):
                         int(bool(local["is_active"])),
                     )
                     remote_state = (name, markning, company, rate, transport_rate, is_active)
-                    if local_state != remote_state:
+                    local_service_upgrade = (
+                        local["service_type"] is None and service_type is not None
+                        and local_state == remote_state
+                    )
+                    if local_state != remote_state or (
+                        not local_service_upgrade
+                        and (local["service_type"] != service_type
+                             or int(bool(local["service_builtin"])) != service_builtin)
+                    ):
                         stats["conflicts"] += 1
                         record_reason(stats["conflict_reasons"], "одинаковая revision содержит разные данные")
                         continue
+                    if local_service_upgrade:
+                        cursor.execute(
+                            "UPDATE objects SET service_type = ?, service_builtin = ? WHERE id = ?",
+                            (service_type, service_builtin, int(local["id"])),
+                        )
+                    if service_type:
+                        merge_service_aliases(sync_id, company, service_aliases)
                     if local_revision == server_revision:
                         cursor.execute(
                             "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ?",
@@ -912,16 +1043,19 @@ def merge_server_object_catalog(cursor, remote_objects):
                         )
                         continue
                 if local['name'] != name:
-                    ensure_object_name_history(cursor)
+                    if not service_type:
+                        ensure_object_name_history(cursor)
                 cursor.execute("""
                     UPDATE objects
                     SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = ?,
-                        server_id = ?, sync_version = ?
+                        server_id = ?, sync_version = ?, service_type = ?, service_builtin = ?
                     WHERE id = ? AND sync_id = ?
                 """, (
                     name, markning, rate, transport_rate, is_active, server_id, server_revision,
-                    int(local["id"]), sync_id,
+                    service_type, service_builtin, int(local["id"]), sync_id,
                 ))
+                if service_type:
+                    merge_service_aliases(sync_id, company, service_aliases)
                 stats["updated"] += 1
                 continue
 
@@ -992,12 +1126,15 @@ def merge_server_object_catalog(cursor, remote_objects):
         cursor.execute("""
             INSERT INTO objects (
                 name, markning, company, rate, transport_rate, sync_id, server_id,
-                is_active, sync_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_active, sync_version, service_type, service_builtin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             name, markning, company, rate, transport_rate, sync_id,
             server_id if sync_id else None, is_active, server_revision if sync_id else 0,
+            service_type, service_builtin,
         ))
+        if sync_id and service_type:
+            merge_service_aliases(sync_id, company, service_aliases)
         stats["imported"] += 1
         if not sync_id:
             reasons = []
@@ -1617,28 +1754,41 @@ def record_type_label(record_type):
     return RECORD_TYPE_LABELS.get(record_type, RECORD_TYPE_LABELS[RECORD_TYPE_REVIEW])
 
 
-def resolve_special_object(cursor, company, record_type):
-    reference = SPECIAL_OBJECTS.get(record_type)
-    if not reference:
+def resolve_special_object(cursor, company, record_type, object_name=None, include_inactive=False):
+    if record_type not in SPECIAL_OBJECTS:
         return None, "Неизвестный тип записи."
-    if reference[0] is None:
-        cursor.execute(
-            "SELECT id, name, markning, company FROM objects WHERE company = ? "
-            "AND is_active = 1 AND COALESCE(markning, '') = ?",
-            (company, reference[1]),
+    active_filter = "" if include_inactive else " AND is_active = 1"
+    parameters = [company, record_type]
+    name_filter = ""
+    if object_name:
+        name_filter = (
+            " AND (name = ? OR EXISTS (SELECT 1 FROM service_category_aliases alias "
+            "WHERE alias.sync_id = objects.sync_id AND alias.company = objects.company "
+            "AND alias.name = ?))"
         )
-    else:
-        cursor.execute(
-            "SELECT id, name, markning, company FROM objects WHERE company = ? "
-            "AND name = ? AND is_active = 1 AND COALESCE(markning, '') = ?",
-            (company, reference[0], reference[1]),
-        )
+        parameters.extend((object_name, object_name))
+    cursor.execute(
+        "SELECT id, name, markning, company, service_type, service_builtin FROM objects "
+        "WHERE company = ? AND service_type = ?" + active_filter + name_filter,
+        parameters,
+    )
     matches = cursor.fetchall()
-    if len(matches) != 1:
-        expected = f"{reference[0]} / {reference[1]}" if reference[0] else reference[1]
+    if not matches:
+        legacy_reference = SPECIAL_OBJECTS[record_type]
+        if not object_name and not include_inactive:
+            cursor.execute(
+                "SELECT id, name, markning, company, service_type, service_builtin FROM objects "
+                "WHERE company = ? AND is_active = 1 AND service_type IS NULL",
+                (company,),
+            )
+            matches = [
+                row for row in cursor.fetchall()
+                if legacy_service_type(row["name"], row["markning"] or "") == record_type
+            ]
         if not matches:
-            return None, f"В справочнике фирмы «{company}» не найдена запись «{expected}»."
-        return None, f"В справочнике фирмы «{company}» неоднозначна запись «{expected}»."
+            return None, f"В справочнике фирмы «{company}» не найдена активная категория типа «{record_type}»."
+    if object_name and len(matches) > 1:
+        return None, "Название связано с несколькими служебными категориями; сохранение заблокировано."
     return matches[0], None
 
 def enqueue_matching_shifts(cursor, where_clause, params):
@@ -2797,7 +2947,7 @@ class SmartReportApp(QMainWindow):
     def reload_input_objects(self, *_):
         record_type = self.record_type_cb.currentData()
         if record_type in SPECIAL_OBJECTS:
-            self.record_type_status_lbl.setText("Тип хранится отдельно и не входит в оплату. Сервер пока не поддерживает синхронизацию АТФ/больничного.")
+            self.record_type_status_lbl.setText(SERVICE_TYPE_DESCRIPTIONS[record_type])
         else:
             self.record_type_status_lbl.clear()
         company = self.comp_cb.currentText()
@@ -3486,7 +3636,7 @@ class SmartReportApp(QMainWindow):
                 conn.close()
 
         catalog_response = requests.get(
-            f"{CLOUD_URL}/api/expense-objects?include_inactive=1",
+            f"{CLOUD_URL}/api/expense-objects?include_inactive=1&include_service_categories=1",
             headers=headers,
             timeout=4,
         )
@@ -3643,14 +3793,21 @@ class SmartReportApp(QMainWindow):
                             cursor.execute("""
                                 UPDATE objects
                                 SET server_id = ?, name = ?, markning = ?, rate = ?, transport_rate = ?,
-                                    is_active = ?, sync_version = ?
+                                    is_active = ?, sync_version = ?, service_type = ?, service_builtin = ?
                                 WHERE id = ? AND sync_id = ? AND sync_version = ?
                             """, (
                                 result.get("server_object_id"), state.get("name"), state.get("markning") or "",
                                 float(state.get("rate") or 0.0), float(state.get("transport_rate") or 0.0),
                                 int(bool(state.get("is_active"))), int(result.get("revision", event["revision"])),
+                                state.get("service_type"), int(bool(state.get("service_builtin"))),
                                 int(event["object_id"]), event["sync_id"], int(event["revision"]),
                             ))
+                            for alias in state.get("service_aliases", []):
+                                cursor.execute(
+                                    "INSERT OR IGNORE INTO service_category_aliases (sync_id, company, name) "
+                                    "VALUES (?, ?, ?)",
+                                    (event["sync_id"], state.get("company") or "", alias),
+                                )
                         else:
                             cursor.execute("""
                                 UPDATE objects SET server_id = NULL, is_active = 0, sync_version = ?
@@ -3663,11 +3820,13 @@ class SmartReportApp(QMainWindow):
                         state = result["object"]
                         cursor.execute("""
                             UPDATE objects
-                            SET server_id = ?, rate = ?, transport_rate = ?, is_active = ?
+                            SET server_id = ?, rate = ?, transport_rate = ?, is_active = ?,
+                                service_type = ?, service_builtin = ?
                             WHERE id = ? AND sync_id = ? AND sync_version = ?
                         """, (
                             result.get("server_object_id"), float(state.get("rate") or 0.0),
                             float(state.get("transport_rate") or 0.0), int(bool(state.get("is_active"))),
+                            state.get("service_type"), int(bool(state.get("service_builtin"))),
                             int(event["object_id"]), event["sync_id"], int(event["revision"]),
                         ))
                     else:
@@ -3738,6 +3897,8 @@ class SmartReportApp(QMainWindow):
         self._sync_worker = None
         if success:
             self.load_shifts_history()
+            if getattr(self, "tabs", None) and self.tabs.currentIndex() == 6:
+                self.load_service_categories_table()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3 and hasattr(self, "table_supplier_documents"):
             if getattr(self, "_async_expense_reads", False) and (getattr(self, "_expense_read_dirty", False) or self._manual_sync_requested):
                 self._expense_read_dirty = False
@@ -10503,35 +10664,52 @@ class SmartReportApp(QMainWindow):
         selected_name = obj_cb.currentData() or archived_object_name
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT name, COALESCE(markning, ''), COALESCE(rate, 0.0),
-                   COALESCE(transport_rate, 0.0), is_active
-            FROM objects
-            WHERE company = ? AND (is_active = 1 OR (? = 1 AND name = ?))
-            ORDER BY name
-        """, (comp_name or "", int(archived_object_name is not None), archived_object_name or ""))
-        rows = cursor.fetchall()
-        conn.close()
-        if record_type in SPECIAL_OBJECTS:
-            reference = SPECIAL_OBJECTS[record_type]
-            rows = [
-                row for row in rows
-                if matches_special_object(row[0], row[1], reference)
-            ]
-            if len(rows) != 1:
-                rows = []
-        elif record_type == RECORD_TYPE_WORK:
-            rows = [
-                row for row in rows
-                if not any(
-                    matches_special_object(row[0], row[1], reference)
-                    for reference in SPECIAL_OBJECTS.values()
-                )
-            ]
+        try:
+            cursor.execute("""
+                SELECT name, COALESCE(markning, '') AS markning,
+                       COALESCE(rate, 0.0) AS rate,
+                       COALESCE(transport_rate, 0.0) AS transport_rate,
+                       is_active, service_type, sync_id
+                FROM objects
+                WHERE company = ? AND (is_active = 1 OR (? = 1 AND name = ?))
+                ORDER BY name
+            """, (comp_name or "", int(archived_object_name is not None), archived_object_name or ""))
+            rows = cursor.fetchall()
+            if record_type in SPECIAL_OBJECTS:
+                rows = [
+                    row for row in rows
+                    if row["service_type"] == record_type
+                    or (row["service_type"] is None
+                        and legacy_service_type(row["name"], row["markning"]) == record_type)
+                ]
+                if archived_object_name and not any(row["name"] == archived_object_name for row in rows):
+                    aliases = cursor.execute("""
+                        SELECT o.name, a.name AS alias_name, COALESCE(o.markning, '') AS markning,
+                               COALESCE(o.rate, 0.0) AS rate, COALESCE(o.transport_rate, 0.0) AS transport_rate,
+                               o.is_active, o.service_type, o.sync_id
+                        FROM service_category_aliases a JOIN objects o
+                          ON o.sync_id = a.sync_id AND o.company = a.company
+                        WHERE a.company = ? AND a.name = ? AND o.service_type = ?
+                    """, (comp_name or "", archived_object_name, record_type)).fetchall()
+                    rows.extend(aliases)
+            elif record_type == RECORD_TYPE_WORK:
+                rows = [
+                    row for row in rows
+                    if row["service_type"] is None
+                    and legacy_service_type(row["name"], row["markning"]) is None
+                ]
+        finally:
+            conn.close()
         items = []
         for row in rows:
-            name, mark, rate, tr_rate, is_active = row[0], row[1], row[2], row[3], bool(row[4])
-            display = f"{mark} | {name} ({rate} kr/ч, тр: {tr_rate})" if mark else f"{name} ({rate} kr/ч)"
+            name = row["alias_name"] if "alias_name" in row.keys() else row["name"]
+            mark, rate, tr_rate = row["markning"], row["rate"], row["transport_rate"]
+            is_active = bool(row["is_active"])
+            display = f"{mark} | {name}" if mark else str(name)
+            if "alias_name" in row.keys():
+                display += f" — историческое название ({row['name']})"
+            elif record_type == RECORD_TYPE_WORK:
+                display += f" ({rate} kr/ч, тр: {tr_rate})" if mark else f" ({rate} kr/ч)"
             if not is_active:
                 display += " — В архиве"
             items.append((display, name))
@@ -10960,21 +11138,68 @@ class SmartReportApp(QMainWindow):
         service_layout = QVBoxLayout(service_card)
         service_layout.addWidget(QLabel("<b>Служебные категории</b>"))
         service_layout.addWidget(QLabel(
-            "Это специальные записи для учёта времени, а не строительные объекты. "
-            "Их ID и настройки не редактируются здесь."
+            "Категории доступны при вводе времени отдельно от строительных объектов. "
+            "Тип расчёта определяет учёт часов и не меняет формулы программы."
         ))
+        service_actions = QHBoxLayout()
+        self.service_category_add_button = QPushButton("Добавить категорию")
+        self.service_category_add_button.clicked.connect(self.add_service_category)
+        self.service_category_edit_button = QPushButton("Изменить категорию")
+        self.service_category_edit_button.setEnabled(False)
+        self.service_category_edit_button.clicked.connect(self.edit_service_category)
+        self.service_category_archive_button = QPushButton("В архив")
+        self.service_category_archive_button.setEnabled(False)
+        self.service_category_archive_button.clicked.connect(self.toggle_service_category_archive)
+        self.service_category_delete_button = QPushButton("Удалить")
+        self.service_category_delete_button.setEnabled(False)
+        self.service_category_delete_button.setToolTip(
+            "Удаление не поддерживается общим протоколом синхронизации. "
+            "Архивирование сохраняет ID и историю."
+        )
+        service_actions.addWidget(self.service_category_add_button)
+        service_actions.addWidget(self.service_category_edit_button)
+        service_actions.addWidget(self.service_category_archive_button)
+        service_actions.addWidget(self.service_category_delete_button)
+        service_actions.addStretch()
+        service_layout.addLayout(service_actions)
+        service_layout.addWidget(QLabel("<b>Встроенные расчётные категории</b>"))
         self.table_service_categories = QTableWidget()
-        self.table_service_categories.setColumnCount(5)
+        self.table_service_categories.setColumnCount(6)
         self.table_service_categories.setHorizontalHeaderLabels(
-            ["Категория", "Фирма", "Справочная запись", "Маркировка", "Состояние"]
+            ["Тип", "Фирма", "Название", "Маркировка", "Записей", "Состояние"]
         )
         self.table_service_categories.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_service_categories.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_service_categories.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table_service_categories.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.table_service_categories.horizontalHeader().setStretchLastSection(True)
+        self.table_service_categories.itemSelectionChanged.connect(
+            lambda: self._service_category_selection_changed(self.table_service_categories)
+        )
         service_layout.addWidget(self.table_service_categories)
+        service_layout.addWidget(QLabel("<b>Пользовательские категории</b>"))
+        self.table_custom_service_categories = QTableWidget()
+        self.table_custom_service_categories.setColumnCount(6)
+        self.table_custom_service_categories.setHorizontalHeaderLabels(
+            ["Тип расчёта", "Фирма", "Название", "Маркировка", "Записей", "Состояние"]
+        )
+        self.table_custom_service_categories.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_custom_service_categories.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_custom_service_categories.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_custom_service_categories.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table_custom_service_categories.horizontalHeader().setStretchLastSection(True)
+        self.table_custom_service_categories.itemSelectionChanged.connect(
+            lambda: self._service_category_selection_changed(self.table_custom_service_categories)
+        )
+        service_layout.addWidget(self.table_custom_service_categories)
+        service_layout.addWidget(QLabel(
+            "Удаление недоступно из-за общего каталога синхронизации; архивирование сохраняет "
+            "ссылки и историю. Категорию без устойчивой связи сначала нужно синхронизировать."
+        ))
         layout.addWidget(service_card)
 
     def load_companies_into_combobox(self, cb):
@@ -11524,7 +11749,8 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, company, name, markning, COALESCE(rate, 0.0),
-                   COALESCE(transport_rate, 0.0), is_active, sync_id, server_id, sync_version
+                   COALESCE(transport_rate, 0.0), is_active, sync_id, server_id,
+                   sync_version, service_type
             FROM objects
             ORDER BY company, name, id
         """)
@@ -11533,10 +11759,7 @@ class SmartReportApp(QMainWindow):
 
         service_ids = {
             int(row[0]) for row in rows
-            if any(
-                matches_special_object(row[2], row[3] or "", reference)
-                for reference in SPECIAL_OBJECTS.values()
-            )
+            if row[10] is not None or legacy_service_type(row[2], row[3] or "") is not None
         }
         object_rows = [row for row in rows if int(row[0]) not in service_ids]
         active_count = sum(bool(row[6]) for row in object_rows)
@@ -11653,37 +11876,399 @@ class SmartReportApp(QMainWindow):
         conn = get_db_connection()
         try:
             rows = conn.execute("""
-                SELECT id, company, name, markning, is_active, sync_id
+                SELECT id, company, name, markning, is_active, sync_id, server_id,
+                       sync_version, service_type, service_builtin
                 FROM objects ORDER BY company, markning, name, id
             """).fetchall()
+            states = {
+                self.table_service_categories: {},
+                self.table_custom_service_categories: {},
+            }
+            for row in rows:
+                service_type = row["service_type"] or legacy_service_type(
+                    row["name"], row["markning"] or ""
+                )
+                if service_type is None:
+                    continue
+                builtin = bool(row["service_builtin"]) or (
+                    row["service_type"] is None
+                    and legacy_service_type(row["name"], row["markning"] or "") is not None
+                )
+                table = self.table_service_categories if builtin else self.table_custom_service_categories
+                aliases = conn.execute(
+                    "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ?",
+                    (row["sync_id"] or "", row["company"] or ""),
+                ).fetchall() if row["sync_id"] else []
+                names = [row["name"], *(alias["name"] for alias in aliases)]
+                placeholders = ",".join("?" for _ in names)
+                history_count = conn.execute(
+                    f"SELECT COUNT(*) FROM shifts WHERE company = ? AND entry_type = ? "
+                    f"AND object_name IN ({placeholders})",
+                    (row["company"], service_type, *names),
+                ).fetchone()[0]
+                state = "Активна" if row["is_active"] else "В архиве"
+                if not row["sync_id"]:
+                    state += " · не связана"
+                elif row["sync_version"] and not row["server_id"]:
+                    state += " · синхронизация ожидается"
+                values = (
+                    record_type_label(service_type), row["company"] or "",
+                    row["name"] or "—", row["markning"] or "—",
+                    str(history_count), state,
+                )
+                states[table][int(row["id"])] = (values, row, service_type, builtin)
         finally:
             conn.close()
-        type_names = {
-            RECORD_TYPE_ATF: "Arbetstidsförkortning",
-            RECORD_TYPE_SICK: "Sjuk",
-            RECORD_TYPE_VACATION: "Semestertimmar",
-            RECORD_TYPE_HOLIDAY: "Röda dagar",
-        }
-        table = self.table_service_categories
-        table.setRowCount(0)
-        for row in rows:
-            record_type = next((
-                kind for kind, reference in SPECIAL_OBJECTS.items()
-                if matches_special_object(row["name"], row["markning"] or "", reference)
-            ), None)
-            if record_type is None:
-                continue
-            values = (
-                type_names[record_type], row["company"], row["name"] or "—",
-                row["markning"] or "—", "Активна" if row["is_active"] else "В архиве",
+
+        for table, records in states.items():
+            selected_id = None
+            selected_row = table.currentRow()
+            if selected_row >= 0 and table.item(selected_row, 0) is not None:
+                selected_id = table.item(selected_row, 0).data(Qt.ItemDataRole.UserRole)
+            table.setRowCount(0)
+            for object_id, (values, row, service_type, builtin) in records.items():
+                table.insertRow(table.rowCount())
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, object_id)
+                        item.setData(Qt.ItemDataRole.UserRole + 1, row["sync_id"])
+                        item.setData(Qt.ItemDataRole.UserRole + 2, service_type)
+                        item.setData(Qt.ItemDataRole.UserRole + 3, builtin)
+                    table.setItem(table.rowCount() - 1, column, item)
+                if object_id == selected_id:
+                    table.selectRow(table.rowCount() - 1)
+        self.update_service_category_actions()
+
+    def _selected_service_category(self):
+        for table in (self.table_custom_service_categories, self.table_service_categories):
+            selected = table.currentRow()
+            item = table.item(selected, 0) if selected >= 0 else None
+            if item is not None:
+                return table, int(item.data(Qt.ItemDataRole.UserRole))
+        return None, None
+
+    def _service_category_selection_changed(self, selected_table):
+        if selected_table.currentRow() >= 0:
+            other_table = (
+                self.table_service_categories
+                if selected_table is self.table_custom_service_categories
+                else self.table_custom_service_categories
             )
-            table.insertRow(table.rowCount())
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
-                    item.setData(Qt.ItemDataRole.UserRole + 1, row["sync_id"])
-                table.setItem(table.rowCount() - 1, column, item)
+            other_table.clearSelection()
+        self.update_service_category_actions()
+
+    def update_service_category_actions(self):
+        if not hasattr(self, "service_category_edit_button"):
+            return
+        _, object_id = self._selected_service_category()
+        if object_id is None:
+            self.service_category_edit_button.setEnabled(False)
+            self.service_category_archive_button.setEnabled(False)
+            self.service_category_archive_button.setText("В архив")
+            return
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT sync_id, server_id, is_active, sync_version FROM objects WHERE id = ?",
+                (object_id,),
+            ).fetchone()
+            pending = conn.execute(
+                "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1",
+                (object_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        ready = bool(row and row["sync_id"] and row["server_id"] and not pending)
+        active = bool(row and row["is_active"])
+        self.service_category_edit_button.setEnabled(ready and active)
+        self.service_category_edit_button.setToolTip(
+            "" if ready and active else (
+                "Сначала восстановите категорию." if not active
+                else "Дождитесь устойчивой связи с сервером и завершения предыдущей синхронизации."
+            )
+        )
+        self.service_category_archive_button.setText(
+            "В архив" if active else "Восстановить"
+        )
+        self.service_category_archive_button.setEnabled(ready)
+        self.service_category_archive_button.setToolTip(
+            "" if ready else "Дождитесь устойчивой связи с сервером и завершения предыдущей синхронизации."
+        )
+
+    def _service_category_history_count(self, cursor, row):
+        service_type = row["service_type"] or legacy_service_type(
+            row["name"], row["markning"] or ""
+        )
+        if service_type is None:
+            return 0
+        aliases = []
+        if row["sync_id"]:
+            aliases = [
+                alias["name"] for alias in cursor.execute(
+                    "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ?",
+                    (row["sync_id"], row["company"]),
+                ).fetchall()
+            ]
+        names = [row["name"], *aliases]
+        placeholders = ",".join("?" for _ in names)
+        return int(cursor.execute(
+            f"SELECT COUNT(*) FROM shifts WHERE company = ? AND entry_type = ? "
+            f"AND object_name IN ({placeholders})",
+            (row["company"], service_type, *names),
+        ).fetchone()[0])
+
+    def _service_category_dialog(self, existing=None):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Служебная категория" if existing else "Добавить служебную категорию")
+        form = QFormLayout(dialog)
+        name_field = QLineEdit(existing["name"] if existing else "")
+        name_field.setMaxLength(200)
+        name_field.setPlaceholderText("Название категории")
+        company_field = QComboBox()
+        company_field.setEditable(False)
+        companies_conn = get_db_connection()
+        try:
+            companies = [
+                row["name"] for row in companies_conn.execute(
+                    "SELECT name FROM companies ORDER BY name"
+                ).fetchall()
+            ]
+        finally:
+            companies_conn.close()
+        company_field.addItems(companies)
+        if existing:
+            company_field.setCurrentText(existing["company"] or "")
+            company_field.setEnabled(False)
+
+        type_field = QComboBox()
+        type_field.addItem("— Выберите тип расчёта —", None)
+        for service_type in SPECIAL_OBJECTS:
+            type_field.addItem(record_type_label(service_type), service_type)
+        existing_type = (
+            existing["service_type"] or legacy_service_type(
+                existing["name"], existing["markning"] or ""
+            )
+        ) if existing else None
+        if existing:
+            type_field.setCurrentIndex(type_field.findData(existing_type))
+        else:
+            type_field.setCurrentIndex(0)
+        conn = get_db_connection()
+        try:
+            use_count = self._service_category_history_count(conn.cursor(), existing) if existing else 0
+        finally:
+            conn.close()
+        builtin = bool(existing and (
+            existing["service_builtin"] or (
+                existing["service_type"] is None
+                and existing_type == legacy_service_type(
+                    existing["name"], existing["markning"] or ""
+                )
+            )
+        ))
+        if builtin:
+            type_field.setEnabled(False)
+        elif existing and use_count:
+            type_field.setEnabled(False)
+            type_field.setToolTip("Тип нельзя менять: у категории есть записи в истории.")
+
+        description = QLabel()
+        description.setWordWrap(True)
+
+        def update_description():
+            service_type = type_field.currentData()
+            description.setText(
+                SERVICE_TYPE_DESCRIPTIONS[service_type]
+                if service_type else "Выберите один из четырёх поддерживаемых типов. "
+                "Новые формулы и автоматический подбор не применяются."
+            )
+
+        type_field.currentIndexChanged.connect(update_description)
+        update_description()
+        form.addRow("Название:", name_field)
+        form.addRow("Фирма:", company_field)
+        form.addRow("Тип расчёта:", type_field)
+        form.addRow("Влияние типа:", description)
+        if builtin:
+            form.addRow(QLabel("Встроенную категорию можно переименовать и архивировать; её тип расчёта неизменяем."))
+        elif existing and use_count:
+            form.addRow(QLabel(f"Тип расчёта зафиксирован: в истории {use_count} записей."))
+        elif existing:
+            form.addRow(QLabel("Тип можно изменить только пока категория не использована в записях."))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        service_type = type_field.currentData()
+        name = name_field.text().strip()
+        company = company_field.currentText().strip()
+        if not name or not company or service_type not in SPECIAL_OBJECTS:
+            QMessageBox.warning(
+                self, "Служебная категория",
+                "Укажите название, фирму и явно выберите один из четырёх поддерживаемых типов расчёта.",
+            )
+            return None
+        return name, company, service_type
+
+    def add_service_category(self):
+        values = self._service_category_dialog()
+        if values is None:
+            return
+        name, company, service_type = values
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            if cursor.execute(
+                "SELECT 1 FROM objects WHERE company = ? AND name = ? LIMIT 1",
+                (company, name),
+            ).fetchone():
+                raise ValueError("Название уже занято в этой фирме; выберите другое.")
+            if cursor.execute(
+                "SELECT 1 FROM service_category_aliases WHERE company = ? AND name = ? LIMIT 1",
+                (company, name),
+            ).fetchone():
+                raise ValueError("Название уже используется как историческое название другой категории.")
+            cursor.execute("""
+                INSERT INTO objects (
+                    name, markning, company, rate, transport_rate, sync_id,
+                    is_active, service_type, service_builtin
+                ) VALUES (?, ?, ?, 0, 0, ?, 1, ?, 0)
+            """, (
+                name, SERVICE_TYPE_MARKINGS[service_type], company,
+                str(uuid.uuid4()), service_type,
+            ))
+            enqueue_object_sync_event(cursor, int(cursor.lastrowid), "upsert")
+            conn.commit()
+        except (sqlite3.Error, ValueError) as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Служебная категория", str(error))
+            return
+        finally:
+            conn.close()
+        self.load_service_categories_table()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
+
+    def edit_service_category(self):
+        _, object_id = self._selected_service_category()
+        if object_id is None:
+            return
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            current_type = (
+                row["service_type"] or legacy_service_type(row["name"], row["markning"] or "")
+            ) if row is not None else None
+            if row is None or not current_type:
+                raise ValueError("Служебная категория больше не найдена.")
+            pending = cursor.execute(
+                "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1",
+                (object_id,),
+            ).fetchone()
+            if not row["sync_id"] or not row["server_id"] or pending:
+                raise ValueError("Сначала дождитесь устойчивой связи с сервером и подтверждения предыдущего изменения.")
+            if not row["is_active"]:
+                raise ValueError("Сначала восстановите категорию из архива.")
+            values = self._service_category_dialog(row)
+            if values is None:
+                return
+            name, _company, service_type = values
+            history_count = self._service_category_history_count(cursor, row)
+            builtin = bool(row["service_builtin"]) or (
+                row["service_type"] is None
+                and legacy_service_type(row["name"], row["markning"] or "") is not None
+            )
+            if builtin and service_type != current_type:
+                raise ValueError("Тип встроенной категории менять нельзя.")
+            if history_count and service_type != current_type:
+                raise ValueError("Тип нельзя изменить: у категории уже есть записи в истории.")
+            if cursor.execute(
+                "SELECT 1 FROM objects WHERE company = ? AND name = ? AND id <> ? LIMIT 1",
+                (row["company"], name, object_id),
+            ).fetchone():
+                raise ValueError("Название уже занято в этой фирме; выберите другое.")
+            if cursor.execute(
+                "SELECT 1 FROM service_category_aliases WHERE company = ? AND name = ? AND sync_id <> ? LIMIT 1",
+                (row["company"], name, row["sync_id"]),
+            ).fetchone():
+                raise ValueError("Название уже связано с историей другой категории.")
+            if name == row["name"] and service_type == row["service_type"]:
+                return
+            cursor.execute("BEGIN IMMEDIATE")
+            if name != row["name"]:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO service_category_aliases (sync_id, company, name) VALUES (?, ?, ?)",
+                    (row["sync_id"], row["company"], row["name"]),
+                )
+            cursor.execute(
+                "UPDATE objects SET name = ?, markning = ?, service_type = ?, service_builtin = ? "
+                "WHERE id = ? AND sync_id = ? AND sync_version = ? AND is_active = 1",
+                (
+                    name, SERVICE_TYPE_MARKINGS[service_type], current_type if builtin else service_type,
+                    int(builtin),
+                    object_id, row["sync_id"], row["sync_version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Категория изменилась во время редактирования; обновите список.")
+            enqueue_object_sync_event(cursor, object_id, "upsert")
+            conn.commit()
+        except (sqlite3.Error, ValueError) as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Служебная категория", str(error))
+            return
+        finally:
+            conn.close()
+        self.load_service_categories_table()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
+
+    def toggle_service_category_archive(self):
+        _, object_id = self._selected_service_category()
+        if object_id is None:
+            return
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                "SELECT is_active, sync_id, server_id FROM objects WHERE id = ?",
+                (object_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Категория больше не существует.")
+            if not row["sync_id"] or not row["server_id"]:
+                raise ValueError("Категория ещё не имеет устойчивой связи с сервером.")
+            if cursor.execute(
+                "SELECT 1 FROM object_sync_outbox WHERE object_id = ? LIMIT 1",
+                (object_id,),
+            ).fetchone():
+                raise ValueError("Предыдущее изменение категории ещё не подтверждено сервером.")
+            activating = not bool(row["is_active"])
+            cursor.execute(
+                "UPDATE objects SET is_active = ? WHERE id = ? AND is_active = ?",
+                (int(activating), object_id, int(bool(row["is_active"]))),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Состояние категории изменилось; обновите справочник.")
+            enqueue_object_sync_event(cursor, object_id, "activate" if activating else "deactivate")
+            conn.commit()
+        except (sqlite3.Error, ValueError) as error:
+            conn.rollback()
+            QMessageBox.warning(self, "Служебные категории", str(error))
+            return
+        finally:
+            conn.close()
+        self.load_service_categories_table()
+        self.load_dropdowns()
+        self.background_sync_with_cloud()
 
     def load_object_overview(self, *_):
         if not hasattr(self, "object_overview_status"):
@@ -12444,8 +13029,10 @@ class SmartReportApp(QMainWindow):
                 QMessageBox.warning(self, "Некорректный интервал OB", str(error))
                 return
         if record_type in SPECIAL_OBJECTS:
-            special_row, error = resolve_special_object(cursor, comp, record_type)
-            if error or not special_row or obj_name != special_row['name']:
+            special_row, error = resolve_special_object(
+                cursor, comp, record_type, object_name=obj_name
+            )
+            if error or not special_row:
                 conn.close()
                 QMessageBox.warning(self, "Справочник объекта", error or "Выберите существующую справочную запись для выбранного типа.")
                 return
@@ -12454,11 +13041,15 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Тип записи", "Необходимо выбрать известный тип записи.")
             return
         else:
-            cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (comp, obj_name))
+            cursor.execute(
+                "SELECT COALESCE(markning, ''), service_type FROM objects "
+                "WHERE company = ? AND name = ? AND is_active = 1",
+                (comp, obj_name),
+            )
             object_row = cursor.fetchone()
-            if object_row and any(
-                matches_special_object(obj_name, object_row[0], reference)
-                for reference in SPECIAL_OBJECTS.values()
+            if object_row and (
+                object_row["service_type"] is not None
+                or legacy_service_type(obj_name, object_row[0]) is not None
             ):
                 conn.close()
                 QMessageBox.warning(self, "Тип записи", "Служебные объекты нельзя сохранить как обычную работу.")
@@ -13130,8 +13721,11 @@ class SmartReportApp(QMainWindow):
         check_conn = get_db_connection()
         check_cursor = check_conn.cursor()
         if record_type in SPECIAL_OBJECTS:
-            special_row, error = resolve_special_object(check_cursor, company_field.currentText().strip(), record_type)
-            if error or not special_row or special_row['name'] != object_name:
+            special_row, error = resolve_special_object(
+                check_cursor, company_field.currentText().strip(), record_type,
+                object_name=object_name, include_inactive=True,
+            )
+            if error or not special_row:
                 check_conn.close()
                 QMessageBox.warning(self, "Справочник объекта", error or "Выберите существующую справочную запись для выбранного типа.")
                 return
@@ -13140,11 +13734,15 @@ class SmartReportApp(QMainWindow):
             QMessageBox.warning(self, "Тип записи", "Необходимо выбрать известный тип записи.")
             return
         else:
-            check_cursor.execute("SELECT COALESCE(markning, '') FROM objects WHERE company = ? AND name = ? AND is_active = 1", (company_field.currentText().strip(), object_name))
+            check_cursor.execute(
+                "SELECT COALESCE(markning, '') AS markning, service_type FROM objects "
+                "WHERE company = ? AND name = ? AND is_active = 1",
+                (company_field.currentText().strip(), object_name),
+            )
             object_row = check_cursor.fetchone()
-            if object_row and any(
-                matches_special_object(object_name, object_row[0], reference)
-                for reference in SPECIAL_OBJECTS.values()
+            if object_row and (
+                object_row["service_type"] is not None
+                or legacy_service_type(object_name, object_row["markning"]) is not None
             ):
                 check_conn.close()
                 QMessageBox.warning(self, "Тип записи", "Служебные объекты нельзя сохранить как обычную работу.")

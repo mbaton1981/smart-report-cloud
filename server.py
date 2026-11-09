@@ -52,6 +52,12 @@ SPECIAL_SUBMISSION_OBJECTS = {
     "vacation": ("Semestertimmar", "p1002"),
     "holiday": (None, "p1004"),
 }
+SERVICE_TYPE_MARKINGS = {
+    "atf": "p1000",
+    "sick": "p1001",
+    "vacation": "p1002",
+    "holiday": "p1004",
+}
 
 
 def matches_special_submission_object(name, marking, reference):
@@ -59,6 +65,40 @@ def matches_special_submission_object(name, marking, reference):
     return marking == expected_marking and (
         expected_name is None or name == expected_name
     )
+
+
+def legacy_service_type(name, marking):
+    for submission_type, reference in SPECIAL_SUBMISSION_OBJECTS.items():
+        if matches_special_submission_object(name, marking, reference):
+            return submission_type
+    return None
+
+
+def ensure_cloud_service_category_schema(cursor):
+    cursor.execute("CREATE TABLE IF NOT EXISTS service_category_aliases ("
+                   "sync_id TEXT NOT NULL, company TEXT NOT NULL, name TEXT NOT NULL, "
+                   "PRIMARY KEY (sync_id, company, name))")
+    cursor.execute("PRAGMA table_info(meta_objects)")
+    columns = {row[1] for row in cursor.fetchall()}
+    for column_name, definition in (
+        ("service_type", "TEXT"),
+        ("service_builtin", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE meta_objects ADD COLUMN {column_name} {definition}")
+    for submission_type, (expected_name, marking) in SPECIAL_SUBMISSION_OBJECTS.items():
+        if expected_name is None:
+            cursor.execute(
+                "UPDATE meta_objects SET service_type = ?, service_builtin = 1 "
+                "WHERE service_type IS NULL AND COALESCE(markning, '') = ?",
+                (submission_type, marking),
+            )
+        else:
+            cursor.execute(
+                "UPDATE meta_objects SET service_type = ?, service_builtin = 1 "
+                "WHERE service_type IS NULL AND name = ? AND COALESCE(markning, '') = ?",
+                (submission_type, expected_name, marking),
+            )
 
 
 def resolve_submission_type(data, default="work"):
@@ -220,39 +260,40 @@ def validate_submission_object(cursor, submission_type, company, object_name, al
     reference = SPECIAL_SUBMISSION_OBJECTS.get(submission_type)
     if not reference:
         cursor.execute(
-            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? "
+            "SELECT id, name, markning, service_type FROM meta_objects WHERE name = ? AND company = ? "
+            "AND service_type IS NULL AND NOT EXISTS (SELECT 1 FROM service_category_aliases alias "
+            "WHERE alias.company = meta_objects.company AND alias.name = meta_objects.name) "
             "AND (is_active = 1 OR ? = 1)",
             (object_name, company, int(allow_inactive)),
         )
-    elif reference[0] is None:
-        cursor.execute(
-            "SELECT id, name, markning FROM meta_objects WHERE company = ? AND markning = ? "
-            "AND (is_active = 1 OR ? = 1)",
-            (company, reference[1], int(allow_inactive)),
-        )
     else:
         cursor.execute(
-            "SELECT id, name, markning FROM meta_objects WHERE name = ? AND company = ? AND markning = ? "
-            "AND (is_active = 1 OR ? = 1)",
-            (reference[0], company, reference[1], int(allow_inactive))
+            "SELECT id, name, markning, service_type FROM meta_objects "
+            "WHERE company = ? AND (service_type = ? OR service_type IS NULL) AND "
+            "(name = ? OR EXISTS (SELECT 1 FROM service_category_aliases alias "
+            "WHERE alias.sync_id = meta_objects.sync_id AND alias.company = meta_objects.company "
+            "AND alias.name = ?)) AND (is_active = 1 OR ? = 1)",
+            (company, submission_type, object_name, object_name, int(allow_inactive)),
         )
-    matches = cursor.fetchall()
+        matches = [
+            row for row in cursor.fetchall()
+            if row["service_type"] == submission_type
+            or (
+                row["service_type"] is None
+                and legacy_service_type(row["name"], row["markning"]) == submission_type
+            )
+        ]
+    if not reference:
+        matches = cursor.fetchall()
     if len(matches) != 1:
         if reference and not matches:
-            expected = f"{reference[0]} / {reference[1]}" if reference[0] else reference[1]
-            raise ValueError(f"Для типа {submission_type} не найдена точная запись справочника {expected}.")
+            raise ValueError(f"Для типа {submission_type} не найдена активная запись служебной категории.")
         if len(matches) > 1:
             raise ValueError("Запись объекта неоднозначна в справочнике.")
         raise ValueError("Объект не принадлежит выбранной фирме или не существует.")
-    if reference and reference[0] is not None and object_name != reference[0]:
-        raise ValueError(f"Для типа {submission_type} нужно выбрать объект {reference[0]}.")
-    if reference and object_name != matches[0]["name"]:
-        raise ValueError(f"Для типа {submission_type} нужно выбрать объект {matches[0]['name']}.")
-    if not reference and any(
-        matches_special_submission_object(
-            matches[0]["name"], matches[0]["markning"], special_reference
-        )
-        for special_reference in SPECIAL_SUBMISSION_OBJECTS.values()
+    if not reference and (
+        matches[0]["service_type"] is not None
+        or legacy_service_type(matches[0]["name"], matches[0]["markning"]) is not None
     ):
         raise ValueError("Справочный объект АТФ/больничного/отпуска/праздничных часов требует соответствующий тип.")
     return matches[0]['id']
@@ -260,13 +301,21 @@ def validate_submission_object(cursor, submission_type, company, object_name, al
 
 def infer_submission_type_from_object(cursor, company, object_name):
     cursor.execute(
-        "SELECT name, markning FROM meta_objects WHERE company = ? AND name = ? AND is_active = 1",
-        (company, object_name)
+        "SELECT name, markning, service_type FROM meta_objects WHERE company = ? AND "
+        "(name = ? OR EXISTS (SELECT 1 FROM service_category_aliases alias "
+        "WHERE alias.sync_id = meta_objects.sync_id AND alias.company = meta_objects.company "
+        "AND alias.name = ?)) AND is_active = 1",
+        (company, object_name, object_name)
     )
     matches = cursor.fetchall()
     if len(matches) > 1:
         raise ValueError("Объект неоднозначен; требуется проверить название и отметку справочника.")
     if matches:
+        if matches[0]["service_type"] in SPECIAL_SUBMISSION_OBJECTS:
+            return matches[0]["service_type"]
+        inferred = legacy_service_type(matches[0]["name"], matches[0]["markning"])
+        if inferred:
+            return inferred
         for submission_type, reference in SPECIAL_SUBMISSION_OBJECTS.items():
             if matches_special_submission_object(
                 matches[0]['name'], matches[0]['markning'], reference
@@ -612,6 +661,8 @@ def init_cloud_db():
             transport_rate REAL NOT NULL DEFAULT 0.0,
             is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
             sync_version INTEGER NOT NULL DEFAULT 0,
+            service_type TEXT,
+            service_builtin INTEGER NOT NULL DEFAULT 0,
             UNIQUE(name, company)
         )
     ''')
@@ -623,9 +674,12 @@ def init_cloud_db():
         ("transport_rate", "REAL NOT NULL DEFAULT 0.0"),
         ("is_active", "INTEGER NOT NULL DEFAULT 1"),
         ("sync_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("service_type", "TEXT"),
+        ("service_builtin", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if column_name not in object_columns:
             cursor.execute(f"ALTER TABLE meta_objects ADD COLUMN {column_name} {column_sql}")
+    ensure_cloud_service_category_schema(cursor)
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_objects_sync_id ON meta_objects(sync_id) WHERE sync_id IS NOT NULL")
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS object_sync_events (
@@ -1210,7 +1264,10 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
                 if item.get(key) not in (None, "") and parse_invoice_money(item[key]) is None:
                     raise ValueError("Некорректная сумма распределения.")
             if destination == "object" and item.get("object_id") is not None:
-                if cursor.execute("SELECT 1 FROM meta_objects WHERE id = ? AND is_active = 1", (item["object_id"],)).fetchone() is None:
+                if cursor.execute(
+                    "SELECT 1 FROM meta_objects WHERE id = ? AND is_active = 1 AND service_type IS NULL",
+                    (item["object_id"],),
+                ).fetchone() is None:
                     raise ValueError("Активный объект не найден в серверном справочнике.")
         issues = net_invoice_issues(fields, raw_allocations)
         if fields["verification_status"] == "confirmed" and issues:
@@ -1239,7 +1296,8 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
                 object_id = int(object_id)
             except (TypeError, ValueError) as error:
                 raise ValueError("Некорректный объект распределения.") from error
-            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND (is_active = 1 OR ? = 'object_cost')",
+            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND service_type IS NULL "
+                           "AND (is_active = 1 OR ? = 'object_cost')",
                            (object_id, fields.get("usage")))
             if cursor.fetchone() is None:
                 raise ValueError("Активный объект не найден в серверном справочнике.")
@@ -1327,7 +1385,10 @@ def validate_expense_order_proposals(cursor, raw_proposals):
                 object_id = int(object_id)
             except (TypeError, ValueError) as error:
                 raise ValueError("Некорректный объект в предложении по заказу.") from error
-            cursor.execute("SELECT id FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,))
+            cursor.execute(
+                "SELECT id FROM meta_objects WHERE id = ? AND is_active = 1 AND service_type IS NULL",
+                (object_id,),
+            )
             if cursor.fetchone() is None:
                 raise ValueError("Объект предложения отсутствует в активном серверном справочнике.")
         sources = item.get("sources") or []
@@ -1574,11 +1635,33 @@ def expense_objects_api():
     conn = get_db_connection()
     try:
         include_inactive = request.args.get("include_inactive") == "1"
-        query = "SELECT id, sync_id, name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects"
+        include_service_categories = request.args.get("include_service_categories") == "1"
+        conditions = []
         if not include_inactive:
-            query += " WHERE is_active = 1"
+            conditions.append("is_active = 1")
+        if not include_service_categories:
+            conditions.append("service_type IS NULL")
+        query = (
+            "SELECT id, sync_id, name, markning, company, rate, transport_rate, "
+            "is_active, sync_version, service_type, service_builtin FROM meta_objects"
+        )
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         rows = conn.execute(query + " ORDER BY company, name, id").fetchall()
-        return jsonify({"ok": True, "objects": [dict(row) for row in rows]})
+        objects = []
+        for row in rows:
+            item = dict(row)
+            if item["service_type"]:
+                item["service_aliases"] = [
+                    alias["name"] for alias in conn.execute(
+                        "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ? ORDER BY name",
+                        (item["sync_id"], item["company"] or ""),
+                    ).fetchall()
+                ]
+            else:
+                item["service_aliases"] = []
+            objects.append(item)
+        return jsonify({"ok": True, "objects": objects})
     finally:
         conn.close()
 
@@ -1639,7 +1722,10 @@ def expense_project_code_links_api():
         return jsonify({"ok": False, "error": "Поставщик и код проекта обязательны."}), 400
     conn = get_db_connection()
     try:
-        if conn.execute("SELECT 1 FROM meta_objects WHERE id = ? AND is_active = 1", (object_id,)).fetchone() is None:
+        if conn.execute(
+            "SELECT 1 FROM meta_objects WHERE id = ? AND is_active = 1 AND service_type IS NULL",
+            (object_id,),
+        ).fetchone() is None:
             return jsonify({"ok": False, "error": "Объект отсутствует в активном серверном справочнике."}), 400
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
@@ -2801,7 +2887,10 @@ def index():
     if not companies:
         companies = ["Privat"]
 
-    cursor.execute("SELECT name, markning, company FROM meta_objects WHERE is_active = 1 ORDER BY company, name")
+    cursor.execute(
+        "SELECT sync_id, name, markning, company, service_type, service_builtin "
+        "FROM meta_objects WHERE is_active = 1 ORDER BY company, name"
+    )
     obj_rows = cursor.fetchall()
     
     objects = []
@@ -2825,12 +2914,31 @@ def index():
         if comp and comp != 'Privat':
             display_str += f" [{comp}]"
             
+        service_type = r["service_type"] or legacy_service_type(name, r["markning"])
         objects.append({
             "name": name,
             "markning": mark,
             "company": comp,
-            "display": display_str
+            "display": display_str,
+            "service_type": service_type,
+            "is_alias": False,
         })
+        if service_type and r["sync_id"]:
+            aliases = cursor.execute(
+                "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ? ORDER BY name",
+                (r["sync_id"], comp),
+            ).fetchall()
+            for alias in aliases:
+                alias_name = str(alias["name"] or "").strip()
+                if alias_name and alias_name != name:
+                    objects.append({
+                        "name": alias_name,
+                        "markning": mark,
+                        "company": comp,
+                        "display": f"{alias_name} — историческое название",
+                        "service_type": service_type,
+                        "is_alias": True,
+                    })
 
     conn.close()
     return render_template('index.html', employees=employees, companies=companies, objects=objects)
@@ -3938,6 +4046,52 @@ def export_shifts_csv():
     response.headers["Content-type"] = "text/csv; charset=utf-8-sig"
     return response
 
+def server_service_object_state(cursor, object_id):
+    if object_id is None:
+        return None
+    row = cursor.execute(
+        "SELECT sync_id, name, markning, company, rate, transport_rate, is_active, sync_version, "
+        "service_type, service_builtin FROM meta_objects WHERE id = ?",
+        (object_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    if result["service_type"]:
+        result["service_aliases"] = [
+            item["name"] for item in cursor.execute(
+                "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ? ORDER BY name",
+                (result.get("sync_id") or "", result["company"] or ""),
+            ).fetchall()
+        ]
+    else:
+        result["service_aliases"] = []
+    return result
+
+
+def merge_server_service_aliases(cursor, sync_id, company, aliases):
+    if not isinstance(aliases, list):
+        raise ValueError("Список прежних названий служебной категории имеет неверный формат.")
+    for alias in aliases:
+        name = str(alias or "").strip()
+        if not name or len(name) > 200:
+            raise ValueError("Некорректное прежнее название служебной категории.")
+        name_collision = cursor.execute(
+            "SELECT id FROM meta_objects WHERE company = ? AND name = ? AND sync_id <> ?",
+            (company, name, sync_id),
+        ).fetchone()
+        alias_collision = cursor.execute(
+            "SELECT 1 FROM service_category_aliases WHERE company = ? AND name = ? AND sync_id <> ?",
+            (company, name, sync_id),
+        ).fetchone()
+        if name_collision or alias_collision:
+            raise ValueError("Прежнее название категории уже связано с другой записью.")
+        cursor.execute(
+            "INSERT OR IGNORE INTO service_category_aliases (sync_id, company, name) VALUES (?, ?, ?)",
+            (sync_id, company, name),
+        )
+
+
 def apply_object_sync_event(cursor, event):
     if not isinstance(event, dict):
         raise ValueError("Некорректное событие синхронизации объекта.")
@@ -3963,11 +4117,7 @@ def apply_object_sync_event(cursor, event):
     if previous:
         if previous["payload_hash"] != payload_hash or previous["sync_id"] != sync_id or previous["operation"] != operation:
             raise ValueError("operation_id объекта повторно использован с другими данными.")
-        cursor.execute(
-            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
-            (previous["server_object_id"],),
-        )
-        object_state = cursor.fetchone()
+        object_state = server_service_object_state(cursor, previous["server_object_id"])
         cursor.execute("SELECT MAX(revision) FROM object_sync_events WHERE sync_id = ?", (sync_id,))
         latest_revision = int(cursor.fetchone()[0] or 0)
         if object_state is not None:
@@ -4003,6 +4153,83 @@ def apply_object_sync_event(cursor, event):
     except (TypeError, ValueError):
         raise ValueError("Некорректная ставка или транспортная ставка объекта.")
 
+    cursor.execute(
+        "SELECT id, name, company, is_active, sync_version, service_type, service_builtin "
+        "FROM meta_objects WHERE sync_id = ?",
+        (sync_id,),
+    )
+    current_object = cursor.fetchone()
+    inferred_type = legacy_service_type(object_name, markning)
+    if "service_type" in object_data:
+        supplied_type = str(object_data.get("service_type") or "").strip() or None
+        service_type = supplied_type or (
+            current_object["service_type"] if current_object else inferred_type
+        )
+    else:
+        service_type = current_object["service_type"] if current_object else inferred_type
+    if "service_builtin" in object_data:
+        try:
+            service_builtin = int(object_data.get("service_builtin"))
+        except (TypeError, ValueError):
+            raise ValueError("Некорректный признак встроенной категории.")
+    else:
+        service_builtin = (
+            int(bool(current_object["service_builtin"])) if current_object
+            else int(inferred_type is not None)
+        )
+    if current_object and current_object["service_builtin"]:
+        if service_builtin != 1:
+            raise ValueError("Встроенную категорию нельзя превратить в пользовательскую.")
+        service_builtin = 1
+    if current_object and not current_object["service_builtin"] and service_builtin:
+        raise ValueError("Пользовательскую категорию нельзя превратить во встроенную.")
+    if not current_object and service_builtin and inferred_type is None:
+        raise ValueError("Встроенный тип можно назначить только существующей расчётной категории.")
+    service_aliases = object_data.get("service_aliases", [])
+    if service_type is not None:
+        if service_type not in SPECIAL_SUBMISSION_OBJECTS:
+            raise ValueError("Неизвестный тип служебной категории.")
+        if markning != SERVICE_TYPE_MARKINGS[service_type]:
+            raise ValueError("Маркировка не соответствует выбранному типу служебной категории.")
+        if service_builtin not in (0, 1):
+            raise ValueError("Некорректный признак встроенной категории.")
+    elif service_builtin:
+        raise ValueError("Обычный объект не может иметь признак встроенной служебной категории.")
+    if current_object is not None:
+        if current_object["company"] != company:
+            raise ValueError("Устойчивый ID принадлежит другой фирме.")
+        if current_object["service_builtin"] and service_type != current_object["service_type"]:
+            raise ValueError("Встроенный тип служебной категории нельзя изменить.")
+        if service_type != current_object["service_type"] and current_object["service_type"]:
+            aliases = [
+                row["name"] for row in cursor.execute(
+                    "SELECT name FROM service_category_aliases WHERE sync_id = ? AND company = ?",
+                    (sync_id, company),
+                ).fetchall()
+            ]
+            names = [current_object["name"], *aliases]
+            placeholders = ",".join("?" for _ in names)
+            existing_records = cursor.execute(
+                f"SELECT 1 FROM incoming_submissions WHERE company = ? AND submission_type = ? "
+                f"AND object_name IN ({placeholders}) LIMIT 1",
+                (company, current_object["service_type"], *names),
+            ).fetchone()
+            if existing_records:
+                raise ValueError("Тип нельзя изменить: у категории уже есть записи в истории.")
+    alias_collision = cursor.execute(
+        "SELECT 1 FROM service_category_aliases WHERE company = ? AND name = ? AND sync_id <> ? LIMIT 1",
+        (company, object_name, sync_id),
+    ).fetchone()
+    if alias_collision:
+        raise ValueError("Название уже связано с историей другой служебной категории.")
+    if service_type:
+        if not isinstance(service_aliases, list):
+            raise ValueError("Список прежних названий служебной категории имеет неверный формат.")
+        if current_object and current_object["service_type"] and current_object["name"] != object_name:
+            service_aliases = list(dict.fromkeys([*service_aliases, current_object["name"]]))
+    else:
+        service_aliases = []
+
     state_payload = {
         "sync_id": sync_id,
         "revision": revision,
@@ -4010,6 +4237,9 @@ def apply_object_sync_event(cursor, event):
         "object": {
             "name": object_name, "company": company, "markning": markning,
             "rate": rate, "transport_rate": transport_rate,
+            "service_type": service_type,
+            "service_builtin": service_builtin,
+            "service_aliases": service_aliases if service_type else [],
         },
     }
     if operation == "link_legacy":
@@ -4031,8 +4261,6 @@ def apply_object_sync_event(cursor, event):
 
     cursor.execute("SELECT MAX(revision) FROM object_sync_events WHERE sync_id = ?", (sync_id,))
     latest_event_revision = int(cursor.fetchone()[0] or 0)
-    cursor.execute("SELECT id, company, sync_version FROM meta_objects WHERE sync_id = ?", (sync_id,))
-    current_object = cursor.fetchone()
     if current_object is not None and current_object["company"] != company:
         raise ValueError("Устойчивый ID принадлежит другой фирме.")
     current_revision = max(
@@ -4051,11 +4279,7 @@ def apply_object_sync_event(cursor, event):
             operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
             datetime.now(timezone.utc).isoformat(),
         ))
-        cursor.execute(
-            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
-            (server_object_id,),
-        )
-        object_state = cursor.fetchone()
+        object_state = server_service_object_state(cursor, server_object_id)
         return {
             "operation_id": operation_id,
             "sync_id": sync_id,
@@ -4082,11 +4306,7 @@ def apply_object_sync_event(cursor, event):
             operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
             datetime.now(timezone.utc).isoformat(),
         ))
-        cursor.execute(
-            "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
-            (server_object_id,),
-        )
-        object_state = cursor.fetchone()
+        object_state = server_service_object_state(cursor, server_object_id)
         return {
             "operation_id": operation_id,
             "sync_id": sync_id,
@@ -4112,7 +4332,8 @@ def apply_object_sync_event(cursor, event):
                 or not math.isfinite(expected_server_rate) or not math.isfinite(expected_server_transport_rate)):
             raise ValueError("Некорректное ожидаемое состояние серверного объекта.")
         cursor.execute(
-            "SELECT id, name, company, markning, sync_id, rate, transport_rate, is_active, sync_version "
+            "SELECT id, name, company, markning, sync_id, rate, transport_rate, is_active, sync_version, "
+            "service_type, service_builtin "
             "FROM meta_objects WHERE id = ?",
             (server_object_id,),
         )
@@ -4154,8 +4375,7 @@ def apply_object_sync_event(cursor, event):
         if cursor.rowcount != 1:
             raise ValueError("Серверный объект изменился во время подтверждения связи.")
     else:
-        cursor.execute("SELECT id, company, is_active FROM meta_objects WHERE sync_id = ?", (sync_id,))
-        target = cursor.fetchone()
+        target = current_object
         if target is not None:
             server_object_id = int(target["id"])
             if target["company"] != company:
@@ -4164,17 +4384,21 @@ def apply_object_sync_event(cursor, event):
                 if not target["is_active"]:
                     raise ValueError("Неактивный объект нельзя восстановить обычным upsert; нужна явная операция activate.")
                 cursor.execute(
-                    "UPDATE meta_objects SET name = ?, markning = ?, rate = ?, transport_rate = ?, sync_version = ? WHERE id = ?",
-                    (object_name, markning, rate, transport_rate, revision, server_object_id),
+                    "UPDATE meta_objects SET name = ?, markning = ?, rate = ?, transport_rate = ?, "
+                    "service_type = ?, service_builtin = ?, sync_version = ? WHERE id = ?",
+                    (object_name, markning, rate, transport_rate, service_type, service_builtin,
+                     revision, server_object_id),
                 )
             elif operation == "deactivate":
                 cursor.execute("UPDATE meta_objects SET is_active = 0, sync_version = ? WHERE id = ?", (revision, server_object_id))
             else:
                 cursor.execute("""
                     UPDATE meta_objects
-                    SET name = ?, markning = ?, rate = ?, transport_rate = ?, is_active = 1, sync_version = ?
+                    SET name = ?, markning = ?, rate = ?, transport_rate = ?, service_type = ?,
+                        service_builtin = ?, is_active = 1, sync_version = ?
                     WHERE id = ?
-                """, (object_name, markning, rate, transport_rate, revision, server_object_id))
+                """, (object_name, markning, rate, transport_rate, service_type,
+                      service_builtin, revision, server_object_id))
         elif operation == "deactivate":
             server_object_id = None
         elif operation == "activate":
@@ -4190,10 +4414,18 @@ def apply_object_sync_event(cursor, event):
                     "сначала подтвердите связь с серверной записью."
                 )
             cursor.execute("""
-                INSERT INTO meta_objects (sync_id, name, markning, company, rate, transport_rate, is_active, sync_version)
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-            """, (sync_id, object_name, markning, company, rate, transport_rate, revision))
+                INSERT INTO meta_objects (
+                    sync_id, name, markning, company, rate, transport_rate,
+                    is_active, sync_version, service_type, service_builtin
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """, (
+                sync_id, object_name, markning, company, rate, transport_rate,
+                revision, service_type, service_builtin,
+            ))
             server_object_id = int(cursor.lastrowid)
+
+    if service_type:
+        merge_server_service_aliases(cursor, sync_id, company, service_aliases)
 
     cursor.execute("""
         INSERT INTO object_sync_events (
@@ -4203,11 +4435,7 @@ def apply_object_sync_event(cursor, event):
         operation_id, payload_hash, sync_id, revision, state_hash, operation, server_object_id,
         datetime.now(timezone.utc).isoformat(),
     ))
-    cursor.execute(
-        "SELECT name, markning, company, rate, transport_rate, is_active, sync_version FROM meta_objects WHERE id = ?",
-        (server_object_id,),
-    )
-    object_state = cursor.fetchone()
+    object_state = server_service_object_state(cursor, server_object_id)
     return {
         "operation_id": operation_id,
         "sync_id": sync_id,

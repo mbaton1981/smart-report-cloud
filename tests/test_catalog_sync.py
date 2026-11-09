@@ -5314,15 +5314,18 @@ class CatalogSyncTests(unittest.TestCase):
 
         desktop_conn = self.desktop.get_db_connection()
         server_conn = self.server.get_db_connection()
-        for object_id, name, markning, sync_id, _record_type in identities:
+        for object_id, name, markning, sync_id, record_type in identities:
             self.assertEqual(tuple(desktop_conn.execute(
                 "SELECT id, name, markning, sync_id, rate, transport_rate, is_active, sync_version "
                 "FROM objects WHERE sync_id = ?", (sync_id,),
             ).fetchone()), (object_id, name, markning, sync_id, 520, 450, 1, 3))
+            self.assertEqual(tuple(desktop_conn.execute(
+                "SELECT service_type, service_builtin FROM objects WHERE sync_id = ?", (sync_id,),
+            ).fetchone()), (record_type, 1))
             self.assertEqual(tuple(server_conn.execute(
-                "SELECT name, markning, rate, transport_rate, is_active, sync_version "
+                "SELECT name, markning, rate, transport_rate, is_active, sync_version, service_type, service_builtin "
                 "FROM meta_objects WHERE sync_id = ?", (sync_id,),
-            ).fetchone()), (name, markning, 520, 450, 1, 3))
+            ).fetchone()), (name, markning, 520, 450, 1, 3, record_type, 1))
             self.assertEqual(server_conn.execute(
                 "SELECT COUNT(*) FROM object_sync_events WHERE sync_id = ?", (sync_id,)
             ).fetchone()[0], 3)
@@ -5332,6 +5335,304 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 2)
         desktop_conn.close()
         server_conn.close()
+
+    def test_builtin_service_category_management_preserves_type_and_identity(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        company = "Built-in service category test"
+        self._add_company(company)
+        name = "Arbetstidsförkortning"
+        sync_id = str(uuid.uuid4())
+        desktop_conn = self.desktop.get_db_connection()
+        object_id = int(desktop_conn.execute("""
+            INSERT INTO objects (company, name, markning, rate, transport_rate, is_active, sync_id)
+            VALUES (?, ?, 'p1000', 0, 0, 1, ?)
+        """, (company, name, sync_id)).lastrowid)
+        self.desktop.enqueue_object_sync_event(desktop_conn.cursor(), object_id, "upsert")
+        desktop_conn.commit()
+        desktop_conn.close()
+        self.assertEqual(self._worker()["conflicts"], 0)
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._setup_catalog_window(window)
+        window.load_dropdowns = lambda **kwargs: None
+        window.background_sync_with_cloud = lambda: None
+        try:
+            window.load_service_categories_table()
+            self.assertEqual(window.table_service_categories.rowCount(), 1)
+            window.table_service_categories.selectRow(0)
+            window._service_category_dialog = lambda existing=None: (
+                "Arbetstidsförkortning renamed", company, self.desktop.RECORD_TYPE_ATF,
+            )
+            window.edit_service_category()
+            self.assertEqual(self._worker()["conflicts"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            row = desktop_conn.execute(
+                "SELECT id, name, markning, service_type, service_builtin, sync_id "
+                "FROM objects WHERE id = ?", (object_id,),
+            ).fetchone()
+            self.assertEqual(tuple(row), (
+                object_id, "Arbetstidsförkortning renamed", "p1000",
+                self.desktop.RECORD_TYPE_ATF, 1, sync_id,
+            ))
+            desktop_conn.close()
+
+            window.load_service_categories_table()
+            window.table_service_categories.selectRow(0)
+            window._service_category_dialog = lambda existing=None: (
+                "Should not change type", company, self.desktop.RECORD_TYPE_SICK,
+            )
+            with patch.object(QMessageBox, "warning") as warning:
+                window.edit_service_category()
+                warning.assert_called_once()
+
+            window.toggle_service_category_archive()
+            self.assertEqual(self._worker()["conflicts"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(desktop_conn.execute(
+                "SELECT is_active FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()[0], 0)
+            desktop_conn.close()
+            window.table_service_categories.selectRow(0)
+            window.toggle_service_category_archive()
+            self.assertEqual(self._worker()["conflicts"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            restored = desktop_conn.execute(
+                "SELECT id, name, service_type, service_builtin, is_active, sync_id "
+                "FROM objects WHERE id = ?", (object_id,),
+            ).fetchone()
+            self.assertEqual(tuple(restored), (
+                object_id, "Arbetstidsförkortning renamed",
+                self.desktop.RECORD_TYPE_ATF, 1, 1, sync_id,
+            ))
+            desktop_conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_user_service_category_uses_existing_type_and_preserves_history_through_lifecycle(self):
+        from PyQt6.QtWidgets import QDialog, QMessageBox
+
+        company = "Custom service category test"
+        self._add_company(company)
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._setup_catalog_window(window)
+        window.load_dropdowns = lambda **kwargs: None
+        window.background_sync_with_cloud = lambda: None
+        try:
+            with patch.object(QDialog, "exec", return_value=QDialog.DialogCode.Accepted), \
+                 patch.object(QMessageBox, "warning"):
+                self.assertIsNone(window._service_category_dialog())
+
+            window._service_category_dialog = lambda existing=None: (
+                "Extended leave", company, self.desktop.RECORD_TYPE_VACATION,
+            )
+            window.add_service_category()
+            desktop_conn = self.desktop.get_db_connection()
+            category = desktop_conn.execute(
+                "SELECT id, name, markning, sync_id, service_type, service_builtin "
+                "FROM objects WHERE company = ? AND name = 'Extended leave'",
+                (company,),
+            ).fetchone()
+            self.assertIsNotNone(category)
+            object_id = int(category["id"])
+            sync_id = category["sync_id"]
+            self.assertEqual(
+                (category["markning"], category["service_type"], category["service_builtin"]),
+                ("p1002", self.desktop.RECORD_TYPE_VACATION, 0),
+            )
+            self.assertEqual(
+                json.loads(desktop_conn.execute(
+                    "SELECT payload_json FROM object_sync_outbox WHERE object_id = ?",
+                    (object_id,),
+                ).fetchone()[0])["object"]["service_type"],
+                self.desktop.RECORD_TYPE_VACATION,
+            )
+            desktop_conn.close()
+            self.assertEqual(self._worker()["conflicts"], 0)
+
+            service_items = self.desktop.QComboBox()
+            work_items = self.desktop.QComboBox()
+            self.desktop.SmartReportApp.load_objects_for_company(
+                SimpleNamespace(), company, service_items, self.desktop.RECORD_TYPE_VACATION
+            )
+            self.desktop.SmartReportApp.load_objects_for_company(
+                SimpleNamespace(), company, work_items, self.desktop.RECORD_TYPE_WORK
+            )
+            self.assertEqual(
+                [service_items.itemData(index) for index in range(service_items.count())],
+                ["Extended leave"],
+            )
+            self.assertNotIn(
+                "Extended leave",
+                [work_items.itemData(index) for index in range(work_items.count())],
+            )
+
+            server_conn = self.server.get_db_connection()
+            remote = server_conn.execute(
+                "SELECT id, service_type, service_builtin FROM meta_objects WHERE sync_id = ?",
+                (sync_id,),
+            ).fetchone()
+            self.assertEqual(
+                (remote["service_type"], remote["service_builtin"]),
+                (self.desktop.RECORD_TYPE_VACATION, 0),
+            )
+            self.assertEqual(
+                self.server.validate_submission_object(
+                    server_conn.cursor(), self.desktop.RECORD_TYPE_VACATION,
+                    company, "Extended leave",
+                ),
+                int(remote["id"]),
+            )
+            expense_objects = self.server_client.get(
+                "/api/expense-objects",
+                headers={"X-Sync-Key": "isolated-sync-test-key"},
+            ).get_json()["objects"]
+            self.assertNotIn(
+                "Extended leave", [item["name"] for item in expense_objects]
+            )
+            with self.assertRaises(ValueError):
+                self.server.validate_submission_object(
+                    server_conn.cursor(), self.desktop.RECORD_TYPE_WORK,
+                    company, "Extended leave",
+                )
+            server_conn.execute(
+                "INSERT INTO meta_employees (name, salary_rate, is_active) VALUES (?, 500, 1)",
+                ("Service category history",),
+            )
+            server_conn.commit()
+            server_conn.close()
+
+            with self.server_client.session_transaction() as web_session:
+                web_session["user_id"] = 1
+                web_session["role"] = "admin"
+            form_page = self.server_client.get("/")
+            self.assertEqual(form_page.status_code, 200)
+            self.assertIn(b"Extended leave", form_page.data)
+            submission = self.server_client.post("/submit-shift", json={
+                "request_id": str(uuid.uuid4()),
+                "date": self.server.datetime.now().strftime("%Y-%m-%d"),
+                "employee": "Service category history",
+                "company": company,
+                "object_name": "Extended leave",
+                "hours": 4,
+                "rate": 0,
+                "transport": 0,
+                "submission_type": self.desktop.RECORD_TYPE_VACATION,
+            })
+            self.assertEqual(submission.status_code, 201, submission.get_json())
+            self.assertEqual(self._worker()["conflicts"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            self.assertEqual(tuple(desktop_conn.execute(
+                "SELECT object_name, entry_type, hours FROM shifts WHERE company = ?",
+                (company,),
+            ).fetchone()), (
+                "Extended leave", self.desktop.RECORD_TYPE_VACATION, 4,
+            ))
+            desktop_conn.close()
+            server_conn = self.server.get_db_connection()
+            server_state = server_conn.execute(
+                "SELECT sync_version FROM meta_objects WHERE sync_id = ?", (sync_id,)
+            ).fetchone()
+            server_conn.close()
+            type_change_event = {
+                "operation_id": str(uuid.uuid4()),
+                "sync_id": sync_id,
+                "revision": int(server_state["sync_version"]) + 1,
+                "operation": "upsert",
+                "object": {
+                    "name": "Extended leave",
+                    "company": company,
+                    "markning": "p1000",
+                    "rate": 0,
+                    "transport_rate": 0,
+                    "service_type": self.desktop.RECORD_TYPE_ATF,
+                    "service_builtin": 0,
+                    "service_aliases": [],
+                },
+            }
+            self.assertEqual(
+                self._server_post({"object_events": [type_change_event]}).status_code,
+                400,
+            )
+
+            window.load_service_categories_table()
+            self.assertEqual(window.table_custom_service_categories.rowCount(), 1)
+            window.table_custom_service_categories.selectRow(0)
+            window._service_category_dialog = lambda existing=None: (
+                "Changed type", company, self.desktop.RECORD_TYPE_ATF,
+            )
+            with patch.object(QMessageBox, "warning") as warning:
+                window.edit_service_category()
+                warning.assert_called_once()
+            desktop_conn = self.desktop.get_db_connection()
+            unchanged = desktop_conn.execute(
+                "SELECT name, service_type FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            self.assertEqual(
+                tuple(unchanged),
+                ("Extended leave", self.desktop.RECORD_TYPE_VACATION),
+            )
+            desktop_conn.close()
+
+            window._service_category_dialog = lambda existing=None: (
+                "Extended leave renamed", company, self.desktop.RECORD_TYPE_VACATION,
+            )
+            window.edit_service_category()
+            self.assertEqual(self._worker()["conflicts"], 0)
+            historical_items = self.desktop.QComboBox()
+            self.desktop.SmartReportApp.load_objects_for_company(
+                SimpleNamespace(), company, historical_items,
+                self.desktop.RECORD_TYPE_VACATION, "Extended leave",
+            )
+            self.assertEqual(historical_items.currentData(), "Extended leave")
+            server_conn = self.server.get_db_connection()
+            self.assertTrue(server_conn.execute(
+                "SELECT 1 FROM service_category_aliases WHERE sync_id = ? AND name = 'Extended leave'",
+                (sync_id,),
+            ).fetchone())
+            self.assertEqual(
+                self.server.validate_submission_object(
+                    server_conn.cursor(), self.desktop.RECORD_TYPE_VACATION,
+                    company, "Extended leave",
+                ),
+                int(remote["id"]),
+            )
+            server_conn.close()
+
+            window.load_service_categories_table()
+            window.table_custom_service_categories.selectRow(0)
+            window.toggle_service_category_archive()
+            self.assertEqual(self._worker()["conflicts"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            archived = desktop_conn.execute(
+                "SELECT id, is_active FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            self.assertEqual(tuple(archived), (object_id, 0))
+            historical = desktop_conn.execute(
+                "SELECT object_name, entry_type, hours FROM shifts WHERE company = ?",
+                (company,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(historical),
+                ("Extended leave", self.desktop.RECORD_TYPE_VACATION, 4),
+            )
+            desktop_conn.close()
+
+            window.table_custom_service_categories.selectRow(0)
+            window.toggle_service_category_archive()
+            self.assertEqual(self._worker()["conflicts"], 0)
+            desktop_conn = self.desktop.get_db_connection()
+            restored = desktop_conn.execute(
+                "SELECT id, is_active, sync_id FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            self.assertEqual(tuple(restored), (object_id, 1, sync_id))
+            desktop_conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
 
     def test_archived_object_allows_existing_history_edit_but_not_new_shift(self):
         server_conn = self.server.get_db_connection()

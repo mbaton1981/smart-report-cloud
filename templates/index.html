@@ -374,6 +374,15 @@
     <!-- Скрипты -->
     <script>
         const allObjects = {{ objects | tojson }};
+        const legacyServiceTypes = {
+            'Arbetstidsförkortning|p1000': 'atf',
+            'Sjuk|p1001': 'sick',
+            'Semestertimmar|p1002': 'vacation'
+        };
+        function serviceTypeOf(object) {
+            return object.service_type || legacyServiceTypes[`${object.name}|${object.markning}`]
+                || (object.markning === 'p1004' ? 'holiday' : null);
+        }
         let currentUser = null;
         let pendingShiftRequestId = null;
         let historySnapshot = null;
@@ -464,25 +473,19 @@
                 return;
             }
 
-            const specialRefs = {
-                atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
-                sick: { name: 'Sjuk', marking: 'p1001' },
-                vacation: { name: 'Semestertimmar', marking: 'p1002' },
-                holiday: { marking: 'p1004' }
-            };
-            const reference = specialRefs[submissionType];
-            const filtered = allObjects.filter(obj => obj.company === selectedCompany && (
-                reference
-                    ? (!reference.name || obj.name === reference.name) && obj.markning === reference.marking
-                    : !Object.values(specialRefs).some(item =>
-                        obj.markning === item.marking && (!item.name || obj.name === item.name)
-                    )
-            ));
+            const isSpecial = !['work', 'ob'].includes(submissionType);
+            const filtered = allObjects.filter(obj => obj.company === selectedCompany
+                && !obj.is_alias
+                && (isSpecial
+                    ? serviceTypeOf(obj) === submissionType
+                    : serviceTypeOf(obj) === null));
 
             if (filtered.length === 0) {
                 const opt = document.createElement('option');
                 opt.value = "";
-                opt.textContent = reference ? "-- Специальная запись не найдена в справочнике --" : "-- Нет рабочих объектов для этой фирмы --";
+                opt.textContent = isSpecial
+                    ? "-- Служебная категория этого типа не найдена --"
+                    : "-- Нет рабочих объектов для этой фирмы --";
                 objectSelect.appendChild(opt);
             } else {
                 const defaultOpt = document.createElement('option');
@@ -631,22 +634,12 @@
         function filterEditObjects(selectedName = '') {
             const type = document.getElementById('edit-type').value;
             const company = document.getElementById('edit-company').value;
-            const reference = {
-                atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
-                sick: { name: 'Sjuk', marking: 'p1001' },
-                vacation: { name: 'Semestertimmar', marking: 'p1002' },
-                holiday: { marking: 'p1004' }
-            }[type];
+            const isSpecial = !['work', 'ob'].includes(type);
             const select = document.getElementById('edit-object');
             const options = allObjects.filter(obj => obj.company === company && (
-                reference
-                    ? (!reference.name || obj.name === reference.name) && obj.markning === reference.marking
-                    : !Object.values({
-                        atf: { name: 'Arbetstidsförkortning', marking: 'p1000' },
-                        sick: { name: 'Sjuk', marking: 'p1001' },
-                        vacation: { name: 'Semestertimmar', marking: 'p1002' },
-                        holiday: { marking: 'p1004' }
-                    }).some(item => obj.markning === item.marking && (!item.name || obj.name === item.name))
+                isSpecial
+                    ? serviceTypeOf(obj) === type
+                    : serviceTypeOf(obj) === null
             ));
             select.replaceChildren();
             for (const object of options) {
@@ -658,7 +651,9 @@
             if (options.length === 0) {
                 const option = document.createElement('option');
                 option.value = '';
-                option.textContent = reference ? 'Специальная запись не найдена' : 'Нет рабочих объектов';
+                option.textContent = isSpecial
+                    ? 'Служебная категория не найдена'
+                    : 'Нет рабочих объектов';
                 select.appendChild(option);
             } else if (options.some(object => object.name === selectedName)) {
                 select.value = selectedName;
