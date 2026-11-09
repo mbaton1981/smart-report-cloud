@@ -25,11 +25,12 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
     QFrame, QFormLayout, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
-    QTextEdit, QSplitter, QGraphicsView, QGraphicsScene, QAbstractItemView
+    QTextEdit, QSplitter, QGraphicsView, QGraphicsScene, QAbstractItemView,
+    QGridLayout, QMenu, QToolButton
 )
 from PyQt6.QtCore import (
     Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool,
-    QItemSelectionModel,
+    QItemSelectionModel, QSignalBlocker,
 )
 from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QImage, QPixmap
 from PyQt6.QtCore import QUrl
@@ -2254,6 +2255,39 @@ class DocumentGalleryDialog(QDialog):
             document.close()
         self._temporary_directory.cleanup()
         super().closeEvent(event)
+
+
+class ResponsiveExpenseSplitter(QSplitter):
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._compact_orientation = False
+        self._watched_window = None
+
+    def track_window(self, window):
+        if self._watched_window is not None:
+            self._watched_window.removeEventFilter(self)
+        self._watched_window = window
+        window.installEventFilter(self)
+        self._update_orientation()
+
+    def _update_orientation(self):
+        window = self._watched_window or self.window()
+        compact = window.width() < 1180
+        if compact != self._compact_orientation:
+            self._compact_orientation = compact
+            self.setOrientation(
+                Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
+            )
+            self.setSizes([420, 420] if compact else [650, 520])
+
+    def eventFilter(self, watched, event):
+        if watched is self._watched_window and event.type() == QEvent.Type.Resize:
+            self._update_orientation()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):
+        self._update_orientation()
+        super().resizeEvent(event)
 
 
 def create_half_hour_time_field(default_time):
@@ -6656,55 +6690,141 @@ class SmartReportApp(QMainWindow):
 
     def setup_expenses_tab(self):
         layout = QVBoxLayout(self.tab_expenses)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
         self.exp_document_tabs = QTabWidget(self.tab_expenses)
         self.exp_documents_page = QWidget()
         page_layout = QVBoxLayout(self.exp_documents_page)
+        page_layout.setContentsMargins(8, 8, 8, 8)
+        page_layout.setSpacing(10)
 
-        period_row = QHBoxLayout()
+        title_row = QHBoxLayout()
+        title_block = QVBoxLayout()
+        title = QLabel("Расходы")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        subtitle = QLabel("Проверьте документы и распределите затраты по фирме и объектам.")
+        subtitle.setWordWrap(True)
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        title_row.addLayout(title_block, 1)
+        actions_menu = QMenu(self)
+        action_items = (
+            ("Загрузить PDF / фото", self.upload_expense_document),
+            ("Добавить вручную", self.open_manual_document_dialog),
+            ("Открыть входящие", self.open_incoming_documents),
+            ("Распознать сохранённый оригинал", self.reprocess_selected_document),
+            ("НДС по позициям", lambda: self.calculate_allocation_vat(self.table_supplier_documents)),
+            ("Изменить документ", self.review_selected_document),
+            ("Открыть оригинал", self.open_selected_document_original),
+            ("Удалить документ", self.delete_selected_expense_document),
+        )
+        from incoming_documents import enabled as incoming_enabled
+        self.exp_actions = {}
+        for label, callback in action_items:
+            if label == "Открыть входящие" and not incoming_enabled():
+                continue
+            action = actions_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, handler=callback: handler())
+            self.exp_actions[label] = action
+        self.exp_actions["Удалить документ"].setObjectName("danger")
+        actions_button = QToolButton()
+        actions_button.setText("Ещё действия")
+        actions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        actions_button.setMenu(actions_menu)
+        actions_button.setToolTip("Загрузка, распознавание и другие действия с расходами")
+        title_row.addWidget(actions_button, 0, Qt.AlignmentFlag.AlignTop)
+        page_layout.addLayout(title_row)
+
+        self.exp_metrics = {}
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(9)
+        for key, title_text, accent in (
+            ("accounted", "Учтённые расходы", "#68d391"),
+            ("review", "Требуют проверки", "#f6ad55"),
+            ("unallocated", "Не распределены", "#63b3ed"),
+        ):
+            card = QFrame()
+            card.setObjectName("expenseSummaryCard")
+            desktop_theme.apply_style(
+                card,
+                "QFrame#expenseSummaryCard { background-color: #242933; border: 1px solid #323946; border-radius: 9px; }",
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(13, 9, 13, 9)
+            card_layout.setSpacing(3)
+            label = QLabel(title_text)
+            label.setStyleSheet("font-size: 11px; font-weight: 650;")
+            value = QLabel("—")
+            desktop_theme.apply_style(
+                value, f"QLabel {{ font-size: 18px; font-weight: 750; color: {accent}; }}"
+            )
+            meta = QLabel("")
+            meta.setWordWrap(True)
+            meta.setStyleSheet("font-size: 10px;")
+            card_layout.addWidget(label)
+            card_layout.addWidget(value)
+            card_layout.addWidget(meta)
+            metrics_row.addWidget(card, 1)
+            self.exp_metrics[key] = (value, meta)
+        page_layout.addLayout(metrics_row)
+
+        filters = QGridLayout()
+        filters.setHorizontalSpacing(8)
+        filters.setVerticalSpacing(3)
+        filters.addWidget(QLabel("Период с"), 0, 0)
+        filters.addWidget(QLabel("по"), 0, 1)
+        filters.addWidget(QLabel("Объект / назначение"), 0, 2)
+        filters.addWidget(QLabel("Состояние"), 0, 3)
+        filters.addWidget(QLabel("Поставщик или номер документа"), 0, 4)
         today = QDate.currentDate()
         month_start = QDate(today.year(), today.month(), 1)
         month_end = month_start.addMonths(1).addDays(-1)
         self.exp_date_from = create_date_field(month_start.toString("yyyy-MM-dd"))
         self.exp_date_to = create_date_field(month_end.toString("yyyy-MM-dd"))
-        period_row.addWidget(QLabel("Период:"))
-        period_row.addWidget(self.exp_date_from)
-        period_row.addWidget(QLabel("по"))
-        period_row.addWidget(self.exp_date_to)
+        for date_field in (self.exp_date_from, self.exp_date_to):
+            date_field.setMinimumWidth(112)
+            date_field.setMaximumWidth(155)
+        filters.addWidget(self.exp_date_from, 1, 0)
+        filters.addWidget(self.exp_date_to, 1, 1)
         self.exp_filter_object = QComboBox()
-        period_row.addWidget(QLabel("Объект:"))
-        period_row.addWidget(self.exp_filter_object, 1)
-        self.exp_filter_unallocated = QCheckBox("Только нераспределённые")
-        period_row.addWidget(self.exp_filter_unallocated)
-        page_layout.addLayout(period_row)
-
-        state_row = QHBoxLayout()
-        state_row.addWidget(QLabel("Состояние:"))
+        self.exp_filter_object.setMinimumWidth(110)
+        filters.addWidget(self.exp_filter_object, 1, 2)
         self.exp_filter_status = QComboBox()
+        self.exp_filter_status.setMinimumWidth(120)
         for label, key in (
             ("Все состояния", "all"),
-            ("Требует проверки", "requires_review"),
+            ("Требуют проверки", "requires_review"),
             ("Отложен", "later"),
             ("Учтён", "accounted"),
             ("Не учитывать", "ignored"),
             ("Ошибка / передача", "transfer"),
         ):
             self.exp_filter_status.addItem(label, key)
-        state_row.addWidget(self.exp_filter_status)
+        filters.addWidget(self.exp_filter_status, 1, 3)
+        self.exp_search = QLineEdit()
+        self.exp_search.setPlaceholderText("Например, поставщик или номер фактуры")
+        self.exp_search.setClearButtonEnabled(True)
+        filters.addWidget(self.exp_search, 1, 4)
+        filters.setColumnStretch(4, 1)
+        self.exp_filter_unallocated = QCheckBox("Только нераспределённые")
+        self.exp_filter_unallocated.hide()
+        page_layout.addLayout(filters)
+
+        self.exp_api_status_lbl = QLabel("")
+        self.exp_api_status_lbl.setWordWrap(True)
         self.exp_docs_state_counts_lbl = QLabel()
         self.exp_docs_state_counts_lbl.setWordWrap(True)
-        state_row.addWidget(self.exp_docs_state_counts_lbl, 1)
-        page_layout.addLayout(state_row)
-
+        self.exp_docs_state_counts_lbl.hide()
         self.exp_docs_state_legend_lbl = QLabel()
         self.exp_docs_state_legend_lbl.setWordWrap(True)
         self.exp_docs_state_legend_lbl.setAccessibleName("Легенда цветов состояний расходов")
-        page_layout.addWidget(self.exp_docs_state_legend_lbl)
+        self.exp_docs_state_legend_lbl.hide()
         theme_manager = getattr(QApplication.instance(), "_smartreport_theme", None)
         if theme_manager is not None:
             theme_manager.changed.connect(self._update_expense_register_legend)
         self._update_expense_register_legend()
 
-        totals_row = QHBoxLayout()
+        legacy_totals = QHBoxLayout()
         for attribute, label in (
             ("exp_docs_gross_lbl", "Сумма с НДС"),
             ("exp_docs_vat_lbl", "Известный НДС"),
@@ -6717,13 +6837,9 @@ class SmartReportApp(QMainWindow):
             value.setToolTip(label)
             desktop_theme.apply_style(value, "font-weight: bold; color: #63b3ed; border: none;")
             setattr(self, attribute, value)
-            totals_row.addWidget(QLabel(f"{label}:"))
-            totals_row.addWidget(value)
-        page_layout.addLayout(totals_row)
-
-        self.exp_api_status_lbl = QLabel("")
-        self.exp_api_status_lbl.setWordWrap(True)
-        page_layout.addWidget(self.exp_api_status_lbl)
+            legacy_totals.addWidget(QLabel(f"{label}:"))
+            legacy_totals.addWidget(value)
+            value.hide()
 
         self.table_supplier_documents = QTableWidget(0, 8)
         self.table_supplier_documents.setHorizontalHeaderLabels([
@@ -6731,44 +6847,128 @@ class SmartReportApp(QMainWindow):
             "Сумма с НДС", "НДС", "Состояние",
         ])
         self.table_supplier_documents.setColumnHidden(0, True)
+        self.table_supplier_documents.setColumnHidden(3, True)
+        self.table_supplier_documents.setColumnHidden(6, True)
+        self.table_supplier_documents.setHorizontalHeaderLabels([
+            "ID", "Дата", "Поставщик / документ", "№ документа", "Назначение",
+            "Сумма с НДС", "НДС", "Состояние",
+        ])
         document_header = self.table_supplier_documents.horizontalHeader()
-        for column, width in {1: 95, 2: 155, 3: 125, 5: 125, 6: 105, 7: 205}.items():
+        for column, width in {1: 90, 2: 180, 5: 115, 7: 150}.items():
             document_header.resizeSection(column, width)
         document_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table_supplier_documents.setItemDelegate(
             desktop_ui.ExpenseRegisterTableDelegate(self.table_supplier_documents))
         self.table_supplier_documents.setAlternatingRowColors(True)
         self.table_supplier_documents.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_supplier_documents.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table_supplier_documents.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table_supplier_documents.setWordWrap(True)
+        self.table_supplier_documents.verticalHeader().setVisible(False)
+        self.table_supplier_documents.verticalHeader().setDefaultSectionSize(48)
+        self.table_supplier_documents.setMinimumHeight(190)
+        self.table_supplier_documents.setAccessibleName("Реестр документов расходов")
         self.table_supplier_documents.cellDoubleClicked.connect(self.open_selected_document_original)
-        page_layout.addWidget(self.table_supplier_documents, 1)
+        self.table_supplier_documents.currentCellChanged.connect(
+            self._update_expense_detail)
 
-        actions = QHBoxLayout()
-        upload_button = QPushButton("Загрузить PDF / фото")
-        upload_button.clicked.connect(self.upload_expense_document)
-        manual_button = QPushButton("Добавить вручную")
-        manual_button.clicked.connect(self.open_manual_document_dialog)
-        from incoming_documents import enabled as incoming_enabled
-        mail_button = QPushButton("Открыть входящие")
-        mail_button.setToolTip("Неподтверждённые документы уже показаны в этом реестре.")
-        mail_button.setVisible(incoming_enabled())
-        mail_button.clicked.connect(self.open_incoming_documents)
-        edit_button = QPushButton("Проверить документ")
-        edit_button.clicked.connect(self.review_selected_document)
-        reprocess_button = QPushButton("Распознать сохранённый оригинал")
-        reprocess_button.clicked.connect(self.reprocess_selected_document)
-        vat_button = QPushButton("НДС по позициям")
-        vat_button.clicked.connect(lambda: self.calculate_allocation_vat(self.table_supplier_documents))
-        delete_button = QPushButton("Удалить")
-        delete_button.setObjectName("danger")
-        delete_button.clicked.connect(self.delete_selected_expense_document)
-        open_button = QPushButton("Открыть оригинал")
-        open_button.clicked.connect(self.open_selected_document_original)
-        for button in (upload_button, mail_button, manual_button, edit_button, reprocess_button, vat_button, delete_button, open_button):
-            actions.addWidget(button)
-        page_layout.addLayout(actions)
+        register_panel = QFrame()
+        register_panel.setObjectName("expensePanel")
+        register_layout = QVBoxLayout(register_panel)
+        register_layout.setContentsMargins(0, 0, 0, 0)
+        register_title_row = QHBoxLayout()
+        register_title = QLabel("Документы")
+        register_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        self.exp_docs_result_count = QLabel("—")
+        register_title_row.addWidget(register_title)
+        register_title_row.addStretch(1)
+        register_title_row.addWidget(self.exp_docs_result_count)
+        register_layout.addLayout(register_title_row)
+        register_layout.addWidget(self.table_supplier_documents, 1)
+
+        self.exp_detail_scroll = QScrollArea()
+        self.exp_detail_scroll.setWidgetResizable(True)
+        self.exp_detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.exp_detail_scroll.setMinimumWidth(260)
+        self.exp_detail_content = QFrame()
+        self.exp_detail_content.setObjectName("expensePanel")
+        detail_layout = QVBoxLayout(self.exp_detail_content)
+        detail_layout.setContentsMargins(12, 12, 12, 12)
+        detail_layout.setSpacing(8)
+        heading_row = QHBoxLayout()
+        self.exp_detail_supplier = QLabel("Выберите документ")
+        self.exp_detail_supplier.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.exp_detail_supplier.setWordWrap(True)
+        self.exp_detail_status = QLabel("")
+        self.exp_detail_status.setWordWrap(True)
+        heading_row.addWidget(self.exp_detail_supplier, 1)
+        heading_row.addWidget(self.exp_detail_status, 0, Qt.AlignmentFlag.AlignTop)
+        detail_layout.addLayout(heading_row)
+
+        self.exp_detail_preview = QLabel("Выберите фактуру, чтобы проверить оригинал и реквизиты.")
+        self.exp_detail_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.exp_detail_preview.setWordWrap(True)
+        self.exp_detail_preview.setMinimumHeight(110)
+        desktop_theme.apply_style(
+            self.exp_detail_preview,
+            "QLabel { background-color: #2a313d; border: 1px solid #323946; border-radius: 8px; padding: 8px; }",
+        )
+        detail_layout.addWidget(self.exp_detail_preview)
+        self.exp_detail_original_button = QPushButton("Открыть оригинал")
+        self.exp_detail_original_button.clicked.connect(self.open_selected_document_original)
+        detail_layout.addWidget(self.exp_detail_original_button)
+
+        info_grid = QGridLayout()
+        self.exp_detail_values = {}
+        for index, (key, caption) in enumerate((
+            ("supplier", "Поставщик"), ("date", "Дата"),
+            ("number", "Номер документа"), ("category", "Категория"),
+            ("net", "Без НДС"), ("vat", "НДС"),
+            ("gross", "Итого с НДС"), ("destination", "Назначение"),
+        )):
+            cell = QVBoxLayout()
+            label = QLabel(caption)
+            label.setStyleSheet("font-size: 10px;")
+            value = QLabel("—")
+            value.setWordWrap(True)
+            value.setStyleSheet("font-size: 11px; font-weight: 650;")
+            cell.addWidget(label)
+            cell.addWidget(value)
+            info_grid.addLayout(cell, index // 2, index % 2)
+            self.exp_detail_values[key] = value
+        detail_layout.addLayout(info_grid)
+        self.exp_detail_progress = QLabel("")
+        self.exp_detail_progress.setWordWrap(True)
+        detail_layout.addWidget(self.exp_detail_progress)
+        self.exp_assign_button = QPushButton("Назначить расход")
+        self.exp_assign_button.clicked.connect(self.assign_selected_expense_document)
+        detail_layout.addWidget(self.exp_assign_button)
+        self.exp_primary_action = QPushButton("Проверить фактуру")
+        self.exp_primary_action.setObjectName("primaryAction")
+        self.exp_primary_action.setMinimumHeight(38)
+        self.exp_primary_action.clicked.connect(self.expense_detail_primary_action)
+        detail_layout.addWidget(self.exp_primary_action)
+        self.exp_detail_hint = QLabel("")
+        self.exp_detail_hint.setWordWrap(True)
+        self.exp_detail_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        detail_layout.addWidget(self.exp_detail_hint)
+        detail_layout.addStretch(1)
+        self.exp_detail_scroll.setWidget(self.exp_detail_content)
+
+        self.expense_splitter = ResponsiveExpenseSplitter(self.exp_documents_page)
+        self.expense_splitter.addWidget(register_panel)
+        self.expense_splitter.addWidget(self.exp_detail_scroll)
+        self.expense_splitter.setStretchFactor(0, 3)
+        self.expense_splitter.setStretchFactor(1, 2)
+        page_layout.addWidget(self.expense_splitter, 1)
+
+        information_row = QHBoxLayout()
+        self.exp_api_status_lbl.setMinimumHeight(0)
+        information_row.addWidget(self.exp_api_status_lbl, 1)
+        page_layout.addLayout(information_row)
 
         self.exp_document_tabs.addTab(self.exp_documents_page, "Все документы")
+        self.expense_splitter.track_window(self.window())
         self.exp_document_tabs.addTab(self.tab_object_expenses, "По объектам")
         self.exp_document_tabs.currentChanged.connect(self._on_expense_view_changed)
         layout.addWidget(self.exp_document_tabs, 1)
@@ -6777,6 +6977,237 @@ class SmartReportApp(QMainWindow):
         self.exp_filter_object.currentIndexChanged.connect(self.load_expense_documents)
         self.exp_filter_unallocated.toggled.connect(self.load_expense_documents)
         self.exp_filter_status.currentIndexChanged.connect(self.load_expense_documents)
+        self.exp_search.textChanged.connect(self.load_expense_documents)
+
+    @staticmethod
+    def _expense_document_identity(document):
+        return (
+            document.get("incoming_document_id")
+            or document.get("client_id")
+            or document.get("id")
+        )
+
+    def _update_expense_summary_cards(self, documents):
+        buckets = {"accounted": [], "review": [], "unallocated": []}
+        for document in documents:
+            status = self._expense_register_status_key(document)
+            if status == "accounted":
+                buckets["accounted"].append(document)
+            elif status == "requires_review":
+                buckets["review"].append(document)
+            if status not in {"accounted", "ignored"}:
+                remaining = self._expense_register_unallocated_amount(document)
+                if remaining is None or remaining != 0:
+                    buckets["unallocated"].append(document)
+
+        def totals(rows, field):
+            result = {}
+            for row in rows:
+                amount = parse_decimal(row.get(field))
+                if amount is not None:
+                    currency = str(row.get("currency_code") or "SEK")
+                    result[currency] = result.get(currency, Decimal(0)) + amount
+            return self._expense_money_label(result)
+
+        if not hasattr(self, "exp_metrics"):
+            return
+        accounted, review, unallocated = (
+            self.exp_metrics[key] for key in ("accounted", "review", "unallocated")
+        )
+        accounted[0].setText(totals(buckets["accounted"], "gross_amount"))
+        accounted[1].setText(
+            "с НДС · без НДС " + totals(buckets["accounted"], "net_amount")
+        )
+        review[0].setText(totals(buckets["review"], "gross_amount"))
+        review[1].setText(
+            f"с НДС · {len(buckets['review'])} документа, отдельно от учтённых"
+        )
+        unallocated_amounts = {}
+        for document in buckets["unallocated"]:
+            amount = self._expense_register_unallocated_amount(document)
+            if amount is not None and amount != 0:
+                currency = str(document.get("currency_code") or "SEK")
+                unallocated_amounts[currency] = unallocated_amounts.get(
+                    currency, Decimal(0)
+                ) + amount
+        unallocated[0].setText(self._expense_money_label(unallocated_amounts))
+        unallocated[1].setText(
+            f"остаток с НДС · {len(buckets['unallocated'])} документа, "
+            "не входят в учтённые"
+        )
+
+    def _update_expense_detail(self, *_):
+        if not hasattr(self, "exp_detail_supplier"):
+            return
+        document = self._selected_expense_document(self.table_supplier_documents, notify=False)
+        if document is None:
+            self.exp_detail_supplier.setText("Выберите документ")
+            self.exp_detail_status.clear()
+            self.exp_detail_preview.setPixmap(QPixmap())
+            self.exp_detail_preview.setText("Выберите фактуру, чтобы проверить оригинал и реквизиты.")
+            for value in self.exp_detail_values.values():
+                value.setText("—")
+            self.exp_detail_progress.clear()
+            self.exp_detail_hint.clear()
+            self.exp_assign_button.setEnabled(False)
+            self.exp_primary_action.setEnabled(False)
+            self.exp_detail_original_button.setEnabled(False)
+            return
+
+        status = self._expense_register_status_key(document)
+        currency = str(document.get("currency_code") or "SEK")
+
+        def money_value(key):
+            value = parse_decimal(document.get(key))
+            return f"{value:,.2f} {currency}" if value is not None else "Не указана"
+
+        self.exp_detail_supplier.setText(document.get("supplier_name") or "Не указан поставщик")
+        self.exp_detail_values["supplier"].setText(document.get("supplier_name") or "Не указан")
+        self.exp_detail_values["date"].setText(document.get("document_date") or "Не указана")
+        self.exp_detail_values["number"].setText(document.get("invoice_number") or "Не указан")
+        self.exp_detail_values["category"].setText(document.get("expense_category") or "—")
+        self.exp_detail_values["net"].setText(money_value("net_amount"))
+        self.exp_detail_values["vat"].setText(money_value("vat_amount"))
+        self.exp_detail_values["gross"].setText(money_value("gross_amount"))
+        self.exp_detail_values["destination"].setText(
+            self._expense_distribution_label(document) or "Не назначено"
+        )
+
+        status_label = self._expense_register_status_label(document)
+        if status == "requires_review" and document.get("allocations"):
+            status_label = "Назначено · ждёт проверки"
+        self.exp_detail_status.setText(status_label)
+        tone = self._expense_register_row_tone(document)
+        status_colors = {
+            "unassigned": ("#4a3b24", "#f6ad55"),
+            "distributed": ("#26394b", "#90cdf4"),
+            "accounted": ("#1c4532", "#68d391"),
+            "neutral": ("#30343b", "#cbd5e1"),
+        }
+        background, foreground = status_colors.get(
+            "error" if self._expense_register_has_transfer_error(document) else tone,
+            ("#632c2c", "#fca5a5"),
+        )
+        desktop_theme.apply_style(
+            self.exp_detail_status,
+            f"QLabel {{ background-color: {background}; color: {foreground}; "
+            "border-radius: 8px; padding: 4px 7px; font-size: 10px; font-weight: 650; }",
+        )
+
+        allocated = bool(document.get("allocations"))
+        verified = status == "accounted"
+        self.exp_detail_progress.setText(
+            ("✓ Проверено   " if verified else "1 · Проверить   ")
+            + ("✓ Назначено   " if allocated else "2 · Назначить   ")
+            + ("✓ Учтено" if verified else "3 · Подтвердить")
+        )
+        self.exp_detail_hint.setText(
+            "Назначение не подтверждает расход: в учёт входят только подтверждённые документы."
+            if allocated and not verified else
+            ("Расход подтверждён и включён в учтённые суммы." if verified else
+             "Сверьте реквизиты с оригиналом и подтвердите расход после проверки.")
+        )
+
+        incoming_id = document.get("incoming_document_id")
+        self.exp_assign_button.setEnabled(not verified and incoming_id is None)
+        if incoming_id is not None:
+            self.exp_assign_button.setText("Назначение во входящих документах")
+            self.exp_assign_button.setToolTip(
+                "Откройте проверку входящего документа, чтобы изменить назначение."
+            )
+        else:
+            self.exp_assign_button.setText("Изменить назначение" if allocated else "Назначить расход")
+            self.exp_assign_button.setToolTip("Сохранить назначение отдельно от подтверждения расхода.")
+
+        transfer_retry = (
+            status == "transfer"
+            and document.get("sync_state") in {"pending", "unverified"}
+            and bool(document.get("sync_error"))
+        )
+        self.exp_primary_action.setEnabled(True)
+        if transfer_retry:
+            self.exp_primary_action.setText("Повторить передачу")
+            self.exp_primary_action.setToolTip("Повторить отправку сохранённого расхода на сервер.")
+        elif status == "accounted":
+            self.exp_primary_action.setText("Расход учтён")
+            self.exp_primary_action.setEnabled(False)
+        elif status == "transfer":
+            self.exp_primary_action.setText("Проверить передачу")
+        else:
+            self.exp_primary_action.setText("Проверить фактуру")
+
+        self.exp_detail_original_button.setEnabled(True)
+        self.exp_detail_preview.setPixmap(QPixmap())
+        local_paths = [
+            Path(path) for path in document.get("local_attachment_paths") or []
+            if Path(path).is_file()
+        ]
+        if local_paths:
+            source = local_paths[0]
+            try:
+                if source.suffix.casefold() == ".pdf":
+                    import pypdfium2 as pdfium
+                    pdf = pdfium.PdfDocument(str(source))
+                    try:
+                        image = pdf[0].render(scale=1.1).to_pil().convert("RGB")
+                        qimage = QImage(
+                            image.tobytes(), image.width, image.height, image.width * 3,
+                            QImage.Format.Format_RGB888,
+                        ).copy()
+                        pixmap = QPixmap.fromImage(qimage)
+                    finally:
+                        pdf.close()
+                else:
+                    pixmap = QPixmap(str(source))
+                if not pixmap.isNull():
+                    self.exp_detail_preview.setPixmap(pixmap.scaled(
+                        270, 210, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    ))
+                    self.exp_detail_preview.setText("")
+                else:
+                    self.exp_detail_preview.setText("Предпросмотр оригинала недоступен.")
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Не удалось показать оригинал расходного документа %s", source
+                )
+                self.exp_detail_preview.setText(
+                    "Не удалось показать предпросмотр. Откройте оригинал отдельно."
+                )
+        else:
+            self.exp_detail_preview.setText(
+                "Оригинал сохранён отдельно. Откройте его для просмотра страниц."
+                if document.get("has_original") or document.get("attachments")
+                else "Оригинал к документу не прикреплён."
+            )
+
+    def assign_selected_expense_document(self, *_):
+        document = self._selected_expense_document(self.table_supplier_documents, notify=False)
+        if not document:
+            return
+        incoming_id = document.get("incoming_document_id")
+        if incoming_id is not None:
+            self.open_incoming_documents(incoming_id)
+            return
+        self._expense_document_review_dialog(document=document, assignment_only=True)
+
+    def expense_detail_primary_action(self, *_):
+        document = self._selected_expense_document(self.table_supplier_documents, notify=False)
+        if not document:
+            return
+        if (
+            self._expense_register_status_key(document) == "transfer"
+            and document.get("sync_state") in {"pending", "unverified"}
+            and document.get("sync_error")
+        ):
+            self._invalidate_expense_reads()
+            self.sync_with_cloud()
+            return
+        if document.get("sync_state") == "conflict":
+            self.review_selected_document()
+            return
+        if self._expense_register_status_key(document) != "accounted":
+            self.review_selected_document()
 
     def open_mail_queue(self):
         QMessageBox.information(self, "Почта отключена", "Почтовое получение в интеграционный кандидат не включено.")
@@ -6849,6 +7280,12 @@ class SmartReportApp(QMainWindow):
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        splitter = getattr(self, "expense_splitter", None)
+        if splitter is not None:
+            splitter._update_orientation()
 
     def closeEvent(self, event):
         incoming = getattr(self, "_incoming_viewer", None)
@@ -7060,6 +7497,7 @@ class SmartReportApp(QMainWindow):
             combo.clear()
             if include_all:
                 combo.addItem("Все объекты", None)
+                combo.addItem("Без назначения", "unassigned")
             else:
                 combo.addItem("Выберите объект", None)
             combo.addItem("Общие расходы фирмы", "company")
@@ -7457,14 +7895,25 @@ class SmartReportApp(QMainWindow):
         if date_from > date_to:
             self.table_supplier_documents.setRowCount(0)
             self.exp_api_status_lbl.setText("Проверьте период: начало позже окончания.")
+            if hasattr(self, "exp_metrics"):
+                self._update_expense_summary_cards([])
+            if hasattr(self, "exp_docs_result_count"):
+                self.exp_docs_result_count.setText("0")
+                self._update_expense_detail()
             return
         selected_filter = self.exp_filter_object.currentData()
-        only_unallocated = self.exp_filter_unallocated.isChecked()
+        only_unallocated = self.exp_filter_unallocated.isChecked() or selected_filter == "unassigned"
         status_filter = self.exp_filter_status.currentData()
+        search_text = (
+            self.exp_search.text().strip().casefold()
+            if hasattr(self, "exp_search") else ""
+        )
         documents, online = self._expense_register_snapshot(date_from, date_to)
         base_filtered = []
         for document in documents:
             allocations = document.get("allocations") or []
+            if selected_filter == "unassigned" and allocations:
+                continue
             if selected_filter == "company" and not any(item.get("object_id") is None and item.get("destination", "company") == "company" for item in allocations):
                 continue
             if isinstance(selected_filter, int) and not any(item.get("object_id") == selected_filter for item in allocations):
@@ -7474,8 +7923,15 @@ class SmartReportApp(QMainWindow):
             base_filtered.append(document)
         filtered = [
             document for document in base_filtered
-            if status_filter == "all" or self._expense_register_status_key(document) == status_filter
+            if (status_filter == "all" or self._expense_register_status_key(document) == status_filter)
+            and (
+                not search_text
+                or search_text in " ".join(str(document.get(key) or "")
+                                           for key in ("supplier_name", "invoice_number")).casefold()
+            )
         ]
+        if hasattr(self, "exp_metrics"):
+            self._update_expense_summary_cards(base_filtered)
 
         selected_identity = None
         current_row = self.table_supplier_documents.currentRow()
@@ -7517,8 +7973,10 @@ class SmartReportApp(QMainWindow):
             state_summary += f" · Входящих вне выбранного периода: {outside_period}"
         self.exp_docs_state_counts_lbl.setText(state_summary)
 
-        self.table_supplier_documents.setCurrentCell(-1, -1)
-        self.table_supplier_documents.setRowCount(len(filtered))
+        table = self.table_supplier_documents
+        blocker = QSignalBlocker(table)
+        table.setCurrentCell(-1, -1)
+        table.setRowCount(len(filtered))
         restored_row = -1
         for row_index, document in enumerate(filtered):
             allocations = document.get("allocations") or []
@@ -7542,15 +8000,29 @@ class SmartReportApp(QMainWindow):
                     status += "; " + "; ".join(processing["errors"])
             row_color = EXPENSE_REGISTER_ROW_COLORS[
                 self._expense_register_row_tone(document)]
+            short_status = {
+                "requires_review": "Требует проверки",
+                "later": "Отложен",
+                "accounted": "Учтён",
+                "ignored": "Не учитывать",
+                "transfer": "Ошибка передачи",
+            }[self._expense_register_status_key(document)]
+            if (self._expense_register_status_key(document) == "requires_review"
+                    and allocations):
+                short_status = "Назначено · ждёт проверки"
+            if (self._expense_register_status_key(document) == "transfer"
+                    and document.get("sync_state") in {"pending", "unverified"}):
+                short_status = "Повторить передачу"
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "Не указана",
-                document.get("supplier_name") or "Не указан",
+                (document.get("supplier_name") or "Не указан")
+                + "\n№ " + str(document.get("invoice_number") or "не указан"),
                 document.get("invoice_number") or "Не указан",
                 object_label,
                 f"{document['gross_amount']} {currency}" if document.get("gross_amount") is not None else "Не определена",
                 vat_text,
-                status,
+                short_status,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -7561,24 +8033,42 @@ class SmartReportApp(QMainWindow):
                     item.setToolTip("Дата в документе не указана или не распознана.")
                 elif column == 2 and not document.get("supplier_name"):
                     item.setToolTip("Поставщик не указан или не распознан.")
+                elif column == 2:
+                    item.setToolTip(
+                        f"{document.get('supplier_name') or 'Не указан'} · "
+                        f"№ {document.get('invoice_number') or 'не указан'}"
+                    )
                 elif column == 3 and not document.get("invoice_number"):
                     item.setToolTip("Номер документа отсутствует или не распознан.")
                 elif column == 5 and document.get("gross_amount") is None:
                     item.setToolTip("Сумма не определена; проверьте оригинал.")
+                elif column == 5:
+                    item.setToolTip(
+                        f"С НДС: {document.get('gross_amount')} {currency}\n"
+                        f"Без НДС: {document.get('net_amount') or 'неизвестно'} {currency}\n"
+                        f"НДС: {vat_text}"
+                    )
                 elif column == 6 and document.get("vat_amount") is None:
                     item.setToolTip("НДС не указан или не распознан. Он не вычислялся автоматически.")
                 elif column == 7:
                     item.setToolTip(status)
-                self.table_supplier_documents.setItem(row_index, column, item)
-            self.table_supplier_documents.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
+                table.setItem(row_index, column, item)
+            table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
             identity = (document.get("incoming_document_id") or
                         document.get("client_id") or document.get("id"))
             if identity == selected_identity:
                 restored_row = row_index
         if restored_row >= 0:
-            self.table_supplier_documents.setCurrentCell(restored_row, 1)
-        self.table_supplier_documents.verticalScrollBar().setValue(vertical_scroll)
-        self.table_supplier_documents.horizontalScrollBar().setValue(horizontal_scroll)
+            table.setCurrentCell(restored_row, 1)
+        elif filtered:
+            table.setCurrentCell(0, 1)
+        table.verticalScrollBar().setValue(vertical_scroll)
+        table.horizontalScrollBar().setValue(horizontal_scroll)
+        del blocker
+        if hasattr(self, "exp_docs_result_count"):
+            self.exp_docs_result_count.setText(f"{len(filtered)} из {len(documents)}")
+        if hasattr(self, "exp_detail_scroll"):
+            self._update_expense_detail()
 
         if not filtered:
             if not documents:
@@ -8045,7 +8535,8 @@ class SmartReportApp(QMainWindow):
         return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _expense_document_review_dialog(
-        self, document=None, source_paths=None, parsed_fields=None, recognition_message=""
+        self, document=None, source_paths=None, parsed_fields=None, recognition_message="",
+        assignment_only=False,
     ):
         document = dict(document or {})
         if document.get("usage") == "object_cost" and not document.get("local_conflict_payload"):
@@ -8145,6 +8636,9 @@ class SmartReportApp(QMainWindow):
             status.addItem(label, value)
         status_index = status.findData(str(document.get("verification_status") or "requires_review"))
         status.setCurrentIndex(max(0, status_index))
+        if assignment_only:
+            status.setEnabled(False)
+            status.setToolTip("Изменение назначения не меняет состояние проверки или подтверждения.")
 
         form.addRow("Поставщик:", supplier)
         form.addRow("Дата:", document_date)
@@ -8204,6 +8698,13 @@ class SmartReportApp(QMainWindow):
         additional_toggle.toggled.connect(additional_fields.setVisible)
         form.addRow(additional_toggle)
         form.addRow(additional_fields)
+        if assignment_only:
+            for widget in (
+                supplier, document_date, due_date_input, due_date_reviewed,
+                gross_amount, vat_amount, currency, comment, invoice_number,
+                category, status, additional_toggle,
+            ):
+                widget.setEnabled(False)
 
         def append_allocation(object_id, allocated_gross, allocated_vat):
             row = split_table.rowCount()
@@ -8265,7 +8766,9 @@ class SmartReportApp(QMainWindow):
         update_net_preview()
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить документ")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(
+            "Сохранить назначение" if assignment_only else "Сохранить документ"
+        )
         def accept_due_date():
             if object_cost:
                 dialog.accept()
@@ -8354,7 +8857,10 @@ class SmartReportApp(QMainWindow):
             "invoice_number": invoice_number.text().strip(),
             "document_type": document.get("document_type") or parsed_fields.get("document_type") or "manual",
             "usage": document.get("usage"),
-            "verification_status": status.currentData(),
+            "verification_status": (
+                document.get("verification_status") or "requires_review"
+                if assignment_only else status.currentData()
+            ),
             "allocations": allocations,
         }
         if object_cost:
@@ -8563,12 +9069,13 @@ class SmartReportApp(QMainWindow):
         except Exception as error:
             QMessageBox.warning(self, "Распознавание", str(error))
 
-    def _selected_expense_document(self, table):
+    def _selected_expense_document(self, table, notify=True):
         row = table.currentRow()
         item = table.item(row, 0) if row >= 0 else None
         document = item.data(Qt.ItemDataRole.UserRole) if item else None
         if not isinstance(document, dict):
-            QMessageBox.information(self, "Расход", "Выберите документ.")
+            if notify:
+                QMessageBox.information(self, "Расход", "Выберите документ.")
             return None
         return document
 

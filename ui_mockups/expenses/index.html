@@ -1,0 +1,1046 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>SmartReport — Расходы · концепт</title>
+  <style>
+    :root {
+      font-family: "Segoe UI", Arial, sans-serif;
+      color-scheme: light;
+      --page: #f2f5f8;
+      --surface: #ffffff;
+      --surface-soft: #f7f9fb;
+      --border: #e2e8ee;
+      --text: #263547;
+      --muted: #718094;
+      --brand: #16725e;
+      --brand-strong: #105d4d;
+      --brand-soft: #e7f3ef;
+      --blue: #47789c;
+      --amber: #926b22;
+      --amber-soft: #fbf3df;
+      --green: #2b7654;
+      --green-soft: #e8f4ec;
+      --red: #a55050;
+      --red-soft: #f8ebeb;
+      --row-selected: #edf5f2;
+      --shadow: 0 8px 26px rgb(34 53 73 / 6%);
+      --radius: 12px;
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --page: #171d25;
+      --surface: #202832;
+      --surface-soft: #252f39;
+      --border: #35414d;
+      --text: #e6edf2;
+      --muted: #a2b0bd;
+      --brand: #76c5aa;
+      --brand-strong: #9cddc6;
+      --brand-soft: #243a35;
+      --blue: #8eb6d1;
+      --amber: #e0bd72;
+      --amber-soft: #3a3324;
+      --green: #87c8a4;
+      --green-soft: #25392e;
+      --red: #dfa0a0;
+      --red-soft: #3b292c;
+      --row-selected: #263a36;
+      --shadow: 0 8px 26px rgb(0 0 0 / 16%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      min-height: 100vh;
+      background: var(--page);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    button, input, select { font: inherit; }
+    button { color: inherit; }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 30px;
+      padding: 22px 14px 18px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 8px;
+      font-size: 17px;
+      font-weight: 720;
+      letter-spacing: -.3px;
+    }
+
+    .brand-mark {
+      width: 31px;
+      height: 31px;
+      display: grid;
+      place-items: center;
+      border-radius: 9px;
+      color: #fff;
+      background: #16725e;
+      font-size: 16px;
+      font-weight: 800;
+    }
+
+    .nav-group { display: grid; gap: 5px; }
+
+    .nav-label {
+      padding: 0 11px 6px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .8px;
+      text-transform: uppercase;
+    }
+
+    .nav-link {
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 0 11px;
+      border-radius: 8px;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 550;
+    }
+
+    .nav-link .icon {
+      width: 19px;
+      flex: 0 0 19px;
+      text-align: center;
+      font-size: 16px;
+    }
+
+    .nav-link.active {
+      color: var(--brand-strong);
+      background: var(--brand-soft);
+      font-weight: 680;
+    }
+
+    .side-bottom { margin-top: auto; }
+
+    .user-chip {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 9px 0;
+      border-top: 1px solid var(--border);
+    }
+
+    .avatar {
+      width: 32px;
+      height: 32px;
+      display: grid;
+      flex: 0 0 32px;
+      place-items: center;
+      border-radius: 50%;
+      color: var(--brand-strong);
+      background: var(--brand-soft);
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .user-name { font-size: 12px; font-weight: 650; }
+    .user-role { color: var(--muted); font-size: 11px; }
+
+    .main { min-width: 0; padding: 24px 28px 32px; }
+
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+
+    .breadcrumbs { margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+    h1 { margin: 0; font-size: 25px; line-height: 1.2; letter-spacing: -.5px; }
+    .subtitle { margin-top: 6px; color: var(--muted); font-size: 13px; }
+
+    .top-actions { display: flex; align-items: center; gap: 9px; }
+
+    .button {
+      min-height: 37px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 620;
+      white-space: nowrap;
+    }
+
+    .button:hover { border-color: var(--brand); }
+    .button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, .choice:focus-within {
+      outline: 2px solid var(--brand);
+      outline-offset: 2px;
+    }
+
+    .button.primary {
+      border-color: var(--brand);
+      background: var(--brand);
+      color: #fff;
+    }
+
+    :root[data-theme="dark"] .button.primary { color: #17241f; }
+    .button.primary:hover { background: var(--brand-strong); }
+    .button.icon-only { width: 37px; padding: 0; font-size: 16px; }
+    .button:disabled { opacity: .48; cursor: not-allowed; }
+
+    .demo-note {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 17px;
+      padding: 9px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 11px;
+    }
+
+    .demo-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 13px;
+      margin-bottom: 17px;
+    }
+
+    .metric {
+      min-height: 103px;
+      padding: 15px 17px 13px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .metric-top { display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+    .metric-label { font-size: 12px; font-weight: 670; }
+    .metric-icon { color: var(--muted); font-size: 15px; }
+    .metric-value { margin-top: 8px; font-size: 22px; font-weight: 740; letter-spacing: -.55px; }
+    .metric-meta { margin-top: 2px; color: var(--muted); font-size: 11px; }
+    .metric.review .metric-icon, .metric.review .metric-value { color: var(--amber); }
+    .metric.unallocated .metric-icon, .metric.unallocated .metric-value { color: var(--blue); }
+
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 9px;
+      margin-bottom: 13px;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+    }
+
+    .filter { display: grid; gap: 4px; }
+    .filter label { color: var(--muted); font-size: 10px; font-weight: 660; }
+
+    .control {
+      height: 34px;
+      min-width: 116px;
+      padding: 0 9px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      outline: none;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .control:focus { border-color: var(--brand); }
+    .control.date { min-width: 143px; }
+    .control.search { width: 210px; }
+    .range-separator { align-self: center; padding-top: 14px; color: var(--muted); font-size: 11px; }
+    .filter.search-filter { margin-left: auto; }
+
+    .content-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(350px, .95fr);
+      align-items: start;
+      gap: 14px;
+    }
+
+    .panel {
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .panel-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 51px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-title { font-size: 13px; font-weight: 700; }
+    .result-count { color: var(--muted); font-size: 11px; }
+
+    .table-scroll { overflow: auto; max-height: 540px; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-soft);
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    tbody tr { cursor: pointer; transition: background-color .12s ease; }
+    tbody tr:hover { background: var(--surface-soft); }
+    tbody tr.selected { background: var(--row-selected); }
+    tbody tr:last-child td { border-bottom: 0; }
+    .date-cell { color: var(--muted); white-space: nowrap; }
+    .supplier { font-weight: 680; }
+    .doc-number { margin-top: 2px; color: var(--muted); font-size: 10px; }
+    .destination { max-width: 175px; color: var(--text); line-height: 1.35; }
+    .destination.muted { color: var(--muted); }
+    .amount { font-weight: 680; white-space: nowrap; }
+    .amount small { display: block; color: var(--muted); font-size: 9px; font-weight: 450; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 7px;
+      border-radius: 99px;
+      font-size: 10px;
+      font-weight: 650;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    .badge.review { color: var(--amber); background: var(--amber-soft); }
+    .badge.accounted { color: var(--green); background: var(--green-soft); }
+    .badge.later { color: var(--muted); background: var(--surface-soft); }
+    .badge.transfer { color: var(--red); background: var(--red-soft); }
+    .badge.distributed { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, var(--surface)); }
+    .table-footer { padding: 10px 13px; border-top: 1px solid var(--border); color: var(--muted); font-size: 10px; }
+
+    .detail { position: sticky; top: 12px; }
+    .detail .panel-heading { min-height: 52px; }
+    .detail-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .detail-heading .panel-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detail-body {
+      display: grid;
+      grid-template-columns: minmax(0, .95fr) minmax(0, 1.05fr);
+      align-items: start;
+      gap: 14px;
+      padding: 14px;
+    }
+    .section-heading { margin: 0 0 8px; color: var(--muted); font-size: 10px; font-weight: 720; letter-spacing: .35px; text-transform: uppercase; }
+
+    .document-preview {
+      position: relative;
+      min-height: 151px;
+      display: grid;
+      place-items: center;
+      padding: 12px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface-soft);
+    }
+
+    .paper {
+      width: min(100%, 300px);
+      min-height: 131px;
+      padding: 12px 15px;
+      border: 1px solid #e8e8e5;
+      border-radius: 3px;
+      background: #fff;
+      color: #26313c;
+      box-shadow: 0 2px 8px rgb(28 39 50 / 12%);
+      font-size: 9px;
+      transition: min-height .15s ease;
+    }
+
+    .document-preview.expanded .paper { min-height: 215px; }
+    .paper-head { display: flex; justify-content: space-between; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid #e8ebed; }
+    .paper-brand { font-size: 12px; font-weight: 800; letter-spacing: .35px; }
+    .paper-subtitle { color: #738090; font-size: 8px; }
+    .paper-invoice { text-align: right; }
+    .paper-lines { display: grid; gap: 5px; padding-top: 8px; }
+    .paper-line { display: flex; justify-content: space-between; gap: 10px; }
+    .paper-line.total { margin-top: 2px; padding-top: 5px; border-top: 1px solid #dfe4e7; font-weight: 800; }
+    .paper-note { margin-top: 7px; color: #8a939e; font-size: 7px; }
+
+    .document-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; }
+    .document-actions span { color: var(--muted); font-size: 10px; }
+    .button.small { min-height: 29px; padding: 0 9px; font-size: 10px; }
+
+    .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+    .meta-label { color: var(--muted); font-size: 10px; }
+    .meta-value { margin-top: 2px; font-size: 12px; font-weight: 650; overflow-wrap: anywhere; }
+    .amounts {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 7px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface-soft);
+    }
+
+    .amount-card { min-width: 0; }
+    .amount-card .meta-label { font-size: 9px; }
+    .amount-card .meta-value { font-size: 11px; }
+    .amount-card.total { color: var(--brand-strong); }
+    .tax-note { grid-column: 1 / -1; color: var(--muted); font-size: 9px; }
+
+    .assignment-list { display: grid; gap: 6px; }
+    .choice {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 38px;
+      padding: 7px 9px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 580;
+    }
+
+    .choice:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); }
+    .choice input { accent-color: var(--brand); }
+    .assignment-extra { margin: 7px 0 0 26px; }
+    .assignment-extra .control { width: 100%; }
+    .assignment-hint { margin: 6px 0 0 26px; color: var(--muted); font-size: 10px; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+      gap: 6px 8px;
+      color: var(--muted);
+      font-size: 9px;
+    }
+
+    .flow-step { display: flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+    .flow-step .step-dot {
+      width: 17px;
+      height: 17px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      background: var(--surface);
+      font-size: 9px;
+    }
+
+    .flow-step.done { color: var(--green); }
+    .flow-step.done .step-dot { border-color: var(--green); background: var(--green-soft); }
+    .flow-line { display: none; }
+    .detail-column.full { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+    .primary-action { width: 100%; min-height: 40px; }
+    .action-hint { color: var(--muted); font-size: 10px; text-align: center; }
+
+    .empty-state { padding: 28px 12px; color: var(--muted); text-align: center; }
+
+    .below-tools {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    details.utility {
+      min-width: min(100%, 290px);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface);
+    }
+
+    details.utility summary {
+      padding: 9px 12px;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .utility-content { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 10px 10px; }
+    .utility-content p { width: 100%; margin: 0; color: var(--muted); font-size: 10px; }
+    .tech { flex: 1; text-align: right; }
+    .tech summary { display: inline-block; padding: 8px 0; color: var(--muted); cursor: pointer; font-size: 10px; }
+    .tech-content { max-width: 450px; margin: 0 0 0 auto; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--muted); font-size: 10px; text-align: left; }
+
+    .toast {
+      position: fixed;
+      right: 24px;
+      bottom: 20px;
+      z-index: 5;
+      max-width: min(400px, calc(100vw - 32px));
+      padding: 11px 14px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      font-size: 12px;
+    }
+
+    .toast[hidden] { display: none; }
+    #detail-status[hidden] { display: none; }
+    .menu { position: relative; }
+    .menu > summary { list-style: none; }
+    .menu > summary::-webkit-details-marker { display: none; }
+    .menu-content {
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      z-index: 4;
+      min-width: 195px;
+      flex-direction: column;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    @media (max-width: 1180px) {
+      .app { grid-template-columns: 66px minmax(0, 1fr); }
+      .sidebar { align-items: center; padding-inline: 8px; }
+      .brand { padding: 0; }
+      .brand-name, .nav-label, .nav-link .nav-text, .user-details { display: none; }
+      .nav-group { width: 100%; }
+      .nav-link { justify-content: center; padding: 0; }
+      .user-chip { justify-content: center; padding-inline: 0; }
+      .main { padding-inline: 20px; }
+      .content-grid { grid-template-columns: minmax(0, 1fr); }
+      .detail { position: static; }
+      .table-scroll { max-height: 390px; }
+    }
+
+    @media (max-width: 980px) {
+      .detail-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+      .detail-column { display: grid; gap: 13px; min-width: 0; }
+      .detail-column.full { grid-column: 1 / -1; }
+    }
+
+    @media (max-width: 700px) {
+      .main { padding: 17px 12px 24px; }
+      .topbar { align-items: center; }
+      h1 { font-size: 22px; }
+      .subtitle { max-width: 45ch; font-size: 11px; }
+      .metrics { grid-template-columns: minmax(0, 1fr); gap: 7px; }
+      .metric {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        min-height: 66px;
+        padding: 9px 11px;
+      }
+      .metric-top { grid-column: 1; grid-row: 1; justify-content: flex-start; }
+      .metric-value { grid-column: 2; grid-row: 1; margin-top: 0; font-size: 15px; white-space: nowrap; }
+      .metric-meta { grid-column: 1 / -1; grid-row: 2; font-size: 9px; }
+      .metric-label { font-size: 10px; }
+      .filters { align-items: end; gap: 8px; padding: 9px; }
+      .filter { flex: 1 1 125px; }
+      .filter.search-filter { flex: 1 1 100%; margin-left: 0; }
+      .control, .control.date, .control.search { width: 100%; min-width: 0; }
+      .range-separator { display: none; }
+      .filters .filter:nth-child(3) { flex-basis: 100%; }
+      .filters .filter:nth-child(4) { flex-basis: 100%; }
+      .table-scroll { max-height: 330px; }
+      table { min-width: 620px; }
+      .detail-body { grid-template-columns: minmax(0, 1fr); }
+      .detail-column.full { grid-column: auto; }
+      .top-actions .button:not(.icon-only) { display: none; }
+      .below-tools { display: grid; }
+      .tech { text-align: left; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" aria-label="Главная навигация">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <span class="brand-name">SmartReport</span>
+      </div>
+      <nav class="nav-group" aria-label="Разделы">
+        <div class="nav-label">Рабочее</div>
+        <a class="nav-link" href="#" aria-label="Обзор"><span class="icon">⌂</span><span class="nav-text">Обзор</span></a>
+        <a class="nav-link" href="#" aria-label="Смены"><span class="icon">◷</span><span class="nav-text">Смены</span></a>
+        <a class="nav-link active" href="#expenses" aria-current="page" aria-label="Расходы"><span class="icon">▤</span><span class="nav-text">Расходы</span></a>
+        <a class="nav-link" href="#" aria-label="По объектам"><span class="icon">⌖</span><span class="nav-text">По объектам</span></a>
+        <div class="nav-label" style="margin-top: 15px">Финансы</div>
+        <a class="nav-link" href="#" aria-label="Отчёты и фактурирование"><span class="icon">▧</span><span class="nav-text">Отчёты и фактурирование</span></a>
+        <a class="nav-link" href="#" aria-label="Сотрудники"><span class="icon">♙</span><span class="nav-text">Сотрудники</span></a>
+      </nav>
+      <div class="side-bottom">
+        <div class="user-chip">
+          <div class="avatar" aria-hidden="true">MB</div>
+          <div class="user-details"><div class="user-name">Михаил</div><div class="user-role">Директор</div></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main" id="expenses">
+      <header class="topbar">
+        <div>
+          <div class="breadcrumbs">Финансы <span aria-hidden="true">/</span> Расходы</div>
+          <h1>Расходы</h1>
+          <div class="subtitle">Проверьте документы и распределите затраты по фирме и объектам.</div>
+        </div>
+        <div class="top-actions">
+          <button class="button" type="button" id="theme-toggle" aria-label="Переключить тему">◐ <span id="theme-label">Тёмная тема</span></button>
+          <details class="menu">
+            <summary class="button icon-only" aria-label="Дополнительные действия" title="Дополнительные действия">···</summary>
+            <div class="utility-content menu-content">
+              <button class="button small" type="button" data-utility="Загрузить PDF или фото">Загрузить документ</button>
+              <button class="button small" type="button" data-utility="Добавить расход вручную">Добавить вручную</button>
+              <button class="button small" type="button" data-utility="Открыть входящие документы">Входящие</button>
+            </div>
+          </details>
+        </div>
+      </header>
+
+      <div class="demo-note"><span class="demo-dot" aria-hidden="true"></span>Демонстрационный макет · примеры не связаны с базой данных и никуда не отправляются</div>
+
+      <section class="metrics" aria-label="Сводка расходов">
+        <article class="metric">
+          <div class="metric-top"><div class="metric-label">Учтённые расходы</div><span class="metric-icon" aria-hidden="true">✓</span></div>
+          <div class="metric-value" id="metric-accounted">—</div>
+          <div class="metric-meta" id="metric-accounted-meta">с НДС · без НДС —</div>
+        </article>
+        <article class="metric review">
+          <div class="metric-top"><div class="metric-label">Требуют проверки</div><span class="metric-icon" aria-hidden="true">◷</span></div>
+          <div class="metric-value" id="metric-review">—</div>
+          <div class="metric-meta" id="metric-review-meta">с НДС · не включены в учтённые расходы</div>
+        </article>
+        <article class="metric unallocated">
+          <div class="metric-top"><div class="metric-label">Не распределены</div><span class="metric-icon" aria-hidden="true">↗</span></div>
+          <div class="metric-value" id="metric-unallocated">—</div>
+          <div class="metric-meta" id="metric-unallocated-meta">с НДС · не включены в учтённые расходы</div>
+        </article>
+      </section>
+
+      <section class="filters" aria-label="Фильтры документов">
+        <div class="filter">
+          <label for="date-from">Период с</label>
+          <input class="control date" id="date-from" type="date" value="2026-11-01">
+        </div>
+        <span class="range-separator" aria-hidden="true">—</span>
+        <div class="filter">
+          <label for="date-to">по</label>
+          <input class="control date" id="date-to" type="date" value="2026-11-30">
+        </div>
+        <div class="filter">
+          <label for="object-filter">Объект / назначение</label>
+          <select class="control" id="object-filter">
+            <option value="all">Все объекты</option>
+            <option value="company">Общие расходы фирмы</option>
+            <option value="site-north">ЖК «Северный»</option>
+            <option value="site-river">Речной, корпус 2</option>
+            <option value="unassigned">Без назначения</option>
+          </select>
+        </div>
+        <div class="filter">
+          <label for="status-filter">Состояние</label>
+          <select class="control" id="status-filter">
+            <option value="all">Все состояния</option>
+            <option value="review">Требуют проверки</option>
+            <option value="accounted">Учтённые</option>
+            <option value="later">Отложенные</option>
+            <option value="transfer">Ошибка передачи</option>
+          </select>
+        </div>
+        <div class="filter search-filter">
+          <label for="search">Поставщик или номер документа</label>
+          <input class="control search" id="search" type="search" placeholder="Например, EasyPark или DEMO-EP-001" autocomplete="off">
+        </div>
+      </section>
+
+      <section class="content-grid" aria-label="Реестр расходов и выбранный документ">
+        <article class="panel">
+          <div class="panel-heading">
+            <div class="panel-title">Документы</div>
+            <div class="result-count" id="result-count" aria-live="polite">—</div>
+          </div>
+          <div class="table-scroll">
+            <table aria-label="Документы расходов">
+              <thead>
+                <tr>
+                  <th scope="col">Дата</th>
+                  <th scope="col">Поставщик / документ</th>
+                  <th scope="col">Назначение</th>
+                  <th scope="col">Сумма</th>
+                  <th scope="col">Состояние</th>
+                </tr>
+              </thead>
+              <tbody id="documents-body"></tbody>
+            </table>
+          </div>
+          <div class="table-footer">Распределение не означает подтверждение: проверка и учёт показаны отдельно.</div>
+        </article>
+
+        <aside class="panel detail" id="detail-panel" aria-label="Проверка выбранного документа">
+          <div class="panel-heading">
+            <div class="detail-heading">
+              <div class="panel-title" id="detail-title">Проверка документа</div>
+              <span class="badge review" id="detail-status">Требует проверки</span>
+            </div>
+            <span class="result-count" id="detail-index">1 из 8</span>
+          </div>
+          <div class="detail-body" id="detail-body"></div>
+        </aside>
+      </section>
+
+      <div class="below-tools">
+        <details class="utility">
+          <summary>Ещё действия</summary>
+          <div class="utility-content">
+            <button class="button small" type="button" data-utility="Повторно распознать сохранённый оригинал">Повторить распознавание</button>
+            <button class="button small" type="button" data-utility="Рассчитать НДС по позициям">Рассчитать НДС</button>
+            <button class="button small" type="button" data-utility="Удалить документ">Удалить документ</button>
+            <p>Действия с документом доступны в контексте выбранной строки.</p>
+          </div>
+        </details>
+        <details class="tech">
+          <summary>Техническая информация</summary>
+          <div class="tech-content">Локальный концепт интерфейса. Сервер, рабочая очередь, синхронизация, базы и файлы приложения не подключены.</div>
+        </details>
+      </div>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script>
+    const documents = [
+      { id: "easypark", date: "2026-11-02", supplier: "EasyPark AB", number: "DEMO-EP-001", net: 920, vat: 230, gross: 1150, currency: "SEK", status: "review", destination: null, allocation: null, category: "Парковка", description: "Парковочные сессии · 01–02 ноября" },
+      { id: "ahlsell", date: "2026-11-06", supplier: "Ahlsell Sverige AB", number: "47628105", net: 6288, vat: 1572, gross: 7860, currency: "SEK", status: "review", destination: "site-north", allocation: "ЖК «Северный»", category: "Материалы", description: "Крепёж и монтажные материалы" },
+      { id: "circlek", date: "2026-11-08", supplier: "Circle K Sverige AB", number: "83017429", net: 3744, vat: 936, gross: 4680, currency: "SEK", status: "accounted", destination: "company", allocation: "Общие расходы фирмы", category: "Топливо", description: "Заправка служебного автомобиля" },
+      { id: "ramirent", date: "2026-11-10", supplier: "Ramirent AB", number: "RI-2026-11108", net: 14736, vat: 3684, gross: 18420, currency: "SEK", status: "accounted", destination: "split", allocation: "ЖК «Северный» · Речной, корпус 2", category: "Аренда техники", description: "Аренда подъёмника · 4 дня", split: [{ name: "ЖК «Северный»", value: 11052 }, { name: "Речной, корпус 2", value: 7368 }] },
+      { id: "byggmax", date: "2026-11-12", supplier: "Byggmax AB", number: "BM-9061884", net: 8200, vat: 2050, gross: 10250, currency: "SEK", status: "accounted", destination: "site-river", allocation: "Речной, корпус 2", category: "Материалы", description: "Смесь и расходные материалы" },
+      { id: "nordbygg", date: "2026-11-14", supplier: "Nordbygg Gross AB", number: "NB-7741-26", net: 6288, vat: 1572, gross: 7860, currency: "SEK", status: "review", destination: "site-river", allocation: "Речной, корпус 2", category: "Материалы", description: "Листы и профили" },
+      { id: "bauhaus", date: "2026-11-17", supplier: "BAUHAUS & Co KB", number: "BH-20845731", net: 3898, vat: 974.5, gross: 4872.5, currency: "SEK", status: "later", destination: null, allocation: null, category: "Инструмент", description: "Расходные инструменты" },
+      { id: "bygglogik", date: "2026-11-18", supplier: "Bygglogik AB", number: "BL-526104", net: 3800, vat: 950, gross: 4750, currency: "SEK", status: "transfer", destination: null, allocation: null, category: "Материалы", description: "Соединительные детали", syncError: true }
+    ];
+
+    const stateNames = {
+      review: "Требует проверки",
+      accounted: "Учтён",
+      later: "Отложен",
+      transfer: "Проверить передачу"
+    };
+    const money = value => new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+    const shortDate = value => new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(`${value}T12:00:00`));
+    const esc = value => String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+    let selectedId = "easypark";
+    let selectedAssignment = null;
+    let checkedDocuments = new Set();
+    let toastTimer;
+
+    const byId = id => document.getElementById(id);
+    const selectedDocument = () => documents.find(doc => doc.id === selectedId);
+
+    function destinationLabel(doc) {
+      if (!doc.destination) return "Не назначено";
+      if (doc.destination === "company") return "Общие расходы фирмы";
+      if (doc.destination === "split") return "Разделено между объектами";
+      return doc.allocation || "На объект";
+    }
+
+    function stateBadge(doc) {
+      const tone = doc.status === "review" ? "review" : doc.status === "accounted" ? "accounted" : doc.status === "later" ? "later" : "transfer";
+      let label = stateNames[doc.status];
+      if (doc.status === "review" && doc.destination) label = "Назначен · ждёт проверки";
+      return `<span class="badge ${tone}">${esc(label)}</span>`;
+    }
+
+    function filteredDocuments() {
+      const from = byId("date-from").value;
+      const to = byId("date-to").value;
+      const object = byId("object-filter").value;
+      const state = byId("status-filter").value;
+      const query = byId("search").value.trim().toLocaleLowerCase("ru");
+      if (from && to && from > to) return [];
+      return documents.filter(doc => {
+        const inPeriod = (!from || doc.date >= from) && (!to || doc.date <= to);
+        const matchesObject = object === "all" ||
+          (object === "unassigned" ? !doc.destination :
+            object === "company" ? doc.destination === "company" :
+              doc.destination === object || (doc.destination === "split" && doc.split.some(part => object === "site-north" ? part.name.includes("Северный") : part.name.includes("Речной"))));
+        const matchesState = state === "all" || doc.status === state;
+        const matchesQuery = !query || `${doc.supplier} ${doc.number}`.toLocaleLowerCase("ru").includes(query);
+        return inPeriod && matchesObject && matchesState && matchesQuery;
+      });
+    }
+
+    function renderMetrics() {
+      const accounted = documents.filter(doc => doc.status === "accounted");
+      const review = documents.filter(doc => doc.status === "review");
+      const unallocated = documents.filter(doc => !doc.destination && doc.status !== "accounted");
+      const total = list => list.reduce((sum, doc) => sum + doc.gross, 0);
+      const net = list => list.reduce((sum, doc) => sum + doc.net, 0);
+      byId("metric-accounted").textContent = `${money(total(accounted))} kr`;
+      byId("metric-accounted-meta").textContent = `с НДС · без НДС ${money(net(accounted))} kr`;
+      byId("metric-review").textContent = `${money(total(review))} kr`;
+      byId("metric-review-meta").textContent = `с НДС · ${review.length} документа, отдельно от учтённых`;
+      byId("metric-unallocated").textContent = `${money(total(unallocated))} kr`;
+      byId("metric-unallocated-meta").textContent = `с НДС · ${unallocated.length} документа, не входят в учтённые`;
+    }
+
+    function renderTable() {
+      const list = filteredDocuments();
+      byId("result-count").textContent = `${list.length} из ${documents.length}`;
+      const body = byId("documents-body");
+      if (!list.length) {
+        body.innerHTML = `<tr><td colspan="5"><div class="empty-state">${byId("date-from").value > byId("date-to").value ? "Начало периода позже окончания." : "Документы не найдены. Измените условия фильтра."}</div></td></tr>`;
+        renderDetail();
+        return;
+      }
+      if (!list.some(doc => doc.id === selectedId)) selectedId = list[0].id;
+      body.innerHTML = list.map(doc => `
+        <tr data-id="${esc(doc.id)}" class="${doc.id === selectedId ? "selected" : ""}" tabindex="0" aria-selected="${doc.id === selectedId}">
+          <td class="date-cell">${shortDate(doc.date)}</td>
+          <td><div class="supplier">${esc(doc.supplier)}</div><div class="doc-number">№ ${esc(doc.number)}</div></td>
+          <td><div class="destination ${doc.destination ? "" : "muted"}">${esc(destinationLabel(doc))}</div></td>
+          <td class="amount">${money(doc.gross)} kr<small>с НДС</small></td>
+          <td>${stateBadge(doc)}</td>
+        </tr>`).join("");
+      body.querySelectorAll("tr[data-id]").forEach(row => {
+        const select = () => {
+          selectedId = row.dataset.id;
+          selectedAssignment = null;
+          renderTable();
+        };
+        row.addEventListener("click", select);
+        row.addEventListener("keydown", event => {
+          if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); }
+        });
+      });
+      renderDetail();
+    }
+
+    function renderPaper(doc) {
+      const number = doc.number;
+      const total = money(doc.gross);
+      const vat = money(doc.vat);
+      return `<div class="paper" aria-label="Фрагмент оригинала фактуры">
+        <div class="paper-head">
+          <div><div class="paper-brand">${esc(doc.supplier)}</div><div class="paper-subtitle">Счёт-фактура · оригинал PDF</div></div>
+          <div class="paper-invoice"><strong>ФАКТУРА</strong><br><span class="paper-subtitle">№ ${esc(number)}</span></div>
+        </div>
+        <div class="paper-lines">
+          <div class="paper-line"><span>Дата документа</span><strong>${shortDate(doc.date)}</strong></div>
+          <div class="paper-line"><span>${esc(doc.description)}</span><strong>${money(doc.net)} kr</strong></div>
+          <div class="paper-line"><span>НДС</span><strong>${vat} kr</strong></div>
+          <div class="paper-line total"><span>Итого к оплате, с НДС</span><strong>${total} kr</strong></div>
+        </div>
+        <div class="paper-note">Иллюстрация оригинала · демонстрационные данные</div>
+      </div>`;
+    }
+
+    function renderDetail() {
+      const doc = selectedDocument();
+      const panel = byId("detail-body");
+      if (!doc) {
+        byId("detail-title").textContent = "Документ не выбран";
+        byId("detail-status").hidden = true;
+        byId("detail-index").textContent = "—";
+        panel.innerHTML = `<div class="empty-state">Выберите документ в таблице.</div>`;
+        return;
+      }
+      byId("detail-title").textContent = doc.supplier;
+      byId("detail-status").hidden = false;
+      byId("detail-status").className = `badge ${doc.status === "accounted" ? "accounted" : doc.status === "later" ? "later" : doc.status === "transfer" ? "transfer" : "review"}`;
+      byId("detail-status").textContent = doc.status === "review" && doc.destination ? "Назначен · ждёт проверки" : stateNames[doc.status];
+      byId("detail-index").textContent = `${filteredDocuments().findIndex(item => item.id === doc.id) + 1} из ${filteredDocuments().length}`;
+
+      const checked = checkedDocuments.has(doc.id) || doc.status === "accounted";
+      const assignment = selectedAssignment?.documentId === doc.id ? selectedAssignment.value : doc.destination || "";
+      const progress = `<div class="flow" aria-label="Этапы обработки">
+        <span class="flow-step done"><span class="step-dot">1</span>Выбрать</span><span class="flow-line"></span>
+        <span class="flow-step ${checked ? "done" : ""}"><span class="step-dot">${checked ? "✓" : "2"}</span>Проверить</span><span class="flow-line"></span>
+        <span class="flow-step ${assignment ? "done" : ""}"><span class="step-dot">${assignment ? "✓" : "3"}</span>Назначить</span><span class="flow-line"></span>
+        <span class="flow-step ${doc.status === "accounted" ? "done" : ""}"><span class="step-dot">${doc.status === "accounted" ? "✓" : "4"}</span>Подтвердить</span>
+      </div>`;
+
+      let actionLabel = checked ? (assignment ? "Подтвердить расход" : "Выбрать назначение") : "Проверить фактуру";
+      let actionDisabled = doc.status === "accounted";
+      let actionHint = doc.status === "accounted" ? "Документ уже подтверждён в этом демо." :
+        !checked ? "Сверьте реквизиты с оригиналом и отметьте проверку." :
+          !assignment ? "После проверки выберите назначение расхода." :
+            "Подтверждение учтёт только этот демонстрационный документ.";
+
+      panel.innerHTML = `
+        <div class="detail-column">
+          <section aria-label="Оригинал документа">
+            <h2 class="section-heading">Оригинал</h2>
+            <div class="document-preview" id="document-preview">${renderPaper(doc)}</div>
+            <div class="document-actions"><span>PDF · демонстрационный фрагмент</span><button class="button small" id="expand-preview" type="button">Развернуть</button></div>
+          </section>
+          <section aria-label="Реквизиты документа">
+            <h2 class="section-heading">Реквизиты</h2>
+            <div class="meta-grid">
+              <div><div class="meta-label">Поставщик</div><div class="meta-value">${esc(doc.supplier)}</div></div>
+              <div><div class="meta-label">Дата</div><div class="meta-value">${shortDate(doc.date)}</div></div>
+              <div><div class="meta-label">Номер документа</div><div class="meta-value">${esc(doc.number)}</div></div>
+              <div><div class="meta-label">Категория</div><div class="meta-value">${esc(doc.category)}</div></div>
+            </div>
+          </section>
+        </div>
+        <div class="detail-column">
+          <section aria-label="Суммы документа">
+            <h2 class="section-heading">Суммы по документу</h2>
+            <div class="amounts">
+              <div class="amount-card"><div class="meta-label">Без НДС</div><div class="meta-value">${money(doc.net)} kr</div></div>
+              <div class="amount-card"><div class="meta-label">НДС</div><div class="meta-value">${money(doc.vat)} kr</div></div>
+              <div class="amount-card total"><div class="meta-label">Итого с НДС</div><div class="meta-value">${money(doc.gross)} kr</div></div>
+              <div class="tax-note">НДС показан по оригиналу, не рассчитывался автоматически.</div>
+            </div>
+          </section>
+          <section aria-label="Назначение расхода">
+            <h2 class="section-heading">Куда отнести расход</h2>
+            <div class="assignment-list" role="radiogroup" aria-label="Назначение">
+              <label class="choice"><input type="radio" name="assignment" value="company" ${assignment === "company" ? "checked" : ""}><span>Общие расходы фирмы</span></label>
+              <label class="choice"><input type="radio" name="assignment" value="site-north" ${assignment === "site-north" ? "checked" : ""}><span>На объект</span></label>
+              <label class="choice"><input type="radio" name="assignment" value="split" ${assignment === "split" ? "checked" : ""}><span>Разделить между объектами</span></label>
+            </div>
+            ${assignment === "site-north" ? `<div class="assignment-extra"><select class="control" id="site-select" aria-label="Выберите объект"><option value="site-north" selected>ЖК «Северный»</option><option value="site-river">Речной, корпус 2</option></select></div>` : ""}
+            ${assignment === "split" ? `<div class="assignment-extra"><select class="control" aria-label="Первый объект"><option>ЖК «Северный» · 574,84 kr</option><option>Речной, корпус 2 · 574,84 kr</option></select></div><div class="assignment-extra"><select class="control" aria-label="Второй объект"><option>Речной, корпус 2 · 574,84 kr</option><option>ЖК «Северный» · 574,84 kr</option></select></div>` : ""}
+            <div class="assignment-hint">${assignment ? `Текущее назначение: ${esc(assignment === "company" ? "Общие расходы фирмы" : assignment === "split" ? "Разделить между объектами" : doc.allocation || "ЖК «Северный»")}. Назначение само по себе не подтверждает расход.` : "Сначала проверьте документ, затем выберите фирму или объект."}</div>
+          </section>
+          <section class="detail-column full" aria-label="Следующий шаг">
+            ${progress}
+            <button class="button primary primary-action" id="next-action" type="button" ${actionDisabled ? "disabled" : ""}>${actionLabel}</button>
+            <div class="action-hint">${actionHint}</div>
+          </section>
+        </div>`;
+
+      panel.querySelectorAll('input[name="assignment"]').forEach(input => input.addEventListener("change", () => {
+        if (input.checked) selectedAssignment = { documentId: doc.id, value: input.value };
+        renderDetail();
+      }));
+      const siteSelect = byId("site-select");
+      if (siteSelect) siteSelect.addEventListener("change", () => {
+        selectedAssignment = { documentId: doc.id, value: siteSelect.value };
+        doc.allocation = siteSelect.options[siteSelect.selectedIndex].text;
+      });
+      byId("expand-preview").addEventListener("click", event => {
+        const preview = byId("document-preview");
+        preview.classList.toggle("expanded");
+        event.currentTarget.textContent = preview.classList.contains("expanded") ? "Свернуть" : "Развернуть";
+      });
+      byId("next-action").addEventListener("click", () => advance(doc.id));
+    }
+
+    function advance(id) {
+      const doc = documents.find(item => item.id === id);
+      if (doc.status === "accounted") return;
+      if (!checkedDocuments.has(id)) {
+        checkedDocuments.add(id);
+        showToast("Проверка отмечена в демо. Теперь выберите назначение.");
+        renderTable();
+        document.querySelector('.assignment-list input')?.focus();
+        return;
+      }
+      const assignment = selectedAssignment?.documentId === id ? selectedAssignment.value : doc.destination;
+      if (!assignment) {
+        showToast("Сначала выберите: общие расходы фирмы, объект или разделение.");
+        return;
+      }
+      doc.destination = assignment;
+      if (assignment === "company") doc.allocation = "Общие расходы фирмы";
+      if (assignment === "site-north") doc.allocation ||= "ЖК «Северный»";
+      if (assignment === "split") {
+        doc.allocation = "ЖК «Северный» · Речной, корпус 2";
+        doc.split = [{ name: "ЖК «Северный»", value: doc.gross / 2 }, { name: "Речной, корпус 2", value: doc.gross / 2 }];
+      }
+      doc.status = "accounted";
+      selectedAssignment = null;
+      showToast("Расход подтверждён только в демонстрационном макете.");
+      renderMetrics();
+      renderTable();
+    }
+
+    function showToast(message) {
+      const toast = byId("toast");
+      toast.textContent = message;
+      toast.hidden = false;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { toast.hidden = true; }, 3200);
+    }
+
+    document.querySelectorAll(".filters .control").forEach(control => {
+      control.addEventListener("input", renderTable);
+      control.addEventListener("change", renderTable);
+    });
+    document.querySelectorAll("[data-utility]").forEach(button => button.addEventListener("click", () => {
+      showToast(`${button.dataset.utility} · действие показано только в концепте.`);
+      button.closest("details")?.removeAttribute("open");
+    }));
+    byId("theme-toggle").addEventListener("click", () => {
+      const root = document.documentElement;
+      const dark = root.dataset.theme !== "dark";
+      root.dataset.theme = dark ? "dark" : "light";
+      byId("theme-label").textContent = dark ? "Светлая тема" : "Тёмная тема";
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape") document.querySelectorAll("details[open]").forEach(item => item.removeAttribute("open"));
+    });
+
+    renderMetrics();
+    renderTable();
+  </script>
+</body>
+</html>

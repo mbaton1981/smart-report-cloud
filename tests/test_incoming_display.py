@@ -310,8 +310,9 @@ class IncomingDisplayTests(unittest.TestCase):
                         elif identity == "error":
                             original_color = expected["dark"]["distributed"]
                         self.assertEqual(item.data(BACKGROUND_ROLE).lower(), original_color)
-                self.assertIn("Ожидает подтверждения сервера",
-                              table.item(row_for("pending"), 7).text())
+                pending_status = table.item(row_for("pending"), 7)
+                self.assertEqual(pending_status.text(), "Повторить передачу")
+                self.assertIn("Ожидает подтверждения сервера", pending_status.toolTip())
                 self.assertTrue(table.item(row_for("accounted"), 7).text().startswith("Учтён"))
                 self.assertNotIn("Оплачен", table.item(row_for("accounted"), 7).text())
 

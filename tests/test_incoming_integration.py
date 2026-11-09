@@ -270,7 +270,6 @@ class IncomingIntegrationTests(unittest.TestCase):
         self.assertEqual(documents[0]["allocations"][0]["object_id"], self.object_id)
 
     def test_actual_main_window_default_off_has_no_incoming_entry_or_profile(self):
-        from PyQt6.QtWidgets import QPushButton
         root = Path(self._case.name) / "test-app-data"
         root.mkdir()
         window = None
@@ -282,12 +281,196 @@ class IncomingIntegrationTests(unittest.TestCase):
             try:
                 window = self.desktop.SmartReportApp()
                 window.auto_sync_timer.stop()
-                buttons = [button for button in window.findChildren(QPushButton)
-                           if button.text() == "Открыть входящие"]
-                self.assertEqual(len(buttons), 1)
-                self.assertTrue(buttons[0].isHidden())
+                self.assertNotIn("Открыть входящие", window.exp_actions)
                 self.assertFalse((root / "incoming-documents").exists())
                 self.assertIsNone(getattr(window, "_incoming_viewer", None))
+            finally:
+                if window:
+                    window.close()
+                    window.deleteLater()
+
+    def test_expense_workbench_search_selection_scroll_and_compact_layout(self):
+        from PyQt6.QtCore import QDate, Qt
+        root = Path(self._case.name) / "workbench-app-data"
+        root.mkdir()
+        window = None
+        documents = []
+        for index in range(24):
+            confirmed = index == 1
+            allocated = index == 2
+            gross = 125 + index
+            documents.append({
+                "id": index + 1,
+                "client_id": f"synthetic-expense-{index:02d}",
+                "supplier_name": f"Synthetic Supplier {index:02d}",
+                "invoice_number": f"DEMO-{index:03d}",
+                "document_date": f"2026-11-{index + 1:02d}",
+                "gross_amount": f"{gross}.00",
+                "net_amount": f"{gross - 25}.00",
+                "vat_amount": "25.00",
+                "currency_code": "SEK",
+                "verification_status": "confirmed" if confirmed else "requires_review",
+                "allocations": ([{
+                    "destination": "company", "object_id": None,
+                    "object_name": "Общие расходы фирмы", "gross_amount": f"{gross}.00",
+                }] if allocated else []),
+                "unallocated_gross": "0.00" if allocated else f"{gross}.00",
+                "has_original": False,
+            })
+        documents[18]["expense_category"] = "Long synthetic category " * 120
+        with patch.dict(os.environ, {"SMARTREPORT_INCOMING_DOCUMENTS": "0"}), \
+                patch.object(self.desktop.desktop_auth, "app_data_dir", return_value=root), \
+                patch.object(self.desktop.SmartReportApp, "_schedule_expense_read"), \
+                patch.object(self.desktop.requests, "request", side_effect=self.request):
+            try:
+                window = self.desktop.SmartReportApp()
+                window.auto_sync_timer.stop()
+                window._expense_register_snapshot = lambda *_args, **_kwargs: (documents, True)
+                window.tabs.setCurrentIndex(3)
+                window.resize(1240, 850)
+                window.show()
+                window.load_expense_documents()
+                self.qt_app.processEvents()
+
+                self.assertEqual(window.table_supplier_documents.rowCount(), 24)
+                self.assertIn("SEK", window.exp_metrics["accounted"][0].text())
+                self.assertIn("с НДС", window.exp_metrics["accounted"][1].text())
+                self.assertIn("DEMO-000", window.table_supplier_documents.item(0, 2).text())
+                self.assertEqual(window.exp_metrics["review"][0].text(), "SEK 3,150.00")
+
+                window.exp_search.setText("DEMO-007")
+                self.assertEqual(window.table_supplier_documents.rowCount(), 1)
+                self.assertEqual(window.table_supplier_documents.item(0, 2).text().splitlines()[0],
+                                 "Synthetic Supplier 07")
+                window.exp_search.clear()
+                window.exp_filter_object.setCurrentIndex(0)
+                window.exp_filter_status.setCurrentIndex(
+                    window.exp_filter_status.findData("all"))
+                window.exp_filter_unallocated.setChecked(False)
+                self.assertEqual(window.table_supplier_documents.rowCount(), 24,
+                                 window.exp_api_status_lbl.text())
+                row = 18
+                self.assertIn("Synthetic Supplier 18",
+                              window.table_supplier_documents.item(row, 2).text())
+                window.table_supplier_documents.setCurrentCell(row, 1)
+                self.qt_app.processEvents()
+                scrollbar = window.table_supplier_documents.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+                selected_id = window._selected_expense_document(
+                    window.table_supplier_documents, notify=False)["client_id"]
+                scroll_value = scrollbar.value()
+                detail_scrollbar = window.exp_detail_scroll.verticalScrollBar()
+                detail_scrollbar.setValue(detail_scrollbar.maximum())
+                detail_scroll_value = detail_scrollbar.value()
+                self.assertGreater(detail_scrollbar.maximum(), 0)
+                window.load_expense_documents()
+                self.qt_app.processEvents()
+                self.assertEqual(
+                    window._selected_expense_document(
+                        window.table_supplier_documents, notify=False)["client_id"],
+                    selected_id,
+                )
+                self.assertEqual(scrollbar.value(), scroll_value)
+                self.assertEqual(detail_scrollbar.value(), detail_scroll_value)
+                self.assertIn("Synthetic Supplier 18", window.exp_detail_supplier.text())
+
+                manager = self.qt_app._smartreport_theme
+                original_theme = manager.name
+                manager.name = "dark"
+                manager.apply()
+                self.assertEqual(manager.name, "dark")
+                self.assertIn("#f6ad55", window.exp_metrics["review"][0].styleSheet())
+                manager.name = "light"
+                manager.apply()
+                self.assertEqual(manager.name, "light")
+                self.assertIn("#885c21", window.exp_metrics["review"][0].styleSheet())
+                manager.name = original_theme
+                manager.apply()
+
+                window.exp_date_from.setDate(QDate(2026, 11, 30))
+                window.exp_date_to.setDate(QDate(2026, 11, 1))
+                self.assertEqual(window.table_supplier_documents.rowCount(), 0)
+                self.assertIn("начало позже", window.exp_api_status_lbl.text())
+                window.exp_date_from.setDate(QDate(2026, 11, 1))
+                window.exp_date_to.setDate(QDate(2026, 11, 30))
+                self.assertEqual(window.table_supplier_documents.rowCount(), 24)
+
+                window.resize(760, 600)
+                self.qt_app.processEvents()
+                self.assertEqual(
+                    window.expense_splitter.orientation(), Qt.Orientation.Vertical,
+                    (window.width(), window.expense_splitter.width(),
+                     window.expense_splitter.window() is window,
+                     window.expense_splitter._compact_orientation,
+                     window.expense_splitter._watched_window.width()),
+                )
+                self.assertTrue(window.exp_primary_action.isVisible())
+                self.assertGreaterEqual(window.exp_detail_scroll.minimumWidth(), 260)
+            finally:
+                if window:
+                    window.close()
+                    window.deleteLater()
+
+    def test_assign_action_saves_allocation_without_confirming_expense(self):
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QComboBox, QDialogButtonBox
+
+        root = Path(self._case.name) / "assignment-app-data"
+        root.mkdir()
+        document = {
+            "id": 41,
+            "client_id": "synthetic-assignment-only",
+            "supplier_name": "Isolated Supplier AB",
+            "invoice_number": "DEMO-ASSIGN-001",
+            "document_date": "2026-11-09",
+            "gross_amount": "125.00",
+            "net_amount": "100.00",
+            "vat_amount": "25.00",
+            "currency_code": "SEK",
+            "verification_status": "requires_review",
+            "allocations": [],
+            "local_attachment_paths": [],
+        }
+        captured = []
+        window = None
+        with patch.dict(os.environ, {"SMARTREPORT_INCOMING_DOCUMENTS": "0"}), \
+                patch.object(self.desktop.desktop_auth, "app_data_dir", return_value=root), \
+                patch.object(self.desktop.SmartReportApp, "_schedule_expense_read"), \
+                patch.object(self.desktop.requests, "request", side_effect=self.request):
+            try:
+                window = self.desktop.SmartReportApp()
+                window.auto_sync_timer.stop()
+                window._expense_register_snapshot = lambda *_args, **_kwargs: ([document], True)
+                window.load_expense_documents()
+                window.queue_expense_document_operation = (
+                    lambda *args, **kwargs: captured.append((args, kwargs)) or 1)
+                window.load_expense_documents = lambda *_args: None
+                window.background_sync_with_cloud = lambda: None
+
+                def fill_assignment_and_save():
+                    dialog = self.qt_app.activeModalWidget()
+                    status = dialog.findChild(QComboBox, "expenseVerificationStatus")
+                    self.assertIsNotNone(status)
+                    self.assertFalse(status.isEnabled())
+                    destination = dialog.findChild(QComboBox, "expenseObject")
+                    destination.setCurrentIndex(destination.findData("company"))
+                    save = dialog.findChild(QDialogButtonBox).button(
+                        QDialogButtonBox.StandardButton.Save
+                    )
+                    self.assertEqual(save.text(), "Сохранить назначение")
+                    save.click()
+
+                from PyQt6.QtWidgets import QMessageBox
+                with patch.object(QMessageBox, "information"):
+                    QTimer.singleShot(0, fill_assignment_and_save)
+                    window.assign_selected_expense_document()
+
+                self.assertEqual(len(captured), 1)
+                payload = captured[0][0][2]
+                self.assertEqual(payload["verification_status"], "requires_review")
+                self.assertEqual(payload["gross_amount"], "125.00")
+                self.assertEqual(payload["vat_amount"], "25.00")
+                self.assertIsNone(payload["allocations"][0]["object_id"])
             finally:
                 if window:
                     window.close()
