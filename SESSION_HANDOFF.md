@@ -55,14 +55,22 @@
   корня удалены после проверки нового rollback. Удалён старый локальный
   recovery-комплект 1.0.48; временная сборка, staged-копии, снимок хэшей
   рабочего профиля и патч переноса checkout очищены.
-- Исходники опубликованы в `origin/main`, commit `97e353e`. Серверные изменения
-  ограничены capability/инструкцией помощника; бизнес-API и серверные данные
-  не менялись. GitHub Actions workflow в репозитории нет; Render не предоставляет
-  доступный здесь инструмент управления deployment. Публичный
-  `/api/auth/me` отвечает 401 без входа (сервер доступен), но это не доказывает
-  версию развернутого commit. Поэтому deployment Render после push не подтверждён
-  и остаётся внешним пунктом, требующим доступа к Render. Код и handoff
-  опубликованы в `origin/main`.
+- Исходники и handoff опубликованы в `origin/main`. В Render у сервиса
+  `smart-report-server` Auto-Deploy выключен, поэтому после входа в Dashboard
+  вручную выполнен Deploy latest commit. Deploy
+  `dep-dbp3nnbbc2fs7392079g` завершился `Deploy succeeded | Live` на commit
+  `395f835245c56cc0d67eb4ea8c56e8bfe3f1b9ad` (09.11.2026, около 22:32 GMT+1).
+- После Live выполнена авторизованная production-проверка сохранённой admin
+  сессией с обязательной границей `X-SmartReport-Dataset`: `/api/auth/me`,
+  `/api/assistant/capabilities` и `/api/assistant/status` вернули HTTP 200;
+  роль — admin, помощник включён, integration version 2. В capabilities
+  `object_catalog` опубликован как `native_section`. Read-only запрос
+  `/api/assistant/inspect` с планом `object_catalog` вернул HTTP 200 и
+  `native_action=object_catalog`. Этот ответ обрабатывается клиентом переходом
+  на `tab_objects`; локальный интеграционный тест перехода пройден. OpenAI
+  provider не вызывался; производственные справочники, смены, расходы и баланс
+  запросом не изменялись. Серверный deployment и переход проверены, открытых
+  пунктов по выпуску 1.0.50 нет.
 
 ## 09.11.2026 — Исправление парсера и производительности, выпуск 1.0.49
 
