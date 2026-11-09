@@ -1571,6 +1571,26 @@ class AssistantApiTests(unittest.TestCase):
                     export.assert_called_once_with(client.return_value, [999], window)
                     card_dialog.assert_not_called()
 
+    def test_integrated_object_catalog_opens_objects_tab(self):
+        from assistant_desktop import native_action
+        from PyQt6.QtWidgets import QMainWindow, QTabWidget, QWidget
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        window.tabs = QTabWidget(window)
+        window.tab_sprav = QWidget()
+        window.tab_objects = QWidget()
+        window.tabs.addTab(window.tab_sprav, "Справочники")
+        window.tabs.addTab(window.tab_objects, "Объекты")
+        window.tabs.setCurrentWidget(window.tab_sprav)
+        native_action(
+            window,
+            dict(plan=plan("object_catalog"), native_action="object_catalog"),
+            window,
+        )
+        self.assertIs(window.tabs.currentWidget(), window.tab_objects)
+
     def test_integrated_payroll_history_preserves_person_object_and_period_without_saving(self):
         from assistant_desktop import native_action
         from PyQt6.QtWidgets import QMainWindow, QLineEdit, QComboBox, QDateEdit

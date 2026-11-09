@@ -256,6 +256,15 @@ def line_icon(name, stroke, size=18):
         line(8.5, 3.5, 8.5, 20.5)
         line(11.5, 8.5, 16, 8.5)
         line(11.5, 12, 16, 12)
+    elif name == "objects":
+        path = QPainterPath(QPointF(4, 10))
+        path.lineTo(12, 4)
+        path.lineTo(20, 10)
+        path.lineTo(20, 20)
+        path.lineTo(4, 20)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawRect(QRectF(9, 13, 6, 7))
     elif name == "analytics":
         line(4, 20, 20, 20)
         for x, top in ((7, 13), (12, 8), (17, 4.5)):

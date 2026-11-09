@@ -100,6 +100,342 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.commit()
         desktop_conn.close()
 
+    def _setup_catalog_window(self, window):
+        window.tab_objects = self.desktop.QWidget()
+        window.setup_objects_tab()
+        window._expense_read_cache = {(None, None): []}
+        window._expense_online = True
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+
+    def test_objects_tab_separates_service_categories_and_filters_same_names_by_company(self):
+        self._add_company("Object test")
+        self._add_company("Other test")
+        conn = self.desktop.get_db_connection()
+        conn.executemany("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,is_active,sync_id,server_id)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, [
+            ("Object test", "Shared site", "p2001", 500, 35, 1, str(uuid.uuid4()), 21001),
+            ("Other test", "Shared site", "p2002", 600, 45, 1, str(uuid.uuid4()), 21002),
+            ("Object test", "Old site", "p2003", 400, 25, 0, str(uuid.uuid4()), 21003),
+            ("Object test", "Arbetstidsförkortning", "p1000", 0, 0, 1, str(uuid.uuid4()), 21004),
+            ("Object test", "Sjuk", "p1001", 0, 0, 1, str(uuid.uuid4()), 21005),
+            ("Object test", "Privat", "p1001", 520, 0, 1, str(uuid.uuid4()), 21006),
+        ])
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._setup_catalog_window(window)
+        try:
+            window.object_filter_company.addItem("Object test", "Object test")
+            window.object_filter_company.addItem("Other test", "Other test")
+            window.object_filter_company.setCurrentIndex(
+                window.object_filter_company.findData("Object test")
+            )
+            window.load_objects_table()
+            self.assertEqual(window.table_objects.rowCount(), 2)
+            names = {
+                window.table_objects.item(row, 1).text()
+                for row in range(window.table_objects.rowCount())
+            }
+            self.assertEqual(names, {"Shared site", "Privat"})
+            window.object_search.setText("Privat")
+            self.assertEqual(window.table_objects.rowCount(), 1)
+            self.assertEqual(window.table_objects.item(0, 1).text(), "Privat")
+            window.object_search.clear()
+            window.show_archived_objects_check.setChecked(True)
+            self.assertEqual(window.table_objects.rowCount(), 3)
+            window.load_service_categories_table()
+            service_names = {
+                window.table_service_categories.item(row, 2).text()
+                for row in range(window.table_service_categories.rowCount())
+            }
+            self.assertEqual(service_names, {"Arbetstidsförkortning", "Sjuk"})
+            visible_names = {
+                window.table_objects.item(row, 1).text()
+                for row in range(window.table_objects.rowCount())
+            }
+            self.assertEqual(visible_names, {"Shared site", "Old site", "Privat"})
+            local_shared_id = next(
+                window.table_objects.item(row, 0).data(self.desktop.Qt.ItemDataRole.UserRole)
+                for row in range(window.table_objects.rowCount())
+                if window.table_objects.item(row, 1).text() == "Shared site"
+            )
+            window.object_filter_company.setCurrentIndex(
+                window.object_filter_company.findData("Other test")
+            )
+            self.assertEqual(window.table_objects.rowCount(), 1)
+            self.assertEqual(window.table_objects.item(0, 1).text(), "Shared site")
+            remote_shared_id = window.table_objects.item(
+                0, 0
+            ).data(self.desktop.Qt.ItemDataRole.UserRole)
+            self.assertNotEqual(local_shared_id, remote_shared_id)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_objects_tab_create_edit_archive_restore_keeps_identity(self):
+        from PyQt6.QtTest import QTest
+
+        self._add_company("Object lifecycle test")
+        conn = self.desktop.get_db_connection()
+        conn.execute("DELETE FROM object_sync_outbox")
+        conn.execute("DELETE FROM object_name_history")
+        conn.execute("DELETE FROM objects")
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._setup_catalog_window(window)
+        window._expense_read_cache = {(None, None): []}
+        window._expense_online = True
+        window._schedule_expense_read = lambda *args: None
+        window.load_dropdowns = lambda **kwargs: None
+        window.background_sync_with_cloud = lambda: None
+
+        def wait_for_overview():
+            deadline = time.monotonic() + 3
+            while getattr(window, "_object_overview_task", None) is not None and time.monotonic() < deadline:
+                self.qt_app.processEvents()
+                QTest.qWait(10)
+
+        try:
+            window.new_obj_comp_cb.setCurrentText("Object lifecycle test")
+            window.new_obj_name_input.setText("North Ridge")
+            window.new_obj_mark_input.setText("p8100")
+            window.new_obj_rate_input.setText("540")
+            window.new_obj_trans_input.setText("35")
+            window.add_object()
+
+            conn = self.desktop.get_db_connection()
+            object_row = conn.execute(
+                "SELECT id, sync_id FROM objects WHERE company='Object lifecycle test' AND name='North Ridge'"
+            ).fetchone()
+            self.assertIsNotNone(object_row)
+            object_id, sync_id = int(object_row["id"]), object_row["sync_id"]
+            conn.execute(
+                "UPDATE objects SET server_id=51001,sync_version=1 WHERE id=?", (object_id,)
+            )
+            conn.execute("DELETE FROM object_sync_outbox WHERE object_id=?", (object_id,))
+            conn.commit()
+            conn.close()
+
+            window.load_objects_table()
+            window.table_objects.selectRow(0)
+            wait_for_overview()
+
+            window.table_objects.item(0, 1).setText("North Ridge East")
+            window.table_objects.item(0, 2).setText("p8101")
+            window.table_objects.item(0, 3).setText("575.00")
+            window.table_objects.item(0, 4).setText("40.00")
+            wait_for_overview()
+            conn = self.desktop.get_db_connection()
+            updated = conn.execute("SELECT * FROM objects WHERE id=?", (object_id,)).fetchone()
+            self.assertEqual(updated["name"], "North Ridge East")
+            self.assertEqual(updated["markning"], "p8101")
+            self.assertEqual(updated["rate"], 575)
+            self.assertEqual(updated["transport_rate"], 40)
+            self.assertEqual(updated["sync_id"], sync_id)
+            self.assertTrue(conn.execute(
+                "SELECT 1 FROM object_name_history WHERE sync_id=? AND name='North Ridge'",
+                (sync_id,),
+            ).fetchone())
+            conn.execute("DELETE FROM object_sync_outbox WHERE object_id=?", (object_id,))
+            conn.commit()
+            conn.close()
+
+            window.toggle_object_archive()
+            conn = self.desktop.get_db_connection()
+            archived = conn.execute("SELECT * FROM objects WHERE id=?", (object_id,)).fetchone()
+            self.assertEqual(archived["is_active"], 0)
+            self.assertEqual(archived["sync_id"], sync_id)
+            conn.execute("DELETE FROM object_sync_outbox WHERE object_id=?", (object_id,))
+            conn.commit()
+            conn.close()
+
+            window.show_archived_objects_check.setChecked(True)
+            window.load_objects_table()
+            window.table_objects.selectRow(0)
+            wait_for_overview()
+            window.toggle_object_archive()
+            conn = self.desktop.get_db_connection()
+            restored = conn.execute("SELECT * FROM objects WHERE id=?", (object_id,)).fetchone()
+            self.assertEqual(restored["is_active"], 1)
+            self.assertEqual(restored["sync_id"], sync_id)
+            self.assertEqual(restored["server_id"], 51001)
+            conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
+            self.qt_app.processEvents()
+
+    def test_objects_tab_stacks_card_below_table_in_small_window(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._setup_catalog_window(window)
+        try:
+            window.resize(1280, 860)
+            window.show()
+            QTest.qWait(50)
+            self.assertEqual(
+                window.objects_splitter.orientation(), Qt.Orientation.Horizontal
+            )
+            window.resize(780, 560)
+            QTest.qWait(50)
+            self.assertEqual(
+                window.objects_splitter.orientation(), Qt.Orientation.Vertical
+            )
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_object_overview_uses_history_confirmed_expense_shares_and_read_only_costs(self):
+        self._add_company("Overview test")
+        sync_id = str(uuid.uuid4())
+        conn = self.desktop.get_db_connection()
+        object_id = conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,is_active)
+            VALUES ('Overview test','Current site','p3001',900,70,?,31001,1)
+        """, (sync_id,)).lastrowid
+        conn.executemany(
+            "INSERT INTO object_name_history (sync_id,company,name) VALUES (?,?,?)",
+            ((sync_id, "Overview test", name) for name in ("Current site", "Previous site")),
+        )
+        conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,is_active)
+            VALUES ('Other test','Current site','p3002',0,0,?,31002,1)
+        """, (str(uuid.uuid4()),))
+        quotes = {
+            "Previous site": {
+                "version": 1, "company": "Overview test", "object_name": "Previous site",
+                "date_from": "2026-10-22", "date_to": "2026-10-22", "source": "isolated confirmed",
+                "confirmed": True, "confirmed_at": "2026-10-22T00:00:00+00:00",
+                "base": 100, "travel": 0, "ob": {},
+            },
+            "ob": {
+                "version": 1, "company": "Overview test", "object_name": "Previous site",
+                "date_from": "2026-10-22", "date_to": "2026-10-22", "source": "isolated confirmed",
+                "confirmed": True, "confirmed_at": "2026-10-22T00:00:00+00:00",
+                "base": 100, "travel": 0, "ob": {"weekday_early_evening": 50},
+            },
+        }
+        conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                entry_type,sync_id,customer_pricing)
+            VALUES ('2026-10-22','Worker A','Overview test','Previous site',8,0,0,0,'work','overview-work',?)
+        """, (json.dumps(quotes["Previous site"]),))
+        conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                entry_type,sync_id,customer_pricing,start_time,end_time,ob_base_rate)
+            VALUES ('2026-10-22','Worker A','Overview test','Previous site',2,0,0,0,'ob','overview-ob',?,'16:00','18:00',100)
+        """, (json.dumps(quotes["ob"]),))
+        conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                entry_type,sync_id)
+            VALUES ('2026-10-22','Other worker','Other test','Current site',100,0,0,0,'work','other-company-work')
+        """)
+        conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,invoiced,
+                entry_type,sync_id)
+            VALUES ('2026-10-23','Worker B','Overview test','Current site',4,0,0,0,'work','overview-unpriced')
+        """)
+        conn.execute("""
+            INSERT INTO ob_segments (shift_id,segment_date,start_time,end_time,hours,category,
+                premium_percent,multiplier,base_rate,calculated_rate,amount,created_at,updated_at)
+            VALUES ('overview-ob','2026-10-22','16:00','18:00',2,'weekday_early_evening',
+                100,2,100,200,200,'test','test')
+        """)
+        before = {
+            table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
+            for table in ("objects", "shifts", "ob_segments")
+        }
+        conn.commit()
+        conn.close()
+        documents = [
+            {
+                "document_date": "2026-10-22", "currency_code": "SEK",
+                "verification_status": "confirmed",
+                "allocations": [{"object_id": 31001, "gross_amount": "110.00", "net_amount": "100.00"}],
+            },
+            {
+                "document_date": "2026-10-22", "currency_code": "SEK",
+                "verification_status": "confirmed",
+                "allocations": [
+                    {"object_id": 31001, "gross_amount": "30.00", "net_amount": "25.00"},
+                    {"object_id": 31002, "gross_amount": "70.00", "net_amount": "60.00"},
+                ],
+            },
+            {
+                "document_date": "2026-10-22", "currency_code": "SEK",
+                "verification_status": "review",
+                "allocations": [{"object_id": 31001, "gross_amount": "999.00", "net_amount": "900.00"}],
+            },
+            {
+                "document_date": "2026-10-23", "currency_code": "SEK",
+                "verification_status": "confirmed",
+                "allocations": [{"object_id": 31001, "gross_amount": "50.00", "net_amount": None}],
+            },
+            {
+                "document_date": "2026-10-22", "currency_code": "SEK",
+                "verification_status": "confirmed",
+                "allocations": [{"object_id": None, "destination": "company", "gross_amount": "500.00",
+                                 "net_amount": "400.00"}],
+            },
+        ]
+        result = self.desktop.SmartReportApp._read_object_overview(
+            None, object_id, sync_id, 31001, "2026-10-22", "2026-10-22", documents, True, True,
+        )
+        self.assertEqual(result["hours"], 10)
+        self.assertEqual(result["employees"], 1)
+        self.assertEqual(result["work_cost"], 1100)
+        self.assertEqual(result["expense_sums"]["gross_amount"], {"SEK": "140.00"})
+        self.assertEqual(result["expense_sums"]["net_amount"], {"SEK": "125.00"})
+        self.assertEqual(result["expense_count"], 2)
+        next_month = self.desktop.SmartReportApp._read_object_overview(
+            None, object_id, sync_id, 31001, "2026-11-01", "2026-11-30", documents, True, True,
+        )
+        self.assertEqual(next_month["hours"], 0)
+        self.assertEqual(next_month["employees"], 0)
+        self.assertIsNone(next_month["work_cost"])
+        self.assertEqual(next_month["expense_count"], 0)
+        incomplete = self.desktop.SmartReportApp._read_object_overview(
+            None, object_id, sync_id, 31001, "2026-10-23", "2026-10-23", documents, True, True,
+        )
+        self.assertEqual(incomplete["hours"], 4)
+        self.assertIsNone(incomplete["work_cost"])
+        self.assertEqual(incomplete["expense_sums"]["gross_amount"], {"SEK": "50.00"})
+        self.assertTrue(incomplete["expense_unknown"]["net_amount"])
+        conn = self.desktop.get_db_connection()
+        after = {
+            table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
+            for table in ("objects", "shifts", "ob_segments")
+        }
+        conn.close()
+        self.assertEqual(after, before)
+
+    def test_stale_object_overview_response_is_ignored(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._object_overview_request_id = 2
+        window._object_overview_task = object()
+        window.object_overview_status = self.desktop.QLabel("Current selection loading")
+        try:
+            window._on_object_overview_ready(1, {"object": {}}, "")
+            self.assertEqual(
+                window.object_overview_status.text(), "Current selection loading"
+            )
+            self.assertIsNotNone(window._object_overview_task)
+        finally:
+            window.close()
+            window.deleteLater()
+
     def _server_post(self, payload):
         return self.server_client.post(
             "/sync-desktop-data",
@@ -1257,8 +1593,7 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.close()
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.tab_sprav = self.desktop.QWidget()
-        window.setup_sprav_tab()
+        self._setup_catalog_window(window)
         window.setCentralWidget(window.tab_sprav)
         window.show()
         try:
@@ -1363,8 +1698,7 @@ class CatalogSyncTests(unittest.TestCase):
         desktop_conn.commit()
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.tab_sprav = self.desktop.QWidget()
-        window.setup_sprav_tab()
+        self._setup_catalog_window(window)
         try:
             window.load_objects_table()
             row = next(row for row in range(window.table_objects.rowCount())
@@ -4229,8 +4563,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.tab_sprav = self.desktop.QWidget()
-        window.setup_sprav_tab()
+        self._setup_catalog_window(window)
         window.resize(1200, 900)
         window.table_employees.setMaximumHeight(220)
         window.table_objects.setMaximumHeight(220)
@@ -4384,8 +4717,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.tab_sprav = self.desktop.QWidget()
-        window.setup_sprav_tab()
+        self._setup_catalog_window(window)
         window.tabs = QTabWidget()
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -4509,6 +4841,154 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_object_history_filter_shows_only_selected_object_and_period(self):
+        from PyQt6.QtWidgets import QComboBox, QLineEdit, QTabWidget
+
+        self._add_company("History filter test")
+        object_sync_id = str(uuid.uuid4())
+        conn = self.desktop.get_db_connection()
+        conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,is_active)
+            VALUES ('History filter test','Current site','p4001',500,0,?,41001,1)
+        """, (object_sync_id,))
+        conn.executemany(
+            "INSERT INTO object_name_history (sync_id,company,name) VALUES (?,?,?)",
+            (
+                (object_sync_id, "History filter test", name)
+                for name in ("Current site", "Previous site")
+            ),
+        )
+        conn.executemany("""
+            INSERT INTO shifts (
+                date,employee,company,object_name,hours,rate,transport,invoiced,entry_type,sync_id
+            ) VALUES (?,?,?,?,8,500,0,0,'work',?)
+        """, [
+            ("2026-10-22", "Worker A", "History filter test", "Previous site", "in-range"),
+            ("2026-10-20", "Worker A", "History filter test", "Current site", "out-of-range"),
+            ("2026-10-22", "Worker A", "History filter test", "Other site", "other-object"),
+            ("2026-10-22", "Worker B", "Other test", "Previous site", "other-company"),
+        ])
+        expected_shift_id = conn.execute(
+            "SELECT id FROM shifts WHERE sync_id='in-range'"
+        ).fetchone()["id"]
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.filter_obj = QComboBox()
+        window.filter_obj.addItem("Current site", object_sync_id)
+        window.filter_date_from = QLineEdit("2026-10-21")
+        window.filter_date_to = QLineEdit("2026-10-23")
+        window.tabs = QTabWidget()
+        window.load_dropdowns = lambda **kwargs: None
+        window.apply_shifts_filters = lambda: None
+        window.update_reopen_shift_action = lambda: None
+        try:
+            window.load_shifts_history()
+            self.assertEqual(window.table_shifts.rowCount(), 1)
+            self.assertEqual(window.table_shifts.item(0, 4).text(), "Previous site")
+            self.assertEqual(window.table_shifts.item(0, 0).text(), str(expected_shift_id))
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_object_card_actions_route_with_stable_identifiers_and_history_period(self):
+        from PyQt6.QtWidgets import QCheckBox, QComboBox, QDateEdit, QTabWidget
+
+        self._add_company("Object navigation test")
+        object_sync_id = str(uuid.uuid4())
+        conn = self.desktop.get_db_connection()
+        object_id = conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,is_active)
+            VALUES ('Object navigation test','Current site','p4100',500,35,?,41001,1)
+        """, (object_sync_id,)).lastrowid
+        conn.executemany(
+            "INSERT INTO object_name_history (sync_id,company,name) VALUES (?,?,?)",
+            (
+                (object_sync_id, "Object navigation test", name)
+                for name in ("Current site", "Previous site")
+            ),
+        )
+        conn.executemany("""
+            INSERT INTO shifts (
+                date,employee,company,object_name,hours,rate,transport,invoiced,entry_type,sync_id
+            ) VALUES (?,?,?,'Previous site',8,500,0,0,'work',?)
+        """, [
+            ("2026-10-04", "Worker A", "Object navigation test", "nav-first"),
+            ("2026-10-29", "Worker A", "Object navigation test", "nav-last"),
+        ])
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.table_objects = self.desktop.QTableWidget(1, 6)
+        company_item = self.desktop.QTableWidgetItem("Object navigation test")
+        company_item.setData(self.desktop.Qt.ItemDataRole.UserRole, object_id)
+        company_item.setData(self.desktop.Qt.ItemDataRole.UserRole + 2, object_sync_id)
+        window.table_objects.setItem(0, 0, company_item)
+        window.table_objects.selectRow(0)
+        window.object_all_period = QCheckBox()
+        window.object_all_period.setChecked(True)
+        window.object_date_from = QDateEdit()
+        window.object_date_to = QDateEdit()
+        window.tabs = QTabWidget()
+        for label in ("Ввод часов", "Зарплата", "Баланс", "Расходы", "Отчёты", "Объекты"):
+            window.tabs.addTab(self.desktop.QWidget(), label)
+
+        window.filter_date_from = QDateEdit()
+        window.filter_date_to = QDateEdit()
+        window.filter_comp = QComboBox()
+        window.filter_comp.addItem("Object navigation test")
+        window.filter_obj = QComboBox()
+        window.filter_obj.addItem("Current site", object_sync_id)
+        shifts = []
+        window.load_shifts_history = lambda: shifts.append("loaded")
+        window.apply_shifts_filters = lambda: shifts.append("filtered")
+
+        window.object_expenses_object = QComboBox()
+        window.object_expenses_object.addItem("Current site", 41001)
+        window.object_expenses_period_enabled = QCheckBox()
+        window.object_expenses_date_from = QDateEdit()
+        window.object_expenses_date_to = QDateEdit()
+        window.exp_document_tabs = QTabWidget()
+        window.exp_document_tabs.addTab(self.desktop.QWidget(), "Документы")
+        window.exp_document_tabs.addTab(self.desktop.QWidget(), "По объекту")
+        window.load_expense_document_filters = lambda: None
+        expenses = []
+        window.load_object_expense_overview = lambda: expenses.append("loaded")
+
+        window.inv_comp_cb = QComboBox()
+        window.inv_comp_cb.addItem("Object navigation test")
+        window.inv_obj_cb = QComboBox()
+        window.inv_date_from = QDateEdit()
+        window.inv_date_to = QDateEdit()
+        window.inv_show_archived = QCheckBox()
+        window.load_invoice_objects = lambda company: window.inv_obj_cb.addItem("Current site", object_id)
+        reports = []
+        window.generate_invoice = lambda: reports.append("generated")
+        try:
+            window.open_selected_object_shifts()
+            self.assertEqual(shifts, ["loaded", "filtered"])
+            self.assertEqual(window.filter_obj.currentData(), object_sync_id)
+            self.assertEqual(window.filter_date_from.date().toString("yyyy-MM-dd"), "2026-10-04")
+            self.assertEqual(window.filter_date_to.date().toString("yyyy-MM-dd"), "2026-10-29")
+
+            window.open_selected_object_expenses()
+            self.assertEqual(window.object_expenses_object.currentData(), 41001)
+            self.assertEqual(window.exp_document_tabs.currentIndex(), 1)
+            self.assertEqual(expenses, ["loaded"])
+
+            window.open_selected_object_report()
+            self.assertEqual(window.inv_obj_cb.currentData(), object_id)
+            self.assertEqual(window.tabs.currentIndex(), 4)
+            self.assertEqual(reports, ["generated"])
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_history_refresh_preserves_selection_scroll_and_updates_changed_rows(self):
         from PyQt6.QtTest import QTest
         from PyQt6.QtWidgets import QTabWidget
@@ -4585,8 +5065,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.tab_sprav = self.desktop.QWidget()
-        window.setup_sprav_tab()
+        self._setup_catalog_window(window)
         gui_thread = threading.get_ident()
         request_threads = []
         response = SimpleNamespace(status_code=200, json=lambda: {
@@ -4653,8 +5132,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.tab_sprav = self.desktop.QWidget()
-        window.setup_sprav_tab()
+        self._setup_catalog_window(window)
         response = SimpleNamespace(status_code=200, json=lambda: {
             "users": [{"username": "Archived", "has_pin": True}]
         })
@@ -4667,7 +5145,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertFalse(window.show_inactive_employees_check.isChecked())
                 self.assertEqual(window.table_objects.rowCount(), 1)
                 self.assertEqual(window.table_employees.rowCount(), 1)
-                self.assertEqual(window.object_counts_label.text(), "Активных: 1 | В архиве: 1")
+                self.assertEqual(window.object_counts_label.text(), "Активных: 1 · архивных: 1")
                 self.assertEqual(window.employee_counts_label.text(), "Активных: 1 | Неактивных: 1")
                 self.assertFalse(window.object_archive_button.isEnabled())
                 self.assertFalse(window.employee_status_button.isEnabled())

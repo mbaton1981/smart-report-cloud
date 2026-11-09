@@ -100,6 +100,8 @@ def native_action(window, result, parent):
         window.load_expense_documents()
     elif action == "shift_form":
         window.tabs.setCurrentWidget(window.tab_hours)
+    elif action == "object_catalog":
+        window.tabs.setCurrentWidget(window.tab_objects)
     elif action == "directories":
         window.tabs.setCurrentWidget(window.tab_sprav)
     elif action == "invoice_period":

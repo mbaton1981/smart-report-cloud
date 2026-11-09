@@ -1669,6 +1669,27 @@ class ExpenseReadTask(QRunnable):
             self.signals.completed.emit(self.key, [], [], str(error))
 
 
+class ObjectOverviewSignals(QObject):
+    completed = pyqtSignal(int, object, str)
+
+
+class ObjectOverviewTask(QRunnable):
+    def __init__(self, request_id, fetch):
+        super().__init__()
+        self.request_id = request_id
+        self.fetch = fetch
+        self.signals = ObjectOverviewSignals()
+
+    def run(self):
+        try:
+            result = self.fetch()
+        except Exception as error:
+            logging.exception("Object overview read failed")
+            self.signals.completed.emit(self.request_id, None, str(error))
+        else:
+            self.signals.completed.emit(self.request_id, result, "")
+
+
 class EmployeeStatusSignals(QObject):
     completed = pyqtSignal(int, object, str, object, str)
 
@@ -2416,6 +2437,7 @@ class SmartReportApp(QMainWindow):
         self.tab_object_expenses = QWidget()
         self.tab_invoice = QWidget()
         self.tab_dagbok = QWidget()
+        self.tab_objects = QWidget()
         self.tab_sprav = QWidget()
         
         self.tabs.addTab(self.tab_hours, "Ввод часов")
@@ -2423,6 +2445,7 @@ class SmartReportApp(QMainWindow):
         self.tabs.addTab(self.tab_balance, "Баланс")
         self.tabs.addTab(self.tab_expenses, "Расходы")
         self.tabs.addTab(self.tab_invoice, "Отчёты и фактурирование")
+        self.tabs.addTab(self.tab_objects, "Объекты")
         self.tabs.addTab(self.tab_sprav, "Справочники")
 
         self.setup_hours_tab()
@@ -2433,6 +2456,7 @@ class SmartReportApp(QMainWindow):
         self.setup_invoice_tab()
         self.setup_dagbok_tab()
         self.setup_reporting_pages()
+        self.setup_objects_tab()
         self.setup_sprav_tab()
         if self.can_request_shift_reopen():
             from analytics_ui import AnalyticsWidget
@@ -2461,7 +2485,7 @@ class SmartReportApp(QMainWindow):
         self.tabs.blockSignals(blocked)
         self.tabs.setCurrentIndex(current_tab)
         desktop_theme.install_tab_icons(self.tabs, dict(enumerate(
-            ("hours", "salary", "balance", "expenses", "reports", "catalogs", "analytics")
+            ("hours", "salary", "balance", "expenses", "reports", "objects", "catalogs", "analytics")
         )))
 
     def on_tab_changed(self, index):
@@ -2475,10 +2499,8 @@ class SmartReportApp(QMainWindow):
             self.load_expense_documents()
             if self.exp_document_tabs.currentIndex() == 1:
                 self.load_object_expense_overview()
-        elif index == 5:
-            self.load_companies_table()
-            self.load_objects_table()
-            self.load_employees_table()
+        elif index == 6:
+            self.load_service_categories_table()
 
     def setup_hours_tab(self):
         layout = QVBoxLayout(self.tab_hours)
@@ -2744,7 +2766,7 @@ class SmartReportApp(QMainWindow):
         
         emp_val = self.filter_emp.currentText()
         comp_val = self.filter_comp.currentText()
-        obj_val = self.filter_obj.currentText()
+        obj_sync_id = self.filter_obj.currentData()
         status_val = self.filter_status.currentText()
 
         for row in range(self.table_shifts.rowCount()):
@@ -2752,7 +2774,7 @@ class SmartReportApp(QMainWindow):
             date_cell = self.table_shifts.item(row, 1).text()
             emp_cell = self.table_shifts.item(row, 2).text()
             comp_cell = self.table_shifts.item(row, 3).text()
-            obj_cell = self.table_shifts.item(row, 4).text()
+            shift_identity = self.table_shifts.item(row, 0)
             status_cell = self.table_shifts.item(row, 11).text()
 
             if d_from and d_to and not (d_from <= date_cell <= d_to):
@@ -2761,7 +2783,9 @@ class SmartReportApp(QMainWindow):
                 match = False
             if comp_val != "-- Все фирмы --" and comp_cell != comp_val:
                 match = False
-            if obj_val != "-- Все объекты --" and obj_cell != obj_val:
+            if obj_sync_id is not None and (
+                    shift_identity is None
+                    or shift_identity.data(Qt.ItemDataRole.UserRole + 1) != obj_sync_id):
                 match = False
             if status_val == "В работе" and "В работе" not in status_cell:
                 match = False
@@ -7521,6 +7545,8 @@ class SmartReportApp(QMainWindow):
             self.load_expense_documents()
             if self.exp_document_tabs.currentIndex() == 1:
                 self.load_object_expense_overview()
+        elif getattr(self, "tabs", None) and self.tabs.currentIndex() == 5:
+            self.load_object_overview()
         requested = getattr(self, "_expense_requested_key", key)
         if requested != key or refresh_again:
             self._schedule_expense_read(requested)
@@ -7576,6 +7602,19 @@ class SmartReportApp(QMainWindow):
 
     def load_expense_document_filters(self, *_):
         objects, online = self._expense_server_objects()
+        object_expense_objects = list(objects)
+        known_ids = {int(item["id"]) for item in objects}
+        conn = get_db_connection()
+        try:
+            object_expense_objects.extend(
+                dict(row) for row in conn.execute("""
+                    SELECT server_id AS id, sync_id, name, markning, company, is_active
+                    FROM objects WHERE server_id IS NOT NULL
+                    ORDER BY company, name, id
+                """) if int(row["id"]) not in known_ids
+            )
+        finally:
+            conn.close()
         for combo, include_all in (
             (getattr(self, "exp_filter_object", None), True),
             (getattr(self, "object_expenses_object", None), False),
@@ -7591,9 +7630,11 @@ class SmartReportApp(QMainWindow):
             else:
                 combo.addItem("Выберите объект", None)
             combo.addItem("Общие расходы фирмы", "company")
-            for item in objects:
+            combo_objects = object_expense_objects if combo is getattr(self, "object_expenses_object", None) else objects
+            for item in combo_objects:
                 combo.addItem(
-                    f"{item['name']} ({item.get('markning') or 'без кода'}) · {item.get('company') or ''}",
+                    f"{item['name']} ({item.get('markning') or 'без кода'}) · {item.get('company') or ''}"
+                    + (" · архив" if not item.get("is_active", 1) else ""),
                     int(item["id"]),
                 )
             index = combo.findData(selected_id)
@@ -10624,6 +10665,178 @@ class SmartReportApp(QMainWindow):
     def export_dagbok_to_pdf(self):
         self._export_customer_report_pdf(journal_only=True)
 
+    def setup_objects_tab(self):
+        layout = QVBoxLayout(self.tab_objects)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        controls = QFrame()
+        controls.setObjectName("card")
+        controls_layout = QVBoxLayout(controls)
+        filter_row = QHBoxLayout()
+        self.object_search = QLineEdit()
+        self.object_search.setPlaceholderText("Поиск по названию или маркировке")
+        self.object_search.textChanged.connect(self.load_objects_table)
+        self.object_filter_company = QComboBox()
+        self.object_filter_company.addItem("Все фирмы", None)
+        self.object_filter_company.currentIndexChanged.connect(self.load_objects_table)
+        self.show_archived_objects_check = QCheckBox("Показать архивные")
+        self.show_archived_objects_check.toggled.connect(self.load_objects_table)
+        self.object_counts_label = QLabel()
+        filter_row.addWidget(self.object_search, 2)
+        filter_row.addWidget(self.object_filter_company, 1)
+        filter_row.addWidget(self.show_archived_objects_check)
+        filter_row.addWidget(self.object_counts_label)
+        controls_layout.addLayout(filter_row)
+
+        add_row = QHBoxLayout()
+        self.new_obj_comp_cb = QComboBox()
+        self.load_companies_into_combobox(self.new_obj_comp_cb)
+        self.new_obj_name_input = QLineEdit()
+        self.new_obj_name_input.setPlaceholderText("Объект / адрес")
+        self.new_obj_mark_input = QLineEdit()
+        self.new_obj_mark_input.setPlaceholderText("Markning")
+        self.new_obj_mark_input.setMaximumWidth(130)
+        self.new_obj_rate_input = QLineEdit()
+        self.new_obj_rate_input.setPlaceholderText("SEK/ч")
+        self.new_obj_rate_input.setMaximumWidth(110)
+        self.new_obj_trans_input = QLineEdit()
+        self.new_obj_trans_input.setPlaceholderText("Транспорт, SEK")
+        self.new_obj_trans_input.setMaximumWidth(135)
+        add_obj_btn = QPushButton("Добавить объект")
+        add_obj_btn.clicked.connect(self.add_object)
+        add_row.addWidget(self.new_obj_comp_cb, 1)
+        add_row.addWidget(self.new_obj_name_input, 2)
+        add_row.addWidget(self.new_obj_mark_input)
+        add_row.addWidget(self.new_obj_rate_input)
+        add_row.addWidget(self.new_obj_trans_input)
+        add_row.addWidget(add_obj_btn)
+        controls_layout.addLayout(add_row)
+        desktop_theme.adapt_box_layout(controls, filter_row, compact_width=980)
+        desktop_theme.adapt_box_layout(controls, add_row, compact_width=1050)
+        layout.addWidget(controls)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.objects_splitter = splitter
+        object_list = QFrame()
+        object_list.setObjectName("card")
+        object_list_layout = QVBoxLayout(object_list)
+        object_list_layout.setContentsMargins(8, 8, 8, 8)
+        object_list_layout.addWidget(QLabel("<b>Строительные объекты</b>"))
+        self.table_objects = QTableWidget()
+        self.table_objects.setColumnCount(6)
+        self.table_objects.setHorizontalHeaderLabels([
+            "Фирма", "Объект / адрес", "Markning", "Ставка, SEK/ч",
+            "Транспорт, SEK/выезд", "Состояние",
+        ])
+        obj_header = self.table_objects.horizontalHeader()
+        for column in range(6):
+            obj_header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        obj_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 130), (2, 90), (3, 110), (4, 125), (5, 110)):
+            self.table_objects.setColumnWidth(column, width)
+        self.table_objects.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_objects.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_objects.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.table_objects.setAlternatingRowColors(True)
+        self.table_objects.setMinimumHeight(230)
+        self.table_objects.cellChanged.connect(self.on_object_cell_changed)
+        self.table_objects.itemSelectionChanged.connect(self.update_object_archive_action)
+        self.table_objects.itemSelectionChanged.connect(self.load_object_overview)
+        object_list_layout.addWidget(self.table_objects)
+        self.object_archive_button = QPushButton("Выберите объект")
+        self.object_archive_button.setObjectName("secondaryAction")
+        self.object_archive_button.setEnabled(False)
+        self.object_archive_button.clicked.connect(self.toggle_object_archive)
+        object_list_layout.addWidget(self.object_archive_button)
+        splitter.addWidget(object_list)
+
+        detail = QFrame()
+        detail.setObjectName("card")
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(12, 12, 12, 12)
+        detail_layout.setSpacing(8)
+        self.object_detail_title = QLabel("Выберите объект")
+        self.object_detail_title.setStyleSheet("font-size: 18px; font-weight: 600")
+        self.object_detail_title.setWordWrap(True)
+        self.object_detail_meta = QLabel("Название и маркировка объекта появятся здесь.")
+        self.object_detail_meta.setWordWrap(True)
+        detail_layout.addWidget(self.object_detail_title)
+        detail_layout.addWidget(self.object_detail_meta)
+
+        period_row = QHBoxLayout()
+        self.object_all_period = QCheckBox("За весь объект")
+        self.object_all_period.setChecked(True)
+        self.object_date_from = create_date_field(QDate.currentDate().toString("yyyy-MM-dd"))
+        self.object_date_to = create_date_field(QDate.currentDate().toString("yyyy-MM-dd"))
+        self.object_all_period.toggled.connect(self._object_period_changed)
+        self.object_date_from.dateChanged.connect(self.load_object_overview)
+        self.object_date_to.dateChanged.connect(self.load_object_overview)
+        period_row.addWidget(self.object_all_period)
+        period_row.addWidget(QLabel("с"))
+        period_row.addWidget(self.object_date_from)
+        period_row.addWidget(QLabel("по"))
+        period_row.addWidget(self.object_date_to)
+        detail_layout.addLayout(period_row)
+        desktop_theme.adapt_box_layout(detail, period_row, compact_width=620)
+
+        self.object_overview_status = QLabel("Выберите объект для загрузки сводки.")
+        self.object_overview_status.setWordWrap(True)
+        detail_layout.addWidget(self.object_overview_status)
+        metrics = QGridLayout()
+        self.object_hours_value = QLabel("—")
+        self.object_employees_value = QLabel("—")
+        self.object_work_cost_value = QLabel("—")
+        self.object_expense_gross_value = QLabel("—")
+        self.object_expense_net_value = QLabel("—")
+        for label, value, row, column in (
+            ("Рабочие часы, ч", self.object_hours_value, 0, 0),
+            ("Сотрудники за период", self.object_employees_value, 0, 1),
+            ("Работа и OB (расчёт), SEK без НДС", self.object_work_cost_value, 1, 0),
+            ("Подтверждённые расходы объекта, SEK с НДС", self.object_expense_gross_value, 1, 1),
+            ("Те же расходы, SEK без НДС", self.object_expense_net_value, 2, 0),
+        ):
+            caption = QLabel(label)
+            caption.setWordWrap(True)
+            value.setStyleSheet("font-size: 16px; font-weight: 600")
+            metrics.addWidget(caption, row * 2, column)
+            metrics.addWidget(value, row * 2 + 1, column)
+        detail_layout.addLayout(metrics)
+        self.object_expense_status = QLabel(
+            "Расходы учитываются только по подтверждённым долям распределения."
+        )
+        self.object_expense_status.setWordWrap(True)
+        detail_layout.addWidget(self.object_expense_status)
+
+        actions = QHBoxLayout()
+        self.object_shifts_button = QPushButton("Смены")
+        self.object_expenses_button = QPushButton("Расходы")
+        self.object_report_button = QPushButton("Отчёт")
+        self.object_shifts_button.clicked.connect(self.open_selected_object_shifts)
+        self.object_expenses_button.clicked.connect(self.open_selected_object_expenses)
+        self.object_report_button.clicked.connect(self.open_selected_object_report)
+        actions.addWidget(self.object_shifts_button)
+        actions.addWidget(self.object_expenses_button)
+        actions.addWidget(self.object_report_button)
+        detail_layout.addLayout(actions)
+        detail_layout.addStretch(1)
+        splitter.addWidget(detail)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([650, 540])
+        desktop_theme.adapt_splitter(
+            self, splitter, compact_width=1080,
+            wide_sizes=(650, 540), compact_sizes=(420, 420),
+        )
+        layout.addWidget(splitter, 1)
+
+    def _object_period_changed(self, checked):
+        self.object_date_from.setEnabled(not checked)
+        self.object_date_to.setEnabled(not checked)
+        self.load_object_overview()
+
     def setup_sprav_tab(self):
         layout = QVBoxLayout(self.tab_sprav)
         layout.setSpacing(10)
@@ -10742,88 +10955,27 @@ class SmartReportApp(QMainWindow):
         layout.addLayout(top_layout, stretch=1)
         desktop_theme.adapt_box_layout(self.tab_sprav, top_layout, compact_width=1040)
 
-        # Нижняя панель (Управление объектами со ставками и транспортом)
-        obj_card = QFrame()
-        obj_card.setObjectName("card")
-        obj_card_layout = QVBoxLayout(obj_card)
-        obj_card_layout.setSpacing(6)
-        obj_card_layout.addWidget(QLabel("<b>Управление объектами (Ставки и транспорт):</b>"))
-
-        object_view_layout = QHBoxLayout()
-        self.show_archived_objects_check = QCheckBox("Показать архив")
-        desktop_theme.apply_style(self.show_archived_objects_check, archive_filter_style)
-        self.show_archived_objects_check.setChecked(False)
-        self.show_archived_objects_check.toggled.connect(self.load_objects_table)
-        self.object_counts_label = QLabel()
-        object_view_layout.addWidget(self.show_archived_objects_check)
-        object_view_layout.addStretch()
-        object_view_layout.addWidget(self.object_counts_label)
-        obj_card_layout.addLayout(object_view_layout)
-
-        obj_add_layout = QHBoxLayout()
-        self.new_obj_comp_cb = QComboBox()
-        self.load_companies_into_combobox(self.new_obj_comp_cb)
-
-        self.new_obj_name_input = QLineEdit()
-        self.new_obj_name_input.setPlaceholderText("Адрес / Название объекта...")
-        
-        self.new_obj_mark_input = QLineEdit()
-        self.new_obj_mark_input.setPlaceholderText("Markning")
-        self.new_obj_mark_input.setMinimumWidth(90)
-        self.new_obj_mark_input.setMaximumWidth(150)
-        
-        self.new_obj_rate_input = QLineEdit()
-        self.new_obj_rate_input.setPlaceholderText("kr/ч")
-        self.new_obj_rate_input.setMinimumWidth(90)
-        self.new_obj_rate_input.setMaximumWidth(150)
-
-        self.new_obj_trans_input = QLineEdit()
-        self.new_obj_trans_input.setPlaceholderText("Транс.kr")
-        self.new_obj_trans_input.setMinimumWidth(100)
-        self.new_obj_trans_input.setMaximumWidth(160)
-
-        add_obj_btn = QPushButton("Добавить")
-        add_obj_btn.clicked.connect(self.add_object)
-
-        obj_add_layout.addWidget(self.new_obj_comp_cb, stretch=2)
-        obj_add_layout.addWidget(self.new_obj_name_input, stretch=3)
-        obj_add_layout.addWidget(self.new_obj_mark_input, stretch=1)
-        obj_add_layout.addWidget(self.new_obj_rate_input, stretch=1)
-        obj_add_layout.addWidget(self.new_obj_trans_input, stretch=1)
-        obj_add_layout.addWidget(add_obj_btn)
-        obj_card_layout.addLayout(obj_add_layout)
-        desktop_theme.adapt_box_layout(obj_card, obj_add_layout, compact_width=1050)
-        
-        self.table_objects = QTableWidget()
-        self.table_objects.setColumnCount(6)
-        self.table_objects.setHorizontalHeaderLabels(["Фирма", "Объект / Адрес", "Markning", "Клиентская ставка (SEK/ч)", "Транспорт (kr/выезд)", "Состояние"])
-        
-        obj_header = self.table_objects.horizontalHeader()
-        obj_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        obj_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        obj_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        obj_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        obj_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        obj_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        
-        self.table_objects.setColumnWidth(0, 150)
-        self.table_objects.setColumnWidth(2, 110)
-        self.table_objects.setColumnWidth(3, 140)
-        self.table_objects.setColumnWidth(4, 150)
-        self.table_objects.setColumnWidth(5, 120)
-        self.table_objects.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-
-        self.table_objects.cellChanged.connect(self.on_object_cell_changed)
-        self.table_objects.itemSelectionChanged.connect(self.update_object_archive_action)
-        obj_card_layout.addWidget(self.table_objects, stretch=1)
-
-        self.object_archive_button = QPushButton("В архив")
-        self.object_archive_button.setObjectName("danger")
-        self.object_archive_button.setEnabled(False)
-        self.object_archive_button.clicked.connect(self.toggle_object_archive)
-        obj_card_layout.addWidget(self.object_archive_button)
-
-        layout.addWidget(obj_card, stretch=1)
+        service_card = QFrame()
+        service_card.setObjectName("card")
+        service_layout = QVBoxLayout(service_card)
+        service_layout.addWidget(QLabel("<b>Служебные категории</b>"))
+        service_layout.addWidget(QLabel(
+            "Это специальные записи для учёта времени, а не строительные объекты. "
+            "Их ID и настройки не редактируются здесь."
+        ))
+        self.table_service_categories = QTableWidget()
+        self.table_service_categories.setColumnCount(5)
+        self.table_service_categories.setHorizontalHeaderLabels(
+            ["Категория", "Фирма", "Справочная запись", "Маркировка", "Состояние"]
+        )
+        self.table_service_categories.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_service_categories.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_service_categories.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table_service_categories.horizontalHeader().setStretchLastSection(True)
+        service_layout.addWidget(self.table_service_categories)
+        layout.addWidget(service_card)
 
     def load_companies_into_combobox(self, cb):
         conn = get_db_connection()
@@ -11009,6 +11161,12 @@ class SmartReportApp(QMainWindow):
         if not name or not comp:
             QMessageBox.warning(self, "Ошибка", "Выберите фирму и укажите название объекта!")
             return
+        if any(matches_special_object(name, mark, reference) for reference in SPECIAL_OBJECTS.values()):
+            QMessageBox.warning(
+                self, "Служебная категория",
+                "Эта маркировка относится к служебной категории и не может быть создана как объект.",
+            )
+            return
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -11064,6 +11222,8 @@ class SmartReportApp(QMainWindow):
                 mark = mark_item.text().strip()
                 if not name or len(name) > 200 or len(mark) > 50:
                     raise ValueError("Название должно содержать до 200 символов, markning — до 50.")
+                if any(matches_special_object(name, mark, reference) for reference in SPECIAL_OBJECTS.values()):
+                    raise ValueError("Служебные категории нельзя редактировать как строительные объекты.")
                 new_rate = parse_float(rate_item.text(), 0.0)
                 new_trans = parse_float(trans_item.text(), 0.0)
                 if not 0 <= new_rate <= 100000 or not 0 <= new_trans <= 100000:
@@ -11115,6 +11275,7 @@ class SmartReportApp(QMainWindow):
             finally:
                 if conn is not None:
                     conn.close()
+            self.load_object_overview()
             self.background_sync_with_cloud()
 
     def delete_object(self):
@@ -11291,15 +11452,45 @@ class SmartReportApp(QMainWindow):
                     self.filter_comp.setCurrentIndex(idx)
 
         if hasattr(self, 'filter_obj') and not self.filter_obj.view().isVisible():
-            curr_obj = self.filter_obj.currentText()
-            cursor.execute("SELECT name FROM objects WHERE is_active = 1 ORDER BY name")
-            items = ["-- Все объекты --"] + [row[0] for row in cursor.fetchall()]
-            if desktop_ui.combo_items_need_refresh(self.filter_obj, [(name,) for name in items]):
+            selected_sync_id = self.filter_obj.currentData()
+            cursor.execute("""
+                SELECT sync_id, name, company FROM objects
+                WHERE is_active = 1 ORDER BY company, name, id
+            """)
+            object_items = [
+                (f"{row[1]} · {row[2]}", row[0])
+                for row in cursor.fetchall() if row[0]
+            ]
+            expected_items = [("-- Все объекты --", None), *object_items]
+            if desktop_ui.combo_items_need_refresh(
+                self.filter_obj, [(label, value) for label, value in expected_items]
+            ):
+                blocked = self.filter_obj.blockSignals(True)
                 self.filter_obj.clear()
-                self.filter_obj.addItems(items)
-                idx = self.filter_obj.findText(curr_obj)
-                if idx >= 0:
-                    self.filter_obj.setCurrentIndex(idx)
+                for label, value in expected_items:
+                    self.filter_obj.addItem(label, value)
+                selected_index = self.filter_obj.findData(selected_sync_id)
+                self.filter_obj.setCurrentIndex(max(0, selected_index))
+                self.filter_obj.blockSignals(blocked)
+
+        if hasattr(self, "object_filter_company"):
+            selected_company = self.object_filter_company.currentData()
+            companies = [row[0] for row in cursor.execute(
+                "SELECT name FROM companies ORDER BY name"
+            ).fetchall()]
+            expected_companies = [("Все фирмы", None)] + [(name, name) for name in companies]
+            current_companies = [
+                (self.object_filter_company.itemText(index), self.object_filter_company.itemData(index))
+                for index in range(self.object_filter_company.count())
+            ]
+            if current_companies != expected_companies:
+                blocked = self.object_filter_company.blockSignals(True)
+                self.object_filter_company.clear()
+                for label, value in expected_companies:
+                    self.object_filter_company.addItem(label, value)
+                index = self.object_filter_company.findData(selected_company)
+                self.object_filter_company.setCurrentIndex(max(0, index))
+                self.object_filter_company.blockSignals(blocked)
 
         for cb in [getattr(self, 'comp_cb', None), getattr(self, 'inv_comp_cb', None), getattr(self, 'dag_comp_cb', None), getattr(self, 'new_obj_comp_cb', None)]:
             if cb is not None:
@@ -11319,7 +11510,8 @@ class SmartReportApp(QMainWindow):
 
         if refresh_tables and hasattr(self, 'table_employees'):
             self.load_employees_table()
-        if refresh_tables and hasattr(self, 'table_objects'):
+        if (refresh_tables and hasattr(self, 'table_objects')
+                and self.tabs.currentIndex() == 5):
             self.load_objects_table()
         if refresh_tables and hasattr(self, 'table_companies'):
             self.load_companies_table()
@@ -11327,37 +11519,58 @@ class SmartReportApp(QMainWindow):
     def load_objects_table(self):
         if self.table_objects.state() == QTableWidget.State.EditingState:
             return
+        selected_sync_id = self._selected_object_sync_id()
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT is_active, COUNT(*) FROM objects GROUP BY is_active")
-        counts = {int(row[0]): int(row[1]) for row in cursor.fetchall()}
-        self.object_counts_label.setText(
-            f"Активных: {counts.get(1, 0)} | В архиве: {counts.get(0, 0)}"
-        )
         cursor.execute("""
             SELECT id, company, name, markning, COALESCE(rate, 0.0),
                    COALESCE(transport_rate, 0.0), is_active, sync_id, server_id, sync_version
             FROM objects
-            WHERE is_active = 1 OR ? = 1
             ORDER BY company, name, id
-        """, (int(self.show_archived_objects_check.isChecked()),))
+        """)
         rows = cursor.fetchall()
         conn.close()
 
+        service_ids = {
+            int(row[0]) for row in rows
+            if any(
+                matches_special_object(row[2], row[3] or "", reference)
+                for reference in SPECIAL_OBJECTS.values()
+            )
+        }
+        object_rows = [row for row in rows if int(row[0]) not in service_ids]
+        active_count = sum(bool(row[6]) for row in object_rows)
+        archived_count = len(object_rows) - active_count
+        self.object_counts_label.setText(f"Активных: {active_count} · архивных: {archived_count}")
+        company_filter = self.object_filter_company.currentData()
+        search = self.object_search.text().strip().casefold()
+        if not self.show_archived_objects_check.isChecked():
+            object_rows = [row for row in object_rows if row[6]]
+        if company_filter:
+            object_rows = [row for row in object_rows if row[1] == company_filter]
+        if search:
+            object_rows = [
+                row for row in object_rows
+                if search in str(row[2] or "").casefold()
+                or search in str(row[3] or "").casefold()
+                or search in str(row[1] or "").casefold()
+            ]
+
         display_rows = {}
-        for row in rows:
+        for row in object_rows:
             state_label = "В архиве" if not row[6] else "Активен" if row[7] else "Legacy: не связан"
             display_rows[int(row[0])] = (
                 (
                     row[1] or "", row[2] or "", row[3] or "", f"{row[4]:.2f}",
                     f"{row[5]:.2f}", state_label,
                 ),
-                (int(row[9] or 0), row[7]),
+                (int(row[9] or 0), row[7], int(row[8]) if row[8] is not None else None),
                 ("", "", "", "", "", ""),
             )
 
         if self._catalog_table_matches(self.table_objects, display_rows):
             self.update_object_archive_action()
+            self.load_object_overview()
             return
 
         view_state = self._capture_catalog_table_view(self.table_objects)
@@ -11374,13 +11587,14 @@ class SmartReportApp(QMainWindow):
         sort_order = table.horizontalHeader().sortIndicatorOrder()
         table.setSortingEnabled(False)
         try:
-            table.setRowCount(len(rows))
-            for row_idx, row in enumerate(rows):
+            table.setRowCount(len(object_rows))
+            for row_idx, row in enumerate(object_rows):
                 values, metadata, _tooltips = display_rows[int(row[0])]
                 company_item = QTableWidgetItem(values[0])
                 company_item.setData(Qt.ItemDataRole.UserRole, int(row[0]))
                 company_item.setData(Qt.ItemDataRole.UserRole + 1, metadata[0])
                 company_item.setData(Qt.ItemDataRole.UserRole + 2, metadata[1])
+                company_item.setData(Qt.ItemDataRole.UserRole + 3, int(row[8]) if row[8] is not None else None)
                 table.setItem(row_idx, 0, company_item)
                 name_item = QTableWidgetItem(values[1])
                 mark_item = QTableWidgetItem(values[2])
@@ -11417,7 +11631,467 @@ class SmartReportApp(QMainWindow):
             table.cellChanged.connect(self.on_object_cell_changed)
 
         self._restore_catalog_table_view(table, view_state)
+        if selected_sync_id:
+            for row_index in range(table.rowCount()):
+                item = table.item(row_index, 0)
+                if item is not None and item.data(Qt.ItemDataRole.UserRole + 2) == selected_sync_id:
+                    table.selectRow(row_index)
+                    break
         self.update_object_archive_action()
+        self.load_object_overview()
+
+    def _selected_object_sync_id(self):
+        if not hasattr(self, "table_objects"):
+            return None
+        selected = self.table_objects.currentRow()
+        item = self.table_objects.item(selected, 0) if selected >= 0 else None
+        return item.data(Qt.ItemDataRole.UserRole + 2) if item is not None else None
+
+    def load_service_categories_table(self):
+        if not hasattr(self, "table_service_categories"):
+            return
+        conn = get_db_connection()
+        try:
+            rows = conn.execute("""
+                SELECT id, company, name, markning, is_active, sync_id
+                FROM objects ORDER BY company, markning, name, id
+            """).fetchall()
+        finally:
+            conn.close()
+        type_names = {
+            RECORD_TYPE_ATF: "Arbetstidsförkortning",
+            RECORD_TYPE_SICK: "Sjuk",
+            RECORD_TYPE_VACATION: "Semestertimmar",
+            RECORD_TYPE_HOLIDAY: "Röda dagar",
+        }
+        table = self.table_service_categories
+        table.setRowCount(0)
+        for row in rows:
+            record_type = next((
+                kind for kind, reference in SPECIAL_OBJECTS.items()
+                if matches_special_object(row["name"], row["markning"] or "", reference)
+            ), None)
+            if record_type is None:
+                continue
+            values = (
+                type_names[record_type], row["company"], row["name"] or "—",
+                row["markning"] or "—", "Активна" if row["is_active"] else "В архиве",
+            )
+            table.insertRow(table.rowCount())
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(row["id"]))
+                    item.setData(Qt.ItemDataRole.UserRole + 1, row["sync_id"])
+                table.setItem(table.rowCount() - 1, column, item)
+
+    def load_object_overview(self, *_):
+        if not hasattr(self, "object_overview_status"):
+            return
+        selected_row = self.table_objects.currentRow()
+        identity = self.table_objects.item(selected_row, 0) if selected_row >= 0 else None
+        if identity is None:
+            self._object_overview_request_id = getattr(self, "_object_overview_request_id", 0) + 1
+            self.object_detail_title.setText("Выберите объект")
+            self.object_detail_meta.setText("Название и маркировка объекта появятся здесь.")
+            self.object_overview_status.setText("Выберите объект для загрузки сводки.")
+            for value in (
+                self.object_hours_value, self.object_employees_value,
+                self.object_work_cost_value, self.object_expense_gross_value,
+                self.object_expense_net_value,
+            ):
+                value.setText("—")
+            self.object_expense_status.setText(
+                "Расходы учитываются только по подтверждённым долям распределения."
+            )
+            for button in (
+                self.object_shifts_button, self.object_expenses_button,
+                self.object_report_button,
+            ):
+                button.setEnabled(False)
+            return
+
+        object_id = int(identity.data(Qt.ItemDataRole.UserRole))
+        sync_id = identity.data(Qt.ItemDataRole.UserRole + 2)
+        server_id = identity.data(Qt.ItemDataRole.UserRole + 3)
+        expense_cache = getattr(self, "_expense_read_cache", {})
+        if server_id is not None and (None, None) not in expense_cache:
+            self._schedule_expense_read((None, None))
+        self.object_detail_title.setText(self.table_objects.item(selected_row, 1).text())
+        company = self.table_objects.item(selected_row, 0).text()
+        mark = self.table_objects.item(selected_row, 2).text()
+        rate = self.table_objects.item(selected_row, 3).text()
+        transport = self.table_objects.item(selected_row, 4).text()
+        state = self.table_objects.item(selected_row, 5).text()
+        self.object_detail_meta.setText(
+            f"{company} · Markning: {mark or '—'} · {state}\n"
+            f"Действующие клиентские ставки: {rate} SEK/ч; транспорт {transport} SEK/выезд. "
+            "Исторические записи не переоцениваются по этим ставкам. "
+            "Отдельного поля адреса в справочнике нет."
+        )
+        self.object_shifts_button.setEnabled(True)
+        self.object_expenses_button.setEnabled(server_id is not None)
+        self.object_expenses_button.setToolTip(
+            "" if server_id is not None else "Нет устойчивой связи с реестром расходов."
+        )
+        self.object_report_button.setEnabled(bool(sync_id))
+
+        date_from = None
+        date_to = None
+        if not self.object_all_period.isChecked():
+            date_from = self.object_date_from.text().strip()
+            date_to = self.object_date_to.text().strip()
+            if date_from > date_to:
+                self.object_overview_status.setText("Проверьте период: начало позже окончания.")
+                for value in (
+                    self.object_hours_value, self.object_employees_value,
+                    self.object_work_cost_value, self.object_expense_gross_value,
+                    self.object_expense_net_value,
+                ):
+                    value.setText("—")
+                return
+
+        self._object_overview_request_id = getattr(self, "_object_overview_request_id", 0) + 1
+        request_id = self._object_overview_request_id
+        self.object_overview_status.setText("Загружаем данные объекта…")
+        for value in (
+            self.object_hours_value, self.object_employees_value,
+            self.object_work_cost_value, self.object_expense_gross_value,
+            self.object_expense_net_value,
+        ):
+            value.setText("…")
+        documents = list(expense_cache.get((None, None), []))
+        expense_online = bool(getattr(self, "_expense_online", False))
+        task = ObjectOverviewTask(
+            request_id,
+            lambda: self._read_object_overview(
+                object_id, sync_id, server_id, date_from, date_to, documents, expense_online,
+                (None, None) in expense_cache,
+            ),
+        )
+        task.signals.completed.connect(self._on_object_overview_ready)
+        self._object_overview_task = task
+        QThreadPool.globalInstance().start(task)
+
+    def _read_object_overview(
+        self, object_id, expected_sync_id, server_id, date_from, date_to,
+        expense_documents, expense_online, expense_snapshot_available,
+    ):
+        conn = get_db_connection()
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            cursor = conn.cursor()
+            object_row = cursor.execute(
+                "SELECT * FROM objects WHERE id = ?", (object_id,)
+            ).fetchone()
+            if object_row is None or object_row["sync_id"] != expected_sync_id:
+                raise ValueError("Выбранный объект изменился. Обновите список.")
+            object_row = dict(object_row)
+            object_names = invoice_object_names(cursor, object_row)
+            marks = ",".join("?" for _ in object_names)
+            filters = ["company = ?", f"object_name IN ({marks})", "entry_type IN ('work', 'ob')"]
+            parameters = [object_row["company"], *object_names]
+            if date_from and date_to:
+                filters.extend(("date >= ?", "date <= ?"))
+                parameters.extend((date_from, date_to))
+            journal_rows = [
+                dict(row) for row in cursor.execute(
+                    f"SELECT * FROM shifts WHERE {' AND '.join(filters)} ORDER BY date, employee, id",
+                    parameters,
+                ).fetchall()
+            ]
+            journal_segments = {}
+            has_ob_schema = invoice_ob_schema_present(cursor)
+            for row in journal_rows:
+                if row["entry_type"] == RECORD_TYPE_OB and has_ob_schema and row.get("sync_id"):
+                    journal_segments[row["sync_id"]] = [
+                        dict(segment) for segment in get_ob_segments(cursor, row["sync_id"])
+                    ]
+
+            by_employee = {}
+            for row in journal_rows:
+                current = by_employee.setdefault(row["employee"], {"hours": 0.0, "has_ob": False})
+                current["hours"] += float(row["hours"] or 0)
+                current["has_ob"] |= row["entry_type"] == RECORD_TYPE_OB
+            categories, premium_hours = ({}, {})
+            if has_ob_schema and journal_rows:
+                data_start = date_from or min(row["date"] for row in journal_rows)
+                data_end = date_to or max(row["date"] for row in journal_rows)
+                categories, premium_hours = _collect_invoice_ob_hours(
+                    cursor, object_row["company"], object_names, data_start, data_end,
+                )
+            invalid_ob_employees = set()
+            for row in journal_rows:
+                if row["entry_type"] != RECORD_TYPE_OB:
+                    continue
+                segments = journal_segments.get(row.get("sync_id"), [])
+                if (not has_ob_schema or not segments
+                        or abs(sum(float(segment["hours"] or 0) for segment in segments)
+                               - float(row["hours"] or 0)) > 0.000001):
+                    invalid_ob_employees.add(row["employee"])
+            for employee, stats in by_employee.items():
+                employee_categories = categories.get(employee, {})
+                premium = premium_hours.get(employee, 0.0)
+                if (employee in invalid_ob_employees
+                        or sum(employee_categories.values()) > premium + 0.000001
+                        or premium > stats["hours"] + 0.000001):
+                    invalid_ob_employees.add(employee)
+            without_ob_hours = (
+                None if invalid_ob_employees else
+                sum(stats["hours"] - premium_hours.get(employee, 0.0)
+                    for employee, stats in by_employee.items())
+            )
+
+            report = {
+                "company": object_row["company"],
+                "sync_id": object_row["sync_id"],
+                "date_from": date_from or (min((row["date"] for row in journal_rows), default="")),
+                "date_to": date_to or (max((row["date"] for row in journal_rows), default="")),
+                "journal_rows": journal_rows,
+                "journal_segments": journal_segments,
+                "totals": {"without_ob_hours": without_ob_hours},
+                "warnings": [],
+                "is_fast_pris": False,
+                "fast_pris_amount": 0.0,
+            }
+            prepare_customer_costs(report)
+            work_lines = [
+                line for line in report["cost_lines"]
+                if line["label"].startswith(("Arbete", "Fast pris", "OB"))
+            ]
+            work_cost = (
+                None if not journal_rows or any(line["amount"] is None for line in work_lines)
+                else sum(float(line["amount"]) for line in work_lines)
+            )
+
+            expense_sums = {field: {} for field in ("gross_amount", "net_amount")}
+            expense_unknown = {field: False for field in expense_sums}
+            matched_expense_count = 0
+            if server_id is not None:
+                for document in expense_documents:
+                    if document.get("verification_status") != "confirmed":
+                        continue
+                    document_date = str(document.get("document_date") or "")
+                    if date_from and document_date < date_from:
+                        continue
+                    if date_to and document_date > date_to:
+                        continue
+                    allocations = [
+                        allocation for allocation in document.get("allocations", [])
+                        if allocation.get("object_id") is not None
+                        and int(allocation["object_id"]) == int(server_id)
+                        and not allocation.get("company_expense")
+                        and allocation.get("destination") != "company"
+                    ]
+                    if not allocations:
+                        continue
+                    matched_expense_count += 1
+                    currency = str(document.get("currency_code") or "UNKNOWN")
+                    for allocation in allocations:
+                        for field in expense_sums:
+                            amount = parse_decimal(allocation.get(field))
+                            if amount is None:
+                                expense_unknown[field] = True
+                            else:
+                                expense_sums[field][currency] = (
+                                    expense_sums[field].get(currency, Decimal(0)) + amount
+                                )
+            return {
+                "object": object_row,
+                "hours": sum(float(row["hours"] or 0) for row in journal_rows),
+                "employees": len(by_employee),
+                "work_cost": work_cost,
+                "expense_sums": {
+                    field: {currency: str(amount) for currency, amount in values.items()}
+                    for field, values in expense_sums.items()
+                },
+                "expense_unknown": expense_unknown,
+                "expense_count": matched_expense_count,
+                "expense_online": expense_online,
+                "expense_snapshot_available": expense_snapshot_available,
+                "expense_linked": server_id is not None,
+                "has_work_rows": bool(journal_rows),
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _object_money_text(values, unknown, count, available):
+        if not available:
+            return "Неизвестно"
+        if unknown:
+            return "Неизвестно"
+        if not count:
+            return "Нет подтверждённых расходов"
+        if not values:
+            return "Неизвестно"
+        return " · ".join(
+            f"{float(amount):,.2f} {currency}".replace(",", " ")
+            for currency, amount in sorted(values.items())
+        )
+
+    def _on_object_overview_ready(self, request_id, result, error):
+        if request_id != getattr(self, "_object_overview_request_id", None):
+            return
+        self._object_overview_task = None
+        if error:
+            self.object_overview_status.setText(f"Не удалось загрузить сводку объекта: {error}")
+            for value in (
+                self.object_hours_value, self.object_employees_value,
+                self.object_work_cost_value, self.object_expense_gross_value,
+                self.object_expense_net_value,
+            ):
+                value.setText("—")
+            return
+        object_row = result["object"]
+        self.object_detail_title.setText(object_row["name"])
+        self.object_detail_meta.setText(
+            f"{object_row['company']} · Markning: {object_row.get('markning') or '—'} · "
+            f"{'Активен' if object_row['is_active'] else 'В архиве'}\n"
+            f"Действующие клиентские ставки: {float(object_row['rate'] or 0):.2f} SEK/ч; "
+            f"транспорт {float(object_row['transport_rate'] or 0):.2f} SEK/выезд. "
+            "Ставки не применяются задним числом. Отдельного поля адреса в справочнике нет."
+        )
+        self.object_hours_value.setText(f"{result['hours']:,.2f} ч".replace(",", " "))
+        self.object_employees_value.setText(str(result["employees"]))
+        self.object_work_cost_value.setText(
+            "Нет рабочих записей" if not result["has_work_rows"] else
+            "Неизвестно" if result["work_cost"] is None else
+            f"{result['work_cost']:,.2f} SEK".replace(",", " ")
+        )
+        if not result["expense_linked"]:
+            self.object_expense_gross_value.setText("Неизвестно")
+            self.object_expense_net_value.setText("Неизвестно")
+        else:
+            self.object_expense_gross_value.setText(self._object_money_text(
+                result["expense_sums"]["gross_amount"], result["expense_unknown"]["gross_amount"],
+                result["expense_count"], result["expense_snapshot_available"],
+            ))
+            self.object_expense_net_value.setText(self._object_money_text(
+                result["expense_sums"]["net_amount"], result["expense_unknown"]["net_amount"],
+                result["expense_count"], result["expense_snapshot_available"],
+            ))
+        period_label = (
+            "за весь объект" if self.object_all_period.isChecked()
+            else f"за {self.object_date_from.text()} — {self.object_date_to.text()}"
+        )
+        self.object_overview_status.setText(
+            f"Смены и расчётная стоимость — по сохранённой истории, {period_label}. "
+            "Часы записей OB включены один раз. Стоимость — без НДС, это не полученная оплата или прибыль."
+        )
+        if not result["expense_linked"]:
+            expense_status = "Расходы недоступны: объект ещё не связан с серверным реестром."
+        elif result["expense_online"]:
+            expense_status = "Данные расходов из общего реестра; учтены только подтверждённые доли этого объекта."
+        elif not result["expense_snapshot_available"]:
+            expense_status = "Нет связи с сервером и нет доступного снимка реестра расходов; суммы неизвестны."
+        else:
+            expense_status = "Сервер недоступен; суммы рассчитаны по последнему доступному снимку."
+        self.object_expense_status.setText(expense_status)
+
+    def _selected_object_for_navigation(self):
+        selected = self.table_objects.currentRow()
+        item = self.table_objects.item(selected, 0) if selected >= 0 else None
+        if item is None:
+            return None
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM objects WHERE id = ?", (int(item.data(Qt.ItemDataRole.UserRole)),)
+            ).fetchone()
+            if row is None or row["sync_id"] != item.data(Qt.ItemDataRole.UserRole + 2):
+                raise ValueError("Объект изменился. Обновите список перед переходом.")
+            return dict(row)
+        finally:
+            conn.close()
+
+    def _object_history_period(self, object_row):
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            names = invoice_object_names(cursor, object_row)
+            placeholders = ",".join("?" for _ in names)
+            row = cursor.execute(
+                f"SELECT MIN(date), MAX(date) FROM shifts WHERE company = ? "
+                f"AND object_name IN ({placeholders}) AND entry_type IN ('work', 'ob')",
+                (object_row["company"], *names),
+            ).fetchone()
+            return (row[0], row[1]) if row and row[0] and row[1] else (
+                QDate.currentDate().toString("yyyy-MM-dd"),
+                QDate.currentDate().toString("yyyy-MM-dd"),
+            )
+        finally:
+            conn.close()
+
+    def _object_link_period(self, object_row):
+        if not self.object_all_period.isChecked():
+            return self.object_date_from.text(), self.object_date_to.text()
+        return self._object_history_period(object_row)
+
+    def open_selected_object_shifts(self):
+        try:
+            object_row = self._selected_object_for_navigation()
+            if object_row is None:
+                return
+            start, end = self._object_link_period(object_row)
+            self.filter_date_from.setDate(QDate.fromString(start, "yyyy-MM-dd"))
+            self.filter_date_to.setDate(QDate.fromString(end, "yyyy-MM-dd"))
+            self.filter_comp.setCurrentText(object_row["company"])
+            index = self.filter_obj.findData(object_row["sync_id"])
+            if index < 0:
+                raise ValueError("Для объекта нет устойчивого ID фильтра смен.")
+            self.filter_obj.setCurrentIndex(index)
+            self.tabs.setCurrentIndex(0)
+            self.load_shifts_history()
+            self.apply_shifts_filters()
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Переход к сменам", str(error))
+
+    def open_selected_object_expenses(self):
+        try:
+            object_row = self._selected_object_for_navigation()
+            if object_row is None:
+                return
+            if object_row["server_id"] is None:
+                raise ValueError("Объект ещё не связан с реестром расходов.")
+            self.load_expense_document_filters()
+            index = self.object_expenses_object.findData(int(object_row["server_id"]))
+            if index < 0:
+                raise ValueError("Объект отсутствует в списке распределений расходов.")
+            if not self.object_all_period.isChecked():
+                self.object_expenses_date_from.setDate(self.object_date_from.date())
+                self.object_expenses_date_to.setDate(self.object_date_to.date())
+            self.object_expenses_period_enabled.setChecked(not self.object_all_period.isChecked())
+            self.object_expenses_object.setCurrentIndex(index)
+            self.exp_document_tabs.setCurrentIndex(1)
+            self.tabs.setCurrentIndex(3)
+            self.load_object_expense_overview()
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Переход к расходам", str(error))
+
+    def open_selected_object_report(self):
+        try:
+            object_row = self._selected_object_for_navigation()
+            if object_row is None:
+                return
+            if not object_row["sync_id"]:
+                raise ValueError("Для объекта нет устойчивого ID отчётного фильтра.")
+            start, end = self._object_link_period(object_row)
+            self.inv_comp_cb.setCurrentText(object_row["company"])
+            if not object_row["is_active"]:
+                self.inv_show_archived.setChecked(True)
+            self.load_invoice_objects(object_row["company"])
+            index = self.inv_obj_cb.findData(int(object_row["id"]))
+            if index < 0:
+                raise ValueError("Объект отсутствует в фильтре отчётов.")
+            self.inv_obj_cb.setCurrentIndex(index)
+            self.inv_date_from.setDate(QDate.fromString(start, "yyyy-MM-dd"))
+            self.inv_date_to.setDate(QDate.fromString(end, "yyyy-MM-dd"))
+            self.tabs.setCurrentIndex(4)
+            self.generate_invoice()
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Переход к отчёту", str(error))
 
     def update_object_archive_action(self):
         selected = self.table_objects.currentRow()
@@ -11898,8 +12572,29 @@ class SmartReportApp(QMainWindow):
             conn = get_db_connection()
             cursor = conn.cursor()
             has_ob_schema = ob_schema_ready(cursor)
-            cursor.execute("SELECT * FROM shifts ORDER BY id DESC LIMIT 200")
-            rows = cursor.fetchall()
+            selected_object_sync_id = (
+                self.filter_obj.currentData()
+                if hasattr(self, "filter_obj") else None
+            )
+            if selected_object_sync_id:
+                object_row = cursor.execute(
+                    "SELECT * FROM objects WHERE sync_id = ?", (selected_object_sync_id,)
+                ).fetchone()
+                if object_row is None:
+                    rows = []
+                else:
+                    names = invoice_object_names(cursor, dict(object_row))
+                    marks = ",".join("?" for _ in names)
+                    date_from = self.filter_date_from.text().strip()
+                    date_to = self.filter_date_to.text().strip()
+                    rows = cursor.execute(
+                        f"SELECT * FROM shifts WHERE company = ? AND object_name IN ({marks}) "
+                        "AND entry_type IN ('work', 'ob') AND date >= ? AND date <= ? "
+                        "ORDER BY id DESC LIMIT 200",
+                        (object_row["company"], *names, date_from, date_to),
+                    ).fetchall()
+            else:
+                rows = cursor.execute("SELECT * FROM shifts ORDER BY id DESC LIMIT 200").fetchall()
             delete_states = {
                 row["sync_id"]: row["state"] for row in cursor.execute(
                     "SELECT sync_id,state FROM shift_sync_outbox WHERE operation='delete' ORDER BY id"
@@ -11939,27 +12634,16 @@ class SmartReportApp(QMainWindow):
                 detail_tooltip = ""
                 if has_ob_schema and entry_type == RECORD_TYPE_OB:
                     segments = ob_segments_by_id.get(row["sync_id"], [])
-                    if not segments and has_start and has_end:
-                        try:
-                            calc_conn = get_db_connection()
-                            base_rate = float(row['ob_base_rate'] or 0.0) if "ob_base_rate" in row.keys() else 0.0
-                            if base_rate <= 0:
-                                base_rate = get_local_employee_ob_base_rate(calc_conn.cursor(), row['employee'])
-                            calc_res = calculate_work_interval(row['date'], row['start_time'], row['end_time'], base_rate)
-                            replace_ob_segments(calc_conn.cursor(), row['sync_id'], calc_res["segments"])
-                            calc_conn.commit()
-                            calc_conn.close()
-                            segments = calc_res["segments"]
-                        except Exception:
-                            pass
-                    ob_amount = sum(segment["amount"] for segment in segments)
-                    ob_amount_str = f"{ob_amount:.2f}"
+                    ob_amount = sum(segment["amount"] for segment in segments) if segments else None
+                    ob_amount_str = f"{ob_amount:.2f}" if ob_amount is not None else "Неизвестно"
                     detalization = format_ob_detail(row['start_time'], row['end_time'], row['hours'], segments)
                     if segments:
                         detail_tooltip = ";\n".join(
                             f"{s['segment_date']} {s['start_time']}–{s['end_time']}: {s['hours']:.2f} ч (×{s['multiplier']:.2f}, {s['amount']:.2f} kr)"
                             for s in segments
                         ) + f"\nЗарплатное начисление OB: {ob_amount:.2f} kr (не клиентские доплаты)"
+                    elif has_start and has_end:
+                        detail_tooltip = "Сохранённые OB-сегменты отсутствуют; просмотр не пересчитывает и не сохраняет их."
                 elif entry_type == RECORD_TYPE_ATF:
                     detalization = "АТФ (p1000)"
                 elif entry_type == RECORD_TYPE_SICK:
@@ -11989,6 +12673,9 @@ class SmartReportApp(QMainWindow):
 
                 for col_idx, val in enumerate(values):
                     it = QTableWidgetItem(str(val))
+                    if col_idx == 0:
+                        it.setData(Qt.ItemDataRole.UserRole, row["id"])
+                        it.setData(Qt.ItemDataRole.UserRole + 1, row["sync_id"])
                     if col_idx in (1, 5, 6, 8, 9, 11, 12, 13, 14):
                         it.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                     if col_idx == 7 and detail_tooltip:
