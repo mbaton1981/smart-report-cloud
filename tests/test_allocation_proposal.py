@@ -83,10 +83,13 @@ class ProposalIntegrationTests(unittest.TestCase):
         return window, document_id, objects
 
     def test_explicit_apply_save_reopen_confirm_sync_lost_ack_one_original(self):
+        from PyQt6.QtWidgets import QMessageBox
+
         window, document_id, objects = self.prepare()
         self.assertEqual(window.allocations.rowCount(), 0)
         self.assertIsNone(self.store.card(document_id))
-        window.apply_proposal_button.click()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            window.apply_proposal_button.click()
         self.assertEqual(window.allocations.rowCount(), 3)
         self.assertIn("Объект неактивен", window.allocations.cellWidget(2, 0).currentText())
         window.checked.setChecked(True)

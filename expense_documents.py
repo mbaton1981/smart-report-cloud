@@ -460,6 +460,48 @@ def invoice_seller_blocks(cells, page):
     return candidates
 
 
+def invoice_supplier_identifiers(page, supplier_name):
+    stem = re.sub(r"\s+(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS)$", "", supplier_name, flags=re.IGNORECASE)
+    if not stem:
+        return {}
+    lines = [line.strip() for line in str(page.get("text") or "").splitlines() if line.strip()]
+    identifiers = {}
+    sources = {}
+    labels = {
+        "supplier_org_number": re.compile(
+            rf"\b{re.escape(stem)}\s+(?:org\.?\s*(?:nr|nummer)|organisationsnummer)\b",
+            re.IGNORECASE,
+        ),
+        "supplier_vat_number": re.compile(
+            rf"\b{re.escape(stem)}\s+(?:moms(?:nummer|reg(?:istrerings)?(?:nummer|nr)?)|"
+            r"VAT(?:\s*(?:no\.?|number|nr))?)\b",
+            re.IGNORECASE,
+        ),
+    }
+    patterns = {
+        "supplier_org_number": re.compile(r"(?<!\d)\d{6}[- ]?\d{4}(?!\d)"),
+        "supplier_vat_number": re.compile(r"(?<!\w)SE[\s-]*\d(?:[\s-]*\d){11}(?!\w)", re.IGNORECASE),
+    }
+    for key, label in labels.items():
+        for index, line in enumerate(lines):
+            match = label.search(line)
+            if not match:
+                continue
+            for candidate in (line[match.end():], *lines[index + 1:index + 3]):
+                value = patterns[key].search(candidate)
+                if value:
+                    identifiers[key] = re.sub(r"\s+", "", value.group(0))
+                    sources[key] = {
+                        "page": page.get("page", 1),
+                        "text": candidate,
+                        "kind": "seller_identity_block",
+                    }
+                    break
+            if key in identifiers:
+                break
+    return {"values": identifiers, "sources": sources}
+
+
 def invoice_context(text):
     return {
         "reverse_charge": bool(re.search(r"omvänd\s+(?:moms|skattskyldighet|betalningsskyldighet)|reverse\s+charge", text or "", re.IGNORECASE)),
@@ -501,6 +543,7 @@ def parse_invoice_pages(pages):
         labels["amount_due"] += r"|Summa\s+er\s+tillgodo|Belopp\s+att\s+återfå"
     candidates = {key: [] for key in labels}
     companies = []
+    supplier_identity = None
     field_sources = {}
     order_pages = []
     due_caption_seen = False
@@ -532,7 +575,8 @@ def parse_invoice_pages(pages):
             rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
                     for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
         cells = [cell for row in rows for cell in row]
-        companies.extend(invoice_seller_blocks(cells, page))
+        if page.get("page", 1) == 1:
+            companies.extend(invoice_seller_blocks(cells, page))
         order_lines, order_sources = invoice_order_lines(rows)
         order_pages.append({**page, "text": "\n".join(order_lines), "line_sources": order_sources})
         if is_receipt:
@@ -659,6 +703,7 @@ def parse_invoice_pages(pages):
             _, company, page, cell = best[0]
             candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"],
                                                        "kind": "seller_address_block"}))
+            supplier_identity = invoice_supplier_identifiers(page, company)
     fiscal_summary_pages = {
         (source.get("attachment_index", 0), source["page"])
         for _, source in candidates["taxable_net_amount"]
@@ -683,6 +728,11 @@ def parse_invoice_pages(pages):
             diagnostics.append(f"Несколько различных значений поля {key}; требуется сверка по оригиналу.")
         elif key not in ("currency_code",):
             fields[key] = None
+    if supplier_identity is not None:
+        for key in ("supplier_org_number", "supplier_vat_number"):
+            fields[key] = supplier_identity["values"].get(key)
+            if key in supplier_identity["sources"]:
+                field_sources[key] = [supplier_identity["sources"][key]]
     if fields.get("net_amount") is None and all(fields.get(key) is not None for key in ("taxable_net_amount", "exempt_net_amount", "vat_amount", "gross_amount")):
         explicit_net = Decimal(fields["taxable_net_amount"]) + Decimal(fields["exempt_net_amount"])
         if explicit_net + Decimal(fields["vat_amount"]) == Decimal(fields["gross_amount"]):
