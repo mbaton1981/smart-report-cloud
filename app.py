@@ -1744,7 +1744,7 @@ class JournalTranslationDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Использовать перевод и создать PDF")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        self.retry_button = buttons.addButton("🔄 Повторить перевод", QDialogButtonBox.ButtonRole.ActionRole)
+        self.retry_button = buttons.addButton("Повторить перевод", QDialogButtonBox.ButtonRole.ActionRole)
         self.retry_button.setObjectName("journal_translation_retry")
         self.retry_button.clicked.connect(self.retry_translation)
         buttons.accepted.connect(self.accept)
@@ -2124,6 +2124,37 @@ class ZoomableDocumentView(QGraphicsView):
         super().wheelEvent(event)
 
 
+class ResponsiveExpenseSplitter(QSplitter):
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._compact_orientation = False
+        self._watched_window = None
+
+    def track_window(self, window):
+        if self._watched_window is not None:
+            self._watched_window.removeEventFilter(self)
+        self._watched_window = window
+        window.installEventFilter(self)
+        self._update_orientation()
+
+    def _update_orientation(self):
+        window = self._watched_window or self.window()
+        compact = window.width() < 1180
+        if compact != self._compact_orientation:
+            self._compact_orientation = compact
+            self.setOrientation(Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal)
+            self.setSizes([420, 420] if compact else [650, 520])
+
+    def eventFilter(self, watched, event):
+        if watched is self._watched_window and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self._update_orientation()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):
+        self._update_orientation()
+        super().resizeEvent(event)
+
+
 class DocumentPreviewDialog(QDialog):
     def __init__(self, pixmap, title, parent=None, source_path=None):
         super().__init__(parent)
@@ -2155,6 +2186,7 @@ class DocumentPreviewDialog(QDialog):
             controls.addWidget(source_button)
         controls.addStretch()
         layout.addLayout(controls)
+        desktop_theme.adapt_box_layout(self, controls, compact_width=980)
         layout.addWidget(self.preview, 1)
 
 
@@ -2205,6 +2237,7 @@ class DocumentGalleryDialog(QDialog):
         controls.addWidget(self.next_button)
         controls.addStretch()
         layout.addLayout(controls)
+        desktop_theme.adapt_box_layout(self, controls, compact_width=620)
         zoom_controls = QHBoxLayout()
         for label, callback in (
             ("−", lambda: self.preview.zoom(1 / 1.2)),
@@ -2217,6 +2250,7 @@ class DocumentGalleryDialog(QDialog):
             zoom_controls.addWidget(button)
         zoom_controls.addStretch()
         layout.addLayout(zoom_controls)
+        desktop_theme.adapt_box_layout(self, zoom_controls, compact_width=620)
         layout.addWidget(self.preview, 1)
         self.show_page(starting_page)
 
@@ -2255,39 +2289,6 @@ class DocumentGalleryDialog(QDialog):
             document.close()
         self._temporary_directory.cleanup()
         super().closeEvent(event)
-
-
-class ResponsiveExpenseSplitter(QSplitter):
-    def __init__(self, parent=None):
-        super().__init__(Qt.Orientation.Horizontal, parent)
-        self._compact_orientation = False
-        self._watched_window = None
-
-    def track_window(self, window):
-        if self._watched_window is not None:
-            self._watched_window.removeEventFilter(self)
-        self._watched_window = window
-        window.installEventFilter(self)
-        self._update_orientation()
-
-    def _update_orientation(self):
-        window = self._watched_window or self.window()
-        compact = window.width() < 1180
-        if compact != self._compact_orientation:
-            self._compact_orientation = compact
-            self.setOrientation(
-                Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
-            )
-            self.setSizes([420, 420] if compact else [650, 520])
-
-    def eventFilter(self, watched, event):
-        if watched is self._watched_window and event.type() == QEvent.Type.Resize:
-            self._update_orientation()
-        return super().eventFilter(watched, event)
-
-    def resizeEvent(self, event):
-        self._update_orientation()
-        super().resizeEvent(event)
 
 
 def create_half_hour_time_field(default_time):
@@ -2339,6 +2340,7 @@ class SmartReportApp(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         header = desktop_theme.header(self)
         assistant_button = QPushButton("ИИ-помощник")
+        assistant_button.setObjectName("secondaryAction")
         assistant_button.clicked.connect(self.open_assistant)
         header.layout().addWidget(assistant_button)
         main_layout.addWidget(header)
@@ -2448,10 +2450,13 @@ class SmartReportApp(QMainWindow):
         self.record_type_cb.currentIndexChanged.connect(self.reload_input_objects)
 
         self.hours_input = QLineEdit("8.0")
+        self.hours_input.setMaximumWidth(140)
         self.rate_input = QLineEdit()
+        self.rate_input.setMaximumWidth(220)
         self.rate_input.setPlaceholderText("Автоматически из договора / справочника")
         self.rate_input.setToolTip("Оставьте пустым для автоматической цены. Введённая цена сохраняется как ручная.")
         self.trans_input = QLineEdit("0")
+        self.trans_input.setMaximumWidth(140)
         self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Описание выполненных работ...")
@@ -2487,7 +2492,7 @@ class SmartReportApp(QMainWindow):
         self.emp_cb.currentTextChanged.connect(self.refresh_ob_preview)
         self.update_ob_form_visibility()
 
-        save_btn = QPushButton("💾 Сохранить смену")
+        save_btn = QPushButton("Сохранить смену")
         save_btn.setObjectName("primaryAction")
         save_btn.clicked.connect(self.save_shift)
         card_layout.addRow(save_btn)
@@ -2501,19 +2506,19 @@ class SmartReportApp(QMainWindow):
         c_layout.setSpacing(8)
 
         btn_row = QHBoxLayout()
-        refresh_shifts_btn = QPushButton("🔄 Обновить данные")
+        refresh_shifts_btn = QPushButton("Обновить данные")
         refresh_shifts_btn.setObjectName("secondaryAction")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
         
-        sync_cloud_btn = QPushButton("🌐 Синхронизация с облаком")
-        sync_cloud_btn.setObjectName("primaryAction")
+        sync_cloud_btn = QPushButton("Синхронизация с облаком")
+        sync_cloud_btn.setObjectName("secondaryAction")
         sync_cloud_btn.clicked.connect(self.sync_with_cloud)
 
-        del_shift_btn = QPushButton("🗑 Удалить")
+        del_shift_btn = QPushButton("Удалить")
         del_shift_btn.setObjectName("deleteShiftButton")
         del_shift_btn.setToolTip("Удалить выбранную смену")
         del_shift_btn.clicked.connect(self.delete_shift)
-        edit_shift_btn = QPushButton("✏ Изменить")
+        edit_shift_btn = QPushButton("Изменить")
         edit_shift_btn.setObjectName("editShiftButton")
         edit_shift_btn.setToolTip("Изменить выбранную смену")
         edit_shift_btn.clicked.connect(self.edit_shift)
@@ -2530,6 +2535,7 @@ class SmartReportApp(QMainWindow):
         btn_row.addStretch()
         btn_row.addWidget(del_shift_btn)
         c_layout.addLayout(btn_row)
+        desktop_theme.adapt_box_layout(control_card, btn_row, compact_width=1080)
 
         filter_layout = QVBoxLayout()
         filter_date_row = QHBoxLayout()
@@ -2575,6 +2581,8 @@ class SmartReportApp(QMainWindow):
         filter_layout.addWidget(self.shift_period_warning)
         filter_layout.addLayout(filter_select_row)
         c_layout.addLayout(filter_layout)
+        desktop_theme.adapt_box_layout(control_card, filter_date_row, compact_width=650)
+        desktop_theme.adapt_box_layout(control_card, filter_select_row, compact_width=880)
 
         layout.addWidget(control_card)
 
@@ -3751,6 +3759,7 @@ class SmartReportApp(QMainWindow):
         t_layout.addWidget(self.sal_summary_net_lbl)
         t_layout.addWidget(self.sal_summary_employer_lbl)
         layout.addWidget(total_card)
+        desktop_theme.adapt_box_layout(total_card, t_layout, compact_width=980)
 
         card = QFrame()
         card.setObjectName("card")
@@ -3758,19 +3767,22 @@ class SmartReportApp(QMainWindow):
         period_layout = QHBoxLayout()
 
         self.sal_report_mode = QComboBox()
+        self.sal_report_mode.setMaximumWidth(440)
         self.sal_report_mode.addItem("Часы бухгалтеру / ориентировочный расчёт", "management")
         self.sal_report_mode.addItem("Сохранённые расчёты / зарплатная история", "history")
         card_layout.addWidget(self.sal_report_mode)
         employee_layout = QHBoxLayout()
         employee_layout.addWidget(QLabel("Сотрудник:"))
         self.sal_employee_filter = QComboBox()
+        self.sal_employee_filter.setMaximumWidth(360)
         self.sal_employee_filter.addItem("Все сотрудники", None)
         employee_layout.addWidget(self.sal_employee_filter, 1)
         card_layout.addLayout(employee_layout)
+        desktop_theme.adapt_box_layout(card, employee_layout, compact_width=700)
         period_layout.addWidget(QLabel("<b>Период:</b>"))
         self.sal_date_from = create_date_field("2026-10-01")
         self.sal_date_to = create_date_field("2026-10-31")
-        calc_btn = QPushButton("🔄 Обновить расчёт")
+        calc_btn = QPushButton("Обновить расчёт")
         calc_btn.clicked.connect(self.calculate_salary)
 
         period_layout.addWidget(self.sal_date_from)
@@ -3779,14 +3791,17 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(calc_btn)
 
         preview_salary_pdf_btn = QPushButton("Предпросмотр PDF")
+        preview_salary_pdf_btn.setObjectName("secondaryAction")
         preview_salary_pdf_btn.clicked.connect(self.preview_salary_pdf)
         period_layout.addWidget(preview_salary_pdf_btn)
-        export_salary_pdf_btn = QPushButton("🖨 Экспорт зарплат в PDF")
+        export_salary_pdf_btn = QPushButton("Экспорт зарплат в PDF")
         export_salary_pdf_btn.setObjectName("secondaryAction")
         export_salary_pdf_btn.clicked.connect(self.export_salary_to_pdf)
         period_layout.addWidget(export_salary_pdf_btn)
         period_layout.addStretch()
         card_layout.addLayout(period_layout)
+        calc_btn.setObjectName("primaryAction")
+        desktop_theme.adapt_box_layout(card, period_layout, compact_width=1080)
         self.sal_period_warning = QLabel(input_safety.PERIOD_WARNING)
         self.sal_period_warning.setWordWrap(True)
         desktop_theme.apply_style(self.sal_period_warning, "color: #f6ad55; font-weight: bold;")
@@ -3794,17 +3809,24 @@ class SmartReportApp(QMainWindow):
         card_layout.addWidget(self.sal_period_warning)
         self.sal_unknown_ob_button =  QPushButton("OB не определён — показать записи…")
         self.sal_unknown_ob_button.clicked.connect(lambda: payroll_ui.show_unknown_ob(self, sys.modules[__name__]))
-        card_layout.addWidget(self.sal_unknown_ob_button)
+        self.sal_unknown_ob_button.setObjectName("secondaryAction")
         self.sal_norm_label = QLabel()
         self.sal_norm_label.setWordWrap(True)
         card_layout.addWidget(self.sal_norm_label)
         self.sal_norm_button = QPushButton("Изменить норму сотрудника за выбранный период…")
         self.sal_norm_button.clicked.connect(lambda: payroll_ui.edit_norm(self, sys.modules[__name__]))
-        card_layout.addWidget(self.sal_norm_button)
+        self.sal_norm_button.setObjectName("secondaryAction")
 
-        history_btn = QPushButton("Необязательно: история ставок, сохранённые расчёты и корректировки…")
+        history_btn = QPushButton("История ставок и расчётов…")
+        history_btn.setObjectName("secondaryAction")
+        history_btn.setToolTip("История ставок, сохранённые расчёты и корректировки")
         history_btn.clicked.connect(lambda: payroll_ui.open_history(self, sys.modules[__name__]))
-        card_layout.addWidget(history_btn)
+        payroll_actions = QHBoxLayout()
+        payroll_actions.addWidget(self.sal_unknown_ob_button)
+        payroll_actions.addWidget(self.sal_norm_button)
+        payroll_actions.addWidget(history_btn)
+        card_layout.addLayout(payroll_actions)
+        desktop_theme.adapt_box_layout(card, payroll_actions, compact_width=1080)
         self.payroll_history_note = QLabel("Закрытие зарплаты не означает выплату. «Баланс» не меняется.")
         self.payroll_history_note.setWordWrap(True)
         card_layout.addWidget(self.payroll_history_note)
@@ -3854,6 +3876,7 @@ class SmartReportApp(QMainWindow):
         settings_layout.addWidget(self.sal_sick_percent)
         settings_layout.addStretch()
         card_layout.addWidget(self.sal_history_parameters)
+        desktop_theme.adapt_box_layout(self.sal_history_parameters, settings_layout, compact_width=1080)
         self.sal_history_parameters.setVisible(False)
         for rate_control in (
             self.sal_vacation_percent, self.sal_tax_percent,
@@ -4361,7 +4384,7 @@ class SmartReportApp(QMainWindow):
         
         total_layout = QVBoxLayout(total_card)
         total_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        total_title = QLabel("💰 ОБЩИЙ ИТОГ (БАЛАНС ПО ВСЕМ СОТРУДНИКАМ):")
+        total_title = QLabel("ОБЩИЙ ИТОГ (БАЛАНС ПО ВСЕМ СОТРУДНИКАМ):")
         total_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         desktop_theme.apply_style(total_title, "font-size: 13px; font-weight: bold; color: #63b3ed; border: none;")
         
@@ -4376,7 +4399,7 @@ class SmartReportApp(QMainWindow):
         summary_card = QFrame()
         summary_card.setObjectName("card")
         summary_layout = QVBoxLayout(summary_card)
-        summary_layout.addWidget(QLabel("<b>📌 Текущий баланс (долг) по сотрудникам:</b>"))
+        summary_layout.addWidget(QLabel("<b>Текущий баланс (долг) по сотрудникам:</b>"))
         
         self.table_bal_summary = QTableWidget()
         self.table_bal_summary.setColumnCount(2)
@@ -4384,6 +4407,7 @@ class SmartReportApp(QMainWindow):
         self.table_bal_summary.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_bal_summary.setAlternatingRowColors(True)
         self.table_bal_summary.setMinimumHeight(180)
+        self.table_bal_summary.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         summary_layout.addWidget(self.table_bal_summary)
         layout.addWidget(summary_card)
 
@@ -4395,9 +4419,12 @@ class SmartReportApp(QMainWindow):
         self.bal_date = create_date_field(QDate.currentDate().toString("yyyy-MM-dd"))
         self.bal_emp_cb = QComboBox()
         self.bal_emp_cb.setEditable(True)
+        self.bal_emp_cb.setMaximumWidth(360)
         self.bal_desc = QLineEdit()
+        self.bal_desc.setMaximumWidth(420)
         self.bal_desc.setPlaceholderText("Например: Выдан аванс / Зарплата")
         self.bal_amount = QLineEdit()
+        self.bal_amount.setMaximumWidth(220)
         self.bal_amount.setPlaceholderText("Сумма (+ долг, - выплата)")
 
         card_layout.addRow("Дата:", self.bal_date)
@@ -4406,6 +4433,7 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Изменение (SEK):", self.bal_amount)
 
         self.add_balance_button = QPushButton("Добавить операцию")
+        self.add_balance_button.setObjectName("primaryAction")
         self.add_balance_button.clicked.connect(self.add_balance_entry)
         card_layout.addRow(self.add_balance_button)
         layout.addWidget(card)
@@ -4420,6 +4448,8 @@ class SmartReportApp(QMainWindow):
         self.table_balance.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table_balance.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table_balance.setAlternatingRowColors(True)
+        self.table_balance.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_balance.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.table_balance)
         delete_button = QPushButton("Удалить выбранную операцию")
         delete_button.setObjectName("danger")
@@ -5026,6 +5056,7 @@ class SmartReportApp(QMainWindow):
         for button in (save_draft, save_review, confirm, cancel):
             actions.addWidget(button)
         layout.addLayout(actions)
+        desktop_theme.adapt_box_layout(self.tab_object_expenses, actions, compact_width=980)
 
         def save_document(status):
             if is_transfer_receipt and status != "requires_review":
@@ -6753,14 +6784,14 @@ class SmartReportApp(QMainWindow):
             card_layout.setContentsMargins(13, 9, 13, 9)
             card_layout.setSpacing(3)
             label = QLabel(title_text)
-            label.setStyleSheet("font-size: 11px; font-weight: 650;")
+            label.setStyleSheet("font-size: 12px; font-weight: 650;")
             value = QLabel("—")
             desktop_theme.apply_style(
                 value, f"QLabel {{ font-size: 18px; font-weight: 750; color: {accent}; }}"
             )
             meta = QLabel("")
             meta.setWordWrap(True)
-            meta.setStyleSheet("font-size: 10px;")
+            meta.setStyleSheet("font-size: 12px;")
             card_layout.addWidget(label)
             card_layout.addWidget(value)
             card_layout.addWidget(meta)
@@ -6897,7 +6928,7 @@ class SmartReportApp(QMainWindow):
         detail_layout.setSpacing(8)
         heading_row = QHBoxLayout()
         self.exp_detail_supplier = QLabel("Выберите документ")
-        self.exp_detail_supplier.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.exp_detail_supplier.setStyleSheet("font-size: 15px; font-weight: 700;")
         self.exp_detail_supplier.setWordWrap(True)
         self.exp_detail_status = QLabel("")
         self.exp_detail_status.setWordWrap(True)
@@ -6928,10 +6959,10 @@ class SmartReportApp(QMainWindow):
         )):
             cell = QVBoxLayout()
             label = QLabel(caption)
-            label.setStyleSheet("font-size: 10px;")
+            label.setStyleSheet("font-size: 12px;")
             value = QLabel("—")
             value.setWordWrap(True)
-            value.setStyleSheet("font-size: 11px; font-weight: 650;")
+            value.setStyleSheet("font-size: 13px; font-weight: 650;")
             cell.addWidget(label)
             cell.addWidget(value)
             info_grid.addLayout(cell, index // 2, index % 2)
@@ -6969,6 +7000,8 @@ class SmartReportApp(QMainWindow):
 
         self.exp_document_tabs.addTab(self.exp_documents_page, "Все документы")
         self.expense_splitter.track_window(self.window())
+        self.exp_document_tabs.setUsesScrollButtons(True)
+        self.exp_document_tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.exp_document_tabs.addTab(self.tab_object_expenses, "По объектам")
         self.exp_document_tabs.currentChanged.connect(self._on_expense_view_changed)
         layout.addWidget(self.exp_document_tabs, 1)
@@ -7091,7 +7124,7 @@ class SmartReportApp(QMainWindow):
         desktop_theme.apply_style(
             self.exp_detail_status,
             f"QLabel {{ background-color: {background}; color: {foreground}; "
-            "border-radius: 8px; padding: 4px 7px; font-size: 10px; font-weight: 650; }",
+            "border-radius: 8px; padding: 4px 7px; font-size: 12px; font-weight: 650; }",
         )
 
         allocated = bool(document.get("allocations"))
@@ -7330,7 +7363,8 @@ class SmartReportApp(QMainWindow):
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Объект:"))
         self.object_expenses_object = QComboBox()
-        self.object_expenses_object.setMinimumWidth(320)
+        self.object_expenses_object.setMinimumWidth(0)
+        self.object_expenses_object.setMaximumWidth(420)
         controls.addWidget(self.object_expenses_object, 1)
         self.object_expenses_period_enabled = QCheckBox("За период")
         controls.addWidget(self.object_expenses_period_enabled)
@@ -9216,6 +9250,7 @@ class SmartReportApp(QMainWindow):
         period_layout.addWidget(self.inv_date_to)
         period_layout.addStretch(1)
         card_layout.addRow("Период:", period_layout)
+        desktop_theme.adapt_box_layout(card, period_layout, compact_width=700)
         card_layout.addRow("Фирма:", self.inv_comp_cb)
         object_row = QHBoxLayout()
         object_row.addWidget(self.inv_obj_cb, stretch=1)
@@ -9223,9 +9258,10 @@ class SmartReportApp(QMainWindow):
         card_layout.addRow("Объект:", object_row)
 
         fast_pris_box = QHBoxLayout()
-        self.fast_pris_check = QCheckBox("📌 Фиксированная цена за объект (Fast pris)")
+        self.fast_pris_check = QCheckBox("Фиксированная цена за объект (Fast pris)")
         desktop_theme.apply_style(self.fast_pris_check, "color: #63b3ed; font-weight: bold;")
         self.fast_pris_input = QLineEdit()
+        self.fast_pris_input.setMaximumWidth(220)
         self.fast_pris_input.setPlaceholderText("Сумма без НДС (SEK)")
         self.fast_pris_input.setEnabled(False)
         self.fast_pris_check.toggled.connect(self.fast_pris_input.setEnabled)
@@ -9236,41 +9272,38 @@ class SmartReportApp(QMainWindow):
         self.fast_pris_saved_note = QLabel()
         self.fast_pris_saved_note.setWordWrap(True)
         card_layout.addRow(self.fast_pris_saved_note)
-        fast_details = QPushButton("Fast pris: включённые работы и платные дополнения…")
-        fast_details.clicked.connect(self.configure_fast_pris)
-        card_layout.addRow(fast_details)
         self.inv_obj_cb.currentIndexChanged.connect(self._reset_fast_pris_draft)
         self.inv_date_from.dateChanged.connect(self._reset_fast_pris_draft)
         self.inv_date_to.dateChanged.connect(self._reset_fast_pris_draft)
 
         btn_layout = QHBoxLayout()
-        gen_btn = QPushButton("📊 Просмотр сводки и журнала")
+        gen_btn = QPushButton("Просмотр сводки и журнала")
+        gen_btn.setObjectName("secondaryAction")
         gen_btn.clicked.connect(self.generate_invoice)
         
-        export_pdf_inv_btn = QPushButton("📄 Сформировать общий PDF (SV)")
+        export_pdf_inv_btn = QPushButton("Сформировать общий PDF (SV)")
         export_pdf_inv_btn.setObjectName("primaryAction")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
         
-        mark_invoiced_btn = QPushButton("✅ Закрыть период")
-        mark_invoiced_btn.setObjectName("successAction")
-        mark_invoiced_btn.clicked.connect(self.mark_period_as_invoiced)
-
-        unmark_invoiced_btn = QPushButton("❌ Вернуть в работу")
-        unmark_invoiced_btn.setObjectName("danger")
-        unmark_invoiced_btn.clicked.connect(self.unmark_period_as_invoiced)
-
         btn_layout.addWidget(gen_btn)
         btn_layout.addWidget(export_pdf_inv_btn)
-        btn_layout.addWidget(mark_invoiced_btn)
-        btn_layout.addWidget(unmark_invoiced_btn)
         card_layout.addRow(btn_layout)
-        prices_btn = QPushButton("Клиентские цены выбранного периода…")
-        prices_btn.clicked.connect(self.confirm_customer_prices)
-        card_layout.addRow(prices_btn)
-        catalog_prices_btn = QPushButton("Применить цены справочника…")
-        catalog_prices_btn.setObjectName("apply_catalog_prices")
-        catalog_prices_btn.clicked.connect(self.preview_catalog_prices)
-        card_layout.addRow(catalog_prices_btn)
+        actions_menu = QMenu(card)
+        for label, callback in (
+            ("Закрыть период", self.mark_period_as_invoiced),
+            ("Вернуть период в работу", self.unmark_period_as_invoiced),
+            ("Fast pris: работы и дополнения…", self.configure_fast_pris),
+            ("Клиентские цены выбранного периода…", self.confirm_customer_prices),
+            ("Применить цены справочника…", self.preview_catalog_prices),
+        ):
+            action = actions_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, handler=callback: handler())
+        actions_button = QToolButton(card)
+        actions_button.setText("Другие действия")
+        actions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        actions_button.setMenu(actions_menu)
+        btn_layout.addWidget(actions_button)
+        desktop_theme.adapt_box_layout(card, btn_layout, compact_width=1040)
 
         layout.addWidget(card)
         layout.addWidget(QLabel(
@@ -9371,6 +9404,8 @@ class SmartReportApp(QMainWindow):
             item = layout.takeAt(1)
             summary_layout.addWidget(item.widget())
         self.report_pages = QTabWidget()
+        self.report_pages.setUsesScrollButtons(True)
+        self.report_pages.setElideMode(Qt.TextElideMode.ElideNone)
         self.report_pages.addTab(summary, "Сводка и стоимость")
         self.report_pages.addTab(self.tab_dagbok, "Журнал работ")
         layout.addWidget(self.report_pages)
@@ -9615,8 +9650,8 @@ class SmartReportApp(QMainWindow):
             )
             status = (
                 "Частично закрыт" if status_code == 2
-                else "✅ Выставлен" if status_code == 1
-                else "⏳ В работе"
+                else "Выставлен" if status_code == 1
+                else "В работе"
             )
             matching = [
                 shift for shift in report.get("journal_rows", [])
@@ -9828,7 +9863,7 @@ class SmartReportApp(QMainWindow):
             ]
             for col_idx, val in enumerate(row_values):
                 it = QTableWidgetItem(str(val))
-                if row["status"].startswith("✅ Выставлен"):
+                if row["status"].startswith("Выставлен"):
                     desktop_theme.item_color(it, "#1c4532")
                 related = [shift for shift in report["journal_rows"] if shift["employee"] == row["employee"]
                            and shift["entry_type"] in ("work", "ob")]
@@ -10416,7 +10451,7 @@ class SmartReportApp(QMainWindow):
 
     def setup_dagbok_tab(self):
         layout = QVBoxLayout(self.tab_dagbok)
-        journal_pdf = QPushButton("📖 PDF только журнала (SV)")
+        journal_pdf = QPushButton("PDF только журнала (SV)")
         journal_pdf.clicked.connect(self.export_dagbok_to_pdf)
         layout.addWidget(journal_pdf)
         layout.addWidget(QLabel("<b>Журнал выполненных работ (Dagbok):</b>"))
@@ -10546,12 +10581,12 @@ class SmartReportApp(QMainWindow):
         comp_card.setObjectName("card")
         comp_card_layout = QVBoxLayout(comp_card)
         comp_card_layout.setSpacing(6)
-        comp_card_layout.addWidget(QLabel("<b>🏢 Фирмы (Заказчики):</b>"))
+        comp_card_layout.addWidget(QLabel("<b>Фирмы (Заказчики):</b>"))
         
         comp_add_layout = QHBoxLayout()
         self.new_comp_input = QLineEdit()
         self.new_comp_input.setPlaceholderText("Название фирмы...")
-        add_comp_btn = QPushButton("➕ Добавить")
+        add_comp_btn = QPushButton("Добавить")
         add_comp_btn.clicked.connect(self.add_company)
         comp_add_layout.addWidget(self.new_comp_input, stretch=3)
         comp_add_layout.addWidget(add_comp_btn, stretch=1)
@@ -10563,7 +10598,7 @@ class SmartReportApp(QMainWindow):
         self.table_companies.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         comp_card_layout.addWidget(self.table_companies, stretch=1)
 
-        del_comp_btn = QPushButton("🗑 Удалить фирму")
+        del_comp_btn = QPushButton("Удалить фирму")
         del_comp_btn.setObjectName("danger")
         del_comp_btn.clicked.connect(self.delete_company)
         comp_card_layout.addWidget(del_comp_btn)
@@ -10574,20 +10609,22 @@ class SmartReportApp(QMainWindow):
         emp_card.setObjectName("card")
         emp_card_layout = QVBoxLayout(emp_card)
         emp_card_layout.setSpacing(6)
-        emp_card_layout.addWidget(QLabel("<b>👥 Сотрудники:</b>"))
+        emp_card_layout.addWidget(QLabel("<b>Сотрудники:</b>"))
         
         emp_add_layout = QHBoxLayout()
         self.new_emp_input = QLineEdit()
         self.new_emp_input.setPlaceholderText("ФИО...")
         self.new_emp_rate_input = QLineEdit()
         self.new_emp_rate_input.setPlaceholderText("kr/ч...")
-        self.new_emp_rate_input.setFixedWidth(80)
-        add_emp_btn = QPushButton("➕ Добавить")
+        self.new_emp_rate_input.setMinimumWidth(90)
+        self.new_emp_rate_input.setMaximumWidth(130)
+        add_emp_btn = QPushButton("Добавить")
         add_emp_btn.clicked.connect(self.add_or_update_employee)
         emp_add_layout.addWidget(self.new_emp_input, stretch=2)
         emp_add_layout.addWidget(self.new_emp_rate_input, stretch=1)
         emp_add_layout.addWidget(add_emp_btn)
         emp_card_layout.addLayout(emp_add_layout)
+        desktop_theme.adapt_box_layout(emp_card, emp_add_layout, compact_width=520)
 
         employee_view_layout = QHBoxLayout()
         archive_filter_style = (
@@ -10621,7 +10658,7 @@ class SmartReportApp(QMainWindow):
         self.employee_status_button.setEnabled(False)
         self.employee_status_button.clicked.connect(self.toggle_employee_active)
         
-        set_pin_btn = QPushButton("🔑 Задать ПИН")
+        set_pin_btn = QPushButton("Задать ПИН")
         set_pin_btn.clicked.connect(self.reset_employee_pin_desktop)
 
         emp_btn_layout.addWidget(self.employee_status_button)
@@ -10638,19 +10675,21 @@ class SmartReportApp(QMainWindow):
         card_actions.addWidget(open_card)
         card_actions.addWidget(export_cards)
         emp_card_layout.addLayout(card_actions)
+        desktop_theme.adapt_box_layout(emp_card, card_actions, compact_width=520)
         card_access = QPushButton("Доступ бухгалтера…")
         card_access.clicked.connect(lambda: accountant_access(self))
         emp_card_layout.addWidget(card_access)
-        top_layout.addWidget(emp_card, stretch=1)
+        top_layout.addWidget(emp_card, stretch=2)
 
         layout.addLayout(top_layout, stretch=1)
+        desktop_theme.adapt_box_layout(self.tab_sprav, top_layout, compact_width=1040)
 
         # Нижняя панель (Управление объектами со ставками и транспортом)
         obj_card = QFrame()
         obj_card.setObjectName("card")
         obj_card_layout = QVBoxLayout(obj_card)
         obj_card_layout.setSpacing(6)
-        obj_card_layout.addWidget(QLabel("<b>🏗 Управление объектами (Ставки и транспорт):</b>"))
+        obj_card_layout.addWidget(QLabel("<b>Управление объектами (Ставки и транспорт):</b>"))
 
         object_view_layout = QHBoxLayout()
         self.show_archived_objects_check = QCheckBox("Показать архив")
@@ -10672,17 +10711,20 @@ class SmartReportApp(QMainWindow):
         
         self.new_obj_mark_input = QLineEdit()
         self.new_obj_mark_input.setPlaceholderText("Markning")
-        self.new_obj_mark_input.setFixedWidth(90)
+        self.new_obj_mark_input.setMinimumWidth(90)
+        self.new_obj_mark_input.setMaximumWidth(150)
         
         self.new_obj_rate_input = QLineEdit()
         self.new_obj_rate_input.setPlaceholderText("kr/ч")
-        self.new_obj_rate_input.setFixedWidth(70)
+        self.new_obj_rate_input.setMinimumWidth(90)
+        self.new_obj_rate_input.setMaximumWidth(150)
 
         self.new_obj_trans_input = QLineEdit()
         self.new_obj_trans_input.setPlaceholderText("Транс.kr")
-        self.new_obj_trans_input.setFixedWidth(75)
+        self.new_obj_trans_input.setMinimumWidth(100)
+        self.new_obj_trans_input.setMaximumWidth(160)
 
-        add_obj_btn = QPushButton("➕ Добавить")
+        add_obj_btn = QPushButton("Добавить")
         add_obj_btn.clicked.connect(self.add_object)
 
         obj_add_layout.addWidget(self.new_obj_comp_cb, stretch=2)
@@ -10692,6 +10734,7 @@ class SmartReportApp(QMainWindow):
         obj_add_layout.addWidget(self.new_obj_trans_input, stretch=1)
         obj_add_layout.addWidget(add_obj_btn)
         obj_card_layout.addLayout(obj_add_layout)
+        desktop_theme.adapt_box_layout(obj_card, obj_add_layout, compact_width=1050)
         
         self.table_objects = QTableWidget()
         self.table_objects.setColumnCount(6)
@@ -11790,7 +11833,7 @@ class SmartReportApp(QMainWindow):
             self.table_shifts.setRowCount(len(rows))
             for row_idx, row in enumerate(rows):
                 is_inv = row["invoiced"] == 1
-                status_text = "✅ Выставлен" if is_inv else "⏳ В работе"
+                status_text = "Выставлен" if is_inv else "В работе"
                 delete_state = delete_states.get(row["sync_id"])
                 if delete_state in ("pending", "blocked"):
                     status_text += " · Удаление ожидает сервера"

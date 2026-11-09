@@ -4,6 +4,8 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from PyQt6.QtWidgets import QBoxLayout
+
 import test_incoming_integration as integration
 from offline_review import ReviewError
 
@@ -14,6 +16,24 @@ class IncomingDisplayTests(unittest.TestCase):
     _add_company = integration.IncomingIntegrationTests._add_company
     setUp = integration.IncomingIntegrationTests.setUp
     stage = integration.IncomingIntegrationTests.stage
+
+    def test_document_preview_controls_reflow_in_small_dialog(self):
+        dialogs = (
+            self.desktop.DocumentPreviewDialog(
+                self.desktop.QPixmap(32, 32), "Synthetic preview"),
+            self.desktop.DocumentGalleryDialog([], "Synthetic gallery"),
+        )
+        for dialog in dialogs:
+            with self.subTest(dialog=type(dialog).__name__):
+                self.addCleanup(dialog.deleteLater)
+                dialog.resize(560, 500)
+                dialog.show()
+                self.qt_app.processEvents()
+                self.assertTrue(any(
+                    controller.layout.direction() == QBoxLayout.Direction.TopToBottom
+                    for controller in dialog._smartreport_responsive_layouts
+                ))
+                dialog.close()
 
     def open_window(self):
         from offline_review_ui import OfflineReviewWindow
@@ -324,7 +344,8 @@ class IncomingDisplayTests(unittest.TestCase):
                 painter = QPainter(image)
                 table.render(painter)
                 painter.end()
-                cell = table.visualItemRect(table.item(selected_row, 1))
+                cell = table.visualItemRect(table.item(selected_row, 1)).translated(
+                    table.viewport().geometry().topLeft())
                 selection_color = expected[theme_name]["selected"]
                 selected_pixels = sum(
                     image.pixelColor(x, y).name() == selection_color

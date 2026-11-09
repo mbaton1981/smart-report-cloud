@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox, QProgressBar,
+    QScrollArea, QWidget, QFrame,
 )
 from date_widgets import CalendarDateEdit
 
@@ -486,10 +487,23 @@ class AssistantDialog(QDialog):
         self.assistant_candidate = bool(getattr(app_module, "ASSISTANT_CANDIDATE", False))
         self.database = getattr(app_module, "DB_FILE", None)
         self.setWindowTitle("SmartReport — ИИ-помощник")
-        self.resize(1000, 740)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        self.resize(
+            min(1000, max(440, available.width() - 48)) if available is not None else 1000,
+            min(740, max(360, available.height() - 80)) if available is not None else 740,
+        )
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
         self.setSizeGripEnabled(True)
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        self.content_scroll = QScrollArea(self)
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget(self.content_scroll)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        self.content_scroll.setWidget(content)
+        outer_layout.addWidget(self.content_scroll)
         notice_text = ("Кандидат подключён к рабочему серверу: только чтение и подготовка PDF. "
                        "Синхронизация, рабочие формы, изменения и отправка писем отключены."
                        if self.assistant_candidate else
@@ -500,7 +514,10 @@ class AssistantDialog(QDialog):
         layout.addWidget(notice)
         self.diagnostics = QDialog(self)
         self.diagnostics.setWindowTitle("Помощник — диагностика и настройки")
-        self.diagnostics.resize(800, 600)
+        self.diagnostics.resize(
+            min(800, max(420, available.width() - 64)) if available is not None else 800,
+            min(600, max(320, available.height() - 96)) if available is not None else 600,
+        )
         diagnostic_layout = QVBoxLayout(self.diagnostics)
         form = QFormLayout()
         self.enabled = QCheckBox("Помощник включён на сервере")
@@ -525,6 +542,7 @@ class AssistantDialog(QDialog):
             button.clicked.connect(action)
             controls.addWidget(button)
         diagnostic_layout.addLayout(controls)
+        desktop_theme.adapt_box_layout(self.diagnostics, controls, compact_width=900)
         self.diagnostic_output = QTextEdit()
         self.diagnostic_output.setReadOnly(True)
         diagnostic_layout.addWidget(self.diagnostic_output)
@@ -537,6 +555,7 @@ class AssistantDialog(QDialog):
             button.clicked.connect(action)
             header.addWidget(button)
         layout.addLayout(header)
+        desktop_theme.adapt_box_layout(content, header, compact_width=900)
         filters = QHBoxLayout()
         today = QDate.currentDate()
         monday = today.addDays(1 - today.dayOfWeek())
@@ -557,6 +576,7 @@ class AssistantDialog(QDialog):
         filters.addWidget(self.company)
         filters.addWidget(self.object_name)
         layout.addLayout(filters)
+        desktop_theme.adapt_box_layout(content, filters, compact_width=1080)
         shortcuts = QHBoxLayout()
         for text, purpose in (("Кто сколько отработал", "hours_summary"), ("Дубли и пропущенные ставки", "anomalies"),
                               ("Проверить транспорт", "transport_check")):
@@ -564,6 +584,7 @@ class AssistantDialog(QDialog):
             button.clicked.connect(lambda checked=False, purpose=purpose: self.quick_action(purpose))
             shortcuts.addWidget(button)
         layout.addLayout(shortcuts)
+        desktop_theme.adapt_box_layout(content, shortcuts, compact_width=900)
         actions = QHBoxLayout()
         self.action_choice = QComboBox()
         for key, (title, mode) in CAPABILITIES.items():
@@ -575,6 +596,8 @@ class AssistantDialog(QDialog):
         run_action.clicked.connect(lambda: self.quick_action(self.action_choice.currentData()))
         actions.addWidget(run_action)
         layout.addLayout(actions)
+        run_action.setObjectName("primaryAction")
+        desktop_theme.adapt_box_layout(content, actions, compact_width=900)
         self.workflow_choice = QComboBox()
         self.workflow_choice.setVisible(False)
         self.workflow_choice.currentIndexChanged.connect(self.select_workflow_result)
@@ -593,6 +616,7 @@ class AssistantDialog(QDialog):
                                                 if self.context else None)
         clarification_row.addWidget(self.continue_selection)
         layout.addLayout(clarification_row)
+        desktop_theme.adapt_box_layout(content, clarification_row, compact_width=900)
         hint = QLabel("Выбор выше — контекст диалога. Можно изменить его словами: «за прошлую неделю», "
                       "«по другому объекту». Открытие формы не означает сохранения данных.")
         hint.setWordWrap(True)
@@ -678,6 +702,9 @@ class AssistantDialog(QDialog):
         self.confirm_mail.setEnabled(False)
         self.confirm_mail.clicked.connect(self.send_mail)
         layout.addWidget(self.confirm_mail)
+        desktop_theme.adapt_box_layout(content, row, compact_width=1000)
+        desktop_theme.adapt_box_layout(content, voice_status, compact_width=1000)
+        desktop_theme.adapt_box_layout(content, tools, compact_width=1000)
         if self.assistant_candidate:
             self.native.hide()
             self.mail_button.hide()

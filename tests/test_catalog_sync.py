@@ -1956,7 +1956,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertIsNone(totals['ob_amount'])
                 self.assertIsNone(totals['invoice_total'])
                 self.assertEqual(report['prepared_rows'][0]['rate'], 520)
-                self.assertIn('⏳ В работе', report['prepared_rows'][0]['status'])
+                self.assertIn('В работе', report['prepared_rows'][0]['status'])
                 reports_dir = Path(self._case.name) / 'ob-only-pdf'
                 with patch.object(self.desktop, 'REPORTS_DIR', str(reports_dir)), \
                      patch.object(window, '_collect_journal_translations', return_value={ob_id: 'Bevarad manuell kommentar'}), \
@@ -1991,7 +1991,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(hotel['totals']['work_amount'], 4160)
                 self.assertEqual(hotel['totals']['invoice_total'], 4610)
                 self.assertEqual(totals['hours'] + hotel['totals']['hours'], 12)
-                self.assertIn('✅ Выставлен', hotel['prepared_rows'][0]['status'])
+                self.assertIn('Выставлен', hotel['prepared_rows'][0]['status'])
             conn = self.desktop.get_db_connection()
             self.assertEqual(list(conn.iterdump()), before)
             conn.close()

@@ -5,11 +5,14 @@ import os
 from pathlib import Path
 import re
 
-from PyQt6.QtCore import QIODevice, QObject, QPointF, QRectF, QSaveFile, QSignalBlocker, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QIODevice, QObject, QPointF, QRectF, QSaveFile, QSignalBlocker, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QColor, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
 )
-from PyQt6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton
+from PyQt6.QtWidgets import (
+    QApplication, QBoxLayout, QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QSplitter,
+)
 
 COLORS = {
     "#1e2229": "#edf2f6", "#242933": "#f7f9fb", "#2a313d": "#e4ebf1",
@@ -51,6 +54,112 @@ def style_text(style, theme=None):
 def apply_style(widget, dark_style):
     widget.setProperty("smartreportDarkStyle", dark_style)
     _inline_style(widget, style_text(dark_style))
+
+
+class AdaptiveBoxLayout(QObject):
+    """Stack a dense horizontal control row when its owning panel gets narrow."""
+
+    def __init__(self, owner, layout, compact_width):
+        super().__init__(owner)
+        self.owner = owner
+        self.layout = layout
+        self.compact_width = compact_width
+        self.wide_direction = layout.direction()
+        if self.wide_direction in (QBoxLayout.Direction.LeftToRight, QBoxLayout.Direction.RightToLeft):
+            self.compact_direction = QBoxLayout.Direction.TopToBottom
+            owner.installEventFilter(self)
+            self.update_direction()
+
+    def eventFilter(self, watched, event):
+        if watched is self.owner and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self.update_direction()
+        return False
+
+    def update_direction(self):
+        if self.owner.width() <= 0:
+            return
+        direction = (
+            self.compact_direction if self.owner.width() < self.compact_width
+            else self.wide_direction
+        )
+        if self.layout.direction() != direction:
+            self.layout.setDirection(direction)
+
+
+def adapt_box_layout(owner, layout, compact_width=900):
+    controller = AdaptiveBoxLayout(owner, layout, compact_width)
+    if not hasattr(owner, "_smartreport_responsive_layouts"):
+        owner._smartreport_responsive_layouts = []
+    owner._smartreport_responsive_layouts.append(controller)
+    return controller
+
+
+class AdaptiveSplitter(QObject):
+    def __init__(self, owner, splitter, compact_width=1000, wide_sizes=(650, 520), compact_sizes=(420, 420)):
+        super().__init__(owner)
+        self.owner = owner
+        self.splitter = splitter
+        self.compact_width = compact_width
+        self.wide_sizes = list(wide_sizes)
+        self.compact_sizes = list(compact_sizes)
+        self.compact = None
+        owner.installEventFilter(self)
+        self.update_orientation()
+
+    def eventFilter(self, watched, event):
+        if watched is self.owner and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self.update_orientation()
+        return False
+
+    def update_orientation(self):
+        if self.owner.width() <= 0:
+            return
+        compact = self.owner.width() < self.compact_width
+        if compact == self.compact:
+            return
+        self.compact = compact
+        self.splitter.setOrientation(
+            Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
+        )
+        self.splitter.setSizes(self.compact_sizes if compact else self.wide_sizes)
+
+
+def adapt_splitter(owner, splitter, compact_width=1000, wide_sizes=(650, 520), compact_sizes=(420, 420)):
+    controller = AdaptiveSplitter(owner, splitter, compact_width, wide_sizes, compact_sizes)
+    if not hasattr(owner, "_smartreport_responsive_splitters"):
+        owner._smartreport_responsive_splitters = []
+    owner._smartreport_responsive_splitters.append(controller)
+    return controller
+
+
+class DialogBoundsGuard(QObject):
+    def eventFilter(self, watched, event):
+        if event.type() != QEvent.Type.Show or not isinstance(watched, QDialog):
+            return False
+        screen = watched.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return False
+        available = screen.availableGeometry()
+        frame = watched.frameGeometry()
+        width_extra = max(0, frame.width() - watched.width())
+        height_extra = max(0, frame.height() - watched.height())
+        max_width = max(1, available.width() - width_extra)
+        max_height = max(1, available.height() - height_extra)
+        minimum = watched.minimumSize()
+        if minimum.width() > max_width or minimum.height() > max_height:
+            watched.setMinimumSize(
+                min(minimum.width(), max_width),
+                min(minimum.height(), max_height),
+            )
+        width = min(max(watched.width(), watched.minimumWidth()), max_width)
+        height = min(max(watched.height(), watched.minimumHeight()), max_height)
+        watched.resize(width, height)
+        frame = watched.frameGeometry()
+        left = min(max(frame.left(), available.left()), max(available.left(), available.right() - frame.width() + 1))
+        top = min(max(frame.top(), available.top()), max(available.top(), available.bottom() - frame.height() + 1))
+        if left != frame.left() or top != frame.top():
+            watched.move(left, top)
+        return False
 
 
 def _inline_style(widget, style):
@@ -205,6 +314,32 @@ QPushButton#danger:disabled, QPushButton#deleteShiftButton:disabled, QPushButton
 QLineEdit:disabled, QComboBox:disabled, QDateEdit:disabled, QSpinBox:disabled,
 QDoubleSpinBox:disabled, QTextEdit:disabled { background-color: #252b35; color: #718096; }
 QLineEdit[readOnly="true"] { background-color: #242933; color: #a0aec0; }
+QLineEdit, QComboBox, QDateEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit {
+    min-height: 32px;
+}
+QDateEdit { min-width: 126px; max-width: 168px; }
+QToolButton {
+    background-color: #313c4e; color: #ffffff; border: 1px solid #4a5568;
+    padding: 7px 12px; border-radius: 7px; min-height: 20px; font-weight: 600;
+}
+QToolButton:hover { background-color: #3c495f; border-color: #4299e1; }
+QToolButton:pressed { background-color: #2b6cb0; border-color: #3182ce; }
+QToolButton:disabled { background-color: #252b35; color: #718096; border-color: #323946; }
+QMenu { border: 1px solid #3f4c60; padding: 4px; }
+QMenu::item { padding: 7px 24px 7px 10px; border-radius: 4px; }
+QCalendarWidget QToolButton {
+    background-color: #313c4e; border: 1px solid #4a5568; padding: 5px 8px;
+    min-height: 24px; border-radius: 5px;
+}
+QCalendarWidget QToolButton:hover { background-color: #3c495f; border-color: #4299e1; }
+QCalendarWidget QAbstractItemView { font-size: 13px; selection-background-color: #2b6cb0; }
+QCalendarWidget QAbstractItemView::item { padding: 4px; min-width: 28px; min-height: 26px; }
+QHeaderView::section { min-height: 32px; padding: 7px 8px; font-size: 13px; }
+QTableWidget::item, QTableView::item { padding: 6px 8px; }
+QSplitter::handle { background-color: #323946; }
+QSplitter::handle:hover { background-color: #4299e1; }
+QGroupBox { padding: 14px 10px 10px; }
+QGroupBox::title { font-weight: 600; }
 QCheckBox::indicator, QRadioButton::indicator {
     width: 16px; height: 16px; border: 1px solid #718096;
     background-color: #28303d; border-radius: 3px;
@@ -258,6 +393,9 @@ QPushButton#primaryAction:disabled { background-color: #e8edf1; color: #657888; 
 QPushButton#successAction { background-color: #4f705c; color: #ffffff; border-color: #61836b; }
 QPushButton#successAction:disabled { background-color: #e8edf1; color: #657888; border-color: #ccd8e1; }
 QTableWidget::item:selected, QTableView::item:selected { background-color: #d6e5f0; color: #243b4e; }
+QTableWidget::item:selected:!active, QTableView::item:selected:!active {
+    background-color: #d6e5f0; color: #243b4e;
+}
 QLineEdit, QComboBox, QDateEdit, QSpinBox, QDoubleSpinBox, QTextEdit,
 QComboBox QAbstractItemView, QCalendarWidget QAbstractItemView {
     selection-background-color: #d6e5f0; selection-color: #243b4e;
@@ -268,6 +406,17 @@ QCalendarWidget QAbstractItemView::item:selected {
     background-color: #d6e5f0; color: #243b4e;
 }
 QMenu::item:selected { background-color: #d6e5f0; color: #243b4e; }
+QToolButton { background-color: #e2ebf2; color: #2c4052; border-color: #b7cad9; }
+QToolButton:hover { background-color: #d4e2ed; border-color: #7d9bb1; }
+QToolButton:pressed { background-color: #52718a; color: #ffffff; border-color: #5c7e99; }
+QToolButton:disabled { background-color: #e8edf1; color: #657888; border-color: #ccd8e1; }
+QMenu { border-color: #b9cad7; }
+QCalendarWidget QToolButton { background-color: #e2ebf2; color: #2c4052; border-color: #b7cad9; }
+QCalendarWidget QToolButton:hover { background-color: #d4e2ed; border-color: #7d9bb1; }
+QCalendarWidget QAbstractItemView { selection-background-color: #d6e5f0; }
+QHeaderView::section { background-color: #e4ebf1; color: #395d77; border-color: #ccd8e1; }
+QSplitter::handle { background-color: #dce5ec; }
+QSplitter::handle:hover { background-color: #7d9bb1; }
 QComboBox::down-arrow, QDateEdit::down-arrow {
     image: url("__CHEVRON__"); width: 12px; height: 8px; border: none;
 }
@@ -283,6 +432,8 @@ class ThemeManager(QObject):
         super().__init__(application)
         self.application = application
         self.dark_style = dark_style
+        self._dialog_bounds_guard = DialogBoundsGuard(self)
+        application.installEventFilter(self._dialog_bounds_guard)
         if os.name == "nt":
             for filename in ("segoeui.ttf", "segoeuib.ttf"):
                 font = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / filename

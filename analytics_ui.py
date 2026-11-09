@@ -5,7 +5,7 @@ import logging
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QDate, pyqtSignal
 from PyQt6.QtGui import QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
     QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
 )
 from date_widgets import CalendarDateEdit
@@ -55,7 +55,7 @@ class Chart(QWidget):
     def __init__(self, kind, parent=None):
         super().__init__(parent)
         self.kind, self.data, self.has_data = kind, [], False
-        self.setMinimumHeight(290 if kind == "hours" else 340)
+        self.setMinimumHeight(220)
         self.setMinimumWidth(300)
 
     def set_data(self, data, has_data):
@@ -150,7 +150,7 @@ class AnalyticsWidget(QWidget):
         title.setWordWrap(True)
         title.setStyleSheet("font-size: 18px; font-weight: 600")
         layout.addWidget(title)
-        filters = QHBoxLayout()
+        filters = QGridLayout()
         self.preset = QComboBox()
         for text, key in (("Эта неделя", "week"), ("Прошлая неделя", "previous_week"),
                           ("Этот месяц", "month"), ("Прошлый месяц", "previous_month"),
@@ -164,12 +164,21 @@ class AnalyticsWidget(QWidget):
         self.customer, self.object = QComboBox(), QComboBox()
         self.customer.addItem("Все заказчики", "")
         self.object.addItem("Все объекты", "")
-        self.customer.setMinimumWidth(140)
-        self.object.setMinimumWidth(180)
+        self.customer.setMinimumWidth(0)
+        self.object.setMinimumWidth(0)
         self.refresh_button = QPushButton("Обновить")
+        self.refresh_button.setObjectName("primaryAction")
         self.refresh_button.clicked.connect(self.refresh)
-        for widget in (self.preset, self.start, self.end, self.customer, self.object, self.refresh_button):
-            filters.addWidget(widget)
+        period_row = QWidget(self)
+        period_layout = QHBoxLayout(period_row)
+        period_layout.setContentsMargins(0, 0, 0, 0)
+        period_layout.addWidget(QLabel("Период с:", period_row))
+        period_layout.addWidget(self.start)
+        period_layout.addWidget(QLabel("по:", period_row))
+        period_layout.addWidget(self.end)
+        period_layout.addStretch(1)
+        self.filter_widgets = (period_row, self.preset, self.customer, self.object, self.refresh_button)
+        self.filters_layout = filters
         layout.addLayout(filters)
         self.scope = QLabel("Расчёт ещё не выполнен")
         self.scope.setWordWrap(True)
@@ -178,7 +187,9 @@ class AnalyticsWidget(QWidget):
         layout.addWidget(self.scope)
         layout.addWidget(self.status)
         cards = QGridLayout()
+        self.cards_layout = cards
         self.cards = {}
+        self.card_widgets = []
         for column, (key, text) in enumerate((
                 ("hours", "Рабочие часы"), ("employees", "Сотрудники"),
                 ("revenue", "Стоимость работ"), ("cost", "Учтённые затраты"),
@@ -194,12 +205,13 @@ class AnalyticsWidget(QWidget):
             value.setStyleSheet("font-size: 17px; font-weight: 600")
             contents.addWidget(value)
             help_button = QPushButton("Как рассчитано")
+            help_button.setObjectName("secondaryAction")
             help_button.setToolTip(HOW[key])
             help_button.clicked.connect(lambda checked=False, k=key, t=text: QMessageBox.information(
                 self, t, HOW[k]))
             contents.addWidget(help_button)
             self.cards[key] = value
-            cards.addWidget(card, 0, column)
+            self.card_widgets.append(card)
         layout.addLayout(cards)
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(("Объект", "Часы", "Стоимость · SEK", "Затраты · SEK",
@@ -213,9 +225,11 @@ class AnalyticsWidget(QWidget):
             self.table.setColumnWidth(column, 160)
         self.table.setColumnWidth(5, 210)
         self.table.setMinimumHeight(240)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.table)
         self.hours_chart, self.objects_chart = Chart("hours"), Chart("objects")
         charts = QHBoxLayout()
+        self.charts_layout = charts
         charts.addWidget(self.hours_chart)
         charts.addWidget(self.objects_chart)
         layout.addLayout(charts)
@@ -231,11 +245,35 @@ class AnalyticsWidget(QWidget):
         self.debounce.setInterval(200)
         self.debounce.timeout.connect(self.refresh)
         self.set_period()
+        self._refresh_responsive_layout()
         self.preset.currentIndexChanged.connect(self.set_period)
         for field in (self.start, self.end):
             field.dateChanged.connect(self.custom_period)
         self.customer.currentIndexChanged.connect(self.customer_changed)
         self.object.currentIndexChanged.connect(self.changed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_responsive_layout()
+
+    def _refresh_responsive_layout(self):
+        width = self.width()
+        filter_columns = 4 if width >= 1120 else 2 if width >= 650 else 1
+        while self.filters_layout.count():
+            self.filters_layout.takeAt(0)
+        for index, widget in enumerate(self.filter_widgets):
+            self.filters_layout.addWidget(widget, index // filter_columns, index % filter_columns)
+
+        card_columns = 5 if width >= 1180 else 3 if width >= 760 else 2 if width >= 520 else 1
+        while self.cards_layout.count():
+            self.cards_layout.takeAt(0)
+        for index, card in enumerate(self.card_widgets):
+            self.cards_layout.addWidget(card, index // card_columns, index % card_columns)
+
+        self.charts_layout.setDirection(
+            QBoxLayout.Direction.LeftToRight if width >= 980
+            else QBoxLayout.Direction.TopToBottom
+        )
 
     def set_period(self):
         if self.preset.currentData() != "custom":

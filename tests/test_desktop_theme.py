@@ -8,7 +8,10 @@ import unittest
 from unittest.mock import patch
 
 from PyQt6.QtCore import QEvent, Qt
-from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem
+from PyQt6.QtWidgets import (
+    QApplication, QBoxLayout, QDialog, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QWidget,
+)
 
 import desktop_theme as theme
 
@@ -96,6 +99,63 @@ class DesktopThemeTests(unittest.TestCase):
         panel.deleteLater()
         self.application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.assertTrue(self.manager.toggle())
+
+    def test_dense_control_rows_stack_below_their_width_threshold(self):
+        owner = QWidget()
+        row = QHBoxLayout(owner)
+        row.addWidget(QLabel("Start", owner))
+        row.addWidget(QLabel("End", owner))
+        theme.adapt_box_layout(owner, row, compact_width=800)
+        owner.show()
+        self.application.processEvents()
+
+        owner.resize(900, 120)
+        self.application.processEvents()
+        self.assertEqual(row.direction(), QBoxLayout.Direction.LeftToRight)
+        owner.resize(700, 120)
+        self.application.processEvents()
+        self.assertEqual(row.direction(), QBoxLayout.Direction.TopToBottom)
+        owner.resize(900, 120)
+        self.application.processEvents()
+        self.assertEqual(row.direction(), QBoxLayout.Direction.LeftToRight)
+        owner.deleteLater()
+
+    def test_dialog_windows_are_kept_inside_the_available_screen(self):
+        screen = self.application.primaryScreen().availableGeometry()
+        dialog = QDialog()
+        dialog.setMinimumSize(screen.width() + 80, screen.height() + 80)
+        dialog.resize(screen.width() + 120, screen.height() + 120)
+        dialog.move(screen.right(), screen.bottom())
+        dialog.show()
+        self.application.processEvents()
+
+        geometry = dialog.frameGeometry()
+        self.assertLessEqual(geometry.width(), screen.width())
+        self.assertLessEqual(geometry.height(), screen.height())
+        self.assertGreaterEqual(geometry.left(), screen.left())
+        self.assertGreaterEqual(geometry.top(), screen.top())
+        self.assertLessEqual(geometry.right(), screen.right())
+        self.assertLessEqual(geometry.bottom(), screen.bottom())
+        dialog.close()
+
+    def test_splitter_switches_to_vertical_layout_for_narrow_windows(self):
+        owner = QWidget()
+        splitter = QSplitter(Qt.Orientation.Horizontal, owner)
+        splitter.addWidget(QLabel("Left", splitter))
+        splitter.addWidget(QLabel("Right", splitter))
+        theme.adapt_splitter(owner, splitter, compact_width=800)
+        owner.resize(900, 600)
+        owner.show()
+        self.application.processEvents()
+        self.assertEqual(splitter.orientation(), Qt.Orientation.Horizontal)
+
+        owner.resize(700, 600)
+        self.application.processEvents()
+        self.assertEqual(splitter.orientation(), Qt.Orientation.Vertical)
+        owner.resize(900, 600)
+        self.application.processEvents()
+        self.assertEqual(splitter.orientation(), Qt.Orientation.Horizontal)
+        owner.deleteLater()
 
     def test_write_failure_is_explicit_and_does_not_switch_theme(self):
         with patch.object(theme, "QSaveFile") as output, patch.object(theme.QMessageBox, "warning") as warning:

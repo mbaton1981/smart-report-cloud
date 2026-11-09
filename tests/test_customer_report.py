@@ -261,8 +261,8 @@ class CustomerReportTests(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "dag_comp_cb"))
         self.assertFalse(hasattr(self.window, "dag_date_from"))
         buttons = [button.text() for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)]
-        self.assertIn("📄 Сформировать общий PDF (SV)", buttons)
-        self.assertIn("📖 PDF только журнала (SV)", buttons)
+        self.assertIn("Сформировать общий PDF (SV)", buttons)
+        self.assertIn("PDF только журнала (SV)", buttons)
 
     def test_latin_english_and_mixed_descriptions_require_review_offline(self):
         with patch("requests.sessions.Session.request", side_effect=AssertionError("No network")):
@@ -348,7 +348,7 @@ class CustomerReportTests(unittest.TestCase):
             patch.object(self.desktop.QMessageBox, "information"),
             patch.object(self.desktop.QMessageBox, "critical") as critical,
         ):
-            for label in ("📄 Сформировать общий PDF (SV)", "📖 PDF только журнала (SV)"):
+            for label in ("Сформировать общий PDF (SV)", "PDF только журнала (SV)"):
                 button = next(
                     button for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)
                     if button.text() == label

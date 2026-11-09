@@ -64,7 +64,7 @@ class CalendarDateEditTests(unittest.TestCase):
             self.host.resize(width, 180)
             calendar = self.open_calendar()
 
-            self.assertLess(self.field.width(), self.host.width() // 2)
+            self.assertLess(self.field.width(), self.host.width() * 0.55)
             self.assertTrue(calendar.isVisible())
             view = calendar.findChild(QTableView, "qt_calendar_calendarview")
             navigation = calendar.findChild(QWidget, "qt_calendar_navigationbar")

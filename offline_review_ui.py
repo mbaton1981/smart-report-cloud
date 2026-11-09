@@ -75,7 +75,7 @@ class OfflineReviewWindow(QDialog):
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
                             else "SmartReport — ЛОКАЛЬНЫЙ ТЕСТ: входящие PDF")
         self.resize(1450, 940)
-        self.setMinimumSize(760, 560)
+        self.setMinimumSize(600, 480)
         layout = QVBoxLayout(self)
         banner = QLabel(
             ("Сверьте оригинал, исправьте данные и выберите назначение суммы. "
@@ -111,9 +111,10 @@ class OfflineReviewWindow(QDialog):
         self.splitter.addWidget(self.preview_host)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(470)
+        scroll.setMinimumWidth(0)
         details = QWidget()
         form = QFormLayout(details)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         if integrated:
             form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -182,7 +183,8 @@ class OfflineReviewWindow(QDialog):
             self.allocations.setColumnWidth(2, max(100, QPushButton("Убрать").sizeHint().width() + 10))
             self.allocations.verticalHeader().hide()
             self.allocations.setMinimumHeight(190)
-            self.allocations.setMinimumWidth(440)
+            self.allocations.setMinimumWidth(0)
+            self.allocations.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             self.proposal_label = QLabel()
             self.proposal_label.setWordWrap(True)
             self.proposal_label.setTextFormat(Qt.TextFormat.RichText)
@@ -230,6 +232,10 @@ class OfflineReviewWindow(QDialog):
         scroll.setWidget(details)
         self.financial_panel = scroll
         self.splitter.addWidget(scroll)
+        desktop_theme.adapt_splitter(
+            self, self.splitter, compact_width=1020,
+            wide_sizes=(650, 760), compact_sizes=(480, 480),
+        )
         self.splitter.setSizes([800, 600])
         self.save_button = QPushButton(
             "Сохранить черновик — не включать в расходы" if integrated
