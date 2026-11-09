@@ -1,4 +1,4 @@
-"""Verify an installed 1.0.7 -> 1.0.8 upgrade using isolated data and localhost only."""
+"""Verify an installed client upgrade using isolated data and localhost only."""
 import hashlib
 import json
 import os
@@ -42,6 +42,7 @@ def main():
         "USERPROFILE": str(work / "user"),
         "QT_QPA_PLATFORM": "offscreen",
         "SMARTREPORT_DATA_DIR": str(data_dir),
+        "SMARTREPORT_DB_FILE": str(data_dir / "smart_report.db"),
         "SMARTREPORT_CLOUD_URL": url,
         "SMARTREPORT_DOCUMENTS_DIR": str(data_dir / "SupplierDocuments"),
         "PYTHONIOENCODING": "utf-8",
@@ -76,7 +77,7 @@ def main():
             str(install_dir / "SmartReport.exe"), "--diagnostic", action,
             "--work", str(work / "client_work"), "--case", "upgrade",
             "--out", str(output),
-        ], env=dict(env, **extra), capture_output=True, timeout=300)
+        ], env=dict(env, **extra), capture_output=True, timeout=120)
         result = json.loads(output.read_text(encoding="utf-8")) if output.is_file() else {}
         record("installed_client_" + action, exit_code=completed.returncode, result=result)
         if expect_success != (completed.returncode == 0):
@@ -130,7 +131,7 @@ def main():
 
     outcome = "failed"
     try:
-        install(old_installer, "1.0.7")
+        install(old_installer, "previous_release")
         start_server()
         client("selftest")
         client("login", SMARTREPORT_E2E_USER="admin", SMARTREPORT_E2E_PASS=password)
@@ -176,7 +177,7 @@ def main():
             """, (operation_id, sync_id, json.dumps(payload)))
         before = snapshot_files()
         old_exe_hash = sha256(install_dir / "SmartReport.exe")
-        install(new_installer, "1.0.8")
+        install(new_installer, "current_release")
         if snapshot_files() != before:
             raise RuntimeError("Installer changed profile files before first launch")
         if sha256(install_dir / "SmartReport.exe") == old_exe_hash:

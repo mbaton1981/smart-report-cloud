@@ -1669,6 +1669,62 @@ class ExpenseReadTask(QRunnable):
             self.signals.completed.emit(self.key, [], [], str(error))
 
 
+class EmployeeStatusSignals(QObject):
+    completed = pyqtSignal(int, object, str, object, str)
+
+
+class EmployeeStatusTask(QRunnable):
+    def __init__(self, request_id):
+        super().__init__()
+        self.request_id = request_id
+        self.signals = EmployeeStatusSignals()
+
+    def run(self):
+        pin_statuses, pin_error = {}, ""
+        try:
+            response = requests.get(
+                f"{CLOUD_URL}/admin/get-users-status", headers=sync_headers(), timeout=5
+            )
+            if response.status_code != 200:
+                raise requests.HTTPError(
+                    f"HTTP {response.status_code} при загрузке статусов ПИН."
+                )
+            data = response.json()
+            users = data.get("users") if isinstance(data, dict) else None
+            if not isinstance(users, list):
+                raise ValueError("Сервер вернул неверный список статусов ПИН.")
+            for user in users:
+                if not isinstance(user, dict) or not isinstance(user.get("username"), str):
+                    raise ValueError("Сервер вернул неверную запись статуса ПИН.")
+                pin_statuses[user["username"].strip().lower()] = user.get("has_pin", False)
+        except (requests.RequestException, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
+            pin_error = str(error) or "Не удалось обновить статусы ПИН."
+
+        card_states, card_error = {}, ""
+        try:
+            from employee_cards_client import CardClient
+            employees = CardClient().employees()
+            if not isinstance(employees, list):
+                raise ValueError("Сервер вернул неверный список карточек.")
+            for item in employees:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("name"), str)
+                    or not isinstance(item.get("missing", []), list)
+                    or not isinstance(item.get("warnings", []), list)
+                ):
+                    raise ValueError("Сервер вернул неверную запись карточки.")
+            card_states = {employee_sync_key(item["name"]): item for item in employees}
+        except (
+            employee_cards.CardError, ValueError, KeyError, TypeError, sqlite3.Error, OSError
+        ) as error:
+            card_error = str(error) or "Не удалось обновить карточки сотрудников."
+
+        self.signals.completed.emit(
+            self.request_id, pin_statuses, pin_error, card_states, card_error
+        )
+
+
 class SyncWorker(QThread):
     completed = pyqtSignal(bool, int, int, int, int, int, str, str, str)
 
@@ -10635,7 +10691,9 @@ class SmartReportApp(QMainWindow):
         self.show_inactive_employees_check = QCheckBox("Показать неактивных")
         desktop_theme.apply_style(self.show_inactive_employees_check, archive_filter_style)
         self.show_inactive_employees_check.setChecked(False)
-        self.show_inactive_employees_check.toggled.connect(self.load_employees_table)
+        self.show_inactive_employees_check.toggled.connect(
+            lambda _checked: self.load_employees_table(refresh_status=False)
+        )
         self.employee_counts_label = QLabel()
         employee_view_layout.addWidget(self.show_inactive_employees_check)
         employee_view_layout.addStretch()
@@ -11435,16 +11493,44 @@ class SmartReportApp(QMainWindow):
         self.load_dropdowns()
         self.background_sync_with_cloud()
 
-    def load_employees_table(self):
+    def _schedule_employee_status_update(self):
+        if getattr(self, "_employee_status_pending", False):
+            return
+        request_id = getattr(self, "_employee_status_request_id", 0) + 1
+        self._employee_status_request_id = request_id
+        self._employee_status_pending = True
+        task = EmployeeStatusTask(request_id)
+        task.signals.completed.connect(self._on_employee_status_updated)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_employee_status_updated(
+        self, request_id, pin_statuses, pin_error, card_states, card_error,
+    ):
+        if request_id != getattr(self, "_employee_status_request_id", None):
+            return
+        self._employee_status_pending = False
+        self._employee_pin_statuses = pin_statuses
+        self._employee_pin_error = pin_error
+        self._employee_card_states = card_states
+        self._employee_card_error = card_error
+        self.load_employees_table(refresh_status=False)
+
+    def load_employees_table(self, refresh_status=True):
         if self.table_employees.state() == QTableWidget.State.EditingState:
             return
+        if refresh_status:
+            self._schedule_employee_status_update()
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT is_active, COUNT(*) FROM employees GROUP BY is_active")
         counts = {int(row[0]): int(row[1]) for row in cursor.fetchall()}
-        self.employee_counts_label.setText(
-            f"Активных: {counts.get(1, 0)} | Неактивных: {counts.get(0, 0)}"
-        )
+        pin_error = getattr(self, "_employee_pin_error", "")
+        counts_text = f"Активных: {counts.get(1, 0)} | Неактивных: {counts.get(0, 0)}"
+        if pin_error:
+            counts_text += " | Статус ПИН недоступен"
+        self.employee_counts_label.setText(counts_text)
+        self.employee_counts_label.setToolTip(pin_error)
         cursor.execute("""
             SELECT id, name, salary_rate, is_active
             FROM employees
@@ -11454,30 +11540,16 @@ class SmartReportApp(QMainWindow):
         rows = cursor.fetchall()
         conn.close()
 
-        pin_statuses = {}
-        try:
-            headers = sync_headers()
-            res = requests.get(f"{CLOUD_URL}/admin/get-users-status", headers=headers, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                for u in data.get("users", []):
-                    pin_statuses[u["username"].strip().lower()] = u.get("has_pin", False)
-        except Exception:
-            pass
-
-        from employee_cards_client import CardClient
-        card_states, card_error = {}, ""
-        try:
-            card_states = {employee_sync_key(item["name"]): item for item in CardClient().employees()}
-        except employee_cards.CardError as error:
-            card_error = str(error)
+        pin_statuses = getattr(self, "_employee_pin_statuses", {})
+        card_states = getattr(self, "_employee_card_states", {})
+        card_error = getattr(self, "_employee_card_error", "")
 
         display_rows = {}
         for row in rows:
             employee_id, name, rate, is_active = int(row[0]), row[1], row[2], bool(row[3])
             has_pin = pin_statuses.get(name.strip().lower(), None)
             state = card_states.get(employee_sync_key(name))
-            issues = (state["missing"] + state["warnings"]) if state else []
+            issues = (state.get("missing", []) + state.get("warnings", [])) if state else []
             summary = ("Не хватает данных" if issues else "Данные заполнены") if state else "Карточка недоступна"
             pin_text = "Неизвестно" if has_pin is None else "Задан" if has_pin else "Не задан"
             display_rows[employee_id] = (
@@ -11812,6 +11884,17 @@ class SmartReportApp(QMainWindow):
 
     def load_shifts_history(self):
         try:
+            table = self.table_shifts
+            selected_shift_ids = {
+                table.item(index.row(), 0).text()
+                for index in table.selectionModel().selectedRows()
+                if table.item(index.row(), 0) is not None
+            }
+            current_item = table.item(table.currentRow(), 0) if table.currentRow() >= 0 else None
+            current_shift_id = current_item.text() if current_item is not None else None
+            current_column = max(table.currentColumn(), 0)
+            vertical_scroll = table.verticalScrollBar().value()
+            horizontal_scroll = table.horizontalScrollBar().value()
             conn = get_db_connection()
             cursor = conn.cursor()
             has_ob_schema = ob_schema_ready(cursor)
@@ -11917,8 +12000,35 @@ class SmartReportApp(QMainWindow):
                     if is_inv:
                         desktop_theme.item_color(it, "#1c4532")
                     self.table_shifts.setItem(row_idx, col_idx, it)
-            self.load_dropdowns()
+            self.load_dropdowns(refresh_tables=False)
+            current_tab = self.tabs.currentWidget() if getattr(self, "tabs", None) else None
+            catalog_tab = getattr(self, "tab_sprav", None)
+            if (
+                catalog_tab is not None
+                and (
+                    current_tab is catalog_tab
+                    or isinstance(current_tab, QScrollArea) and current_tab.widget() is catalog_tab
+                )
+            ):
+                self.load_companies_table()
+                self.load_objects_table()
+                self.load_employees_table()
             self.apply_shifts_filters()
+            selection_model = table.selectionModel()
+            for row_idx, row in enumerate(rows):
+                if str(row["id"]) in selected_shift_ids:
+                    selection_model.select(
+                        table.model().index(row_idx, 0),
+                        QItemSelectionModel.SelectionFlag.Select
+                        | QItemSelectionModel.SelectionFlag.Rows,
+                    )
+                if str(row["id"]) == current_shift_id:
+                    selection_model.setCurrentIndex(
+                        table.model().index(row_idx, current_column),
+                        QItemSelectionModel.SelectionFlag.NoUpdate,
+                    )
+            table.verticalScrollBar().setValue(vertical_scroll)
+            table.horizontalScrollBar().setValue(horizontal_scroll)
             self.update_reopen_shift_action()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось обновить данные: {e}")

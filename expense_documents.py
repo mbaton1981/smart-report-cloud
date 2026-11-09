@@ -541,6 +541,7 @@ def parse_invoice_pages(pages):
         labels["vat_amount"] += r"|Varav\s+moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?"
     if fields.get("document_type") == "credit_note":
         labels["amount_due"] += r"|Summa\s+er\s+tillgodo|Belopp\s+att\s+återfå"
+    amount_caption_patterns = tuple(labels.values()) + (r"Bankkonto\s*(?:nr\.?|nummer)?",)
     candidates = {key: [] for key in labels}
     companies = []
     supplier_identity = None
@@ -639,8 +640,9 @@ def parse_invoice_pages(pages):
                 value_cell = cell
                 if re.fullmatch(rf"(?:{label})\s*:?", cell_text, re.IGNORECASE):
                     def is_caption(other):
-                        return any(re.fullmatch(rf"(?:{caption})\s*:?", other["text"].strip(), re.IGNORECASE)
-                                   for caption in labels.values())
+                        return any(re.fullmatch(
+                            rf"(?:{caption})\s*:?", other["text"].strip(), re.IGNORECASE
+                        ) for caption in amount_caption_patterns)
 
                     row_tolerance = 6 if is_receipt and key == "vat_amount" and re.match(r"Varav\s+moms", cell_text, re.IGNORECASE) else 4
                     same_row_values = [other for other in cells if other["x0"] >= cell["x1"]

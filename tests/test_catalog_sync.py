@@ -3,6 +3,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from decimal import Decimal
@@ -77,6 +79,16 @@ class CatalogSyncTests(unittest.TestCase):
 
     def tearDown(self):
         self._case.cleanup()
+
+    def _wait_for_employee_status(self, window, timeout=3):
+        from PyQt6.QtTest import QTest
+
+        deadline = time.monotonic() + timeout
+        while getattr(window, "_employee_status_pending", False) and time.monotonic() < deadline:
+            self.qt_app.processEvents()
+            QTest.qWait(10)
+        self.qt_app.processEvents()
+        self.assertFalse(getattr(window, "_employee_status_pending", False))
 
     def _add_company(self, name):
         server_conn = self.server.get_db_connection()
@@ -4227,6 +4239,7 @@ class CatalogSyncTests(unittest.TestCase):
             with patch.object(self.desktop.requests, "get", return_value=response), \
                  patch("employee_cards_client.CardClient.employees", return_value=[]):
                 window.load_employees_table()
+                self._wait_for_employee_status(window)
                 window.load_objects_table()
                 window.show()
                 self.qt_app.processEvents()
@@ -4303,7 +4316,7 @@ class CatalogSyncTests(unittest.TestCase):
                 desktop_conn.close()
                 expected_scroll = employees_table.verticalScrollBar().value()
                 window.load_employees_table()
-                QTest.qWait(50)
+                self._wait_for_employee_status(window)
                 self.assertEqual(employees_table.verticalScrollBar().value(), expected_scroll)
                 self.assertEqual(
                     employees_table.item(
@@ -4315,10 +4328,8 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(employees_table.item(selected_row, 1).text(), "475.00")
                 active_employee_count = employees_table.rowCount()
                 window.show_inactive_employees_check.setChecked(True)
-                window.load_employees_table()
                 self.assertEqual(employees_table.rowCount(), active_employee_count + 1)
                 window.show_inactive_employees_check.setChecked(False)
-                window.load_employees_table()
                 self.assertEqual(employees_table.rowCount(), active_employee_count)
 
                 objects_table = window.table_objects
@@ -4394,6 +4405,7 @@ class CatalogSyncTests(unittest.TestCase):
             with patch.object(self.desktop.requests, "get", return_value=response), \
                  patch("employee_cards_client.CardClient.employees", return_value=[]):
                 window.load_employees_table()
+                self._wait_for_employee_status(window)
                 window.load_objects_table()
                 window.load_companies_table()
                 window.show()
@@ -4432,6 +4444,7 @@ class CatalogSyncTests(unittest.TestCase):
                     timer.start()
                     QTest.qWait(10250)
                     timer.stop()
+                    self._wait_for_employee_status(window)
                     self.qt_app.processEvents()
 
                     self.assertGreaterEqual(ticks["count"], 5)
@@ -4471,6 +4484,150 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_history_refresh_does_not_reload_catalogs_off_catalog_tab(self):
+        from PyQt6.QtWidgets import QTabWidget
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tabs = QTabWidget()
+        window.tabs.addTab(self.desktop.QWidget(), "Ввод часов")
+        window.tab_sprav = self.desktop.QWidget()
+        window.tabs.addTab(window.tab_sprav, "Справочники")
+        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.apply_shifts_filters = lambda: None
+        try:
+            with patch.object(window, "load_employees_table") as employees_refresh, \
+                 patch.object(window, "load_objects_table") as objects_refresh, \
+                 patch.object(window, "load_companies_table") as companies_refresh, \
+                 patch.object(self.desktop.QMessageBox, "critical") as error_message:
+                window.load_shifts_history()
+            employees_refresh.assert_not_called()
+            objects_refresh.assert_not_called()
+            companies_refresh.assert_not_called()
+            error_message.assert_not_called()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_history_refresh_preserves_selection_scroll_and_updates_changed_rows(self):
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QTabWidget
+
+        conn = self.desktop.get_db_connection()
+        conn.executemany(
+            """INSERT INTO shifts (
+                date,employee,company,object_name,hours,rate,transport,comment,invoiced
+            ) VALUES (?,?,?,?,?,?,?,?,0)""",
+            [
+                (f"2026-02-{(index % 28) + 1:02d}", f"Employee {index:02d}",
+                 "Renatur", f"Object {index:02d}", 8, 450, 0, "original")
+                for index in range(80)
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tabs = QTabWidget()
+        window.tabs.addTab(self.desktop.QWidget(), "Ввод часов")
+        window.tab_sprav = self.desktop.QWidget()
+        window.tabs.addTab(window.tab_sprav, "Справочники")
+        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.table_shifts.setSelectionBehavior(
+            self.desktop.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        window.table_shifts.setSelectionMode(
+            self.desktop.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        window.table_shifts.setMaximumHeight(220)
+        window.setCentralWidget(window.table_shifts)
+        window.apply_shifts_filters = lambda: None
+        try:
+            window.load_shifts_history()
+            window.show()
+            self.qt_app.processEvents()
+            QTest.qWait(50)
+            table = window.table_shifts
+            self.assertGreater(table.verticalScrollBar().maximum(), 0)
+            selected_row = 40
+            selected_id = table.item(selected_row, 0).text()
+            table.selectRow(selected_row)
+            table.setCurrentCell(selected_row, 0)
+            table.verticalScrollBar().setValue(table.verticalScrollBar().maximum())
+            expected_scroll = table.verticalScrollBar().value()
+
+            conn = self.desktop.get_db_connection()
+            conn.execute("UPDATE shifts SET comment = 'updated' WHERE id = ?", (int(selected_id),))
+            conn.commit()
+            conn.close()
+
+            window.load_shifts_history()
+            self.qt_app.processEvents()
+            selected_indexes = table.selectionModel().selectedRows()
+            self.assertEqual(len(selected_indexes), 1)
+            selected_row = selected_indexes[0].row()
+            self.assertEqual(table.item(selected_row, 0).text(), selected_id)
+            self.assertEqual(table.item(selected_row, 10).text(), "updated")
+            self.assertEqual(table.currentItem().text(), selected_id)
+            self.assertEqual(table.verticalScrollBar().value(), expected_scroll)
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_employee_status_requests_run_off_gui_thread_and_report_errors(self):
+        conn = self.desktop.get_db_connection()
+        conn.execute(
+            "INSERT INTO employees (name, salary_rate, is_active) VALUES ('Active', 450, 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_sprav = self.desktop.QWidget()
+        window.setup_sprav_tab()
+        gui_thread = threading.get_ident()
+        request_threads = []
+        response = SimpleNamespace(status_code=200, json=lambda: {
+            "users": [{"username": "Active", "has_pin": True}]
+        })
+
+        try:
+            with patch.object(
+                self.desktop.requests, "get",
+                side_effect=lambda *args, **kwargs: (
+                    request_threads.append(threading.get_ident()) or response
+                ),
+            ), patch("employee_cards_client.CardClient.employees", side_effect=lambda: (
+                request_threads.append(threading.get_ident()) or []
+            )):
+                window.load_employees_table()
+                window.load_employees_table()
+                self._wait_for_employee_status(window)
+
+            self.assertEqual(len(request_threads), 2)
+            self.assertTrue(all(thread_id != gui_thread for thread_id in request_threads))
+            self.assertEqual(window.table_employees.item(0, 3).text(), "Задан")
+
+            with patch.object(
+                self.desktop.requests, "get",
+                side_effect=self.desktop.requests.ConnectionError("isolated status failure"),
+            ), patch(
+                "employee_cards_client.CardClient.employees",
+                side_effect=self.desktop.employee_cards.CardError("isolated card failure"),
+            ):
+                window.load_employees_table()
+                self._wait_for_employee_status(window)
+
+            self.assertIn("Статус ПИН недоступен", window.employee_counts_label.text())
+            self.assertIn("isolated status failure", window.employee_counts_label.toolTip())
+            self.assertEqual(window.table_employees.item(0, 3).text(), "Неизвестно")
+            self.assertIn("isolated card failure", window.table_employees.item(0, 4).toolTip())
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_archive_filters_counts_stable_selection_and_action_state(self):
         desktop_conn = self.desktop.get_db_connection()
         desktop_conn.execute("DELETE FROM objects")
@@ -4505,6 +4662,7 @@ class CatalogSyncTests(unittest.TestCase):
             with patch.object(self.desktop.requests, "get", return_value=response):
                 window.load_objects_table()
                 window.load_employees_table()
+                self._wait_for_employee_status(window)
                 self.assertFalse(window.show_archived_objects_check.isChecked())
                 self.assertFalse(window.show_inactive_employees_check.isChecked())
                 self.assertEqual(window.table_objects.rowCount(), 1)
@@ -4528,6 +4686,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(window.table_employees.item(employee_row, 3).text(), "Задан")
                 window.load_objects_table()
                 window.load_employees_table()
+                self._wait_for_employee_status(window)
                 self.assertEqual(window.table_objects.item(window.table_objects.currentRow(), 0).data(role), object_id)
                 self.assertEqual(window.table_employees.item(window.table_employees.currentRow(), 0).data(role), employee_id)
                 window.show_archived_objects_check.setChecked(False)
