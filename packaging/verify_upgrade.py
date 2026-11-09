@@ -63,7 +63,7 @@ def main():
     def install(installer, label):
         completed = subprocess.run([
             str(installer.resolve()), "/VERYSILENT", "/SUPPRESSMSGBOXES",
-            "/CURRENTUSER", "/NORESTART", f"/DIR={install_dir}",
+            "/CURRENTUSER", "/TASKS=", "/NORESTART", f"/DIR={install_dir}",
             f"/LOG={work / (label + '_install.log')}",
         ], env=env, timeout=600)
         if completed.returncode != 0 or not (install_dir / "SmartReport.exe").is_file():
