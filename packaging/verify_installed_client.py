@@ -91,10 +91,97 @@ def run_client(exe, profile, action, case="case", **extra):
     return completed.returncode, data
 
 
+def run_fresh_profile_launcher(install_dir, exe):
+    profile_root = temp / "fresh-first-run"
+    local = profile_root / "AppData" / "Local"
+    user = profile_root / "AppData" / "Roaming"
+    local.mkdir(parents=True, exist_ok=True)
+    user.mkdir(parents=True, exist_ok=True)
+    (temp / "tmp").mkdir(exist_ok=True)
+    env = {
+        "SystemRoot": os.environ["SystemRoot"], "SystemDrive": os.environ["SystemDrive"],
+        "USERPROFILE": str(profile_root), "LOCALAPPDATA": str(local), "APPDATA": str(user),
+        "TEMP": str(temp / "tmp"), "TMP": str(temp / "tmp"),
+        "PATH": r"C:\Windows\System32;C:\Windows", "SMARTREPORT_CLOUD_URL": "http://127.0.0.1:5999",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    script = install_dir / "launch_fresh_profile.ps1"
+    assert script.is_file(), f"fresh-profile launcher missing: {script}"
+    powershell = Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    launch = subprocess.Popen(
+        [str(powershell), "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+         "-File", str(script), "-ExecutablePath", str(exe), "-WaitForExit"],
+        env=env, cwd=install_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    pid = None
+    try:
+        line = launch.stdout.readline().strip()
+        if not line.isdigit():
+            stdout, stderr = launch.communicate(timeout=15)
+            raise RuntimeError(f"fresh-profile launcher did not start SmartReport: {stdout} {stderr}")
+        pid = int(line)
+        title = ""
+        for _ in range(60):
+            probe = subprocess.run(
+                [str(powershell), "-NoProfile", "-Command",
+                 f"$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [Console]::Out.Write($p.MainWindowTitle) }}"],
+                env=env, capture_output=True, timeout=10, text=True, encoding="utf-8", errors="replace",
+            )
+            title = probe.stdout.strip()
+            if title or launch.poll() is not None:
+                break
+            time.sleep(0.5)
+        assert title.startswith("SmartReport"), f"unexpected first-run window: {title!r}"
+        fresh = local / "SmartReport" / "default-profile"
+        marker = json.loads((fresh / "fresh_profile.json").read_text(encoding="utf-8-sig"))
+        database = fresh / "smart_report.db"
+        assert marker["profile_type"] == "fresh" and Path(marker["database"]) == database.resolve()
+        assert not database.exists(), "cancelling first-run login unexpectedly created a database"
+        steps.append({"step": "fresh_profile_first_launch", "login_window": title,
+                      "profile_marker_created": True, "empty_database_uncreated": True})
+    finally:
+        if pid is not None:
+            subprocess.run(
+                [str(powershell), "-NoProfile", "-Command",
+                 f"$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ [Console]::Out.Write($p.CloseMainWindow()) }}"],
+                env=env, capture_output=True, timeout=10,
+            )
+        try:
+            launch.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            if pid is not None:
+                subprocess.run(
+                    [str(powershell), "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
+                    env=env, capture_output=True, timeout=10,
+                )
+            launch.wait(timeout=10)
+        if launch.stdout:
+            launch.stdout.close()
+        if launch.stderr:
+            launch.stderr.close()
+
+    blocked_root = temp / "existing-first-run"
+    blocked_local = blocked_root / "AppData" / "Local"
+    blocked_profile = blocked_local / "SmartReport" / "default-profile"
+    blocked_profile.mkdir(parents=True)
+    existing_database = blocked_profile / "smart_report.db"
+    existing_database.write_bytes(b"existing-profile-guard")
+    blocked_env = dict(env, USERPROFILE=str(blocked_root), LOCALAPPDATA=str(blocked_local),
+                       APPDATA=str(blocked_root / "AppData" / "Roaming"))
+    blocked = subprocess.run(
+        [str(powershell), "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+         "-File", str(script), "-ExecutablePath", str(exe)],
+        env=blocked_env, cwd=install_dir, capture_output=True, timeout=30,
+    )
+    assert blocked.returncode != 0 and existing_database.read_bytes() == b"existing-profile-guard"
+    steps.append({"step": "fresh_launcher_preserves_unmarked_existing_profile", "blocked": True})
+
+
 try:
     install_dir = temp / "installed"
     scrubbed = {"SystemRoot": os.environ["SystemRoot"], "TEMP": str(temp), "TMP": str(temp), "PATH": r"C:\Windows\System32;C:\Windows"}
-    completed = subprocess.run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/NORESTART", f"/DIR={install_dir}",
+    completed = subprocess.run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/NOICONS", "/NORESTART", f"/DIR={install_dir}",
                                 f"/LOG={temp / 'install.log'}"], env=scrubbed, timeout=600)
     exe = install_dir / "SmartReport.exe"
     steps.append({"step": "install_without_python_in_path", "exit_code": completed.returncode, "exe_exists": exe.exists(),
@@ -109,6 +196,8 @@ try:
             if any(needle in blob for needle in needles):
                 leaked.append(str(path))
     steps.append({"step": "no_test_secret_inside_installed_files", "leaked_files": leaked})
+
+    run_fresh_profile_launcher(install_dir, exe)
 
     start_server()
     code, data = run_client(exe, "A", "selftest")

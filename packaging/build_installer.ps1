@@ -41,6 +41,10 @@ $env:SMARTREPORT_VERSION_INFO = $versionInfoPath
 $env:PYTHONIOENCODING = "utf-8"
 & $BuildPython -m PyInstaller --noconfirm --clean --distpath "$build\dist" --workpath "$build\work" "$PSScriptRoot\smartreport.spec"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибкой" }
+foreach ($launcher in @("launch_existing_profile.ps1", "launch_fresh_profile.ps1")) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $launcher) `
+        -Destination (Join-Path $build "dist\SmartReport\$launcher") -Force
+}
 & $Iscc "/DAppVersion=$Version" "/DSourceDir=$build\dist\SmartReport" "/O$build\installer" "$PSScriptRoot\installer.iss"
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup завершился с ошибкой" }
 Get-FileHash "$build\installer\SmartReport-Setup-$Version.exe" -Algorithm SHA256

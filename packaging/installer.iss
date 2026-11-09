@@ -30,6 +30,9 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
-Source: "launch_existing_profile.ps1"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autoprograms}\SmartReport"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"
+Name: "{autodesktop}\SmartReport"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"
 
 ; Данные пользователя (%LOCALAPPDATA%\SmartReport) при удалении программы сохраняются.
