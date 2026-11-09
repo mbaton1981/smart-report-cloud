@@ -31,8 +31,11 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
+[Tasks]
+Name: "shortcuts"; Description: "Create Start Menu and Desktop shortcuts"; GroupDescription: "Shortcuts:"; Flags: checkedonce
+
 [Icons]
-Name: "{autoprograms}\SmartReport"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"
-Name: "{autodesktop}\SmartReport"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"
+Name: "{autoprograms}\SmartReport {#AppVersion}"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"; Tasks: shortcuts
+Name: "{autodesktop}\SmartReport {#AppVersion}"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"; Tasks: shortcuts
 
 ; Данные пользователя (%LOCALAPPDATA%\SmartReport) при удалении программы сохраняются.

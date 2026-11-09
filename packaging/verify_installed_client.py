@@ -181,7 +181,7 @@ def run_fresh_profile_launcher(install_dir, exe):
 try:
     install_dir = temp / "installed"
     scrubbed = {"SystemRoot": os.environ["SystemRoot"], "TEMP": str(temp), "TMP": str(temp), "PATH": r"C:\Windows\System32;C:\Windows"}
-    completed = subprocess.run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/NOICONS", "/NORESTART", f"/DIR={install_dir}",
+    completed = subprocess.run([str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/TASKS=", "/NORESTART", f"/DIR={install_dir}",
                                 f"/LOG={temp / 'install.log'}"], env=scrubbed, timeout=600)
     exe = install_dir / "SmartReport.exe"
     steps.append({"step": "install_without_python_in_path", "exit_code": completed.returncode, "exe_exists": exe.exists(),
