@@ -20,9 +20,10 @@ import requests
 from PyQt6.QtCore import QBuffer, QDate, QIODevice, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog, QDateEdit,
+    QPushButton, QTextEdit, QVBoxLayout, QLineEdit, QFileDialog,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox, QProgressBar,
 )
+from date_widgets import CalendarDateEdit
 
 import desktop_auth
 import desktop_theme
@@ -539,7 +540,7 @@ class AssistantDialog(QDialog):
         filters = QHBoxLayout()
         today = QDate.currentDate()
         monday = today.addDays(1 - today.dayOfWeek())
-        self.date_from, self.date_to = QDateEdit(monday), QDateEdit(monday.addDays(6))
+        self.date_from, self.date_to = CalendarDateEdit(monday), CalendarDateEdit(monday.addDays(6))
         for field in (self.date_from, self.date_to):
             field.setDisplayFormat("dd.MM.yyyy")
             field.setCalendarPopup(True)

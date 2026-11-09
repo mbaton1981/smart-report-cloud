@@ -6,8 +6,9 @@ from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QD
 from PyQt6.QtGui import QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
-    QDateEdit, QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+    QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
 )
+from date_widgets import CalendarDateEdit
 from analytics import period, HOW
 
 logger = logging.getLogger(__name__)
@@ -156,11 +157,10 @@ class AnalyticsWidget(QWidget):
                           ("Произвольный диапазон", "custom")):
             self.preset.addItem(text, key)
         self.preset.setCurrentIndex(2)
-        self.start, self.end = QDateEdit(), QDateEdit()
+        self.start, self.end = CalendarDateEdit(), CalendarDateEdit()
         for field in (self.start, self.end):
             field.setDisplayFormat("yyyy-MM-dd")
             field.setCalendarPopup(True)
-            field.setMinimumWidth(130)
         self.customer, self.object = QComboBox(), QComboBox()
         self.customer.addItem("Все заказчики", "")
         self.object.addItem("Все объекты", "")

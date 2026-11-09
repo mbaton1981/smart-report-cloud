@@ -227,7 +227,8 @@ def report_text(report):
 
 def archive_period(parent):
     from PyQt6.QtCore import QDate
-    from PyQt6.QtWidgets import QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QMessageBox
+    from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QMessageBox
+    from date_widgets import CalendarDateEdit
     if date.today() < IMPORT_START_DATE:
         QMessageBox.information(parent, "Получение с 01.11.2026", ERRORS["import_not_started"])
         return None
@@ -236,7 +237,7 @@ def archive_period(parent):
     dialog = QDialog(parent)
     dialog.setWindowTitle("Загрузить архив — период INBOX")
     layout = QFormLayout(dialog)
-    start, end = QDateEdit(), QDateEdit()
+    start, end = CalendarDateEdit(), CalendarDateEdit()
     start.setObjectName("archive_start")
     end.setObjectName("archive_end")
     for field in (start, end):

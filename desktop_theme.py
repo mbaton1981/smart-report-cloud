@@ -193,6 +193,8 @@ QMenu, QComboBox QAbstractItemView, QCalendarWidget QAbstractItemView {
     background-color: #28303d; color: #e2e8f0;
     selection-background-color: #2b6cb0; selection-color: #ffffff;
 }
+QCalendarWidget QAbstractItemView::item { background-color: #28303d; }
+QCalendarWidget QAbstractItemView::item:selected { background-color: #2b6cb0; }
 QMenu::item:selected { background-color: #2b6cb0; color: #ffffff; }
 QGroupBox { border: 1px solid #323946; border-radius: 7px; margin-top: 12px; padding-top: 12px; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
@@ -260,6 +262,10 @@ QLineEdit, QComboBox, QDateEdit, QSpinBox, QDoubleSpinBox, QTextEdit,
 QComboBox QAbstractItemView, QCalendarWidget QAbstractItemView {
     selection-background-color: #d6e5f0; selection-color: #243b4e;
     placeholder-text-color: #657888;
+}
+QCalendarWidget QAbstractItemView::item { background-color: #fcfdfe; }
+QCalendarWidget QAbstractItemView::item:selected {
+    background-color: #d6e5f0; color: #243b4e;
 }
 QMenu::item:selected { background-color: #d6e5f0; color: #243b4e; }
 QComboBox::down-arrow, QDateEdit::down-arrow {

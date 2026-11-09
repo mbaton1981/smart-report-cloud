@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover
 
 if QApplication is not None:
     import input_safety
+    from date_widgets import CalendarDateEdit
 
 
 def wheel(widget, steps=-3):
@@ -44,7 +45,7 @@ class WheelGuardTests(unittest.TestCase):
         self.assertIs(input_safety.install_wheel_guard(self.app), input_safety.install_wheel_guard(self.app))
 
     def test_wheel_does_not_change_value_with_or_without_focus(self):
-        date = QDateEdit(QDate(2026, 10, 31), self.host)
+        date = CalendarDateEdit(QDate(2026, 10, 31), self.host)
         date.setDisplayFormat("yyyy-MM-dd")
         date.setCalendarPopup(True)
         combo = QComboBox(self.host)
@@ -67,7 +68,7 @@ class WheelGuardTests(unittest.TestCase):
                 self.assertFalse(event.isAccepted())
 
     def test_keyboard_and_explicit_changes_still_work(self):
-        date = QDateEdit(QDate(2026, 10, 31), self.host)
+        date = CalendarDateEdit(QDate(2026, 10, 31), self.host)
         date.setDisplayFormat("yyyy-MM-dd")
         number = QDoubleSpinBox(self.host)
         number.setValue(5)

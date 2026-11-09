@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QTabWidget,
-    QFrame, QFormLayout, QDateEdit, QCheckBox, QFileDialog, QInputDialog,
+    QFrame, QFormLayout, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
     QTextEdit, QSplitter, QGraphicsView, QGraphicsScene, QAbstractItemView
 )
@@ -49,6 +49,7 @@ import payroll_ui
 import employee_cards
 import desktop_theme
 import input_safety
+from date_widgets import CalendarDateEdit
 from ob_calculator import (
     calculate_work_interval,
     describe_category_time_ranges,
@@ -2062,9 +2063,7 @@ DARK_THEME_QSS = DARK_THEME_QSS.replace(
 )
 
 def create_date_field(default_date_str=""):
-    date_edit = QDateEdit()
-    date_edit.setMinimumWidth(144)
-    date_edit.setCalendarPopup(True)
+    date_edit = CalendarDateEdit()
     date_edit.setDisplayFormat("yyyy-MM-dd")
     if default_date_str:
         qdate = QDate.fromString(default_date_str, "yyyy-MM-dd")
@@ -8702,8 +8701,14 @@ class SmartReportApp(QMainWindow):
             lambda _checked: self.load_invoice_objects(self.inv_comp_cb.currentText())
         )
 
-        card_layout.addRow("Период с:", self.inv_date_from)
-        card_layout.addRow("Период по:", self.inv_date_to)
+        period_layout = QHBoxLayout()
+        period_layout.setContentsMargins(0, 0, 0, 0)
+        period_layout.addWidget(QLabel("с:"))
+        period_layout.addWidget(self.inv_date_from)
+        period_layout.addWidget(QLabel("по:"))
+        period_layout.addWidget(self.inv_date_to)
+        period_layout.addStretch(1)
+        card_layout.addRow("Период:", period_layout)
         card_layout.addRow("Фирма:", self.inv_comp_cb)
         object_row = QHBoxLayout()
         object_row.addWidget(self.inv_obj_cb, stretch=1)
