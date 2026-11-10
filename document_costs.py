@@ -4,7 +4,10 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from expense_documents import _date_value, decimal_text, non_invoice_document_type, parse_invoice_money
+from expense_documents import (
+    _date_value, decimal_text, is_service_category, non_invoice_document_type,
+    normalize_object_marking, object_marking_matches, parse_invoice_money,
+)
 
 
 def propose_object_allocations(fields, objects):
@@ -21,7 +24,7 @@ def propose_object_allocations(fields, objects):
         marker = str(order.get("project_code") or order.get("original_marker") or "").strip()
         identifier = order.get("order_id")
         net, vat = (parse_invoice_money(order.get(key)) for key in ("net_amount", "vat_amount"))
-        if (not marker or not identifier or identifier in seen or order.get("ambiguous")
+        if (not identifier or identifier in seen or order.get("ambiguous")
                 or net is None or vat is None or not net.is_finite() or not vat.is_finite()
                 or net < 0 or vat < 0):
             result["errors"].append("Есть неоднозначный заказ, маркировка или сумма. Автоприменение запрещено.")
@@ -34,8 +37,10 @@ def propose_object_allocations(fields, objects):
                 or sum(values[0], Decimal(0)) != net or sum(values[1], Decimal(0)) != vat):
             result["errors"].append(f"{marker}: позиции не подтверждают сумму и НДС заказа.")
             continue
-        key = marker.casefold()
-        part = grouped.setdefault(key, {"marker": marker, "net": Decimal(0), "vat": Decimal(0),
+        known_marker = bool(re.fullmatch(r"[A-Za-z]*\s*\d(?:[A-Za-z0-9 -]*[A-Za-z0-9])?", marker))
+        key = normalize_object_marking(marker) if known_marker else f"unmarked:{identifier}"
+        part = grouped.setdefault(key, {"marker": marker if known_marker else "",
+                                         "net": Decimal(0), "vat": Decimal(0),
                                          "pages": set(), "orders": []})
         part["net"] += net
         part["vat"] += vat
@@ -61,15 +66,23 @@ def propose_object_allocations(fields, objects):
     for key in sorted(shares, key=lambda k: (-(shares[k] - cents[k]), k))[:count - sum(cents.values())]:
         cents[key] += 1
     for key, part in grouped.items():
-        matches = [obj for obj in objects if str(obj.get("markning") or "").strip().casefold() == key]
-        selected = matches[0] if len(matches) == 1 else None
+        matches = [obj for obj in objects if not is_service_category(obj) and object_marking_matches(
+            part["marker"], str(obj.get("markning") or "")
+        )]
+        options = [{
+            "id": int(obj["id"]), "name": str(obj.get("name") or ""),
+            "markning": str(obj.get("markning") or ""),
+            "company": str(obj.get("company") or ""),
+            "is_active": str(obj.get("is_active", 1)).strip().casefold() not in {"0", "false", "no"},
+        } for obj in matches]
         warning = ("Неизвестная маркировка — выберите объект вручную" if not matches else
-                   "Маркировка соответствует нескольким объектам — выберите вручную" if len(matches) > 1 else
-                   "Объект неактивен" if not selected.get("is_active", 1) else "")
+                   "Маркировка совпала с несколькими объектами — выберите вручную" if len(matches) > 1 else
+                   "Объект неактивен" if not options[0]["is_active"] else
+                   "Проверьте предложенный объект и выберите его вручную")
         adjustment = Decimal(cents[key]) / 100 * (-1 if rounding < 0 else 1)
         result["parts"].append({
-            "marker": part["marker"], "object_id": selected["id"] if selected else None,
-            "object_name": selected["name"] if selected else "", "warning": warning,
+            "marker": part["marker"], "object_id": None, "object_name": "",
+            "object_options": options, "warning": warning,
             "net_amount": decimal_text(part["net"]), "vat_amount": decimal_text(part["vat"]),
             "before_rounding": decimal_text(part["net"] + part["vat"]),
             "rounding": decimal_text(adjustment),
@@ -77,7 +90,7 @@ def propose_object_allocations(fields, objects):
             "pages": sorted(part["pages"]), "orders": part["orders"],
         })
         if warning:
-            result["warnings"].append(f"{part['marker']}: {warning}")
+            result["warnings"].append(f"{part['marker'] or 'Без маркировки'}: {warning}")
     result.update(rounding=decimal_text(rounding), total=decimal_text(total))
     return result
 

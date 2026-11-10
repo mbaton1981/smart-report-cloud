@@ -58,8 +58,9 @@ from ob_calculator import (
 )
 from expense_documents import (
     apply_expense_documents_migration, build_project_order_allocations, decimal_text, document_storage_root,
-    extract_local_document, find_document_duplicates, get_object_expense_summary,
-    match_objects, parse_decimal, parse_document_text, parse_project_order_allocations,
+    extract_local_document, find_document_duplicates, get_object_expense_summary, is_service_category,
+    match_objects, normalize_object_marking, object_marking_matches,
+    parse_decimal, parse_document_text, parse_project_order_allocations,
     safe_folder_name, sha256_file,
     store_original_file,
     validate_allocations,
@@ -70,6 +71,7 @@ from expense_documents import (
 )
 from desktop_ui import ReportTable as QTableWidget
 import desktop_ui
+from object_picker import ObjectPickerComboBox
 
 import desktop_auth
 
@@ -5047,7 +5049,22 @@ class SmartReportApp(QMainWindow):
             reason_label.setWordWrap(True)
             form.addRow("Проверьте:", reason_label)
 
-        objects = list(getattr(self, "_expense_objects", []))
+        objects = list(self.incoming_allocation_objects())
+        object_combos = []
+        archive_toggle = QCheckBox("Показать архивные")
+        archive_toggle.setObjectName("expenseShowArchivedObjects")
+
+        def refresh_object_combos():
+            for combo in object_combos:
+                if sip.isdeleted(combo):
+                    continue
+                combo.set_object_choices(
+                    objects, selected=combo.currentData(),
+                    show_archived=archive_toggle.isChecked(),
+                    placeholder="Выберите объект",
+                )
+
+        archive_toggle.toggled.connect(refresh_object_combos)
         order_proposals = [dict(item) for item in fields.get("order_proposals") or []]
         order_table = QTableWidget()
         order_table.setObjectName("expenseOrderProposals")
@@ -5066,7 +5083,7 @@ class SmartReportApp(QMainWindow):
         except Exception:
             supplier_links = []
         mapped_objects = {
-            str(link.get("project_code") or "").casefold(): int(link["object_id"])
+            normalize_object_marking(str(link.get("project_code") or "")): int(link["object_id"])
             for link in supplier_links if link.get("object_id") is not None
         }
 
@@ -5076,31 +5093,32 @@ class SmartReportApp(QMainWindow):
             order_table.insertRow(row)
             order_table.setItem(row, 0, QTableWidgetItem(str(proposal.get("project_code") or "")))
             order_table.setItem(row, 1, QTableWidgetItem(str(proposal.get("order_id") or "")))
-            object_combo = QComboBox()
-            object_combo.addItem("Выберите объект", None)
-            for object_row in objects:
-                label = str(object_row["name"])
-                if object_row.get("markning"):
-                    label += f" ({object_row['markning']})"
-                if object_row.get("company"):
-                    label += f" · {object_row['company']}"
-                object_combo.addItem(label, int(object_row["id"]))
-            selected_object = proposal.get("object_id") or mapped_objects.get(
-                str(proposal.get("project_code") or "").casefold()
+            object_combo = ObjectPickerComboBox()
+            object_combo.set_object_choices(
+                objects, selected=None, show_archived=archive_toggle.isChecked(),
+                placeholder="Выберите объект",
             )
-            if selected_object is None:
-                exact_matches = [
-                    int(item["id"]) for item in objects
-                    if str(item.get("markning") or "").strip().casefold()
-                    == str(proposal.get("project_code") or "").strip().casefold()
-                    and str(proposal.get("project_code") or "").strip()
+            object_combos.append(object_combo)
+            code = normalize_object_marking(str(proposal.get("project_code") or ""))
+            suggested_ids = {
+                int(item["id"]) for item in objects
+                if not is_service_category(item)
+                and object_marking_matches(str(proposal.get("project_code") or ""), item.get("markning"))
+            }
+            mapped_id = mapped_objects.get(code)
+            if mapped_id is not None and any(
+                int(item["id"]) == mapped_id and not is_service_category(item) for item in objects
+            ):
+                suggested_ids.add(mapped_id)
+            if suggested_ids:
+                labels = [
+                    f"{item['name']} ({item.get('markning') or 'без маркировки'})"
+                    + (f" · {item.get('company')}" if item.get("company") else "")
+                    for item in objects if int(item["id"]) in suggested_ids
                 ]
-                if len(exact_matches) == 1:
-                    selected_object = exact_matches[0]
-            if selected_object is not None:
-                selected_index = object_combo.findData(int(selected_object))
-                if selected_index >= 0:
-                    object_combo.setCurrentIndex(selected_index)
+                object_combo.setToolTip(
+                    "Предложение по маркировке; объект не выбран. Варианты: " + "; ".join(labels)
+                )
             order_table.setCellWidget(row, 2, object_combo)
             order_table.setItem(row, 3, QTableWidgetItem(str(proposal.get("net_amount") or "")))
             order_table.setItem(row, 4, QTableWidgetItem(str(proposal.get("vat_amount") or "")))
@@ -5170,6 +5188,7 @@ class SmartReportApp(QMainWindow):
         order_table.cellChanged.connect(update_order_proposal_totals)
         update_order_proposal_totals()
         if order_proposals:
+            form.addRow("Объекты распределения:", archive_toggle)
             form.addRow("Распределение по заказам:", order_table)
             form.addRow("Проверка заказов:", proposal_status)
         orders_reviewed = QCheckBox("Строки заказов и VAT сверены с оригиналом")
@@ -5212,18 +5231,14 @@ class SmartReportApp(QMainWindow):
             allocation = allocation or {}
             row = allocation_table.rowCount()
             allocation_table.insertRow(row)
-            object_combo = QComboBox()
-            object_combo.addItem("Выберите объект", None)
-            for object_row in objects:
-                label = str(object_row["name"])
-                if object_row.get("markning"):
-                    label += f" ({object_row['markning']})"
-                if object_row.get("company"):
-                    label += f" · {object_row['company']}"
-                object_combo.addItem(label, int(object_row["id"]))
+            object_combo = ObjectPickerComboBox()
             selected_object = allocation.get("object_id")
-            if selected_object is not None:
-                object_combo.setCurrentIndex(max(0, object_combo.findData(int(selected_object))))
+            object_combo.set_object_choices(
+                objects, selected=selected_object,
+                show_archived=archive_toggle.isChecked(),
+                placeholder="Выберите объект",
+            )
+            object_combos.append(object_combo)
             allocation_table.setCellWidget(row, 0, object_combo)
             allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
 
@@ -5239,6 +5254,8 @@ class SmartReportApp(QMainWindow):
         allocation_box.addLayout(allocation_buttons)
         allocation_container = QWidget()
         allocation_container.setLayout(allocation_box)
+        if not order_proposals:
+            form.addRow("Объекты распределения:", archive_toggle)
         form.addRow("Распределение:", allocation_container)
 
         total_label = QLabel()
@@ -5491,7 +5508,9 @@ class SmartReportApp(QMainWindow):
 
         conn = get_db_connection()
         known_suppliers = conn.execute("SELECT name FROM expense_suppliers ORDER BY name COLLATE NOCASE").fetchall()
-        object_rows = conn.execute("SELECT id, name, markning, is_active FROM objects ORDER BY name").fetchall()
+        object_rows = [dict(row) for row in conn.execute(
+            "SELECT id, name, markning, company, is_active FROM objects ORDER BY name"
+        ).fetchall()]
         conn.close()
         supplier = QComboBox()
         supplier.setEditable(True)
@@ -5589,7 +5608,12 @@ class SmartReportApp(QMainWindow):
         add_vat_button.clicked.connect(lambda: vat_table.insertRow(vat_table.rowCount()))
         remove_vat_button.clicked.connect(lambda: vat_table.removeRow(vat_table.currentRow()) if vat_table.currentRow() >= 0 else None)
 
-        suggestion_text = "; ".join(f"{item['name']}: {item['reason']}" for item in suggestions)
+        suggestion_text = "; ".join(
+            f"{item['name']} ({item.get('markning') or 'без маркировки'})"
+            + (f" · {item['company']}" if item.get("company") else "")
+            + f": {item['reason']}"
+            for item in suggestions
+        )
         suggestion_label = QLabel(
             "Предложение объекта: " + (suggestion_text if suggestion_text else "совпадение не найдено; объект выберите вручную")
         )
@@ -5601,27 +5625,23 @@ class SmartReportApp(QMainWindow):
         allocation_table.setHorizontalHeaderLabels(["Объект", "Распределённая сумма документа"])
         allocations = existing_allocations if existing_allocations is not None else []
         if not allocations and fields.get("gross_amount"):
-            suggestion_id = suggestions[0]["object_id"] if len(suggestions) == 1 else None
-            allocations = [{"object_id": suggestion_id, "gross_amount": fields.get("gross_amount"), "note": suggestions[0]["reason"] if len(suggestions) == 1 else ""}]
+            allocations = [{"object_id": None, "gross_amount": fields.get("gross_amount"), "note": ""}]
+        object_combos = []
+        archive_toggle = QCheckBox("Показать архивные")
+        archive_toggle.setObjectName("expenseShowArchivedObjects")
 
         def add_allocation(allocation=None):
             allocation = allocation or {}
             row = allocation_table.rowCount()
             allocation_table.insertRow(row)
-            object_combo = QComboBox()
-            object_combo.addItem("Без объекта", None)
+            object_combo = ObjectPickerComboBox()
             selected_object = allocation.get("object_id")
-            for object_row in object_rows:
-                object_id = int(object_row["id"])
-                if not object_row["is_active"] and object_id != selected_object:
-                    continue
-                title = str(object_row["name"])
-                if object_row["markning"]:
-                    title += f" ({object_row['markning']})"
-                if not object_row["is_active"]:
-                    title += " [архив]"
-                object_combo.addItem(title, object_id)
-            object_combo.setCurrentIndex(max(0, object_combo.findData(int(selected_object)) if selected_object is not None else 0))
+            object_combo.set_object_choices(
+                object_rows, selected=selected_object,
+                show_archived=archive_toggle.isChecked(),
+                placeholder="Без объекта",
+            )
+            object_combos.append(object_combo)
             allocation_table.setCellWidget(row, 0, object_combo)
             allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
         for allocation in allocations:
@@ -5638,7 +5658,20 @@ class SmartReportApp(QMainWindow):
         allocation_box.addLayout(allocation_buttons)
         allocation_container = QWidget()
         allocation_container.setLayout(allocation_box)
+        form.addRow("Объекты распределения:", archive_toggle)
         form.addRow("Распределение:", allocation_container)
+
+        def refresh_object_combos():
+            for combo in object_combos:
+                if sip.isdeleted(combo):
+                    continue
+                combo.set_object_choices(
+                    object_rows, selected=combo.currentData(),
+                    show_archived=archive_toggle.isChecked(),
+                    placeholder="Без объекта",
+                )
+
+        archive_toggle.toggled.connect(refresh_object_combos)
         add_allocation_button.clicked.connect(lambda: add_allocation())
         remove_allocation_button.clicked.connect(lambda: allocation_table.removeRow(allocation_table.currentRow()) if allocation_table.currentRow() >= 0 else None)
 
@@ -6713,7 +6746,9 @@ class SmartReportApp(QMainWindow):
 
     def _expense_object_candidates(self):
         conn = get_db_connection()
-        objects = conn.execute("SELECT id, name, markning, company FROM objects ORDER BY name").fetchall()
+        objects = conn.execute(
+            "SELECT id, name, markning, company, is_active, service_type FROM objects ORDER BY name"
+        ).fetchall()
         candidates = []
         for row in objects:
             aliases = conn.execute(
@@ -6723,6 +6758,7 @@ class SmartReportApp(QMainWindow):
             candidates.append({
                 "id": int(row["id"]), "name": str(row["name"]),
                 "markning": str(row["markning"] or ""), "company": str(row["company"] or ""),
+                "is_active": row["is_active"], "service_type": row["service_type"],
                 "aliases": [str(alias[0]) for alias in aliases],
             })
         conn.close()
@@ -7713,53 +7749,70 @@ class SmartReportApp(QMainWindow):
             self._schedule_expense_read(requested)
 
     def incoming_allocation_objects(self):
-        objects = list(getattr(self, "_expense_objects", []))
-        known = {item["id"] for item in objects}
-        conn = get_db_connection()
-        try:
-            objects.extend(dict(row) for row in conn.execute("""
-                SELECT server_id AS id,sync_id,name,markning,company,is_active FROM objects
-                WHERE server_id IS NOT NULL AND is_active=0 ORDER BY company,name,id
-            """) if row["id"] not in known)
-        finally:
-            conn.close()
-        return objects
+        return self._expense_server_objects(include_inactive=True)[0]
 
-    def _expense_server_objects(self):
+    def _expense_server_objects(self, *, include_inactive=False):
+        if include_inactive:
+            conn = get_db_connection()
+            try:
+                catalog = [dict(row) for row in conn.execute("""
+                    SELECT server_id AS id,sync_id,name,markning,company,is_active,service_type
+                    FROM objects WHERE server_id IS NOT NULL ORDER BY company,name,id
+                """)]
+            finally:
+                conn.close()
+            by_id = {int(item["id"]): item for item in catalog}
+            for item in getattr(self, "_expense_objects", []):
+                by_id.setdefault(int(item["id"]), item)
+            return list(by_id.values()), getattr(self, "_expense_online", False)
+        cache_name = "_expense_objects_all" if include_inactive else "_expense_objects"
         if getattr(self, "_async_expense_reads", False):
-            if not hasattr(self, "_expense_objects"):
+            if not hasattr(self, cache_name):
                 conn = get_db_connection()
                 try:
-                    self._expense_objects = [dict(row) for row in conn.execute("""
+                    objects = [dict(row) for row in conn.execute("""
                         SELECT server_id AS id,sync_id,name,markning,company,is_active FROM objects
-                        WHERE server_id IS NOT NULL AND is_active=1 ORDER BY company,name,id
+                        WHERE server_id IS NOT NULL
+                        ORDER BY company,name,id
                     """)]
                 finally:
                     conn.close()
-            return list(getattr(self, "_expense_objects", [])), self._expense_online
+                if not include_inactive:
+                    objects = [item for item in objects if item.get("is_active", 1)]
+                setattr(self, cache_name, objects)
+            return list(getattr(self, cache_name, [])), self._expense_online
         try:
-            result = request_expense_api("GET", "/api/expense-objects")
+            params = {"include_inactive": "1"} if include_inactive else None
+            result = request_expense_api("GET", "/api/expense-objects", params=params)
             objects = result.get("objects", [])
-            self._expense_objects = objects
+            setattr(self, cache_name, objects)
             return objects, True
         except Exception as error:
-            cached = getattr(self, "_expense_objects", None)
+            cached = getattr(self, cache_name, None)
             if cached is None:
                 conn = get_db_connection()
                 try:
                     cached = [dict(row) for row in conn.execute("""
                         SELECT server_id AS id, sync_id, name, markning, company,
                                is_active FROM objects
-                        WHERE server_id IS NOT NULL AND is_active = 1
+                        WHERE server_id IS NOT NULL
                         ORDER BY company, name, id
                     """).fetchall()]
                 finally:
                     conn.close()
-                self._expense_objects = cached
-            self.exp_api_status_lbl.setText(
-                f"Сервер недоступен; используется кэш объектов. Расходы останутся в очереди. {error}"
-            )
+                if not include_inactive:
+                    cached = [item for item in cached if item.get("is_active", 1)]
+                setattr(self, cache_name, cached)
+            message = f"Сервер недоступен; используется кэш объектов. Расходы останутся в очереди. {error}"
+            status_label = getattr(self, "exp_api_status_lbl", None)
+            if status_label is not None:
+                status_label.setText(message)
+            else:
+                logging.getLogger(__name__).warning(message)
             return cached, False
+
+    def _expense_assignment_objects(self):
+        return self._expense_server_objects(include_inactive=True)[0]
 
     def load_expense_document_filters(self, *_):
         objects, online = self._expense_server_objects()
@@ -8488,21 +8541,28 @@ class SmartReportApp(QMainWindow):
                 Path(stored_path).unlink(missing_ok=True)
             raise
 
-    def _expense_object_choices(self, combo, selected=None):
+    def _expense_object_choices(self, combo, selected=None, show_archived=False, objects=None):
+        if objects is None:
+            objects = self._expense_assignment_objects()
+        if isinstance(combo, ObjectPickerComboBox):
+            combo.set_object_choices(
+                objects, selected=selected, show_archived=show_archived,
+                placeholder="Выберите назначение", include_company=True,
+            )
+            return
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("Выберите объект", "unselected")
+        combo.addItem("Выберите назначение", "unselected")
         combo.addItem("Общие расходы фирмы", "company")
-        for item in getattr(self, "_expense_objects", []):
-            combo.addItem(
-                f"{item['name']} ({item.get('markning') or 'без кода'}) · {item.get('company') or ''}",
-                int(item["id"]),
-            )
+        for item in objects:
+            if not item.get("is_active", 1) and not show_archived and int(item["id"]) != selected:
+                continue
+            label = f"{item['name']} ({item.get('markning') or 'без маркировки'})"
+            if not item.get("is_active", 1):
+                label += " [Архив]"
+            combo.addItem(label, int(item["id"]))
         index = combo.findData(selected)
-        if index >= 0:
-            combo.setCurrentIndex(index)
-        elif combo.count() > 2:
-            combo.setCurrentIndex(2)
+        combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
 
     def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None):
@@ -8601,7 +8661,23 @@ class SmartReportApp(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(table, 2)
         source_rows = []
-        objects = list(getattr(self, "_expense_objects", []))
+        objects = list(self.incoming_allocation_objects())
+        object_combos = []
+        archive_toggle = QCheckBox("Показать архивные")
+        archive_toggle.setObjectName("invoiceShowArchivedObjects")
+        layout.addWidget(archive_toggle)
+
+        def refresh_object_combos():
+            for combo in object_combos:
+                if sip.isdeleted(combo):
+                    continue
+                combo.set_object_choices(
+                    objects, selected=combo.currentData(),
+                    show_archived=archive_toggle.isChecked(),
+                    placeholder="Выберите объект",
+                )
+
+        archive_toggle.toggled.connect(refresh_object_combos)
         distribution = QLabel()
         distribution.setObjectName("invoiceDistribution")
         issues_label = QLabel()
@@ -8706,17 +8782,24 @@ class SmartReportApp(QMainWindow):
             destination = QComboBox()
             for label, value in (("Выберите назначение", "unselected"), ("На объект", "object"), ("Общие расходы фирмы", "company")):
                 destination.addItem(label, value)
-            object_combo = QComboBox()
-            object_combo.addItem("Выберите объект", None)
-            for item in objects:
-                object_combo.addItem(f"{item['name']} ({item.get('markning') or ''})", int(item["id"]))
+            object_combo = ObjectPickerComboBox()
             selected = original.get("object_id")
-            if selected is None and original.get("project_code"):
-                matches = [int(item["id"]) for item in objects if str(item.get("markning") or "").casefold()
-                           == str(original["project_code"]).casefold()]
-                selected = matches[0] if len(matches) == 1 else None
-            if selected is not None:
-                object_combo.setCurrentIndex(max(0, object_combo.findData(selected)))
+            object_combo.set_object_choices(
+                objects, selected=selected, show_archived=archive_toggle.isChecked(),
+                placeholder="Выберите объект",
+            )
+            object_combos.append(object_combo)
+            code = str(original.get("project_code") or original.get("original_marker") or "")
+            options = [
+                f"{item['name']} ({item.get('markning') or 'без маркировки'})"
+                + (f" · {item.get('company')}" if item.get("company") else "")
+                for item in objects if not is_service_category(item)
+                and object_marking_matches(code, item.get("markning"))
+            ]
+            if options:
+                object_combo.setToolTip(
+                    "Предложение по маркировке; объект не выбран. Варианты: " + "; ".join(options)
+                )
             selected_destination = original.get("destination") or ("object" if selected is not None else "unselected")
             destination.setCurrentIndex(max(0, destination.findData(selected_destination)))
             category = QLineEdit(str(original.get("expense_category") or ""))
@@ -8751,7 +8834,7 @@ class SmartReportApp(QMainWindow):
                 source_rows.pop(index)
                 refresh()
 
-        initial_rows = fields.get("order_proposals") or fields.get("allocations") or [{"net_amount": fields.get("net_amount")}]
+        initial_rows = fields.get("allocations") or fields.get("order_proposals") or [{"net_amount": fields.get("net_amount")}]
         for row in initial_rows:
             append_row(row)
         table.itemChanged.connect(refresh)
@@ -8905,17 +8988,26 @@ class SmartReportApp(QMainWindow):
         currency.setObjectName("expenseCurrency")
         currency.addItems(["SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN", "UNKNOWN"])
         currency.setCurrentText(str(document.get("currency_code") or parsed_fields.get("currency_code") or "SEK").upper())
-        single_object = QComboBox()
+        single_object = ObjectPickerComboBox()
         single_object.setObjectName("expenseObject")
         selected_object = "unselected" if document else None
         if len(existing_allocations) == 1:
             selected_object = existing_allocations[0].get("object_id")
             if selected_object is None:
                 selected_object = "company"
-        elif not document:
-            current_filter = self.exp_filter_object.currentData()
-            selected_object = current_filter if isinstance(current_filter, int) else None
-        self._expense_object_choices(single_object, selected_object)
+        objects = self._expense_assignment_objects()
+        self._expense_object_choices(single_object, selected_object, objects=objects)
+        object_combos = [single_object]
+        archive_toggle = QCheckBox("Показать архивные")
+        archive_toggle.setObjectName("expenseShowArchivedObjects")
+        def refresh_object_combos():
+            for combo in object_combos:
+                if sip.isdeleted(combo):
+                    continue
+                self._expense_object_choices(
+                    combo, combo.currentData(), archive_toggle.isChecked(), objects=objects,
+                )
+        archive_toggle.toggled.connect(refresh_object_combos)
         comment = QLineEdit(str(document.get("document_comment") or parsed_fields.get("document_comment") or ""))
         comment.setObjectName("expenseComment")
         status = QComboBox()
@@ -8946,6 +9038,7 @@ class SmartReportApp(QMainWindow):
         form.addRow("НДС (moms):", vat_amount)
         form.addRow("Сумма без НДС:", net_preview)
         form.addRow("Объект:", single_object)
+        form.addRow(archive_toggle)
         form.addRow("Комментарий:", comment)
         form.addRow("Статус:", status)
         recognition_label = QLabel(recognition_message or "Распознавание не запускалось; значения можно ввести вручную.")
@@ -9001,8 +9094,11 @@ class SmartReportApp(QMainWindow):
         def append_allocation(object_id, allocated_gross, allocated_vat):
             row = split_table.rowCount()
             split_table.insertRow(row)
-            object_combo = QComboBox()
-            self._expense_object_choices(object_combo, object_id)
+            object_combo = ObjectPickerComboBox()
+            self._expense_object_choices(
+                object_combo, object_id, archive_toggle.isChecked(), objects=objects,
+            )
+            object_combos.append(object_combo)
             split_table.setCellWidget(row, 0, object_combo)
             split_table.setItem(row, 1, QTableWidgetItem(str(allocated_gross or "")))
             split_table.setItem(row, 2, QTableWidgetItem(str(allocated_vat) if allocated_vat is not None else ""))

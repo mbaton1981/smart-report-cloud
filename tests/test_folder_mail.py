@@ -114,6 +114,28 @@ class FolderMailTests(unittest.TestCase):
         self.assertEqual(report["new_drafts"], 4)
         self.assertEqual(report["skipped"], 3)
 
+    def test_direct_and_nested_forward_import_only_same_pdf_not_signature(self):
+        from email import policy
+        from email.message import EmailMessage
+        from email.parser import BytesParser
+        from unittest.mock import Mock
+
+        content = pdf("Isolated invoice with seller and buyer")
+        original = BytesParser(policy=policy.default).parsebytes(eml(content))
+        forwarded = EmailMessage()
+        forwarded.set_content("Forwarded message\nSignature: Buyer Company AB\nAmount: 9999")
+        forwarded.add_attachment(original)
+        FolderIMAP.messages = {1: original.as_bytes(), 2: forwarded.as_bytes()}
+        recognizer = Mock(side_effect=recognized)
+        report = import_folder(self.store, "isolated-only",
+                               client_factory=FolderIMAP, recognizer=recognizer)
+        self.assertEqual(report["new_drafts"], 1)
+        self.assertEqual(report["duplicates"], 1)
+        self.assertEqual(recognizer.call_count, 1)
+        self.assertEqual(self.store.original(1).read_bytes(), content)
+        self.assertEqual(self.store.latest(1)[0], 0)
+        self.assertIsNone(self.store.card(1))
+
     def test_uidvalidity_change_is_explicit_and_completed_uid_never_refetched(self):
         self.run_import()
         FolderIMAP.epoch = 51

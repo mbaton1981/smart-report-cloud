@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
+from PyQt6 import sip
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter, QTableWidgetItem,
@@ -13,9 +14,10 @@ from PyQt6.QtWidgets import (
 from desktop_ui import ReportTable as QTableWidget
 from document_preview import DocumentGalleryDialog
 from expense_documents import (
-    decimal_text, due_date_edit, due_date_issues, invoice_context,
-    net_invoice_issues, non_invoice_document_type, parse_invoice_money,
+    decimal_text, due_date_edit, due_date_issues, invoice_context, is_service_category,
+    net_invoice_issues, non_invoice_document_type, object_marking_matches, parse_invoice_money,
 )
+from object_picker import ObjectPickerComboBox
 
 
 class InvoiceReviewMixin:
@@ -154,6 +156,12 @@ class InvoiceReviewMixin:
         layout.addWidget(table, 2)
         source_rows = []
         objects = list(trial_objects if trial_objects is not None else getattr(self, "_expense_objects", []))
+        if trial_objects is None and hasattr(self, "incoming_allocation_objects"):
+            objects = list(self.incoming_allocation_objects())
+        object_combos = []
+        archive_toggle = QCheckBox("Показать архивные")
+        archive_toggle.setObjectName("invoiceShowArchivedObjects")
+        form.addRow("Объекты распределения:", archive_toggle)
         distribution = QLabel()
         distribution.setObjectName("invoiceDistribution")
         issues_label = QLabel()
@@ -288,18 +296,24 @@ class InvoiceReviewMixin:
             destination = QComboBox()
             for label, value in (("Выберите назначение", "unselected"), ("На объект", "object"), ("Общие расходы фирмы", "company")):
                 destination.addItem(label, value)
-            object_combo = QComboBox()
-            object_combo.addItem("Выберите объект", None)
-            for item in objects:
-                object_combo.addItem(f"{item['name']} ({item.get('markning') or ''})", int(item["id"]))
+            object_combo = ObjectPickerComboBox()
             selected = original.get("object_id")
-            if (selected is None and original.get("project_code")
-                    and (trial_save is None or "destination" not in original)):
-                matches = [int(item["id"]) for item in objects if str(item.get("markning") or "").casefold()
-                           == str(original["project_code"]).casefold()]
-                selected = matches[0] if len(matches) == 1 else None
-            if selected is not None:
-                object_combo.setCurrentIndex(max(0, object_combo.findData(selected)))
+            object_combo.set_object_choices(
+                objects, selected=selected, show_archived=archive_toggle.isChecked(),
+                placeholder="Выберите объект",
+            )
+            object_combos.append(object_combo)
+            code = str(original.get("project_code") or original.get("original_marker") or "")
+            options = [
+                f"{item['name']} ({item.get('markning') or 'без маркировки'})"
+                + (f" · {item.get('company')}" if item.get("company") else "")
+                for item in objects if not is_service_category(item)
+                and object_marking_matches(code, item.get("markning"))
+            ]
+            if options:
+                object_combo.setToolTip(
+                    "Предложение по маркировке; объект не выбран. Варианты: " + "; ".join(options)
+                )
             selected_destination = original.get("destination") or ("object" if selected is not None else "unselected")
             destination.setCurrentIndex(max(0, destination.findData(selected_destination)))
             category = QLineEdit(str(original.get("expense_category") or ""))
@@ -334,9 +348,20 @@ class InvoiceReviewMixin:
                 source_rows.pop(index)
                 refresh()
 
-        initial_rows = fields.get("order_proposals") or fields.get("allocations") or [{"net_amount": fields.get("net_amount")}]
+        initial_rows = fields.get("allocations") or fields.get("order_proposals") or [{"net_amount": fields.get("net_amount")}]
         for row in initial_rows:
             append_row(row)
+        def refresh_object_combos():
+            for combo in object_combos:
+                if sip.isdeleted(combo):
+                    continue
+                combo.set_object_choices(
+                    objects, selected=combo.currentData(),
+                    show_archived=archive_toggle.isChecked(),
+                    placeholder="Выберите объект",
+                )
+
+        archive_toggle.toggled.connect(refresh_object_combos)
         table.itemChanged.connect(refresh)
         for widget in inputs.values():
             widget.textChanged.connect(refresh)

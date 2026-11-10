@@ -160,6 +160,43 @@ class MailImportTests(unittest.TestCase):
         self.assertEqual(document["sha256"], hashlib.sha256(original.read_bytes()).hexdigest())
         self.assertEqual(len(list(original.parent.iterdir())), 1)
 
+    def test_nested_forward_extracts_original_pdf_not_forward_text_and_deduplicates(self):
+        original_pdf = b"%PDF-1.4 isolated Bauhaus invoice"
+        nested = EmailMessage()
+        nested["Message-ID"] = "<supplier@local.test>"
+        nested["From"] = "seller@bauhaus.local.test"
+        nested["Subject"] = "Invoice"
+        nested.set_content("Invoice date 2026-10-19. Seller: Bauhaus.")
+        nested.add_attachment(original_pdf, maintype="application", subtype="pdf", filename="bauhaus.pdf")
+
+        forwarded = EmailMessage()
+        forwarded["Message-ID"] = "<forwarded@local.test>"
+        forwarded["From"] = "customer@local.test"
+        forwarded["To"] = ADDRESS
+        forwarded["Subject"] = "Fwd: Invoice"
+        forwarded.set_content("Forwarded message. Sender signature: Bygger och renoverar i Sthlm AB.")
+        forwarded.make_mixed()
+        nested_part = EmailMessage()
+        nested_part.set_type("message/rfc822")
+        nested_part.set_payload([nested])
+        forwarded.attach(nested_part)
+
+        client = FakeIMAP({
+            "1": message(("invoice.pdf", original_pdf)),
+            "2": forwarded.as_bytes(),
+        })
+        recognizer = Mock(side_effect=recognized)
+        documents = self.run_import(client, recognizer)["documents"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(len(documents[0]["sources"]), 2)
+        self.assertEqual(self.summary.documents_added, 1)
+        self.assertEqual(self.summary.duplicates_skipped, 1)
+        self.assertEqual(recognizer.call_count, 1)
+        saved = self.queue.root / documents[0]["original"]
+        self.assertEqual(saved.read_bytes(), original_pdf)
+        forwarded_report = next(item for item in self.summary.messages if item["uid"] == "2")
+        self.assertEqual([item["filename"] for item in forwarded_report["attachments"]], ["bauhaus.pdf"])
+
     def test_latest_messages_include_old_mail_and_report_empty_unsupported_and_duplicates(self):
         client = FakeIMAP({
             "2": message(("ignored.pdf", b"not selected")),

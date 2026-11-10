@@ -316,13 +316,51 @@ class IncomingStore(OfflineReviewStore):
                                datetime.now(timezone.utc).isoformat()))
         return True
 
-    def record_recognition(self, document_id, result):
+    def record_recognition(self, document_id, result, *, replace_automatic=False):
         fields = current_classification(result.get("fields") or {})
         fields["_recognition_state"] = result.get("state")
         revision, current_payload = self.latest(document_id)
         if revision or self.card(document_id):
             raise ReviewError("Распознавание не заменяет сохранённые ручные исправления.")
         base = self.base(document_id)
+        if replace_automatic:
+            if result.get("errors") or result.get("state") == "failed":
+                raise ReviewError("Повторное распознавание завершилось ошибкой; прежние данные сохранены.")
+            if (self.allocations(current_payload) or current_payload.get("original_checked")
+                    or current_payload.get("confirmed_type")
+                    or any(source.get("kind") == "manual"
+                           for sources in base.get("field_sources", {}).values() for source in sources)):
+                raise ReviewError("Распознавание не заменяет проверку оригинала или сохранённое распределение.")
+            source_json = self.conn.execute(
+                "SELECT source_json FROM documents WHERE id=?", (document_id,)
+            ).fetchone()[0]
+            source = json.loads(source_json)
+            source.setdefault("recognition_history", []).append({
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "base": base, "payload": current_payload,
+                "reason": "explicit_automatic_recognition_refresh",
+            })
+            payload = dict(current_payload)
+            payload.update({key: fields.get(key) for key in EDITABLE
+                            if key not in {"confirmed_type", "object_id", "original_checked", "settlement_status"}})
+            with self.conn:
+                self.conn.execute("BEGIN IMMEDIATE")
+                row = self.conn.execute(
+                    "SELECT MAX(revision) FROM revisions WHERE document_id=?", (document_id,)
+                ).fetchone()
+                if (row[0] != 0 or self.card(document_id)
+                        or self.latest(document_id)[1] != current_payload
+                        or self.base(document_id) != base):
+                    raise ReviewError("Документ изменился во время распознавания; обновите список.")
+                self.conn.execute(
+                    "UPDATE documents SET base_json=?,source_json=? WHERE id=?",
+                    (packed(fields), packed(source), document_id),
+                )
+                self.conn.execute(
+                    "UPDATE revisions SET payload_json=? WHERE document_id=? AND revision=0",
+                    (packed(payload), document_id),
+                )
+            return []
         merged_base = dict(base)
         merged_payload = dict(current_payload)
         conflicts = []

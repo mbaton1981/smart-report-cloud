@@ -109,6 +109,34 @@ class IncomingDisplayTests(unittest.TestCase):
         self.background_refresh(window)
         self.assertEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
 
+    def test_explicit_automatic_refresh_preserves_original_id_and_audit(self):
+        original = self.store.original(1).read_bytes()
+        before = self.store.base(1)
+        source_before = json.loads(self.store.conn.execute(
+            "SELECT source_json FROM documents WHERE id=1").fetchone()[0])
+        result = {"fields": dict(self.fields, supplier_name="Correct issuer AB"),
+                  "state": "requires_review", "errors": []}
+        self.store.record_recognition(1, result, replace_automatic=True)
+        self.assertEqual(self.store.latest(1)[0], 0)
+        self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Correct issuer AB")
+        self.assertEqual(self.store.original(1).read_bytes(), original)
+        source_after = json.loads(self.store.conn.execute(
+            "SELECT source_json FROM documents WHERE id=1").fetchone()[0])
+        self.assertEqual(source_after["result"], source_before["result"])
+        self.assertEqual(source_after["recognition_history"][0]["base"], before)
+        self.assertIsNone(self.store.card(1))
+
+    def test_explicit_automatic_refresh_rejects_manual_or_allocated_draft(self):
+        revision, payload = self.store.latest(1)
+        payload["allocations"] = [{"object_id": 7, "gross_amount": "125.00"}]
+        with self.store.conn:
+            self.store.conn.execute(
+                "UPDATE revisions SET payload_json=? WHERE document_id=1 AND revision=0",
+                (json.dumps(payload),))
+        with self.assertRaises(ReviewError):
+            self.store.record_recognition(
+                1, {"fields": self.fields}, replace_automatic=True)
+
     def test_main_register_projects_local_documents_before_confirmation_and_company_is_allocated(self):
         host = SimpleNamespace(
             _incoming_documents_root=lambda: self.store.root,

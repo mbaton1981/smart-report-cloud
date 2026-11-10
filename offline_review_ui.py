@@ -11,7 +11,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPalette, QBrush
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSplitter, QTextEdit,
     QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
     QStyledItemDelegate, QStyle,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from document_preview import DocumentGalleryDialog
 from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
+from object_picker import ObjectPickerComboBox
 import desktop_theme
 
 
@@ -164,11 +165,14 @@ class OfflineReviewWindow(QDialog):
         else:
             self.amount_choices.hide()
         self.amount_choices.currentIndexChanged.connect(self.choose_amount)
-        self.object = QComboBox()
+        self.object = ObjectPickerComboBox()
         self.object.setObjectName("review_object")
-        self.object.addItem("Обязательно выберите объект", None)
-        for obj in store.objects():
-            self.object.addItem(obj["name"], obj["id"])
+        self.object.set_object_choices(
+            store.objects(), placeholder="Обязательно выберите объект",
+        )
+        self.show_archived_objects = QCheckBox("Показать архивные")
+        self.show_archived_objects.toggled.connect(self.refresh_objects)
+        form.addRow(self.show_archived_objects)
         if integrated:
             self.object.hide()
             self.allocations = QTableWidget(0, 3)
@@ -319,21 +323,17 @@ class OfflineReviewWindow(QDialog):
         part = part or {}
         row = self.allocations.rowCount()
         self.allocations.insertRow(row)
-        combo = QComboBox()
+        combo = ObjectPickerComboBox()
         combo.setMinimumWidth(110)
         combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        combo.addItem("Выберите назначение", None)
-        combo.addItem("Общие расходы фирмы", "company")
-        for obj in self.store.objects():
-            combo.addItem(
-                obj["name"] + (" — Объект неактивен" if not obj.get("is_active", 1) else ""),
-                obj["id"])
         selected = part.get("object_id")
         destination = part.get("destination") or ("object" if selected is not None else "unselected")
         selected_data = "company" if destination == "company" else selected
-        if selected is not None and combo.findData(selected) < 0:
-            combo.addItem(f"Объект #{selected} — недоступен", selected)
-        combo.setCurrentIndex(max(0, combo.findData(selected_data)))
+        combo.set_object_choices(
+            self.store.objects(), selected=selected_data,
+            show_archived=self.show_archived_objects.isChecked(),
+            placeholder="Выберите назначение", include_company=True,
+        )
         combo.setToolTip(combo.currentText())
         combo.currentTextChanged.connect(combo.setToolTip)
         self.allocations.setCellWidget(row, 0, combo)
@@ -357,8 +357,16 @@ class OfflineReviewWindow(QDialog):
         lines = ["<b>Предложение по маркировкам и позициям на страницах PDF. "
                  "Это не подтверждённое распределение.</b>"]
         for part in proposal["parts"]:
+            options = ", ".join(
+                f"{item['name']} ({item['markning'] or 'без маркировки'})"
+                + (f" · {item['company']}" if item["company"] else "")
+                + (" [Архив]" if not item.get("is_active", 1) else "")
+                for item in part.get("object_options", [])
+            )
+            suggestion = f"Варианты: {options}; назначение не выбрано." if options else "Объект не найден."
+            marker_label = part["marker"] or "Без маркировки — заказ " + ", ".join(part["orders"])
             lines.append(
-                f"{escape(part['marker'])} — {escape(part['object_name'] or 'Объект не определён')}: "
+                f"{escape(marker_label)} — {escape(suggestion)}: "
                 f"<b>{part['gross_amount']}</b>; до округления {part['before_rounding']}, "
                 f"доля округления {part['rounding']}; стр. {', '.join(map(str, part['pages']))}"
                 + (f" — <b>{escape(part['warning'])}</b>" if part["warning"] else ""))
@@ -558,23 +566,56 @@ class OfflineReviewWindow(QDialog):
 
     def refresh_objects(self):
         selected = self.object.currentData()
-        self.object.blockSignals(True)
-        self.object.clear()
-        self.object.addItem("Обязательно выберите объект", None)
-        for obj in self.store.objects():
-            self.object.addItem(obj["name"], obj["id"])
-        self.object.setCurrentIndex(max(0, self.object.findData(selected)))
-        self.object.blockSignals(False)
+        objects = self.store.objects()
+        self.object.set_object_choices(
+            objects, selected=selected, show_archived=self.show_archived_objects.isChecked(),
+            placeholder="Обязательно выберите объект",
+        )
+        for row in range(self.allocations.rowCount() if self.integrated else 0):
+            combo = self.allocations.cellWidget(row, 0)
+            if isinstance(combo, ObjectPickerComboBox):
+                combo.set_object_choices(
+                    objects, selected=combo.currentData(),
+                    show_archived=self.show_archived_objects.isChecked(),
+                    placeholder="Выберите назначение", include_company=True,
+                )
 
     def reassign_object(self):
-        from PyQt6.QtWidgets import QInputDialog
         objects = self.store.objects()
-        names = [f"{row['name']} (#{row['id']})" for row in objects]
-        name, accepted = QInputDialog.getItem(self, "Изменение привязки", "Новый объект:", names, 0, False)
-        if not accepted:
+        _, payload = self.store.current_review(self.document_id)
+        allocations = self.store.allocations(payload)
+        selected = allocations[0].get("object_id") if len(allocations) == 1 else None
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Изменение привязки")
+        layout = QVBoxLayout(dialog)
+        picker = ObjectPickerComboBox(dialog)
+        picker.set_object_choices(
+            objects, selected=selected, placeholder="Выберите объект",
+        )
+        layout.addWidget(picker)
+        show_archived = QCheckBox("Показать архивные", dialog)
+        layout.addWidget(show_archived)
+        show_archived.toggled.connect(
+            lambda checked: picker.set_object_choices(
+                objects, selected=picker.currentData(), show_archived=checked,
+                placeholder="Выберите объект",
+            )
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        object_id = picker.currentData()
+        if not isinstance(object_id, int):
+            QMessageBox.warning(self, "Объект не изменён", "Выберите объект.")
             return
         try:
-            self.store.reassign(self.document_id, objects[names.index(name)]["id"], self.revision)
+            self.store.reassign(self.document_id, object_id, self.revision)
         except (ReviewError, OSError, sqlite3.Error, ValueError) as error:
             QMessageBox.warning(self, "Объект не изменён", str(error))
             return
@@ -608,7 +649,11 @@ class OfflineReviewWindow(QDialog):
             field.setText(str(payload[key]) if payload.get(key) not in (None, "UNKNOWN") else "")
             field.blockSignals(False)
         self.kind.setCurrentIndex(max(0, self.kind.findData(payload.get("confirmed_type"))))
-        self.object.setCurrentIndex(max(0, self.object.findData(payload.get("object_id"))))
+        self.object.set_object_choices(
+            self.store.objects(), selected=payload.get("object_id"),
+            show_archived=self.show_archived_objects.isChecked(),
+            placeholder="Обязательно выберите объект",
+        )
         if self.integrated:
             self.allocations.setRowCount(0)
             parts = self.store.allocations(payload)

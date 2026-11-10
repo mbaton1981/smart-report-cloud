@@ -8,6 +8,57 @@ class InvoiceSupplierTests(unittest.TestCase):
     def cell(text, x0, y0, x1, y1):
         return {"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1}
 
+    def test_right_issuer_identity_beats_unlabelled_buyer_and_reads_fiscal_summary(self):
+        elements = [
+            self.cell("Issuer Parking AB", 420, 77, 520, 85),
+            self.cell("Box 12", 420, 89, 460, 97),
+            self.cell("111 22 Stockholm", 420, 101, 510, 109),
+            self.cell("Buyer AB", 45, 110, 150, 118),
+            self.cell("Kundvägen 1", 45, 122, 150, 130),
+            self.cell("123 45 Stockholm", 45, 134, 150, 142),
+            self.cell("Organisationsnummer", 306, 189, 395, 197),
+            self.cell("556000-0000", 420, 189, 480, 197),
+            self.cell("Momsregistreringsnummer", 306, 177, 413, 185),
+            self.cell("SE556000000001", 420, 177, 500, 185),
+            self.cell("Fakturanummer", 45, 280, 130, 288),
+            self.cell("TEST1234", 45, 295, 130, 303),
+            self.cell("Fakturadatum", 240, 280, 320, 288),
+            self.cell("2026-11-05", 240, 295, 320, 303),
+            self.cell("Totalt belopp exkl moms", 36, 737, 145, 745),
+            self.cell("SEK 1.000,00", 520, 737, 575, 745),
+            self.cell("25% MOMS", 36, 752, 85, 760),
+            self.cell("SEK 1.000,00", 340, 752, 395, 760),
+            self.cell("SEK 250,00", 528, 752, 575, 760),
+            self.cell("Oss tillhanda 2026-11-29", 36, 766, 145, 774),
+            self.cell("Totalt belopp inkl moms", 292, 766, 395, 774),
+            self.cell("SEK 1.250,00", 520, 766, 575, 774),
+            self.cell("OCR nummer: 1234567890", 36, 790, 180, 798),
+        ]
+        fields = parse_invoice_pages([{
+            "text": "Faktura\nIssuer Parking ABBox 12\nBuyer AB",
+            "page": 1, "elements": elements,
+        }])
+        self.assertEqual(fields["supplier_name"], "Issuer Parking AB")
+        self.assertEqual(fields["supplier_org_number"], "556000-0000")
+        self.assertEqual(fields["supplier_vat_number"], "SE556000000001")
+        self.assertEqual(fields["net_amount"], "1000.00")
+        self.assertEqual(fields["vat_amount"], "250.00")
+        self.assertEqual(fields["amount_due"], "1250.00")
+        self.assertEqual(fields["payment_reference"], "1234567890")
+        self.assertEqual(fields["due_date"], "2026-11-29")
+
+    def test_order_heading_after_buyer_address_is_not_an_invoice(self):
+        text = "\n".join(["Bank: Example"] * 8 + [
+            "Kundnr.: 12345", "Buyer AB", "Street 1", "111 22 Stockholm",
+            "Leveransadress:", "Project: P1039", "EDI nr.: 0000",
+            "Orderbekräftelse", "Sida: 1 av 3", "Seller AB",
+            "Ordernr.: 12345", "Skapad datum: 06.11.2026",
+        ])
+        fields = parse_invoice_pages([{"text": text, "page": 1}])
+        self.assertEqual(fields["document_type"], "order_confirmation")
+        self.assertIsNone(fields["invoice_number"])
+        self.assertIsNone(fields["supplier_name"])
+
     def test_supplier_uses_invoice_issuer_not_buyer_collector_or_later_operator(self):
         first_page = {
             "source": "synthetic-invoice.pdf",

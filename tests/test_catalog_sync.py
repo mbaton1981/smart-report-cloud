@@ -2535,7 +2535,15 @@ class CatalogSyncTests(unittest.TestCase):
                 table.setCurrentCell(3, 0)
                 dialog.findChild(self.desktop.QPushButton, "invoiceRemoveAllocation").click()
                 self.assertEqual(table.rowCount(), 3)
-                self.assertEqual(table.cellWidget(0, 3).currentData(), object_id)
+                self.assertIsNone(table.cellWidget(0, 3).currentData())
+                self.assertIn("Предложение по маркировке", table.cellWidget(0, 3).toolTip())
+                for row in (0, 1):
+                    destination = table.cellWidget(row, 2)
+                    destination.setCurrentIndex(destination.findData("object"))
+                    object_combo = table.cellWidget(row, 3)
+                    self.assertIsNone(object_combo.currentData())
+                    object_combo.setCurrentIndex(object_combo.findData(object_id))
+                    self.assertEqual(object_combo.currentData(), object_id)
                 self.assertEqual(table.cellWidget(2, 2).currentData(), "unselected")
                 confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
                 self.assertFalse(confirm.isEnabled())
@@ -2562,6 +2570,7 @@ class CatalogSyncTests(unittest.TestCase):
                  patch.object(self.desktop.QMessageBox, "warning") as warnings, \
                  patch.object(self.desktop.QMessageBox, "information"), \
                  patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop, "ensure_sync_dataset"), \
                  patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 window.upload_expense_document()
 
@@ -3461,7 +3470,9 @@ class CatalogSyncTests(unittest.TestCase):
             confirm = dialog.findChild(self.desktop.QPushButton, "invoiceConfirm")
             self.assertFalse(confirm.isEnabled())
             self.assertEqual(table.cellWidget(1, 2).currentData(), "unselected")
-            self.assertEqual(table.cellWidget(0, 3).currentData(), object_id)
+            self.assertIsNone(table.cellWidget(0, 3).currentData())
+            table.cellWidget(0, 2).setCurrentIndex(table.cellWidget(0, 2).findData("object"))
+            table.cellWidget(0, 3).setCurrentIndex(table.cellWidget(0, 3).findData(object_id))
             table.cellWidget(1, 2).setCurrentIndex(table.cellWidget(1, 2).findData("company"))
             table.cellWidget(1, 4).setText("Инструмент")
             supplier = dialog.findChild(self.desktop.QLineEdit, "invoice_supplier_name")

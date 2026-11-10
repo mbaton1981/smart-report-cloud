@@ -111,7 +111,7 @@ def _date_value(value: str | None) -> str | None:
 
 def non_invoice_document_type(text: str) -> str | None:
     headings = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.startswith("---")]
-    header = "\n".join(headings[:15])
+    header = "\n".join(headings[:60])
     if re.search(r"^\s*Beslut\s+om\s+trängselskatt\s*$", header, re.IGNORECASE | re.MULTILINE):
         return "tax_decision"
     if re.search(r"^\s*ORDERBEKRÄFTELSE\s*$", header, re.IGNORECASE | re.MULTILINE):
@@ -453,6 +453,8 @@ def invoice_seller_blocks(cells, page):
             and abs(other["x0"] - cell["x0"]) < 24 and 0 <= other["y0"] - cell["y0"] < 80
             for other in cells
         )
+        identity = invoice_supplier_identifiers(page, name)
+        own_registration = own_registration or bool(identity["values"])
         if cell["y0"] < height * 0.3:
             candidates.append((95 if own_registration else 82 if cell["x0"] < width * 0.45 else 80, name, page, cell))
         elif cell["y0"] > height * 0.65:
@@ -499,6 +501,38 @@ def invoice_supplier_identifiers(page, supplier_name):
                     break
             if key in identifiers:
                 break
+    rows = invoice_layout_rows(page.get("elements") or [])
+    sellers = [cell for row in rows for cell in row
+               if cell["text"].strip().casefold() == supplier_name.casefold()]
+    for seller in sellers:
+        for key, pattern in patterns.items():
+            if key in identifiers:
+                continue
+            caption = (r"Org\.?\s*(?:nr|nummer)|Organisationsnummer" if key == "supplier_org_number"
+                       else r"Momsreg(?:istrerings)?(?:nummer|nr)|VAT(?:\s*(?:no\.?|number|nr))?")
+            matches = []
+            for row in rows:
+                for index, cell in enumerate(row):
+                    if (not 0 < cell["y0"] - seller["y0"] < 160
+                            or not seller["x0"] - 140 <= cell["x0"] <= seller["x0"] + 24):
+                        continue
+                    inline = re.fullmatch(rf"(?:{caption})\s*:?\s+(.+)", cell["text"], re.IGNORECASE)
+                    if inline and pattern.fullmatch(inline.group(1)) and cell["x1"] > seller["x0"]:
+                        matches.append((inline.group(1), cell))
+                    if not re.fullmatch(rf"(?:{caption})\s*:?", cell["text"], re.IGNORECASE):
+                        continue
+                    for value_cell in row[index + 1:]:
+                        value = pattern.fullmatch(value_cell["text"].strip())
+                        if value and abs(value_cell["x0"] - seller["x0"]) < 24:
+                            matches.append((value.group(0), value_cell))
+            if len({value for value, _ in matches}) == 1:
+                value, cell = matches[0]
+                identifiers[key] = re.sub(r"\s+", "", value)
+                sources[key] = {
+                    "page": page.get("page", 1), "text": cell["text"],
+                    "kind": "seller_identity_block",
+                    "box": [cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                }
     return {"values": identifiers, "sources": sources}
 
 
@@ -522,15 +556,15 @@ def parse_invoice_pages(pages):
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
         "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
-        "payment_reference": r"OCR(?:-\s*(?:nummer|nr)(?:/meddelande)?|/Meddelande|-/referensnummer)?|Betalningsreferens|Payment\s*reference|Vänligen\s+ange\s+referens",
+        "payment_reference": r"OCR(?:(?:-|\s+)\s*(?:nummer|nr)(?:/meddelande)?|/Meddelande|-/referensnummer)?|Betalningsreferens|Payment\s*reference|Vänligen\s+ange\s+referens",
         "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date",
-        "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda\s+senast|Tillhanda\s+senast|Due\s*date|Payment\s*due",
+        "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda(?:\s+senast)?|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
-        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
+        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms\s+totalt|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
-        "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
-        "gross_amount": r"Totalt?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Totalt",
+        "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalt\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
+        "gross_amount": r"Totalt?(?:\s+belopp)?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Totalt",
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
     }
@@ -580,6 +614,22 @@ def parse_invoice_pages(pages):
             companies.extend(invoice_seller_blocks(cells, page))
         order_lines, order_sources = invoice_order_lines(rows)
         order_pages.append({**page, "text": "\n".join(order_lines), "line_sources": order_sources})
+        for row in rows:
+            if not row:
+                continue
+            rate_match = re.fullmatch(r"(\d+(?:[,.]\d+)?)\s*%\s*MOMS", row[0]["text"], re.IGNORECASE)
+            amounts = [(cell, parse_invoice_money(cell["text"])) for cell in row[1:]]
+            amounts = [(cell, value) for cell, value in amounts if value is not None]
+            if rate_match and len(amounts) == 2:
+                rate = parse_decimal(rate_match.group(1))
+                (base_cell, taxable), (vat_cell, vat) = amounts
+                if (taxable * rate / 100).quantize(CENT, rounding=ROUND_HALF_UP) == vat:
+                    candidates["vat_amount"].append((decimal_text(vat), {
+                        "page": page.get("page", 1), "attachment_index": page.get("attachment_index", 0),
+                        "text": vat_cell["text"], "caption": row[0]["text"],
+                        "kind": "invoice_total", "priority": 3,
+                        "box": [vat_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                    }))
         if is_receipt:
             for row in rows:
                 for cell in row:
@@ -914,14 +964,20 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
     orders_by_key = {}
     warnings = []
     project_since_total = False
+    attachment = None
     for page in pages:
         source_name = str(page.get("source") or page.get("name") or "PDF")
+        page_attachment = (page.get("attachment_index", 0), source_name)
+        if attachment != page_attachment:
+            current_project = current_order = last_order_key = None
+            project_since_total = False
+            attachment = page_attachment
         page_number = int(page.get("page") or 1)
         for line_number, line in enumerate(str(page.get("text") or "").splitlines(), 1):
             project_match = project_pattern.search(line)
             if project_match:
                 new_project = project_match.group(1).strip()
-                if current_project and new_project.casefold() != current_project.casefold():
+                if current_project and normalize_object_marking(new_project) != normalize_object_marking(current_project):
                     if last_order_key is not None:
                         current_order = None
                     last_order_key = None
@@ -982,9 +1038,9 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
                 source.update(page["line_sources"][line_number - 1])
             project_since_total = False
             if current_order:
-                key = ("order", current_order.casefold(), (current_project or "").casefold())
+                key = (attachment, "order", current_order.casefold(), normalize_object_marking(current_project))
             else:
-                key = ("project-total", (current_project or "").casefold(), decimal_text(amount))
+                key = (attachment, "project-total", normalize_object_marking(current_project), decimal_text(amount))
             existing = orders_by_key.get(key)
             if existing is not None:
                 if existing["net_amount"] != decimal_text(amount):
@@ -1003,7 +1059,7 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
                 continue
             orders_by_key[key] = {
                 "order_id": current_order,
-                "project_code": current_project if current_project and re.fullmatch(r"[A-Za-z]*\d[\w./-]*", current_project) else None,
+                "project_code": current_project if current_project and re.fullmatch(r"[A-Za-z]*\s*\d[A-Za-z0-9 -]*", current_project) else None,
                 "original_marker": current_project,
                 "net_amount": decimal_text(amount),
                 "vat_amount": None,
@@ -1517,39 +1573,92 @@ def _normalize_match(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", value)
 
 
+def normalize_object_marking(value: str | None) -> str:
+    value = unicodedata.normalize("NFKD", value or "").casefold()
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    normalized = re.sub(r"[^a-z0-9]+", "", value)
+    return normalized[1:] if normalized.startswith("p") and normalized[1:].isdigit() else normalized
+
+
+def is_service_category(item: dict[str, Any]) -> bool:
+    if item.get("service_type"):
+        return True
+    name = str(item.get("name") or "")
+    marking = str(item.get("markning") or "")
+    return (name, marking) in {
+        ("Arbetstidsförkortning", "p1000"), ("Sjuk", "p1001"),
+        ("Semestertimmar", "p1002"),
+    } or marking == "p1004"
+
+
+def object_marking_matches(value: str | None, marking: str | None) -> bool:
+    if not re.fullmatch(r"\s*[A-Za-z]*\s*\d(?:[A-Za-z0-9 -]*[A-Za-z0-9])?\s*", str(value or "")):
+        return False
+    normalized = normalize_object_marking(marking)
+    if not normalized:
+        return False
+    alternatives = {normalized}
+    if normalized.startswith("p") and normalized[1:].isdigit():
+        alternatives.add(normalized[1:])
+    elif normalized.isdigit():
+        alternatives.add("p" + normalized)
+    for candidate in alternatives:
+        parts = [re.escape(character) for character in candidate]
+        pattern = r"[ -]*".join(parts)
+        if candidate.isdigit():
+            pattern = rf"(?:p[ -]*)?{pattern}"
+        if re.search(rf"(?<!\w){pattern}(?!\w)", str(value or ""), re.IGNORECASE):
+            return True
+    return False
+
+
 def match_objects(document_text: str, objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized_document = _normalize_match(document_text)
+    context_pattern = re.compile(
+        r"^\s*(?P<label>Märkn(?:ing)?|Markning|Märke/Ordnr\.?|Projekt(?:namn|\s*(?:nr\.?|nummer|kod|code))?|"
+        r"Proj\s*\.?\s*nr\.?|Project(?:\s*(?:reference|nr\.?|number|code))?|"
+        r"Er\s+referens|Your\s+reference|Kundreferens|"
+        r"Referens|Reference(?:\s*(?:nr\.?|no\.?))?|"
+        r"Order(?:\s*(?:nr\.?|no\.?|number|id|#))?|Ordernummer|Beställningsnr|Purchase\s+order)"
+        r"(?:\s*[:#]\s*|\s+)(?P<value>.*?)\s*$",
+        re.IGNORECASE,
+    )
+    contexts = []
+    for line in (document_text or "").splitlines():
+        match = context_pattern.match(line)
+        if match:
+            contexts.append((match.group("label"), match.group("value")))
     matches = []
     for item in objects:
+        if is_service_category(item):
+            continue
         candidates = []
         marking = str(item.get("markning") or "").strip()
-        if marking and marking not in {"*", "**", "***", "****"} and _normalize_match(marking) in normalized_document:
-            normalized_marking = _normalize_match(marking)
-            match_field = None
-            for line in (document_text or "").splitlines():
-                if normalized_marking not in _normalize_match(line):
-                    continue
-                field_match = re.match(r"\s*(Projekt|Märkn(?:ing)?|Markning|Er\s+referens|Project|Your\s+reference)\b", line, re.IGNORECASE)
-                if field_match:
-                    match_field = field_match.group(1)
+        if marking and marking not in {"*", "**", "***", "****"}:
+            for label, value in contexts:
+                if object_marking_matches(value, marking):
+                    candidates.append((100, f"Найдена маркировка {marking} в поле {label}"))
                     break
-            reason = (
-                f"Найден код {marking} в поле {match_field}"
-                if match_field else f"Найден код {marking} в тексте документа"
-            )
-            candidates.append((100, reason))
         for alias in item.get("aliases", []):
             alias_text = str(alias.get("alias") if isinstance(alias, dict) else alias)
             normalized_alias = _normalize_match(alias_text)
-            if len(normalized_alias) >= 4 and normalized_alias in normalized_document:
-                candidates.append((90, f"Найден альтернативный вариант названия: {alias_text}"))
+            if len(normalized_alias) >= 4 and any(
+                normalized_alias in _normalize_match(value) for _, value in contexts
+            ):
+                candidates.append((90, f"Найдена ссылка на объект: {alias_text}"))
         name = str(item.get("name") or "").strip()
         normalized_name = _normalize_match(name)
-        if len(normalized_name) >= 6 and normalized_name in normalized_document:
-            candidates.append((80, f"Найдено название объекта: {name}"))
+        if len(normalized_name) >= 6 and any(
+            normalized_name in _normalize_match(value) for _, value in contexts
+        ):
+            candidates.append((80, f"Название объекта указано в ссылке: {name}"))
         if candidates:
             best = max(candidates, key=lambda result: result[0])
-            matches.append({"object_id": item["id"], "name": name, "reason": best[1], "score": best[0]})
+            matches.append({
+                "object_id": item["id"], "name": name, "markning": marking,
+                "company": str(item.get("company") or ""),
+                "is_active": item.get("is_active", 1),
+                "reason": best[1], "score": best[0],
+            })
     return sorted(matches, key=lambda item: (-item["score"], item["name"].casefold()))
 
 

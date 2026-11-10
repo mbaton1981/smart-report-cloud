@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import test_incoming_integration as integration
 from document_costs import propose_object_allocations
+from expense_documents import match_objects, object_marking_matches, parse_project_order_allocations
 
 
 def fixture():
@@ -46,6 +47,70 @@ class ProposalTests(unittest.TestCase):
             result = propose_object_allocations(fixture(), objects)
             self.assertIsNone(result["parts"][2]["object_id"])
             self.assertTrue(result["parts"][2]["warning"])
+
+    def test_equivalent_markings_group_across_pages_but_remain_unassigned(self):
+        fields = fixture()
+        fields["order_proposals"][2]["project_code"] = "10-35"
+        fields["order_proposals"][2]["vat_items"][0]["page"] = 3
+        result = propose_object_allocations(fields, OBJECTS)
+        part = next(item for item in result["parts"] if item["marker"] == "P1035")
+        self.assertEqual(part["pages"], [2, 3])
+        self.assertEqual([option["id"] for option in part["object_options"]], [13])
+        self.assertIsNone(part["object_id"])
+
+    def test_markings_match_format_variants_only_in_labeled_context(self):
+        variants = ("P1039", "P10-39", "1039", "10-39")
+        self.assertTrue(all(object_marking_matches(value, "P1039") for value in variants))
+        objects = [{"id": 7, "name": "HOTEL", "markning": "P1039", "is_active": 1}]
+        for text in ("Project reference: P10-39", "Projekt 1039", "Order nr 10-39"):
+            self.assertEqual([item["object_id"] for item in match_objects(text, objects)], [7])
+        for text in ("Invoice number: 1039", "Article number: P1039", "Total: 1039"):
+            self.assertEqual(match_objects(text, objects), [])
+        for text in ("Reference: 10.39", "Order nr: 1039.00", "Project: 10/39"):
+            self.assertEqual(match_objects(text, objects), [])
+
+    def test_ambiguous_context_returns_all_candidates_without_assigning(self):
+        fields = fixture()
+        fields["order_proposals"] = [dict(fields["order_proposals"][0], project_code="P10-22")]
+        fields["net_amount"] = "473.86"
+        fields["vat_amount"] = "118.47"
+        fields["rounding_amount"] = "0.00"
+        result = propose_object_allocations(fields, [OBJECTS[0], {**OBJECTS[0], "id": 99}])
+        self.assertIsNone(result["parts"][0]["object_id"])
+        self.assertEqual({item["id"] for item in result["parts"][0]["object_options"]}, {5, 99})
+
+    def test_service_categories_are_not_suggested_as_projects(self):
+        objects = [*OBJECTS, {
+            "id": 15, "name": "Custom category", "markning": "P1027",
+            "service_type": "atf", "is_active": 1,
+        }]
+        part = propose_object_allocations(fixture(), objects)["parts"][2]
+        self.assertEqual([item["id"] for item in part["object_options"]], [12])
+        self.assertIsNone(part["object_id"])
+
+    def test_unmarked_order_remains_separate_without_discarding_other_proposals(self):
+        fields = fixture()
+        fields["order_proposals"][1]["project_code"] = "."
+        result = propose_object_allocations(fields, OBJECTS)
+        self.assertFalse(result["errors"])
+        part = next(part for part in result["parts"] if part["marker"] == "")
+        self.assertEqual(part["orders"], ["1"])
+        self.assertEqual(part["object_options"], [])
+        self.assertIsNone(part["object_id"])
+
+    def test_project_context_continues_between_pages_but_not_attachments(self):
+        parsed = parse_project_order_allocations([
+            {"page": 1, "source": "first.pdf", "attachment_index": 0,
+             "text": "Order nr: A1\nProj.nr.: P 10-39"},
+            {"page": 2, "source": "first.pdf", "attachment_index": 0,
+             "text": "Summa order: 100,00\nMoms order: 25,00"},
+            {"page": 1, "source": "second.pdf", "attachment_index": 1,
+             "text": "Order nr: A1\nSumma order: 200,00\nMoms order: 50,00"},
+        ])
+        self.assertEqual(len(parsed["orders"]), 2)
+        self.assertEqual(parsed["orders"][0]["project_code"], "P 10-39")
+        self.assertEqual(parsed["orders"][0]["sources"][0]["page"], 2)
+        self.assertIsNone(parsed["orders"][1]["project_code"])
 
     def test_ambiguous_or_incomplete_items_do_not_make_valid_proposal(self):
         for key, value in (("ambiguous", True), ("vat_amount", "1.00"), ("vat_items", [])):
@@ -91,7 +156,14 @@ class ProposalIntegrationTests(unittest.TestCase):
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
             window.apply_proposal_button.click()
         self.assertEqual(window.allocations.rowCount(), 3)
-        self.assertIn("Объект неактивен", window.allocations.cellWidget(2, 0).currentText())
+        self.assertTrue(all(window.allocations.cellWidget(row, 0).currentData() == "unselected"
+                            for row in range(window.allocations.rowCount())))
+        window.show_archived_objects.setChecked(True)
+        for row, obj in enumerate(objects):
+            combo = window.allocations.cellWidget(row, 0)
+            self.assertGreaterEqual(combo.findData(obj["id"]), 0)
+            combo.setCurrentIndex(combo.findData(obj["id"]))
+        self.assertIn("[Архив]", window.allocations.cellWidget(2, 0).currentText())
         window.checked.setChecked(True)
         self.assertIsNone(self.store.card(document_id))
         self.assertEqual(self.store.latest(document_id)[0], 0)
@@ -144,3 +216,18 @@ class ProposalIntegrationTests(unittest.TestCase):
             window.apply_proposal_button.click()
         self.assertEqual(window.allocations.rowCount(), 1)
         self.assertEqual(self.store.latest(document_id), before)
+
+    def test_saved_archived_assignment_survives_reopen_and_filter_changes(self):
+        window, document_id, objects = self.prepare()
+        archived = objects[2]
+        window.add_allocation({"object_id": archived["id"], "gross_amount": "5286.00"})
+        self.assertTrue(window.save_edits())
+        window.select_document()
+        combo = window.allocations.cellWidget(0, 0)
+        self.assertEqual(combo.currentData(), archived["id"])
+        self.assertIn("[Архив]", combo.currentText())
+        window.show_archived_objects.setChecked(True)
+        self.assertEqual(combo.currentData(), archived["id"])
+        window.show_archived_objects.setChecked(False)
+        self.assertEqual(combo.currentData(), archived["id"])
+        self.assertIn("[Архив]", combo.currentText())

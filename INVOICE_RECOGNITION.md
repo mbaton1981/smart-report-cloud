@@ -1326,3 +1326,41 @@ The entry is enabled in this release; set `SMARTREPORT_INCOMING_DOCUMENTS=0`
 to hide it for rollback. Roll back the executable without restoring an old
 database over newer operations. Preserve the incoming sidecar, PDFs and pending
 ordinary outbox. Mail/Cron remain off until a user explicitly retrieves mail.
+
+# Object selection and marking normalization
+
+Object marking variants such as `P1039`, `P10-39`, `1039` and `10-39` are
+normalized for comparison only; the catalog's original marking is displayed
+and never rewritten. Matching is restricted to explicit marking, project,
+reference or order fields. A match produces review options, not an assignment.
+New allocation rows remain unselected until the user chooses an object.
+
+Allocation selectors search by name or marking and show active construction
+objects by default. `Показать архивные` adds archived objects with an
+`[Архив]` label; a previously saved archived assignment stays visible when the
+filter is off. Duplicate names include the company, service categories are
+excluded, and `Общие расходы фирмы` remains a separate destination. Forwarded
+MIME messages are traversed for their actual supported attachments; the
+forwarder's body and signature are not treated as an invoice attachment.
+
+The order context continues across pages of one attachment, not across
+attachments. An unmarked order with independently verified item net/VAT remains
+a separate unassigned part; it does not discard proposals for the other orders.
+Only the explicitly stated rounding is apportioned, without changing net/VAT.
+Search text never stands in for a selected object ID, and a deferred catalog
+refresh retains the selection made while its popup was open.
+
+Issuer selection uses the seller's address and aligned registration/VAT block,
+not the first company address. Fiscal captions also support `Totalt belopp
+exkl/inkl moms`, `OCR nummer`, `Oss tillhanda`, and a rate/base/VAT summary
+whose arithmetic is checked. An exact `Orderbekräftelse` heading is checked
+through the first-page header rather than only the first 15 text lines.
+Such a document remains an order confirmation, not a payable invoice.
+
+An explicitly authorized automatic-only refresh is available through
+`IncomingStore.record_recognition(..., replace_automatic=True)`. It refuses
+manual revisions, checked/allocated drafts, accounted documents and failed
+recognition. Prior automatic fields and payload are retained in
+`source_json.recognition_history`; original intake/result, bytes, hash and ID
+are unchanged. Ordinary retry still only fills missing fields and explains
+conflicts. This is not a mass-reprocessing or automatic-confirmation feature.
