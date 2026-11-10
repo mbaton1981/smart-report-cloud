@@ -78,6 +78,10 @@ class CatalogSyncTests(unittest.TestCase):
         self._add_company("Renatur")
 
     def tearDown(self):
+        from PyQt6.QtCore import QThreadPool
+
+        self.assertTrue(QThreadPool.globalInstance().waitForDone(10000),
+                        "Background catalog reads must finish before deleting their database")
         self._case.cleanup()
 
     def _wait_for_employee_status(self, window, timeout=3):
