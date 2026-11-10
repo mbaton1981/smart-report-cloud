@@ -228,11 +228,11 @@ class MailTrialTests(unittest.TestCase):
             table = dialog.findChild(ReportTable, "invoiceAllocations")
             self.assertEqual(table.rowCount(), 5)
             self.assertEqual([table.cellWidget(i, 3).currentData() for i in range(5)],
-                             [101, None, None, 102, None])
+                             [None, None, None, None, None])
             self.assertFalse(dialog.findChild(QPushButton, "invoiceConfirm").isEnabled())
-            for i in (1, 2):
+            for i, object_id in enumerate((101, 103, 104, 102)):
                 combo = table.cellWidget(i, 3)
-                combo.setCurrentIndex(combo.findData(103 if i == 1 else 104))
+                combo.setCurrentIndex(combo.findData(object_id))
                 dest = table.cellWidget(i, 2)
                 dest.setCurrentIndex(dest.findData("object"))
             # Use the existing company destination and category editor.
@@ -285,6 +285,12 @@ class MailTrialTests(unittest.TestCase):
         viewer = MailViewer(self.root)
         def edit(dialog):
             table = dialog.findChild(ReportTable, "invoiceAllocations")
+            self.assertTrue(all(table.cellWidget(i, 3).currentData() is None
+                                for i in range(table.rowCount())))
+            combo = table.cellWidget(0, 3)
+            combo.setCurrentIndex(combo.findData(101))
+            destination = table.cellWidget(0, 2)
+            destination.setCurrentIndex(destination.findData("object"))
             table.item(0, 1).setText("19.00")
             destination = table.cellWidget(3, 2)
             destination.setCurrentIndex(destination.findData("unselected"))
