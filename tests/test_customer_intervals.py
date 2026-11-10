@@ -201,6 +201,43 @@ class IntervalServerTests(unittest.TestCase):
     _add_company = transport.OBTransportTests._add_company
     records = transport.OBTransportTests.records
 
+    def test_simple_worker_form_legacy_hours_edit_and_retained_detailed_intervals(self):
+        from pathlib import Path
+        markup = (Path(self.server.__file__).parent / "templates" / "index.html").read_text(encoding="utf-8")
+        for removed in ("timeEditors", "createTimeEditor", "Рассчитать часы", "time-facts-fields"):
+            self.assertNotIn(removed, markup)
+        self.assertIn('OB/сверхурочные</option>', markup)
+        payload = dict(request_id="simple-hours", date="2026-10-21", employee="Travel Test",
+                       company="Renatur", object_name="Travel A", submission_type="work", hours=4, transport=1)
+        response = self.server_client.post("/submit-shift", json=payload)
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertTrue(self.server_client.post("/submit-shift", json=payload).get_json()["idempotent"])
+        row = self.records()[0]
+        self.assertIsNone(row["time_facts"])
+        response = self.server_client.post("/edit-shift", json=dict(
+            sync_id=row["sync_id"], operation_id="simple-edit", version=row["version"], hours=5))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self.records()[0]["hours"], 5)
+        payload.update(request_id="retained-details", date="2026-10-22", time_facts=facts())
+        self.assertEqual(self.server_client.post("/submit-shift", json=payload).status_code, 201)
+        row = self.records()[-1]
+        original_facts = row["time_facts"]
+        response = self.server_client.post("/edit-shift", json=dict(
+            sync_id=row["sync_id"], operation_id="simple-comment", version=row["version"],
+            hours=4, transport=0, comment="simple form preserves details"))
+        self.assertEqual(response.status_code, 200, response.get_json())
+        row = self.records()[-1]
+        self.assertEqual(row["time_facts"], original_facts)
+        self.assertEqual(row["hours"], 4)
+        self.assertEqual(row["transport"], 0)
+        for changes in (dict(hours=3), dict(date="2026-10-23"), dict(submission_type="ob")):
+            response = self.server_client.post("/edit-shift", json=dict(
+                sync_id=row["sync_id"], operation_id="unsafe-simple-edit", version=row["version"], **changes))
+            self.assertEqual(response.status_code, 400, response.get_json())
+            self.assertIn("десктопе", response.get_json()["error"])
+            self.assertEqual(self.records()[-1]["time_facts"], original_facts)
+            self.assertEqual(self.records()[-1]["hours"], 4)
+
     def test_customer_terms_reject_different_dataset_before_any_write(self):
         from sync_dataset import HEADER
         with patch("sync_dataset.file_dataset", return_value="prepared-dataset"):

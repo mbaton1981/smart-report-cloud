@@ -3315,6 +3315,11 @@ def edit_shift():
         company = str(data.get('company', existing['company'])).strip()
         object_name = str(data.get('object_name', existing['object_name'])).strip()
         validate_submission_object(cursor, submission_type, company, object_name)
+        if existing["time_facts"] and "time_facts" not in data and (
+            date_val != existing["date"] or submission_type != existing["submission_type"]
+        ):
+            raise ValueError("Для этой записи сохранены подробные интервалы. "
+                             "Изменение даты или вида работы уточните у администратора в десктопе.")
         if submission_type == "ob":
             if not ob_schema_ready(cursor):
                 conn.rollback()
@@ -3335,8 +3340,12 @@ def edit_shift():
             transport = submission_transport(data.get("transport", existing["transport"]), submission_type)
         else:
             retained_facts = data.get("time_facts", existing["time_facts"])
-            hours = (customer_intervals.paid_hours(retained_facts, date_val)
-                     if submission_type == "work" and retained_facts else float(data.get('hours', existing['hours'])))
+            hours = (customer_intervals.paid_hours(data["time_facts"], date_val)
+                     if submission_type == "work" and data.get("time_facts")
+                     else float(data.get('hours', existing['hours'])))
+            if existing["time_facts"] and "time_facts" not in data and hours != existing["hours"]:
+                raise ValueError("Для этой записи сохранены подробные интервалы. "
+                                 "Изменение часов уточните у администратора в десктопе; интервалы сохранены.")
             transport = round(float(data.get('transport', existing['transport'])), 2)
             if not (0 < hours <= 24) or (not retained_facts and (hours < 0.5 or hours % 0.5 != 0)) or not (0 <= transport <= 10000):
                 raise ValueError("Часы или транспорт вне допустимого диапазона.")
