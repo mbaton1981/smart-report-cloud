@@ -2654,6 +2654,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.load_expense_documents()
             if self.exp_document_tabs.currentIndex() == 1:
                 self.load_object_expense_overview()
+        elif index == 5:
+            self.load_objects_table()
         elif index == 6:
             self.load_service_categories_table()
 

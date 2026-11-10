@@ -126,6 +126,13 @@ class IntervalDesktopTests(unittest.TestCase):
         self.conn.commit()
         return identifier
 
+    def test_opening_objects_tab_loads_catalog_for_customer_terms(self):
+        with patch.object(self.window, "load_dropdowns") as dropdowns, \
+                patch.object(self.window, "load_objects_table") as catalog:
+            self.window.on_tab_changed(5)
+        dropdowns.assert_called_once_with(refresh_tables=False)
+        catalog.assert_called_once_with()
+
     def test_report_close_reopen_snapshot_and_no_payroll_double_count(self):
         identifier = self.prepared("ob")
         salary_before = list(map(tuple, self.conn.execute("SELECT * FROM ob_segments")))
