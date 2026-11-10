@@ -79,6 +79,18 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Выберите объект для этой части.")
             cleaned["allocations"].append({"destination": destination, "object_id": object_id,
                                            "gross_amount": decimal_text(amount)})
+            for key in ("net_amount", "vat_amount", "rounding_amount"):
+                if key in part:
+                    value = parse_invoice_money(part[key])
+                    if part[key] not in (None, "") and (value is None or not value.is_finite()):
+                        raise ReviewError("Некорректная сумма net, НДС или округления части.")
+                    cleaned["allocations"][-1][key] = decimal_text(value)
+            saved = cleaned["allocations"][-1]
+            if all(saved.get(key) is not None for key in ("net_amount", "vat_amount", "gross_amount")):
+                net, vat = (parse_invoice_money(saved[key]) for key in ("net_amount", "vat_amount"))
+                rounding = parse_invoice_money(saved.get("rounding_amount")) or 0
+                if net + vat + rounding != amount:
+                    raise ReviewError("Net + НДС + отдельное округление части не совпадают с её итогом.")
         cleaned["object_id"] = (cleaned["allocations"][0]["object_id"]
                                 if len(cleaned["allocations"]) == 1 else None)
         if payload.get("server_version") is not None:
@@ -106,7 +118,9 @@ class IncomingStore(OfflineReviewStore):
                 payload["allocations"] = [{"destination": row.get("destination") or
                                            ("object" if row.get("object_id") is not None else "company"),
                                            "object_id": row.get("object_id"),
-                                           "gross_amount": row.get("gross_amount")}
+                                           "gross_amount": row.get("gross_amount"),
+                                           **{key: row[key] for key in ("net_amount", "vat_amount", "rounding_amount")
+                                              if key in row}}
                                           for row in existing.get("allocations", [])]
                 payload["object_id"] = (payload["allocations"][0]["object_id"]
                                         if len(payload["allocations"]) == 1 else None)

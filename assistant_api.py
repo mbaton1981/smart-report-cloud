@@ -2754,6 +2754,17 @@ def register_assistant(app, connect, authenticate):
         return handle(lambda conn, actor: jsonify(ok=True, translations=translate_descriptions(
             conn, actor, request.get_json(silent=True))))
 
+    @app.route("/api/assistant/invoice-layout", methods=["POST"])
+    def assistant_invoice_layout():
+        from invoice_layout_ai import request_selection
+        def action(conn, actor):
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict) or set(payload) != {"layout", "operation_id"}:
+                raise AssistantError("Нужны обезличенный макет и идентификатор операции.")
+            selection = request_selection(conn, actor, payload["layout"], payload["operation_id"])
+            return jsonify(ok=True, selection=selection)
+        return handle(action)
+
     @app.route("/api/assistant/audit", methods=["GET"])
     def assistant_audit():
         def action(conn, actor):

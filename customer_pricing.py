@@ -4,6 +4,7 @@ import json
 import math
 from fixed_pricing import parse_fixed, report_agreements, validate_fixed_storage
 import payroll_history
+import customer_intervals
 
 
 CATALOG_PRICE_SOURCE = "Цены справочника объекта (применены пользователем)"
@@ -39,7 +40,7 @@ def new_shift_pricing(cursor, table, row, *, manual_base=None):
             source="Ручной ввод клиентской цены при создании записи",
             confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat(),
         )
-    return quote
+    return customer_intervals.attach_terms(cursor, row, quote)
 
 
 def catalog_price_preview(rows, base, travel):
@@ -108,6 +109,7 @@ def ensure_pricing_schema(cursor, table):
             changed_at TEXT NOT NULL
         )
     """)
+    customer_intervals.ensure_schema(cursor, table)
 
 
 def checked_rate(value):
@@ -159,6 +161,19 @@ def parse_pricing(value, row):
     }
     if value.get("fixed") is not None:
         result["fixed"] = parse_fixed(value["fixed"], dict(row))
+    if "interval_terms" in value:
+        saved = value["interval_terms"]
+        if (not isinstance(saved, dict) or not isinstance(saved.get("id"), str)
+                or not saved["id"] or type(saved.get("revision")) is not int or saved["revision"] < 1):
+            raise ValueError("Некорректная версия клиентских условий.")
+        conditions = customer_intervals.terms(saved.get("conditions"))
+        if conditions["effective_from"] > row["date"]:
+            raise ValueError("Клиентские условия не действовали на дату записи.")
+        result["interval_terms"] = {"id": saved["id"], "revision": saved["revision"], "conditions": conditions}
+    if "interval_calculation" in value:
+        if "interval_terms" not in result:
+            raise ValueError("Расчёт без версии клиентских условий запрещён.")
+        result["interval_calculation"] = customer_intervals.validate_calculation(value["interval_calculation"], dict(row), result)
     return result
 
 
@@ -276,6 +291,19 @@ def require_final_prices(row, segments):
     prices = row_prices(row)
     fixed = prices.get("fixed")
     extra = fixed["members"][row["sync_id"]]["extra"] if fixed else dict.fromkeys(("base", "ob", "travel"), True)
+    if prices.get("interval_terms") or row.get("time_facts"):
+        parts = customer_intervals.calculated_row(row, prices)
+        if prices.get("interval_calculation") and parts != customer_intervals.calculate(
+                row.get("time_facts"), row["date"], prices["base"], prices["interval_terms"]["conditions"]):
+            raise ValueError("Сохранённый расчёт не соответствует подтверждённой версии условий.")
+        unknown = [f"{part['start']} — {part['end']} ({part['mode']}/{part['day']})"
+                   for part in parts if (extra["base"] and part["base_amount"] is None)
+                   or (extra["ob"] and part["premium_amount"] is None)]
+        if unknown:
+            raise ValueError("Клиентские условия не заданы: " + "; ".join(unknown))
+        if extra["travel"] and row.get("transport") and prices["travel"] is None:
+            raise ValueError("Не подтверждена историческая клиентская цена транспорта.")
+        return
     missing = []
     if extra["base"] and prices["base"] is None:
         missing.append("работа")
@@ -310,6 +338,7 @@ def agreed_prices_for_date(cursor, table, row, *, reject_conflicts=False):
         if raw.get("fixed") or raw.get("source") in (CATALOG_PRICE_SOURCE, NEW_SHIFT_PRICE_SOURCE):
             continue
         if raw["date_from"] <= row["date"] <= raw["date_to"]:
+            raw.pop("interval_calculation", None)
             matches.add(pricing_json(raw, row))
     prices = {
         json.dumps({key: json.loads(value)[key] for key in ("base", "travel", "ob")}, sort_keys=True)

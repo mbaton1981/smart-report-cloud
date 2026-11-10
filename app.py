@@ -43,6 +43,8 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
+import customer_intervals
+from customer_intervals_desktop import CustomerIntervalsMixin, cache_terms
 from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, checked_rate, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing, reopen_invoiced_shifts
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
@@ -1743,6 +1745,7 @@ def shift_payload(row):
         "record_type": row['entry_type'] if 'entry_type' in row.keys() else RECORD_TYPE_WORK,
         "invoiced": row['invoiced'] or 0,
         "customer_pricing": row["customer_pricing"] if "customer_pricing" in row.keys() else None,
+        "time_facts": row["time_facts"] if "time_facts" in row.keys() else None,
     }
     if payload["record_type"] == RECORD_TYPE_OB:
         payload.update({
@@ -2529,7 +2532,7 @@ def create_half_hour_time_field(default_time):
     return field
 
 
-class SmartReportApp(QMainWindow):
+class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self._expense_temp_directory = tempfile.TemporaryDirectory(prefix="smartreport_expenses_")
@@ -2704,6 +2707,16 @@ class SmartReportApp(QMainWindow):
         self.record_type_status_lbl.setWordWrap(True)
         card_layout.addRow(self.record_type_status_lbl)
         card_layout.addRow("Часы:", self.hours_input)
+        new_time_row = QHBoxLayout()
+        new_time_button = QPushButton("Начало, конец, перерывы и режим…")
+        new_time_button.clicked.connect(self.prepare_new_time_facts)
+        new_time_row.addWidget(new_time_button)
+        clear_time_button = QPushButton("Только часы")
+        clear_time_button.clicked.connect(self.clear_new_time_facts)
+        new_time_row.addWidget(clear_time_button)
+        card_layout.addRow(new_time_row)
+        self.new_time_status = QLabel("Только часы; фактические интервалы не заданы.")
+        card_layout.addRow(self.new_time_status)
         card_layout.addRow("Клиентская ставка (SEK/ч):", self.rate_input)
         card_layout.addRow("Транспорт (0 или 1):", self.trans_input)
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
@@ -2761,6 +2774,9 @@ class SmartReportApp(QMainWindow):
         btn_row.addWidget(refresh_shifts_btn)
         btn_row.addWidget(sync_cloud_btn)
         btn_row.addWidget(edit_shift_btn)
+        edit_time_btn = QPushButton("Время и режим…")
+        edit_time_btn.clicked.connect(lambda: self.edit_time_facts())
+        btn_row.addWidget(edit_time_btn)
         btn_row.addWidget(self.reopen_shift_btn)
         btn_row.addStretch()
         btn_row.addWidget(del_shift_btn)
@@ -3113,6 +3129,9 @@ class SmartReportApp(QMainWindow):
                      sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache))
+        if "time_facts" in shift:
+            ensure_pricing_schema(cursor, "shifts")
+            customer_intervals.store_time(cursor, "shifts", sync_id, shift["time_facts"], from_sync=True, previous_row=local)
         if "customer_pricing" in shift:
             ensure_pricing_schema(cursor, "shifts")
             store_pricing(cursor, "shifts", sync_id, shift["customer_pricing"], from_sync=True)
@@ -3512,6 +3531,7 @@ class SmartReportApp(QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            cache_terms(cursor, pulled.get("customer_terms", []))
             blocked_ob_sequences = []
             for shift in pulled.get('changes', []):
                 remote_type = shift.get('record_type', shift.get('submission_type', RECORD_TYPE_WORK))
@@ -8508,8 +8528,11 @@ class SmartReportApp(QMainWindow):
             )
             for column, value in enumerate(values):
                 self.object_expenses_table.setItem(row_index, column, QTableWidgetItem(str(value)))
-            self.object_expenses_table.item(row_index, 4).setToolTip(
-                f"Без НДС: {allocated_net:,.2f} {currency}" if allocated_net is not None else "Сумма без НДС неизвестна")
+            rounding = (allocated_gross - allocated_net - allocated_vat
+                        if all(value is not None for value in (allocated_gross, allocated_net, allocated_vat)) else None)
+            self.object_expenses_table.item(row_index, 4).setToolTip("\n".join(
+                f"{label}: {f'{value:,.2f} {currency}' if value is not None else 'Неизвестно'}"
+                for label, value in (("Без НДС", allocated_net), ("НДС", allocated_vat), ("Отдельное округление", rounding))))
             self.object_expenses_table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
 
     def _store_expense_originals(self, paths, client_id):
@@ -9091,7 +9114,7 @@ class SmartReportApp(QMainWindow):
             ):
                 widget.setEnabled(False)
 
-        def append_allocation(object_id, allocated_gross, allocated_vat):
+        def append_allocation(object_id, allocated_gross, allocated_vat, original=None):
             row = split_table.rowCount()
             split_table.insertRow(row)
             object_combo = ObjectPickerComboBox()
@@ -9101,13 +9124,18 @@ class SmartReportApp(QMainWindow):
             object_combos.append(object_combo)
             split_table.setCellWidget(row, 0, object_combo)
             split_table.setItem(row, 1, QTableWidgetItem(str(allocated_gross or "")))
+            split_table.item(row, 1).setData(Qt.ItemDataRole.UserRole, original)
             split_table.setItem(row, 2, QTableWidgetItem(str(allocated_vat) if allocated_vat is not None else ""))
 
         def update_net_preview(*_):
             gross = parse_decimal(gross_amount.text())
             vat = parse_decimal(vat_amount.text())
+            original_unchanged = (
+                gross == parse_decimal(document.get("gross_amount"))
+                and vat == parse_decimal(document.get("vat_amount")))
+            known_net = parse_decimal(document.get("net_amount")) if original_unchanged else None
             net_preview.setText(
-                f"{gross - vat:,.2f} {currency.currentText()}"
+                f"{known_net if known_net is not None else gross - vat:,.2f} {currency.currentText()}"
                 if gross is not None and vat is not None else "Неизвестно"
             )
             if not split_check.isChecked():
@@ -9131,7 +9159,7 @@ class SmartReportApp(QMainWindow):
                         selected = allocation.get("object_id")
                         if selected is None and allocation.get("company_expense"):
                             selected = "company"
-                        append_allocation(selected, allocation.get("gross_amount"), allocation.get("vat_amount"))
+                        append_allocation(selected, allocation.get("gross_amount"), allocation.get("vat_amount"), allocation)
                 else:
                     selected = single_object.currentData()
                     append_allocation(selected, gross_amount.text(), vat_amount.text())
@@ -9222,6 +9250,12 @@ class SmartReportApp(QMainWindow):
                     "gross_amount": decimal_text(row_gross),
                     "vat_amount": decimal_text(row_vat),
                 })
+                old_part = split_table.item(row, 1).data(Qt.ItemDataRole.UserRole)
+                if (old_part and row_gross == parse_decimal(old_part.get("gross_amount"))
+                        and row_vat == parse_decimal(old_part.get("vat_amount"))):
+                    for key in ("net_amount", "rounding_amount"):
+                        if old_part.get(key) is not None:
+                            allocations[-1][key] = old_part[key]
         elif gross is not None:
             selected = single_object.currentData()
             if selected != "unselected":
@@ -9253,6 +9287,18 @@ class SmartReportApp(QMainWindow):
         }
         if object_cost:
             payload["cost_operation_id"] = uuid.uuid4().hex
+        if (gross == parse_decimal(document.get("gross_amount"))
+                and vat == parse_decimal(document.get("vat_amount"))):
+            for key in ("net_amount", "rounding_amount"):
+                if document.get(key) is not None:
+                    payload[key] = document[key]
+            if len(allocations) == 1 and len(existing_allocations) == 1:
+                old_part = existing_allocations[0]
+                if (parse_decimal(allocations[0]["gross_amount"]) == parse_decimal(old_part.get("gross_amount"))
+                        and parse_decimal(allocations[0]["vat_amount"]) == parse_decimal(old_part.get("vat_amount"))):
+                    for key in ("net_amount", "rounding_amount"):
+                        if old_part.get(key) is not None:
+                            allocations[0][key] = old_part[key]
         known_hashes = [item["sha256"] for item in document.get("attachments") or [] if item.get("sha256")]
         if known_hashes:
             payload["required_attachment_sha256"] = known_hashes
@@ -9649,6 +9695,8 @@ class SmartReportApp(QMainWindow):
             ("Fast pris: работы и дополнения…", self.configure_fast_pris),
             ("Клиентские цены выбранного периода…", self.confirm_customer_prices),
             ("Применить цены справочника…", self.preview_catalog_prices),
+            ("Предпросмотр условий для открытых записей…", self.preview_customer_terms),
+            ("Клиентский расчёт по интервалам…", self.customer_interval_breakdown),
         ):
             action = actions_menu.addAction(label)
             action.triggered.connect(lambda _checked=False, handler=callback: handler())
@@ -10730,8 +10778,12 @@ class SmartReportApp(QMainWindow):
                     raise ValueError("Сначала дождитесь ответа сервера на запрос удаления записи.")
             for row in changed:
                 fixed = allocations.get(row["sync_id"])
-                if closed and fixed:
-                    store_pricing(cursor, "shifts", row["sync_id"], fixed_quote(row, fixed))
+                if closed:
+                    quote = fixed_quote(row, fixed) if fixed else row_prices(row)
+                    if quote.get("interval_terms"):
+                        quote["interval_calculation"] = customer_intervals.calculated_row(row, quote)
+                    if fixed or quote.get("interval_terms"):
+                        store_pricing(cursor, "shifts", row["sync_id"], quote)
             if not closed:
                 reopen_invoiced_shifts(cursor, "shifts", selected)
             ids = tuple(row["id"] for row in changed)
@@ -11106,6 +11158,10 @@ class SmartReportApp(QMainWindow):
         self.object_detail_meta.setWordWrap(True)
         detail_layout.addWidget(self.object_detail_title)
         detail_layout.addWidget(self.object_detail_meta)
+        customer_terms_button = QPushButton("Клиентские доплаты")
+        customer_terms_button.setObjectName("customerTermsButton")
+        customer_terms_button.clicked.connect(self.customer_terms_dialog)
+        detail_layout.addWidget(customer_terms_button)
 
         period_row = QHBoxLayout()
         self.object_all_period = QCheckBox("За весь объект")
@@ -13247,6 +13303,17 @@ class SmartReportApp(QMainWindow):
             return
 
         quote = None
+        facts = None
+        try:
+            supplied_facts = getattr(self, "__dict__", {}).get("_new_time_facts")
+            if supplied_facts is not None:
+                if record_type != RECORD_TYPE_WORK:
+                    raise ValueError("Для фактического времени выберите «Работа» или явно нажмите «Только часы».")
+                facts = customer_intervals.time_facts(supplied_facts, date, hours_val)
+        except ValueError as error:
+            conn.close()
+            QMessageBox.warning(self, "Фактическое время", str(error))
+            return
         if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
             try:
                 quote = new_shift_pricing(cursor, "shifts", {
@@ -13277,6 +13344,8 @@ class SmartReportApp(QMainWindow):
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
         if quote:
             store_pricing(cursor, "shifts", sync_id, quote)
+        if facts is not None:
+            customer_intervals.store_time(cursor, "shifts", sync_id, facts)
         payload = {
             "date": date, "employee": emp, "company": comp, "object_name": obj_name,
             "hours": hours_val, "rate": rate_val, "transport": trans_val,
@@ -13290,9 +13359,12 @@ class SmartReportApp(QMainWindow):
         payload["customer_pricing"] = cursor.execute(
             "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)
         ).fetchone()[0]
+        payload["time_facts"] = facts
         enqueue_shift_operation(cursor, sync_id, 'upsert', 0, payload)
         conn.commit()
         conn.close()
+        if facts is not None:
+            self.clear_new_time_facts()
         
         if record_type in (
             RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_VACATION, RECORD_TYPE_HOLIDAY,
@@ -14018,6 +14090,11 @@ class SmartReportApp(QMainWindow):
                 replace_ob_segments(cursor, sync_id, ob_result["segments"])
             elif not preserve_ob and ob_schema_ready(cursor) and shift['entry_type'] == RECORD_TYPE_OB:
                 cursor.execute("DELETE FROM ob_segments WHERE shift_id = ?", (sync_id,))
+            facts = customer_intervals.time_facts(
+                shift["time_facts"] if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else None,
+                payload["date"], payload["hours"])
+            customer_intervals.store_time(cursor, "shifts", sync_id, facts, previous_row=shift)
+            payload["time_facts"] = facts
             base_price = rate_field.value() if rate_field.value() >= 0 else None
             ob_prices = dict(client_prices["ob"])
             if record_type == RECORD_TYPE_OB:
@@ -14043,6 +14120,7 @@ class SmartReportApp(QMainWindow):
                     source="Ручное изменение клиентской цены записи",
                     confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat(),
                 )
+                quote.pop("interval_calculation", None)
                 store_pricing(cursor, "shifts", sync_id, quote)
             payload["customer_pricing"] = cursor.execute(
                 "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)

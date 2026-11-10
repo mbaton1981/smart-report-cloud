@@ -1,5 +1,31 @@
 # Invoice Recognition and Net Allocations
 
+## Missing-field AI fallback and saved gross-allocation VAT — 1.0.54
+
+The normal local parser/OCR remains first. When required invoice fields are
+missing, the existing authenticated assistant connection can select evidence
+through `/api/assistant/invoice-layout`, using the existing server key, model,
+budget and request audit. Only opaque block IDs, page geometry and fixed public
+caption/type labels leave the server/client. Original text, files, company names,
+dates, invoice numbers and monetary values are not sent to the model.
+Returned IDs are resolved locally; caption/proximity, seller-versus-buyer and
+fiscal arithmetic checks remain mandatory. Unknown evidence stays unknown.
+Existing nonempty fields are not replaced and recognition never confirms costs.
+Documents without usable OCR text/coordinates remain an explicit manual review;
+this is not an image-understanding fallback. Provider failures are reported.
+
+The allocation-VAT endpoint now also supports existing gross-based object costs.
+It independently checks all original pages, invoice totals, item VAT and order
+markings, then matches only unique saved destinations/amounts. It fills fiscal
+details without changing original bytes, document ID, assignments or status.
+Separate rounding is preserved rather than being included in net. Existing
+fiscal values are protected unless replacement is explicitly requested.
+The source calculation and previous allocations are retained in processing audit.
+Gross-basis VAT enrichment does not replace the user's allocations with orders.
+Reopening/saving through incoming review, the expense editor or a legacy API
+client preserves unchanged known net/VAT/rounding. Unknown VAT is not inferred
+proportionally from the invoice total.
+
 ## Trio VVS summary and responsive incoming review — 1.0.17-rc1
 
 The retained four-page Trio VVS original contains a native-text fiscal summary

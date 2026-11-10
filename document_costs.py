@@ -95,6 +95,44 @@ def propose_object_allocations(fields, objects):
     return result
 
 
+def verified_saved_allocation_vat(pages, document, allocations, objects):
+    """Enrich an existing gross split only when original items reproduce it exactly."""
+    from expense_documents import allocation_vat_from_items, parse_invoice_pages, parse_project_order_allocations
+    fields = parse_invoice_pages(pages)
+    if fields.get("non_invoice_document_type") or fields.get("invoice_number") != document["invoice_number"]:
+        raise ValueError("Оригинал не подтверждает номер или тип фактуры.")
+    for key in ("net_amount", "vat_amount", "rounding_amount"):
+        if parse_invoice_money(fields.get(key)) != parse_invoice_money(document.get(key)):
+            raise ValueError("Оригинал не подтверждает " + key + "; автоматическое дополнение НДС отклонено.")
+    original_orders = parse_project_order_allocations(pages)
+    fields["order_proposals"] = allocation_vat_from_items(
+        pages, original_orders["orders"], fields["net_amount"], fields["vat_amount"])
+    fields["order_proposal_warnings"] = original_orders["warnings"]
+    # The item-level VAT check supersedes warnings about absent order-level VAT captions.
+    fields["order_proposal_warnings"] = [
+        warning for warning in fields["order_proposal_warnings"]
+        if not (warning.startswith("НДС для заказа ") and "не распознан" in warning)]
+    proposal = propose_object_allocations(fields, objects)
+    if proposal["errors"] or len(proposal["parts"]) != len(allocations):
+        raise ValueError("Позиции не воспроизводят сохранённые части: " + "; ".join(proposal["errors"]))
+    remaining = list(proposal["parts"])
+    result = []
+    for saved in allocations:
+        candidates = [part for part in remaining
+                      if len(part["object_options"]) == 1
+                      and part["object_options"][0]["id"] == saved["object_id"]
+                      and saved.get("destination", "object") == "object"
+                      and parse_invoice_money(part["gross_amount"]) == parse_invoice_money(saved["allocated_gross"])]
+        if len(candidates) != 1:
+            raise ValueError("Маркировка и сумма оригинала не подтверждают однозначно сохранённое назначение.")
+        part = candidates[0]
+        remaining.remove(part)
+        result.append({**part, "allocation_id": saved["id"]})
+    if sum((parse_invoice_money(p["gross_amount"]) for p in result), Decimal(0)) != parse_invoice_money(fields["amount_due"]):
+        raise ValueError("Итог частей не совпадает с суммой к оплате оригинала.")
+    return result, fields["order_proposals"]
+
+
 def extract_cost_fields(pages, fields):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     tax = non_invoice_document_type(text) == "tax_decision"

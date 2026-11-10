@@ -201,7 +201,7 @@
                         <option value="sick">Больничный</option>
                         <option value="vacation">Отпуск / Semestertimmar</option>
                         <option value="holiday">Красные дни / Röda dagar</option>
-                        <option value="ob">OB/сверхурочные</option>
+                        <option value="ob">Зарплатный OB (прежний ввод)</option>
                     </select>
                 </div>
 
@@ -217,6 +217,7 @@
                     <input type="number" step="0.5" id="hours" name="hours" value="8.0" required>
                 </div>
 
+                <div id="time-facts-fields"></div>
                 <div id="ob-fields" style="display:none;">
                     <div class="form-group">
                         <label>Время начала (Europe/Stockholm):</label>
@@ -313,12 +314,13 @@
                 <option value="sick">Больничный</option>
                 <option value="vacation">Отпуск / Semestertimmar</option>
                 <option value="holiday">Красные дни / Röda dagar</option>
-                <option value="ob">OB/сверхурочные</option>
+                <option value="ob">Зарплатный OB (прежний ввод)</option>
             </select>
             <label for="edit-object">Объект</label>
             <select id="edit-object" required></select>
             <label for="edit-hours">Часы</label>
             <input id="edit-hours" type="number" min="0.5" max="24" step="0.5" required>
+            <div id="edit-time-facts-fields"></div>
             <div id="edit-ob-fields" style="display:none;">
                 <label>Время начала (Europe/Stockholm)</label>
                 <div class="ob-time-control">
@@ -515,7 +517,8 @@
                         : (submissionType === 'vacation'
                             ? 'Отпускные часы:'
                             : (submissionType === 'holiday' ? 'Праздничные нерабочие часы:' : 'Отработано часов:'))));
-            document.getElementById('hours').readOnly = isOb;
+            document.getElementById('hours').readOnly = isOb || (submissionType === 'work' && timeEditors.main.enabled.checked);
+            timeEditors.main.container.style.display = submissionType === 'work' ? 'block' : 'none';
             document.getElementById('ob-fields').style.display = isOb ? 'block' : 'none';
             const transportCheck = document.getElementById('transport_check');
             transportCheck.checked = false;
@@ -570,6 +573,162 @@
         }
 
         initializeHalfHourTimeFields();
+
+        function createTimeEditor(containerId, edit) {
+            const container = document.getElementById(containerId);
+            function field(label, type) {
+                const wrapper = document.createElement('label');
+                wrapper.textContent = label;
+                const input = document.createElement('input');
+                input.type = type;
+                wrapper.appendChild(input);
+                container.appendChild(wrapper);
+                return input;
+            }
+            const enabled = field('Ввести по началу/окончанию (старые записи можно оставить в часах)', 'checkbox');
+            enabled.checked = !edit;
+            const start = field('Начало', 'time');
+            const end = field('Конец', 'time');
+            const nextDay = field('Окончание на следующий день', 'checkbox');
+            const modeLabel = document.createElement('label');
+            modeLabel.textContent = 'Режим работы';
+            const mode = document.createElement('select');
+            for (const [value, text] of [['normal', 'Обычная (в том числе вечером)'], ['all', 'Вся смена сверхурочная'], ['part', 'Часть смены сверхурочная']]) {
+                mode.add(new Option(text, value));
+            }
+            modeLabel.appendChild(mode);
+            container.appendChild(modeLabel);
+            const groups = {};
+            for (const [key, title] of [['breaks', 'Неоплачиваемые перерывы'], ['overtime', 'Сверхурочные части']]) {
+                const group = document.createElement('fieldset');
+                const legend = document.createElement('legend');
+                legend.textContent = title;
+                group.appendChild(legend);
+                const rows = document.createElement('div');
+                group.appendChild(rows);
+                function add(entry = {}) {
+                    const row = document.createElement('div');
+                    row.style.cssText = 'display:flex;gap:8px;align-items:center';
+                    for (const name of ['start', 'end']) {
+                        const input = document.createElement('input');
+                        input.type = 'time';
+                        input.value = entry[name] || '';
+                        input.setAttribute('aria-label', `${title}: ${name === 'start' ? 'начало' : 'конец'}`);
+                        row.appendChild(input);
+                    }
+                    const remove = document.createElement('button');
+                    remove.type = 'button';
+                    remove.textContent = 'Убрать';
+                    remove.onclick = () => {
+                        row.remove();
+                        container.dispatchEvent(new Event('change', {bubbles: true}));
+                    };
+                    row.appendChild(remove);
+                    rows.appendChild(row);
+                }
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.textContent = 'Добавить интервал';
+                button.onclick = () => {
+                    add();
+                    container.dispatchEvent(new Event('change', {bubbles: true}));
+                };
+                group.appendChild(button);
+                container.appendChild(group);
+                groups[key] = {group, rows, add};
+            }
+            const status = document.createElement('p');
+            status.setAttribute('role', 'status');
+            container.appendChild(status);
+            const preview = document.createElement('button');
+            preview.type = 'button';
+            preview.textContent = 'Рассчитать часы';
+            preview.onclick = async () => {
+                preview.disabled = true;
+                try {
+                    await previewTimeFacts(edit);
+                } catch (error) {
+                    status.textContent = error.message || 'Не удалось рассчитать время';
+                } finally {
+                    preview.disabled = !enabled.checked;
+                }
+            };
+            container.appendChild(preview);
+            const explanation = document.createElement('p');
+            explanation.textContent = 'Цены и проценты задаёт администратор. Вечер не означает переработку. Часы перерыва вычитаются один раз. Время следующего дня указывается обычными часами 00:00–23:59.';
+            container.appendChild(explanation);
+            function update() {
+                const on = enabled.checked;
+                preview.disabled = !on;
+                for (const element of [start, end, nextDay, mode]) element.disabled = !on;
+                groups.overtime.group.style.display = on && mode.value === 'part' ? 'block' : 'none';
+                groups.breaks.group.style.display = on ? 'block' : 'none';
+                const type = document.getElementById(edit ? 'edit-type' : 'submission_type').value;
+                const hours = document.getElementById(edit ? 'edit-hours' : 'hours');
+                if (type === 'work') {
+                    hours.readOnly = on;
+                    hours.step = on ? 'any' : '0.5';
+                    hours.min = on ? '0.016666666' : '0.5';
+                }
+            }
+            function changed() {
+                update();
+                if (document.getElementById(edit ? 'edit-type' : 'submission_type').value !== 'work') return;
+                if (enabled.checked) {
+                    status.textContent = 'Время изменено — рассчитайте часы перед отправкой.';
+                    document.getElementById(edit ? 'edit-hours' : 'hours').value = '';
+                } else {
+                    status.textContent = 'Ввод только количества часов; интервалы не предполагаются.';
+                }
+            }
+            container.addEventListener('change', changed);
+            document.getElementById(edit ? 'edit-date' : 'date').addEventListener('change', changed);
+            update();
+            if (!edit) changed();
+            return {
+                container, enabled, status,
+                value() {
+                    const value = {version: 1, start: start.value, end: end.value, next_day: nextDay.checked};
+                    for (const key of ['breaks', 'overtime']) {
+                        value[key] = [...groups[key].rows.children].map(row => {
+                            const inputs = row.querySelectorAll('input');
+                            return {start: inputs[0].value, end: inputs[1].value};
+                        });
+                    }
+                    if (mode.value === 'normal') value.overtime = [];
+                    if (mode.value === 'all') value.overtime = [{start: start.value, end: end.value}];
+                    return value;
+                },
+                load(value) {
+                    enabled.checked = !!value;
+                    start.value = value ? value.start : '';
+                    end.value = value ? value.end : '';
+                    nextDay.checked = value ? value.next_day : false;
+                    mode.value = value && value.overtime.length ? 'part' : 'normal';
+                    for (const key of ['breaks', 'overtime']) {
+                        groups[key].rows.replaceChildren();
+                        for (const entry of (value ? value[key] : [])) groups[key].add(entry);
+                    }
+                    update();
+                }
+            };
+        }
+        const timeEditors = {
+            main: createTimeEditor('time-facts-fields', false),
+            edit: createTimeEditor('edit-time-facts-fields', true)
+        };
+        async function previewTimeFacts(edit) {
+            const editor = edit ? timeEditors.edit : timeEditors.main;
+            const response = await fetch('/time-preview', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({date: document.getElementById(edit ? 'edit-date' : 'date').value, time_facts: editor.value()})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Проверьте фактическое время');
+            editor.status.textContent = `Оплачиваемое время: ${data.hours} ч (перерывы исключены)`;
+            document.getElementById(edit ? 'edit-hours' : 'hours').value = data.hours;
+            return data.hours;
+        }
 
         function formatObHours(value) {
             const hours = Number(value || 0);
@@ -666,7 +825,8 @@
             const transport = document.getElementById('edit-transport-check');
             transport.disabled = special;
             transport.checked = special ? false : editOriginalTransport > 0;
-            document.getElementById('edit-hours').readOnly = isOb;
+            document.getElementById('edit-hours').readOnly = isOb || (!special && !isOb && timeEditors.edit.enabled.checked);
+            timeEditors.edit.container.style.display = document.getElementById('edit-type').value === 'work' ? 'block' : 'none';
             document.getElementById('edit-ob-fields').style.display = isOb ? 'block' : 'none';
             filterEditObjects(document.getElementById('edit-object').value);
             if (isOb) refreshObPreview(true);
@@ -689,6 +849,7 @@
             companySelect.value = shift.company;
             document.getElementById('edit-type').value = shift.submission_type || 'work';
             document.getElementById('edit-hours').value = shift.hours;
+            timeEditors.edit.load(shift.time_facts ? JSON.parse(shift.time_facts) : null);
             setHalfHourTime('edit-ob-start', shift.start_time || '07:00');
             setHalfHourTime('edit-ob-end', shift.end_time || '18:00');
             document.getElementById('edit-comment').value = shift.comment || '';
@@ -738,6 +899,10 @@
                     ? (editOriginalTransport > 0 ? editOriginalTransport : 1) : 0;
             }
             try {
+                if (submissionType === 'work' && timeEditors.edit.enabled.checked) {
+                    payload.time_facts = timeEditors.edit.value();
+                    payload.hours = await previewTimeFacts(true);
+                }
                 const response = await fetch('/edit-shift', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -955,9 +1120,12 @@
                 const preview = await refreshObPreview(false);
                 if (!preview) return;
             }
-            const hoursVal = parseFloat(document.getElementById('hours').value);
+            let hoursVal = parseFloat(document.getElementById('hours').value);
 
             try {
+                if (submissionType === 'work' && timeEditors.main.enabled.checked) {
+                    hoursVal = await previewTimeFacts(false);
+                }
                 const checkRes = await fetch('/check-employee-shifts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -982,7 +1150,7 @@
                 executeShiftSubmission();
 
             } catch (err) {
-                showFormAlert("Не удалось проверить историю смен.", "error");
+                showFormAlert(err.message || "Не удалось проверить историю смен.", "error");
                 console.error(err);
             }
         });
@@ -1030,6 +1198,10 @@
             }
 
             try {
+                if (submissionType === 'work' && timeEditors.main.enabled.checked) {
+                    formData.time_facts = timeEditors.main.value();
+                    formData.hours = await previewTimeFacts(false);
+                }
                 const response = await fetch('/submit-shift', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1052,7 +1224,7 @@
                     showFormAlert("Ошибка: " + (result.error || result.message || "Не удалось отправить"), "error");
                 }
             } catch (err) {
-                showFormAlert("Не удалось отправить данные на сервер.", "error");
+                showFormAlert(err.message || "Не удалось отправить данные на сервер.", "error");
                 console.error(err);
             }
         }

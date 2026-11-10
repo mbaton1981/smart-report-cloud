@@ -6,6 +6,7 @@ import math
 import os
 from xml.sax.saxutils import escape
 from customer_pricing import row_prices
+from customer_intervals import calculated_row
 from fixed_pricing import report_agreements
 
 from reportlab.lib import colors
@@ -74,6 +75,7 @@ def prepare_customer_costs(report):
     groups, allocations = report_agreements(report)
     trips = 0.0
     unassigned_hours = 0.0
+    interval_lines, interval_details = [], []
     for row in report["journal_rows"]:
         if row["entry_type"] not in WORK_TYPES:
             continue
@@ -88,6 +90,28 @@ def prepare_customer_costs(report):
             unassigned_hours += float(row["hours"])
             continue
         extra = fixed["members"][row["sync_id"]]["extra"] if fixed else dict.fromkeys(("base", "ob", "travel"), True)
+        if prices.get("interval_terms") or row.get("time_facts"):
+            try:
+                details = calculated_row(row, prices)
+            except ValueError as error:
+                details = []
+                interval_lines.append({"label": f"Arbete – {row['date']} / {row['employee']}: {error}",
+                                       "quantity": row["hours"], "unit": "h", "rate": None, "amount": None})
+            for part in details:
+                interval_details.append({**part, "employee": row["employee"], "shift_id": row["id"],
+                                         "terms_id": prices["interval_terms"]["id"]})
+                hours = float(part["hours"])
+                if extra["base"]:
+                    interval_lines.append({"label": "Arbete – kundvillkor", "quantity": hours, "unit": "h",
+                                           "rate": float(part["base"]) if part["base"] is not None else None,
+                                           "amount": float(part["base_amount"]) if part["base_amount"] is not None else None})
+                if extra["ob"]:
+                    amount = float(part["premium_amount"]) if part["premium_amount"] is not None else None
+                    interval_lines.append({"label": "Kundtillägg – " + part["mode"], "quantity": hours, "unit": "h",
+                                           "rate": amount / hours if amount is not None else None, "amount": amount})
+            if extra["travel"]:
+                travel[(prices["travel"], bool(fixed))] += count
+            continue
         if extra["base"]:
             grouped[(prices["base"], bool(fixed))] += float(row["hours"])
         if extra["travel"]:
@@ -111,7 +135,8 @@ def prepare_customer_costs(report):
             if active:
                 rate = next(iter(active)) if len(active) == 1 else None
                 ob_costs[(category, rate, is_extra)] += (end - start) / 60
-    lines = []
+    lines = interval_lines
+    report["interval_details"] = interval_details
     for fixed in groups.values():
         lines.append({
             "label": f"Fast pris {fixed['date_from']} – {fixed['date_to']} (inkluderade poster)",
@@ -141,7 +166,7 @@ def prepare_customer_costs(report):
                 "quantity": hours, "unit": "h", "rate": rate, "amount": money(hours, rate),
             })
     unknown_ob_billable = report["totals"]["without_ob_hours"] is None and any(
-        row["entry_type"] == "ob" and (
+        row["entry_type"] == "ob" and not (row_prices(row).get("interval_terms") or row.get("time_facts")) and (
             row["sync_id"] not in allocations
             or allocations[row["sync_id"]]["members"][row["sync_id"]]["extra"]["ob"]
         ) for row in report["journal_rows"]
@@ -169,7 +194,7 @@ def prepare_customer_costs(report):
         selected = [line["amount"] for line in lines if line["label"].startswith(prefix)]
         return sum(selected) if all(value is not None for value in selected) else None
     totals["transport_amount"] = component("Resa")
-    totals["ob_amount"] = None if totals["without_ob_hours"] is None else component("OB")
+    totals["ob_amount"] = (None if totals["without_ob_hours"] is None else component(("OB", "Kundtillägg")))
     known_values = [Decimal(str(line["amount"])) for line in lines if line["amount"] is not None]
     unknown = any(line["amount"] is None for line in lines)
     known = float(sum(known_values)) if known_values or not unknown else None
@@ -320,6 +345,17 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
             costs, [available * .43, available * .17, available * .18, available * .22],
             numeric=(1, 2, 3),
         ))
+        if report.get("interval_details"):
+            detail_rows = [["Datum / medarbetare", "Intervall / arbetssätt", "Timmar", "Bas", "%", "Tillägg", "Totalt"]]
+            for part in report["interval_details"]:
+                detail_rows.append([
+                    part["date"] + " / " + part["employee"],
+                    part["start"][11:16] + "–" + part["end"][11:16] + " / " + part["mode"],
+                    format_quantity(float(part["hours"])), part["base"] or "Ej fastställt",
+                    part["percent"] if part["percent"] is not None else "Ej fastställt",
+                    part["premium_amount"] or "Ej fastställt", part["total"] or "Ej fastställt",
+                ])
+            story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
         preliminary = totals["invoice_total"] is None
         bottom = [
             Spacer(1, 10),

@@ -132,6 +132,48 @@ class AuthLoginTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat",
                                           json={"expected_version": 2}).status_code, 403)
 
+    def test_gross_allocations_preserve_original_net_vat_and_rounding_on_resave(self):
+        from io import BytesIO
+        from contextlib import closing
+        from expense_documents import migrate_invoice_net_schema
+        import uuid
+        with closing(self.server.get_db_connection()) as db, db:
+            migrate_invoice_net_schema(db)
+        headers = self._bearer(self._token())
+        parts = [
+            dict(object_id=1, gross_amount="49.98", net_amount="40.00", vat_amount="10.00", rounding_amount="-0.02"),
+            dict(destination="company", object_id=None, gross_amount="74.97", net_amount="60.00",
+                 vat_amount="15.00", rounding_amount="-0.03")]
+        payload = dict(client_id=str(uuid.uuid4()), supplier_name="Rounding fixture", invoice_number="ROUND-TEST",
+                       document_date="2026-10-19", usage="object_cost", verification_status="confirmed",
+                       net_amount="100.00", vat_amount="25.00", gross_amount="124.95",
+                       rounding_amount="-0.05", allocations=parts)
+        response = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps(payload), "original": (BytesIO(self._invoice_pdf(6010)), "round.pdf")})
+        self.assertEqual(response.status_code, 201, response.get_json())
+        saved = response.get_json()["document"]
+        identifier = saved["id"]
+        for legacy_client in (False, True):
+            update = dict(payload, expected_version=saved["sync_version"])
+            if legacy_client:
+                update.pop("rounding_amount")
+                update["net_amount"] = "99.95"
+                update["allocations"] = [{k: row[k] for k in ("object_id", "gross_amount", "vat_amount")}
+                                         for row in parts]
+            response = self.client.put(f"/api/expense-documents/{identifier}", headers=headers, json=update)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            saved = self.client.get(f"/api/expense-documents/{identifier}", headers=headers).get_json()["document"]
+            self.assertEqual(saved["verification_status"], "confirmed")
+            self.assertEqual((saved["net_amount"], saved["vat_amount"], saved["rounding_amount"]),
+                             ("100.00", "25.00", "-0.05"))
+            self.assertEqual([[p[k] for k in ("net_amount", "vat_amount", "rounding_amount", "gross_amount")]
+                              for p in saved["allocations"]],
+                             [["40.00", "10.00", "-0.02", "49.98"], ["60.00", "15.00", "-0.03", "74.97"]])
+        invalid = dict(payload, expected_version=saved["sync_version"],
+                       allocations=[dict(parts[0], net_amount="40.01"), parts[1]])
+        self.assertEqual(self.client.put(f"/api/expense-documents/{identifier}", headers=headers, json=invalid).status_code, 400)
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 1)
+
     def test_deleted_original_restores_same_record_and_retries_without_duplicate(self):
         from io import BytesIO
         import uuid

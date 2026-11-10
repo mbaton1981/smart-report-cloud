@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import os
 import json
+import customer_intervals
 import hashlib
 import hmac
 import logging
@@ -885,7 +886,7 @@ def enforce_dataset_boundary():
         return None
     guarded = (
         request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/", "/api/admin/shifts/", "/api/admin/analytics"))
-        or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced"}
+        or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced", "/api/customer-terms"}
     )
     if guarded:
         supplied = request.headers.get(HEADER)
@@ -1317,12 +1318,24 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
                 allocation_vat_unknown = True
         if vat_amount is not None and allocated_gross and (vat_amount > allocated_gross if allocated_gross > 0 else vat_amount < allocated_gross):
             raise ValueError("НДС части не может превышать её сумму с НДС.")
+        allocated_net = parse_invoice_money(item.get("net_amount"))
+        raw_rounding = item.get("rounding_amount")
+        rounding = parse_invoice_money(raw_rounding) if raw_rounding not in (None, "") else Decimal(0)
+        if item.get("net_amount") not in (None, ""):
+            if (allocated_net is None or vat_amount is None or rounding is None
+                    or allocated_net + vat_amount + rounding != allocated_gross):
+                raise ValueError("Net + НДС + отдельное округление части не совпадают с её итогом.")
+        elif vat_amount is not None:
+            if not parse_invoice_money(fields.get("rounding_amount")):
+                allocated_net = allocated_gross - vat_amount
+            elif len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"]):
+                allocated_net = parse_invoice_money(fields.get("net_amount"))
         normalized.append({
             "destination": destination,
             "object_id": object_id,
             "gross_amount": decimal_text(allocated_gross),
             "vat_amount": decimal_text(vat_amount),
-            "net_amount": decimal_text(allocated_gross - vat_amount) if vat_amount is not None else None,
+            "net_amount": decimal_text(allocated_net),
             "note": str(item.get("note") or "")[:500],
         })
 
@@ -1332,6 +1345,10 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         raise ValueError("Распределение должно иметь тот же знак, что и сумма фактуры.")
     if abs(allocated_gross) > abs(total_gross):
         raise ValueError("Распределённая сумма не может превышать сумму фактуры.")
+    if normalized and allocated_gross == total_gross and all(part["net_amount"] is not None for part in normalized):
+        stated_net = parse_invoice_money(fields.get("net_amount"))
+        if stated_net is not None and sum((Decimal(part["net_amount"]) for part in normalized), Decimal(0)) != stated_net:
+            raise ValueError("Сумма net частей не совпадает с net фактуры; округление должно храниться отдельно.")
     total_vat = fields["vat_amount"]
     known_allocation_vat = [Decimal(item["vat_amount"]) for item in normalized if item["vat_amount"] is not None]
     if total_vat is not None:
@@ -1505,6 +1522,9 @@ def serialize_expense_document(cursor, document, include_text=False):
         item["company_expense"] = item.get("destination", "company" if item["object_id"] is None else "object") == "company"
         for field in ("gross_amount", "net_amount", "vat_amount"):
             item[field] = decimal_text(item[field])
+        net, vat, gross = (parse_decimal(item[field]) for field in ("net_amount", "vat_amount", "gross_amount"))
+        item["rounding_amount"] = decimal_text(gross - net - vat) if all(
+            value is not None for value in (net, vat, gross)) else None
         serialized_allocations.append(item)
 
     document_gross = parse_decimal(document["gross_amount"])
@@ -2126,6 +2146,24 @@ def expense_document_update_api(document_id):
                 "error": "Документ изменился на сервере; обновите данные перед сохранением.",
                 "current_version": int(existing["sync_version"]),
             }), 409
+        if fields["allocation_basis"] == "gross":
+            saved_parts = cursor.execute("SELECT * FROM expense_allocations WHERE document_id=?", (document_id,)).fetchall()
+            preserved = [dict(part) for part in payload.get("allocations", [])]
+            for part in preserved:
+                matches = [saved for saved in saved_parts if saved["object_id"] == part.get("object_id")
+                           and parse_invoice_money(saved["allocated_gross"]) == parse_invoice_money(part.get("gross_amount"))
+                           and parse_invoice_money(saved["allocated_vat"]) == parse_invoice_money(part.get("vat_amount"))]
+                if (len(matches) == 1 and "allocated_net" in matches[0].keys()
+                        and matches[0]["allocated_net"] is not None and matches[0]["allocated_vat"] is not None):
+                    old = matches[0]
+                    part.setdefault("net_amount", old["allocated_net"])
+                    part.setdefault("rounding_amount", decimal_text(
+                        Decimal(old["allocated_gross"]) - Decimal(old["allocated_net"]) - Decimal(old["allocated_vat"])))
+            payload["allocations"] = preserved
+            if (fields["gross_amount"] == existing["gross_amount"] and fields["vat_amount"] == existing["vat_amount"]
+                    and "rounding_amount" in existing.keys()
+                    and existing["rounding_amount"] is not None and "rounding_amount" not in payload):
+                fields["net_amount"], fields["rounding_amount"] = existing["net_amount"], existing["rounding_amount"]
         if "recognized_text" not in payload:
             fields["recognized_text"] = existing["recognized_text"]
         if not fields["due_date_provided"] and "due_date" in existing.keys() and fields["verification_status"] == "confirmed":
@@ -2230,8 +2268,8 @@ def expense_allocation_vat_api(document_id):
         version = int(document["sync_version"] or 1)
         if payload.get("expected_version") != version:
             return jsonify({"ok": False, "error": "Документ изменился; обновите карточку."}), 409
-        if not invoice_net_schema_ready(conn) or document["allocation_basis"] != "net":
-            raise ValueError("Расчёт по позициям поддерживается для распределения без НДС.")
+        if not invoice_net_schema_ready(conn):
+            raise ValueError("Схема распределения НДС не подготовлена.")
         root = expense_documents_root()
         originals = conn.execute("SELECT stored_name,file_sha256 FROM expense_document_attachments WHERE document_id=? ORDER BY ordinal,id", (document_id,)).fetchall()
         if not originals:
@@ -2244,22 +2282,34 @@ def expense_allocation_vat_api(document_id):
             if hashlib.sha256(path.read_bytes()).hexdigest() != original["file_sha256"]:
                 raise ValueError("Контрольная сумма оригинала не совпадает; НДС частей не изменён.")
             extraction = extract_local_document(path)
-            pages.extend({"page": index + 1, "attachment_index": attachment_index, "elements": elements}
+            pages.extend({"page": index + 1, "attachment_index": attachment_index, "elements": elements,
+                          "text": extraction.pages[index], "source": original["stored_name"]}
                          for index, elements in enumerate(extraction.page_elements))
-        orders = allocation_vat_from_items(pages, json.loads(document["order_proposals_json"] or "[]"),
-                                          document["net_amount"], document["vat_amount"])
-        computed = normalize_net_allocations(orders)
         existing = conn.execute("SELECT * FROM expense_allocations WHERE document_id=? ORDER BY id", (document_id,)).fetchall()
+        gross_basis = document["allocation_basis"] == "gross"
+        gross_parts = []
+        if gross_basis:
+            from document_costs import verified_saved_allocation_vat
+            objects = [dict(row) for row in conn.execute("SELECT * FROM meta_objects")]
+            gross_parts, orders = verified_saved_allocation_vat(
+                pages, dict(document), [dict(row) for row in existing], objects)
+            computed = []
+        else:
+            orders = allocation_vat_from_items(pages, json.loads(document["order_proposals_json"] or "[]"),
+                                              document["net_amount"], document["vat_amount"])
+            computed = normalize_net_allocations(orders)
 
         def allocation_key(row):
             return row["destination"], row["object_id"], row["expense_category"]
 
         by_key = {allocation_key(row): row for row in computed}
-        if (len(existing) != len(computed) or len(by_key) != len(computed)
+        if not gross_basis and (len(existing) != len(computed) or len(by_key) != len(computed)
                 or any(allocation_key(row) not in by_key or parse_invoice_money(row["allocated_net"]) !=
                        parse_invoice_money(by_key[allocation_key(row)]["net_amount"]) for row in existing)):
             raise ValueError("Распределения изменены относительно заказов. Сначала согласуйте net и назначения; НДС не перезаписан.")
-        if any(row["allocated_vat"] is not None or row["allocated_gross"] is not None for row in existing):
+        if any(row["allocated_vat"] is not None or
+               (row["allocated_net"] is not None if gross_basis else row["allocated_gross"] is not None)
+               for row in existing):
             if not payload.get("replace_existing"):
                 raise ValueError("НДС частей уже заполнен; автоматическая перезапись запрещена.")
         conn.execute("BEGIN IMMEDIATE")
@@ -2268,16 +2318,26 @@ def expense_allocation_vat_api(document_id):
             conn.rollback()
             return jsonify({"ok": False, "error": "Документ изменился во время расчёта."}), 409
         for row in existing:
-            amounts = by_key[allocation_key(row)]
-            conn.execute("UPDATE expense_allocations SET allocated_vat=?,allocated_gross=? WHERE id=?",
-                         (amounts["vat_amount"], amounts["gross_amount"], row["id"]))
+            if gross_basis:
+                amounts = next(part for part in gross_parts if part["allocation_id"] == row["id"])
+                conn.execute("UPDATE expense_allocations SET allocated_net=?,allocated_vat=? WHERE id=?",
+                             (amounts["net_amount"], amounts["vat_amount"], row["id"]))
+            else:
+                amounts = by_key[allocation_key(row)]
+                conn.execute("UPDATE expense_allocations SET allocated_vat=?,allocated_gross=? WHERE id=?",
+                             (amounts["vat_amount"], amounts["gross_amount"], row["id"]))
         now = datetime.now(timezone.utc).isoformat()
-        conn.execute("UPDATE expense_documents SET order_proposals_json=?,sync_version=sync_version+1,updated_at=? WHERE id=?",
-                     (json.dumps(orders, ensure_ascii=False), now, document_id))
+        if gross_basis:
+            conn.execute("UPDATE expense_documents SET sync_version=sync_version+1,updated_at=? WHERE id=?", (now, document_id))
+        else:
+            conn.execute("UPDATE expense_documents SET order_proposals_json=?,sync_version=sync_version+1,updated_at=? WHERE id=?",
+                         (json.dumps(orders, ensure_ascii=False), now, document_id))
         previous = conn.execute("SELECT state,details_json FROM expense_processing WHERE document_id=?", (document_id,)).fetchone()
         details = json.loads(previous["details_json"]) if previous else {}
         details["vat_allocation"] = {"basis": "item_rates", "rounding": "ROUND_HALF_UP_per_item",
-                                     "version": version + 1, "orders": orders}
+                                     "version": version + 1, "orders": orders,
+                                     "previous_allocations": [dict(row) for row in existing],
+                                     "gross_parts_with_separate_rounding": gross_parts}
         conn.execute("INSERT OR REPLACE INTO expense_processing VALUES (?,?,?,?)",
                      (document_id, previous["state"] if previous else "allocated", json.dumps(details, ensure_ascii=False), now))
         conn.commit()
@@ -3019,8 +3079,9 @@ def submit_shift():
             return jsonify({"ok": False, "error": str(error)}), 400
     else:
         try:
-            hours = float(data.get('hours'))
-            if not (0.5 <= hours <= 24) or (hours % 0.5 != 0) or str(hours).lower() in ['nan', 'inf', '-inf']:
+            hours = (customer_intervals.paid_hours(data["time_facts"], date_str)
+                     if submission_type == "work" and data.get("time_facts") else float(data.get('hours')))
+            if not (0 < hours <= 24) or (not data.get("time_facts") and (hours < 0.5 or hours % 0.5 != 0)) or str(hours).lower() in ['nan', 'inf', '-inf']:
                 raise ValueError()
         except (TypeError, ValueError):
             conn.close()
@@ -3067,6 +3128,11 @@ def submit_shift():
             "hours": hours, "rate": rate, "transport": transport, "comment": comment,
             "submission_type": submission_type
         }
+        facts = customer_intervals.time_facts(data.get("time_facts"), date_str, hours)
+        if facts is not None:
+            if submission_type != "work":
+                raise ValueError("Новый ввод времени используйте с обычной работой; зарплатные OB не меняются.")
+            payload["time_facts"] = facts
         if ob_result:
             payload.update({
                 "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
@@ -3100,7 +3166,9 @@ def submit_shift():
                 SELECT id FROM incoming_submissions
                 WHERE employee = ? AND date = ? AND company = ? AND object_name = ? AND hours = ?
                   AND submission_type = ? AND created_at >= ? AND is_deleted = 0
-            ''', (employee, date_str, company, final_obj_name, hours, submission_type, sixty_secs_ago))
+                  AND COALESCE(time_facts,'') = ?
+            ''', (employee, date_str, company, final_obj_name, hours, submission_type, sixty_secs_ago,
+                  customer_intervals.encoded(facts) if facts is not None else ""))
         if cursor.fetchone():
             conn.rollback()
             return jsonify({"ok": False, "error": "Похожая смена уже была зарегистрирована только что. Подождите немного."}), 409
@@ -3137,6 +3205,8 @@ def submit_shift():
                 "date": date_str, "company": company, "object_name": final_obj_name,
             }, manual_base=(data.get("rate") if session.get("role") == "admin" else None))
             store_pricing(cursor, "incoming_submissions", request_id, quote)
+        if facts is not None:
+            customer_intervals.store_time(cursor, "incoming_submissions", request_id, facts)
         conn.commit()
     except ValueError as e:
         conn.rollback()
@@ -3157,6 +3227,20 @@ def submit_shift():
     if ob_result:
         response.update(public_ob_result(ob_result))
     return jsonify(response), 201
+
+
+@app.route("/time-preview", methods=["POST"])
+def time_preview():
+    if "user_id" not in session:
+        return jsonify(ok=False, error="Требуется авторизация"), 401
+    try:
+        payload = request.get_json()
+        if not isinstance(payload, dict):
+            raise ValueError("Неверный формат времени.")
+        hours = customer_intervals.paid_hours(payload.get("time_facts"), payload.get("date"))
+        return jsonify(ok=True, hours=hours)
+    except (TypeError, ValueError) as error:
+        return jsonify(ok=False, error=str(error)), 400
 
 
 @app.route('/calculate-ob', methods=['POST'])
@@ -3250,9 +3334,11 @@ def edit_shift():
             hours = ob_result["hours"]
             transport = submission_transport(data.get("transport", existing["transport"]), submission_type)
         else:
-            hours = float(data.get('hours', existing['hours']))
+            retained_facts = data.get("time_facts", existing["time_facts"])
+            hours = (customer_intervals.paid_hours(retained_facts, date_val)
+                     if submission_type == "work" and retained_facts else float(data.get('hours', existing['hours'])))
             transport = round(float(data.get('transport', existing['transport'])), 2)
-            if not (0.5 <= hours <= 24) or hours % 0.5 != 0 or not (0 <= transport <= 10000):
+            if not (0 < hours <= 24) or (not retained_facts and (hours < 0.5 or hours % 0.5 != 0)) or not (0 <= transport <= 10000):
                 raise ValueError("Часы или транспорт вне допустимого диапазона.")
             if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, transport)):
                 raise ValueError("Числовое поле должно быть конечным.")
@@ -3266,6 +3352,8 @@ def edit_shift():
             "transport": transport, "comment": comment, "invoiced": invoiced,
             "submission_type": submission_type
         }
+        facts = customer_intervals.time_facts(data.get("time_facts", existing["time_facts"]), date_val, hours)
+        normalized["time_facts"] = facts
         if ob_result:
             normalized.update({
                 "start_time": ob_result["start_time"], "end_time": ob_result["end_time"],
@@ -3317,10 +3405,15 @@ def edit_shift():
                 invoiced, submission_type, new_version, change_seq, operation_id,
                 operation_hash, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), existing['id']
             ))
+        customer_intervals.store_time(cursor, "incoming_submissions", sync_id, facts, previous_row=existing)
         if existing["customer_pricing"] and any(
             normalized[key] != existing[key] for key in ("date", "company", "object_name")
         ):
             store_pricing(cursor, "incoming_submissions", sync_id, None)
+        elif existing["customer_pricing"]:
+            quote = json.loads(existing["customer_pricing"])
+            if quote.pop("interval_calculation", None) is not None:
+                store_pricing(cursor, "incoming_submissions", sync_id, quote)
         if ob_result and not ob_result.get("preserved"):
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
         elif not ob_result and ob_schema_ready(cursor) and existing['submission_type'] == "ob":
@@ -3588,6 +3681,8 @@ def check_employee_shifts():
             "change_seq": r['change_seq'],
             "submission_type": r['submission_type'] or "work"
         })
+        factual = cursor.execute("SELECT time_facts FROM incoming_submissions WHERE sync_id=?", (r["sync_id"],)).fetchone()
+        shifts[-1]["time_facts"] = factual["time_facts"] if factual else None
         if r['submission_type'] == "ob" and ob_schema_ready(cursor):
             cursor.execute(
                 "SELECT start_time, end_time, ob_base_rate FROM incoming_submissions WHERE sync_id = ?",
@@ -4651,6 +4746,22 @@ register_employee_cards(app, lambda: get_db_connection(), lambda: bearer_user(),
 from assistant_api import register_assistant
 register_assistant(app, lambda: get_db_connection(), lambda: bearer_user())
 
+def invoice_layout_fallback(layout):
+    from assistant_api import ensure_schema
+    from invoice_layout_ai import request_selection
+    actor = bearer_admin_user()
+    if actor is None:
+        raise ValueError("Для резервного ИИ требуется личный вход администратора.")
+    connection = get_db_connection()
+    try:
+        ensure_schema(connection)
+        connection.commit()
+        return request_selection(connection, actor, layout, str(uuid.uuid4()))
+    finally:
+        connection.close()
+
+app.config["INVOICE_LAYOUT_AI"] = invoice_layout_fallback
+
 
 @app.route('/sync-desktop-data', methods=['POST'])
 def sync_desktop_data():
@@ -4835,6 +4946,7 @@ def serialize_submission(row, cursor=None):
         "record_type": sub_type,
         "invoiced": row['invoiced'],
         "customer_pricing": row["customer_pricing"] if "customer_pricing" in row.keys() else None,
+        "time_facts": row["time_facts"] if "time_facts" in row.keys() else None,
     }
     if sub_type == "ob":
         start_time = row["start_time"] if "start_time" in row.keys() else None
@@ -4951,13 +5063,43 @@ def sync_pull():
     cursor.execute("SELECT value FROM sync_metadata WHERE name = 'change_sequence'")
     current_sequence = cursor.fetchone()[0]
     changes = [serialize_submission(row, cursor=cursor) for row in rows]
+    condition_versions = [dict(row) for row in cursor.execute("SELECT * FROM customer_terms ORDER BY company,object_name,revision")]
     conn.commit()
     conn.close()
     return jsonify({
         "ok": True,
         "changes": changes,
+        "customer_terms": condition_versions,
         "cursor": current_sequence
     })
+
+@app.route("/api/customer-terms", methods=["GET", "POST"])
+def customer_terms_api():
+    if bearer_admin_user() is None:
+        return jsonify({"ok": False, "error": "Клиентские условия доступны администратору."}), 403
+    conn = get_db_connection()
+    try:
+        if request.method == "GET":
+            versions = [dict(row) for row in conn.execute(
+                "SELECT * FROM customer_terms ORDER BY company,object_name,revision")]
+            return jsonify(ok=True, versions=versions)
+        payload = request.get_json()
+        if not isinstance(payload, dict) or type(payload.get("expected_revision")) is not int:
+            raise ValueError("Укажите версию условий.")
+        conn.execute("BEGIN IMMEDIATE")
+        obj = conn.execute("SELECT * FROM meta_objects WHERE id=?", (payload.get("object_id"),)).fetchone()
+        if obj is None or obj["service_type"]:
+            raise ValueError("Выберите строительный объект.")
+        version = customer_intervals.save_terms(
+            conn.cursor(), obj["company"], obj["name"], payload.get("conditions"), payload["expected_revision"])
+        conn.commit()
+        return jsonify(ok=True, version=version)
+    except (ValueError, TypeError) as error:
+        conn.rollback()
+        return jsonify(ok=False, error=str(error)), 400
+    finally:
+        conn.close()
+
 
 @app.route('/sync/capabilities', methods=['GET'])
 def sync_capabilities():
@@ -4975,6 +5117,7 @@ def sync_capabilities():
         "submission_types": sorted(submission_types),
         "typed_tombstones": True,
         "customer_pricing": 1,
+        "customer_intervals": 1,
         "fixed_pricing": 1,
         "payroll_history": 1,
     })
@@ -5034,7 +5177,8 @@ def sync_push():
                 hours = float(payload.get('hours'))
                 rate = round(float(payload.get('rate', 0)), 2)
                 transport = round(float(payload.get('transport', 0)), 2)
-                if not (0.5 <= hours <= 24) or hours % 0.5 != 0 or not (0 <= rate <= 100000) or not (0 <= transport <= 10000):
+                supplied_facts = payload.get("time_facts", existing["time_facts"] if existing else None)
+                if not (0 < hours <= 24) or (not supplied_facts and (hours < 0.5 or hours % 0.5 != 0)) or not (0 <= rate <= 100000) or not (0 <= transport <= 10000):
                     raise ValueError("Часы, ставка или транспорт вне допустимого диапазона")
                 if any(str(value).lower() in ('nan', 'inf', '-inf') for value in (hours, rate, transport)):
                     raise ValueError("Числовое поле должно быть конечным")
@@ -5083,6 +5227,9 @@ def sync_push():
                     "transport": transport, "comment": comment, "invoiced": invoiced,
                     "submission_type": submission_type
                 }
+                facts = customer_intervals.time_facts(supplied_facts, date_val, hours)
+                if facts is not None or "time_facts" in payload:
+                    normalized["time_facts"] = facts
                 if ob_result:
                     normalized.update({
                         "start_time": ob_result["start_time"],
@@ -5095,6 +5242,7 @@ def sync_push():
                 if "customer_pricing" in payload or (existing and base_version > 0 and pricing_value):
                     normalized["customer_pricing"] = pricing_json(pricing_value, dict(normalized, sync_id=sync_id))
                     parsed_quote = json.loads(normalized["customer_pricing"]) if normalized["customer_pricing"] else {}
+                    customer_intervals.verify_terms_version(cursor, normalized, parsed_quote)
                     if parsed_quote.get("fixed"):
                         touched_fixed.add(parsed_quote["fixed"]["id"])
                     if existing and existing["invoiced"] and normalized["customer_pricing"] != existing["customer_pricing"]:
@@ -5176,11 +5324,20 @@ def sync_push():
                     "start_time", "end_time", "ob_base_rate",
                 )):
                     raise ValueError("Выставленная запись защищена; сначала верните её в работу.")
+                old_facts = customer_intervals.time_facts(existing["time_facts"], existing["date"], existing["hours"])
+                if normalized.get("time_facts", old_facts) != old_facts:
+                    raise ValueError("Фактическое время закрытой смены защищено.")
             if operation == "upsert" and normalized["invoiced"] and (not existing or not existing["invoiced"]):
+                if normalized.get("time_facts") and "time_facts" not in payload:
+                    raise ValueError("Для закрытия записей с фактическим временем обновите десктопный клиент.")
                 pricing_row = dict(normalized, entry_type=submission_type,
                                    sync_id=sync_id, customer_pricing=normalized.get("customer_pricing"))
                 segments = (ob_result["segments"] if ob_result else [])
                 require_final_prices(pricing_row, segments)
+                quote = json.loads(normalized["customer_pricing"]) if normalized.get("customer_pricing") else {}
+                if quote.get("interval_terms"):
+                    quote["interval_calculation"] = customer_intervals.calculated_row(pricing_row, quote)
+                    normalized["customer_pricing"] = pricing_json(quote, pricing_row)
 
             now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
             change_seq = next_change_sequence(cursor)
@@ -5256,6 +5413,9 @@ def sync_push():
                         normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
                         normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now
                     ))
+            if operation == "upsert" and "time_facts" in normalized:
+                customer_intervals.store_time(cursor, "incoming_submissions", sync_id, normalized["time_facts"],
+                                              from_sync=True, previous_row=existing, protect_payroll=True)
             if operation == "upsert" and "customer_pricing" in normalized:
                 ensure_pricing_schema(cursor, "incoming_submissions")
                 store_pricing(cursor, "incoming_submissions", sync_id, normalized["customer_pricing"], from_sync=True)
