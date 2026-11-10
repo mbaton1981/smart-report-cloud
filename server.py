@@ -3421,7 +3421,13 @@ def edit_shift():
             store_pricing(cursor, "incoming_submissions", sync_id, None)
         elif existing["customer_pricing"]:
             quote = json.loads(existing["customer_pricing"])
-            if quote.pop("interval_calculation", None) is not None:
+            changed_quote = quote.pop("interval_calculation", None) is not None
+            if quote.get("schedule_application") and (
+                hours != existing["hours"] or submission_type != existing["submission_type"] or facts is not None
+            ):
+                quote.pop("schedule_application")
+                changed_quote = True
+            if changed_quote:
                 store_pricing(cursor, "incoming_submissions", sync_id, quote)
         if ob_result and not ob_result.get("preserved"):
             replace_ob_segments(cursor, sync_id, ob_result["segments"])
@@ -5091,7 +5097,7 @@ def customer_terms_api():
         if request.method == "GET":
             versions = [dict(row) for row in conn.execute(
                 "SELECT * FROM customer_terms ORDER BY company,object_name,revision")]
-            return jsonify(ok=True, versions=versions)
+            return jsonify(ok=True, versions=versions, customer_schedules=1)
         payload = request.get_json()
         if not isinstance(payload, dict) or type(payload.get("expected_revision")) is not int:
             raise ValueError("Укажите версию условий.")
@@ -5127,6 +5133,7 @@ def sync_capabilities():
         "typed_tombstones": True,
         "customer_pricing": 1,
         "customer_intervals": 1,
+        "customer_schedules": 1,
         "fixed_pricing": 1,
         "payroll_history": 1,
     })

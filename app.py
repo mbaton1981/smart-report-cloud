@@ -14123,7 +14123,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat(),
                 )
                 quote.pop("interval_calculation", None)
+                if facts is not None or payload["hours"] != shift["hours"]:
+                    quote.pop("schedule_application", None)
                 store_pricing(cursor, "shifts", sync_id, quote)
+            elif shift["customer_pricing"]:
+                quote = json.loads(shift["customer_pricing"])
+                if quote.get("schedule_application") and (
+                    facts is not None or payload["hours"] != shift["hours"]
+                    or record_type != shift["entry_type"]
+                ):
+                    quote.pop("schedule_application")
+                    quote.pop("interval_calculation", None)
+                    store_pricing(cursor, "shifts", sync_id, quote)
             payload["customer_pricing"] = cursor.execute(
                 "SELECT customer_pricing FROM shifts WHERE sync_id=?", (sync_id,)
             ).fetchone()[0]

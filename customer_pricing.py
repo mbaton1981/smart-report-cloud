@@ -170,6 +170,11 @@ def parse_pricing(value, row):
         if conditions["effective_from"] > row["date"]:
             raise ValueError("Клиентские условия не действовали на дату записи.")
         result["interval_terms"] = {"id": saved["id"], "revision": saved["revision"], "conditions": conditions}
+    if "schedule_application" in value:
+        if "interval_terms" not in result:
+            raise ValueError("Применение графика без версии условий запрещено.")
+        result["schedule_application"] = value["schedule_application"]
+        customer_intervals.calculation_facts(dict(row), result)
     if "interval_calculation" in value:
         if "interval_terms" not in result:
             raise ValueError("Расчёт без версии клиентских условий запрещён.")
@@ -294,7 +299,8 @@ def require_final_prices(row, segments):
     if prices.get("interval_terms") or row.get("time_facts"):
         parts = customer_intervals.calculated_row(row, prices)
         if prices.get("interval_calculation") and parts != customer_intervals.calculate(
-                row.get("time_facts"), row["date"], prices["base"], prices["interval_terms"]["conditions"]):
+                customer_intervals.calculation_facts(row, prices), row["date"], prices["base"],
+                prices["interval_terms"]["conditions"]):
             raise ValueError("Сохранённый расчёт не соответствует подтверждённой версии условий.")
         unknown = [f"{part['start']} — {part['end']} ({part['mode']}/{part['day']})"
                    for part in parts if (extra["base"] and part["base_amount"] is None)

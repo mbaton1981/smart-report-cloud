@@ -99,6 +99,7 @@ def prepare_customer_costs(report):
                                        "quantity": row["hours"], "unit": "h", "rate": None, "amount": None})
             for part in details:
                 interval_details.append({**part, "employee": row["employee"], "shift_id": row["id"],
+                                         "time_source": "schedule" if prices.get("schedule_application") else "actual",
                                          "terms_id": prices["interval_terms"]["id"]})
                 hours = float(part["hours"])
                 if extra["base"]:
@@ -350,7 +351,8 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
             for part in report["interval_details"]:
                 detail_rows.append([
                     part["date"] + " / " + part["employee"],
-                    part["start"][11:16] + "–" + part["end"][11:16] + " / " + part["mode"],
+                    part["start"][11:16] + "–" + part["end"][11:16] + " / " + part["mode"]
+                    + (" / schema (bekräftat)" if part.get("time_source") == "schedule" else ""),
                     format_quantity(float(part["hours"])), part["base"] or "Ej fastställt",
                     part["percent"] if part["percent"] is not None else "Ej fastställt",
                     part["premium_amount"] or "Ej fastställt", part["total"] or "Ej fastställt",

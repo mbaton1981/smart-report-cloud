@@ -158,8 +158,65 @@ def terms(value):
         coverage[key].update(points)
         checked.append({key: rule[key] for key in ("day", "mode", "start", "end")} |
                        {"percent": str(percent) if percent is not None else None})
-    return {"version": 1, "effective_from": value["effective_from"],
-            "holidays": sorted(set(holidays)), "rules": checked}
+    result = {"version": 1, "effective_from": value["effective_from"],
+              "holidays": sorted(set(holidays)), "rules": checked}
+    if value.get("schedule") is not None:
+        schedule = value["schedule"]
+        if not isinstance(schedule, dict):
+            raise ValueError("Некорректный типовой график объекта.")
+        days = schedule.get("days")
+        if (not isinstance(days, list) or not days or len(days) > 7
+                or any(type(day) is not int or not 0 <= day <= 6 for day in days)):
+            raise ValueError("Выберите дни недели типового графика.")
+        facts = time_facts(schedule.get("time"), "2026-01-12")
+        if facts is None:
+            raise ValueError("Укажите начало, конец и перерывы типового графика.")
+        result["schedule"] = {"days": sorted(set(days)), "time": facts}
+    return result
+
+
+def schedule_facts(row, quote):
+    conditions = terms(quote.get("interval_terms", {}).get("conditions"))
+    schedule = conditions.get("schedule")
+    if not schedule:
+        raise ValueError("Нет точного времени и типового графика. Уточните начало, конец, перерывы и режим в десктопе.")
+    if row.get("entry_type", row.get("submission_type")) != "work":
+        raise ValueError("Для OB уточните клиентский режим в десктопе: категория OB не означает сверхурочную работу.")
+    if conditions["effective_from"] > row["date"]:
+        raise ValueError("График ещё не действовал на дату смены.")
+    if date.fromisoformat(row["date"]).weekday() not in schedule["days"]:
+        raise ValueError("Дата смены вне дней типового графика. Уточните время и режим в десктопе.")
+    try:
+        return time_facts(schedule["time"], row["date"], row["hours"])
+    except ValueError as error:
+        raise ValueError(f"Смена отличается от типового графика: {error} Уточните в десктопе.") from None
+
+
+def apply_schedule(row, quote):
+    if row.get("time_facts"):
+        raise ValueError("Точное время уже сохранено; график его не заменяет.")
+    if row["invoiced"]:
+        raise ValueError("Закрытая смена защищена от применения графика.")
+    schedule_facts(row, quote)
+    return dict(quote, schedule_application={
+        "confirmed": True, "date": row["date"], "hours": str(number(row["hours"])), "sync_id": row["sync_id"],
+    })
+
+
+def calculation_facts(row, quote):
+    application = quote.get("schedule_application")
+    if application is not None:
+        if (not isinstance(application, dict)
+                or set(application) != {"confirmed", "date", "hours", "sync_id"}
+                or application["confirmed"] is not True
+                or application["date"] != row["date"]
+                or application["sync_id"] != row["sync_id"]
+                or number(application["hours"]) != number(row["hours"])):
+            raise ValueError("Применение графика не подтверждено для этой записи; нужен новый предпросмотр.")
+        if row.get("time_facts"):
+            raise ValueError("У записи появилось точное время. Повторно проверьте клиентский расчёт вместо графика.")
+        return schedule_facts(row, quote)
+    return time_facts(row.get("time_facts"), row["date"], row["hours"])
 
 
 def calculate(facts, work_date, base, conditions):
@@ -286,7 +343,7 @@ def calculated_row(row, quote):
         raise ValueError("Клиентские условия по времени не подтверждены для этой записи.")
     if "interval_calculation" in quote:
         return validate_calculation(quote["interval_calculation"], row, quote)
-    return calculate(row.get("time_facts"), row["date"], quote["base"], saved["conditions"])
+    return calculate(calculation_facts(row, quote), row["date"], quote["base"], saved["conditions"])
 
 
 def validate_calculation(parts, row, quote):
@@ -326,7 +383,7 @@ def validate_calculation(parts, row, quote):
             if actual != expected:
                 raise ValueError("Суммы сохранённого клиентского расчёта не сходятся.")
     if abs(hours - Decimal(str(row["hours"]))) > Decimal("0.000001") or covered != {
-            instant for instant, _ in paid_minutes(row.get("time_facts"), row["date"])}:
+            instant for instant, _ in paid_minutes(calculation_facts(row, quote), row["date"])}:
         raise ValueError("Сохранённый расчёт не покрывает фактическое оплачиваемое время.")
     return parts
 

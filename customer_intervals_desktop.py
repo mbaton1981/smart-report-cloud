@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 import customer_intervals as intervals
 from customer_intervals_ui import CustomerTermsDialog, TimeFactsEditor
 from customer_pricing import ensure_pricing_schema, row_prices, store_pricing
+from customer_report import prepare_customer_costs
 
 
 def cache_terms(cursor, values):
@@ -35,6 +36,7 @@ class CustomerIntervalsMixin:
         app = sys.modules[self.__class__.__module__]
         if refresh:
             data = app.request_expense_api("GET", "/api/customer-terms")
+            self._customer_schedules_supported = data.get("customer_schedules") == 1
             with closing(app.get_db_connection()) as db, db:
                 ensure_pricing_schema(db.cursor(), "shifts")
                 cache_terms(db.cursor(), data["versions"])
@@ -63,9 +65,12 @@ class CustomerIntervalsMixin:
             dialog = CustomerTermsDialog(obj, versions, objects, self._terms_versions, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
+            conditions = dialog.value()
+            if conditions.get("schedule") and not self._customer_schedules_supported:
+                raise ValueError("Сервер ещё не поддерживает типовой график. Обновите сервер перед сохранением.")
             data = app.request_expense_api("POST", "/api/customer-terms", json={
                 "object_id": obj["server_id"], "expected_revision": versions[-1]["revision"] if versions else 0,
-                "conditions": dialog.value()})
+                "conditions": conditions})
             with closing(app.get_db_connection()) as db, db:
                 cache_terms(db.cursor(), [data["version"]])
             QMessageBox.information(self, "Клиентские доплаты",
@@ -80,6 +85,13 @@ class CustomerIntervalsMixin:
             report = self.collect_invoice_report()
             self._terms_versions({"company": report["company"], "name": report["object"]})
             proposals = []
+            def preview_total(row):
+                segments = report.get("journal_segments", {}).get(row["sync_id"], [])
+                split_ok = row["entry_type"] != "ob" or abs(
+                    sum(float(segment["hours"]) for segment in segments) - row["hours"]) < 0.000001
+                calculated = prepare_customer_costs(dict(
+                    report, journal_rows=[row], warnings=[], totals={"without_ob_hours": 0.0 if split_ok else None}))
+                return calculated["totals"]["invoice_total"]
             with closing(app.get_db_connection()) as db:
                 for row in report["journal_rows"]:
                     if row["entry_type"] not in ("work", "ob") or row["invoiced"]:
@@ -91,39 +103,72 @@ class CustomerIntervalsMixin:
                     if "interval_terms" not in proposed:
                         continue
                     proposed.pop("interval_calculation", None)
+                    proposed.pop("schedule_application", None)
                     # Preserve individual base/travel prices, never replace them from today's catalogue.
                     proposed.update(version=1, company=row["company"], object_name=row["object_name"],
                                     date_from=row["date"], date_to=row["date"], source="Условия объекта: явный предпросмотр",
                                     confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat())
                     try:
+                        if not row.get("time_facts"):
+                            if not getattr(self, "_customer_schedules_supported", False):
+                                raise ValueError("Сервер ещё не поддерживает типовой график. Обновите сервер.")
+                            proposed = intervals.apply_schedule(row, proposed)
                         parts = intervals.calculated_row(row, proposed)
-                        total = sum(float(p["total"]) for p in parts) if all(p["total"] is not None for p in parts) else None
-                        description = f"{total:.2f} SEK" if total is not None else "Условия интервалов не заданы"
+                        single = dict(row, customer_pricing=intervals.encoded(proposed))
+                        total = preview_total(single)
+                        description = f"{total:.2f} SEK" if total is not None else "Уточните клиентские цены/проценты/транспорт"
+                        source = "Типовой график\n" if proposed.get("schedule_application") else "Фактическое время\n"
+                        source += "\n".join(f"{p['start'][11:16]}–{p['end'][11:16]} "
+                                            f"{'OT' if p['mode'] == 'overtime' else 'обычная'}" for p in parts)
                     except ValueError as error:
                         description = str(error)
-                    proposals.append((row, proposed, description))
+                        source, total = "Требуется уточнение администратора", None
+                    old_total = preview_total(row)
+                    before = f"{old_total:.2f} SEK" if old_total is not None else "Итог не определён"
+                    proposals.append((row, proposed, description, source, before, total is not None))
             if not proposals:
                 raise ValueError("Нет открытых записей с действующей версией условий; задайте её в карточке объекта.")
             dialog = QDialog(self)
             dialog.setWindowTitle("Предпросмотр условий — только отмеченные открытые записи")
             layout = QVBoxLayout(dialog)
-            layout.addWidget(QLabel("База/транспорт сохранённых записей не заменяются. Закрытые и Fast pris исключены."))
-            table = QTableWidget(len(proposals), 4)
-            table.setHorizontalHeaderLabels(["Применить", "Запись", "Прежняя версия", "Новый расчёт / чего не хватает"])
+            note = QLabel("Отметьте только согласованные записи. Типовой график — допущение для клиентского "
+                          "расчёта, а не фактическое время. Часы, OB, транспорт и зарплата не меняются. "
+                          "Закрытые и Fast pris исключены. Если смена отличалась — нажмите «Уточнить».")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            table = QTableWidget(len(proposals), 6)
+            table.setObjectName("customerTermsPreview")
+            table.setHorizontalHeaderLabels(["Применить", "Запись", "Было, без НДС",
+                                             "Источник / режим", "Станет / уточнение", "Уточнение"])
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            for index, (row, proposed, description) in enumerate(proposals):
+            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            for index, (row, proposed, description, source, before, eligible) in enumerate(proposals):
                 check = QTableWidgetItem()
-                check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                check.setFlags((Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                               if eligible else Qt.ItemFlag.NoItemFlags)
                 check.setCheckState(Qt.CheckState.Unchecked)
                 table.setItem(index, 0, check)
                 for column, value in enumerate((
-                    f"№{row['id']} · {row['date']} · {row['employee']}",
-                    str(row_prices(row).get("interval_terms", {}).get("revision", "не заданы")),
-                    description,
+                    f"№{row['id']} · {row['date']}\n{row['employee']}",
+                    before, source, description,
                 ), 1):
-                    table.setItem(index, column, QTableWidgetItem(value))
+                    cell = QTableWidgetItem(value)
+                    cell.setToolTip(value)
+                    cell.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    table.setItem(index, column, cell)
+                button = QPushButton("Уточнить")
+                def clarify(_=False, identifier=row["id"]):
+                    self.edit_time_facts(identifier)
+                    dialog.reject()
+                button.clicked.connect(clarify)
+                table.setCellWidget(index, 5, button)
             layout.addWidget(table)
+            table.horizontalHeader().sectionResized.connect(lambda *_: table.resizeRowsToContents())
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+            buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить выбор")
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
             layout.addWidget(buttons)
@@ -137,7 +182,7 @@ class CustomerIntervalsMixin:
             db = app.get_db_connection()
             try:
                 db.execute("BEGIN IMMEDIATE")
-                for old, quote, _ in chosen:
+                for old, quote, *_ in chosen:
                     actual = db.execute("SELECT * FROM shifts WHERE id=?", (old["id"],)).fetchone()
                     if actual is None or dict(actual) != old:
                         raise ValueError("Записи изменились после предпросмотра; обновите отчёт.")
@@ -213,7 +258,11 @@ class CustomerIntervalsMixin:
                           "Зарплатные OB-сегменты не меняются. Для OB сумма часов должна остаться прежней.")
             note.setWordWrap(True)
             layout.addWidget(note)
-            editor = TimeFactsEditor(row.get("time_facts"))
+            value = row.get("time_facts")
+            if not value and row.get("start_time") and row.get("end_time"):
+                value = {"start": row["start_time"], "end": row["end_time"],
+                         "next_day": row["end_time"] <= row["start_time"]}
+            editor = TimeFactsEditor(value)
             layout.addWidget(editor)
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
             def validate_edited_time():
@@ -250,8 +299,9 @@ class CustomerIntervalsMixin:
                 db.execute("UPDATE shifts SET hours=? WHERE id=?", (hours, identifier))
                 intervals.store_time(db.cursor(), "shifts", row["sync_id"], facts, previous_row=row)
                 quote = row_prices(row)
-                if quote.get("interval_calculation"):
-                    quote.pop("interval_calculation")
+                if quote.get("interval_calculation") or quote.get("schedule_application"):
+                    quote.pop("interval_calculation", None)
+                    quote.pop("schedule_application", None)
                     store_pricing(db.cursor(), "shifts", row["sync_id"], quote)
                 app.enqueue_matching_shifts(db.cursor(), "id=?", (identifier,))
                 db.commit()
@@ -281,7 +331,8 @@ class CustomerIntervalsMixin:
                 status = QLabel("\n".join(unresolved))
                 status.setWordWrap(True)
                 layout.addWidget(status)
-            columns = ["Дата", "Сотрудник", "Интервал", "Режим", "Часы", "База", "Доплата %", "Доплата SEK", "Итог SEK"]
+            columns = ["Дата", "Сотрудник", "Интервал", "Режим", "Часы", "База", "Доплата %", "Доплата SEK",
+                       "Итог SEK", "Источник времени"]
             parts = report.get("interval_details", [])
             table = QTableWidget(len(parts), len(columns))
             table.setObjectName("customerIntervalBreakdown")
@@ -291,7 +342,8 @@ class CustomerIntervalsMixin:
             for index, part in enumerate(parts):
                 values = [part["date"], part["employee"], part["start"][11:16] + "–" + part["end"][11:16],
                           "Сверхурочная" if part["mode"] == "overtime" else "Обычная",
-                          f"{float(part['hours']):g}", part["base"], part["percent"], part["premium_amount"], part["total"]]
+                          f"{float(part['hours']):g}", part["base"], part["percent"], part["premium_amount"], part["total"],
+                          "График — подтверждён администратором" if part.get("time_source") == "schedule" else "Фактическое"]
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(str(value) if value is not None else "Не задано")
                     item.setData(Qt.ItemDataRole.UserRole, part["shift_id"])
@@ -304,10 +356,15 @@ class CustomerIntervalsMixin:
                 + (f"{total:,.2f} SEK без НДС" if total is not None else "Итог не определён — уточните данные и условия."))
             total_label.setObjectName("customerIntervalTotal")
             layout.addWidget(total_label)
+            scheduled = {p["shift_id"] for p in parts if p.get("time_source") == "schedule"}
+            if scheduled:
+                layout.addWidget(QLabel("По типовым графикам, явно подтверждённым администратором: "
+                                        + ", ".join(f"№{identifier}" for identifier in sorted(scheduled))))
             missing = [row for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")
-                       and not row.get("time_facts")]
-            missing_label = QLabel("Нет фактических интервалов: " + ", ".join(f"№{r['id']}" for r in missing)
-                                   if missing else "Фактические интервалы заполнены.")
+                       and not row.get("time_facts") and not row_prices(row).get("schedule_application")]
+            missing_label = QLabel("Уточните начало, конец, перерывы и обычный/сверхурочный режим: "
+                                   + ", ".join(f"№{r['id']}" for r in missing)
+                                   if missing else "Источник каждого участка указан в расшифровке.")
             missing_label.setWordWrap(True)
             layout.addWidget(missing_label)
             actions = QHBoxLayout()

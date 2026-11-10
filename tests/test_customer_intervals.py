@@ -25,6 +25,10 @@ def facts(start="16:00", end="20:00", **extra):
     return dict(version=1, start=start, end=end, next_day=False, breaks=[], overtime=[], **extra)
 
 
+def scheduled_terms():
+    return dict(example_terms(), schedule={"days": [0, 1, 2, 3, 4], "time": facts()})
+
+
 class IntervalCalculationTests(unittest.TestCase):
     def total(self, value=None, day="2026-10-21", base=520, conditions=None):
         parts = intervals.calculate(value or facts(), day, base, conditions or example_terms())
@@ -104,6 +108,44 @@ class IntervalCalculationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Переход"):
             intervals.time_facts(facts("02:00", "03:00"), "2026-10-25")
 
+    def test_schedule_is_explicit_row_scoped_and_never_factual_or_automatic_overtime(self):
+        row = dict(sync_id="schedule-row", date="2026-10-21", hours=4, entry_type="work",
+                   invoiced=0, time_facts=None)
+        quote = dict(base=520, interval_terms={"id": "test-version", "revision": 1,
+                                              "conditions": scheduled_terms()})
+        with self.assertRaises(ValueError):
+            intervals.calculated_row(row, quote)
+        applied = intervals.apply_schedule(row, quote)
+        self.assertNotIn("schedule_application", quote)
+        self.assertIsNone(row["time_facts"])
+        parts = intervals.calculated_row(row, applied)
+        self.assertEqual(sum(Decimal(p["total"]) for p in parts), 2496)
+        self.assertEqual({p["mode"] for p in parts}, {"normal"})
+        for change in (dict(hours=3), dict(date="2026-10-22"), dict(sync_id="different")):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                intervals.calculated_row(dict(row, **change), applied)
+        for change in (dict(hours=3), dict(date="2026-10-24"), dict(entry_type="ob"),
+                       dict(time_facts=facts()), dict(invoiced=1), dict(date="2026-09-30")):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                intervals.apply_schedule(dict(row, **change), quote)
+        snapshot = dict(applied, interval_calculation=parts)
+        self.assertEqual(intervals.calculated_row(row, snapshot), parts)
+        for schedule in ({"days": [], "time": facts()}, {"days": [True], "time": facts()},
+                         {"days": [1], "time": None}):
+            with self.assertRaises(ValueError):
+                intervals.terms(dict(example_terms(), schedule=schedule))
+
+    def test_schedule_break_midnight_and_explicit_overtime_rules(self):
+        value = facts("22:00", "06:00")
+        value.update(next_day=True, breaks=[dict(start="00:30", end="01:00")],
+                     overtime=[dict(start="01:00", end="03:00")])
+        quote = dict(base=520, interval_terms={"conditions": dict(
+            example_terms(), schedule={"days": [2], "time": value})})
+        row = dict(sync_id="night", date="2026-10-21", hours=7.5, entry_type="work", invoiced=0)
+        parts = intervals.calculated_row(row, intervals.apply_schedule(row, quote))
+        self.assertEqual(sum(Decimal(p["total"]) for p in parts), 6942)
+        self.assertEqual(sum(Decimal(p["hours"]) for p in parts), Decimal("7.5"))
+
 
 class IntervalDesktopTests(unittest.TestCase):
     @classmethod
@@ -112,7 +154,10 @@ class IntervalDesktopTests(unittest.TestCase):
         historical.HistoricalPricesTests.setUpClass.__func__(cls)
     tearDownClass = classmethod(transport.OBTransportTests.tearDownClass.__func__)
     setUp = historical.HistoricalPricesTests.setUp
-    tearDown = historical.HistoricalPricesTests.tearDown
+    def tearDown(self):
+        from PyQt6.QtCore import QCoreApplication, QEvent
+        historical.HistoricalPricesTests.tearDown(self)
+        QCoreApplication.sendPostedEvents(self.window, QEvent.Type.DeferredDelete)
     shift = historical.HistoricalPricesTests.shift
     ob = historical.HistoricalPricesTests.ob
 
@@ -132,6 +177,92 @@ class IntervalDesktopTests(unittest.TestCase):
             self.window.on_tab_changed(5)
         dropdowns.assert_called_once_with(refresh_tables=False)
         catalog.assert_called_once_with()
+
+    def test_schedule_preview_selected_only_preserves_hours_ob_and_closed_history(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QTableWidget
+        from test_customer_report import CustomerReportTests
+        identifier = self.shift(hours=4)
+        mismatch = self.shift(hours=3, day="2026-10-22")
+        self.conn.execute("UPDATE shifts SET transport=0")
+        before = [tuple(r) for r in self.conn.execute(
+            "SELECT id,date,hours,entry_type,transport,rate,invoiced,time_facts FROM shifts ORDER BY id")]
+        salary_before = [tuple(r) for r in self.conn.execute("SELECT * FROM ob_segments")]
+        obj = self.conn.execute("SELECT company,object_name FROM shifts WHERE sync_id=?", (identifier,)).fetchone()
+        intervals.save_terms(self.conn.cursor(), obj["company"], obj["object_name"], scheduled_terms(), 0)
+        self.conn.commit()
+        self.window._customer_schedules_supported = True
+        def select(dialog):
+            table = dialog.findChild(QTableWidget, "customerTermsPreview")
+            self.assertEqual(table.rowCount(), 2)
+            for i in range(2):
+                if f"№{self.conn.execute('SELECT id FROM shifts WHERE sync_id=?', (identifier,)).fetchone()[0]} " in table.item(i, 1).text():
+                    self.assertIn("Типовой график", table.item(i, 3).text())
+                    self.assertIn("2496.00", table.item(i, 4).text())
+                    self.assertEqual(table.item(i, 0).checkState(), Qt.CheckState.Unchecked)
+                    table.item(i, 0).setCheckState(Qt.CheckState.Checked)
+                else:
+                    self.assertFalse(table.item(i, 0).flags() & Qt.ItemFlag.ItemIsEnabled)
+                    self.assertIn("отличается", table.item(i, 4).text())
+            return self.desktop.QDialog.DialogCode.Accepted
+        with patch.object(self.window, "_terms_versions"), \
+                patch.object(self.desktop.QDialog, "exec", select), \
+                patch.object(self.window, "background_sync_with_cloud") as sync, \
+                patch.object(self.desktop.QMessageBox, "warning", side_effect=AssertionError):
+            self.window.preview_customer_terms()
+        sync.assert_called_once()
+        row = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone())
+        self.assertIn("schedule_application", row_prices(row))
+        other = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (mismatch,)).fetchone())
+        self.assertNotIn("schedule_application", row_prices(other))
+        self.assertEqual(before, [tuple(r) for r in self.conn.execute(
+            "SELECT id,date,hours,entry_type,transport,rate,invoiced,time_facts FROM shifts ORDER BY id")])
+        self.assertEqual(salary_before, [tuple(r) for r in self.conn.execute("SELECT * FROM ob_segments")])
+        self.conn.execute("DELETE FROM shifts WHERE sync_id=?", (mismatch,))
+        self.conn.commit()
+        report = self.window.generate_invoice()
+        self.assertEqual(report["totals"]["invoice_total"], 2496)
+        self.assertEqual({p["time_source"] for p in report["interval_details"]}, {"schedule"})
+        pdf = CustomerReportTests.pdf(self, report)
+        self.assertIn("schema", "\n".join(p.extract_text() for p in pdf.pages))
+        self.window._set_period_invoiced(self.window.collect_invoice_report(), True)
+        changed = scheduled_terms()
+        changed["rules"][1]["percent"] = 80
+        intervals.save_terms(self.conn.cursor(), obj["company"], obj["object_name"], changed, 1)
+        self.conn.commit()
+        self.assertEqual(self.window.generate_invoice()["totals"]["invoice_total"], 2496)
+        self.window._set_period_invoiced(self.window.collect_invoice_report(), False)
+        self.assertEqual(self.window.generate_invoice()["totals"]["invoice_total"], 2496)
+        row_id = self.conn.execute("SELECT id FROM shifts WHERE sync_id=?", (identifier,)).fetchone()[0]
+        with patch.object(self.desktop.QDialog, "exec", return_value=self.desktop.QDialog.DialogCode.Accepted), \
+                patch("customer_intervals_desktop.TimeFactsEditor.value", return_value=facts()), \
+                patch.object(self.window, "background_sync_with_cloud"), \
+                patch.object(self.desktop.QMessageBox, "warning", side_effect=AssertionError):
+            self.window.edit_time_facts(row_id)
+        updated = dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone())
+        self.assertNotIn("schedule_application", row_prices(updated))
+        self.assertNotIn("interval_calculation", row_prices(updated))
+        self.assertEqual(json.loads(updated["time_facts"]), facts())
+        self.assertEqual(updated["hours"], 4)
+
+    def test_terms_dialog_schedule_save_reopen_copy_without_default_activation(self):
+        from customer_intervals_ui import CustomerTermsDialog
+        obj = {"name": "Travel A", "company": "Renatur", "markning": "test-only", "rate": 520}
+        dialog = CustomerTermsDialog(obj, [], [obj], lambda _: [])
+        def dispose():
+            from PyQt6.QtCore import QCoreApplication, QEvent
+            dialog.close()
+            dialog.deleteLater()
+            QCoreApplication.sendPostedEvents(dialog, QEvent.Type.DeferredDelete)
+        self.addCleanup(dispose)
+        self.assertFalse(dialog.schedule_enabled.isChecked())
+        dialog.populate(scheduled_terms())
+        saved = dialog.value()
+        self.assertEqual(saved, intervals.terms(scheduled_terms()))
+        dialog.populate(example_terms())
+        self.assertNotIn("schedule", dialog.value())
+        dialog.populate(saved, keep_date=True)
+        self.assertEqual(dialog.value(), saved)
 
     def test_report_close_reopen_snapshot_and_no_payroll_double_count(self):
         identifier = self.prepared("ob")
@@ -249,6 +380,12 @@ class IntervalServerTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM customer_terms").fetchone()[0], 0)
 
     def test_full_web_desktop_pdf_close_sync_reopen_path(self):
+        self.full_web_desktop_path(schedule=False)
+
+    def test_simple_web_desktop_explicit_schedule_pdf_close_sync_reopen_and_edit(self):
+        self.full_web_desktop_path(schedule=True)
+
+    def full_web_desktop_path(self, *, schedule):
         from types import SimpleNamespace
         from io import BytesIO
         from pypdf import PdfReader
@@ -256,10 +393,14 @@ class IntervalServerTests(unittest.TestCase):
         from customer_intervals_desktop import cache_terms
         with closing(self.server.get_db_connection()) as db, db:
             db.execute("UPDATE meta_objects SET rate=520 WHERE name='Travel A'")
-            intervals.save_terms(db.cursor(), "Renatur", "Travel A", example_terms(), 0)
-        response = self.server_client.post("/submit-shift", json=dict(
+            intervals.save_terms(db.cursor(), "Renatur", "Travel A",
+                                 scheduled_terms() if schedule else example_terms(), 0)
+        data = dict(
             request_id="full-timed", date="2026-10-21", employee="Travel Test", company="Renatur",
-            object_name="Travel A", submission_type="work", time_facts=facts(), transport=0))
+            object_name="Travel A", submission_type="work", hours=4, transport=0)
+        if not schedule:
+            data["time_facts"] = facts()
+        response = self.server_client.post("/submit-shift", json=data)
         self.assertEqual(response.status_code, 201, response.get_json())
         headers = {"X-Sync-Key": "isolated-sync-test-key"}
         pulled = self.server_client.get("/sync/pull?since=0", headers=headers).get_json()
@@ -284,6 +425,21 @@ class IntervalServerTests(unittest.TestCase):
         window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_id))
         window.inv_date_from.setDate(self.desktop.QDate(2026, 10, 1))
         window.inv_date_to.setDate(self.desktop.QDate(2026, 10, 31))
+        if schedule:
+            from PyQt6.QtCore import Qt
+            from PyQt6.QtWidgets import QTableWidget
+            window._customer_schedules_supported = True
+            self.assertIsNone(window.generate_invoice()["totals"]["invoice_total"])
+            def select(dialog):
+                table = dialog.findChild(QTableWidget, "customerTermsPreview")
+                self.assertEqual(table.rowCount(), 1)
+                self.assertEqual(table.item(0, 0).checkState(), Qt.CheckState.Unchecked)
+                table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+                return self.desktop.QDialog.DialogCode.Accepted
+            with patch.object(window, "_terms_versions"), \
+                    patch.object(self.desktop.QDialog, "exec", select), \
+                    patch.object(window, "background_sync_with_cloud"):
+                window.preview_customer_terms()
         report = window.generate_invoice()
         self.assertEqual(report["totals"]["hours"], 4)
         self.assertEqual(report["totals"]["invoice_total"], 2496)
@@ -315,6 +471,24 @@ class IntervalServerTests(unittest.TestCase):
             self.desktop.SmartReportApp.apply_remote_shift(SimpleNamespace(), db.cursor(), remote)
         self.assertEqual(window.generate_invoice()["totals"]["invoice_total"], 2496)
         self.assertEqual(window.collect_invoice_report()["journal_rows"][0]["invoiced"], 0)
+        if schedule:
+            with closing(self.server.get_db_connection()) as db:
+                saved = db.execute("SELECT * FROM incoming_submissions WHERE sync_id='full-timed'").fetchone()
+                self.assertIsNone(saved["time_facts"])
+                self.assertIn("schedule_application", json.loads(saved["customer_pricing"]))
+            changed = self.server_client.post("/edit-shift", json=dict(
+                sync_id="full-timed", operation_id="correct-legacy-hours",
+                date="2026-10-21", company="Renatur", object_name="Travel A",
+                submission_type="work", hours=3, transport=0, comment="Actual hours corrected"))
+            self.assertEqual(changed.status_code, 200, changed.get_json())
+            with closing(self.server.get_db_connection()) as db:
+                saved = db.execute("SELECT * FROM incoming_submissions WHERE sync_id='full-timed'").fetchone()
+                self.assertEqual(saved["hours"], 3)
+                self.assertIsNone(saved["time_facts"])
+                quote = json.loads(saved["customer_pricing"])
+                self.assertNotIn("schedule_application", quote)
+                self.assertNotIn("interval_calculation", quote)
+                self.assertEqual(quote["base"], 520)
 
     def test_web_submit_dedup_edit_sync_and_closed_protection(self):
         with closing(self.server.get_db_connection()) as db, db:

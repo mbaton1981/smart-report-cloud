@@ -5,7 +5,7 @@ from datetime import date
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget, QHeaderView,
+    QVBoxLayout, QWidget, QHeaderView, QTabWidget, QScrollArea,
 )
 
 from customer_intervals import DAYS, MODES, terms, time_facts
@@ -38,6 +38,7 @@ class TimeFactsEditor(QWidget):
         self.tables = {}
         for key, label in (("breaks", "Неоплачиваемые перерывы"), ("overtime", "Сверхурочные части")):
             table = QTableWidget(0, 2)
+            table.setMinimumHeight(95)
             table.setHorizontalHeaderLabels(["Начало HH:MM", "Конец HH:MM"])
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             table.setMaximumHeight(115)
@@ -56,6 +57,19 @@ class TimeFactsEditor(QWidget):
             buttons.addWidget(add)
             buttons.addWidget(remove)
             form.addRow(buttons)
+
+    def load(self, value):
+        value = value or {}
+        self.start.setText(value.get("start", ""))
+        self.end.setText(value.get("end", ""))
+        self.next_day.setChecked(value.get("next_day", False))
+        for key, table in self.tables.items():
+            table.setRowCount(0)
+            for entry in value.get(key, []):
+                row = table.rowCount()
+                table.insertRow(row)
+                for column, field in enumerate(("start", "end")):
+                    table.setItem(row, column, QTableWidgetItem(entry[field]))
 
     def value(self, work_date, expected_hours=None):
         value = {"version": 1, "start": self.start.text().strip(), "end": self.end.text().strip(),
@@ -114,14 +128,48 @@ class CustomerTermsDialog(QDialog):
         self.table.setHorizontalHeaderLabels(["День", "Режим", "Начало HH:MM", "Конец HH:MM", "Доплата %"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.table, 1)
+        tabs = QTabWidget()
+        rules_page = QWidget()
+        rules_layout = QVBoxLayout(rules_page)
+        rules_layout.addWidget(self.table, 1)
         row = QHBoxLayout()
         add, remove = QPushButton("Добавить правило"), QPushButton("Убрать выбранное")
         add.clicked.connect(lambda: self.add_rule())
         remove.clicked.connect(lambda: self.table.removeRow(self.table.currentRow()))
         row.addWidget(add)
         row.addWidget(remove)
-        layout.addLayout(row)
+        rules_layout.addLayout(row)
+        tabs.addTab(rules_page, "Проценты доплат")
+        schedule_page = QWidget()
+        schedule_layout = QVBoxLayout(schedule_page)
+        self.schedule_enabled = QCheckBox("Задать типовой график для клиентского расчёта")
+        self.schedule_enabled.setObjectName("customerScheduleEnabled")
+        schedule_layout.addWidget(self.schedule_enabled)
+        schedule_note = QLabel(
+            "Это не фактическое время сотрудника. График применяется только к отмеченным "
+            "открытым записям «Работа» через предпросмотр отчёта, при точном совпадении часов. "
+            "Для OB или отличающейся смены уточните время и клиентский режим в десктопе. "
+            "Вечер сам по себе не означает сверхурочную работу.")
+        schedule_note.setWordWrap(True)
+        schedule_layout.addWidget(schedule_note)
+        days = QHBoxLayout()
+        self.schedule_days = []
+        for day, title in enumerate(("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")):
+            check = QCheckBox(title)
+            check.setChecked(day < 5)
+            days.addWidget(check)
+            self.schedule_days.append(check)
+        schedule_layout.addLayout(days)
+        self.schedule_editor = TimeFactsEditor()
+        self.schedule_editor.setEnabled(False)
+        self.schedule_enabled.toggled.connect(self.schedule_editor.setEnabled)
+        schedule_layout.addWidget(self.schedule_editor)
+        schedule_layout.addStretch()
+        schedule_scroll = QScrollArea()
+        schedule_scroll.setWidgetResizable(True)
+        schedule_scroll.setWidget(schedule_page)
+        tabs.addTab(schedule_scroll, "Типовой график — только по выбору")
+        layout.addWidget(tabs, 1)
         self.example = QLabel()
         self.example.setObjectName("customerTermsExample")
         self.example.setWordWrap(True)
@@ -166,6 +214,11 @@ class CustomerTermsDialog(QDialog):
         self.table.setRowCount(0)
         for rule in value["rules"]:
             self.add_rule(rule)
+        schedule = value.get("schedule")
+        self.schedule_enabled.setChecked(schedule is not None)
+        for day, check in enumerate(self.schedule_days):
+            check.setChecked(day in schedule["days"] if schedule else day < 5)
+        self.schedule_editor.load(schedule["time"] if schedule else None)
 
     def value(self):
         rules = []
@@ -175,8 +228,12 @@ class CustomerTermsDialog(QDialog):
             rule.update({key: self.table.item(row, column).text().strip() if self.table.item(row, column) else ""
                          for column, key in enumerate(("start", "end", "percent"), 2)})
             rules.append(rule)
-        return terms({"version": 1, "effective_from": self.effective.text().strip(),
-                      "holidays": [d.strip() for d in self.holidays.text().split(",") if d.strip()], "rules": rules})
+        value = {"version": 1, "effective_from": self.effective.text().strip(),
+                 "holidays": [d.strip() for d in self.holidays.text().split(",") if d.strip()], "rules": rules}
+        if self.schedule_enabled.isChecked():
+            value["schedule"] = {"days": [day for day, check in enumerate(self.schedule_days) if check.isChecked()],
+                                 "time": self.schedule_editor.value("2026-01-12")}
+        return terms(value)
 
     def show_example(self, base):
         try:
