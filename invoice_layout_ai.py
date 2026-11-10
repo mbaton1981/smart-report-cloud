@@ -146,6 +146,14 @@ def request_selection(conn, actor, layout, operation, post=None):
         "instructions": "Select invoice fields using ONLY opaque block IDs and fixed caption labels/geometry. "
                         "No document text or values are supplied. Choose seller, never buyer or payment intermediary. "
                         "A caption must have the field's label (seller for supplier_name), on the same page. "
+                        "A caption with has_value=false is a normal label: its value may be in ANOTHER block. "
+                        "For every field, prefer the unique value block to the right on the same row; otherwise "
+                        "use a uniquely associated block immediately below. Money fields use kind=money, dates "
+                        "use kind=date, invoice numbers use kind=identifier or money. The supplier uses kind=text. "
+                        "Example: caption 11 label=net_amount at [0,50,100,60], value 12 kind=money has_value=true "
+                        "at [160,50,260,60] means net_amount={value:12,caption:11}. "
+                        "Do not leave uniquely labelled geometrical matches unknown merely because their text "
+                        "is masked: all values and arithmetic will be verified locally. "
                         "Gross is before rounding, amount_due after rounding. Unknown: value=null, caption=null. "
                         "Do not infer missing data. Select only geometrically unambiguous values.",
         "input": json.dumps(layout), "max_output_tokens": 2000,

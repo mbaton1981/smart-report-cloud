@@ -228,8 +228,13 @@ class IntervalServerTests(unittest.TestCase):
                 self.desktop.SmartReportApp.apply_remote_shift(SimpleNamespace(), db.cursor(), remote)
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        self.addCleanup(window.close)
-        window.tab_invoice = self.desktop.QWidget()
+        def dispose():
+            from PyQt6.QtCore import QCoreApplication, QEvent
+            window.close()
+            window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.addCleanup(dispose)
+        window.tab_invoice = self.desktop.QWidget(window)
         window.setup_invoice_tab()
         window.inv_comp_cb.setCurrentText("Renatur")
         window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(object_id))
