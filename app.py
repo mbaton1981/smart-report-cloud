@@ -43,7 +43,7 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
-from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing, reopen_invoiced_shifts
+from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, checked_rate, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing, reopen_invoiced_shifts
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
@@ -10507,9 +10507,11 @@ class SmartReportApp(QMainWindow):
             if not candidates:
                 raise ValueError("Нет открытых рабочих записей. Закрытые цены не изменяются.")
             categories = sorted({
-                segment["category"] for segments in report["journal_segments"].values()
-                for segment in segments if float(segment["premium_percent"] or 0) > 0
+                segment["category"] for row in candidates
+                for segment in report["journal_segments"].get(row["sync_id"], [])
+                if float(segment["premium_percent"] or 0) > 0
             })
+            historical = {row["sync_id"]: row_prices(row) for row in candidates}
             dialog = QDialog(self)
             dialog.setWindowTitle("Подтверждение исторических клиентских цен")
             dialog.setMinimumWidth(600)
@@ -10519,6 +10521,7 @@ class SmartReportApp(QMainWindow):
                 f"Открытых записей: {len(candidates)}. Закрытые записи не затрагиваются.\n"
                 "Введите подтверждённые вами клиентские цены, не зарплатные ставки.\n"
                 "При сохранении подтверждение и дата записываются автоматически.\n"
+                "Работа — базовая цена каждого часа, включая часы OB. OB1 — доплата сверх базы.\n"
                 "Пусто — неизвестно; 0 — подтверждённая нулевая цена.\n"
                 "Заполняются только неизвестные цены; индивидуальные цены сохраняются.\n"
                 "Индивидуальную цену можно изменить в записи смены.\n"
@@ -10526,14 +10529,77 @@ class SmartReportApp(QMainWindow):
             )
             note.setWordWrap(True)
             form.addRow(note)
+            missing = []
+            for row in candidates:
+                try:
+                    require_final_prices(row, report["journal_segments"].get(row["sync_id"], []))
+                except ValueError as error:
+                    missing.append(f"№{row['id']} · {row['date']} · {row['employee']}: {error}")
+            missing_label = QLabel("\n".join(missing) if missing else "Все необходимые исторические цены заполнены.")
+            missing_label.setObjectName("customer_price_missing")
+            missing_label.setWordWrap(True)
+            form.addRow(missing_label)
             fields = {}
             for key, label in [("base", "Работа, SEK/ч"), ("travel", "Транспорт, SEK/ед.")] + [
                 (category, f"{INVOICE_OB_CATEGORY_LABELS.get(category, category)}, доплата SEK/ч") for category in categories
             ]:
                 field = QLineEdit()
+                field.setObjectName("customer_price_" + key)
                 field.setPlaceholderText("Не задана")
+                prices = [
+                    historical[row["sync_id"]].get(key) if key in ("base", "travel")
+                    else historical[row["sync_id"]]["ob"].get(key)
+                    for row in candidates
+                    if key in ("base", "travel") or any(
+                        segment["category"] == key
+                        for segment in report["journal_segments"].get(row["sync_id"], [])
+                    )
+                ]
+                known = {value for value in prices if value is not None}
+                if len(known) == 1:
+                    field.setText(f"{next(iter(known)):.2f}")
+                elif known:
+                    field.setPlaceholderText("Разные сохранённые цены — будут сохранены")
                 fields[key] = field
                 form.addRow(label, field)
+            hour_preview = QLabel()
+            hour_preview.setObjectName("customer_price_hour_preview")
+            hour_preview.setWordWrap(True)
+            form.addRow(hour_preview)
+
+            def preview_hour_prices():
+                lines = []
+                for category in categories:
+                    combinations = set()
+                    unknown = False
+                    for row in candidates:
+                        if not any(segment["category"] == category for segment in
+                                   report["journal_segments"].get(row["sync_id"], [])):
+                            continue
+                        saved = historical[row["sync_id"]]
+                        try:
+                            base = saved["base"] if saved["base"] is not None else checked_rate(
+                                fields["base"].text().strip().replace(",", "."))
+                            premium = saved["ob"].get(category)
+                            if premium is None:
+                                premium = checked_rate(fields[category].text().strip().replace(",", "."))
+                        except ValueError:
+                            unknown = True
+                            continue
+                        if base is None or premium is None:
+                            unknown = True
+                        else:
+                            combinations.add((base, premium))
+                    label = INVOICE_OB_CATEGORY_LABELS.get(category, category)
+                    lines.extend(f"{label}: {base:.2f} + {premium:.2f} = {base + premium:.2f} SEK/ч"
+                                 for base, premium in sorted(combinations))
+                    if unknown:
+                        lines.append(f"{label}: итог часа неизвестен — заполните базу и доплату.")
+                hour_preview.setText("\n".join(lines))
+
+            for field in fields.values():
+                field.textChanged.connect(preview_hour_prices)
+            preview_hour_prices()
             source = QLineEdit()
             source.setObjectName("customer_price_comment")
             source.setPlaceholderText("Необязательно")

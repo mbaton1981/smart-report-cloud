@@ -1,6 +1,7 @@
 import json
 import unittest
 from unittest.mock import patch
+from PyQt6.QtWidgets import QDateEdit
 
 import test_catalog_sync as catalog
 import test_ob_transport as transport
@@ -54,7 +55,7 @@ class ReopenShiftTests(unittest.TestCase):
         window.table_shifts = self.desktop.QTableWidget(0, 15)
         window.reopen_shift_btn = self.desktop.QPushButton()
         window.reopen_shift_btn.clicked.connect(window.reopen_selected_shift)
-        window.load_dropdowns = lambda: None
+        window.load_dropdowns = lambda **kwargs: None
         window.apply_shifts_filters = lambda: None
         window.load_shifts_history()
         for index in range(window.table_shifts.rowCount()):
@@ -142,7 +143,7 @@ class ReopenShiftTests(unittest.TestCase):
         self.addCleanup(window.deleteLater)
         window.tab_hours = self.desktop.QWidget()
         window.setCentralWidget(window.tab_hours)
-        window.load_dropdowns = lambda: None
+        window.load_dropdowns = lambda **kwargs: None
         with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}):
             window.setup_hours_tab()
             window.resize(1450, 1000)
@@ -328,8 +329,8 @@ class ReopenShiftTests(unittest.TestCase):
         window = self.window()
         window.inv_comp_cb = self.desktop.QComboBox()
         window.inv_comp_cb.addItem("Renatur")
-        window.inv_date_from = self.desktop.QDateEdit()
-        window.inv_date_to = self.desktop.QDateEdit()
+        window.inv_date_from = QDateEdit()
+        window.inv_date_to = QDateEdit()
         window.inv_obj_cb = self.desktop.QComboBox()
         window.inv_obj_cb.addItem("Travel B", object_id)
         window.inv_show_archived = self.desktop.QCheckBox()

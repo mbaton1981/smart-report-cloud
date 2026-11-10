@@ -32,6 +32,7 @@ class HistoricalPricesTests(unittest.TestCase):
             INSERT INTO balance VALUES(1,100),(2,-20),(3,35);
             ALTER TABLE employees ADD COLUMN is_active INTEGER DEFAULT 1;
             ALTER TABLE objects ADD COLUMN is_active INTEGER DEFAULT 1;
+            ALTER TABLE objects ADD COLUMN service_type TEXT;
             ALTER TABLE shifts ADD COLUMN work_transport_cache REAL DEFAULT 0;
             ALTER TABLE shifts ADD COLUMN ob_base_rate REAL;
         """)
@@ -101,6 +102,48 @@ class HistoricalPricesTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT customer_pricing FROM shifts").fetchone()[0], before)
         self.assertEqual(row_prices(dict(self.conn.execute("SELECT * FROM shifts").fetchone()))["base"], 520)
         self.assertEqual(self.window.generate_invoice()["totals"]["invoice_total"], 4160)
+
+    def test_reopening_period_price_form_shows_saved_base_ob_and_hour_total(self):
+        self.ob()
+        self.confirm_period()
+        before = list(map(tuple, self.conn.execute("SELECT * FROM customer_price_audit")))
+
+        def cancel(dialog):
+            self.assertEqual(dialog.findChild(self.desktop.QLineEdit, "customer_price_base").text(), "520.00")
+            self.assertEqual(dialog.findChild(
+                self.desktop.QLineEdit, "customer_price_weekday_early_evening").text(), "125.00")
+            preview = dialog.findChild(self.desktop.QLabel, "customer_price_hour_preview").text()
+            self.assertIn("520.00 + 125.00 = 645.00", preview)
+            self.assertIn("OB1", preview)
+            return self.desktop.QDialog.DialogCode.Rejected
+
+        with patch.object(self.desktop.QDialog, "exec", cancel):
+            self.window.confirm_customer_prices()
+        self.assertEqual(list(map(tuple, self.conn.execute("SELECT * FROM customer_price_audit"))), before)
+        report = self.window.generate_invoice()
+        self.assertEqual(report["totals"]["hours"], 4)
+        self.assertEqual(report["totals"]["ob_categories"], {"weekday_early_evening": 2})
+        self.assertEqual(self.window._set_period_invoiced(report, True), (1, 4))
+
+    def test_price_form_shows_historical_base_and_missing_ob_rows_without_guessing(self):
+        identifier = self.ob()
+        before = self.conn.execute("SELECT customer_pricing FROM shifts").fetchone()[0]
+
+        def cancel(dialog):
+            self.assertEqual(dialog.findChild(self.desktop.QLineEdit, "customer_price_base").text(), "520.00")
+            premium = dialog.findChild(self.desktop.QLineEdit, "customer_price_weekday_early_evening")
+            self.assertEqual(premium.text(), "")
+            details = dialog.findChild(self.desktop.QLabel, "customer_price_missing").text()
+            self.assertIn("OB1", details)
+            self.assertIn("2026-10-21", details)
+            premium.setText("125")
+            self.assertIn("520.00 + 125.00 = 645.00", dialog.findChild(
+                self.desktop.QLabel, "customer_price_hour_preview").text())
+            return self.desktop.QDialog.DialogCode.Rejected
+
+        with patch.object(self.desktop.QDialog, "exec", cancel):
+            self.window.confirm_customer_prices()
+        self.assertEqual(self.conn.execute("SELECT customer_pricing FROM shifts").fetchone()[0], before)
 
     def test_bulk_prices_keep_individual_quotes_legacy_zero_and_noop_repeat(self):
         legacy_id = self.shift(rate=610, confirmed=False)
