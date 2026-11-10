@@ -331,13 +331,13 @@ class IncomingStore(OfflineReviewStore):
                     or any(source.get("kind") == "manual"
                            for sources in base.get("field_sources", {}).values() for source in sources)):
                 raise ReviewError("Распознавание не заменяет проверку оригинала или сохранённое распределение.")
-            source_json = self.conn.execute(
-                "SELECT source_json FROM documents WHERE id=?", (document_id,)
-            ).fetchone()[0]
+            source_json, base_json = self.conn.execute(
+                "SELECT source_json,base_json FROM documents WHERE id=?", (document_id,)
+            ).fetchone()
             source = json.loads(source_json)
             source.setdefault("recognition_history", []).append({
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "base": base, "payload": current_payload,
+                "base": json.loads(base_json), "payload": current_payload,
                 "reason": "explicit_automatic_recognition_refresh",
             })
             payload = dict(current_payload)

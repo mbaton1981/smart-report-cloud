@@ -137,6 +137,18 @@ class IncomingDisplayTests(unittest.TestCase):
             self.store.record_recognition(
                 1, {"fields": self.fields}, replace_automatic=True)
 
+    def test_refresh_audit_retains_raw_fields_before_fresh_classification(self):
+        stored = dict(self.fields, supplier_name="Incorrect buyer AB",
+                      raw_text="\n".join(["Bank details"] * 20 + ["Orderbekräftelse"]))
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1",
+                                    (json.dumps(stored),))
+        self.store.record_recognition(
+            1, {"fields": self.fields, "state": "requires_review"}, replace_automatic=True)
+        source = json.loads(self.store.conn.execute(
+            "SELECT source_json FROM documents WHERE id=1").fetchone()[0])
+        self.assertEqual(source["recognition_history"][0]["base"], stored)
+
     def test_main_register_projects_local_documents_before_confirmation_and_company_is_allocated(self):
         host = SimpleNamespace(
             _incoming_documents_root=lambda: self.store.root,
