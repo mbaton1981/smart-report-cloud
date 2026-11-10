@@ -87,8 +87,11 @@ class FolderMailUITests(unittest.TestCase):
 
     def test_masked_password_progress_stop_and_manual_retry(self):
         original = folder_mail.import_folder
+        first_recognition = [True]
         def slow_recognition(paths):
-            time.sleep(0.05)
+            if first_recognition[0]:
+                first_recognition[0] = False
+                self.assertTrue(dialog.stop_event.wait(5), "UI must request stop during recognition")
             return recognized(paths)
         def isolated_import(*args, **kwargs):
             return original(*args, **kwargs, client_factory=FolderIMAP, recognizer=slow_recognition)
@@ -131,7 +134,7 @@ class FolderMailUITests(unittest.TestCase):
     def test_closing_parent_requests_stop_instead_of_destroying_active_worker(self):
         original = folder_mail.import_folder
         def slow_recognition(paths):
-            time.sleep(0.08)
+            self.assertTrue(dialog.stop_event.wait(5), "Closing the parent must request stop")
             return recognized(paths)
         def isolated_import(*args, **kwargs):
             return original(*args, **kwargs, client_factory=FolderIMAP, recognizer=slow_recognition)
