@@ -184,6 +184,20 @@ class SupplementDesktopTests(unittest.TestCase):
         self.assertIn("остаток", dialog.status.text())
         self.assertTrue(all(not row_prices(row).get("supplement_allocation") for row in dialog.rows))
 
+    def test_explicit_customer_allocation_known_even_when_legacy_ob_breakdown_unknown(self):
+        identifier = self.ob(transport=0)
+        self.conn.execute("DELETE FROM ob_segments WHERE shift_id=?", (identifier,))
+        self.conn.commit()
+        dialog = self.dialog()
+        self.stage(dialog, [0])
+        self.assertIn(0, dialog.drafts, dialog.status.text())
+        store_pricing(self.conn.cursor(), "shifts", identifier, dialog.drafts[0])
+        self.conn.commit()
+        report = self.window.generate_invoice()
+        self.assertIsNone(report["totals"]["without_ob_hours"])
+        self.assertEqual(report["totals"]["ob_amount"], 416)
+        self.assertEqual(report["totals"]["invoice_total"], 2496)
+
     def test_saved_scheme_per_record_overtime_and_weekend_not_period_wide(self):
         self.shift(hours=4)
         self.shift(hours=4, day="2026-10-22")

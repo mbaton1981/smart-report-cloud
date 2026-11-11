@@ -214,7 +214,13 @@ def prepare_customer_costs(report):
         selected = [line["amount"] for line in lines if line["label"].startswith(prefix)]
         return sum(selected) if all(value is not None for value in selected) else None
     totals["transport_amount"] = component("Resa")
-    totals["ob_amount"] = component(("OB", "Kundtillägg"))
+    allocated_ob = any(row["entry_type"] == "ob" for row in report["journal_rows"]) and all(
+        row["entry_type"] != "ob" or row_prices(row).get("supplement_allocation")
+        for row in report["journal_rows"]
+    )
+    totals["ob_amount"] = (
+        None if totals["without_ob_hours"] is None and not allocated_ob else component(("OB", "Kundtillägg"))
+    )
     known_values = [Decimal(str(line["amount"])) for line in lines if line["amount"] is not None]
     unknown = any(line["amount"] is None for line in lines)
     known = float(sum(known_values)) if known_values or not unknown else None
