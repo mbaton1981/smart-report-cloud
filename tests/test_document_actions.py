@@ -18,6 +18,55 @@ Totalt att betala (kronor) 1208"""
 
 
 class CostExtractionTests(unittest.TestCase):
+    def test_swedish_short_year_invoice_date_is_parsed_as_year_first(self):
+        from expense_documents import _date_value
+
+        self.assertEqual(_date_value("26-11-11"), "2026-11-11")
+        self.assertEqual(_date_value("50-01-02"), "1950-01-02")
+        self.assertIsNone(_date_value("26-13-11"))
+
+    def test_cash_note_uses_fakturadatum_not_a_payment_due_date(self):
+        def cell(text, x, y):
+            return {"text": text, "x0": x, "x1": x + len(text) * 6,
+                    "y0": y, "y1": y + 10}
+
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "KONTANTNOTA\nFakturadatum\n26-11-11\nFörfallodag\nKort\nSEK",
+            "elements": [
+                cell("KONTANTNOTA", 20, 10),
+                cell("Fakturadatum", 20, 40), cell("26-11-11", 180, 40),
+                cell("Förfallodag", 20, 60), cell("Kort", 180, 60),
+                cell("Kontantnota", 20, 80), cell("1104790", 180, 80),
+            ],
+        }])
+
+        self.assertEqual(fields["document_type"], "receipt")
+        self.assertEqual(fields["document_date"], "2026-11-11")
+        self.assertIsNone(fields["due_date"])
+
+    def test_explicit_zero_vat_does_not_infer_missing_currency(self):
+        fields = parse_invoice_pages([
+            {"page": 1, "text": """Faktura
+Fakturanummer: 63
+Fakturadatum: 2026-11-11
+Förfallodatum: 2026-12-11
+Exkl. moms 67 240,00
+Moms (0 %) 0,00
+Att betala 67 240,00
+Omvänd betalningsskyldighet"""},
+            {"page": 2, "text": "Arbetsrapport\n164 timmar"},
+        ])
+
+        self.assertEqual(fields["document_type"], "invoice")
+        self.assertEqual(fields["document_date"], "2026-11-11")
+        self.assertEqual(fields["due_date"], "2026-12-11")
+        self.assertEqual(fields["net_amount"], "67240.00")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["gross_amount"], "67240.00")
+        self.assertEqual(fields["currency_code"], "UNKNOWN")
+        self.assertTrue(fields["reverse_charge"])
+
     def test_invoice_summary_with_period_column_and_rounding_is_extracted(self):
         def cell(text, x, y):
             return {"text": text, "x0": x, "x1": x + len(text) * 6,

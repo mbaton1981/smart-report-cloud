@@ -320,13 +320,22 @@ class IncomingStore(OfflineReviewStore):
                       if destination == "object"]
         if len(set(object_ids)) != len(object_ids):
             problems.append("Укажите каждый объект одной строкой.")
-        for key in ("supplier_name", "document_date", "gross_amount", "currency_code"):
+        required_fields = {
+            "supplier_name": "Укажите поставщика.",
+            "document_date": "Укажите дату документа.",
+            "gross_amount": "Укажите сумму расхода.",
+        }
+        for key, message in required_fields.items():
             if payload.get(key) in (None, "", "UNKNOWN"):
-                problems.append(f"Не заполнено обязательное поле: {key}.")
-        try:
-            date.fromisoformat(payload.get("document_date") or "")
-        except (ValueError, TypeError):
-            problems.append("Укажите корректную дату ГГГГ-ММ-ДД.")
+                problems.append(message)
+        if payload.get("currency_code") not in {
+                "SEK", "EUR", "NOK", "DKK", "USD", "GBP", "CHF", "PLN"}:
+            problems.append("Выберите валюту.")
+        if payload.get("document_date") not in (None, ""):
+            try:
+                date.fromisoformat(payload["document_date"])
+            except (ValueError, TypeError):
+                problems.append("Укажите корректную дату документа.")
         gross = parse_invoice_money(payload.get("gross_amount"))
         vat = parse_invoice_money(payload.get("vat_amount"))
         if gross is None or not gross.is_finite() or gross <= 0:

@@ -99,10 +99,16 @@ def _date_value(value: str | None) -> str | None:
     if match:
         year, month, day = map(int, match.groups())
     else:
-        match = re.search(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b", value)
-        if not match:
-            return None
-        day, month, year = map(int, match.groups())
+        match = re.search(r"\b(\d{2})-(\d{2})-(\d{2})\b", value)
+        if match:
+            short_year, month, day = map(int, match.groups())
+            # Swedish YY-MM-DD uses a fixed pivot: 00-49 -> 2000s, 50-99 -> 1900s.
+            year = 2000 + short_year if short_year < 50 else 1900 + short_year
+        else:
+            match = re.search(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b", value)
+            if not match:
+                return None
+            day, month, year = map(int, match.groups())
     try:
         return datetime(year, month, day).strftime("%Y-%m-%d")
     except ValueError:

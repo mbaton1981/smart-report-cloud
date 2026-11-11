@@ -75,6 +75,7 @@ class OfflineReviewWindow(QDialog):
         self.gallery = None
         self.preview_document_id = None
         self.inputs, self.origins = {}, {}
+        self._validation_styles = {}
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
                             else "SmartReport — ЛОКАЛЬНЫЙ ТЕСТ: входящие PDF")
         self.resize(1450, 940)
@@ -142,6 +143,10 @@ class OfflineReviewWindow(QDialog):
             form.addRow(self.receipt_paid)
         else:
             self.receipt_paid.hide()
+
+        def clear_input_error(field_key):
+            return lambda: self._clear_validation_field(field_key)
+
         for key, label in LABELS.items():
             if integrated and key in ("due_date", "amount_due", "rounding_amount"):
                 continue
@@ -156,8 +161,13 @@ class OfflineReviewWindow(QDialog):
             box.setContentsMargins(0, 0, 0, 0)
             field = QLineEdit()
             field.setObjectName("review_" + key)
-            field.setPlaceholderText("Сумма не определена — нужна проверка" if key == "gross_amount"
-                                     else "Не указано / не распознано")
+            placeholders = {
+                "document_date": "Укажите дату документа",
+                "currency_code": "Выберите валюту",
+                "gross_amount": "Сумма не определена — нужна проверка",
+            }
+            field.setPlaceholderText(placeholders.get(key, "Не указано / не распознано"))
+            self._validation_styles[key] = field.styleSheet()
             origin = QLabel()
             origin.setWordWrap(True)
             box.addWidget(field)
@@ -167,6 +177,7 @@ class OfflineReviewWindow(QDialog):
             form.addRow(label + ":", row)
             self.inputs[key], self.origins[key] = field, origin
             field.textChanged.connect(self.update_origins)
+            field.textChanged.connect(clear_input_error(key))
         self.amount_choices = QComboBox()
         if integrated:
             self.amount_label = QLabel("Найденные суммы — выберите по оригиналу:")
@@ -223,8 +234,16 @@ class OfflineReviewWindow(QDialog):
             self.inputs["gross_amount"].textChanged.connect(self.update_allocation_total)
         else:
             form.addRow("Объект:", self.object)
-        self.checked = QCheckBox("Сверил оригинал, реквизиты и отсутствие повтора покупки")
+        self.checked = QCheckBox("Сверил оригинал")
+        self.checked.setObjectName("review_original_checked")
         form.addRow(self.checked)
+        self.original_check_help = QLabel(
+            "Эта отметка обязательна перед учётом расхода: откройте PDF и сверьте реквизиты, "
+            "сумму, валюту, назначение и отсутствие повторной покупки. Сама отметка не создаёт расход."
+        )
+        self.original_check_help.setWordWrap(True)
+        form.addRow(self.original_check_help)
+        self.checked.toggled.connect(lambda: self.checked.setStyleSheet(""))
         self.diagnostics_button = QPushButton("Диагностика")
         self.diagnostics_button.setCheckable(True)
         form.addRow(self.diagnostics_button)
@@ -735,6 +754,9 @@ class OfflineReviewWindow(QDialog):
                 for button in (self.ignore_button, self.later_button, self.expense_button):
                     button.setEnabled(False)
             return
+        for key in self._validation_styles:
+            self._clear_validation_field(key)
+        self.checked.setStyleSheet("")
         self.revision, payload = (self.store.current_review(self.document_id) if self.integrated
                                   else self.store.latest(self.document_id))
         self.loaded_review = payload
@@ -923,10 +945,44 @@ class OfflineReviewWindow(QDialog):
                 refresh()
         return True
 
+    def _clear_validation_field(self, key):
+        field = self.inputs.get(key)
+        if field is not None:
+            field.setStyleSheet(self._validation_styles.get(key, ""))
+
+    def _focus_validation_error(self, problems):
+        for key in self._validation_styles:
+            self._clear_validation_field(key)
+        self.checked.setStyleSheet("")
+        problem_text = "\n".join(problems)
+        field_prompts = {
+            "supplier_name": ("Укажите поставщика",),
+            "document_date": ("Укажите дату документа", "Укажите корректную дату документа"),
+            "gross_amount": ("Укажите сумму расхода", "положительную сумму расхода"),
+            "currency_code": ("Выберите валюту",),
+        }
+        invalid_fields = []
+        for key, prompts in field_prompts.items():
+            if any(prompt in problem_text for prompt in prompts):
+                field = self.inputs[key]
+                field.setStyleSheet(self._validation_styles[key] + "\nQLineEdit { border: 2px solid #c53030; }")
+                invalid_fields.append(field)
+        if "Подтвердите сверку оригинала" in problem_text:
+            self.checked.setStyleSheet("QCheckBox { border: 2px solid #c53030; padding: 3px; }")
+        if invalid_fields:
+            field = invalid_fields[0]
+            self.financial_panel.ensureWidgetVisible(field)
+            field.setFocus()
+            field.selectAll()
+        elif "Подтвердите сверку оригинала" in problem_text:
+            self.financial_panel.ensureWidgetVisible(self.checked)
+            self.checked.setFocus()
+
     def confirm_transfer(self):
         problems = self.store.issues(self.document_id, self.payload())
         if problems:
             QMessageBox.warning(self, "Перенос запрещён", "\n".join(problems))
+            self._focus_validation_error(problems)
             return
         if not self.integrated:
             answer = QMessageBox.question(

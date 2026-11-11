@@ -86,6 +86,57 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("Исключён — Подтверждение заказа, не учитывать",
                       window.selector.currentText())
 
+    def test_missing_date_and_currency_are_localized_focused_and_do_not_clear_review(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        window = self.open_window()
+        window.allocations.setRowCount(0)
+        window.add_allocation({
+            "destination": "object", "object_id": self.object_id, "gross_amount": "125.00",
+        })
+        window.inputs["gross_amount"].setText("125.00")
+        window.inputs["document_date"].clear()
+        window.inputs["currency_code"].clear()
+        allocation_before = window.payload()["allocations"]
+        gross_before = window.inputs["gross_amount"].text()
+
+        with patch("offline_review_ui.QMessageBox.warning") as warning:
+            window.confirm_transfer()
+
+        message = warning.call_args.args[2]
+        self.assertIn("Укажите дату документа", message)
+        self.assertIn("Выберите валюту", message)
+        self.assertNotIn("document_date", message)
+        self.assertNotIn("currency_code", message)
+        self.assertIn("Сверил оригинал", window.checked.text())
+        self.assertIn("обязательна перед учётом расхода", window.original_check_help.text())
+        self.assertEqual(window.inputs["document_date"].placeholderText(), "Укажите дату документа")
+        self.assertEqual(window.inputs["currency_code"].placeholderText(), "Выберите валюту")
+        self.assertIn("#c53030", window.inputs["document_date"].styleSheet())
+        self.assertIn("#c53030", window.inputs["currency_code"].styleSheet())
+        self.assertEqual(window.focusWidget(), window.inputs["document_date"])
+        self.assertEqual(window.payload()["allocations"], allocation_before)
+        self.assertEqual(window.inputs["gross_amount"].text(), gross_before)
+        self.assertIsNone(self.store.card(1))
+        self.assertTrue(window.save_edits())
+
+    def test_manual_date_currency_and_original_check_make_test_copy_ready(self):
+        window = self.open_window()
+        window.allocations.setRowCount(0)
+        window.add_allocation({
+            "destination": "object", "object_id": self.object_id, "gross_amount": "125.00",
+        })
+        window.inputs["document_date"].setText("2026-10-21")
+        window.inputs["currency_code"].setText("XYZ")
+        self.assertIn("Выберите валюту.", self.store.issues(1, window.payload()))
+        window.inputs["currency_code"].setText("EUR")
+        window.checked.setChecked(True)
+
+        self.assertEqual(self.store.issues(1, window.payload()), [])
+        self.assertIsNone(self.store.card(1))
+        self.assertEqual(window.payload()["currency_code"], "EUR")
+        self.assertTrue(window.save_edits())
+
     def test_rerecognition_conflict_is_explained_without_replacing_saved_type(self):
         base = self.store.base(1)
         base["document_type"] = "receipt"
