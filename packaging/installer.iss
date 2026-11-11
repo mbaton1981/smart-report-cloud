@@ -32,7 +32,7 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Tasks]
-Name: "shortcuts"; Description: "Create Start Menu and Desktop shortcuts"; GroupDescription: "Shortcuts:"; Flags: checkedonce
+Name: "shortcuts"; Description: "Create Start Menu and Desktop shortcuts"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Icons]
 Name: "{autoprograms}\SmartReport {#AppVersion}"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\launch_fresh_profile.ps1"" -ExecutablePath ""{app}\SmartReport.exe"""; WorkingDir: "{app}"; IconFilename: "{app}\SmartReport.exe"; Tasks: shortcuts

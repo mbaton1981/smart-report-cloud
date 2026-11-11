@@ -138,10 +138,45 @@ class InvoiceSupplierTests(unittest.TestCase):
         self.assertEqual(fields["vat_amount"], "229.94")
         self.assertEqual(fields["gross_amount"], "1149.68")
         self.assertEqual(fields["amount_due"], "1149.68")
-        self.assertEqual(
-            fields["field_sources"]["supplier_name"][0]["kind"],
-            "seller_address_block",
-        )
+        self.assertIn(fields["field_sources"]["supplier_name"][0]["kind"],
+                      {"seller_address_block", "seller_registration_block"})
+
+    def test_registered_footer_issuer_beats_buyer_and_parses_combined_invoice_ocr_and_rounding(self):
+        text = "\n".join((
+            "Santander Consumer Bank",
+            "FE 302, 171 75 Stockholm",
+            "Faktura",
+            "Bygger och renoverar i Sthlm AB",
+            "INGRID HORNS VÄG 8",
+            "136 36 HANDEN",
+            "Fakturanr/OCR-nr 619719487",
+            "Faktureringsdatum 2026-11-09",
+            "Oss tillhanda senast 2026-12-01",
+            "OCR-nr 619719487",
+            "Hyra 20261201 - 20261231 4 142,00",
+            "Administrationsavgift 59,00",
+            "Moms 25 % 1 050,25",
+            "Öresavrundning −0,25",
+            "Att betala 5 251,00 kr",
+            "Santander Consumer Bank AS Norge,Sverige filial orgnr 516406-0336 VATnr SE516406033601",
+        ))
+
+        fields = parse_invoice_pages([{"text": text, "page": 1}])
+
+        self.assertEqual(fields["supplier_name"], "Santander Consumer Bank AS Norge, Sverige filial")
+        self.assertEqual(fields["supplier_org_number"], "516406-0336")
+        self.assertEqual(fields["supplier_vat_number"], "SE516406033601")
+        self.assertEqual(fields["invoice_number"], "619719487")
+        self.assertEqual(fields["payment_reference"], "619719487")
+        self.assertEqual(fields["document_date"], "2026-11-09")
+        self.assertEqual(fields["due_date"], "2026-12-01")
+        self.assertEqual(fields["net_amount"], "4201.00")
+        self.assertEqual(fields["vat_amount"], "1050.25")
+        self.assertEqual(fields["gross_amount"], "5251.25")
+        self.assertEqual(fields["rounding_amount"], "-0.25")
+        self.assertEqual(fields["amount_due"], "5251.00")
+        self.assertEqual(fields["field_sources"]["supplier_name"][0]["kind"],
+                         "seller_registration_block")
 
 
 if __name__ == "__main__":

@@ -417,19 +417,32 @@ def invoice_seller_blocks(cells, page):
     candidates = []
     width = max((cell["x1"] for cell in cells), default=1)
     height = max((cell["y1"] for cell in cells), default=1)
+    registered_company = re.compile(
+        r"(?:^|[,|])\s*(?P<name>[A-ZÅÄÖ0-9][A-ZÅÄÖa-zåäö0-9&.'’()\- ]{1,100}?"
+        r"\b(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS))"
+        r"(?P<branch>\s+Norge\s*,\s*Sverige\s+filial)?(?=,|\s|$)",
+        re.IGNORECASE,
+    )
     for cell in cells:
         value = cell["text"].strip()
         if any(re.match(r"^(?:Faktura(?:mottagare|adress)|Fakturerat\s+till|Faktureringsadress|Betalningsavsändare|Köparens\s+adress|Köpare|Buyer|Leveransadress)\b", other["text"], re.IGNORECASE)
                and abs(other["x0"] - cell["x0"]) < 24 and 0 <= cell["y0"] - other["y0"] < 100
                for other in cells):
             continue
+        for registered in registered_company.finditer(value):
+            name = re.sub(r"\s*,\s*", ", ",
+                          registered.group("name") + (registered.group("branch") or "")).strip()
+            identity = invoice_supplier_identifiers(page, name)
+            if identity["values"]:
+                candidates.append((99 if registered.group("branch") else 98,
+                                   name, page, cell, "seller_registration_block"))
         if re.fullmatch(r"(?:Post|Besöks)?adress\s*:?", value, re.IGNORECASE):
             below = [other for other in cells if abs(other["x0"] - cell["x0"]) < 12
                      and 4 < other["y0"] - cell["y0"] < 28
                      and re.fullmatch(r"[^\d@:/]{3,160}", other["text"].strip())]
             if below:
                 nearest = min(below, key=lambda other: other["y0"])
-                candidates.append((90, nearest["text"].strip(), page, nearest))
+                candidates.append((90, nearest["text"].strip(), page, nearest, "seller_address_block"))
         company = re.match(r"^(.+?\b(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS)(?:\s+Servicecenter)?)(?=\s*[,|]|$)", value, re.IGNORECASE)
         if not company:
             continue
@@ -458,9 +471,10 @@ def invoice_seller_blocks(cells, page):
         identity = invoice_supplier_identifiers(page, name)
         own_registration = own_registration or bool(identity["values"])
         if cell["y0"] < height * 0.3:
-            candidates.append((95 if own_registration else 82 if cell["x0"] < width * 0.45 else 80, name, page, cell))
+            candidates.append((95 if own_registration else 82 if cell["x0"] < width * 0.45 else 80,
+                               name, page, cell, "seller_address_block"))
         elif cell["y0"] > height * 0.65:
-            candidates.append((95 if own_registration else 85, name, page, cell))
+            candidates.append((95 if own_registration else 85, name, page, cell, "seller_address_block"))
     return candidates
 
 
@@ -486,6 +500,44 @@ def invoice_supplier_identifiers(page, supplier_name):
         "supplier_org_number": re.compile(r"(?<!\d)\d{6}[- ]?\d{4}(?!\d)"),
         "supplier_vat_number": re.compile(r"(?<!\w)SE[\s-]*\d(?:[\s-]*\d){11}(?!\w)", re.IGNORECASE),
     }
+    supplier_aliases = [supplier_name]
+    without_branch = re.sub(r"\s+Norge\s*,\s*Sverige\s+filial$", "", supplier_name,
+                            flags=re.IGNORECASE)
+    if without_branch != supplier_name:
+        supplier_aliases.append(without_branch)
+    exact_name_patterns = []
+    for alias in supplier_aliases:
+        exact_name = []
+        for token in re.split(r"(\s*,\s*|\s+)", alias.strip()):
+            if not token:
+                continue
+            exact_name.append(r",\s*" if "," in token else r"\s+" if token.isspace() else re.escape(token))
+        exact_name_patterns.append(re.compile("".join(exact_name), re.IGNORECASE))
+    exact_labels = {
+        "supplier_org_number": re.compile(r"\b(?:Org\.?\s*(?:nr|nummer)|Organisationsnummer)\b", re.IGNORECASE),
+        "supplier_vat_number": re.compile(
+            r"\b(?:Moms(?:nummer|reg(?:istrerings)?(?:nummer|nr)?)|VAT(?:\s*(?:no\.?|number|nr))?)\b",
+            re.IGNORECASE,
+        ),
+    }
+    for key, label in exact_labels.items():
+        for line in lines:
+            for name_pattern in exact_name_patterns:
+                for match in name_pattern.finditer(line):
+                    context = line[match.end():match.end() + 140]
+                    caption = label.search(context)
+                    value = patterns[key].search(context, caption.end()) if caption else None
+                    if value:
+                        identifiers[key] = re.sub(r"\s+", "", value.group(0))
+                        sources[key] = {
+                            "page": page.get("page", 1), "text": context,
+                            "kind": "seller_identity_block",
+                        }
+                        break
+                if key in identifiers:
+                    break
+            if key in identifiers:
+                break
     for key, label in labels.items():
         for index, line in enumerate(lines):
             match = label.search(line)
@@ -559,7 +611,9 @@ def parse_invoice_pages(pages):
     non_invoice_type = fields.get("non_invoice_document_type")
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
-        "invoice_number": r"Fakturanummer|Faktura\s*nr\.?|Faktura/OCR-nummer|Invoice\s*(?:number|no\.?)",
+        "invoice_number": r"Fakturanummer|Fakturanr\s*/\s*OCR(?:\s*[- ]?\s*nr\.?)?|"
+                          r"Faktura\s*/\s*OCR(?:\s*[- ]?\s*(?:nummer|nr\.?)?)?|"
+                          r"Faktura\s*nr\.?|Invoice\s*(?:number|no\.?)",
         "payment_reference": r"OCR(?:(?:-|\s+)\s*(?:nummer|nr)(?:/meddelande)?|/Meddelande|-/referensnummer)?|Betalningsreferens|Payment\s*reference|Vänligen\s+ange\s+referens",
         "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date",
         "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda(?:\s+senast)?|Tillhanda\s+senast|Due\s*date|Payment\s*due",
@@ -756,9 +810,9 @@ def parse_invoice_pages(pages):
         priority = max(item[0] for item in companies)
         best = [item for item in companies if item[0] == priority]
         if len({item[1].casefold() for item in best}) == 1:
-            _, company, page, cell = best[0]
+            _, company, page, cell, kind = best[0]
             candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"],
-                                                       "kind": "seller_address_block"}))
+                                                       "kind": kind}))
             supplier_identity = invoice_supplier_identifiers(page, company)
     fiscal_summary_pages = {
         (source.get("attachment_index", 0), source["page"])

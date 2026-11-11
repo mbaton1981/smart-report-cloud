@@ -343,8 +343,20 @@ class OfflineReviewWindow(QDialog):
         combo.set_object_choices(
             self.store.objects(), selected=selected_data,
             show_archived=self.show_archived_objects.isChecked(),
-            placeholder="Выберите назначение", include_company=True,
+            placeholder=("Выберите объект или общие расходы"
+                         if selected is None and not part.get("object_options")
+                         else "Выберите назначение"),
+            include_company=True,
         )
+        def update_assignment_style():
+            unselected = combo.currentData() in (None, "unselected")
+            combo.setStyleSheet(
+                "QComboBox { background-color: #fff3cd; border: 1px solid #d39e00; }"
+                if unselected else ""
+            )
+        combo.currentIndexChanged.connect(update_assignment_style)
+        combo.currentTextChanged.connect(lambda _text: update_assignment_style())
+        update_assignment_style()
         combo.setToolTip(combo.currentText())
         combo.currentTextChanged.connect(combo.setToolTip)
         self.allocations.setCellWidget(row, 0, combo)
@@ -374,7 +386,13 @@ class OfflineReviewWindow(QDialog):
                 + (" [Архив]" if not item.get("is_active", 1) else "")
                 for item in part.get("object_options", [])
             )
-            suggestion = f"Варианты: {options}; назначение не выбрано." if options else "Объект не найден."
+            selected = next((item for item in part.get("object_options", [])
+                             if item["id"] == part.get("object_id")), None)
+            suggestion = (f"Подставлен: {selected['name']} — проверьте назначение."
+                          if selected else
+                          f"Варианты: {options}; выберите вручную."
+                          if options else
+                          "Выберите объект или общие расходы.")
             marker_label = part["marker"] or "Без маркировки — заказ " + ", ".join(part["orders"])
             lines.append(
                 f"{escape(marker_label)} — {escape(suggestion)}: "
@@ -402,7 +420,15 @@ class OfflineReviewWindow(QDialog):
             if parse_invoice_money(self.inputs[key].text()) != parse_invoice_money(base.get(key)):
                 QMessageBox.warning(self, "Нужна проверка", "Нетто или НДС изменены вручную. Предложение исходного PDF не применено.")
                 return
-        if self.allocations.rowCount() or parse_invoice_money(self.inputs["gross_amount"].text()) != parse_invoice_money(proposal["total"]):
+        if self.proposal_matches_form(proposal):
+            self.status.setText(
+                "Предложение уже заполнено в форме. Проверьте объекты и суммы; ничего не сохранено."
+            )
+            return
+        loaded_payload = getattr(self, "loaded_payload", {})
+        gross_changed = (parse_invoice_money(self.inputs["gross_amount"].text())
+                         != parse_invoice_money(loaded_payload.get("gross_amount")))
+        if self.allocations.rowCount() or gross_changed:
             if QMessageBox.question(self, "Применить предложение?",
                     "Заменить текущие строки распределения предложением и установить итог с указанным "
                     "округлением? Нетто и НДС не меняются. Сохранение — отдельной кнопкой.",
@@ -417,6 +443,22 @@ class OfflineReviewWindow(QDialog):
             "Предложение заполнено только в форме. Проверьте объекты и суммы; ничего не сохранено. "
             "Расход появится в итогах только после «Учесть как расход».")
 
+    def proposal_matches_form(self, proposal):
+        from expense_documents import parse_invoice_money
+        if (self.allocations.rowCount() != len(proposal["parts"])
+                or parse_invoice_money(self.inputs["gross_amount"].text())
+                != parse_invoice_money(proposal["total"])):
+            return False
+        for row, part in enumerate(proposal["parts"]):
+            destination, object_id = self.allocation_target(row)
+            expected_id = part.get("object_id")
+            expected_destination = "object" if expected_id is not None else "unselected"
+            amount = self.allocations.item(row, 1)
+            if (destination != expected_destination or object_id != expected_id or amount is None
+                    or parse_invoice_money(amount.text()) != parse_invoice_money(part["gross_amount"])):
+                return False
+        return True
+
     def update_allocation_total(self, *_):
         if not self.integrated or not hasattr(self, "allocation_total"):
             return
@@ -430,7 +472,7 @@ class OfflineReviewWindow(QDialog):
             self.allocation_total.setText("Проверьте суммы частей. Черновик можно сохранить.")
             return
         if any(destination not in {"object", "company"} for destination in destinations):
-            self.allocation_total.setText("Выберите общие расходы фирмы или объект для каждой части.")
+            self.allocation_total.setText("Выберите объект или общие расходы для каждой незаполненной части.")
             return
         allocated = sum(amounts, Decimal(0))
         self.allocation_total.setText(

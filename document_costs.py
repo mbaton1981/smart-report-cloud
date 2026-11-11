@@ -75,13 +75,20 @@ def propose_object_allocations(fields, objects):
             "company": str(obj.get("company") or ""),
             "is_active": str(obj.get("is_active", 1)).strip().casefold() not in {"0", "false", "no"},
         } for obj in matches]
-        warning = ("Неизвестная маркировка — выберите объект вручную" if not matches else
-                   "Маркировка совпала с несколькими объектами — выберите вручную" if len(matches) > 1 else
-                   "Объект неактивен" if not options[0]["is_active"] else
-                   "Проверьте предложенный объект и выберите его вручную")
+        object_id = None
+        if len(options) == 1 and options[0]["is_active"]:
+            object_id = options[0]["id"]
+            warning = ""
+        elif not matches:
+            warning = "Неизвестная маркировка — выберите объект или общие расходы"
+        elif len(matches) > 1:
+            warning = "Маркировка совпала с несколькими объектами — выберите вручную"
+        else:
+            warning = "Объект неактивен — выберите объект или общие расходы"
         adjustment = Decimal(cents[key]) / 100 * (-1 if rounding < 0 else 1)
         result["parts"].append({
-            "marker": part["marker"], "object_id": None, "object_name": "",
+            "marker": part["marker"], "object_id": object_id,
+            "object_name": options[0]["name"] if object_id is not None else "",
             "object_options": options, "warning": warning,
             "net_amount": decimal_text(part["net"]), "vat_amount": decimal_text(part["vat"]),
             "before_rounding": decimal_text(part["net"] + part["vat"]),

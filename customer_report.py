@@ -239,17 +239,29 @@ def prepare_customer_costs(report):
 def write_customer_pdf(
     report, filepath, font, bold_font, translate, *, journal_only=False, activity_only=False,
 ):
+    body_size = 9 if activity_only else 10
+    body_leading = 11 if activity_only else 13
     styles = {
-        "body": ParagraphStyle("CustomerBody", fontName=font, fontSize=10, leading=13),
-        "bold": ParagraphStyle("CustomerBold", fontName=bold_font, fontSize=10, leading=13),
+        "body": ParagraphStyle("CustomerBody", fontName=font, fontSize=body_size, leading=body_leading),
+        "bold": ParagraphStyle("CustomerBold", fontName=bold_font, fontSize=body_size, leading=body_leading),
         "header": ParagraphStyle(
-            "CustomerHeader", fontName=bold_font, fontSize=10, leading=12,
+            "CustomerHeader", fontName=bold_font, fontSize=body_size,
+            leading=11 if activity_only else 12,
             textColor=colors.HexColor("#152a38"),
         ),
-        "title": ParagraphStyle("CustomerTitle", fontName=bold_font, fontSize=17, leading=21),
+        "title": ParagraphStyle(
+            "CustomerTitle", fontName=bold_font,
+            fontSize=16 if activity_only else 17, leading=19 if activity_only else 21,
+        ),
+        "summary_value": ParagraphStyle(
+            "CustomerSummaryValue", fontName=bold_font, fontSize=11, leading=12,
+        ),
+        "summary_total": ParagraphStyle(
+            "CustomerSummaryTotal", fontName=bold_font, fontSize=11, leading=12,
+        ),
         "total": ParagraphStyle("CustomerTotal", fontName=bold_font, fontSize=12, leading=16),
     }
-    for name in ("body", "header", "total"):
+    for name in ("body", "header", "summary_value", "summary_total", "total"):
         styles[name + "_number"] = ParagraphStyle(
             "Customer" + name + "Number", parent=styles[name], alignment=TA_RIGHT,
         )
@@ -266,17 +278,33 @@ def write_customer_pdf(
                 f"Beställare: {report['company']}   |   Objekt: {report['object']}\n"
                 f"Period: {report['date_from']} – {report['date_to']}",
             ),
-            Spacer(1, 10),
+            Spacer(1, 6 if activity_only else 10),
         ]
 
-    def table(data, widths, *, total=False, numeric=()):
+    def table(
+        data, widths, *, total=False, total_row=None, numeric=(), bold_rows=(), large_value_rows=(),
+    ):
+        emphasized_total_row = total_row if total_row is not None else (len(data) - 1 if total else None)
+
+        def cell_style(index, column):
+            is_total = index == emphasized_total_row
+            if index == 0:
+                style = "header"
+            elif is_total:
+                style = "summary_total" if activity_only else "total"
+            elif index in bold_rows:
+                style = "bold"
+            else:
+                style = "body"
+            if column in numeric:
+                if index in large_value_rows and not is_total:
+                    style = "summary_value"
+                style += "_number"
+            return style
+
         rows = [
             [
-                paragraph(
-                    value,
-                    ("header" if index == 0 else "total" if total and index == len(data) - 1 else "body")
-                    + ("_number" if column in numeric else ""),
-                )
+                paragraph(value, cell_style(index, column))
                 for column, value in enumerate(row)
             ]
             for index, row in enumerate(data)
@@ -284,19 +312,22 @@ def write_customer_pdf(
         result = LongTable(
             rows, colWidths=widths, repeatRows=1, splitByRow=1, splitInRow=1, hAlign="LEFT",
         )
+        padding = 3 if activity_only else 4
         result.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbe7ef")),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f4f6f8")]),
             ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#28475b")),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), padding),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), padding),
         ]))
-        if total:
+        if emphasized_total_row is not None:
             result.setStyle(TableStyle([
-                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#dbe7ef")),
-                ("LINEABOVE", (0, -1), (-1, -1), 1, colors.HexColor("#28475b")),
-                ("NOSPLIT", (0, -2), (-1, -1)),
+                ("BACKGROUND", (0, emphasized_total_row), (-1, emphasized_total_row),
+                 colors.HexColor("#dbe7ef")),
+                ("LINEABOVE", (0, emphasized_total_row), (-1, emphasized_total_row),
+                 0.8, colors.HexColor("#28475b")),
+                ("NOSPLIT", (0, max(0, emphasized_total_row - 1)), (-1, emphasized_total_row)),
             ]))
         return result
 
@@ -314,22 +345,42 @@ def write_customer_pdf(
         ]))
         return result
 
+    def format_count(value):
+        quantity = float(value or 0)
+        return str(int(quantity)) if quantity.is_integer() else format_quantity(quantity)
+
     story = []
     totals = report["totals"]
     if not journal_only:
         if activity_only:
             story.extend(heading("Arbetstidsrapport"))
+            ordinary_hours = sum(
+                float(row.get("hours") or 0) for row in report["journal_rows"]
+                if row["entry_type"] == "work"
+            )
+            ob_hours = sum(
+                float(row.get("hours") or 0) for row in report["journal_rows"]
+                if row["entry_type"] == "ob"
+            )
+            total_hours = float(totals["hours"])
+            if abs(ordinary_hours + ob_hours - total_hours) > 0.000001:
+                raise ValueError("Arbetstimmar och OB-pass stämmer inte med rapportens total.")
             trips = sum(
                 float(row.get("transport") or 0) for row in report["journal_rows"]
                 if row["entry_type"] in WORK_TYPES
             )
             summary = [
                 ["Sammanfattning", "Värde"],
-                ["Arbetade timmar", format_quantity(totals["hours"]) + " h"],
-                ["Antal resor", format_quantity(trips)],
+                ["Ordinarie arbete", format_quantity(ordinary_hours) + " h"],
+                ["OB-pass, hela registrerade timmar", format_quantity(ob_hours) + " h"],
+                ["Totalt arbete", format_quantity(total_hours) + " h"],
+                ["Antal resor", format_count(trips) + " resor"],
             ]
-            story.append(table(summary, [available * .66, available * .34], numeric=(1,)))
-            story.append(paragraph("Rapporten visar registrerat arbete och tid; priser och tillägg ingår inte."))
+            story.append(table(
+                summary, [available * .66, available * .34], total_row=3, numeric=(1,),
+                bold_rows=(1, 2, 3, 4), large_value_rows=(1, 2, 3, 4),
+            ))
+            story.append(Spacer(1, 7))
         else:
             story.extend(heading("Fakturaunderlag"))
             story.append(paragraph("Status: Pågående"))
@@ -434,8 +485,13 @@ def write_customer_pdf(
             story.append(KeepTogether(bottom))
         if not activity_only:
             story.append(PageBreak())
-    story.extend(heading("Arbetsjournal"))
-    journal = [["Datum", "Medarbetare", "Faktisk tid", "Timmar", "Arbetsbeskrivning"]] if activity_only else [
+    if activity_only:
+        story.append(paragraph("Arbetsjournal", "bold"))
+    else:
+        story.extend(heading("Arbetsjournal"))
+    journal = [[
+        "Datum", "Medarbetare", "Typ", "Faktisk tid", "Timmar", "Resor", "Arbetsbeskrivning",
+    ]] if activity_only else [
         ["Datum", "Medarbetare", "Typ", "Timmar", "Tid / OB", "Arbetsbeskrivning"]
     ]
 
@@ -450,6 +506,10 @@ def write_customer_pdf(
         start = facts.get("start") or row.get("start_time")
         end = facts.get("end") or row.get("end_time")
         if not start or not end:
+            if activity_only and row["entry_type"] == "work":
+                return "Ordinarie arbete"
+            if activity_only:
+                return "Ej angivet" if row["entry_type"] == "ob" else "–"
             return "Ej angivet"
         next_day = facts.get("next_day")
         if next_day is None:
@@ -480,22 +540,32 @@ def write_customer_pdf(
         )
         if activity_only:
             journal.append([
-                row["date"], row["employee"], actual_time(row), format_quantity(row["hours"]), description,
+                row["date"], row["employee"],
+                {"work": "Arbete", "ob": "OB-arbete"}.get(
+                    row["entry_type"], TYPE_LABELS.get(row["entry_type"], "Övrig tid"),
+                ),
+                actual_time(row), format_quantity(row["hours"]),
+                format_count(row.get("transport")) if float(row.get("transport") or 0) > 0 else "–",
+                description,
             ])
         else:
             journal.append([
                 row["date"], row["employee"], TYPE_LABELS.get(row["entry_type"], "Övrig tid"),
                 format_quantity(row["hours"]), "\n".join(details), description,
             ])
-    widths = [65, 115, 90, 55, available - 325] if activity_only else [65, 115, 100, 55, 140, available - 475]
-    story.append(table(journal, widths, numeric=(3,)))
+    widths = (
+        [74, 95, 78, 82, 52, 52, available - 433]
+        if activity_only else [65, 115, 100, 55, 140, available - 475]
+    )
+    story.append(table(journal, widths, numeric=(4, 5) if activity_only else (3,)))
     journal_work_hours = sum(float(row["hours"]) for row in report["journal_rows"] if row["entry_type"] in WORK_TYPES)
     if abs(journal_work_hours - totals["hours"]) > 0.000001:
         raise ValueError("Arbetsjournalens timmar stämmer inte med fakturaunderlaget.")
-    story.extend([
-        Spacer(1, 8),
-        highlight("Totalt antal arbetade timmar", format_quantity(journal_work_hours) + " h"),
-    ])
+    if journal_only:
+        story.extend([
+            Spacer(1, 8),
+            highlight("Totalt antal arbetade timmar", format_quantity(journal_work_hours) + " h"),
+        ])
     if not activity_only:
         absence = defaultdict(float)
         for row in report["journal_rows"]:

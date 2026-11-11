@@ -330,13 +330,57 @@ class CustomerReportTests(unittest.TestCase):
         text = "\n".join(page.extract_text() for page in pages)
         self.assertIn("Arbetstidsrapport", text)
         self.assertIn("Antal resor", text)
-        self.assertIn("1,0", text)
-        self.assertIn("registrerat arbete och tid", text)
+        self.assertIn("OB-pass, hela registrerade timmar", text)
+        self.assertIn("Resor", text)
+        self.assertIn("1", text)
+        self.assertNotIn("1,0", text)
+        self.assertIn("Ordinarie arbete", text)
         self.assertIn("16:00–20:00", text)
         self.assertIn("Montering", text)
         self.assertIn("Faktisk tid", text)
         for forbidden in ("OB1", "OB2", "Övertid", "SEK", "245,8", "№1", "Pris (", "tillägg – OB"):
             self.assertNotIn(forbidden, text)
+
+    def test_activity_pdf_separates_ordinary_ob_and_transport_without_double_count(self):
+        ordinary_id = self.shift(
+            day="2026-10-26", hours=5, transport=1, comment="Демонтаж стен",
+        )
+        for index in range(8):
+            self.ob(
+                name=f"Employee {index}", day="2026-10-28" if index < 4 else "2026-10-29",
+                transport=1 if index < 3 else 0,
+            )
+        report = self.window.generate_activity_report()
+        self.assertEqual(report["totals"]["hours"], 37)
+        report["journal_translations"] = {
+            row["sync_id"]: (
+                "Demontering av väggar" if row["sync_id"] == ordinary_id
+                else "Demontering av träbalkar"
+            )
+            for row in report["journal_rows"]
+        }
+
+        pdf = self.pdf(report, activity_only=True)
+        self.assertEqual(len(pdf.pages), 1)
+        text = pdf.pages[0].extract_text()
+        for expected in (
+            "Ordinarie arbete", "5,0 h", "OB-pass, hela registrerade timmar", "32,0 h",
+            "Totalt arbete", "37,0 h", "Antal resor", "4 resor", "OB-arbete",
+            "16:00–20:00", "Resor", "Demontering av väggar", "Demontering av träbalkar",
+        ):
+            self.assertIn(expected, text)
+        self.assertNotIn("4,0 resor", text)
+        self.assertNotIn("1,0", text)
+        self.assertNotIn("Ej angivet", text)
+        for forbidden in ("OB1", "OB2", "Övertid", "20%", "SEK", "Pris", "245,8"):
+            self.assertNotIn(forbidden, text)
+
+    def test_activity_pdf_rejects_mismatch_between_ordinary_ob_and_total_hours(self):
+        self.ob()
+        report = self.window.generate_activity_report()
+        report["totals"]["hours"] += 1
+        with self.assertRaisesRegex(ValueError, "stämmer inte"):
+            self.pdf(report, activity_only=True)
 
     def test_activity_report_ignores_saved_customer_allocation_without_changing_history(self):
         identifier = self.ob(transport=1)
@@ -421,9 +465,10 @@ class CustomerReportTests(unittest.TestCase):
         exported[0][2].pages[0].extract_text(
             visitor_text=lambda text, cm, tm, font, size: fragments.append((text, size)),
         )
-        self.assertTrue(any("Arbetade timmar" in text for text, _size in fragments))
+        self.assertTrue(any("Totalt arbete" in text for text, _size in fragments))
         combined = "\n".join(page.extract_text() for page in exported[0][2].pages)
-        self.assertIn("Rapporten visar registrerat arbete och tid", combined)
+        self.assertIn("Ordinarie arbete", combined)
+        self.assertIn("OB-pass, hela registrerade timmar", combined)
         self.assertNotIn("Preliminärt totalbelopp", combined)
         self.assertEqual(list(self.conn.iterdump()), before)
 

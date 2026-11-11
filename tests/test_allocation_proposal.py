@@ -1,5 +1,6 @@
 import copy
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +30,37 @@ OBJECTS = [{"id": 5, "name": "Object A", "markning": "p1022", "is_active": 1},
            {"id": 13, "name": "Object B", "markning": "p1035", "is_active": 1},
            {"id": 12, "name": "Object C", "markning": "p1027", "is_active": 0}]
 
+BEIJER_OBJECTS = [
+    {"id": 613148, "name": "HOTEL Hazeliusbacken 20, på Djurgården",
+     "markning": "p1039", "is_active": 1},
+    {"id": 14, "name": "Tallvagen 11 1:116, Lidingö Kejill ÄTA",
+     "markning": "p1037", "is_active": 1},
+]
+
+
+def beijer_fixture():
+    orders = [
+        ("8345806-01", "1039", "258.56", "64.64",
+         [("41.60", "10.40", 1), ("216.96", "54.24", 1)]),
+        ("8345807-01", None, "101.76", "25.44", [("101.76", "25.44", 1)]),
+        ("8782319-01", "P1037", "4182.96", "1045.74",
+         [("1845.36", "461.34", 2), ("345.60", "86.40", 2), ("1992.00", "498.00", 2)]),
+    ]
+    return {
+        "document_type": "invoice", "supplier_name": "BEIJER BYGGMATERIAL AB",
+        "invoice_number": "260420323123", "document_date": "2026-11-05",
+        "currency_code": "SEK", "raw_text": "Beijer order allocations",
+        "net_amount": "4543.28", "vat_amount": "1135.82", "gross_amount": "5679.10",
+        "rounding_amount": "-0.10", "amount_due": "5679.00",
+        "order_proposals": [
+            {"order_id": order_id, "project_code": marker, "net_amount": net, "vat_amount": vat,
+             "vat_items": [{"item": str(index + 1), "net_amount": item_net,
+                            "vat_amount": item_vat, "page": page}
+                           for index, (item_net, item_vat, page) in enumerate(items)]}
+            for order_id, marker, net, vat, items in orders
+        ],
+    }
+
 
 class ProposalTests(unittest.TestCase):
     def test_groups_orders_preserves_net_vat_and_reconciles_stated_rounding(self):
@@ -39,8 +71,19 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual([part["gross_amount"] for part in result["parts"]], ["592.32", "2411.02", "2282.66"])
         self.assertEqual([part["rounding"] for part in result["parts"]], ["-0.01", "-0.06", "-0.05"])
         self.assertEqual(result["total"], "5286.00")
-        self.assertEqual(result["parts"][2]["warning"], "Объект неактивен")
+        self.assertEqual([part["object_id"] for part in result["parts"]], [5, 13, None])
+        self.assertTrue(result["parts"][2]["warning"].startswith("Объект неактивен"))
         self.assertEqual(fields, before)
+
+    def test_beijer_9_autoselects_only_unique_active_objects_and_reconciles_rounding(self):
+        result = propose_object_allocations(beijer_fixture(), BEIJER_OBJECTS)
+        self.assertFalse(result["errors"])
+        self.assertEqual(result["total"], "5679.00")
+        self.assertEqual([part["gross_amount"] for part in result["parts"]],
+                         ["323.19", "127.20", "5228.61"])
+        self.assertEqual([part["object_id"] for part in result["parts"]], [613148, None, 14])
+        self.assertEqual(result["parts"][1]["warning"],
+                         "Неизвестная маркировка — выберите объект или общие расходы")
 
     def test_unknown_and_duplicate_markers_never_select_random_object(self):
         for objects in (OBJECTS[:2], [*OBJECTS, {**OBJECTS[2], "id": 99}]):
@@ -48,7 +91,7 @@ class ProposalTests(unittest.TestCase):
             self.assertIsNone(result["parts"][2]["object_id"])
             self.assertTrue(result["parts"][2]["warning"])
 
-    def test_equivalent_markings_group_across_pages_but_remain_unassigned(self):
+    def test_equivalent_markings_group_across_pages_and_select_unique_active_object(self):
         fields = fixture()
         fields["order_proposals"][2]["project_code"] = "10-35"
         fields["order_proposals"][2]["vat_items"][0]["page"] = 3
@@ -56,7 +99,7 @@ class ProposalTests(unittest.TestCase):
         part = next(item for item in result["parts"] if item["marker"] == "P1035")
         self.assertEqual(part["pages"], [2, 3])
         self.assertEqual([option["id"] for option in part["object_options"]], [13])
-        self.assertIsNone(part["object_id"])
+        self.assertEqual(part["object_id"], 13)
 
     def test_markings_match_format_variants_only_in_labeled_context(self):
         variants = ("P1039", "P10-39", "1039", "10-39")
@@ -143,7 +186,32 @@ class ProposalIntegrationTests(unittest.TestCase):
         document_id = self.store.documents()[-1]["id"]
         from offline_review_ui import OfflineReviewWindow
         window = OfflineReviewWindow(self.store, integrated=True)
-        self.addCleanup(window.close)
+        self.addCleanup(self.close_window, window)
+        window.selector.setCurrentIndex(window.selector.findData(document_id))
+        return window, document_id, objects
+
+    def close_window(self, window):
+        from PyQt6.QtWidgets import QMessageBox
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
+            window.close()
+
+    def prepare_beijer(self):
+        from test_mail_automation import pdf
+        objects = []
+        conn = self.server.get_db_connection()
+        for obj in BEIJER_OBJECTS:
+            cursor = conn.execute("""INSERT INTO meta_objects(company,name,markning,rate,transport_rate,is_active)
+                VALUES ('Renatur',?,?,300,450,?)""", (obj["name"], obj["markning"], obj["is_active"]))
+            objects.append({**obj, "id": cursor.lastrowid})
+        conn.commit()
+        conn.close()
+        self.host._expense_objects = objects
+        self.store.add_pdf(pdf("Read-only Beijer #9 fixture"), "beijer-9.pdf",
+                           {"fields": beijer_fixture()})
+        document_id = self.store.documents()[-1]["id"]
+        from offline_review_ui import OfflineReviewWindow
+        window = OfflineReviewWindow(self.store, integrated=True)
+        self.addCleanup(self.close_window, window)
         window.selector.setCurrentIndex(window.selector.findData(document_id))
         return window, document_id, objects
 
@@ -156,8 +224,9 @@ class ProposalIntegrationTests(unittest.TestCase):
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
             window.apply_proposal_button.click()
         self.assertEqual(window.allocations.rowCount(), 3)
-        self.assertTrue(all(window.allocations.cellWidget(row, 0).currentData() == "unselected"
-                            for row in range(window.allocations.rowCount())))
+        self.assertEqual([window.allocations.cellWidget(row, 0).currentData()
+                          for row in range(window.allocations.rowCount())],
+                         [objects[0]["id"], objects[1]["id"], "unselected"])
         window.show_archived_objects.setChecked(True)
         for row, obj in enumerate(objects):
             combo = window.allocations.cellWidget(row, 0)
@@ -202,6 +271,55 @@ class ProposalIntegrationTests(unittest.TestCase):
         conn = self.server.get_db_connection()
         self.assertEqual(conn.execute("SELECT is_active FROM meta_objects WHERE id=?", (objects[2]["id"],)).fetchone()[0], 0)
         conn.close()
+
+    def test_beijer_proposal_fills_form_idempotently_without_creating_expense(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        window, document_id, objects = self.prepare_beijer()
+        before = self.store.latest(document_id)
+        self.assertFalse(window.proposal["errors"], window.proposal["errors"])
+        self.assertEqual(window.inputs["gross_amount"].text(), "5679.10")
+        with patch.object(QMessageBox, "warning") as warning, \
+                patch.object(QMessageBox, "question",
+                             return_value=QMessageBox.StandardButton.No) as question:
+            window.apply_proposal_button.click()
+        warning.assert_not_called()
+        question.assert_not_called()
+        self.assertEqual(window.allocations.rowCount(), 3)
+        self.assertEqual([window.allocations.cellWidget(row, 0).currentData()
+                          for row in range(3)],
+                         [objects[0]["id"], "unselected", objects[1]["id"]])
+        self.assertEqual([window.allocations.item(row, 1).text() for row in range(3)],
+                         ["323.19", "127.20", "5228.61"])
+        self.assertEqual(window.allocations.cellWidget(1, 0).currentText(),
+                         "Выберите объект или общие расходы")
+        self.assertNotEqual(window.allocations.cellWidget(1, 0).styleSheet(), "")
+        self.assertEqual(window.inputs["gross_amount"].text(), "5679.00")
+        self.assertEqual(sum((Decimal(window.allocations.item(row, 1).text())
+                              for row in range(3)), Decimal(0)), Decimal("5679.00"))
+        self.assertIsNone(self.store.card(document_id))
+        self.assertEqual(self.store.latest(document_id), before)
+
+        with patch.object(QMessageBox, "warning") as warning, \
+                patch.object(QMessageBox, "question",
+                             return_value=QMessageBox.StandardButton.No) as question:
+            window.apply_proposal_button.click()
+        warning.assert_not_called()
+        question.assert_not_called()
+        self.assertEqual(window.allocations.rowCount(), 3)
+        self.assertEqual(window.allocations.cellWidget(1, 0).currentData(), "unselected")
+        self.assertIsNone(self.store.card(document_id))
+
+        unknown = window.allocations.cellWidget(1, 0)
+        unknown.setCurrentIndex(unknown.findData(objects[0]["id"]))
+        with patch.object(QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.No) as question:
+            window.apply_proposal_button.click()
+        question.assert_called_once()
+        self.assertEqual(window.allocations.rowCount(), 3)
+        self.assertEqual(unknown.currentData(), objects[0]["id"])
+        self.assertIsNone(self.store.card(document_id))
+        self.assertEqual(self.store.latest(document_id), before)
 
     def test_saved_manual_rows_survive_preview_and_declined_apply(self):
         from PyQt6.QtWidgets import QMessageBox
