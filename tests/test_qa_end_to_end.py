@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from io import BytesIO
 import hashlib
 import json
@@ -107,6 +108,75 @@ class EndToEndTests(LiveHTTP, unittest.TestCase):
         host.apply_remote_shift = lambda cursor, row: d.SmartReportApp.apply_remote_shift(host, cursor, row)
         host._sync_expense_document_outbox = lambda: d.SmartReportApp._sync_expense_document_outbox(host)
         return d.SmartReportApp.perform_sync_logic(host)
+
+    def test_customer_ready_scheme_simple_web_desktop_pdf_close_sync_reopen(self):
+        from PyQt6.QtCore import QCoreApplication, QEvent, Qt
+        from customer_supplements_ui import SupplementDialog, calculate_supplements
+        from customer_report import write_customer_pdf
+        d = self.desktop
+        body, _ = self.create(hours=4, transport=0)
+        self.sync()
+        window = d.SmartReportApp.__new__(d.SmartReportApp)
+        d.QMainWindow.__init__(window)
+        def dispose():
+            window.close()
+            window.deleteLater()
+            QCoreApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+        self.addCleanup(dispose)
+        window.tab_invoice = d.QWidget(window)
+        window.setup_invoice_tab()
+        window.inv_comp_cb.setCurrentText("Renatur")
+        with closing(d.get_db_connection()) as db:
+            oid = db.execute("SELECT id FROM objects WHERE company='Renatur' AND name='Hotel'").fetchone()[0]
+        window.inv_obj_cb.setCurrentIndex(window.inv_obj_cb.findData(oid))
+        window.inv_date_from.setDate(d.QDate(2026, 10, 23))
+        window.inv_date_to.setDate(d.QDate(2026, 10, 23))
+        login = requests.post(self.url + "/api/auth/token",
+                              json={"username": "admin", "password": "isolated-test-only"}, timeout=10)
+        self.assertEqual(login.status_code, 200, login.text)
+        def api(method, route, **kwargs):
+            response = requests.request(method, self.url + route, headers={"Authorization": "Bearer " + login.json()["token"]},
+                                        timeout=10, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        def accept(dialog):
+            dialog.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+            dialog.scheme.setCurrentIndex(dialog.scheme.findData("ob"))
+            for key, field in dialog.fields.items():
+                field.setText(str({"16-17": 1, "17-19": 2, "19-22": 1}.get(key, 0)))
+            dialog.preview()
+            self.metric("ready-scheme preview rows", 1, len(dialog.drafts))
+            return d.QDialog.DialogCode.Accepted
+        with patch.object(SupplementDialog, "exec", accept), \
+                patch.object(d, "request_expense_api", side_effect=api), \
+                patch.object(window, "background_sync_with_cloud"), \
+                patch("customer_supplements_ui.QMessageBox.warning", side_effect=AssertionError):
+            calculate_supplements(window)
+        self.sync()
+        with closing(self.server.get_db_connection()) as db:
+            confirmed = dict(db.execute("SELECT * FROM incoming_submissions WHERE sync_id=?",
+                                        (body["request_id"],)).fetchone())
+        self.metric("ready scheme server exact allocation", "2496.00", str(sum(
+            Decimal(part["total"]) for part in
+            json.loads(confirmed["customer_pricing"])["supplement_allocation"]["parts"])))
+        invoice = window.generate_invoice()
+        self.metric("ready scheme existing hours once", 4, invoice["totals"]["hours"])
+        self.metric("ready scheme exact total", 2496, invoice["totals"]["invoice_total"])
+        output = BytesIO()
+        write_customer_pdf(invoice, output, d.DEFAULT_FONT, d.DEFAULT_FONT_BOLD, lambda text: text)
+        self.metric("ready scheme PDF allocation", True,
+                    "Bekräftad kundfördelning" in "\n".join(p.extract_text() for p in PdfReader(output).pages))
+        self.metric("ready scheme closes without average OB1", 1,
+                    window._set_period_invoiced(window.collect_invoice_report(), True)[0])
+        self.sync()
+        with closing(self.server.get_db_connection()) as db:
+            saved = dict(db.execute("SELECT * FROM incoming_submissions WHERE sync_id=?", (body["request_id"],)).fetchone())
+        self.metric("ready scheme server closed", 1, saved["invoiced"])
+        self.metric("no fabricated factual intervals", None, saved["time_facts"])
+        self.metric("ready scheme reopen", 1,
+                    window._set_period_invoiced(window.collect_invoice_report(), False)[0])
+        self.sync()
+        self.metric("ready scheme reopened total", 2496, window.generate_invoice()["totals"]["invoice_total"])
 
     def create(self, **changes):
         body = self.payload(**changes)

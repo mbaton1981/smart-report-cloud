@@ -5,6 +5,7 @@ import math
 from fixed_pricing import parse_fixed, report_agreements, validate_fixed_storage
 import payroll_history
 import customer_intervals
+import customer_supplements
 
 
 CATALOG_PRICE_SOURCE = "Цены справочника объекта (применены пользователем)"
@@ -179,6 +180,11 @@ def parse_pricing(value, row):
         if "interval_terms" not in result:
             raise ValueError("Расчёт без версии клиентских условий запрещён.")
         result["interval_calculation"] = customer_intervals.validate_calculation(value["interval_calculation"], dict(row), result)
+    if "supplement_allocation" in value:
+        if any(key in result for key in ("fixed", "interval_terms", "interval_calculation", "schedule_application")):
+            raise ValueError("Готовое распределение не складывается с Fast pris или конструктором интервалов.")
+        result["supplement_allocation"] = customer_supplements.validate(
+            value["supplement_allocation"], dict(row), result["base"])
     return result
 
 
@@ -282,6 +288,9 @@ def fill_missing_prices(row, value):
         elif new is not None:
             added = True
     if previous:
+        for key in ("interval_terms", "interval_calculation", "schedule_application", "supplement_allocation"):
+            if key in previous:
+                merged[key] = previous[key]
         if not added:
             return previous, retained
         merged["date_from"] = max(previous["date_from"], proposed["date_from"])
@@ -296,6 +305,11 @@ def require_final_prices(row, segments):
     prices = row_prices(row)
     fixed = prices.get("fixed")
     extra = fixed["members"][row["sync_id"]]["extra"] if fixed else dict.fromkeys(("base", "ob", "travel"), True)
+    if prices.get("supplement_allocation"):
+        customer_supplements.validate(prices["supplement_allocation"], row, prices["base"])
+        if row.get("transport") and prices["travel"] is None:
+            raise ValueError("Не подтверждена историческая клиентская цена транспорта.")
+        return
     if prices.get("interval_terms") or row.get("time_facts"):
         parts = customer_intervals.calculated_row(row, prices)
         if prices.get("interval_calculation") and parts != customer_intervals.calculate(
@@ -345,6 +359,8 @@ def agreed_prices_for_date(cursor, table, row, *, reject_conflicts=False):
             continue
         if raw["date_from"] <= row["date"] <= raw["date_to"]:
             raw.pop("interval_calculation", None)
+            raw.pop("supplement_allocation", None)
+            raw.pop("schedule_application", None)
             matches.add(pricing_json(raw, row))
     prices = {
         json.dumps({key: json.loads(value)[key] for key in ("base", "travel", "ob")}, sort_keys=True)

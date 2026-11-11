@@ -299,9 +299,10 @@ class CustomerIntervalsMixin:
                 db.execute("UPDATE shifts SET hours=? WHERE id=?", (hours, identifier))
                 intervals.store_time(db.cursor(), "shifts", row["sync_id"], facts, previous_row=row)
                 quote = row_prices(row)
-                if quote.get("interval_calculation") or quote.get("schedule_application"):
+                if quote.get("interval_calculation") or quote.get("schedule_application") or quote.get("supplement_allocation"):
                     quote.pop("interval_calculation", None)
                     quote.pop("schedule_application", None)
+                    quote.pop("supplement_allocation", None)
                     store_pricing(db.cursor(), "shifts", row["sync_id"], quote)
                 app.enqueue_matching_shifts(db.cursor(), "id=?", (identifier,))
                 db.commit()

@@ -75,7 +75,7 @@ def prepare_customer_costs(report):
     groups, allocations = report_agreements(report)
     trips = 0.0
     unassigned_hours = 0.0
-    interval_lines, interval_details = [], []
+    interval_lines, interval_details, supplement_details = [], [], []
     for row in report["journal_rows"]:
         if row["entry_type"] not in WORK_TYPES:
             continue
@@ -90,6 +90,23 @@ def prepare_customer_costs(report):
             unassigned_hours += float(row["hours"])
             continue
         extra = fixed["members"][row["sync_id"]]["extra"] if fixed else dict.fromkeys(("base", "ob", "travel"), True)
+        if prices.get("supplement_allocation"):
+            allocation = prices["supplement_allocation"]
+            for part in allocation["parts"]:
+                supplement_details.append({**part, "date": row["date"], "employee": row["employee"],
+                                           "shift_id": row["id"], "base": allocation["base"],
+                                           "scheme": allocation["scheme"]})
+                hours = float(part["hours"])
+                interval_lines.extend((
+                    {"label": "Arbete – bekräftad fördelning", "quantity": hours, "unit": "h",
+                     "rate": float(allocation["base"]), "amount": float(part["base_amount"])},
+                    {"label": "Kundtillägg – " + ("Helg +100%" if part["bucket"] == "weekend" else
+                                                "OB" if allocation["scheme"] == "ob" else "Övertid"),
+                     "quantity": hours, "unit": "h", "rate": float(part["premium_amount"]) / hours,
+                     "amount": float(part["premium_amount"])},
+                ))
+            travel[(prices["travel"], False)] += count
+            continue
         if prices.get("interval_terms") or row.get("time_facts"):
             try:
                 details = calculated_row(row, prices)
@@ -138,6 +155,7 @@ def prepare_customer_costs(report):
                 ob_costs[(category, rate, is_extra)] += (end - start) / 60
     lines = interval_lines
     report["interval_details"] = interval_details
+    report["supplement_details"] = supplement_details
     for fixed in groups.values():
         lines.append({
             "label": f"Fast pris {fixed['date_from']} – {fixed['date_to']} (inkluderade poster)",
@@ -167,7 +185,8 @@ def prepare_customer_costs(report):
                 "quantity": hours, "unit": "h", "rate": rate, "amount": money(hours, rate),
             })
     unknown_ob_billable = report["totals"]["without_ob_hours"] is None and any(
-        row["entry_type"] == "ob" and not (row_prices(row).get("interval_terms") or row.get("time_facts")) and (
+        row["entry_type"] == "ob" and not (row_prices(row).get("interval_terms") or row.get("time_facts")
+                                         or row_prices(row).get("supplement_allocation")) and (
             row["sync_id"] not in allocations
             or allocations[row["sync_id"]]["members"][row["sync_id"]]["extra"]["ob"]
         ) for row in report["journal_rows"]
@@ -195,7 +214,7 @@ def prepare_customer_costs(report):
         selected = [line["amount"] for line in lines if line["label"].startswith(prefix)]
         return sum(selected) if all(value is not None for value in selected) else None
     totals["transport_amount"] = component("Resa")
-    totals["ob_amount"] = (None if totals["without_ob_hours"] is None else component(("OB", "Kundtillägg")))
+    totals["ob_amount"] = component(("OB", "Kundtillägg"))
     known_values = [Decimal(str(line["amount"])) for line in lines if line["amount"] is not None]
     unknown = any(line["amount"] is None for line in lines)
     known = float(sum(known_values)) if known_values or not unknown else None
@@ -356,6 +375,22 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
                     format_quantity(float(part["hours"])), part["base"] or "Ej fastställt",
                     part["percent"] if part["percent"] is not None else "Ej fastställt",
                     part["premium_amount"] or "Ej fastställt", part["total"] or "Ej fastställt",
+                ])
+            story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
+        if report.get("supplement_details"):
+            names = {"ordinary": "Ordinarie, utan tillägg", "16-17": "16:00–17:00",
+                     "17-19": "17:00–19:00", "19-22": "19:00–22:00",
+                     "22-06": "22:00–06:00", "weekend": "Helg, uttryckligen +100%"}
+            story.append(paragraph(
+                "Bekräftad kundfördelning av registrerade timmar. Intervallnamn är prisgrupper, "
+                "inte påhittade start- och sluttider. OB ingår i totalt antal timmar."))
+            detail_rows = [["Datum / medarbetare", "Schema / prisgrupp", "Timmar", "Bas", "%", "Tillägg", "Totalt"]]
+            for part in report["supplement_details"]:
+                detail_rows.append([
+                    f"#{part['shift_id']} {part['date']} / {part['employee']}",
+                    ("OB" if part["scheme"] == "ob" else "Övertid") + " / " + names[part["bucket"]],
+                    format_quantity(float(part["hours"])), part["base"], part["percent"],
+                    part["premium_amount"], part["total"],
                 ])
             story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
         preliminary = totals["invoice_total"] is None

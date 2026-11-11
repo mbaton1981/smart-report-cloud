@@ -3422,6 +3422,12 @@ def edit_shift():
         elif existing["customer_pricing"]:
             quote = json.loads(existing["customer_pricing"])
             changed_quote = quote.pop("interval_calculation", None) is not None
+            if quote.get("supplement_allocation"):
+                import customer_supplements
+                current = dict(cursor.execute("SELECT * FROM incoming_submissions WHERE sync_id=?", (sync_id,)).fetchone())
+                if quote["supplement_allocation"]["row_signature"] != customer_supplements.signature(current):
+                    quote.pop("supplement_allocation")
+                    changed_quote = True
             if quote.get("schedule_application") and (
                 hours != existing["hours"] or submission_type != existing["submission_type"] or facts is not None
             ):
@@ -5097,7 +5103,7 @@ def customer_terms_api():
         if request.method == "GET":
             versions = [dict(row) for row in conn.execute(
                 "SELECT * FROM customer_terms ORDER BY company,object_name,revision")]
-            return jsonify(ok=True, versions=versions, customer_schedules=1)
+            return jsonify(ok=True, versions=versions, customer_schedules=1, customer_supplements=1)
         payload = request.get_json()
         if not isinstance(payload, dict) or type(payload.get("expected_revision")) is not int:
             raise ValueError("Укажите версию условий.")
@@ -5134,6 +5140,7 @@ def sync_capabilities():
         "customer_pricing": 1,
         "customer_intervals": 1,
         "customer_schedules": 1,
+        "customer_supplements": 1,
         "fixed_pricing": 1,
         "payroll_history": 1,
     })
@@ -5258,6 +5265,15 @@ def sync_push():
                 if "customer_pricing" in payload or (existing and base_version > 0 and pricing_value):
                     normalized["customer_pricing"] = pricing_json(pricing_value, dict(normalized, sync_id=sync_id))
                     parsed_quote = json.loads(normalized["customer_pricing"]) if normalized["customer_pricing"] else {}
+                    if existing and existing["customer_pricing"]:
+                        old_quote = json.loads(existing["customer_pricing"])
+                        if old_quote.get("supplement_allocation") and not parsed_quote.get("supplement_allocation"):
+                            import customer_supplements
+                            if (old_quote["supplement_allocation"]["row_signature"] ==
+                                    customer_supplements.signature(dict(normalized, sync_id=sync_id))
+                                    and old_quote.get("base") == parsed_quote.get("base")):
+                                raise ValueError("Клиентское распределение защищено от потери. Обновите десктоп "
+                                                 "и сохраните новый расчёт через «Рассчитать доплаты».")
                     customer_intervals.verify_terms_version(cursor, normalized, parsed_quote)
                     if parsed_quote.get("fixed"):
                         touched_fixed.add(parsed_quote["fixed"]["id"])
@@ -5335,7 +5351,8 @@ def sync_push():
                     normalized["customer_pricing"] = pricing_json(quote, normalized)
 
             if operation == "upsert" and existing and existing["invoiced"]:
-                if any(normalized.get(key) != (existing[key] or "" if key == "comment" else existing[key]) for key in (
+                previous = dict(existing)
+                if any(normalized.get(key) != (previous[key] or "" if key == "comment" else previous.get(key)) for key in (
                     "date", "employee", "company", "object_name", "hours", "rate", "transport", "comment", "submission_type",
                     "start_time", "end_time", "ob_base_rate",
                 )):

@@ -45,6 +45,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
 import customer_intervals
 from customer_intervals_desktop import CustomerIntervalsMixin, cache_terms
+from customer_supplements_ui import calculate_supplements
 from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, checked_rate, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing, reopen_invoiced_shifts
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
@@ -9688,6 +9689,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
         
         btn_layout.addWidget(gen_btn)
+        supplements_btn = QPushButton("Рассчитать доплаты")
+        supplements_btn.setObjectName("calculateCustomerSupplements")
+        supplements_btn.clicked.connect(lambda: calculate_supplements(self))
+        btn_layout.addWidget(supplements_btn)
         btn_layout.addWidget(export_pdf_inv_btn)
         card_layout.addRow(btn_layout)
         actions_menu = QMenu(card)
@@ -9697,8 +9702,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ("Fast pris: работы и дополнения…", self.configure_fast_pris),
             ("Клиентские цены выбранного периода…", self.confirm_customer_prices),
             ("Применить цены справочника…", self.preview_catalog_prices),
-            ("Предпросмотр условий для открытых записей…", self.preview_customer_terms),
-            ("Клиентский расчёт по интервалам…", self.customer_interval_breakdown),
+            ("Прежние условия: предпросмотр…", self.preview_customer_terms),
+            ("Прежние условия: расшифровка…", self.customer_interval_breakdown),
         ):
             action = actions_menu.addAction(label)
             action.triggered.connect(lambda _checked=False, handler=callback: handler())
@@ -11160,7 +11165,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_detail_meta.setWordWrap(True)
         detail_layout.addWidget(self.object_detail_title)
         detail_layout.addWidget(self.object_detail_meta)
-        customer_terms_button = QPushButton("Клиентские доплаты")
+        customer_terms_button = QPushButton("Прежние клиентские условия…")
         customer_terms_button.setObjectName("customerTermsButton")
         customer_terms_button.clicked.connect(self.customer_terms_dialog)
         detail_layout.addWidget(customer_terms_button)
@@ -14123,11 +14128,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     confirmed=True, confirmed_at=datetime.now(timezone.utc).isoformat(),
                 )
                 quote.pop("interval_calculation", None)
+                quote.pop("supplement_allocation", None)
                 if facts is not None or payload["hours"] != shift["hours"]:
                     quote.pop("schedule_application", None)
                 store_pricing(cursor, "shifts", sync_id, quote)
             elif shift["customer_pricing"]:
                 quote = json.loads(shift["customer_pricing"])
+                if quote.get("supplement_allocation"):
+                    import customer_supplements
+                    current = dict(cursor.execute("SELECT * FROM shifts WHERE sync_id=?", (sync_id,)).fetchone())
+                    if quote["supplement_allocation"]["row_signature"] != customer_supplements.signature(current):
+                        quote.pop("supplement_allocation")
+                        store_pricing(cursor, "shifts", sync_id, quote)
                 if quote.get("schedule_application") and (
                     facts is not None or payload["hours"] != shift["hours"]
                     or record_type != shift["entry_type"]
