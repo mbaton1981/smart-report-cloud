@@ -9682,23 +9682,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         btn_layout = QHBoxLayout()
         gen_btn = QPushButton("Просмотр сводки и журнала")
         gen_btn.setObjectName("secondaryAction")
-        gen_btn.clicked.connect(self.generate_invoice)
+        gen_btn.clicked.connect(self.generate_activity_report)
         
-        export_pdf_inv_btn = QPushButton("Сформировать общий PDF (SV)")
+        export_pdf_inv_btn = QPushButton("Сформировать PDF")
         export_pdf_inv_btn.setObjectName("primaryAction")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
         
         btn_layout.addWidget(gen_btn)
-        supplements_btn = QPushButton("Рассчитать доплаты")
-        supplements_btn.setObjectName("calculateCustomerSupplements")
-        supplements_btn.clicked.connect(lambda: calculate_supplements(self))
-        btn_layout.addWidget(supplements_btn)
         btn_layout.addWidget(export_pdf_inv_btn)
         card_layout.addRow(btn_layout)
         actions_menu = QMenu(card)
         for label, callback in (
             ("Закрыть период", self.mark_period_as_invoiced),
             ("Вернуть период в работу", self.unmark_period_as_invoiced),
+            ("Клиентские доплаты — отдельный отложенный разбор…",
+             lambda: calculate_supplements(self)),
             ("Fast pris: работы и дополнения…", self.configure_fast_pris),
             ("Клиентские цены выбранного периода…", self.confirm_customer_prices),
             ("Применить цены справочника…", self.preview_catalog_prices),
@@ -10190,6 +10188,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         return note
 
     def _render_invoice_summary(self, report):
+        for column in range(self.table_invoice.columnCount()):
+            self.table_invoice.setColumnHidden(column, False)
+        self.table_invoice.setHorizontalHeaderLabels([
+            "Сотрудник", "Всего часов", "Из них OB1", "Из них OB2", "Другие OB", "Статус",
+        ])
         items = self._invoice_summary_items(report)
         self.invoice_summary_table.setRowCount(len(items))
         for row_index, (label, value) in enumerate(items):
@@ -10324,14 +10327,124 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self._render_dagbok_report(report)
         return report
 
-    def export_invoice_to_pdf(self):
-        self._export_customer_report_pdf()
+    def collect_activity_report(self):
+        d_from = self.inv_date_from.text().strip()
+        d_to = self.inv_date_to.text().strip()
+        company = self.inv_comp_cb.currentText()
+        object_id = self.inv_obj_cb.currentData()
+        if not company or object_id is None:
+            raise ValueError("Выберите фирму и объект.")
+        datetime.strptime(d_from, "%Y-%m-%d")
+        datetime.strptime(d_to, "%Y-%m-%d")
+        if d_from > d_to:
+            raise ValueError("Начало периода должно быть не позже окончания.")
+        conn = get_db_connection()
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            cursor = conn.cursor()
+            obj_row = cursor.execute(
+                "SELECT * FROM objects WHERE id=? AND company=?", (object_id, company),
+            ).fetchone()
+            if obj_row is None or obj_row["sync_id"] != self.inv_obj_cb.currentData(Qt.ItemDataRole.UserRole + 1):
+                raise ValueError("Выбранный объект изменился. Обновите список и выберите его заново.")
+            object_names = invoice_object_names(cursor, obj_row)
+            placeholders = ",".join("?" for _ in object_names)
+            shift_columns = {
+                column["name"] for column in cursor.execute("PRAGMA table_info(shifts)")
+            }
+            report_columns = [
+                "id", "date", "employee", "object_name", "entry_type", "hours", "transport", "sync_id",
+                "start_time", "end_time", "comment",
+            ]
+            if "time_facts" in shift_columns:
+                report_columns.append("time_facts")
+            rows = [dict(row) for row in cursor.execute(
+                f"SELECT {', '.join(report_columns)} FROM shifts WHERE company=? AND object_name IN ({placeholders}) "
+                "AND date>=? AND date<=? ORDER BY date,employee,id",
+                (company, *object_names, d_from, d_to),
+            ).fetchall()]
+        finally:
+            conn.close()
+        work_rows = [row for row in rows if row["entry_type"] in ("work", "ob")]
+        return {
+            "object_id": object_id,
+            "sync_id": obj_row["sync_id"],
+            "company": company,
+            "object": obj_row["name"],
+            "date_from": d_from,
+            "date_to": d_to,
+            "journal_rows": rows,
+            "journal_segments": {},
+            "totals": {"hours": sum(float(row["hours"] or 0) for row in work_rows)},
+        }
 
-    def _export_customer_report_pdf(self, *, journal_only=False):
-        report = self.generate_invoice()
+    def generate_activity_report(self):
+        try:
+            report = self.collect_activity_report()
+        except ValueError as error:
+            self.table_invoice.setRowCount(0)
+            self._render_dagbok_report({"journal_rows": [], "journal_segments": {}}, activity_only=True)
+            self.invoice_summary_table.setRowCount(0)
+            self.invoice_summary_note.setText(str(error))
+            self.invoice_status_note.clear()
+            self._invoice_report = None
+            QMessageBox.warning(self, "Отчёты и фактурирование", str(error))
+            return None
+
+        employees = {}
+        trips = 0.0
+        for row in report["journal_rows"]:
+            if row["entry_type"] not in ("work", "ob"):
+                continue
+            employee = employees.setdefault(row["employee"], {"hours": 0.0, "records": 0})
+            employee["hours"] += float(row["hours"] or 0)
+            employee["records"] += 1
+            trips += float(row.get("transport") or 0)
+
+        self.table_invoice.setHorizontalHeaderLabels([
+            "Сотрудник", "Фактические часы", "", "", "", "",
+        ])
+        for column in range(2, self.table_invoice.columnCount()):
+            self.table_invoice.setColumnHidden(column, True)
+        self.table_invoice.setRowCount(len(employees))
+        for row_index, (employee, values) in enumerate(sorted(employees.items())):
+            self.table_invoice.setItem(row_index, 0, QTableWidgetItem(employee))
+            self.table_invoice.setItem(
+                row_index, 1, QTableWidgetItem(format_quantity(values["hours"], ".")),
+            )
+
+        summary = [
+            ("Фактически отработано", f"{report['totals']['hours']:g} ч"),
+            ("Записано выездов", format_quantity(trips, ".")),
+        ]
+        self.invoice_summary_table.setRowCount(len(summary))
+        for row_index, (label, value) in enumerate(summary):
+            self.invoice_summary_table.setItem(row_index, 0, QTableWidgetItem(label))
+            self.invoice_summary_table.setItem(row_index, 1, QTableWidgetItem(value))
+        self.invoice_summary_note.setText(
+            "В этой сводке показаны только сохранённые часы и выезды; клиентские цены и доплаты не рассчитываются."
+        )
+        self.invoice_ob_rules_lbl.clear()
+        self.fast_pris_saved_note.clear()
+        self.invoice_status_note.setPlainText(
+            f"Записей в журнале: {len(report['journal_rows'])}. "
+            "Клиентские доплаты в отчёт не включены."
+        )
+        self._render_dagbok_report(report, activity_only=True)
+        self._invoice_report = report
+        return report
+
+    def export_invoice_to_pdf(self):
+        report = self.generate_activity_report()
+        if report is not None:
+            self._export_customer_report_pdf(report=report)
+
+    def _export_customer_report_pdf(self, *, journal_only=False, report=None):
+        report = report or self.generate_activity_report()
         if report is None:
             return
-        if not report["journal_rows"] and not report["is_fast_pris"]:
+        if not report["journal_rows"]:
             QMessageBox.warning(
                 self, "Отчёты и фактурирование",
                 f"{report['company']} / {report['object']}: за выбранный период нет записей. "
@@ -10345,7 +10458,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 return
             report = {**report, "journal_translations": translations}
             filename = (
-                ("Arbetsjournal" if journal_only else "Fakturaunderlag")
+                ("Arbetsjournal" if journal_only else "Arbetstidsrapport")
                 + f"_{report['company']}_{report['object']}_{report['date_from']}_till_{report['date_to']}.pdf"
             )
             filename = "".join("_" if character in '<>:"/\\|?*' else character for character in filename)
@@ -10354,6 +10467,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             write_customer_pdf(
                 report, filepath, DEFAULT_FONT, DEFAULT_FONT_BOLD,
                 self._journal_description_swedish, journal_only=journal_only,
+                activity_only=True,
             )
             QMessageBox.information(self, "Отчёты и фактурирование", f"PDF sparad:\n{filepath}")
             if sys.platform == "win32":
@@ -10989,11 +11103,33 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout.addLayout(dag_summary_box)
 
     def generate_dagbok(self):
-        return self.generate_invoice()
+        return self.generate_activity_report()
 
-    def _render_dagbok_report(self, report):
+    def _render_dagbok_report(self, report, *, activity_only=False):
         rows = report['journal_rows']
         ob_segments_by_id = report['journal_segments']
+        if activity_only:
+            self.table_dagbok.setHorizontalHeaderLabels([
+                "Дата", "Сотрудник", "Фактическое время", "Часы", "Описание", "",
+            ])
+            for column in (2, 4):
+                self.table_dagbok.setColumnWidth(column, 185)
+            self.table_dagbok.setColumnHidden(5, True)
+            for label in (
+                self.dag_total_atf_lbl, self.dag_total_sick_lbl, self.dag_total_vacation_lbl,
+                self.dag_total_holiday_lbl, self.dag_total_ob_lbl,
+            ):
+                label.hide()
+        else:
+            self.table_dagbok.setHorizontalHeaderLabels([
+                "Дата", "Сотрудник", "Тип", "Часы", "Детализация / OB", "Описание",
+            ])
+            self.table_dagbok.setColumnHidden(5, False)
+            for label in (
+                self.dag_total_atf_lbl, self.dag_total_sick_lbl, self.dag_total_vacation_lbl,
+                self.dag_total_holiday_lbl, self.dag_total_ob_lbl,
+            ):
+                label.show()
         self.table_dagbok.setRowCount(len(rows))
         totals = {
             RECORD_TYPE_WORK: 0.0, RECORD_TYPE_ATF: 0.0, RECORD_TYPE_SICK: 0.0,
@@ -11011,7 +11147,24 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             
             detalization = ""
             detail_tooltip = ""
-            if record_type == RECORD_TYPE_OB:
+            if activity_only:
+                facts = row.get("time_facts")
+                invalid_facts = False
+                if isinstance(facts, str):
+                    try:
+                        facts = json.loads(facts)
+                    except (TypeError, ValueError):
+                        invalid_facts = True
+                if facts is not None and not isinstance(facts, dict):
+                    invalid_facts = True
+                if invalid_facts:
+                    detalization = "Проверьте сохранённое время"
+                else:
+                    facts = facts if isinstance(facts, dict) else {}
+                    start_t = facts.get("start") or row.get("start_time")
+                    end_t = facts.get("end") or row.get("end_time")
+                    detalization = f"{start_t}–{end_t}" if start_t and end_t else "Время не указано"
+            elif record_type == RECORD_TYPE_OB:
                 segments = ob_segments_by_id.get(row["sync_id"], [])
                 start_t = row["start_time"] if "start_time" in row.keys() else None
                 end_t = row["end_time"] if "end_time" in row.keys() else None
@@ -11048,10 +11201,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
             self.table_dagbok.setItem(row_idx, 0, it_date)
             self.table_dagbok.setItem(row_idx, 1, it_emp)
-            self.table_dagbok.setItem(row_idx, 2, it_type)
-            self.table_dagbok.setItem(row_idx, 3, it_hrs)
-            self.table_dagbok.setItem(row_idx, 4, it_det)
-            self.table_dagbok.setItem(row_idx, 5, it_comm)
+            if activity_only:
+                self.table_dagbok.setItem(row_idx, 2, it_det)
+                self.table_dagbok.setItem(row_idx, 3, it_hrs)
+                self.table_dagbok.setItem(row_idx, 4, it_comm)
+                self.table_dagbok.setItem(row_idx, 5, QTableWidgetItem(""))
+            else:
+                self.table_dagbok.setItem(row_idx, 2, it_type)
+                self.table_dagbok.setItem(row_idx, 3, it_hrs)
+                self.table_dagbok.setItem(row_idx, 4, it_det)
+                self.table_dagbok.setItem(row_idx, 5, it_comm)
 
         worked_hours = totals[RECORD_TYPE_WORK] + totals[RECORD_TYPE_OB]
         self.dag_total_hours_lbl.setText(f"<b>Работа: {format_quantity(worked_hours, '.')} ч</b>")

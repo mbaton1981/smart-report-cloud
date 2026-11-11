@@ -236,7 +236,9 @@ def prepare_customer_costs(report):
     return report
 
 
-def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_only=False):
+def write_customer_pdf(
+    report, filepath, font, bold_font, translate, *, journal_only=False, activity_only=False,
+):
     styles = {
         "body": ParagraphStyle("CustomerBody", fontName=font, fontSize=10, leading=13),
         "bold": ParagraphStyle("CustomerBold", fontName=bold_font, fontSize=10, leading=13),
@@ -315,127 +317,178 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
     story = []
     totals = report["totals"]
     if not journal_only:
-        story.extend(heading("Fakturaunderlag"))
-        story.append(paragraph("Status: Pågående"))
-        categories = ["weekday_early_evening", "weekday_late_evening_night"]
-        categories += sorted(set(totals["ob_categories"]) - set(categories))
-        labels = [CATEGORY_LABELS.get(category, "Övrig OB") for category in categories]
-        rows = [["Medarbetare", "Arbetade timmar", *["Varav " + label for label in labels]]]
-        for employee in report["prepared_rows"]:
-            values = {
-                "weekday_early_evening": employee["ob1_hours"],
-                "weekday_late_evening_night": employee["ob2_hours"],
-                **employee["other_ob_categories"],
-            }
+        if activity_only:
+            story.extend(heading("Arbetstidsrapport"))
+            trips = sum(
+                float(row.get("transport") or 0) for row in report["journal_rows"]
+                if row["entry_type"] in WORK_TYPES
+            )
+            summary = [
+                ["Sammanfattning", "Värde"],
+                ["Arbetade timmar", format_quantity(totals["hours"]) + " h"],
+                ["Antal resor", format_quantity(trips)],
+            ]
+            story.append(table(summary, [available * .66, available * .34], numeric=(1,)))
+            story.append(paragraph("Rapporten visar registrerat arbete och tid; priser och tillägg ingår inte."))
+        else:
+            story.extend(heading("Fakturaunderlag"))
+            story.append(paragraph("Status: Pågående"))
+        if not activity_only:
+            categories = ["weekday_early_evening", "weekday_late_evening_night"]
+            categories += sorted(set(totals["ob_categories"]) - set(categories))
+            labels = [CATEGORY_LABELS.get(category, "Övrig OB") for category in categories]
+            rows = [["Medarbetare", "Arbetade timmar", *["Varav " + label for label in labels]]]
+            for employee in report["prepared_rows"]:
+                values = {
+                    "weekday_early_evening": employee["ob1_hours"],
+                    "weekday_late_evening_night": employee["ob2_hours"],
+                    **employee["other_ob_categories"],
+                }
+                rows.append([
+                    employee["employee"], format_quantity(employee["hours"]),
+                    *[format_quantity(
+                        values.get(category, 0) if employee["without_ob_hours"] is not None else None,
+                    ) for category in categories],
+                ])
             rows.append([
-                employee["employee"], format_quantity(employee["hours"]),
+                "Totalt antal timmar", format_quantity(totals["hours"]),
                 *[format_quantity(
-                    values.get(category, 0) if employee["without_ob_hours"] is not None else None,
+                    totals["ob_categories"].get(category, 0)
+                    if totals["without_ob_hours"] is not None else None,
                 ) for category in categories],
             ])
-        rows.append([
-            "Totalt antal timmar", format_quantity(totals["hours"]),
-            *[format_quantity(
-                totals["ob_categories"].get(category, 0)
-                if totals["without_ob_hours"] is not None else None,
-            ) for category in categories],
-        ])
-        story.append(table(
-            rows, [available * .36] + [available * .64 / (len(categories) + 1)] * (len(categories) + 1),
-            total=True, numeric=tuple(range(1, len(categories) + 2)),
-        ))
-        story.append(paragraph("OB-timmar ingår i arbetade timmar och läggs inte till."))
-        if report.get("fixed_agreements"):
-            story.append(paragraph(
-                "Fast pris omfattar inkluderade poster. Endast uttryckligen markerade "
-                "extraposter debiteras utöver paketet."
+            story.append(table(
+                rows, [available * .36] + [available * .64 / (len(categories) + 1)] * (len(categories) + 1),
+                total=True, numeric=tuple(range(1, len(categories) + 2)),
             ))
-            included = [["Datum / medarbetare", "Arbete", "OB", "Resa"]]
-            for row in report["journal_rows"]:
-                fixed = report["fixed_allocations"].get(row["sync_id"])
-                if fixed:
-                    extra = fixed["members"][row["sync_id"]]["extra"]
-                    included.append([
-                        f"{row['date']} / {row['employee']}",
-                        *["Extra" if extra[key] else "Ingår" for key in ("base", "ob", "travel")],
+            story.append(paragraph("OB-timmar ingår i arbetade timmar och läggs inte till."))
+        if not activity_only:
+            if report.get("fixed_agreements"):
+                story.append(paragraph(
+                    "Fast pris omfattar inkluderade poster. Endast uttryckligen markerade "
+                    "extraposter debiteras utöver paketet."
+                ))
+                included = [["Datum / medarbetare", "Arbete", "OB", "Resa"]]
+                for row in report["journal_rows"]:
+                    fixed = report["fixed_allocations"].get(row["sync_id"])
+                    if fixed:
+                        extra = fixed["members"][row["sync_id"]]["extra"]
+                        included.append([
+                            f"{row['date']} / {row['employee']}",
+                            *["Extra" if extra[key] else "Ingår" for key in ("base", "ob", "travel")],
+                        ])
+                story.append(table(included, [available * .55] + [available * .15] * 3))
+            story.append(Spacer(1, 10))
+            costs = [["Position", "Antal", "Pris (SEK)", "Belopp (SEK)"]]
+            for line in report["cost_lines"]:
+                costs.append([
+                    line["label"], format_quantity(line["quantity"]) + " " + line["unit"],
+                    format_number(line["rate"]), format_number(line["amount"]),
+                ])
+            story.append(table(
+                costs, [available * .43, available * .17, available * .18, available * .22],
+                numeric=(1, 2, 3),
+            ))
+            if report.get("interval_details"):
+                detail_rows = [["Datum / medarbetare", "Intervall / arbetssätt", "Timmar", "Bas", "%", "Tillägg", "Totalt"]]
+                for part in report["interval_details"]:
+                    detail_rows.append([
+                        part["date"] + " / " + part["employee"],
+                        part["start"][11:16] + "–" + part["end"][11:16] + " / " + part["mode"]
+                        + (" / schema (bekräftat)" if part.get("time_source") == "schedule" else ""),
+                        format_quantity(float(part["hours"])), part["base"] or "Ej fastställt",
+                        part["percent"] if part["percent"] is not None else "Ej fastställt",
+                        part["premium_amount"] or "Ej fastställt", part["total"] or "Ej fastställt",
                     ])
-            story.append(table(included, [available * .55] + [available * .15] * 3))
-        story.append(Spacer(1, 10))
-        costs = [["Position", "Antal", "Pris (SEK)", "Belopp (SEK)"]]
-        for line in report["cost_lines"]:
-            costs.append([
-                line["label"], format_quantity(line["quantity"]) + " " + line["unit"],
-                format_number(line["rate"]), format_number(line["amount"]),
-            ])
-        story.append(table(
-            costs, [available * .43, available * .17, available * .18, available * .22],
-            numeric=(1, 2, 3),
-        ))
-        if report.get("interval_details"):
-            detail_rows = [["Datum / medarbetare", "Intervall / arbetssätt", "Timmar", "Bas", "%", "Tillägg", "Totalt"]]
-            for part in report["interval_details"]:
-                detail_rows.append([
-                    part["date"] + " / " + part["employee"],
-                    part["start"][11:16] + "–" + part["end"][11:16] + " / " + part["mode"]
-                    + (" / schema (bekräftat)" if part.get("time_source") == "schedule" else ""),
-                    format_quantity(float(part["hours"])), part["base"] or "Ej fastställt",
-                    part["percent"] if part["percent"] is not None else "Ej fastställt",
-                    part["premium_amount"] or "Ej fastställt", part["total"] or "Ej fastställt",
-                ])
-            story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
-        if report.get("supplement_details"):
-            names = {"ordinary": "Ordinarie, utan tillägg", "16-17": "16:00–17:00",
-                     "17-19": "17:00–19:00", "19-22": "19:00–22:00",
-                     "22-06": "22:00–06:00", "weekend": "Helg, uttryckligen +100%"}
-            story.append(paragraph(
-                "Bekräftad kundfördelning av registrerade timmar. Intervallnamn är prisgrupper, "
-                "inte påhittade start- och sluttider. OB ingår i totalt antal timmar."))
-            detail_rows = [["Datum / medarbetare", "Schema / prisgrupp", "Timmar", "Bas", "%", "Tillägg", "Totalt"]]
-            for part in report["supplement_details"]:
-                detail_rows.append([
-                    f"#{part['shift_id']} {part['date']} / {part['employee']}",
-                    ("OB" if part["scheme"] == "ob" else "Övertid") + " / " + names[part["bucket"]],
-                    format_quantity(float(part["hours"])), part["base"], part["percent"],
-                    part["premium_amount"], part["total"],
-                ])
-            story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
-        preliminary = totals["invoice_total"] is None
-        bottom = [
-            Spacer(1, 10),
-            highlight(
-                "Preliminärt totalbelopp" if preliminary else "Totalt belopp",
-                format_number(totals["known_subtotal"]) + " SEK", strongest=True,
-            ),
-            paragraph("Samtliga belopp är exklusive moms."),
-        ]
-        if preliminary:
-            bottom.append(paragraph(
-                "PRELIMINÄRT: Endast kända belopp ingår, utan ej fastställda priser eller "
-                "OB-tillägg. Slutbeloppet kan inte fastställas.", "bold",
-            ))
-        story.append(KeepTogether(bottom))
-        story.append(PageBreak())
+                story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
+            if report.get("supplement_details"):
+                names = {"ordinary": "Ordinarie, utan tillägg", "16-17": "16:00–17:00",
+                         "17-19": "17:00–19:00", "19-22": "19:00–22:00",
+                         "22-06": "22:00–06:00", "weekend": "Helg, uttryckligen +100%"}
+                story.append(paragraph(
+                    "Bekräftad kundfördelning av registrerade timmar. Intervallnamn är prisgrupper, "
+                    "inte påhittade start- och sluttider. OB ingår i totalt antal timmar."))
+                detail_rows = [["Datum / medarbetare", "Schema / prisgrupp", "Timmar", "Bas", "%", "Tillägg", "Totalt"]]
+                for part in report["supplement_details"]:
+                    detail_rows.append([
+                        f"#{part['shift_id']} {part['date']} / {part['employee']}",
+                        ("OB" if part["scheme"] == "ob" else "Övertid") + " / " + names[part["bucket"]],
+                        format_quantity(float(part["hours"])), part["base"], part["percent"],
+                        part["premium_amount"], part["total"],
+                    ])
+                story.append(table(detail_rows, [available * x for x in (.25, .23, .08, .10, .07, .13, .14)]))
+            preliminary = totals["invoice_total"] is None
+            bottom = [
+                Spacer(1, 10),
+                highlight(
+                    "Preliminärt totalbelopp" if preliminary else "Totalt belopp",
+                    format_number(totals["known_subtotal"]) + " SEK", strongest=True,
+                ),
+                paragraph("Samtliga belopp är exklusive moms."),
+            ]
+            if preliminary:
+                bottom.append(paragraph(
+                    "PRELIMINÄRT: Endast kända belopp ingår, utan ej fastställda priser eller "
+                    "OB-tillägg. Slutbeloppet kan inte fastställas.", "bold",
+                ))
+            story.append(KeepTogether(bottom))
+        if not activity_only:
+            story.append(PageBreak())
     story.extend(heading("Arbetsjournal"))
-    journal = [["Datum", "Medarbetare", "Typ", "Timmar", "Tid / OB", "Arbetsbeskrivning"]]
-    for row in report["journal_rows"]:
-        segments = report["journal_segments"].get(row["sync_id"], [])
-        details = []
-        for segment in segments:
-            label = CATEGORY_LABELS.get(segment["category"], "Dagtid" if not segment["premium_percent"] else "Övrig OB")
-            details.append(
-                f"{segment['start_time']}–{segment['end_time']}: "
-                f"{format_quantity(segment['hours'])} h {label}"
+    journal = [["Datum", "Medarbetare", "Faktisk tid", "Timmar", "Arbetsbeskrivning"]] if activity_only else [
+        ["Datum", "Medarbetare", "Typ", "Timmar", "Tid / OB", "Arbetsbeskrivning"]
+    ]
+
+    def actual_time(row):
+        facts = row.get("time_facts")
+        if isinstance(facts, str):
+            try:
+                facts = json.loads(facts)
+            except (TypeError, ValueError):
+                return "Kontrollera sparad tid"
+        facts = facts if isinstance(facts, dict) else {}
+        start = facts.get("start") or row.get("start_time")
+        end = facts.get("end") or row.get("end_time")
+        if not start or not end:
+            return "Ej angivet"
+        next_day = facts.get("next_day")
+        if next_day is None:
+            next_day = end <= start
+        result = f"{start}–{end}" + (" (+1)" if next_day else "")
+        breaks = facts.get("breaks") or []
+        if breaks:
+            result += "; rast " + ", ".join(
+                f"{item['start']}–{item['end']}" for item in breaks
+                if isinstance(item, dict) and item.get("start") and item.get("end")
             )
-        journal.append([
-            row["date"], row["employee"], TYPE_LABELS.get(row["entry_type"], "Övrig tid"),
-            format_quantity(row["hours"]), "\n".join(details),
-            (
-                report["journal_translations"][row["sync_id"]]
-                if row["sync_id"] in report.get("journal_translations", {})
-                else translate(row["comment"] or "")
-            ),
-        ])
-    story.append(table(journal, [65, 115, 100, 55, 140, available - 475], numeric=(3,)))
+        return result
+
+    for row in report["journal_rows"]:
+        details = []
+        if not activity_only:
+            segments = report["journal_segments"].get(row["sync_id"], [])
+            for segment in segments:
+                label = CATEGORY_LABELS.get(segment["category"], "Dagtid" if not segment["premium_percent"] else "Övrig OB")
+                details.append(
+                    f"{segment['start_time']}–{segment['end_time']}: "
+                    f"{format_quantity(segment['hours'])} h {label}"
+                )
+        description = (
+            report["journal_translations"][row["sync_id"]]
+            if row["sync_id"] in report.get("journal_translations", {})
+            else translate(row["comment"] or "")
+        )
+        if activity_only:
+            journal.append([
+                row["date"], row["employee"], actual_time(row), format_quantity(row["hours"]), description,
+            ])
+        else:
+            journal.append([
+                row["date"], row["employee"], TYPE_LABELS.get(row["entry_type"], "Övrig tid"),
+                format_quantity(row["hours"]), "\n".join(details), description,
+            ])
+    widths = [65, 115, 90, 55, available - 325] if activity_only else [65, 115, 100, 55, 140, available - 475]
+    story.append(table(journal, widths, numeric=(3,)))
     journal_work_hours = sum(float(row["hours"]) for row in report["journal_rows"] if row["entry_type"] in WORK_TYPES)
     if abs(journal_work_hours - totals["hours"]) > 0.000001:
         raise ValueError("Arbetsjournalens timmar stämmer inte med fakturaunderlaget.")
@@ -443,12 +496,15 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
         Spacer(1, 8),
         highlight("Totalt antal arbetade timmar", format_quantity(journal_work_hours) + " h"),
     ])
-    absence = defaultdict(float)
-    for row in report["journal_rows"]:
-        if row["entry_type"] not in WORK_TYPES:
-            absence[TYPE_LABELS.get(row["entry_type"], "Övrig tid")] += float(row["hours"])
-    if absence:
-        story.append(paragraph("; ".join(f"{label}: {format_quantity(hours)} h" for label, hours in sorted(absence.items()))))
+    if not activity_only:
+        absence = defaultdict(float)
+        for row in report["journal_rows"]:
+            if row["entry_type"] not in WORK_TYPES:
+                absence[TYPE_LABELS.get(row["entry_type"], "Övrig tid")] += float(row["hours"])
+        if absence:
+            story.append(paragraph(
+                "; ".join(f"{label}: {format_quantity(hours)} h" for label, hours in sorted(absence.items()))
+            ))
 
     def footer(canvas, doc):
         canvas.saveState()
@@ -460,6 +516,7 @@ def write_customer_pdf(report, filepath, font, bold_font, translate, *, journal_
     document = SimpleDocTemplate(
         os.fspath(filepath) if isinstance(filepath, os.PathLike) else filepath,
         pagesize=landscape(A4), leftMargin=36, rightMargin=36,
-        topMargin=30, bottomMargin=32, title="Fakturaunderlag och arbetsjournal",
+        topMargin=30, bottomMargin=32,
+        title="Arbetstidsrapport" if activity_only else "Fakturaunderlag och arbetsjournal",
     )
     document.build(story, onFirstPage=footer, onLaterPages=footer)

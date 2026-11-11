@@ -261,7 +261,8 @@ class CustomerReportTests(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "dag_comp_cb"))
         self.assertFalse(hasattr(self.window, "dag_date_from"))
         buttons = [button.text() for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)]
-        self.assertIn("Сформировать общий PDF (SV)", buttons)
+        self.assertIn("Сформировать PDF", buttons)
+        self.assertNotIn("Рассчитать доплаты", buttons)
         self.assertIn("PDF только журнала (SV)", buttons)
 
     def test_latin_english_and_mixed_descriptions_require_review_offline(self):
@@ -320,6 +321,60 @@ class CustomerReportTests(unittest.TestCase):
         for page in pdf.pages:
             self.assertIn("1,25", page.extract_text())
 
+    def test_activity_pdf_hides_unconfirmed_costs_and_payroll_details(self):
+        self.ob(transport=1)
+        report = self.window.generate_invoice()
+        pages = self.pdf(report, activity_only=True).pages
+        self.assertLessEqual(len(pages), 2)
+        text = "\n".join(page.extract_text() for page in pages)
+        self.assertIn("Arbetstidsrapport", text)
+        self.assertIn("Antal resor", text)
+        self.assertIn("1,0", text)
+        self.assertIn("registrerat arbete och tid", text)
+        self.assertIn("16:00–20:00", text)
+        self.assertIn("Montering", text)
+        self.assertIn("Faktisk tid", text)
+        for forbidden in ("OB1", "OB2", "Övertid", "SEK", "245,8", "№1", "Pris (", "tillägg – OB"):
+            self.assertNotIn(forbidden, text)
+
+    def test_activity_report_ignores_saved_customer_allocation_without_changing_history(self):
+        identifier = self.ob(transport=1)
+        allocation = {
+            "version": 1,
+            "company": "Renatur",
+            "object_name": "Tomteboda ÄTA",
+            "date_from": "2026-10-21",
+            "date_to": "2026-10-21",
+            "source": "Unconfirmed historical allocation",
+            "base": 520,
+            "travel": 450,
+            "ob": {},
+            "supplement_allocation": {
+                "base": 520,
+                "scheme": "ob",
+                "parts": [{
+                    "bucket": "17-19", "hours": 2, "percent": 20,
+                    "base_amount": 1040, "premium_amount": 208, "total": 1248,
+                }],
+            },
+        }
+        self.conn.execute(
+            "UPDATE shifts SET customer_pricing=? WHERE sync_id=?",
+            (json.dumps(allocation), identifier),
+        )
+        self.conn.commit()
+        before = list(self.conn.iterdump())
+
+        report = self.window.generate_activity_report()
+        self.assertNotIn("customer_pricing", report["journal_rows"][0])
+        self.assertFalse({"cost_lines", "supplement_details", "interval_details"} & report.keys())
+        text = "\n".join(page.extract_text() for page in self.pdf(report, activity_only=True).pages)
+        self.assertIn("16:00–20:00", text)
+        self.assertIn("Montering", text)
+        for forbidden in ("Unconfirmed historical allocation", "OB1", "Övertid", "20%", "1 248", "SEK"):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(list(self.conn.iterdump()), before)
+
     def test_invalid_filters_clear_both_views_and_journal_totals(self):
         self.shift(hours=8)
         self.window.generate_invoice()
@@ -338,8 +393,10 @@ class CustomerReportTests(unittest.TestCase):
         before = list(self.conn.iterdump())
         exported = []
 
-        def write(report, filepath, font, bold_font, translate, *, journal_only=False):
-            exported.append((journal_only, self.pdf(report, journal_only=journal_only)))
+        def write(report, filepath, font, bold_font, translate, *, journal_only=False, activity_only=False):
+            exported.append((journal_only, activity_only, self.pdf(
+                report, journal_only=journal_only, activity_only=activity_only,
+            )))
 
         with (
             patch.object(self.desktop, "write_customer_pdf", side_effect=write),
@@ -348,20 +405,62 @@ class CustomerReportTests(unittest.TestCase):
             patch.object(self.desktop.QMessageBox, "information"),
             patch.object(self.desktop.QMessageBox, "critical") as critical,
         ):
-            for label in ("Сформировать общий PDF (SV)", "PDF только журнала (SV)"):
+            for label in ("Сформировать PDF", "PDF только журнала (SV)"):
                 button = next(
                     button for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)
                     if button.text() == label
                 )
                 button.click()
         critical.assert_not_called()
-        self.assertEqual([(journal_only, len(pdf.pages)) for journal_only, pdf in exported], [(False, 2), (True, 1)])
+        self.assertEqual(
+            [(journal_only, activity_only, len(pdf.pages)) for journal_only, activity_only, pdf in exported],
+            [(False, True, 1), (True, True, 1)],
+        )
         fragments = []
-        exported[0][1].pages[0].extract_text(
+        exported[0][2].pages[0].extract_text(
             visitor_text=lambda text, cm, tm, font, size: fragments.append((text, size)),
         )
-        self.assertTrue(any("Totalt antal timmar" in text and size == 12 for text, size in fragments))
-        self.assertTrue(any("Preliminärt totalbelopp" in text and size == 12 for text, size in fragments))
+        self.assertTrue(any("Arbetade timmar" in text for text, _size in fragments))
+        combined = "\n".join(page.extract_text() for page in exported[0][2].pages)
+        self.assertIn("Rapporten visar registrerat arbete och tid", combined)
+        self.assertNotIn("Preliminärt totalbelopp", combined)
+        self.assertEqual(list(self.conn.iterdump()), before)
+
+    def test_pdf_export_checks_swedish_text_before_writing_activity_only_report(self):
+        self.ob()
+        before = list(self.conn.iterdump())
+        sequence = []
+        written = []
+
+        def translated(report):
+            sequence.append("translate")
+            return {report["journal_rows"][0]["sync_id"]: "Demontering av dörrar"}
+
+        def write(report, _path, font, bold_font, translate, *, journal_only=False, activity_only=False):
+            sequence.append("write")
+            written.append((journal_only, activity_only, self.pdf(
+                report, journal_only=journal_only, activity_only=activity_only,
+            )))
+
+        with (
+            patch.object(self.window, "_collect_journal_translations", side_effect=translated),
+            patch.object(self.desktop, "write_customer_pdf", side_effect=write),
+            patch.object(self.desktop.os, "makedirs"),
+            patch.object(self.desktop.os, "startfile", create=True),
+            patch.object(self.desktop.QMessageBox, "information"),
+            patch.object(self.desktop.QMessageBox, "critical") as critical,
+        ):
+            self.window.export_invoice_to_pdf()
+        critical.assert_not_called()
+        self.assertEqual(sequence, ["translate", "write"])
+        self.assertEqual(len(written), 1)
+        self.assertTrue(written[0][1])
+        text = "\n".join(page.extract_text() for page in written[0][2].pages)
+        self.assertIn("Demontering av dörrar", text)
+        self.assertNotIn("Montering", text)
+        self.assertNotIn("SEK", text)
+        self.assertNotIn("cost_lines", self.window._invoice_report)
+        self.assertTrue(self.window.table_invoice.isColumnHidden(2))
         self.assertEqual(list(self.conn.iterdump()), before)
 
     def test_hotel_entire_october_real_descriptions_export_without_changing_source(self):

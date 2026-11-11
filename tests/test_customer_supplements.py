@@ -135,7 +135,14 @@ class SupplementDesktopTests(unittest.TestCase):
         before = [tuple(r) for r in self.conn.execute(
             "SELECT id,hours,entry_type,rate,transport,time_facts,invoiced FROM shifts ORDER BY id")]
         salary = [tuple(r) for r in self.conn.execute("SELECT * FROM ob_segments")]
-        self.assertTrue(any(button.text() == "Рассчитать доплаты" for button in self.window.tab_invoice.findChildren(QPushButton)))
+        self.assertFalse(any(button.text() == "Рассчитать доплаты"
+                             for button in self.window.tab_invoice.findChildren(QPushButton)))
+        self.assertTrue(any(
+            action.text() == "Клиентские доплаты — отдельный отложенный разбор…"
+            for tool_button in self.window.tab_invoice.findChildren(self.desktop.QToolButton)
+            if tool_button.menu() is not None
+            for action in tool_button.menu().actions()
+        ))
         def accept(dialog):
             self.assertFalse(dialog.drafts)
             for i in range(3):
