@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QWidget,
 )
 
+from qt_test_support import cleanup_new_top_level_widgets, snapshot_top_level_widgets
 import desktop_theme as theme
 
 
@@ -28,6 +29,7 @@ class DesktopThemeTests(unittest.TestCase):
         self.previous = getattr(self.application, "_smartreport_theme", None)
         self.previous_style = self.application.styleSheet()
         self.previous_native = self.application.testAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
+        self._qt_widgets_before = snapshot_top_level_widgets(self.application)
         self.manager = theme.ThemeManager(self.application, "QWidget {color:#e2e8f0;background:#1e2229;}", self.path)
         self.application._smartreport_theme = self.manager
         self.addCleanup(self.restore)
@@ -37,9 +39,10 @@ class DesktopThemeTests(unittest.TestCase):
             del self.application._smartreport_theme
         else:
             self.application._smartreport_theme = self.previous
+        self.manager.deleteLater()
+        cleanup_new_top_level_widgets(self.application, self._qt_widgets_before)
         self.application.setStyleSheet(self.previous_style)
         self.application.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, self.previous_native)
-        self.manager.deleteLater()
 
     def test_live_toggle_persists_and_is_read_by_new_process(self):
         self.assertEqual(self.manager.name, "light")

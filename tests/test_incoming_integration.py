@@ -15,6 +15,7 @@ import test_catalog_sync as catalog_tests
 from test_mail_automation import pdf
 from offline_review import ReviewError, digest, packed
 from incoming_documents import IncomingStore, enabled, open_incoming
+from qt_test_support import cleanup_new_top_level_widgets
 
 
 class IncomingIntegrationTests(unittest.TestCase):
@@ -25,6 +26,8 @@ class IncomingIntegrationTests(unittest.TestCase):
     def setUp(self):
         catalog_tests.CatalogSyncTests.setUp(self)
         self.addCleanup(self._case.cleanup)
+        self.addCleanup(
+            cleanup_new_top_level_widgets, self.qt_app, self._qt_widgets_before)
         cloud_url = patch.object(self.desktop, "CLOUD_URL", "http://isolated-testserver")
         cloud_url.start()
         self.addCleanup(cloud_url.stop)

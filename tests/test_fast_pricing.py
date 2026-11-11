@@ -184,7 +184,7 @@ class FixedPriceSyncTests(unittest.TestCase):
     _add_company = historical.PricingSyncTests._add_company
     submit = historical.PricingSyncTests.submit
 
-    def test_fixed_unknown_rates_server_roundtrip_retry_and_reopen(self):
+    def test_fixed_unknown_rates_server_roundtrip_retry_and_closed_record_protection(self):
         self.submit("fixed-sync", "ob", "Travel B", 1)
         conn = self.server.get_db_connection()
         row = dict(conn.execute("SELECT * FROM incoming_submissions WHERE sync_id='fixed-sync'").fetchone())
@@ -216,7 +216,17 @@ class FixedPriceSyncTests(unittest.TestCase):
         change.update(operation_id="fixed-reopen", base_version=saved["version"])
         response = self.server_client.post("/sync/push", json={"changes": [change]},
                                            headers={"X-Sync-Key": "isolated-sync-test-key"})
-        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("защищены", response.get_json()["error"])
+        conn = self.server.get_db_connection()
+        protected = conn.execute(
+            "SELECT invoiced, customer_pricing, version FROM incoming_submissions WHERE sync_id='fixed-sync'"
+        ).fetchone()
+        self.assertEqual(protected["invoiced"], 1)
+        self.assertEqual(json.loads(protected["customer_pricing"])["fixed"], fixed)
+        self.assertEqual(protected["version"], saved["version"])
+        self.assertEqual(list(map(tuple, conn.execute("SELECT * FROM ob_segments"))), segments)
+        conn.close()
 
     def test_incomplete_fixed_membership_rolls_back_whole_request(self):
         self.submit("fixed-first", "ob", "Travel B", 1)
@@ -241,7 +251,45 @@ class FixedPriceSyncTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT SUM(invoiced) FROM incoming_submissions").fetchone()[0], 0)
         conn.close()
 
-    def test_whole_package_sync_and_partial_reopen_rollback(self):
+    def test_open_record_accepts_customer_fixed_price_update(self):
+        self.submit("fixed-open-price", "ob", "Travel B", 1)
+        conn = self.server.get_db_connection()
+        row = dict(conn.execute(
+            "SELECT * FROM incoming_submissions WHERE sync_id='fixed-open-price'"
+        ).fetchone())
+        segments = list(map(tuple, conn.execute("SELECT * FROM ob_segments")))
+        conn.close()
+        row["entry_type"] = "ob"
+        report = {"journal_rows": [row], "company": row["company"], "sync_id": "object-test",
+                  "date_from": row["date"], "date_to": row["date"], "fast_pris_amount": 3000}
+        first_fixed = create_fixed(report)
+        payload = {key: row[key] for key in ("date", "employee", "company", "object_name", "hours",
+                   "rate", "transport", "comment", "start_time", "end_time")}
+        payload.update(record_type="ob", invoiced=0, customer_pricing=fixed_quote(row, first_fixed))
+        change = {"sync_id": row["sync_id"], "operation_id": "fixed-open-initial",
+                  "operation": "upsert", "base_version": row["version"], "shift": payload}
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        response = self.server_client.post("/sync/push", json={"changes": [change]}, headers=headers)
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        updated_report = dict(report, fast_pris_amount=3500)
+        updated_fixed = create_fixed(updated_report)
+        payload["customer_pricing"] = fixed_quote(row, updated_fixed)
+        change.update(operation_id="fixed-open-reprice", base_version=row["version"] + 1)
+        response = self.server_client.post("/sync/push", json={"changes": [change]}, headers=headers)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        conn = self.server.get_db_connection()
+        saved = conn.execute(
+            "SELECT invoiced, customer_pricing, version FROM incoming_submissions "
+            "WHERE sync_id='fixed-open-price'"
+        ).fetchone()
+        self.assertEqual(saved["invoiced"], 0)
+        self.assertEqual(json.loads(saved["customer_pricing"])["fixed"], updated_fixed)
+        self.assertEqual(saved["version"], row["version"] + 2)
+        self.assertEqual(list(map(tuple, conn.execute("SELECT * FROM ob_segments"))), segments)
+        conn.close()
+
+    def test_closed_package_rejects_partial_and_full_reopen_sync(self):
         self.submit("package-ob", "ob", "Travel B", 1)
         self.submit("package-work", "work", "Travel B", 0)
         conn = self.server.get_db_connection()
@@ -272,7 +320,8 @@ class FixedPriceSyncTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT SUM(invoiced) FROM incoming_submissions").fetchone()[0], 2)
         conn.close()
         response = self.server_client.post("/sync/push", json={"changes": changes}, headers=headers)
-        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("защищены", response.get_json()["error"])
         conn = self.server.get_db_connection()
-        self.assertEqual(conn.execute("SELECT SUM(invoiced) FROM incoming_submissions").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT SUM(invoiced) FROM incoming_submissions").fetchone()[0], 2)
         conn.close()

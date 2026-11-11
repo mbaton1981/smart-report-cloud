@@ -2742,6 +2742,20 @@ class AssistantUiTests(unittest.TestCase):
     setUpClass = classmethod(cards.EmployeeCardTests.setUpClass.__func__)
     tearDownClass = classmethod(cards.EmployeeCardTests.tearDownClass.__func__)
 
+    def setUp(self):
+        from PyQt6.QtWidgets import QApplication
+        from qt_test_support import snapshot_top_level_widgets
+
+        self._qt_application = QApplication.instance()
+        self._qt_widgets_before = snapshot_top_level_widgets(self._qt_application)
+        from qt_test_support import cleanup_new_top_level_widgets
+
+        self.addCleanup(
+            cleanup_new_top_level_widgets,
+            self._qt_application,
+            self._qt_widgets_before,
+        )
+
     def test_employee_choice_continues_original_action_and_period_without_reentry(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtWidgets import QWidget
@@ -2956,6 +2970,10 @@ class AssistantUiTests(unittest.TestCase):
                 del application._smartreport_theme
             else:
                 application._smartreport_theme = previous_theme
+            manager.deleteLater()
+            from qt_test_support import cleanup_new_top_level_widgets
+
+            cleanup_new_top_level_widgets(application, self._qt_widgets_before)
             application.setStyleSheet(previous_style)
 
         self.addCleanup(restore_theme)

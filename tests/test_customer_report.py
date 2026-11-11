@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from pypdf import PdfReader
 from customer_report import write_customer_pdf
+from qt_test_support import cleanup_new_top_level_widgets, snapshot_top_level_widgets
 
 
 class CustomerReportTests(unittest.TestCase):
@@ -18,6 +19,9 @@ class CustomerReportTests(unittest.TestCase):
             cls.application = cls.desktop.QApplication.instance() or cls.desktop.QApplication([])
 
     def setUp(self):
+        self._qt_widgets_before = snapshot_top_level_widgets(self.application)
+        self.addCleanup(
+            cleanup_new_top_level_widgets, self.application, self._qt_widgets_before)
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript("""
