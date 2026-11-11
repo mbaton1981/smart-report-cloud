@@ -112,7 +112,9 @@ def _date_value(value: str | None) -> str | None:
 def non_invoice_document_type(text: str) -> str | None:
     headings = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.startswith("---")]
     header = "\n".join(headings[:60])
-    if re.search(r"^\s*Beslut\s+om\s+trängselskatt\s*$", header, re.IGNORECASE | re.MULTILINE):
+    if re.search(
+            r"^\s*Beslut\s+om\s+(?:trängselskatt|fordonsskatt)(?:\s+och\s+avgifter)?\s*$",
+            header, re.IGNORECASE | re.MULTILINE):
         return "tax_decision"
     if re.search(r"^\s*ORDERBEKRÄFTELSE\s*$", header, re.IGNORECASE | re.MULTILINE):
         return "order_confirmation"
@@ -544,6 +546,8 @@ def invoice_context(text):
 
 
 def required_document_fields(document_type):
+    if document_type == "tax_decision":
+        return ("supplier_name", "document_date", "gross_amount", "currency_code")
     common = ("supplier_name", "document_date", "net_amount", "vat_amount", "currency_code")
     return common + (("gross_amount",) if document_type == "receipt"
                      else ("invoice_number", "amount_due"))
@@ -861,6 +865,24 @@ def parse_invoice_pages(pages):
     fields["review_reasons"] = diagnostics
     from document_costs import extract_cost_fields
     fields["object_cost_fields"] = extract_cost_fields(pages, fields)
+    if fields.get("document_type") == "tax_decision":
+        object_fields = fields["object_cost_fields"]
+        object_sources = object_fields.get("field_sources") or {}
+        for key in ("supplier_name", "document_date", "due_date", "payment_reference",
+                    "currency_code", "gross_amount"):
+            fields[key] = object_fields.get(key)
+            if key in object_sources:
+                field_sources[key] = object_sources[key]
+            else:
+                field_sources.pop(key, None)
+        fields["due_date_kind"] = "explicit" if fields.get("due_date") else "absent"
+        fields["due_date_review_required"] = False
+        fields["due_date_reviewed"] = False
+        fields["review_reasons"] = [
+            reason for reason in fields["review_reasons"]
+            if not reason.startswith("Срок оплаты рассчитан по условиям или неоднозначен;")
+        ]
+        fields["document_total"] = fields.get("gross_amount")
     for key in required_document_fields(fields.get("document_type")):
         if fields.get(key) in (None, "", "UNKNOWN"):
             fields["review_reasons"].append(f"Не подтверждено поле {key}; проверьте оригинал.")

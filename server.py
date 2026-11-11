@@ -557,6 +557,7 @@ def init_cloud_db():
             transport REAL NOT NULL DEFAULT 0,
             comment TEXT,
             invoiced INTEGER NOT NULL DEFAULT 0,
+            hours_confirmed INTEGER NOT NULL DEFAULT 0,
             version INTEGER NOT NULL DEFAULT 1,
             change_seq INTEGER NOT NULL DEFAULT 0,
             is_deleted INTEGER NOT NULL DEFAULT 0,
@@ -580,6 +581,8 @@ def init_cloud_db():
         cursor.execute("ALTER TABLE incoming_submissions ADD COLUMN submission_type TEXT NOT NULL DEFAULT 'work'")
     if 'invoiced' not in submission_columns:
         cursor.execute("ALTER TABLE incoming_submissions ADD COLUMN invoiced INTEGER NOT NULL DEFAULT 0")
+    if 'hours_confirmed' not in submission_columns:
+        cursor.execute("ALTER TABLE incoming_submissions ADD COLUMN hours_confirmed INTEGER NOT NULL DEFAULT 0")
     
     cursor.execute("PRAGMA table_info(cloud_shifts)")
     shift_cols = [c[1] for c in cursor.fetchall()]
@@ -3300,6 +3303,9 @@ def edit_shift():
         if existing['is_deleted']:
             conn.rollback()
             return jsonify({"ok": False, "error": "Удалённую смену нельзя редактировать", "reason": "deleted"}), 409
+        if existing["invoiced"] or existing["hours_confirmed"]:
+            state = "Выставленная запись" if existing["invoiced"] else "Подтверждённые часы"
+            raise ValueError(f"{state} защищены. Сначала выполните административный возврат в работу в приложении.")
 
         employee = resolve_session_employee(cursor, data.get('employee', existing['employee']))
         if employee != existing['employee'] and session.get('role') != 'admin':
@@ -3353,8 +3359,6 @@ def edit_shift():
                 raise ValueError("Числовое поле должно быть конечным.")
         comment = str(data.get('comment', existing['comment'] or ''))[:2000]
         invoiced = int(existing['invoiced']) if submission_type in ('work', 'ob') else 0
-        if existing["invoiced"]:
-            raise ValueError("Выставленная запись защищена. Сначала верните её в работу в приложении.")
         normalized = {
             "date": date_val, "employee": employee, "company": company,
             "object_name": object_name, "hours": hours, "rate": existing['rate'],
@@ -3501,10 +3505,11 @@ def delete_shift():
         if existing['is_deleted']:
             conn.rollback()
             return jsonify({"ok": True, "idempotent": True, "sync_id": sync_id, "version": existing['version']}), 200
-        if existing["invoiced"]:
+        if existing["invoiced"] or existing["hours_confirmed"]:
+            state = "Выставленная запись" if existing["invoiced"] else "Подтверждённые часы"
             conn.rollback()
-            return jsonify({"ok": False, "error": "Выставленная запись защищена; сначала верните её в работу.",
-                            "reason": "invoiced"}), 409
+            return jsonify({"ok": False, "error": f"{state} защищены; сначала выполните административный возврат в работу.",
+                            "reason": "invoiced" if existing["invoiced"] else "hours_confirmed"}), 409
         if expected_version != existing['version']:
             conn.rollback()
             return jsonify({"ok": False, "error": "Смена уже изменена; обновите историю", "conflict": True, "current": serialize_submission(existing)}), 409
@@ -3579,10 +3584,11 @@ def delete_cloud_shift():
 
         if submission:
             if not submission['is_deleted']:
-                if submission["invoiced"]:
+                if submission["invoiced"] or submission["hours_confirmed"]:
+                    state = "Выставленная запись" if submission["invoiced"] else "Подтверждённые часы"
                     conn.rollback()
-                    return jsonify({"ok": False, "error": "Выставленная запись защищена; сначала верните её в работу.",
-                                    "reason": "invoiced"}), 409
+                    return jsonify({"ok": False, "error": f"{state} защищены; сначала выполните административный возврат в работу.",
+                                    "reason": "invoiced" if submission["invoiced"] else "hours_confirmed"}), 409
                 change_seq = next_change_sequence(cursor)
                 cursor.execute('''
                     UPDATE incoming_submissions
@@ -3601,10 +3607,11 @@ def delete_cloud_shift():
                 conn.close()
                 return jsonify({"ok": False, "error": "Удаление по полям неоднозначно; требуется стабильный ID"}), 409
             submission = matches[0]
-            if submission["invoiced"]:
+            if submission["invoiced"] or submission["hours_confirmed"]:
+                state = "Выставленная запись" if submission["invoiced"] else "Подтверждённые часы"
                 conn.rollback()
-                return jsonify({"ok": False, "error": "Выставленная запись защищена; сначала верните её в работу.",
-                                "reason": "invoiced"}), 409
+                return jsonify({"ok": False, "error": f"{state} защищены; сначала выполните административный возврат в работу.",
+                                "reason": "invoiced" if submission["invoiced"] else "hours_confirmed"}), 409
             change_seq = next_change_sequence(cursor)
             cursor.execute('''
                 UPDATE incoming_submissions
@@ -3667,14 +3674,14 @@ def check_employee_shifts():
                 end_date = datetime(year, month + 1, 1).strftime('%Y-%m-%d')
             
             cursor.execute("""
-                SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, version, change_seq, submission_type FROM incoming_submissions
+                SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, hours_confirmed, sync_id, version, change_seq, submission_type FROM incoming_submissions
                 WHERE employee = ? AND date >= ? AND date < ? AND is_deleted = 0
                 ORDER BY date ASC, id ASC
             """, (emp, start_date, end_date))
         except Exception:
-            cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, version, change_seq, submission_type FROM incoming_submissions WHERE employee = ? AND is_deleted = 0 ORDER BY date DESC LIMIT 31", (emp,))
+            cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, hours_confirmed, sync_id, version, change_seq, submission_type FROM incoming_submissions WHERE employee = ? AND is_deleted = 0 ORDER BY date DESC LIMIT 31", (emp,))
     else:
-        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, version, change_seq, submission_type FROM incoming_submissions WHERE employee = ? AND is_deleted = 0 ORDER BY date DESC LIMIT 31", (emp,))
+        cursor.execute("SELECT date, employee, company, object_name, hours, rate, transport, comment, invoiced, hours_confirmed, sync_id, version, change_seq, submission_type FROM incoming_submissions WHERE employee = ? AND is_deleted = 0 ORDER BY date DESC LIMIT 31", (emp,))
 
     rows = cursor.fetchall()
     
@@ -3697,6 +3704,7 @@ def check_employee_shifts():
             "company": r['company'],
             "comment": r['comment'] or "",
             "invoiced": r['invoiced'],
+            "hours_confirmed": r['hours_confirmed'],
             "sync_id": r['sync_id'],
             "version": r['version'],
             "change_seq": r['change_seq'],
@@ -4966,6 +4974,7 @@ def serialize_submission(row, cursor=None):
         "submission_type": sub_type,
         "record_type": sub_type,
         "invoiced": row['invoiced'],
+        "hours_confirmed": row['hours_confirmed'] if "hours_confirmed" in row.keys() else 0,
         "customer_pricing": row["customer_pricing"] if "customer_pricing" in row.keys() else None,
         "time_facts": row["time_facts"] if "time_facts" in row.keys() else None,
     }
@@ -5037,7 +5046,8 @@ def reopen_selected_shift():
         if row is None or row["is_deleted"]:
             conn.rollback()
             return jsonify({"ok": False, "error": "Смена не найдена или уже удалена."}), 404
-        if row["last_operation_id"] == operation_id and not row["invoiced"]:
+        if (row["last_operation_id"] == operation_id
+                and not row["invoiced"] and not row["hours_confirmed"]):
             conn.rollback()
             return jsonify({"ok": True, "changed": False, "shift": serialize_submission(row, cursor)})
         if row["version"] != version:
@@ -5045,7 +5055,10 @@ def reopen_selected_shift():
             return jsonify({"ok": False, "error": "Запись изменилась на сервере. Обновите данные и повторите."}), 409
         if row["submission_type"] not in ("work", "ob"):
             raise ValueError("Возврат в работу применяется только к рабочей или OB-смене.")
-        changed = reopen_invoiced_shifts(cursor, "incoming_submissions", [row])
+        changed = reopen_invoiced_shifts(cursor, "incoming_submissions", [row]) if row["invoiced"] else 0
+        if row["hours_confirmed"]:
+            cursor.execute("UPDATE incoming_submissions SET hours_confirmed=0 WHERE sync_id=?", (sync_id,))
+            changed = max(changed, cursor.rowcount)
         if changed:
             cursor.execute("""
                 UPDATE incoming_submissions SET version=version+1,change_seq=?,last_operation_id=?,
@@ -5188,6 +5201,13 @@ def sync_push():
                 if old_fixed:
                     touched_fixed.add(old_fixed["id"])
             ob_result = None
+            if (operation == "upsert" and existing and not existing["is_deleted"]
+                    and (existing["invoiced"] or existing["hours_confirmed"])
+                    and existing["last_operation_id"] != operation_id):
+                state = "Выставленная запись" if existing["invoiced"] else "Подтверждённые часы"
+                raise ValueError(
+                    f"{state} защищены; сначала выполните административный возврат в работу в приложении."
+                )
 
             if operation == 'upsert':
                 date_val = str(payload.get('date', '')).strip()
@@ -5224,6 +5244,9 @@ def sync_push():
                     allow_inactive=preserve_history_object,
                 )
                 invoiced = int(bool(payload.get('invoiced', 0))) if submission_type in ('work', 'ob') else 0
+                hours_confirmed = int(bool(payload.get(
+                    'hours_confirmed', existing['hours_confirmed'] if existing else 0
+                ))) if submission_type in ('work', 'ob') else 0
                 if submission_type == "ob":
                     if not ob_schema_ready(cursor):
                         raise ValueError("OB-схема не подготовлена; выполните миграцию с backup")
@@ -5248,6 +5271,7 @@ def sync_push():
                     "date": date_val, "employee": employee, "company": company,
                     "object_name": object_name, "hours": hours, "rate": rate,
                     "transport": transport, "comment": comment, "invoiced": invoiced,
+                    "hours_confirmed": hours_confirmed,
                     "submission_type": submission_type
                 }
                 facts = customer_intervals.time_facts(supplied_facts, date_val, hours)
@@ -5336,10 +5360,12 @@ def sync_push():
                 results.append({"operation_id": operation_id, "ok": False, "conflict": True, "reason": "missing_record"})
                 continue
 
-            if operation == "delete" and existing and not existing["is_deleted"] and existing["invoiced"]:
+            if (operation == "delete" and existing and not existing["is_deleted"]
+                    and (existing["invoiced"] or existing["hours_confirmed"])):
+                state = "invoiced" if existing["invoiced"] else "hours_confirmed"
                 results.append({
                     "operation_id": operation_id, "ok": False, "conflict": True,
-                    "reason": "invoiced", "current": serialize_submission(existing),
+                    "reason": state, "current": serialize_submission(existing),
                 })
                 continue
             if operation == "upsert" and not existing and submission_type in ("work", "ob") and not invoiced:
@@ -5350,16 +5376,20 @@ def sync_push():
                     )
                     normalized["customer_pricing"] = pricing_json(quote, normalized)
 
-            if operation == "upsert" and existing and existing["invoiced"]:
+            if (operation == "upsert" and existing
+                    and (existing["invoiced"] or existing["hours_confirmed"])):
                 previous = dict(existing)
+                state = "Выставленная запись" if existing["invoiced"] else "Подтверждённые часы"
                 if any(normalized.get(key) != (previous[key] or "" if key == "comment" else previous.get(key)) for key in (
                     "date", "employee", "company", "object_name", "hours", "rate", "transport", "comment", "submission_type",
                     "start_time", "end_time", "ob_base_rate",
                 )):
-                    raise ValueError("Выставленная запись защищена; сначала верните её в работу.")
+                    raise ValueError(f"{state} защищены; сначала выполните административный возврат в работу в приложении.")
                 old_facts = customer_intervals.time_facts(existing["time_facts"], existing["date"], existing["hours"])
                 if normalized.get("time_facts", old_facts) != old_facts:
-                    raise ValueError("Фактическое время закрытой смены защищено.")
+                    raise ValueError("Фактическое время подтверждённой или выставленной смены защищено.")
+                if existing["hours_confirmed"] and not normalized["hours_confirmed"]:
+                    raise ValueError("Подтверждение часов снимается только отдельным административным действием.")
             if operation == "upsert" and normalized["invoiced"] and (not existing or not existing["invoiced"]):
                 if normalized.get("time_facts") and "time_facts" not in payload:
                     raise ValueError("Для закрытия записей с фактическим временем обновите десктопный клиент.")
@@ -5384,6 +5414,7 @@ def sync_push():
                             hours = COALESCE(?, hours), rate = COALESCE(?, rate),
                             transport = COALESCE(?, transport), comment = COALESCE(?, comment),
                             invoiced = COALESCE(?, invoiced),
+                            hours_confirmed = COALESCE(?, hours_confirmed),
                             submission_type = COALESCE(?, submission_type),
                             start_time = ?, end_time = ?, ob_base_rate = ?,
                             version = ?, change_seq = ?, is_deleted = ?, desktop_acked = 1,
@@ -5393,6 +5424,7 @@ def sync_push():
                         normalized.get('date'), normalized.get('employee'), normalized.get('company'),
                         normalized.get('object_name'), normalized.get('hours'), normalized.get('rate'),
                         normalized.get('transport'), normalized.get('comment'), normalized.get('invoiced'),
+                        normalized.get('hours_confirmed'),
                         normalized.get('submission_type'), normalized.get('start_time'), normalized.get('end_time'),
                         normalized.get('ob_base_rate'), version, change_seq,
                         int(operation == 'delete'), operation_id, operation_hash, now, existing['id']
@@ -5405,6 +5437,7 @@ def sync_push():
                             hours = COALESCE(?, hours), rate = COALESCE(?, rate),
                             transport = COALESCE(?, transport), comment = COALESCE(?, comment),
                             invoiced = COALESCE(?, invoiced),
+                            hours_confirmed = COALESCE(?, hours_confirmed),
                             submission_type = COALESCE(?, submission_type),
                             version = ?, change_seq = ?, is_deleted = ?, desktop_acked = 1,
                             last_operation_id = ?, payload_hash = ?, updated_at = ?
@@ -5413,6 +5446,7 @@ def sync_push():
                         normalized.get('date'), normalized.get('employee'), normalized.get('company'),
                         normalized.get('object_name'), normalized.get('hours'), normalized.get('rate'),
                         normalized.get('transport'), normalized.get('comment'), normalized.get('invoiced'),
+                        normalized.get('hours_confirmed'),
                         normalized.get('submission_type'), version, change_seq,
                         int(operation == 'delete'), operation_id, operation_hash, now, existing['id']
                     ))
@@ -5424,27 +5458,29 @@ def sync_push():
                     cursor.execute('''
                         INSERT INTO incoming_submissions (
                             request_id, sync_id, submission_type, date, employee, company, object_name,
-                            hours, rate, transport, comment, invoiced, version, change_seq, is_deleted,
+                            hours, rate, transport, comment, invoiced, hours_confirmed, version, change_seq, is_deleted,
                             desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at,
                             start_time, end_time, ob_base_rate
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         sync_id, sync_id, normalized['submission_type'], normalized['date'], normalized['employee'], normalized['company'],
                         normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
-                        normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now,
+                        normalized['comment'], normalized['invoiced'], normalized['hours_confirmed'],
+                        version, change_seq, operation_id, operation_hash, now, now,
                         normalized.get('start_time'), normalized.get('end_time'), normalized.get('ob_base_rate'),
                     ))
                 else:
                     cursor.execute('''
                         INSERT INTO incoming_submissions (
                             request_id, sync_id, submission_type, date, employee, company, object_name,
-                            hours, rate, transport, comment, invoiced, version, change_seq, is_deleted,
+                            hours, rate, transport, comment, invoiced, hours_confirmed, version, change_seq, is_deleted,
                             desktop_acked, source, last_operation_id, payload_hash, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 'desktop', ?, ?, ?, ?)
                     ''', (
                         sync_id, sync_id, normalized['submission_type'], normalized['date'], normalized['employee'], normalized['company'],
                         normalized['object_name'], normalized['hours'], normalized['rate'], normalized['transport'],
-                        normalized['comment'], normalized['invoiced'], version, change_seq, operation_id, operation_hash, now, now
+                        normalized['comment'], normalized['invoiced'], normalized['hours_confirmed'],
+                        version, change_seq, operation_id, operation_hash, now, now
                     ))
             if operation == "upsert" and "time_facts" in normalized:
                 customer_intervals.store_time(cursor, "incoming_submissions", sync_id, normalized["time_facts"],

@@ -208,6 +208,58 @@ class ReopenShiftTests(unittest.TestCase):
         self.assertEqual(self.reopen(stale).status_code, 409)
         self.assertEqual(self.server_rows(), before)
 
+    def test_hours_confirmation_is_server_locked_and_admin_reopen_clears_only_the_lock(self):
+        self.submit("hours-confirmed", "work", "Travel B", 1)
+        self.worker()
+        connection = self.desktop.get_db_connection()
+        try:
+            local = connection.execute(
+                "SELECT * FROM shifts WHERE sync_id='hours-confirmed'").fetchone()
+            connection.execute("UPDATE shifts SET hours_confirmed=1 WHERE sync_id=?", (local["sync_id"],))
+            local = connection.execute(
+                "SELECT * FROM shifts WHERE sync_id='hours-confirmed'").fetchone()
+            self.desktop.enqueue_shift_operation(
+                connection.cursor(), local["sync_id"], "upsert", local["sync_version"],
+                self.desktop.shift_payload(local))
+            connection.commit()
+        finally:
+            connection.close()
+        self.worker()
+        row = next(item for item in self.records() if item["sync_id"] == "hours-confirmed")
+        self.assertEqual(row["hours_confirmed"], 1)
+        before = self.server_rows()["hours-confirmed"]
+
+        edit = self.server_client.post("/edit-shift", json={
+            "sync_id": row["sync_id"], "version": row["version"],
+            "operation_id": "edit-confirmed-hours", "date": "2026-10-21",
+        })
+        self.assertEqual(edit.status_code, 400, edit.get_json())
+        self.assertIn("защищены", edit.get_json()["error"])
+        delete = self.server_client.post("/delete-shift", json={
+            "sync_id": row["sync_id"], "version": row["version"],
+            "operation_id": "delete-confirmed-hours",
+        })
+        self.assertEqual(delete.status_code, 409, delete.get_json())
+        self.assertEqual(delete.get_json()["reason"], "hours_confirmed")
+
+        rejected = self.server_client.post("/sync/push", headers={
+            "X-Sync-Key": "isolated-sync-test-key",
+        }, json={"changes": [{
+            "sync_id": row["sync_id"], "base_version": row["version"],
+            "operation_id": "sync-edit-confirmed-hours", "operation": "upsert",
+            "shift": dict(row, date="2026-10-21"),
+        }]})
+        self.assertEqual(rejected.status_code, 400, rejected.get_json())
+        self.assertIn("защищены", rejected.get_json()["error"])
+        self.assertEqual(self.server_rows()["hours-confirmed"], before)
+
+        reopened = self.reopen(row, "reopen-confirmed-hours")
+        self.assertEqual(reopened.status_code, 200, reopened.get_json())
+        self.assertTrue(reopened.get_json()["changed"])
+        self.assertEqual(reopened.get_json()["shift"]["hours_confirmed"], 0)
+        self.worker()
+        self.assertEqual(self.local_rows()["hours-confirmed"]["hours_confirmed"], 0)
+
     def test_dataset_boundary_applies_before_single_shift_reopen(self):
         row = self.closed()
         before = self.server_rows()

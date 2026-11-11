@@ -70,6 +70,22 @@ class IncomingDisplayTests(unittest.TestCase):
         window.selector.setCurrentIndex(window.selector.findData(document_id))
         self.assertEqual(window.inputs["supplier_name"].text(), recognized["supplier_name"])
 
+    def test_order_confirmation_exclusion_has_specific_caption(self):
+        base = self.store.base(1)
+        base["document_type"] = "order_confirmation"
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1",
+                                    (json.dumps(base, ensure_ascii=False),))
+        self.store.set_action(1, "ignore", 0)
+        window = self.open_window()
+        window.show_all_states.setChecked(True)
+        index = window.selector.findData(1)
+        self.assertGreaterEqual(index, 0)
+        window.selector.setCurrentIndex(index)
+        self.assertEqual(window.ignore_button.text(), "Подтверждение заказа — не учитывать")
+        self.assertIn("Исключён — Подтверждение заказа, не учитывать",
+                      window.selector.currentText())
+
     def test_rerecognition_conflict_is_explained_without_replacing_saved_type(self):
         base = self.store.base(1)
         base["document_type"] = "receipt"
@@ -177,6 +193,9 @@ class IncomingDisplayTests(unittest.TestCase):
         self.store.set_action(1, "ignore", action_revision)
         documents, _online = self.desktop.SmartReportApp._expense_register_snapshot(host)
         self.assertEqual(self.desktop.SmartReportApp._expense_register_status_key(documents[0]), "ignored")
+        self.assertEqual(documents[0]["exclusion_reason"], "Не фактура")
+        self.assertEqual(
+            self.desktop.SmartReportApp._expense_register_row_tone(documents[0]), "neutral")
 
         company = {
             "verification_status": "confirmed",
@@ -253,7 +272,8 @@ class IncomingDisplayTests(unittest.TestCase):
              "unallocated_gross": "0.00"},
             {"id": "later", "verification_status": "later",
              "gross_amount": "125.00", "currency_code": "SEK", "allocations": []},
-            {"id": "ignored", "verification_status": "ignored",
+            {"id": "ignored", "verification_status": "ignored", "supplier_name": "Bauhaus",
+             "document_type": "order_confirmation", "exclusion_reason": "Не фактура",
              "gross_amount": "125.00", "currency_code": "SEK", "allocations": []},
             {"id": "error", "verification_status": "requires_review",
              "sync_state": "conflict", "sync_error": "Synthetic transfer error",
@@ -294,6 +314,7 @@ class IncomingDisplayTests(unittest.TestCase):
             _expense_money_label=self.desktop.SmartReportApp._expense_money_label,
         )
         host.exp_filter_object.addItem("Все объекты", None)
+        host.exp_filter_status.addItem("Активные", "active")
         host.exp_filter_status.addItem("Все состояния", "all")
         for name in (
                 "_expense_register_snapshot", "_expense_register_status_key",
@@ -303,6 +324,18 @@ class IncomingDisplayTests(unittest.TestCase):
                 "_update_expense_register_legend"):
             setattr(host, name, getattr(self.desktop.SmartReportApp, name))
         host._expense_register_snapshot = lambda *_args, **_kwargs: (documents, True)
+
+        self.desktop.SmartReportApp.load_expense_documents(host)
+        self.assertEqual(table.rowCount(), 6)
+        self.assertFalse(any(table.item(row, 0).text() == "ignored" for row in range(table.rowCount())))
+        host.exp_filter_status.setCurrentIndex(host.exp_filter_status.findData("all"))
+        self.desktop.SmartReportApp.load_expense_documents(host)
+        ignored_row = next(row for row in range(table.rowCount())
+                           if table.item(row, 0).text() == "ignored")
+        self.assertIn("Bauhaus", table.item(ignored_row, 2).text())
+        self.assertIn("Подтверждение заказа", table.item(ignored_row, 2).text())
+        self.assertEqual(table.item(ignored_row, 7).text(), "Исключён — Не фактура")
+        self.assertIn("Причина исключения: Не фактура", table.item(ignored_row, 7).toolTip())
 
         previous = getattr(self.qt_app, "_smartreport_theme", None)
         previous_style = self.qt_app.styleSheet()

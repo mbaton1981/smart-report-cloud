@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import test_incoming_integration as integration
 from document_costs import extract_cost_fields
-from expense_documents import parse_invoice_pages
+from expense_documents import parse_invoice_pages, required_document_fields
 from offline_review import ReviewError, packed
 
 
@@ -58,6 +58,41 @@ Kvitton och fakturor"""
         self.assertIsNone(costs["vat_amount"])
         self.assertIsNone(costs["invoice_number"])
         self.assertEqual([item["amount"] for item in costs["amount_candidates"]], ["1208.00"])
+
+    def test_vehicle_tax_decision_uses_issuer_and_original_fields(self):
+        text = """Beslut om fordonsskatt och avgifter
+Transportstyrelsen
+Beslutsdatum
+07.11.2026
+OCR-nummer
+11147312394640676
+Bygger Och Renoverar I Sthlm AB
+Summaattbetala
+Beloppet ska vara bokfört på Transportstyrelsens konto för fordonsskatt senast 2026-11-30 1675
+Koldioxidbaserad fordonsskatt för 2026-12-01 -- 2027-03-31 1601
+Vägtrafikregisteravgift 74"""
+        fields = parse_invoice_pages([{"page": 1, "text": text}])
+        self.assertEqual(fields["document_type"], "tax_decision")
+        costs = fields["object_cost_fields"]
+        self.assertEqual(costs["supplier_name"], "Transportstyrelsen")
+        self.assertEqual(costs["document_date"], "2026-11-07")
+        self.assertEqual(costs["due_date"], "2026-11-30")
+        self.assertEqual(costs["payment_reference"], "11147312394640676")
+        self.assertEqual(costs["gross_amount"], "1675.00")
+        self.assertEqual(fields["supplier_name"], "Transportstyrelsen")
+        self.assertEqual(fields["document_date"], "2026-11-07")
+        self.assertEqual(fields["due_date"], "2026-11-30")
+        self.assertEqual(fields["payment_reference"], "11147312394640676")
+        self.assertEqual(fields["gross_amount"], "1675.00")
+        self.assertFalse(fields["due_date_review_required"])
+        self.assertIsNone(costs["invoice_number"])
+        self.assertIsNone(costs["vat_amount"])
+        self.assertIsNone(fields["invoice_number"])
+        self.assertIsNone(fields["vat_amount"])
+        self.assertEqual(
+            required_document_fields(fields["document_type"]),
+            ("supplier_name", "document_date", "gross_amount", "currency_code"),
+        )
 
     def test_conflicting_totals_are_candidates_not_an_invented_choice(self):
         fields = extract_cost_fields([{"page": 1, "text": TAX_TEXT.replace(
@@ -325,3 +360,30 @@ class DocumentActionTests(unittest.TestCase):
         finally:
             window.loaded_payload = window.payload()
             window.close()
+
+    def test_ignore_excludes_by_attachment_hash_and_restores_without_losing_original(self):
+        from test_mail_automation import pdf
+        from offline_review_ui import OfflineReviewWindow
+
+        original = self.store.original(1).read_bytes()
+        self.store.set_action(1, "ignore", 0)
+        sha = self.store.conn.execute("SELECT sha256 FROM documents WHERE id=1").fetchone()[0]
+        self.assertEqual(self.store.exclusion_reason(1), "Не фактура")
+        self.assertEqual(self.store.conn.execute(
+            "SELECT reason FROM mail_excluded_pdfs WHERE sha256=?", (sha,)).fetchone()[0], "Не фактура")
+        self.assertFalse(self.store.add_pdf(original, "forwarded-again.pdf", {"fields": {}}))
+        self.assertTrue(self.store.add_pdf(
+            pdf("Other original from the same supplier"), "different.pdf", {"fields": {}}))
+
+        window = OfflineReviewWindow(self.store, integrated=True)
+        self.addCleanup(window.close)
+        self.assertEqual(window.selector.findData(1), -1)
+        window.show_all_states.setChecked(True)
+        window.selector.setCurrentIndex(window.selector.findData(1))
+        self.assertIn("Исключён — Не фактура", window.selector.currentText())
+        self.assertFalse(window.restore_button.isHidden())
+        window.restore_button.click()
+        self.assertIsNone(self.store.exclusion_reason(1))
+        self.assertEqual(self.store.action(1)[1], "expense")
+        self.assertEqual(self.store.original(1).read_bytes(), original)
+        self.assertNotEqual(window.selector.findData(1), -1)

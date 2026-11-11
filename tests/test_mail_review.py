@@ -41,6 +41,37 @@ class MailClassificationTests(unittest.TestCase):
         self.assertIsNone(fields["vat_amount"])
         self.assertTrue(fields["review_reasons"])
 
+    def test_tax_decision_keeps_only_verified_issuer_and_dates(self):
+        fields = {
+            "raw_text": "Beslut om fordonsskatt och avgifter",
+            "document_type": "invoice",
+            "supplier_name": "Receiver AB",
+            "document_date": "2026-01-01",
+            "due_date": "2026-01-02",
+            "payment_reference": "123456789",
+            "invoice_number": "123",
+            "object_cost_fields": {
+                "supplier_name": "Transportstyrelsen",
+                "document_date": "2026-11-07",
+                "due_date": "2026-11-30",
+                "payment_reference": "11147312394640676",
+                "field_sources": {
+                    "supplier_name": [{"kind": "stated_issuer"}],
+                    "document_date": [{"kind": "stated_tax_decision"}],
+                    "due_date": [{"kind": "stated_tax_decision"}],
+                    "payment_reference": [{"kind": "stated_tax_decision"}],
+                },
+            },
+        }
+        classify_mail_document(fields)
+        self.assertEqual(fields["document_type"], "tax_decision")
+        self.assertEqual(fields["supplier_name"], "Transportstyrelsen")
+        self.assertEqual(fields["document_date"], "2026-11-07")
+        self.assertEqual(fields["due_date"], "2026-11-30")
+        self.assertEqual(fields["payment_reference"], "11147312394640676")
+        self.assertIsNone(fields["invoice_number"])
+        self.assertNotIn("invoice_number", fields["field_sources"])
+
     def test_parser_does_not_use_receiver_as_supplier_for_non_invoice_documents(self):
         for text, document_type in (
             ("Beslut om trängselskatt\nSupplier: Receiver AB\nOrg.nr: 556000-0000", "tax_decision"),

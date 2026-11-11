@@ -39,22 +39,23 @@ class IncomingDocumentDelegate(QStyledItemDelegate):
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         accounted = index.data(Qt.ItemDataRole.BackgroundRole) == QColor("#b9efc6")
+        excluded = index.data(Qt.ItemDataRole.BackgroundRole) == QColor("#e5e7eb")
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        background = QColor("#b9efc6" if accounted else "#f7fafc")
+        background = QColor("#b9efc6" if accounted else "#e5e7eb" if excluded else "#f7fafc")
         if selected:
-            background = QColor("#92cfaa" if accounted else "#bdd9ef")
+            background = QColor("#92cfaa" if accounted else "#d1d5db" if excluded else "#bdd9ef")
         elif hovered:
-            background = QColor("#a9dfba" if accounted else "#e2edf7")
-        foreground = QColor("#12351f" if accounted else "#17202a")
+            background = QColor("#a9dfba" if accounted else "#d1d5db" if excluded else "#e2edf7")
+        foreground = QColor("#12351f" if accounted else "#6b7280" if excluded else "#17202a")
         manager = getattr(QApplication.instance(), "_smartreport_theme", None)
         if manager is not None and manager.name == "dark":
-            background = QColor("#1c4532" if accounted else "#28303d")
+            background = QColor("#1c4532" if accounted else "#3b414b" if excluded else "#28303d")
             if selected:
-                background = QColor("#28573d" if accounted else "#2d567c")
+                background = QColor("#28573d" if accounted else "#4b5563" if excluded else "#2d567c")
             elif hovered:
-                background = QColor("#224e38" if accounted else "#303c4b")
-            foreground = QColor("#c6f6d5" if accounted else "#e2e8f0")
+                background = QColor("#224e38" if accounted else "#4b5563" if excluded else "#303c4b")
+            foreground = QColor("#c6f6d5" if accounted else "#9ca3af" if excluded else "#e2e8f0")
         option.backgroundBrush = QBrush(background)
         palette = QPalette(option.palette)
         for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive, QPalette.ColorGroup.Disabled):
@@ -66,10 +67,11 @@ class IncomingDocumentDelegate(QStyledItemDelegate):
 
 
 class OfflineReviewWindow(QDialog):
-    def __init__(self, store: OfflineReviewStore, *, integrated=False):
+    def __init__(self, store: OfflineReviewStore, *, integrated=False, document_id=None):
         super().__init__()
         self.store = store
         self.integrated = integrated
+        self.explicit_document_id = document_id
         self.gallery = None
         self.preview_document_id = None
         self.inputs, self.origins = {}, {}
@@ -85,6 +87,10 @@ class OfflineReviewWindow(QDialog):
              f"ОТДЕЛЬНЫЙ ТЕСТОВЫЙ ПРОФИЛЬ. Почта, рабочая база и синхронизация отключены.\nПрофиль: {store.root}"))
         banner.setWordWrap(True)
         layout.addWidget(banner)
+        if integrated:
+            self.show_all_states = QCheckBox("Все состояния (включая исключённые)")
+            self.show_all_states.toggled.connect(lambda _checked: self.reload_documents())
+            layout.addWidget(self.show_all_states)
         self.selector = QComboBox()
         if integrated:
             self.selector._smartreport_delegate = IncomingDocumentDelegate(self.selector.view())
@@ -97,7 +103,10 @@ class OfflineReviewWindow(QDialog):
         self._label_signatures = {}
         self._label_token = None
         for doc in store.documents():
-            self.selector.addItem("", doc["id"])
+            if (not integrated or self.show_all_states.isChecked()
+                    or doc["id"] == self.explicit_document_id
+                    or store.action(doc["id"])[1] != "ignore"):
+                self.selector.addItem("", doc["id"])
         layout.addWidget(self.selector)
         self.classification = QLabel()
         self.classification.setWordWrap(True)
@@ -254,12 +263,14 @@ class OfflineReviewWindow(QDialog):
             self.reassign_button.clicked.connect(self.refresh_distribution)
             self.diagnostics_layout.addWidget(self.reassign_button)
             actions = QHBoxLayout()
-            self.ignore_button = QPushButton("Не учитывать")
+            self.ignore_button = QPushButton("Не учитывать — не фактура")
+            self.restore_button = QPushButton("Восстановить документ")
             self.later_button = QPushButton("Разобрать позже")
             self.expense_button = self.transfer_button
             self.ignore_button.clicked.connect(lambda: self.set_action("ignore"))
+            self.restore_button.clicked.connect(lambda: self.set_action("expense"))
             self.later_button.clicked.connect(lambda: self.set_action("later"))
-            for button in (self.ignore_button, self.later_button, self.expense_button):
+            for button in (self.ignore_button, self.restore_button, self.later_button, self.expense_button):
                 actions.addWidget(button)
             layout.addLayout(actions)
             draft_actions = QHBoxLayout()
@@ -448,6 +459,7 @@ class OfflineReviewWindow(QDialog):
                 self.allocations.item(0, 1).setText(value)
 
     def set_action(self, action):
+        previous_action = self.store.action(self.document_id)[1] if self.integrated else None
         try:
             self.action_revision = self.store.set_action(self.document_id, action, self.action_revision)
         except (ReviewError, OSError, sqlite3.Error) as error:
@@ -456,16 +468,27 @@ class OfflineReviewWindow(QDialog):
         # Status changes do not parse, save, or discard visible financial edits.
         self.update_action_controls()
         self.refresh_document_labels()
-        labels = {"ignore": "Не учитывать — PDF сохранён, расход не создан",
-                  "later": "Разобрать позже — PDF сохранён, расход не создан",
-                  "expense": "Проверьте данные и распределите сумму по объектам. Номер и НДС необязательны."}
-        self.status.setText(labels[action])
-        if action in ("ignore", "later") and self.payload() != self.loaded_payload:
-            self.status.setText(labels[action] + ". Несохранённые правки полей не применены.")
+        document_type = self.store.base(self.document_id).get("document_type")
+        labels = {
+            "ignore": ("Подтверждение заказа — не учитывать; PDF сохранён, расход не создан"
+                       if document_type == "order_confirmation"
+                       else "Не учитывать — PDF сохранён, расход не создан"),
+            "later": "Разобрать позже — PDF сохранён, расход не создан",
+        }
+        label = ("Документ восстановлен. Проверьте тип и данные; расход ещё не создан."
+                 if action == "expense" and previous_action == "ignore" else
+                 "Проверьте данные и распределите сумму по объектам. Номер и НДС необязательны."
+                 if action == "expense" else labels[action])
+        self.status.setText(label)
+        unsaved = self.payload() != self.loaded_payload
+        if action in ("ignore", "later") and unsaved:
+            self.status.setText(label + ". Несохранённые правки полей не применены.")
         desktop_theme.apply_style(self.status, "")
         refresh = getattr(self.store.host, "incoming_review_changed", None)
         if refresh:
             refresh()
+        if not unsaved:
+            self.reload_documents()
 
     def update_action_controls(self):
         if not self.integrated or self.document_id is None:
@@ -475,11 +498,13 @@ class OfflineReviewWindow(QDialog):
         self.financial_panel.setVisible(True)
         self.save_button.setVisible(card is None or self.server_version is not None)
         self.ignore_button.setEnabled(card is None)
+        self.restore_button.setVisible(action == "ignore" and card is None)
+        self.restore_button.setEnabled(action == "ignore" and card is None)
         self.later_button.setEnabled(card is None)
+        document_type = current_classification(self.store.base(self.document_id)).get("document_type")
         self.transfer_button.setEnabled(
             card is None and self.original_available
-            and current_classification(self.store.base(self.document_id)).get(
-                "suggested_document_type") != "payment_reminder")
+            and document_type in {"invoice", "receipt", "tax_decision"})
         allocations = self.store.allocations(self.store.current_review(self.document_id)[1])
         can_reassign = (card is not None and len(allocations) == 1
                         and allocations[0].get("destination", "object") == "object"
@@ -489,14 +514,29 @@ class OfflineReviewWindow(QDialog):
     def document_label(self, document_id):
         _, fields = (self.store.current_review(document_id) if self.integrated
                      else self.store.latest(document_id))
-        supplier = fields.get("supplier_name") or "Поставщик не распознан"
+        base = self.store.base(document_id)
+        source = self.store.conn.execute("SELECT source_json FROM documents WHERE id=?",
+                                         (document_id,)).fetchone()
+        source_data = json.loads(source["source_json"]) if source else {}
+        sources = source_data.get("sources") or []
+        filename = sources[0].get("filename") if sources and isinstance(sources[0], dict) else None
+        reason = self.store.exclusion_reason(document_id) if self.integrated else None
+        supplier = (fields.get("supplier_name")
+                    or (filename if reason else None)
+                    or "Поставщик не распознан")
         date = fields.get("document_date") or "Дата не распознана"
         amount = fields.get("gross_amount")
         total = (f"{amount} {fields.get('currency_code') or ''}".strip()
                  if amount not in (None, "") else "Сумма не определена — нужна проверка")
+        document_type = fields.get("confirmed_type") or base.get("document_type") or "Тип не установлен"
+        document_type = TYPES.get(document_type, document_type)
         status = (self.store.accounting_status(document_id)[0] if self.integrated
                   else "Требует проверки")
-        return f"№{document_id} — {supplier} — {date} — {total} — {status}"
+        if reason:
+            status = (f"Исключён — {document_type}, не учитывать"
+                      if base.get("document_type") == "order_confirmation"
+                      else f"Исключён — {reason}")
+        return f"№{document_id} — {supplier} — {document_type} — {date} — {total} — {status}"
 
     def refresh_document_labels(self, *, server_changed=False):
         token = (self.store.conn.total_changes, self.store.conn.execute("PRAGMA data_version").fetchone()[0])
@@ -529,10 +569,12 @@ class OfflineReviewWindow(QDialog):
                     self.selector.setItemText(index, label)
                 if self.integrated:
                     _, green = self.store.accounting_status(document_id)
-                    color = QColor("#b9efc6") if green else None
+                    excluded = self.store.action(document_id)[1] == "ignore"
+                    color = QColor("#b9efc6") if green else QColor("#e5e7eb") if excluded else None
                     if self.selector.itemData(index, Qt.ItemDataRole.BackgroundRole) != color:
                         self.selector.setItemData(index, color, Qt.ItemDataRole.BackgroundRole)
-                    foreground = QColor("#12351f") if green else None
+                    foreground = (QColor("#12351f") if green else
+                                  QColor("#6b7280") if excluded else None)
                     if self.selector.itemData(index, Qt.ItemDataRole.ForegroundRole) != foreground:
                         self.selector.setItemData(index, foreground, Qt.ItemDataRole.ForegroundRole)
                 self._label_signatures[document_id] = signature
@@ -540,16 +582,28 @@ class OfflineReviewWindow(QDialog):
         finally:
             self.selector.blockSignals(False)
 
-    def reload_documents(self):
+    def reload_documents(self, document_id=None):
+        if document_id is not None:
+            self.explicit_document_id = document_id
         dirty = hasattr(self, "loaded_payload") and self.payload() != self.loaded_payload
         self.selector.blockSignals(True)
         selected = self.selector.currentData()
+        visible = {
+            doc["id"] for doc in self.store.documents()
+            if (not self.integrated or self.show_all_states.isChecked()
+                or doc["id"] == self.explicit_document_id
+                or self.store.action(doc["id"])[1] != "ignore")
+        }
+        for index in range(self.selector.count() - 1, -1, -1):
+            if self.selector.itemData(index) not in visible:
+                self.selector.removeItem(index)
         existing = {self.selector.itemData(index) for index in range(self.selector.count())}
         for doc in self.store.documents():
-            if doc["id"] not in existing:
+            if doc["id"] in visible and doc["id"] not in existing:
                 self.selector.addItem("", doc["id"])
                 self._label_token = None
-        self.selector.setCurrentIndex(max(0, self.selector.findData(selected)))
+        preferred = document_id if document_id in visible else selected
+        self.selector.setCurrentIndex(max(0, self.selector.findData(preferred)))
         self.selector.blockSignals(False)
         if not dirty:
             self.select_document()
@@ -644,6 +698,12 @@ class OfflineReviewWindow(QDialog):
         self.loaded_review = payload
         self.server_version = payload.get("server_version")
         base = current_classification(self.store.base(self.document_id))
+        if self.integrated:
+            self.ignore_button.setText(
+                "Подтверждение заказа — не учитывать"
+                if base.get("document_type") == "order_confirmation"
+                else "Не учитывать — не фактура"
+            )
         for key, field in self.inputs.items():
             field.blockSignals(True)
             field.setText(str(payload[key]) if payload.get(key) not in (None, "UNKNOWN") else "")

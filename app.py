@@ -590,7 +590,8 @@ def init_db_once():
             rate REAL NOT NULL,
             transport REAL DEFAULT 0.0,
             comment TEXT,
-            invoiced INTEGER DEFAULT 0
+            invoiced INTEGER DEFAULT 0,
+            hours_confirmed INTEGER NOT NULL DEFAULT 0
         )
     ''')
     cursor.execute('''
@@ -618,6 +619,8 @@ def init_db_once():
     columns = [col[1] for col in cursor.fetchall()]
     if 'invoiced' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN invoiced INTEGER DEFAULT 0")
+    if 'hours_confirmed' not in columns:
+        cursor.execute("ALTER TABLE shifts ADD COLUMN hours_confirmed INTEGER NOT NULL DEFAULT 0")
     if 'sync_id' not in columns:
         cursor.execute("ALTER TABLE shifts ADD COLUMN sync_id TEXT")
     if 'sync_version' not in columns:
@@ -727,7 +730,8 @@ def init_db_once():
         "ON expense_document_outbox(state, updated_at, client_id)"
     )
 
-    cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, invoiced, sync_id, entry_type FROM shifts")
+    cursor.execute("SELECT id, date, employee, company, object_name, hours, rate, transport, comment, "
+                   "invoiced, hours_confirmed, sync_id, entry_type FROM shifts")
     existing_shifts = cursor.fetchall()
     for shift in existing_shifts:
         sync_id = shift['sync_id'] or str(uuid.uuid4())
@@ -738,7 +742,8 @@ def init_db_once():
                 "object_name": shift['object_name'], "hours": shift['hours'], "rate": shift['rate'],
                 "transport": shift['transport'] or 0.0, "comment": shift['comment'] or "",
                 "record_type": shift['entry_type'],
-                "invoiced": shift['invoiced'] or 0
+                "invoiced": shift['invoiced'] or 0,
+                "hours_confirmed": shift['hours_confirmed'] or 0
             }
             cursor.execute('''
                 INSERT OR IGNORE INTO shift_sync_outbox
@@ -1745,6 +1750,7 @@ def shift_payload(row):
         "transport": row['transport'] or 0.0, "comment": row['comment'] or "",
         "record_type": row['entry_type'] if 'entry_type' in row.keys() else RECORD_TYPE_WORK,
         "invoiced": row['invoiced'] or 0,
+        "hours_confirmed": int(shift_hours_confirmed(row)),
         "customer_pricing": row["customer_pricing"] if "customer_pricing" in row.keys() else None,
         "time_facts": row["time_facts"] if "time_facts" in row.keys() else None,
     }
@@ -1754,6 +1760,10 @@ def shift_payload(row):
             "end_time": row["end_time"],
         })
     return payload
+
+
+def shift_hours_confirmed(row):
+    return bool(row is not None and "hours_confirmed" in row.keys() and row["hours_confirmed"])
 
 
 def record_type_label(record_type):
@@ -2809,7 +2819,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.filter_obj.currentIndexChanged.connect(self.apply_shifts_filters)
 
         self.filter_status = QComboBox()
-        self.filter_status.addItems(["-- Все статусы --", "В работе", "Выставлен в счёт"])
+        self.filter_status.addItems([
+            "-- Все статусы --", "В работе", "Часы подтверждены", "Выставлен в счёт",
+        ])
         self.filter_status.currentIndexChanged.connect(self.apply_shifts_filters)
 
         filter_date_row.addWidget(QLabel("<b>Период с:</b>"))
@@ -2835,12 +2847,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         layout.addWidget(control_card)
 
-        layout.addWidget(QLabel("<b>История смен в базе данных (зеленые — уже выставлены в счёт):</b>"))
+        layout.addWidget(QLabel(
+            "<b>История смен (зелёные — выставлены в счёт; синие — часы подтверждены, "
+            "клиентская стоимость не рассчитана):</b>"
+        ))
         
         self.table_shifts = QTableWidget()
         self.table_shifts.setMinimumHeight(220)
         self.table_shifts.setColumnCount(15)
-        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Клиентская ставка (SEK/ч)", "Транспорт", "Комментарий", "Статус фактуры", "Зарплата OB (SEK)", "Клиентская доплата OB1 (SEK/ч)", "Клиентская доплата OB2 (SEK/ч)"])
+        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Клиентская ставка (SEK/ч)", "Транспорт", "Комментарий", "Статус часов / счёта", "Зарплата OB (SEK)", "Клиентская доплата OB1 (SEK/ч)", "Клиентская доплата OB2 (SEK/ч)"])
         self.table_shifts.setColumnHidden(0, True)
         shifts_header = self.table_shifts.horizontalHeader()
         shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -2854,7 +2869,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
             8: 130,
             9: 70,   # Транспорт: узкая под 0.0 / 1.0
-            11: 110, # Статус фактуры: узкая под статус (⌛ В работе / ✅ Выставлен)
+            11: 180, # Статус часов / счёта
             12: 95,  # OB сумма (SEK)
             13: 130,
             14: 130,
@@ -2960,6 +2975,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 match = False
             if status_val == "В работе" and "В работе" not in status_cell:
                 match = False
+            elif status_val == "Часы подтверждены" and "Часы подтверждены" not in status_cell:
+                match = False
             elif status_val == "Выставлен в счёт" and "Выставлен" not in status_cell:
                 match = False
 
@@ -3032,7 +3049,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 return
 
         remote_version = int(shift.get('version', 1))
-        if local and local["invoiced"] and not shift.get("invoiced") and remote_version > local["sync_version"]:
+        if (local and (local["invoiced"] or shift_hours_confirmed(local))
+                and not shift.get("invoiced") and not shift.get("hours_confirmed")
+                and remote_version > local["sync_version"]):
             cursor.execute(
                 "DELETE FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' AND state='conflict'",
                 (sync_id,),
@@ -3081,6 +3100,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             shift['date'], shift['employee'], shift['company'], shift['object_name'], shift['hours'],
             stored_rate, stored_transport, shift.get('comment', ''),
             int(bool(shift.get('invoiced', 0))) if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0,
+            int(bool(shift.get(
+                'hours_confirmed', shift_hours_confirmed(local)
+            ))) if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else 0,
             remote_version, record_type, work_rate_cache, work_transport_cache
         )
         needs_type_repair = local and (
@@ -3106,31 +3128,33 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if local:
                 cursor.execute('''
                     UPDATE shifts SET date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
-                        rate = ?, transport = ?, comment = ?, invoiced = ?, sync_version = ?, entry_type = ?,
+                        rate = ?, transport = ?, comment = ?, invoiced = ?, hours_confirmed = ?,
+                        sync_version = ?, entry_type = ?,
                         work_rate_cache = ?, work_transport_cache = ?, start_time = ?, end_time = ?, ob_base_rate = ?
                     WHERE sync_id = ?
                 ''', values + ob_values + (sync_id,))
             else:
                 cursor.execute('''
                     INSERT INTO shifts
-                        (date, employee, company, object_name, hours, rate, transport, comment, invoiced,
+                        (date, employee, company, object_name, hours, rate, transport, comment, invoiced, hours_confirmed,
                          sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache,
                          start_time, end_time, ob_base_rate)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache) + ob_values)
         elif local:
             cursor.execute('''
                 UPDATE shifts SET date = ?, employee = ?, company = ?, object_name = ?, hours = ?,
-                    rate = ?, transport = ?, comment = ?, invoiced = ?, sync_version = ?, entry_type = ?,
+                    rate = ?, transport = ?, comment = ?, invoiced = ?, hours_confirmed = ?,
+                    sync_version = ?, entry_type = ?,
                     work_rate_cache = ?, work_transport_cache = ?
                 WHERE sync_id = ?
             ''', values + (sync_id,))
         else:
             cursor.execute('''
                 INSERT INTO shifts
-                    (date, employee, company, object_name, hours, rate, transport, comment, invoiced,
+                    (date, employee, company, object_name, hours, rate, transport, comment, invoiced, hours_confirmed,
                      sync_id, sync_version, entry_type, work_rate_cache, work_transport_cache)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', values[:-4] + (sync_id, remote_version, record_type, work_rate_cache, work_transport_cache))
         if "time_facts" in shift:
             ensure_pricing_schema(cursor, "shifts")
@@ -3255,10 +3279,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     and int(capability_payload.get("api_version", 0)) >= 2
                     and required_features.issubset(set(capability_payload.get("features", [])))
                 )
-                capability_error = "Сервер расходов старый: обновите сервер до API v2; локальная очередь сохранена."
+                missing_features = sorted(
+                    required_features - set(capability_payload.get("features", []))
+                )
+                capability_error = (
+                    "Сервер расходов старый или не поддерживает необходимые возможности "
+                    f"(API {capability_payload.get('api_version', 0)}; "
+                    f"не хватает: {', '.join(missing_features) or 'API v2'}); "
+                    "локальная очередь сохранена."
+                )
             except Exception as error:
                 supported = False
-                capability_error = f"Сервер расходов недоступен; локальная очередь сохранена: {error}"
+                capability_error = (
+                    "Сервер расходов недоступен; локальная очередь сохранена: "
+                    f"{type(error).__name__}: {error}"
+                )
             if not supported:
                 error_conn = get_db_connection()
                 try:
@@ -7123,6 +7158,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_filter_status = QComboBox()
         self.exp_filter_status.setMinimumWidth(120)
         for label, key in (
+            ("Активные", "active"),
             ("Все состояния", "all"),
             ("Требуют проверки", "requires_review"),
             ("Отложен", "later"),
@@ -7407,6 +7443,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         )
 
         status_label = self._expense_register_status_label(document)
+        if status == "ignored":
+            status_label = f"Исключён — {document.get('exclusion_reason') or 'Не фактура'}"
         if status == "requires_review" and document.get("allocations"):
             status_label = "Назначено · ждёт проверки"
         self.exp_detail_status.setText(status_label)
@@ -7429,17 +7467,24 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         allocated = bool(document.get("allocations"))
         verified = status == "accounted"
-        self.exp_detail_progress.setText(
-            ("✓ Проверено   " if verified else "1 · Проверить   ")
-            + ("✓ Назначено   " if allocated else "2 · Назначить   ")
-            + ("✓ Учтено" if verified else "3 · Подтвердить")
-        )
-        self.exp_detail_hint.setText(
-            "Назначение не подтверждает расход: в учёт входят только подтверждённые документы."
-            if allocated and not verified else
-            ("Расход подтверждён и включён в учтённые суммы." if verified else
-             "Сверьте реквизиты с оригиналом и подтвердите расход после проверки.")
-        )
+        if status == "ignored":
+            self.exp_detail_progress.setText("Исключён — не фактура")
+            self.exp_detail_hint.setText(
+                "Оригинал сохранён. Чтобы вернуть документ в очередь проверки, откройте его "
+                "и нажмите «Восстановить документ»."
+            )
+        else:
+            self.exp_detail_progress.setText(
+                ("✓ Проверено   " if verified else "1 · Проверить   ")
+                + ("✓ Назначено   " if allocated else "2 · Назначить   ")
+                + ("✓ Учтено" if verified else "3 · Подтвердить")
+            )
+            self.exp_detail_hint.setText(
+                "Назначение не подтверждает расход: в учёт входят только подтверждённые документы."
+                if allocated and not verified else
+                ("Расход подтверждён и включён в учтённые суммы." if verified else
+                 "Сверьте реквизиты с оригиналом и подтвердите расход после проверки.")
+            )
 
         incoming_id = document.get("incoming_document_id")
         self.exp_assign_button.setEnabled(not verified and incoming_id is None)
@@ -7461,6 +7506,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if transfer_retry:
             self.exp_primary_action.setText("Повторить передачу")
             self.exp_primary_action.setToolTip("Повторить отправку сохранённого расхода на сервер.")
+        elif status == "ignored":
+            self.exp_primary_action.setText("Открыть исключённый документ")
+            self.exp_primary_action.setToolTip("Оригинал сохранён; восстановление доступно в карточке документа.")
         elif status == "accounted":
             self.exp_primary_action.setText("Расход учтён")
             self.exp_primary_action.setEnabled(False)
@@ -7600,7 +7648,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         viewer = getattr(self, "_incoming_viewer", None)
         if viewer is None:
             try:
-                viewer = open_incoming(self, self._incoming_documents_root())
+                viewer = open_incoming(self, self._incoming_documents_root(), document_id=document_id)
             except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
                 logging.exception("Не удалось открыть входящие документы")
                 QMessageBox.warning(self, "Входящие документы", str(error))
@@ -7608,7 +7656,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self._incoming_viewer = viewer
             viewer.finished.connect(lambda: setattr(self, "_incoming_viewer", None))
         if document_id is not None:
-            viewer.reload_documents()
+            viewer.reload_documents(document_id=document_id)
             viewer.selector.setCurrentIndex(max(0, viewer.selector.findData(document_id)))
         viewer.show()
         viewer.raise_()
@@ -8063,10 +8111,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 documents.append({
                     **payload,
                     "id": f"incoming:{document_id}",
+                    "document_type": store.base(document_id).get("document_type"),
                     "client_id": card["client_id"] if card else f"incoming:{document_id}",
                     "incoming_document_id": document_id,
                     "incoming_revision": revision,
                     "incoming_action": action,
+                    "exclusion_reason": store.exclusion_reason(document_id),
                     "incoming_local": True,
                     "document_date": document_date,
                     "allocations": parts,
@@ -8083,6 +8133,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         if card else None),
                     "local_attachment_paths": (
                         [str(original_path)] if original_path is not None and original_path.is_file() else []),
+                    "source_filename": original_row["filename"] if original_row else None,
                     "attachments": [],
                     "has_original": original_row is not None,
                 })
@@ -8116,12 +8167,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     @staticmethod
     def _expense_register_status_key(document):
-        if document.get("sync_error") or document.get("sync_state") in (
-                "pending", "conflict", "unverified"):
-            return "transfer"
         action = document.get("incoming_action")
         if action == "ignore" or document.get("verification_status") in ("ignored", "not_to_account"):
             return "ignored"
+        if document.get("sync_error") or document.get("sync_state") in (
+                "pending", "conflict", "unverified"):
+            return "transfer"
         if action == "later" or document.get("verification_status") == "later":
             return "later"
         if document.get("verification_status") == "confirmed":
@@ -8291,7 +8342,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             base_filtered.append(document)
         filtered = [
             document for document in base_filtered
-            if (status_filter == "all" or self._expense_register_status_key(document) == status_filter)
+            if (status_filter == "all"
+                or status_filter == "active" and self._expense_register_status_key(document) != "ignored"
+                or self._expense_register_status_key(document) == status_filter)
             and (
                 not search_text
                 or search_text in " ".join(str(document.get(key) or "")
@@ -8381,10 +8434,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if (self._expense_register_status_key(document) == "transfer"
                     and document.get("sync_state") in {"pending", "unverified"}):
                 short_status = "Повторить передачу"
+            if self._expense_register_status_key(document) == "ignored":
+                reason = document.get("exclusion_reason") or "Не фактура"
+                short_status = f"Исключён — {reason}"
+            document_type = document.get("confirmed_type") or document.get("document_type")
+            type_labels = {
+                "invoice": "Фактура", "receipt": "Чек", "tax_decision": "Решение",
+                "order_confirmation": "Подтверждение заказа", "credit_note": "Кредитная фактура",
+                "proforma": "Проформа", "unclassified": "Тип не установлен",
+            }
+            type_label = type_labels.get(document_type, document_type or "Тип не установлен")
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "Не указана",
-                (document.get("supplier_name") or "Не указан")
+                (document.get("supplier_name") or document.get("source_filename") or "Не указан")
+                + "\n" + str(type_label)
                 + "\n№ " + str(document.get("invoice_number") or "не указан"),
                 document.get("invoice_number") or "Не указан",
                 object_label,
@@ -8403,7 +8467,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     item.setToolTip("Поставщик не указан или не распознан.")
                 elif column == 2:
                     item.setToolTip(
-                        f"{document.get('supplier_name') or 'Не указан'} · "
+                        f"{document.get('supplier_name') or document.get('source_filename') or 'Не указан'} · "
                         f"№ {document.get('invoice_number') or 'не указан'}"
                     )
                 elif column == 3 and not document.get("invoice_number"):
@@ -8419,7 +8483,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 elif column == 6 and document.get("vat_amount") is None:
                     item.setToolTip("НДС не указан или не распознан. Он не вычислялся автоматически.")
                 elif column == 7:
-                    item.setToolTip(status)
+                    item.setToolTip(
+                        f"{status}\nПричина исключения: {document.get('exclusion_reason') or 'Не фактура'}"
+                        if self._expense_register_status_key(document) == "ignored" else status
+                    )
                 table.setItem(row_index, column, item)
             table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
             identity = (document.get("incoming_document_id") or
@@ -9687,14 +9754,23 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         export_pdf_inv_btn = QPushButton("Сформировать PDF")
         export_pdf_inv_btn.setObjectName("primaryAction")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
+
+        confirm_hours_btn = QPushButton("Подтвердить часы")
+        confirm_hours_btn.setObjectName("secondaryAction")
+        confirm_hours_btn.setToolTip(
+            "Зафиксировать проверенные фактические часы. Это не рассчитывает клиентскую стоимость "
+            "и не отмечает счёт выставленным."
+        )
+        confirm_hours_btn.clicked.connect(self.confirm_period_hours)
         
         btn_layout.addWidget(gen_btn)
         btn_layout.addWidget(export_pdf_inv_btn)
+        btn_layout.addWidget(confirm_hours_btn)
         card_layout.addRow(btn_layout)
         actions_menu = QMenu(card)
         for label, callback in (
-            ("Закрыть период", self.mark_period_as_invoiced),
-            ("Вернуть период в работу", self.unmark_period_as_invoiced),
+            ("Отметить «выставлено в счёт»", self.mark_period_as_invoiced),
+            ("Снять статус «выставлено в счёт»", self.unmark_period_as_invoiced),
             ("Клиентские доплаты — отдельный отложенный разбор…",
              lambda: calculate_supplements(self)),
             ("Fast pris: работы и дополнения…", self.configure_fast_pris),
@@ -10055,18 +10131,32 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 if all(value is not None for value in (work_amount, transport_amount, ob_amount))
                 else None
             )
-            status = (
-                "Частично закрыт" if status_code == 2
-                else "Выставлен" if status_code == 1
-                else "В работе"
-            )
             matching = [
                 shift for shift in report.get("journal_rows", [])
                 if shift["employee"] == employee and shift["entry_type"] in ("work", "ob")
             ]
             if matching:
-                closed = [shift for shift in matching if shift["invoiced"]]
-                status += f" · {len(closed)}/{len(matching)} записей, {sum(s['hours'] for s in closed):g}/{hours:g} ч"
+                invoiced = [shift for shift in matching if shift["invoiced"]]
+                confirmed = [shift for shift in matching
+                             if shift_hours_confirmed(shift) and not shift["invoiced"]]
+                if len(invoiced) == len(matching):
+                    status = "Выставлен в счёт"
+                elif len(invoiced) + len(confirmed) == len(matching) and confirmed:
+                    status = "Часы подтверждены"
+                elif invoiced or confirmed:
+                    status = "Частично зафиксирован"
+                else:
+                    status = "В работе"
+                status += (
+                    f" · счёт {len(invoiced)}/{len(matching)}; "
+                    f"часы {len(invoiced) + len(confirmed)}/{len(matching)} подтверждены"
+                )
+            else:
+                status = (
+                    "Частично закрыт" if status_code == 2
+                    else "Выставлен" if status_code == 1
+                    else "В работе"
+                )
             prepared_rows.append({
                 "employee": employee, "hours": hours, "rate": rate,
                 "work_amount": work_amount, "transport_amount": transport_amount,
@@ -10281,12 +10371,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                            and shift["entry_type"] in ("work", "ob")]
                 it.setToolTip("\n".join(
                     f"№{shift['id']} · {shift['date']} · {shift['hours']:g} ч · "
-                    + ("выставлена" if shift["invoiced"] else "открыта")
+                    + ("выставлена в счёт" if shift["invoiced"] else
+                       "часы подтверждены — клиентская стоимость не рассчитана"
+                       if shift_hours_confirmed(shift) else "в работе")
                     for shift in related
                 ))
                 self.table_invoice.setItem(row_idx, col_idx, it)
         work_rows = [shift for shift in report["journal_rows"] if shift["entry_type"] in ("work", "ob")]
-        open_rows = [shift for shift in work_rows if not shift["invoiced"]]
+        invoiced_rows = [shift for shift in work_rows if shift["invoiced"]]
+        confirmed_rows = [shift for shift in work_rows
+                          if shift_hours_confirmed(shift) and not shift["invoiced"]]
+        open_rows = [shift for shift in work_rows
+                     if not shift["invoiced"] and not shift_hours_confirmed(shift)]
         issues = []
         for shift in work_rows:
             try:
@@ -10294,12 +10390,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             except ValueError as error:
                 issues.append(f"№{shift['id']} · {shift['date']}: {error}")
         detail = (
-            f"Закрыто {len(work_rows) - len(open_rows)} из {len(work_rows)} записей; "
-            f"открыто {sum(row['hours'] for row in open_rows):g} из {report['totals']['hours']:g} ч. "
-            "Статус записи не означает оплату. Состояние синхронизации проверяется отдельно."
+            f"Счёт: выставлен по {len(invoiced_rows)} из {len(work_rows)} записей. "
+            f"Часы подтверждены без выставления счёта: {len(confirmed_rows)} записей, "
+            f"{sum(row['hours'] for row in confirmed_rows):g} ч. "
+            f"Открыто: {len(open_rows)} записей, {sum(row['hours'] for row in open_rows):g} ч. "
+            "Клиентская стоимость для подтверждённых только по часам записей не рассчитана; "
+            "это не означает оплату. Состояние синхронизации проверяется отдельно."
         )
         if issues:
-            detail += "\nНужно подтвердить клиентские цены (зарплатные ставки не используются):\n"
+            detail += "\nДля отдельного действия «Выставить счёт» нужно подтвердить клиентские цены "
+            "(зарплатные ставки не используются):\n"
             detail += "\n".join(issues)
         if report.get("fixed_allocations"):
             detail += "\nFast pris: без отметки «доп.» позиция включена в сумму."
@@ -10919,6 +11019,89 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         finally:
             conn.close()
 
+    def _set_period_hours_confirmed(self, report):
+        selected = [row for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")]
+        changed = [row for row in selected
+                   if not shift_hours_confirmed(row) and not row["invoiced"]]
+        if not changed:
+            return 0, 0.0
+        conn = get_db_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            marks_scope = ",".join("?" for _ in report["object_names"])
+            actual_ids = {row[0] for row in cursor.execute(
+                f"SELECT id FROM shifts WHERE company=? AND object_name IN ({marks_scope}) "
+                "AND date>=? AND date<=? AND entry_type IN ('work','ob')",
+                (report["company"], *report["object_names"], report["date_from"], report["date_to"]),
+            )}
+            if actual_ids != {row["id"] for row in selected}:
+                raise ValueError("Состав периода изменился. Обновите отчёт; часы не подтверждены.")
+            for row in selected:
+                actual = cursor.execute("SELECT * FROM shifts WHERE id=?", (row["id"],)).fetchone()
+                if actual is None or dict(actual) != row:
+                    raise ValueError("Записи изменились после просмотра. Обновите отчёт; часы не подтверждены.")
+                if cursor.execute(
+                    "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
+                    "AND state IN ('pending','blocked')", (row["sync_id"],),
+                ).fetchone():
+                    raise ValueError("Сначала дождитесь ответа сервера на запрос удаления записи.")
+            ids = tuple(row["id"] for row in changed)
+            marks = ",".join("?" for _ in ids)
+            cursor.execute(f"UPDATE shifts SET hours_confirmed=1 WHERE id IN ({marks})", ids)
+            enqueue_matching_shifts(cursor, f"id IN ({marks})", ids)
+            conn.commit()
+            return len(changed), sum(row["hours"] for row in changed)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def confirm_period_hours(self):
+        try:
+            report = self.collect_invoice_report()
+        except ValueError as error:
+            QMessageBox.warning(self, "Фактические часы", str(error))
+            return
+        rows = [row for row in report["journal_rows"] if row["entry_type"] in ("work", "ob")]
+        if not rows:
+            QMessageBox.information(self, "Фактические часы", "В выбранном периоде нет рабочих записей.")
+            return
+        reply = QMessageBox.question(
+            self, "Подтвердить фактические часы",
+            f"Проверить часы и журнал по объекту <b>{report['object']}</b> за "
+            f"<b>{report['date_from']} — {report['date_to']}</b> и заблокировать рабочие записи от изменений?"
+            "<br><br>Это не рассчитывает клиентскую стоимость, не означает оплату "
+            "и не отмечает счёт выставленным.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if (self.inv_obj_cb.currentData() != report["object_id"]
+                or self.inv_comp_cb.currentText() != report["company"]
+                or self.inv_date_from.text() != report["date_from"]
+                or self.inv_date_to.text() != report["date_to"]):
+            QMessageBox.warning(self, "Параметры изменились", "Сформируйте отчёт заново; часы не подтверждены.")
+            return
+        try:
+            count, hours = self._set_period_hours_confirmed(report)
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Часы не подтверждены", str(error))
+            return
+        QMessageBox.information(
+            self, "Подтверждение часов",
+            (f"Подтверждены и защищены от изменений: {count} записей, {hours:g} ч. "
+             "Клиентская стоимость не рассчитана; счёт не выставлен.")
+            if count else
+            "Все рабочие записи уже подтверждены или выставлены в счёт. Изменений и новых операций нет.",
+        )
+        self.generate_invoice()
+        self.load_shifts_history()
+        if count:
+            self.background_sync_with_cloud()
+
     def mark_period_as_invoiced(self):
         try:
             report = self._prepare_invoice_view(self.collect_invoice_report())
@@ -10929,8 +11112,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         comp, obj = report['company'], report['object']
 
         reply = QMessageBox.question(
-            self, "Подтверждение",
-            f"Закрыть все рабочие записи по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b>?"
+            self, "Отметка счёта",
+            f"Отметить рабочие записи по объекту <b>{obj}</b> за период "
+            f"<b>{d_from} — {d_to}</b> как уже выставленные в счёт?"
             + (
                 f"<br>Fast pris: {report['fast_pris_amount']:,.2f} SEK; "
                 f"итог с явно выбранными дополнениями: {self._invoice_value(report['totals']['invoice_total'])} SEK."
@@ -10952,8 +11136,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             except (ValueError, sqlite3.Error) as error:
                 QMessageBox.warning(self, "Период не закрыт", str(error))
                 return
-            QMessageBox.information(self, "Закрытие периода",
-                                    f"Отмечено как выставленные: {count} записей, {hours:g} ч. Синхронизация — отдельно."
+            QMessageBox.information(self, "Отметка счёта",
+                                    f"Отмечено как выставленные в счёт: {count} записей, {hours:g} ч. "
+                                    "Это не означает оплату; синхронизация — отдельно."
                                     if count else "Все рабочие записи уже закрыты. Изменений и новых операций нет.")
             self.generate_invoice()
             self.load_shifts_history()
@@ -10970,8 +11155,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         comp, obj = report['company'], report['object']
 
         reply = QMessageBox.question(
-            self, "Подтверждение",
-            f"Вернуть в работу все смены по объекту <b>{obj}</b> за период <b>{d_from} — {d_to}</b>?",
+            self, "Снять статус выставления счёта",
+            f"Снять статус «выставлено в счёт» со смен по объекту <b>{obj}</b> за "
+            f"период <b>{d_from} — {d_to}</b>? Отдельно подтверждённые часы останутся защищены.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -10987,9 +11173,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             except (ValueError, sqlite3.Error) as error:
                 QMessageBox.warning(self, "Статус не изменён", str(error))
                 return
-            QMessageBox.information(self, "Возврат в работу",
-                                    f"Возвращено: {count} записей, {hours:g} ч. Исторические цены сохранены."
-                                    if count else "Все рабочие записи уже открыты. Изменений и новых операций нет.")
+            QMessageBox.information(
+                self, "Статус счёта снят",
+                f"Снят статус выставления счёта: {count} записей, {hours:g} ч. "
+                "Отдельно подтверждённые часы остаются защищены; исторические цены сохранены."
+                if count else "В выбранном периоде нет записей со статусом «выставлено в счёт».",
+            )
             self.generate_invoice()
             self.load_shifts_history()
             if count:
@@ -13602,7 +13791,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.table_shifts.setRowCount(len(rows))
             for row_idx, row in enumerate(rows):
                 is_inv = row["invoiced"] == 1
-                status_text = "Выставлен" if is_inv else "В работе"
+                hours_confirmed = shift_hours_confirmed(row)
+                status_text = (
+                    "Выставлен в счёт" if is_inv else
+                    "Часы подтверждены · клиентская стоимость не рассчитана"
+                    if hours_confirmed else "В работе"
+                )
                 delete_state = delete_states.get(row["sync_id"])
                 if delete_state in ("pending", "blocked"):
                     status_text += " · Удаление ожидает сервера"
@@ -13677,6 +13871,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         it.setToolTip(str(val))
                     if is_inv:
                         desktop_theme.item_color(it, "#1c4532")
+                    elif hours_confirmed:
+                        desktop_theme.item_color(it, "#2b6cb0")
                     self.table_shifts.setItem(row_idx, col_idx, it)
             self.load_dropdowns(refresh_tables=False)
             current_tab = self.tabs.currentWidget() if getattr(self, "tabs", None) else None
@@ -13722,7 +13918,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         status = self.table_shifts.item(selected, 11) if selected >= 0 else None
         self.reopen_shift_btn.setEnabled(
             self.can_request_shift_reopen()
-            and status is not None and "Выставлен" in status.text()
+            and status is not None
+            and ("Выставлен" in status.text() or "Часы подтверждены" in status.text())
         )
 
     def reopen_selected_shift(self):
@@ -13740,7 +13937,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if row is None:
                 raise ValueError("Запись не найдена. Обновите историю.")
             row = dict(row)
-            if not row["invoiced"]:
+            if not row["invoiced"] and not shift_hours_confirmed(row):
                 raise ValueError("Смена уже в работе. Повторный возврат не нужен.")
             if conn.execute(
                 "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? "
@@ -13783,7 +13980,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         finally:
             conn.close()
         reply = QMessageBox.question(
-            self, "Вернуть смену в работу?",
+            self, "Разблокировать смену?",
             f"{row['employee']}\n{row['date']} · {row['company']} / {row['object_name']}\n"
             f"{row['hours']:g} ч\n\nБудет открыта только эта смена. Остальные записи и сохранённые "
             "документы не изменятся. Прежний запрос удаления повторён не будет.",
@@ -13807,7 +14004,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             result = response.json()
             remote = result.get("shift") if isinstance(result, dict) else None
             if (not isinstance(remote, dict) or not result.get("ok") or remote.get("sync_id") != row["sync_id"]
-                    or remote.get("invoiced") or remote.get("deleted")
+                    or remote.get("invoiced") or remote.get("hours_confirmed") or remote.get("deleted")
                     or not isinstance(remote.get("version"), int) or remote["version"] < row["sync_version"]):
                 raise ValueError("Сервер не подтвердил возврат выбранной смены. Обновите данные.")
             conn = get_db_connection()
@@ -13849,8 +14046,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 self.table_shifts.selectRow(index)
                 break
         QMessageBox.information(
-            self, "Смена в работе",
-            "Сервер подтвердил возврат одной смены. Исторические цены сохранены. "
+            self, "Смена разблокирована",
+            "Сервер подтвердил разблокировку одной смены. Исторические цены сохранены. "
             "Для удаления понадобится новое явное действие.",
         )
 
@@ -13882,8 +14079,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if deleting:
             QMessageBox.warning(self, "Запись ожидает удаления", "Сначала дождитесь ответа сервера на запрос удаления.")
             return
-        if shift["invoiced"]:
-            QMessageBox.warning(self, "Запись защищена", "Сначала верните выставленную запись в работу.")
+        if shift["invoiced"] or shift_hours_confirmed(shift):
+            QMessageBox.warning(self, "Запись защищена",
+                                "Сначала выполните административное действие «Вернуть в работу» для этой записи.")
             return
         client_prices = row_prices(dict(shift))
 
@@ -14211,8 +14409,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             current = cursor.execute("SELECT * FROM shifts WHERE id=?", (local_id,)).fetchone()
             if current is None or dict(current) != dict(shift):
                 raise ValueError("Запись изменилась. Обновите историю перед редактированием.")
-            if current["invoiced"]:
-                raise ValueError("Сначала верните выставленную запись в работу.")
+            if current["invoiced"] or shift_hours_confirmed(current):
+                raise ValueError("Сначала выполните административное действие «Вернуть в работу» для этой записи.")
             if cursor.execute(
                 "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
                 "AND state IN ('pending','blocked')", (current["sync_id"],),
@@ -14346,8 +14544,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if shift is None:
             QMessageBox.warning(self, "Запись изменилась", "Обновите историю перед удалением.")
             return
-        if shift["invoiced"]:
-            QMessageBox.warning(self, "Запись защищена", "Сначала верните выставленную запись в работу.")
+        if shift["invoiced"] or shift_hours_confirmed(shift):
+            QMessageBox.warning(self, "Запись защищена",
+                                "Сначала выполните административное действие «Вернуть в работу» для этой записи.")
             return
         reply = QMessageBox.question(self, "Подтверждение", "Удалить смену?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
@@ -14361,8 +14560,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             current = cursor.fetchone()
             if current is None or dict(current) != dict(shift):
                 raise ValueError("Запись изменилась. Обновите историю перед удалением.")
-            if current["invoiced"]:
-                raise ValueError("Сначала верните выставленную запись в работу.")
+            if current["invoiced"] or shift_hours_confirmed(current):
+                raise ValueError("Сначала выполните административное действие «Вернуть в работу» для этой записи.")
             if cursor.execute(
                 "SELECT 1 FROM shift_sync_outbox WHERE sync_id=? AND operation='delete' "
                 "AND state IN ('pending','blocked')", (current["sync_id"],),

@@ -284,7 +284,7 @@ class FolderMailTests(unittest.TestCase):
             self.store.conn.execute("INSERT INTO mail_excluded_pdfs VALUES (?,?)",
                                     (hashlib.sha256(deleted_pdf).hexdigest(), "Approved test cleanup"))
         FolderIMAP.messages = {1001: eml(deleted_pdf), 1002: eml(pdf("genuinely new invoice"))}
-        FolderIMAP.dates = {uid: date(2026, 11, 1) for uid in FolderIMAP.messages}
+        FolderIMAP.dates = {uid: date(2026, 11, 14) for uid in FolderIMAP.messages}
         class November(ImportTestDate):
             @classmethod
             def today(cls):
@@ -305,6 +305,42 @@ class FolderMailTests(unittest.TestCase):
         self.assertFalse(any(command[0] == "FETCH" for command in FolderIMAP.commands))
         self.assertEqual(list(self.store.conn.execute("SELECT * FROM mail_messages ORDER BY uid")), markers)
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_excluded_pdfs").fetchone()[0], 1)
+
+    def test_user_exclusion_survives_new_direct_and_forwarded_mail_without_blocking_other_pdf(self):
+        from email import policy
+        from email.message import EmailMessage
+        from email.parser import BytesParser
+        from unittest.mock import Mock
+
+        excluded_pdf = pdf("User excluded order confirmation")
+        order_fields = dict(recognized([])["fields"], document_type="order_confirmation",
+                            raw_text="ORDERBEKRÄFTELSE")
+        self.store.add_pdf(excluded_pdf, "bauhaus.pdf", {"fields": order_fields})
+        self.store.set_action(1, "ignore", 0)
+        self.assertEqual(self.store.base(1)["document_type"], "order_confirmation")
+        original_message = BytesParser(policy=policy.default).parsebytes(eml(excluded_pdf))
+        forwarded = EmailMessage()
+        forwarded.set_content("Forwarded again by a different sender.")
+        forwarded.add_attachment(original_message)
+        other_pdf = pdf("Different genuine invoice from same supplier")
+        FolderIMAP.messages = {
+            101: eml(excluded_pdf),
+            102: forwarded.as_bytes(),
+            103: eml(other_pdf),
+        }
+        FolderIMAP.dates = {uid: date(2027, 1, 14) for uid in FolderIMAP.messages}
+        recognize = Mock(side_effect=recognized)
+        report = self.run_import_with_recognizer(recognize)
+        self.assertEqual(report["excluded"], 2)
+        self.assertEqual(report["new_drafts"], 1)
+        self.assertEqual(recognize.call_count, 1)
+        self.assertEqual(len(self.store.documents()), 2)
+        self.assertEqual(self.store.action(1)[1], "ignore")
+        self.assertEqual(self.store.original(1).read_bytes(), excluded_pdf)
+        self.assertEqual(self.store.original(2).read_bytes(), other_pdf)
+
+    def run_import_with_recognizer(self, recognizer):
+        return import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognizer)
 
     def test_invalid_period_never_connects(self):
         from unittest.mock import Mock

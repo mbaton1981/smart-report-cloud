@@ -137,14 +137,14 @@ def extract_cost_fields(pages, fields):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     tax = non_invoice_document_type(text) == "tax_decision"
     result = {key: fields.get(key) for key in (
-        "supplier_name", "document_date", "invoice_number", "payment_reference",
+        "supplier_name", "document_date", "due_date", "invoice_number", "payment_reference",
         "currency_code", "gross_amount", "net_amount", "vat_amount")}
     result["field_sources"] = dict(fields.get("field_sources") or {})
     result["amount_candidates"] = []
     if not tax:
         return result
 
-    result.update(supplier_name=None, document_date=None, invoice_number=None,
+    result.update(supplier_name=None, document_date=None, due_date=None, invoice_number=None,
                   payment_reference=None, gross_amount=None, net_amount=None, vat_amount=None)
     result["field_sources"] = {}
     references = [item for item in (fields.get("field_sources") or {}).get("payment_reference", [])
@@ -180,6 +180,18 @@ def extract_cost_fields(pages, fields):
                     if match:
                         amount = parse_invoice_money(match.group(1))
                         source["text"] += "\n" + next_line
+                    else:
+                        match = re.search(
+                            r"\bsenast\s+(\d{4}[-./]\d{1,2}[-./]\d{1,2})\s+" + money
+                            + r"\s*(?:SEK|kr(?:onor)?)?\s*$",
+                            next_line, re.IGNORECASE,
+                        )
+                        if match:
+                            result["due_date"] = _date_value(match.group(1))
+                            if result["due_date"]:
+                                result["field_sources"]["due_date"] = [source]
+                            amount = parse_invoice_money(match.group(2))
+                            source["text"] += "\n" + next_line
             if amount is not None and amount.is_finite() and amount > 0:
                 evidence.append({"amount": decimal_text(amount), **source})
             if not result["document_date"] and re.fullmatch(r"(?:Beslutsdatum|Datum)\s*:?", line, re.IGNORECASE):

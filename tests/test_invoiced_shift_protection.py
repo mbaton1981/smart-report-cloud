@@ -223,6 +223,43 @@ class InvoicedServerProtectionTests(unittest.TestCase):
 
 
 class InvoicedDesktopProtectionTests(pricing.HistoricalPricesTests):
+    def test_hours_can_be_confirmed_without_client_price_or_invoice_status(self):
+        identifier = self.shift(confirmed=False)
+        with patch.object(self.desktop.QMessageBox, "question",
+                          return_value=self.desktop.QMessageBox.StandardButton.Yes) as question, \
+                patch.object(self.desktop.QMessageBox, "information") as information, \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(self.window, "background_sync_with_cloud"), \
+                patch.object(self.window, "load_shifts_history"):
+            self.window.confirm_period_hours()
+        warning.assert_not_called()
+        self.assertIn("не рассчитывает клиентскую стоимость", question.call_args.args[2])
+        self.assertIn("счёт не выставлен", information.call_args.args[2])
+        self.assertIn("Клиентская стоимость не рассчитана", information.call_args.args[2])
+        row = self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone()
+        self.assertEqual(row["hours_confirmed"], 1)
+        self.assertEqual(row["invoiced"], 0)
+        self.assertIsNone(self.window._invoice_report["totals"]["invoice_total"])
+
+        self.load_history()
+        self.window.table_shifts.selectRow(0)
+        self.assertIn("Часы подтверждены",
+                      self.window.table_shifts.item(0, 11).text())
+        self.assertIn("клиентская стоимость не рассчитана",
+                      self.window.table_shifts.item(0, 11).text())
+        before = [tuple(item) for item in self.conn.execute("SELECT * FROM shifts")]
+        with patch.object(self.desktop.QMessageBox, "question") as confirm, \
+                patch.object(self.desktop.QMessageBox, "warning") as blocked, \
+                patch.object(self.desktop.QDialog, "exec") as dialog, \
+                patch.object(self.window, "background_sync_with_cloud") as sync:
+            self.window.delete_shift()
+            self.window.edit_shift()
+        confirm.assert_not_called()
+        dialog.assert_not_called()
+        sync.assert_not_called()
+        self.assertEqual(blocked.call_count, 2)
+        self.assertEqual([tuple(item) for item in self.conn.execute("SELECT * FROM shifts")], before)
+
     def test_closed_period_delete_and_edit_are_blocked_before_dialog_or_sync(self):
         self.shift(confirmed=True)
         self.window._set_period_invoiced(self.window.collect_invoice_report(), True)

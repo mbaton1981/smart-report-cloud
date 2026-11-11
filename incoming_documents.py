@@ -37,6 +37,12 @@ class IncomingStore(OfflineReviewStore):
                 revision INTEGER NOT NULL, action TEXT NOT NULL
                 CHECK(action IN ('ignore','later','expense')),
                 created_at TEXT NOT NULL, PRIMARY KEY(document_id,revision))""")
+            self.conn.execute("""
+                INSERT OR IGNORE INTO mail_excluded_pdfs(sha256,reason)
+                SELECT d.sha256,'Не фактура' FROM documents d
+                WHERE (SELECT action FROM document_actions a
+                       WHERE a.document_id=d.id ORDER BY revision DESC LIMIT 1)='ignore'
+            """)
 
     def objects(self):
         provider = getattr(self.host, "incoming_allocation_objects", None)
@@ -173,11 +179,30 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Статус изменён в другом окне. Откройте документ заново.")
             if self.card(document_id):
                 raise ReviewError("Расход уже создан: статус не отменяет расход. Измените существующую запись.")
+            sha = self.conn.execute("SELECT sha256 FROM documents WHERE id=?", (document_id,)).fetchone()["sha256"]
             if previous == action:
+                if action == "ignore":
+                    self.conn.execute("INSERT OR REPLACE INTO mail_excluded_pdfs VALUES (?,?)",
+                                      (sha, "Не фактура"))
+                else:
+                    self.conn.execute("DELETE FROM mail_excluded_pdfs WHERE sha256=?", (sha,))
                 return revision
             self.conn.execute("INSERT INTO document_actions VALUES (?,?,?,?)", (
                 document_id, revision + 1, action, datetime.now(timezone.utc).isoformat()))
+            if action == "ignore":
+                self.conn.execute("INSERT OR REPLACE INTO mail_excluded_pdfs VALUES (?,?)",
+                                  (sha, "Не фактура"))
+            else:
+                self.conn.execute("DELETE FROM mail_excluded_pdfs WHERE sha256=?", (sha,))
         return revision + 1
+
+    def exclusion_reason(self, document_id):
+        row = self.conn.execute("""
+            SELECT e.reason FROM documents d
+            JOIN mail_excluded_pdfs e ON e.sha256=d.sha256
+            WHERE d.id=?
+        """, (document_id,)).fetchone()
+        return row["reason"] if row else None
 
     def cost_fields(self, document_id):
         from document_costs import extract_cost_fields
@@ -313,6 +338,8 @@ class IncomingStore(OfflineReviewStore):
 
     def add_pdf(self, content, filename, result):
         sha = digest(content)
+        if self.conn.execute("SELECT 1 FROM mail_excluded_pdfs WHERE sha256=?", (sha,)).fetchone():
+            return False
         if self.conn.execute("SELECT 1 FROM documents WHERE sha256=?", (sha,)).fetchone():
             return False
         fields = current_classification(result.get("fields") or {})
@@ -601,7 +628,7 @@ class IncomingStore(OfflineReviewStore):
         return card
 
 
-def open_incoming(host, root):
+def open_incoming(host, root, document_id=None):
     if not enabled():
         raise ReviewError("Функция «Входящие документы» выключена.")
     from PyQt6.QtCore import Qt, QTimer
@@ -609,7 +636,7 @@ def open_incoming(host, root):
     from offline_review_ui import OfflineReviewWindow
 
     store = IncomingStore(root, host)
-    window = OfflineReviewWindow(store, integrated=True)
+    window = OfflineReviewWindow(store, integrated=True, document_id=document_id)
     window.setParent(host, Qt.WindowType.Window)
     window.setWindowTitle("SmartReport — Входящие документы")
     retry = QPushButton("Повторить передачу подтверждённого документа")

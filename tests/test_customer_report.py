@@ -31,7 +31,8 @@ class CustomerReportTests(unittest.TestCase):
             INSERT INTO employees VALUES ('Andrii Piskun',245.8);
             CREATE TABLE shifts(id INTEGER PRIMARY KEY, date TEXT, employee TEXT, company TEXT,
                 object_name TEXT, hours REAL, rate REAL DEFAULT 0, transport REAL DEFAULT 0,
-                invoiced INTEGER DEFAULT 0, entry_type TEXT DEFAULT 'work', sync_id TEXT,
+                invoiced INTEGER DEFAULT 0, hours_confirmed INTEGER NOT NULL DEFAULT 0,
+                entry_type TEXT DEFAULT 'work', sync_id TEXT,
                 start_time TEXT, end_time TEXT, work_rate_cache REAL DEFAULT 0, comment TEXT,
                 customer_pricing TEXT);
             CREATE TABLE ob_segments(id INTEGER PRIMARY KEY,shift_id TEXT,segment_date TEXT,

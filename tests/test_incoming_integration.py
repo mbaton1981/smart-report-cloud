@@ -25,6 +25,13 @@ class IncomingIntegrationTests(unittest.TestCase):
     def setUp(self):
         catalog_tests.CatalogSyncTests.setUp(self)
         self.addCleanup(self._case.cleanup)
+        cloud_url = patch.object(self.desktop, "CLOUD_URL", "http://isolated-testserver")
+        cloud_url.start()
+        self.addCleanup(cloud_url.stop)
+        for module in (self.desktop, self.server):
+            sync_key = patch.object(module, "SYNC_API_KEY", "isolated-sync-test-key")
+            sync_key.start()
+            self.addCleanup(sync_key.stop)
         root = Path(self._case.name)
         self.source = root / "snapshot"
         originals = self.source / "intake" / "originals"

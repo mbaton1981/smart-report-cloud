@@ -108,10 +108,25 @@ def classify_mail_document(fields: dict) -> None:
                   "номер исходного счёта и дату печати не переносить в поля новой фактуры.")
     elif detected_type == "tax_decision":
         fields["document_type"] = "tax_decision"
+        object_fields = fields.get("object_cost_fields") or {}
+        object_sources = object_fields.get("field_sources") or {}
         fields.update(
-            supplier_name=None, supplier_org_number=None, supplier_vat_number=None,
-            invoice_number=None, document_date=None, due_date=None, payment_reference=None,
+            supplier_name=object_fields.get("supplier_name"),
+            supplier_org_number=None, supplier_vat_number=None,
+            invoice_number=None,
+            document_date=object_fields.get("document_date"),
+            due_date=object_fields.get("due_date"),
+            payment_reference=object_fields.get("payment_reference"),
         )
+        field_sources = fields.setdefault("field_sources", {})
+        for key in ("supplier_name", "document_date", "due_date", "payment_reference"):
+            if key in object_sources:
+                field_sources[key] = object_sources[key]
+            else:
+                field_sources.pop(key, None)
+        field_sources.pop("supplier_org_number", None)
+        field_sources.pop("supplier_vat_number", None)
+        field_sources.pop("invoice_number", None)
         reason = "Решение о транспортном налоге, не фактура. Получатель не является поставщиком; НДС не подставляется."
     elif detected_type == "order_confirmation":
         fields["document_type"] = "order_confirmation"
