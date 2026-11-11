@@ -10,7 +10,8 @@ from unittest.mock import patch
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import (
     QApplication, QBoxLayout, QDialog, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QWidget,
+    QPushButton, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from qt_test_support import cleanup_new_top_level_widgets, snapshot_top_level_widgets
@@ -88,6 +89,78 @@ class DesktopThemeTests(unittest.TestCase):
         self.assertEqual(item.background().color().name(), "#e4efe9")
         self.assertEqual(edits, [])
         table.deleteLater()
+
+    def test_colored_items_added_before_insertion_stay_tracked_after_sorting(self):
+        table = QTableWidget(2, 1)
+        colored = QTableWidgetItem("z-colored")
+        theme.item_color(colored, "#1c4532")
+        table.setItem(0, 0, colored)
+        table.setItem(1, 0, QTableWidgetItem("a-plain"))
+        theme.refresh_table_item_colors(table)
+        table.setSortingEnabled(True)
+        table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+        self.assertTrue(self.manager.toggle())
+        colored_row = table.findItems("z-colored", Qt.MatchFlag.MatchExactly)[0].row()
+        self.assertEqual(table.item(colored_row, 0).background().color().name(), "#1c4532")
+        table.deleteLater()
+
+    def test_repeated_theme_switch_preserves_open_table_and_invoice_form_state(self):
+        tabs = QTabWidget()
+        first_tab = QWidget()
+        first_layout = QVBoxLayout(first_tab)
+        filter_input = QLineEdit("P1034", first_tab)
+        first_layout.addWidget(filter_input)
+        table = QTableWidget(80, 8, first_tab)
+        first_layout.addWidget(table)
+        tabs.addTab(first_tab, "Journal")
+        tabs.addTab(QWidget(), "Expenses")
+        tabs.setCurrentIndex(1)
+
+        dialog = QDialog(tabs)
+        draft_input = QLineEdit("Unsaved invoice review", dialog)
+        dialog_layout = QVBoxLayout(dialog)
+        dialog_layout.addWidget(draft_input)
+        invoice_table = QTableWidget(24, 6, dialog)
+        dialog_layout.addWidget(invoice_table)
+
+        item = QTableWidgetItem("Reviewed record")
+        table.setItem(0, 0, item)
+        theme.item_color(item, "#1c4532")
+        invoice_item = QTableWidgetItem("Pending document")
+        invoice_table.setItem(0, 0, invoice_item)
+        theme.item_color(invoice_item, "#1c4532")
+        paused_table = QTableWidget(1, 1)
+        paused_table.setUpdatesEnabled(False)
+        signal_changes = []
+        table.cellChanged.connect(lambda *args: signal_changes.append(args))
+        invoice_table.cellChanged.connect(lambda *args: signal_changes.append(args))
+
+        tabs.show()
+        dialog.show()
+        self.application.processEvents()
+        try:
+            for expected_theme in ("dark", "light", "dark", "light"):
+                self.assertTrue(self.manager.toggle())
+                self.application.processEvents()
+                self.assertEqual(self.manager.name, expected_theme)
+                self.assertEqual(tabs.currentIndex(), 1)
+                self.assertEqual(filter_input.text(), "P1034")
+                self.assertEqual(draft_input.text(), "Unsaved invoice review")
+                self.assertEqual(item.text(), "Reviewed record")
+                self.assertEqual(invoice_item.text(), "Pending document")
+                self.assertTrue(table.updatesEnabled())
+                self.assertTrue(invoice_table.updatesEnabled())
+                self.assertFalse(paused_table.updatesEnabled())
+                self.assertEqual(
+                    item.background().color().name(),
+                    "#1c4532" if expected_theme == "dark" else "#e4efe9",
+                )
+            self.assertEqual(signal_changes, [])
+        finally:
+            dialog.close()
+            tabs.close()
+            paused_table.deleteLater()
 
     def test_header_button_is_right_of_brand_and_deleted_buttons_do_not_break_toggle(self):
         panel = theme.header()

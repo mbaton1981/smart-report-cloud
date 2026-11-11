@@ -11,7 +11,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QBoxLayout, QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QSplitter,
+    QPushButton, QSplitter, QTableWidget,
 )
 
 COLORS = {
@@ -177,6 +177,35 @@ def item_color(item, value, *, foreground=False):
         item.setForeground(color(value))
     else:
         item.setBackground(color(value))
+    table = item.tableWidget()
+    if table is not None:
+        register_table_color_item(table, item)
+
+
+def register_table_color_item(table, item):
+    if item.tableWidget() is not table:
+        return
+    cells = set(getattr(table, "_smartreport_color_cells", ()))
+    cells.add((item.row(), item.column()))
+    table._smartreport_color_cells = cells
+    manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+    if manager is not None:
+        manager.register_color_table(table)
+
+
+def refresh_table_item_colors(table):
+    cells = set()
+    for row in range(table.rowCount()):
+        for column in range(table.columnCount()):
+            item = table.item(row, column)
+            if item is not None and (
+                item.data(BACKGROUND_ROLE) or item.data(FOREGROUND_ROLE)
+            ):
+                cells.add((row, column))
+    table._smartreport_color_cells = cells
+    manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+    if manager is not None:
+        manager.register_color_table(table)
 
 
 def _canvas(size, scale=3):
@@ -477,25 +506,67 @@ class ThemeManager(QObject):
         self.application.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
         self.application.setStyleSheet(self.stylesheet())
         from PyQt6.QtWidgets import QTableWidget
+        brushes = {}
         for widget in self.application.allWidgets():
             inline = widget.property("smartreportDarkStyle")
             if inline is not None:
                 _inline_style(widget, style_text(inline, self.name))
-            if isinstance(widget, QTableWidget):
-                # Appearance updates must not invoke editable-table persistence handlers.
+            if not isinstance(widget, QTableWidget):
+                continue
+            if not hasattr(widget, "_smartreport_color_cells"):
+                refresh_table_item_colors(widget)
+            cells = tuple(widget._smartreport_color_cells)
+            if not cells:
+                continue
+            self.register_color_table(widget)
+            was_enabled = widget.updatesEnabled()
+            if was_enabled:
+                widget.setUpdatesEnabled(False)
+            try:
                 with QSignalBlocker(widget):
-                    for row in range(widget.rowCount()):
-                        for column in range(widget.columnCount()):
-                            item = widget.item(row, column)
-                            if item is None:
+                    for row, column in cells:
+                        item = widget.item(row, column)
+                        if item is None:
+                            continue
+                        for role, setter in (
+                            (BACKGROUND_ROLE, item.setBackground),
+                            (FOREGROUND_ROLE, item.setForeground),
+                        ):
+                            original = item.data(role)
+                            if not original:
                                 continue
-                            for role, setter in ((BACKGROUND_ROLE, item.setBackground), (FOREGROUND_ROLE, item.setForeground)):
-                                original = item.data(role)
-                                if original:
-                                    value = COLORS.get(original.lower(), original) if self.name == "light" else original
-                                    setter(QBrush(QColor(value)))
-                widget.viewport().update()
+                            value = COLORS.get(original.lower(), original) if self.name == "light" else original
+                            brush = brushes.get(value)
+                            if brush is None:
+                                brush = brushes[value] = QBrush(QColor(value))
+                            setter(brush)
+            finally:
+                if was_enabled:
+                    widget.setUpdatesEnabled(True)
+                    widget.viewport().update()
         self.changed.emit(self.name)
+
+    def register_color_table(self, table):
+        if getattr(table, "_smartreport_color_manager", None) is self:
+            return
+        model = table.model()
+        for signal in (
+            model.layoutChanged,
+            model.rowsInserted,
+            model.rowsRemoved,
+            model.columnsInserted,
+            model.columnsRemoved,
+            model.modelReset,
+        ):
+            signal.connect(self._refresh_color_table)
+        table._smartreport_color_manager = self
+
+    def _refresh_color_table(self, *_):
+        model = self.sender()
+        for widget in self.application.allWidgets():
+            if isinstance(widget, QTableWidget) and widget.model() is model:
+                refresh_table_item_colors(widget)
+                return
 
     def toggle(self):
         desired = "dark" if self.name == "light" else "light"

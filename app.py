@@ -8493,6 +8493,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         document.get("client_id") or document.get("id"))
             if identity == selected_identity:
                 restored_row = row_index
+        desktop_theme.refresh_table_item_colors(table)
         if restored_row >= 0:
             table.setCurrentCell(restored_row, 1)
         elif filtered:
@@ -10377,6 +10378,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     for shift in related
                 ))
                 self.table_invoice.setItem(row_idx, col_idx, it)
+        desktop_theme.refresh_table_item_colors(self.table_invoice)
         work_rows = [shift for shift in report["journal_rows"] if shift["entry_type"] in ("work", "ob")]
         invoiced_rows = [shift for shift in work_rows if shift["invoiced"]]
         confirmed_rows = [shift for shift in work_rows
@@ -12426,6 +12428,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             table.setUpdatesEnabled(was_enabled)
             table.cellChanged.connect(self.on_object_cell_changed)
 
+        desktop_theme.refresh_table_item_colors(table)
         self._restore_catalog_table_view(table, view_state)
         if selected_sync_id:
             for row_index in range(table.rowCount()):
@@ -13444,6 +13447,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             table.blockSignals(was_blocked)
             table.setUpdatesEnabled(was_enabled)
 
+        desktop_theme.refresh_table_item_colors(table)
         self._restore_catalog_table_view(table, view_state)
         self.update_employee_status_action()
 
@@ -13874,6 +13878,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     elif hours_confirmed:
                         desktop_theme.item_color(it, "#2b6cb0")
                     self.table_shifts.setItem(row_idx, col_idx, it)
+            desktop_theme.refresh_table_item_colors(table)
             self.load_dropdowns(refresh_tables=False)
             current_tab = self.tabs.currentWidget() if getattr(self, "tabs", None) else None
             catalog_tab = getattr(self, "tab_sprav", None)

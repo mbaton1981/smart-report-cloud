@@ -735,27 +735,34 @@ class AssistantDialog(QDialog):
         cursor.movePosition(cursor.MoveOperation.End)
         if self.output.document().blockCount() > 1 or self.output.toPlainText():
             cursor.insertHtml('<p style="margin:0; font-size:8pt">&nbsp;</p>')
+        cursor.insertHtml(self._chat_message_html(role, text))
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
+
+    @staticmethod
+    def _chat_message_html(role, text):
         label = {"Вы": "Вы", "SmartReport": "SmartReport"}.get(str(role), str(role))
         background_color = "#313c4e" if label == "Вы" else "#2d3748"
         background = desktop_theme.color(background_color).name()
         body = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
-        cursor.insertHtml(
+        return (
             f'<table width="100%" cellspacing="0" cellpadding="10" bgcolor="{background}">'
             '<tr><td>'
             f'<p style="margin:0 0 5px 0"><span style="font-size:12pt; font-weight:700">{escape(label)}</span></p>'
             f'<p style="margin:0; font-size:10pt; font-weight:400">{body}</p>'
             '</td></tr></table>'
         )
-        self.output.setTextCursor(cursor)
-        self.output.ensureCursorVisible()
 
     def refresh_chat_theme(self, _theme_name):
         scrollbar = self.output.verticalScrollBar()
         previous_value = scrollbar.value()
         was_at_bottom = previous_value >= scrollbar.maximum()
-        self.output.clear()
-        for role, text in self.chat_messages:
-            self._insert_chat_message(role, text)
+        chunks = []
+        for index, (role, text) in enumerate(self.chat_messages):
+            if index:
+                chunks.append('<p style="margin:0; font-size:8pt">&nbsp;</p>')
+            chunks.append(self._chat_message_html(role, text))
+        self.output.setHtml("".join(chunks))
         scrollbar.setValue(scrollbar.maximum() if was_at_bottom else previous_value)
 
     def new_conversation(self):
