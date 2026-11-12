@@ -292,9 +292,26 @@ class ExpenseSharingTests(unittest.TestCase):
         self.assertEqual(refreshed[0]["id"], document["id"])
         self.assertEqual(refreshed[0]["attachments"], document["attachments"])
         self.assertEqual(refreshed[0]["usage"], "object_cost")
-        self.assertEqual(len(self.documents()), 1)
+        reopened = self.documents()[0]
+        self.assertEqual(
+            [row["gross_amount"] for row in reopened["allocations"]],
+            ["700.00", "1100.00", "1500.00"],
+        )
+        self.assertEqual(
+            sum(Decimal(row["gross_amount"]) for row in reopened["allocations"]),
+            Decimal(reopened["gross_amount"]),
+        )
+        for project, amount in zip(projects, ("700.00", "1100.00", "1500.00")):
+            summary = self.server_client.get(f"/api/expense-objects/{project}/expenses", headers={
+                "X-Sync-Key": "isolated-sync-test-key"}).get_json()
+            self.assertEqual(summary["documents"][0]["object_gross"], amount)
+        reopened_desktop = self.desktop_snapshot()
+        self.assertEqual(
+            [row["gross_amount"] for row in reopened_desktop[0]["allocations"]],
+            ["700.00", "1100.00", "1500.00"],
+        )
         # Match the current gross web form: no per-allocation VAT controls are present.
-        edited.update(expected_version=refreshed[0]["sync_version"], vat_amount="600.00")
+        edited.update(expected_version=reopened_desktop[0]["sync_version"], vat_amount="600.00")
         response = self.server_client.put(f"/api/expense-documents/{document['id']}", json=edited,
                                           headers={"X-CSRF-Token": "isolated-csrf"})
         self.assertEqual(response.status_code, 200, response.get_json())

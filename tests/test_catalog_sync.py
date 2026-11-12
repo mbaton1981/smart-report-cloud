@@ -2127,8 +2127,8 @@ class CatalogSyncTests(unittest.TestCase):
             main_titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
             self.assertEqual(main_titles.count("Расходы"), 1)
             self.assertNotIn("Материалы и расходы по объектам", main_titles)
-            self.assertEqual(window.table_supplier_documents.columnCount(), 8)
-            self.assertEqual(window.object_expenses_table.columnCount(), 7)
+            self.assertEqual(window.table_supplier_documents.columnCount(), 9)
+            self.assertEqual(window.object_expenses_table.columnCount(), 8)
             self.assertEqual(window.object_expenses_object.currentIndex(), 0)
             server_conn = self.server.get_db_connection()
             stable_object = server_conn.execute(
@@ -3365,15 +3365,16 @@ class CatalogSyncTests(unittest.TestCase):
                 combo = window.object_expenses_object
                 combo.setCurrentIndex(combo.findData(5))
                 window.load_object_expense_overview()
-                self.assertEqual(window.object_expenses_table.horizontalHeaderItem(4).text(), "Итого с НДС")
+                self.assertEqual(window.object_expenses_table.horizontalHeaderItem(4).text(), "Доля с НДС")
+                self.assertEqual(window.object_expenses_table.horizontalHeaderItem(5).text(), "Без НДС")
                 self.assertEqual(window.object_expenses_table.item(0, 4).text(), "Неизвестно")
-                self.assertIn("72,495.92", window.object_expenses_table.item(0, 4).toolTip())
-                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "Неизвестно")
+                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "72,495.92 SEK")
+                self.assertEqual(window.object_expenses_table.item(0, 6).text(), "Неизвестно")
                 document["allocations"][0].update(vat_amount="18124.00", gross_amount="90619.92")
                 window.load_object_expense_overview()
                 self.assertIn("90,619.92", window.object_expenses_table.item(0, 4).text())
-                self.assertNotIn("без НДС", window.object_expenses_table.item(0, 4).text())
-                self.assertIn("18,124.00", window.object_expenses_table.item(0, 5).text())
+                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "72,495.92 SEK")
+                self.assertIn("18,124.00", window.object_expenses_table.item(0, 6).text())
                 self.assertIn("18,124.00", window.object_expenses_vat_lbl.text())
                 self.assertIn("90,619.92", window.object_expenses_total_lbl.text())
                 document["allocations"].append({"object_id": 13, "destination": "object", "net_amount": "685.22",
@@ -3382,8 +3383,110 @@ class CatalogSyncTests(unittest.TestCase):
                 combo.setCurrentIndex(combo.findData(13))
                 window.load_object_expense_overview()
                 self.assertIn("856.53", window.object_expenses_table.item(0, 4).text())
-                self.assertIn("171.31", window.object_expenses_table.item(0, 5).text())
+                self.assertIn("685.22", window.object_expenses_table.item(0, 5).text())
+                self.assertIn("171.31", window.object_expenses_table.item(0, 6).text())
                 self.assertIn("685.22", window.object_expenses_net_lbl.text())
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_expense_object_filter_shows_only_its_reconciled_share(self):
+        from decimal import Decimal
+        from PyQt6.QtCore import QDate
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        object_rows = [
+            {"id": 5, "name": "Object 5", "markning": "p1037", "company": "Privat"},
+            {"id": 6, "name": "Object 6", "markning": "p1035", "company": "Privat"},
+        ]
+        document = {
+            "id": 13, "client_id": "multi-object-share",
+            "document_date": "2026-10-19", "supplier_name": "Beijer",
+            "invoice_number": "MULTI-SHARE", "currency_code": "SEK",
+            "gross_amount": "150.25", "net_amount": "120.00", "vat_amount": "30.00",
+            "rounding_amount": "0.25", "amount_due": "150.25",
+            "verification_status": "confirmed", "allocation_basis": "net",
+            "unallocated_gross": "0.00",
+            "allocations": [
+                {"object_id": 5, "object_name": "Object 5", "destination": "object",
+                 "gross_amount": "60.10", "net_amount": "48.00", "vat_amount": "12.00"},
+                {"object_id": 6, "object_name": "Object 6", "destination": "object",
+                 "gross_amount": "90.15", "net_amount": "72.00", "vat_amount": "18.00"},
+            ],
+        }
+        try:
+            with patch.object(window, "_expense_server_objects", return_value=(object_rows, True)), \
+                 patch.object(window, "_expense_register_snapshot", return_value=([document], True)), \
+                 patch.object(window, "_expense_document_snapshot", return_value=([document], True)):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+            with patch.object(window, "_expense_register_snapshot", return_value=([document], True)), \
+                 patch.object(window, "_expense_document_snapshot", return_value=([document], True)):
+                report_date = QDate.fromString(document["document_date"], "yyyy-MM-dd")
+                window.exp_date_from.setDate(report_date)
+                window.exp_date_to.setDate(report_date)
+                window.exp_filter_object.setCurrentIndex(
+                    window.exp_filter_object.findData(5))
+                window.load_expense_documents()
+                self.assertEqual(window.table_supplier_documents.item(0, 5).text(), "60.10 SEK")
+                self.assertEqual(window.table_supplier_documents.item(0, 6).text(), "48.00 SEK")
+                self.assertIn("Полная сумма фактуры с НДС: 150.25 SEK",
+                              window.table_supplier_documents.item(0, 5).toolTip())
+                self.assertIn("Округление фактуры отдельно: 0.25 SEK",
+                              window.table_supplier_documents.item(0, 5).toolTip())
+                self.assertEqual(window.exp_metrics["accounted"][0].text(), "SEK 60.10")
+                self.assertIn("SEK 48.00", window.exp_metrics["accounted"][1].text())
+
+                window.object_expenses_object.setCurrentIndex(
+                    window.object_expenses_object.findData(5))
+                window.load_object_expense_overview()
+                self.assertEqual(window.object_expenses_table.item(0, 4).text(), "60.10 SEK")
+                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "48.00 SEK")
+                self.assertEqual(window.object_expenses_table.item(0, 6).text(), "12.00 SEK")
+                self.assertIn("Отдельное округление: 0.10 SEK",
+                              window.object_expenses_table.item(0, 4).toolTip())
+
+                window.exp_filter_object.setCurrentIndex(
+                    window.exp_filter_object.findData(6))
+                window.load_expense_documents()
+                self.assertEqual(window.table_supplier_documents.item(0, 5).text(), "90.15 SEK")
+                self.assertEqual(window.table_supplier_documents.item(0, 6).text(), "72.00 SEK")
+                window.object_expenses_object.setCurrentIndex(
+                    window.object_expenses_object.findData(6))
+                window.load_object_expense_overview()
+                self.assertEqual(window.object_expenses_table.item(0, 4).text(), "90.15 SEK")
+                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "72.00 SEK")
+                self.assertEqual(window.object_expenses_table.item(0, 6).text(), "18.00 SEK")
+                self.assertEqual(
+                    sum(Decimal(value) for value in ("60.10", "90.15")),
+                    Decimal(document["gross_amount"]),
+                )
+                self.assertEqual(
+                    sum(Decimal(value) for value in ("48.00", "72.00")),
+                    Decimal(document["net_amount"]),
+                )
+                self.assertEqual(
+                    sum(Decimal(value) for value in ("12.00", "18.00")),
+                    Decimal(document["vat_amount"]),
+                )
+
+                document["allocations"][0]["gross_amount"] = None
+                document["allocations"][0]["vat_amount"] = None
+                window.exp_filter_object.setCurrentIndex(
+                    window.exp_filter_object.findData(5))
+                window.load_expense_documents()
+                self.assertEqual(window.table_supplier_documents.item(0, 5).text(), "Неизвестно")
+                self.assertEqual(window.table_supplier_documents.item(0, 6).text(), "48.00 SEK")
+                self.assertIn("Неизвестно", window.exp_docs_gross_lbl.text())
+                window.object_expenses_object.setCurrentIndex(
+                    window.object_expenses_object.findData(5))
+                window.load_object_expense_overview()
+                self.assertEqual(window.object_expenses_table.item(0, 4).text(), "Неизвестно")
+                self.assertEqual(window.object_expenses_table.item(0, 5).text(), "48.00 SEK")
+                self.assertEqual(window.object_expenses_table.item(0, 6).text(), "Неизвестно")
         finally:
             window.close()
             window.deleteLater()

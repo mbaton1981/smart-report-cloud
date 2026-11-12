@@ -328,11 +328,35 @@ class OfflineReviewWindow(QDialog):
             if (rounding is not None and net is not None and vat is not None
                     and net + vat + rounding == gross):
                 result["rounding_amount"] = decimal_text(rounding)
+            loaded_review = getattr(self, "loaded_review", {}) or {}
+            same_document_totals = all(
+                parse_invoice_money(result.get(key)) == parse_invoice_money(loaded_review.get(key))
+                for key in ("net_amount", "vat_amount", "gross_amount")
+            )
+            if same_document_totals and result.get("rounding_amount") in (None, ""):
+                if loaded_review.get("rounding_amount") not in (None, ""):
+                    result["rounding_amount"] = loaded_review["rounding_amount"]
+            original_parts = self.store.allocations(loaded_review)
             parts = []
             for row in range(self.allocations.rowCount()):
                 destination, object_id = self.allocation_target(row)
-                parts.append({"destination": destination, "object_id": object_id,
-                              "gross_amount": self.allocations.item(row, 1).text().strip() or None})
+                gross_amount = self.allocations.item(row, 1).text().strip() or None
+                part = {"destination": destination, "object_id": object_id,
+                        "gross_amount": gross_amount}
+                if same_document_totals:
+                    matches = [
+                        original for original in original_parts
+                        if (original.get("destination") or
+                            ("object" if original.get("object_id") is not None else "company")) == destination
+                        and original.get("object_id") == object_id
+                        and parse_invoice_money(original.get("gross_amount"))
+                        == parse_invoice_money(gross_amount)
+                    ]
+                    if len(matches) == 1:
+                        for key in ("net_amount", "vat_amount", "rounding_amount"):
+                            if matches[0].get(key) not in (None, ""):
+                                part[key] = matches[0][key]
+                parts.append(part)
             if parts:
                 result["allocations"] = parts
             elif self.object.currentData() is None:

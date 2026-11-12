@@ -160,6 +160,69 @@ class IncomingIntegrationTests(unittest.TestCase):
         self.assertEqual(document["attachments"][0]["sha256"], card["sha256"])
         self.assertEqual(self.sync()["synced"], 0)
 
+    def test_resaving_existing_object_cost_preserves_allocation_tax(self):
+        from offline_review_ui import OfflineReviewWindow
+
+        parts = [
+            {"destination": "object", "object_id": self.object_id, "gross_amount": "50.00",
+             "net_amount": "40.00", "vat_amount": "10.00", "rounding_amount": "0.00"},
+            {"destination": "company", "object_id": None, "gross_amount": "75.00",
+             "net_amount": "60.00", "vat_amount": "15.00", "rounding_amount": "0.00"},
+        ]
+        revision, payload = self.store.latest(1)
+        payload.update(
+            supplier_name="Isolated Supplier AB",
+            invoice_number="TEST-123",
+            document_date="2026-10-21",
+            currency_code="SEK",
+            net_amount="100.00",
+            vat_amount="25.00",
+            gross_amount="125.00",
+            rounding_amount="0.00",
+            object_id=self.object_id,
+            allocations=parts,
+            original_checked=True,
+        )
+        revision = self.store.save(1, payload, revision)
+        card = self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        self.host.incoming_register_snapshot = lambda: self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
+        try:
+            window.inputs["vat_amount"].setText("24.00")
+            changed_totals = window.payload()["allocations"][0]
+            self.assertNotIn("net_amount", changed_totals)
+            self.assertNotIn("vat_amount", changed_totals)
+            self.assertNotIn("rounding_amount", changed_totals)
+            window.inputs["vat_amount"].setText("25.00")
+
+            resaved = window.payload()
+            self.assertEqual(resaved["allocations"], parts)
+            self.assertEqual(resaved["rounding_amount"], "0.00")
+            self.store.save(1, resaved, window.revision)
+            self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+
+            documents = self.server_client.get(
+                "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+            ).get_json()["documents"]
+            saved = next(row for row in documents if row["client_id"] == card["client_id"])
+            self.assertEqual(
+                [[part[key] for key in ("net_amount", "vat_amount", "rounding_amount", "gross_amount")]
+                 for part in saved["allocations"]],
+                [["40.00", "10.00", "0.00", "50.00"], ["60.00", "15.00", "0.00", "75.00"]],
+            )
+            _revision, reopened = self.store.current_review(1)
+            self.assertEqual(
+                [[part[key] for key in ("net_amount", "vat_amount", "rounding_amount", "gross_amount")]
+                 for part in reopened["allocations"]],
+                [["40.00", "10.00", "0.00", "50.00"], ["60.00", "15.00", "0.00", "75.00"]],
+            )
+        finally:
+            window.close()
+
     def test_unsupported_server_keeps_receipt_and_retries_safe(self):
         self.host._incoming_costs_supported = False
         revision = self.approve(2)

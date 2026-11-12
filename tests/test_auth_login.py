@@ -125,12 +125,33 @@ class AuthLoginTests(unittest.TestCase):
         report = self.client.get("/api/expense-objects/1/expenses", headers=headers).get_json()
         self.assertEqual(report["documents"][0]["object_vat"], "31.00")
         self.assertEqual(report["documents"][0]["object_gross"], "181.00")
+        resave = dict(payload)
+        resave.update(
+            expected_version=document["sync_version"],
+            net_amount=document["net_amount"],
+            vat_amount=document["vat_amount"],
+            gross_amount=document["gross_amount"],
+            rounding_amount=document["rounding_amount"],
+            allocations=document["allocations"],
+            order_proposals=document["order_proposals"],
+        )
+        response = self.client.put(f"/api/expense-documents/{identifier}", headers=headers, json=resave)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        reread = self.client.get(f"/api/expense-documents/{identifier}", headers=headers).get_json()["document"]
+        self.assertEqual(
+            [[part["net_amount"], part["vat_amount"], part["gross_amount"]]
+             for part in reread["allocations"]],
+            [["150.00", "31.00", "181.00"], ["133.33", "2.00", "135.33"]],
+        )
+        report = self.client.get("/api/expense-objects/1/expenses", headers=headers).get_json()
+        self.assertEqual(report["documents"][0]["object_vat"], "31.00")
+        self.assertEqual(report["documents"][0]["object_gross"], "181.00")
         self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat", headers=headers,
                                           json={"expected_version": 1}).status_code, 409)
         self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat", headers=headers,
-                                          json={"expected_version": 2}).status_code, 400)
+                                          json={"expected_version": reread["sync_version"]}).status_code, 400)
         self.assertEqual(self.client.post(f"/api/expense-documents/{identifier}/allocation-vat",
-                                          json={"expected_version": 2}).status_code, 403)
+                                          json={"expected_version": reread["sync_version"]}).status_code, 403)
 
     def test_gross_allocations_preserve_original_net_vat_and_rounding_on_resave(self):
         from io import BytesIO

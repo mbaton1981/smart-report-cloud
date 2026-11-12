@@ -278,8 +278,11 @@ class IncomingDisplayTests(unittest.TestCase):
             exp_filter_object=QComboBox(),
             exp_filter_unallocated=QCheckBox(),
             exp_filter_status=QComboBox(),
-            table_supplier_documents=QTableWidget(0, 8),
+            table_supplier_documents=QTableWidget(0, 9),
             _expense_money_label=self.desktop.SmartReportApp._expense_money_label,
+            _expense_totals_label=self.desktop.SmartReportApp._expense_totals_label,
+            _expense_selected_allocations=self.desktop.SmartReportApp._expense_selected_allocations,
+            _expense_allocation_total=self.desktop.SmartReportApp._expense_allocation_total,
         )
         host.exp_filter_object.addItem("Все объекты", None)
         host.exp_filter_status.addItem("Все состояния", "all")
@@ -378,7 +381,7 @@ class IncomingDisplayTests(unittest.TestCase):
                               "gross_amount": "125.00"}],
              "unallocated_gross": "0.00"},
         ]
-        table = self.desktop.QTableWidget(0, 8)
+        table = self.desktop.QTableWidget(0, 9)
         table.setItemDelegate(self.desktop.desktop_ui.ExpenseRegisterTableDelegate(table))
         table.setFixedSize(1100, 150)
         table.setAlternatingRowColors(True)
@@ -403,6 +406,9 @@ class IncomingDisplayTests(unittest.TestCase):
             exp_filter_status=QComboBox(),
             table_supplier_documents=table,
             _expense_money_label=self.desktop.SmartReportApp._expense_money_label,
+            _expense_totals_label=self.desktop.SmartReportApp._expense_totals_label,
+            _expense_selected_allocations=self.desktop.SmartReportApp._expense_selected_allocations,
+            _expense_allocation_total=self.desktop.SmartReportApp._expense_allocation_total,
         )
         host.exp_filter_object.addItem("Все объекты", None)
         host.exp_filter_status.addItem("Активные", "active")
@@ -425,8 +431,8 @@ class IncomingDisplayTests(unittest.TestCase):
                            if table.item(row, 0).text() == "ignored")
         self.assertIn("Bauhaus", table.item(ignored_row, 2).text())
         self.assertIn("Подтверждение заказа", table.item(ignored_row, 2).text())
-        self.assertEqual(table.item(ignored_row, 7).text(), "Исключён — Не фактура")
-        self.assertIn("Причина исключения: Не фактура", table.item(ignored_row, 7).toolTip())
+        self.assertEqual(table.item(ignored_row, 8).text(), "Исключён — Не фактура")
+        self.assertIn("Причина исключения: Не фактура", table.item(ignored_row, 8).toolTip())
 
         previous = getattr(self.qt_app, "_smartreport_theme", None)
         previous_style = self.qt_app.styleSheet()
@@ -482,23 +488,23 @@ class IncomingDisplayTests(unittest.TestCase):
                     for column in range(1, table.columnCount()):
                         item = table.item(row, column)
                         wanted = color
-                        if identity == "error" and column == 7:
+                        if identity == "error" and column == 8:
                             wanted = expected[theme_name]["error"]
                         elif identity == "error":
                             wanted = expected[theme_name]["distributed"]
                         self.assertEqual(item.background().color().name(), wanted,
                                          (theme_name, identity, column))
                         original_color = expected["dark"][identity]
-                        if identity == "error" and column == 7:
+                        if identity == "error" and column == 8:
                             original_color = expected["dark"]["error"]
                         elif identity == "error":
                             original_color = expected["dark"]["distributed"]
                         self.assertEqual(item.data(BACKGROUND_ROLE).lower(), original_color)
-                pending_status = table.item(row_for("pending"), 7)
+                pending_status = table.item(row_for("pending"), 8)
                 self.assertEqual(pending_status.text(), "Повторить передачу")
                 self.assertIn("Ожидает подтверждения сервера", pending_status.toolTip())
-                self.assertTrue(table.item(row_for("accounted"), 7).text().startswith("Учтён"))
-                self.assertNotIn("Оплачен", table.item(row_for("accounted"), 7).text())
+                self.assertTrue(table.item(row_for("accounted"), 8).text().startswith("Учтён"))
+                self.assertNotIn("Оплачен", table.item(row_for("accounted"), 8).text())
 
                 selected_row = row_for("distributed")
                 table.selectRow(selected_row)

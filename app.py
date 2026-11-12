@@ -7229,6 +7229,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         page_layout.addLayout(title_row)
 
         self.exp_metrics = {}
+        self.exp_metric_labels = {}
         metrics_row = QHBoxLayout()
         metrics_row.setSpacing(9)
         for key, title_text, accent in (
@@ -7259,6 +7260,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             card_layout.addWidget(meta)
             metrics_row.addWidget(card, 1)
             self.exp_metrics[key] = (value, meta)
+            self.exp_metric_labels[key] = label
         page_layout.addLayout(metrics_row)
 
         filters = QGridLayout()
@@ -7335,20 +7337,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             legacy_totals.addWidget(value)
             value.hide()
 
-        self.table_supplier_documents = QTableWidget(0, 8)
+        self.table_supplier_documents = QTableWidget(0, 9)
         self.table_supplier_documents.setHorizontalHeaderLabels([
             "ID", "Дата", "Поставщик", "№ документа", "Назначение / распределение",
-            "Сумма с НДС", "НДС", "Состояние",
+            "Сумма фактуры с НДС", "Без НДС", "НДС", "Состояние",
         ])
         self.table_supplier_documents.setColumnHidden(0, True)
         self.table_supplier_documents.setColumnHidden(3, True)
-        self.table_supplier_documents.setColumnHidden(6, True)
+        self.table_supplier_documents.setColumnHidden(7, True)
         self.table_supplier_documents.setHorizontalHeaderLabels([
             "ID", "Дата", "Поставщик / документ", "№ документа", "Назначение",
-            "Сумма с НДС", "НДС", "Состояние",
+            "Сумма фактуры с НДС", "Без НДС", "НДС", "Состояние",
         ])
         document_header = self.table_supplier_documents.horizontalHeader()
-        for column, width in {1: 90, 2: 180, 5: 115, 7: 150}.items():
+        for column, width in {1: 90, 2: 180, 5: 135, 6: 115, 8: 150}.items():
             document_header.resizeSection(column, width)
         document_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table_supplier_documents.setItemDelegate(
@@ -7417,8 +7419,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         for index, (key, caption) in enumerate((
             ("supplier", "Поставщик"), ("date", "Дата"),
             ("number", "Номер документа"), ("category", "Категория"),
-            ("net", "Без НДС"), ("vat", "НДС"),
-            ("gross", "Итого с НДС"), ("destination", "Назначение"),
+            ("net", "Фактура без НДС"), ("vat", "НДС фактуры"),
+            ("gross", "Сумма фактуры с НДС"), ("destination", "Назначение"),
         )):
             cell = QVBoxLayout()
             label = QLabel(caption)
@@ -7586,6 +7588,35 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             or document.get("id")
         )
 
+    @staticmethod
+    def _expense_selected_allocations(document, selected_filter):
+        allocations = document.get("allocations") or []
+        if isinstance(selected_filter, int):
+            return [item for item in allocations if item.get("object_id") == selected_filter]
+        if selected_filter == "company":
+            return [
+                item for item in allocations
+                if item.get("object_id") is None
+                and item.get("destination", "company") == "company"
+            ]
+        return []
+
+    @staticmethod
+    def _expense_allocation_total(allocations, field):
+        amounts = [parse_decimal(item.get(field)) for item in allocations]
+        if not amounts or any(amount is None for amount in amounts):
+            return None
+        return sum(amounts, Decimal(0))
+
+    @classmethod
+    def _expense_totals_label(cls, totals, incomplete=False):
+        label = cls._expense_money_label(totals)
+        if not incomplete:
+            return label
+        if not totals:
+            return "Неизвестно"
+        return f"Частично известно: {label}"
+
     def _update_expense_summary_cards(self, documents):
         buckets = {"accounted": [], "review": [], "unallocated": []}
         for document in documents:
@@ -7601,25 +7632,67 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         def totals(rows, field):
             result = {}
+            incomplete = False
+            selected_filter = (
+                self.exp_filter_object.currentData()
+                if hasattr(self, "exp_filter_object") else None
+            )
+            allocation_scope = isinstance(selected_filter, int) or selected_filter == "company"
             for row in rows:
-                amount = parse_decimal(row.get(field))
+                if allocation_scope:
+                    allocations = self._expense_selected_allocations(row, selected_filter)
+                    amount = self._expense_allocation_total(allocations, field)
+                    incomplete = incomplete or amount is None
+                else:
+                    amount = parse_decimal(row.get(field))
                 if amount is not None:
                     currency = str(row.get("currency_code") or "SEK")
                     result[currency] = result.get(currency, Decimal(0)) + amount
-            return self._expense_money_label(result)
+            return self._expense_totals_label(result, incomplete)
 
         if not hasattr(self, "exp_metrics"):
             return
         accounted, review, unallocated = (
             self.exp_metrics[key] for key in ("accounted", "review", "unallocated")
         )
+        selected_filter = (
+            self.exp_filter_object.currentData()
+            if hasattr(self, "exp_filter_object") else None
+        )
+        allocation_scope = isinstance(selected_filter, int) or selected_filter == "company"
+        labels = getattr(self, "exp_metric_labels", {})
+        if allocation_scope:
+            selected_title = (
+                "Учтённая доля объекта" if isinstance(selected_filter, int)
+                else "Учтённые общие расходы"
+            )
+            if "accounted" in labels:
+                labels["accounted"].setText(selected_title)
+            if "review" in labels:
+                labels["review"].setText(
+                    "Доля объекта требует проверки" if isinstance(selected_filter, int)
+                    else "Общие расходы требуют проверки"
+                )
+            if "unallocated" in labels:
+                labels["unallocated"].setText("Остаток полных документов")
+        else:
+            for key, title in (
+                ("accounted", "Учтённые расходы"),
+                ("review", "Требуют проверки"),
+                ("unallocated", "Не распределены"),
+            ):
+                if key in labels:
+                    labels[key].setText(title)
         accounted[0].setText(totals(buckets["accounted"], "gross_amount"))
         accounted[1].setText(
-            "с НДС · без НДС " + totals(buckets["accounted"], "net_amount")
+            ("доля с НДС · доля без НДС " if allocation_scope else "с НДС · без НДС ")
+            + totals(buckets["accounted"], "net_amount")
         )
         review[0].setText(totals(buckets["review"], "gross_amount"))
         review[1].setText(
-            f"с НДС · {len(buckets['review'])} документа, отдельно от учтённых"
+            ("доля с НДС · " if allocation_scope else "с НДС · ")
+            + f"{len(buckets['review'])} "
+            + ("долей, отдельно от учтённых" if allocation_scope else "документа, отдельно от учтённых")
         )
         unallocated_amounts = {}
         for document in buckets["unallocated"]:
@@ -7632,7 +7705,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         unallocated[0].setText(self._expense_money_label(unallocated_amounts))
         unallocated[1].setText(
             f"остаток с НДС · {len(buckets['unallocated'])} документа, "
-            "не входят в учтённые"
+            + ("полные суммы документов; не доля объекта" if allocation_scope
+               else "не входят в учтённые")
         )
 
     def _update_expense_detail(self, *_):
@@ -7956,10 +8030,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_expenses_selected_label.setWordWrap(True)
         layout.addWidget(self.object_expenses_selected_label)
         summary = QHBoxLayout()
-        self.object_expenses_total_lbl = QLabel("Итого с НДС: —")
-        self.object_expenses_vat_lbl = QLabel("Известный НДС: —")
-        self.object_expenses_net_lbl = QLabel("Сумма без НДС: —")
-        self.object_expenses_unallocated_lbl = QLabel("Не распределено: —")
+        self.object_expenses_total_lbl = QLabel("Доля с НДС: —")
+        self.object_expenses_vat_lbl = QLabel("НДС доли: —")
+        self.object_expenses_net_lbl = QLabel("Доля без НДС: —")
+        self.object_expenses_unallocated_lbl = QLabel("Не распределено в документах: —")
         for label in (
             self.object_expenses_total_lbl, self.object_expenses_vat_lbl,
             self.object_expenses_net_lbl, self.object_expenses_unallocated_lbl,
@@ -7968,14 +8042,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             summary.addWidget(label)
         layout.addLayout(summary)
 
-        self.object_expenses_table = QTableWidget(0, 7)
+        self.object_expenses_table = QTableWidget(0, 8)
         self.object_expenses_table.setHorizontalHeaderLabels([
-            "ID", "Дата", "Поставщик", "Документ", "Итого с НДС",
-            "НДС", "Статус распределения",
+            "ID", "Дата", "Поставщик", "Документ", "Доля с НДС",
+            "Без НДС", "НДС доли", "Статус распределения",
         ])
         self.object_expenses_table.setColumnHidden(0, True)
         object_header = self.object_expenses_table.horizontalHeader()
-        for column, width in {1: 95, 3: 165, 4: 125, 5: 105, 6: 185}.items():
+        for column, width in {1: 95, 3: 165, 4: 125, 5: 115, 6: 105, 7: 185}.items():
             object_header.resizeSection(column, width)
         object_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.object_expenses_table.setAlternatingRowColors(True)
@@ -8652,6 +8726,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         vertical_scroll = self.table_supplier_documents.verticalScrollBar().value()
         horizontal_scroll = self.table_supplier_documents.horizontalScrollBar().value()
         gross_totals, vat_totals, net_totals, unallocated_totals = {}, {}, {}, {}
+        allocation_scope = isinstance(selected_filter, int) or selected_filter == "company"
+        incomplete_totals = {"gross_amount": False, "vat_amount": False, "net_amount": False}
         counts = {key: 0 for key in ("requires_review", "later", "accounted", "ignored", "transfer")}
         for document in base_filtered:
             key = self._expense_register_status_key(document)
@@ -8660,16 +8736,36 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         for document in filtered:
             currency = str(document.get("currency_code") or "SEK")
             if self._expense_register_status_key(document) == "accounted":
-                for field, totals in (("gross_amount", gross_totals), ("vat_amount", vat_totals), ("net_amount", net_totals)):
-                    amount = parse_decimal(document.get(field))
+                allocations = self._expense_selected_allocations(document, selected_filter)
+                for field, totals in (
+                    ("gross_amount", gross_totals), ("vat_amount", vat_totals),
+                    ("net_amount", net_totals),
+                ):
+                    amount = (
+                        self._expense_allocation_total(allocations, field)
+                        if allocation_scope else parse_decimal(document.get(field))
+                    )
                     if amount is not None:
                         totals[currency] = totals.get(currency, Decimal(0)) + amount
+                    elif allocation_scope:
+                        incomplete_totals[field] = True
             remaining = self._expense_register_unallocated_amount(document)
             if remaining is not None and remaining != 0 and self._expense_register_status_key(document) != "ignored":
                 unallocated_totals[currency] = unallocated_totals.get(currency, Decimal(0)) + remaining
-        self.exp_docs_gross_lbl.setText(self._expense_money_label(gross_totals))
-        self.exp_docs_vat_lbl.setText(self._expense_money_label(vat_totals))
-        self.exp_docs_net_lbl.setText(self._expense_money_label(net_totals))
+        total_labels = {
+            "gross_amount": gross_totals,
+            "vat_amount": vat_totals,
+            "net_amount": net_totals,
+        }
+        for field, totals in total_labels.items():
+            label = self._expense_totals_label(totals, incomplete_totals[field])
+            if allocation_scope:
+                label = "Доля: " + label
+            getattr(self, {
+                "gross_amount": "exp_docs_gross_lbl",
+                "vat_amount": "exp_docs_vat_lbl",
+                "net_amount": "exp_docs_net_lbl",
+            }[field]).setText(label)
         self.exp_docs_unallocated_lbl.setText(self._expense_money_label(unallocated_totals))
         self.exp_docs_review_lbl.setText(str(reviews))
         state_summary = (
@@ -8683,21 +8779,63 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_docs_state_counts_lbl.setText(state_summary)
 
         table = self.table_supplier_documents
+        table.setHorizontalHeaderLabels([
+            "ID", "Дата", "Поставщик / документ", "№ документа", "Назначение",
+            "Доля с НДС" if allocation_scope else "Сумма фактуры с НДС",
+            "Без НДС", "НДС доли" if allocation_scope else "НДС", "Состояние",
+        ])
         blocker = QSignalBlocker(table)
         table.setCurrentCell(-1, -1)
         table.setRowCount(len(filtered))
         restored_row = -1
         for row_index, document in enumerate(filtered):
             allocations = document.get("allocations") or []
+            selected_allocations = (
+                self._expense_selected_allocations(document, selected_filter)
+                if allocation_scope else allocations
+            )
             object_names = sorted({
                 item.get("object_name") or (
                     "Общие расходы фирмы" if item.get("destination") == "company"
                     else "Назначение не выбрано")
-                for item in allocations
+                for item in selected_allocations
             })
             object_label = ", ".join(object_names) if object_names else "Назначение не выбрано"
             currency = str(document.get("currency_code") or "SEK")
-            vat_text = f"{document['vat_amount']} {currency}" if document.get("vat_amount") is not None else "Не указан / не распознан"
+            row_amounts = {
+                field: (
+                    self._expense_allocation_total(selected_allocations, field)
+                    if allocation_scope else parse_decimal(document.get(field))
+                )
+                for field in ("gross_amount", "net_amount", "vat_amount")
+            }
+            row_amount_labels = {
+                field: (
+                    f"{amount:,.2f} {currency}" if amount is not None else "Неизвестно"
+                )
+                for field, amount in row_amounts.items()
+            }
+            allocation_rounding = (
+                row_amounts["gross_amount"] - row_amounts["net_amount"] - row_amounts["vat_amount"]
+                if all(row_amounts[field] is not None
+                       for field in ("gross_amount", "net_amount", "vat_amount"))
+                else None
+            )
+            allocation_rounding_label = (
+                f"{allocation_rounding:,.2f} {currency}"
+                if allocation_rounding is not None else "Неизвестно"
+            )
+            document_rounding = parse_decimal(document.get("rounding_amount"))
+            document_rounding_label = (
+                f"{document_rounding:,.2f} {currency}"
+                if document_rounding is not None else "Не указано"
+            )
+            vat_text = (
+                row_amount_labels["vat_amount"]
+                if row_amounts["vat_amount"] is not None
+                else "Неизвестно" if allocation_scope
+                else "Не указан / не распознан"
+            )
             status = self._expense_register_status_label(document)
             distribution = self._expense_distribution_label(document)
             if distribution:
@@ -8740,14 +8878,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 + "\n№ " + str(document.get("invoice_number") or "не указан"),
                 document.get("invoice_number") or "Не указан",
                 object_label,
-                f"{document['gross_amount']} {currency}" if document.get("gross_amount") is not None else "Не определена",
+                row_amount_labels["gross_amount"],
+                row_amount_labels["net_amount"],
                 vat_text,
                 short_status,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 desktop_theme.item_color(item, row_color)
-                if column == 7 and self._expense_register_has_transfer_error(document):
+                if column == 8 and self._expense_register_has_transfer_error(document):
                     desktop_theme.item_color(item, EXPENSE_REGISTER_TRANSFER_ERROR_COLOR)
                 if column == 1 and not document.get("document_date"):
                     item.setToolTip("Дата в документе не указана или не распознана.")
@@ -8760,17 +8899,35 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     )
                 elif column == 3 and not document.get("invoice_number"):
                     item.setToolTip("Номер документа отсутствует или не распознан.")
-                elif column == 5 and document.get("gross_amount") is None:
-                    item.setToolTip("Сумма не определена; проверьте оригинал.")
                 elif column == 5:
+                    if allocation_scope:
+                        item.setToolTip(
+                            f"Доля выбранного назначения с НДС: "
+                            f"{row_amount_labels['gross_amount']}\n"
+                            f"Без НДС: {row_amount_labels['net_amount']}\n"
+                            f"НДС доли: {row_amount_labels['vat_amount']}\n"
+                            f"Округление доли отдельно: {allocation_rounding_label}\n"
+                            f"Полная сумма фактуры с НДС: "
+                            f"{document.get('gross_amount') or 'неизвестно'} {currency}\n"
+                            f"Округление фактуры отдельно: {document_rounding_label}"
+                        )
+                    else:
+                        item.setToolTip(
+                            f"Полная сумма фактуры с НДС: "
+                            f"{row_amount_labels['gross_amount']}\n"
+                            f"Фактура без НДС: "
+                            f"{row_amount_labels['net_amount']}\n"
+                            f"НДС фактуры: {vat_text}\n"
+                            f"Округление фактуры отдельно: {document_rounding_label}"
+                        )
+                elif column == 6 and row_amounts["net_amount"] is None:
                     item.setToolTip(
-                        f"С НДС: {document.get('gross_amount')} {currency}\n"
-                        f"Без НДС: {document.get('net_amount') or 'неизвестно'} {currency}\n"
-                        f"НДС: {vat_text}"
+                        "Доля без НДС не сохранена или не распознана."
+                        if allocation_scope else "Сумма фактуры без НДС не определена."
                     )
-                elif column == 6 and document.get("vat_amount") is None:
+                elif column == 7 and row_amounts["vat_amount"] is None:
                     item.setToolTip("НДС не указан или не распознан. Он не вычислялся автоматически.")
-                elif column == 7:
+                elif column == 8:
                     item.setToolTip(
                         f"{status}\nПричина исключения: {document.get('exclusion_reason') or 'Не фактура'}"
                         if self._expense_register_status_key(document) == "ignored" else status
@@ -8858,11 +9015,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if remaining is not None and remaining:
                 totals["unallocated"][currency] = totals["unallocated"].get(currency, Decimal(0)) + remaining
             rows.append((document, allocations))
-        self.object_expenses_total_lbl.setText("Итого с НДС: " + ("Неизвестно (не все части указаны)" if unknown["gross"] else self._expense_money_label(totals["gross"])))
-        self.object_expenses_vat_lbl.setText("НДС частей: " + ("Неизвестно (не все части указаны)" if unknown["vat"] else self._expense_money_label(totals["vat"])))
-        self.object_expenses_net_lbl.setText(f"Сумма без НДС: {self._expense_money_label(totals['net'])}")
+        self.object_expenses_total_lbl.setText(
+            "Доля с НДС: " + self._expense_totals_label(totals["gross"], unknown["gross"])
+        )
+        self.object_expenses_vat_lbl.setText(
+            "НДС доли: " + self._expense_totals_label(totals["vat"], unknown["vat"])
+        )
+        self.object_expenses_net_lbl.setText(
+            "Доля без НДС: " + self._expense_totals_label(totals["net"], unknown["net"])
+        )
         self.object_expenses_unallocated_lbl.setText(
-            f"Не распределено (отдельно): {self._expense_money_label(totals['unallocated'])}"
+            "Не распределено в полных документах (отдельно от доли): "
+            + self._expense_money_label(totals["unallocated"])
         )
         self.object_expenses_selected_label.setText(
             "Общие расходы фирмы" if is_company else self.object_expenses_object.currentText()
@@ -8870,18 +9034,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_expenses_table.setRowCount(len(rows))
         for row_index, (document, allocations) in enumerate(rows):
             currency = str(document.get("currency_code") or "SEK")
-            allocated_gross_values = [parse_decimal(item.get("gross_amount")) for item in allocations]
-            allocated_gross = sum(allocated_gross_values, Decimal(0)) if all(value is not None for value in allocated_gross_values) else None
-            allocated_net_values = [parse_decimal(item.get("net_amount")) for item in allocations]
-            allocated_net = sum(allocated_net_values, Decimal(0)) if all(value is not None for value in allocated_net_values) else None
+            allocated_gross = self._expense_allocation_total(allocations, "gross_amount")
+            allocated_net = self._expense_allocation_total(allocations, "net_amount")
             amount_label = f"{allocated_gross:,.2f} {currency}" if allocated_gross is not None else "Неизвестно"
-            allocated_vat_values = [parse_decimal(item.get("vat_amount")) for item in allocations]
-            allocated_vat = sum(allocated_vat_values, Decimal(0)) if all(value is not None for value in allocated_vat_values) else None
+            net_label = f"{allocated_net:,.2f} {currency}" if allocated_net is not None else "Неизвестно"
+            allocated_vat = self._expense_allocation_total(allocations, "vat_amount")
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "—", document.get("supplier_name") or "Не указан",
                 document.get("invoice_number") or "Документ расходов",
                 amount_label,
+                net_label,
                 f"{allocated_vat:,.2f} {currency}" if allocated_vat is not None else "Неизвестно",
                 self._expense_distribution_label(document),
             )
@@ -8891,7 +9054,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         if all(value is not None for value in (allocated_gross, allocated_net, allocated_vat)) else None)
             self.object_expenses_table.item(row_index, 4).setToolTip("\n".join(
                 f"{label}: {f'{value:,.2f} {currency}' if value is not None else 'Неизвестно'}"
-                for label, value in (("Без НДС", allocated_net), ("НДС", allocated_vat), ("Отдельное округление", rounding))))
+                for label, value in (("Доля без НДС", allocated_net), ("НДС доли", allocated_vat), ("Отдельное округление", rounding))
+            ) + "\n" + "\n".join(
+                f"{label}: {document.get(field) or 'Неизвестно'} {currency}"
+                for label, field in (
+                    ("Полная сумма фактуры с НДС", "gross_amount"),
+                    ("Фактура без НДС", "net_amount"),
+                    ("НДС фактуры", "vat_amount"),
+                    ("Округление фактуры отдельно", "rounding_amount"),
+                )
+            ))
+            self.object_expenses_table.item(row_index, 5).setToolTip(
+                "Сохранённая доля без НДС." if allocated_net is not None
+                else "Доля без НДС не сохранена или не распознана."
+            )
             self.object_expenses_table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
 
     def _store_expense_originals(self, paths, client_id):
