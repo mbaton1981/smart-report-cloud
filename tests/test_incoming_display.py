@@ -298,6 +298,46 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("3 входящих вне периода", host.exp_api_status_lbl.text())
         self.assertIn("Измените период", host.exp_api_status_lbl.text())
 
+    def test_incoming_copy_of_synced_original_merges_into_single_register_row(self):
+        import hashlib
+        from PyQt6.QtWidgets import QLabel
+        from test_mail_automation import pdf
+
+        content = pdf("BEIJER synthetic original")
+        self.store.add_pdf(content, "beijer.pdf", {
+            "fields": dict(self.fields, supplier_name="BEIJER BYGGMATERIAL AB",
+                           invoice_number="260414428128", document_date="2026-10-28"),
+            "state": "requires_review"})
+        document_id = self.store.documents()[-1]["id"]
+        sha = hashlib.sha256(content).hexdigest()
+        server_document = {
+            "id": 38, "client_id": "server-client", "sync_version": 3,
+            "supplier_name": "BEIJER BYGGMATERIAL AB", "invoice_number": "260414428128",
+            "document_date": "2026-10-28", "currency_code": "SEK",
+            "gross_amount": "139629.77", "vat_amount": "27926.00",
+            "verification_status": "draft", "allocations": [],
+            "attachments": [{"id": 1, "sha256": sha, "has_original": True}],
+        }
+        host = SimpleNamespace(
+            _incoming_documents_root=lambda: self.store.root,
+            _expense_objects=self.host._expense_objects,
+            _expense_document_snapshot=lambda *_a, **_k: ([dict(server_document)], True),
+            exp_api_status_lbl=QLabel(),
+        )
+        host._local_incoming_expense_documents = lambda date_from=None, date_to=None: (
+            self.desktop.SmartReportApp._local_incoming_expense_documents(
+                host, date_from, date_to))
+        documents, online = self.desktop.SmartReportApp._expense_register_snapshot(host)
+        self.assertTrue(online)
+        rows = [document for document in documents
+                if document.get("id") == 38
+                or document.get("incoming_document_id") == document_id]
+        self.assertEqual(len(rows), 1)
+        merged = rows[0]
+        self.assertEqual(merged["id"], 38)
+        self.assertEqual(merged["incoming_document_id"], document_id)
+        self.assertTrue(merged["incoming_local"])
+
     def test_expense_register_state_colors_follow_saved_state_and_both_themes(self):
         import tempfile
         from pathlib import Path

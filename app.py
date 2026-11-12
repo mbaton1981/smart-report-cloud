@@ -8327,6 +8327,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "local_attachment_paths": (
                         [str(original_path)] if original_path is not None and original_path.is_file() else []),
                     "source_filename": original_row["filename"] if original_row else None,
+                    "original_sha256": record["sha256"],
                     "attachments": [],
                     "has_original": original_row is not None,
                 })
@@ -8347,10 +8348,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             document.get("client_id"): index
             for index, document in enumerate(documents) if document.get("client_id")
         }
+        sha_positions = {}
+        for index, document in enumerate(documents):
+            for attachment in document.get("attachments") or []:
+                sha256 = attachment.get("sha256")
+                if sha256:
+                    sha_positions.setdefault(sha256, index)
         for incoming in self._local_incoming_expense_documents(date_from, date_to):
             client_id = incoming.get("client_id")
-            if client_id in positions:
-                document = documents[positions[client_id]]
+            index = positions.get(client_id)
+            if index is None:
+                # Тот же оригинал уже в общем реестре: одна строка и один подсчёт,
+                # даже если входящий документ ещё не связан карточкой.
+                index = sha_positions.get(incoming.get("original_sha256"))
+            if index is not None:
+                document = documents[index]
                 document["incoming_document_id"] = incoming["incoming_document_id"]
                 document["incoming_action"] = incoming["incoming_action"]
                 document["incoming_local"] = True
