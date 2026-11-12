@@ -9151,7 +9151,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 source_rows.pop(index)
                 refresh()
 
-        initial_rows = fields.get("allocations") or fields.get("order_proposals") or [{"net_amount": fields.get("net_amount")}]
+        initial_rows = list(fields.get("allocations") or [])
+        if (fields.get("order_proposals")
+                and not SmartReportApp._expense_has_assignment({"allocations": initial_rows})):
+            # Сервер сводит строки без назначения в одну; предложения по заказам сохраняют
+            # детализацию и маркировки, пока ни одно назначение не выбрано.
+            initial_rows = list(fields["order_proposals"])
+        initial_rows = initial_rows or [{"net_amount": fields.get("net_amount")}]
         for row in initial_rows:
             append_row(row)
         table.itemChanged.connect(refresh)

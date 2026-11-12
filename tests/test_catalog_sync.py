@@ -1362,7 +1362,8 @@ class CatalogSyncTests(unittest.TestCase):
         """, (str(uuid.uuid4()),))
         desktop_conn.commit()
         desktop_conn.close()
-        parsed = {
+        document = {
+            "client_id": str(uuid.uuid4()),
             "supplier_name": "BEIJER BYGGMATERIAL AB",
             "invoice_number": "260414428128",
             "document_date": "2026-10-28",
@@ -1371,8 +1372,13 @@ class CatalogSyncTests(unittest.TestCase):
             "vat_amount": "25.00",
             "rounding_amount": "0.00",
             "amount_due": "125.00",
+            "gross_amount": "125.00",
             "document_type": "invoice",
-            "raw_text": "Fakturadatum: 2026-10-28",
+            "verification_status": "draft",
+            "recognized_text": "Fakturadatum: 2026-10-28",
+            # Сервер свёл строки без назначения в одну; детализация осталась в предложениях.
+            "allocations": [{"destination": "unselected", "object_id": None,
+                             "net_amount": "100.00", "vat_amount": None, "gross_amount": None}],
             "order_proposals": [
                 {"project_code": "P1035", "original_marker": "P1035", "order_id": "A-1",
                  "net_amount": "60.00", "ambiguous": False, "sources": []},
@@ -1391,6 +1397,8 @@ class CatalogSyncTests(unittest.TestCase):
 
             def fill_and_save(dialog):
                 table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+                # Детализация по заказам, а не единственная свёрнутая строка без назначения.
+                self.assertEqual(table.rowCount(), 2)
                 dialog.findChild(
                     self.desktop.QPushButton, "invoiceApplyObjectProposal").click()
                 self.assertEqual(table.cellWidget(0, 2).currentData(), "object")
@@ -1404,8 +1412,7 @@ class CatalogSyncTests(unittest.TestCase):
                  patch.object(self.desktop.QMessageBox, "information"), \
                  patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 window._expense_document_review_dialog(
-                    document=None, source_paths=[], parsed_fields=parsed,
-                    recognition_message="test",
+                    document=document, recognition_message="test",
                 )
             desktop_conn = self.desktop.get_db_connection()
             payload = json.loads(desktop_conn.execute(
