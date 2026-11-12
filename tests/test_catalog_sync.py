@@ -80,6 +80,11 @@ class CatalogSyncTests(unittest.TestCase):
         self.server.init_cloud_db()
         self.desktop.init_db_once()
         self.server_client = self.server.app.test_client()
+        hidden_prompt = patch.object(
+            self.desktop.SmartReportApp, "_confirm_show_hidden_expense_document", return_value=False,
+        )
+        hidden_prompt.start()
+        self.addCleanup(hidden_prompt.stop)
         self._add_company("Renatur")
 
     def tearDown(self):
@@ -3011,6 +3016,104 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_october_duplicate_under_november_filter_opens_same_card_by_id(self):
+        source = Path(self._case.name) / "october-invoice.pdf"
+        source.write_bytes(b"isolated october invoice original")
+        october = {"id": 21, "client_id": "october-doc", "document_date": "2026-10-29", "supplier_name": "Oct AB",
+                   "gross_amount": "100.00", "currency_code": "SEK", "allocations": [],
+                   "attachments": [{"sha256": self.desktop.sha256_file(source)}]}
+        november = {"id": 22, "client_id": "november-doc", "document_date": "2026-11-01", "supplier_name": "Nov AB",
+                    "gross_amount": "50.00", "currency_code": "SEK", "allocations": []}
+        registry = [november, october]
+
+        def snapshot(date_from=None, date_to=None, fresh=False):
+            return [dict(item) for item in registry
+                    if not date_from or date_from <= item["document_date"] <= date_to], True
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        table = None
+        try:
+            with patch.object(window, "_expense_server_objects", return_value=([], True)):
+                window.setup_expenses_tab()
+            table = window.table_supplier_documents
+            with patch.object(window, "_expense_document_snapshot", side_effect=snapshot), \
+                 patch.object(window, "_expense_document_review_dialog") as review, \
+                 patch.object(self.desktop.QMessageBox, "information") as opened_message, \
+                 patch.object(window, "_confirm_show_hidden_expense_document", return_value=False) as ask, \
+                 patch("expense_documents.extract_local_document") as extract:
+                window.exp_date_to.setText("2026-11-30")
+                window.exp_date_from.setText("2026-11-01")
+                window.load_expense_documents()
+                self.assertEqual(table.rowCount(), 1)
+                table.setCurrentCell(0, 1)
+                window._upload_expense_document_paths([str(source)])
+                ask.assert_called_once()
+                review.assert_not_called()
+                opened_message.assert_not_called()
+                self.assertEqual(window.exp_date_from.text(), "2026-11-01")
+                ask.return_value = True
+                window._upload_expense_document_paths([str(source)])
+                review.assert_called_once()
+                self.assertEqual(review.call_args.kwargs["document"]["client_id"], "october-doc")
+                self.assertEqual(review.call_args.kwargs["document"]["document_date"], "2026-10-29")
+                opened_message.assert_not_called()
+                self.assertEqual(window.exp_date_from.text(), "2026-10-29")
+                self.assertEqual(window.exp_date_to.text(), "2026-11-30")
+                for _refresh in range(3):
+                    window.load_expense_documents()
+                    self.assertEqual(table.rowCount(), 2)
+                    self.assertEqual(table.item(table.currentRow(), 0).data(self.desktop.Qt.ItemDataRole.UserRole)["client_id"],
+                                     "october-doc")
+                self.assertEqual(table.item(table.currentRow(), 1).text(), "2026-10-29")
+                window.exp_date_from.setText("2026-11-01")
+                window.load_expense_documents()
+                self.assertEqual(table.currentRow(), -1)
+                window.exp_date_from.setText("2026-10-01")
+                window.load_expense_documents()
+                self.assertEqual(table.item(table.currentRow(), 0).data(self.desktop.Qt.ItemDataRole.UserRole)["client_id"],
+                                 "october-doc")
+            extract.assert_not_called()
+            connection = self.desktop.get_db_connection()
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox").fetchone()[0], 0)
+            connection.close()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_queue_and_synced_documents_share_period_filter(self):
+        client_id = str(uuid.uuid4())
+        undated_id = str(uuid.uuid4())
+        for item_id, date_value in ((client_id, "2026-10-29"), (undated_id, "")):
+            self.desktop.SmartReportApp.queue_expense_document_operation(
+                SimpleNamespace(), item_id, "upsert",
+                {"client_id": item_id, "document_date": date_value, "supplier_name": "Queue AB", "allocations": []},
+            )
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.exp_api_status_lbl = self.desktop.QLabel()
+        try:
+            with patch.object(self.desktop, "request_expense_api", return_value={"documents": []}):
+                november, _ = window._expense_document_snapshot("2026-11-01", "2026-11-30")
+                october, _ = window._expense_document_snapshot("2026-10-01", "2026-11-30")
+                everything, _ = window._expense_document_snapshot(fresh=True)
+            self.assertEqual([doc["client_id"] for doc in november], [undated_id])
+            self.assertEqual({doc["client_id"] for doc in october}, {client_id, undated_id})
+            self.assertEqual({doc["client_id"] for doc in everything}, {client_id, undated_id})
+            connection = self.desktop.get_db_connection()
+            connection.execute("DELETE FROM expense_document_outbox")
+            connection.commit()
+            connection.close()
+            synced = {"id": 31, "client_id": client_id, "document_date": "2026-10-29", "allocations": []}
+            with patch.object(self.desktop, "request_expense_api", return_value={"documents": [synced]}):
+                after_sync, _ = window._expense_document_snapshot("2026-10-01", "2026-11-30")
+            self.assertEqual([doc["client_id"] for doc in after_sync], [client_id])
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_expense_form_queues_manual_company_document(self):
         class Response:
             def __init__(self, response):
@@ -3214,10 +3317,16 @@ class CatalogSyncTests(unittest.TestCase):
                  patch("expense_documents.extract_local_document", side_effect=extraction_results), \
                  patch.object(self.desktop.QDialog, "exec", new=correct_and_accept), \
                  patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(window, "_confirm_show_hidden_expense_document", return_value=False) as hidden_prompt, \
                  patch.object(self.desktop.QMessageBox, "information"), \
                  patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 window.upload_expense_document()
-
+            hidden_prompt.assert_called_once()
+            self.assertEqual(
+                window._selected_expense_identity,
+                json.loads(self.desktop.get_db_connection().execute(
+                    "SELECT payload_json FROM expense_document_outbox").fetchone()[0])["client_id"],
+            )
             desktop_conn = self.desktop.get_db_connection()
             outbox = desktop_conn.execute(
                 "SELECT payload_json, attachment_paths_json FROM expense_document_outbox"

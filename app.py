@@ -7347,7 +7347,110 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_filter_unallocated.toggled.connect(self.load_expense_documents)
         self.exp_filter_status.currentIndexChanged.connect(self.load_expense_documents)
         self.exp_search.textChanged.connect(self.load_expense_documents)
+        self.table_supplier_documents.currentCellChanged.connect(self._on_expense_row_changed)
 
+    def _on_expense_row_changed(self, row, *_):
+        if row < 0:
+            return
+        item = self.table_supplier_documents.item(row, 0)
+        document = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(document, dict):
+            self._selected_expense_identity = self._expense_document_identity(document)
+
+    def _expense_document_hidden_reasons(self, document):
+        """Причины, по которым текущие фильтры реестра скрывают документ."""
+        if not hasattr(self, "exp_date_from"):
+            return []
+        reasons = []
+        date_from = self.exp_date_from.text().strip()
+        date_to = self.exp_date_to.text().strip()
+        document_date = str(document.get("document_date") or "")
+        if QDate.fromString(document_date, "yyyy-MM-dd").isValid() and not date_from <= document_date <= date_to:
+            reasons.append(f"дата документа {document_date} вне периода {date_from} — {date_to}")
+        selected_filter = self.exp_filter_object.currentData()
+        allocations = document.get("allocations") or []
+        if (selected_filter == "unassigned" and allocations
+                or selected_filter == "company" and not any(
+                    item.get("object_id") is None and item.get("destination", "company") == "company"
+                    for item in allocations)
+                or isinstance(selected_filter, int) and not any(
+                    item.get("object_id") == selected_filter for item in allocations)):
+            reasons.append("выбран другой объект или назначение")
+        if ((self.exp_filter_unallocated.isChecked() or selected_filter == "unassigned")
+                and not self._expense_register_is_unallocated(document)):
+            reasons.append("включён фильтр «Только нераспределённые»")
+        status_filter = self.exp_filter_status.currentData()
+        status_key = self._expense_register_status_key(document)
+        if not (status_filter == "all" or status_filter == "active" and status_key != "ignored"
+                or status_key == status_filter):
+            reasons.append(f"фильтр состояния «{self.exp_filter_status.currentText()}»")
+        search_text = self.exp_search.text().strip().casefold()
+        if search_text and search_text not in " ".join(
+                str(document.get(key) or "") for key in ("supplier_name", "invoice_number")).casefold():
+            reasons.append("поиск по поставщику или номеру")
+        return reasons
+
+    def _reveal_expense_document(self, document):
+        """Расширяет фильтры до документа, не меняя его дату, и выбирает его по ID."""
+        self._selected_expense_identity = self._expense_document_identity(document)
+        widgets = (self.exp_date_from, self.exp_date_to, self.exp_filter_object,
+                   self.exp_filter_unallocated, self.exp_filter_status, self.exp_search)
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            document_date = QDate.fromString(str(document.get("document_date") or ""), "yyyy-MM-dd")
+            if document_date.isValid():
+                if document_date < self.exp_date_from.date():
+                    self.exp_date_from.setDate(document_date)
+                if document_date > self.exp_date_to.date():
+                    self.exp_date_to.setDate(document_date)
+            if self.exp_filter_object.currentData() is not None:
+                self.exp_filter_object.setCurrentIndex(0)
+            self.exp_filter_unallocated.setChecked(False)
+            self.exp_filter_status.setCurrentIndex(max(0, self.exp_filter_status.findData("all")))
+            self.exp_search.clear()
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+        self.exp_document_tabs.setCurrentIndex(0)
+        self._invalidate_expense_reads()
+        self.load_expense_documents()
+
+    def _confirm_show_hidden_expense_document(self, document, reasons, intro):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Документ скрыт фильтром")
+        box.setText(
+            f"{intro}\n\nТекущий фильтр скрывает документ: {'; '.join(reasons)}.\n"
+            "Дата документа не изменялась."
+        )
+        show_button = box.addButton("Показать документ", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Оставить фильтр", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is show_button
+
+    def _offer_hidden_expense_document(self, document, intro):
+        """Возвращает True, если документ уже виден; иначе предлагает его показать."""
+        reasons = self._expense_document_hidden_reasons(document)
+        if not reasons:
+            return True
+        if self._confirm_show_hidden_expense_document(document, reasons, intro):
+            self._reveal_expense_document(document)
+        return False
+
+    def _open_existing_expense_document(self, document):
+        self._selected_expense_identity = self._expense_document_identity(document)
+        intro = "Этот оригинал уже есть в реестре или очереди синхронизации; второй расход не создан."
+        reasons = self._expense_document_hidden_reasons(document)
+        if reasons:
+            if not self._confirm_show_hidden_expense_document(document, reasons, intro):
+                return
+            self._reveal_expense_document(document)
+        else:
+            QMessageBox.information(
+                self, "Документ уже загружен", intro + " Сейчас откроется карточка этого документа.",
+            )
+        self._expense_document_review_dialog(document=document)
     @staticmethod
     def _expense_document_identity(document):
         return (
@@ -8037,6 +8140,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     merged[positions[client_id]] = pending
             else:
                 merged.append(pending)
+        if date_from or date_to:
+            # Очередь фильтруется тем же правилом, что и сервер (недатированные видны),
+            # чтобы документ не исчезал после завершения синхронизации.
+            merged = [
+                doc for doc in merged
+                if not str(doc.get("document_date") or "")
+                or (not date_from or str(doc["document_date"]) >= date_from)
+                and (not date_to or str(doc["document_date"]) <= date_to)
+            ]
         if getattr(self, "_async_expense_reads", False):
             if self._expense_read_busy:
                 self.exp_api_status_lbl.setText(f"Показаны доступные данные; обновление в фоне. В очереди: {len(queued)}.")
@@ -8354,9 +8466,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if hasattr(self, "exp_metrics"):
             self._update_expense_summary_cards(base_filtered)
 
-        selected_identity = None
+        # Выбор хранится по постоянному ID и переживает перерисовку, даже если документ
+        # временно не попал в отфильтрованный список.
+        selected_identity = getattr(self, "_selected_expense_identity", None)
+        pinned_identity = selected_identity is not None
         current_row = self.table_supplier_documents.currentRow()
-        if current_row >= 0 and self.table_supplier_documents.item(current_row, 0):
+        if selected_identity is None and current_row >= 0 and self.table_supplier_documents.item(current_row, 0):
             old_doc = self.table_supplier_documents.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
             if isinstance(old_doc, dict):
                 selected_identity = (old_doc.get("incoming_document_id") or
@@ -8489,14 +8604,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     )
                 table.setItem(row_index, column, item)
             table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
-            identity = (document.get("incoming_document_id") or
-                        document.get("client_id") or document.get("id"))
-            if identity == selected_identity:
+            if selected_identity is not None and selected_identity in (
+                    document.get("incoming_document_id"), document.get("client_id"), document.get("id")):
                 restored_row = row_index
         desktop_theme.refresh_table_item_colors(table)
         if restored_row >= 0:
             table.setCurrentCell(restored_row, 1)
-        elif filtered:
+            table.scrollToItem(table.item(restored_row, 1))
+        elif filtered and not pinned_identity:
             table.setCurrentCell(0, 1)
         table.verticalScrollBar().setValue(vertical_scroll)
         table.horizontalScrollBar().setValue(horizontal_scroll)
@@ -8994,8 +9109,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 QMessageBox.warning(dialog, "Не сохранено", str(error))
                 return
             dialog.accept()
+            self._selected_expense_identity = client_id
             self.load_expense_documents()
             self.background_sync_with_cloud()
+            self._offer_hidden_expense_document(payload, "Документ сохранён и поставлен в очередь синхронизации.")
 
         draft.clicked.connect(lambda: save("draft"))
         confirm.clicked.connect(lambda: save("confirmed"))
@@ -9397,9 +9514,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 Path(path).unlink(missing_ok=True)
             QMessageBox.warning(self, "Расход", f"Документ не поставлен в очередь: {error}")
             return False
+        self._selected_expense_identity = client_id
         self.load_expense_documents()
         self.background_sync_with_cloud()
-        QMessageBox.information(self, "Расход", "Документ сохранён и поставлен в очередь синхронизации.")
+        if self._offer_hidden_expense_document(
+            payload, "Документ сохранён и поставлен в очередь синхронизации.",
+        ):
+            QMessageBox.information(self, "Расход", "Документ сохранён и поставлен в очередь синхронизации.")
         return True
 
     def open_manual_document_dialog(self, *_):
@@ -9443,12 +9564,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     if Path(local_path).is_file():
                         known_hashes.add(sha256_file(local_path))
                 if known_hashes.intersection(incoming_hashes):
-                    QMessageBox.information(
-                        self, "Документ уже загружен",
-                        "Этот оригинал уже есть в реестре или очереди синхронизации. "
-                        "Открыта существующая карточка; второй расход не создан.",
-                    )
-                    self._expense_document_review_dialog(document=document)
+                    self._open_existing_expense_document(document)
                     return
         except OSError as error:
             QMessageBox.warning(self, "Оригинал недоступен", str(error))
