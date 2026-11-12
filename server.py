@@ -750,6 +750,7 @@ def init_cloud_db():
         ("due_date_review_required", "INTEGER NOT NULL DEFAULT 0"),
         ("due_date_reviewed", "INTEGER NOT NULL DEFAULT 0"),
         ("due_date_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("document_type", "TEXT"),
     ):
         if column_name not in expense_document_columns:
             cursor.execute(f"ALTER TABLE expense_documents ADD COLUMN {column_name} {column_sql}")
@@ -1117,6 +1118,9 @@ def expense_due_date_schema_ready(connection):
 
 def validate_expense_fields(payload):
     document_type = payload.get("document_type") or "invoice"
+    if not isinstance(document_type, str) or len(document_type) > 60:
+        raise ValueError("Некорректный тип документа.")
+    document_type = document_type.strip() or "invoice"
     object_cost = payload.get("usage") == "object_cost"
     # A saved or user-supplied invoice label cannot override current reminder classification.
     from mail_import import classify_mail_document
@@ -1218,6 +1222,7 @@ def validate_expense_fields(payload):
 
     return {
         "document_type": document_type,
+        "document_type_provided": bool(payload.get("document_type")),
         "usage": "object_cost" if object_cost else None,
         "supplier_name": supplier_name,
         "invoice_number": invoice_number,
@@ -1477,10 +1482,19 @@ def save_expense_project_code_links(cursor, supplier_name, proposals, now):
         ))
 
 
+def expense_document_type_schema_ready(cursor_or_connection):
+    return "document_type" in {
+        row[1] for row in cursor_or_connection.execute("PRAGMA table_info(expense_documents)")
+    }
+
+
 def store_expense_allocation_rows(cursor, document_id, allocations, fields):
     if fields.get("payment_reference_provided"):
         cursor.execute("UPDATE expense_documents SET payment_reference=? WHERE id=?",
                        (fields["payment_reference"], document_id))
+    if fields.get("document_type_provided") and expense_document_type_schema_ready(cursor):
+        cursor.execute("UPDATE expense_documents SET document_type=? WHERE id=?",
+                       (fields["document_type"], document_id))
     if fields.get("due_date_provided"):
         cursor.execute("""UPDATE expense_documents SET due_date=?, due_date_kind=?, due_date_review_required=?,
                           due_date_reviewed=?, due_date_evidence_json=? WHERE id=?""",
@@ -1580,6 +1594,7 @@ def serialize_expense_document(cursor, document, include_text=False):
         "gross_amount": decimal_text(document["gross_amount"]),
         "expense_category": document["expense_category"],
         "document_comment": document["document_comment"],
+        "document_type": (document["document_type"] if "document_type" in document.keys() else None),
         "order_proposals": json.loads(document["order_proposals_json"] or "[]"),
         **invoice_context(document["recognized_text"] or ""),
         "verification_status": document["verification_status"],
@@ -1702,6 +1717,8 @@ def expense_document_capabilities_api():
             net_features.append("payment_reference_v1")
         net_features.append("object_costs_v1")
         net_features.append("object_cost_allocations_v1")
+        if expense_document_type_schema_ready(connection):
+            net_features.append("document_type_v1")
     finally:
         connection.close()
     return jsonify({

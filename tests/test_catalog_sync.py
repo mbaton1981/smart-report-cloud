@@ -1211,18 +1211,217 @@ class CatalogSyncTests(unittest.TestCase):
 
             second_client = str(uuid.uuid4())
             path.write_bytes(original_bytes)
-            queue(harness, second_client, "upsert", {**fields, "client_id": second_client}, attachment_paths=[path])
-            self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
-            self.assertEqual([row["state"] for row in outbox_rows()], ["pending"])
-            self.assertEqual(outbox_rows()[0]["client_id"], first_client, outbox_rows())
-            self.assertEqual(self.desktop.SmartReportApp._sync_expense_document_outbox(harness)["synced"], 1)
+            queue(harness, second_client, "upsert",
+                  {**fields, "client_id": second_client, "document_comment": "re-imported draft"},
+                  attachment_paths=[path])
+            harness._selected_expense_identity = second_client
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            # Восстановление выполняется в том же проходе: карточка доступна сразу после сохранения.
+            self.assertEqual(result["synced"], 1, result)
+            self.assertEqual(result["conflicts"], 0)
+            self.assertEqual(harness._selected_expense_identity, first_client)
 
         self.assertEqual(outbox_rows(), [])
         server_conn = self.server.get_db_connection()
         rows = server_conn.execute(
             "SELECT id, client_id, is_deleted, verification_status FROM expense_documents").fetchall()
+        comment_type = server_conn.execute(
+            "SELECT document_comment, document_type FROM expense_documents WHERE client_id = ?",
+            (first_client,)).fetchone()
+        attachments = server_conn.execute(
+            "SELECT COUNT(*) FROM expense_document_attachments WHERE document_id = ?",
+            (identifier,)).fetchone()[0]
         server_conn.close()
         self.assertEqual([tuple(row) for row in rows], [(identifier, first_client, 0, "draft")])
+        self.assertEqual(tuple(comment_type), ("re-imported draft", "invoice"))
+        self.assertEqual(attachments, 1)
+
+    def test_deleted_document_requisites_do_not_block_new_upload_with_other_original(self):
+        payload = {
+            "client_id": str(uuid.uuid4()),
+            "supplier_name": "Requisite supplier",
+            "invoice_number": "77001",
+            "document_date": "2026-10-20",
+            "currency_code": "SEK",
+            "gross_amount": "100.00",
+            "vat_amount": "20.00",
+            "verification_status": "draft",
+            "allocations": [],
+        }
+        created = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            data={"payload": json.dumps(payload),
+                  "originals": [(BytesIO(b"first original"), "first.pdf")]},
+        )
+        self.assertEqual(created.status_code, 201)
+        active_duplicate = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            json={**payload, "client_id": str(uuid.uuid4())},
+        )
+        self.assertEqual(active_duplicate.status_code, 409)
+        self.assertIn("уже есть в архиве", active_duplicate.get_json()["error"])
+
+        self.assertEqual(self.server_client.delete(
+            f"/api/expense-documents/by-client/{payload['client_id']}",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).status_code, 200)
+
+        same_original = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            data={"payload": json.dumps({**payload, "client_id": str(uuid.uuid4())}),
+                  "originals": [(BytesIO(b"first original"), "first.pdf")]},
+        )
+        self.assertEqual(same_original.status_code, 409)
+        self.assertEqual(same_original.get_json().get("code"), "deleted_original")
+
+        other_original = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            data={"payload": json.dumps({**payload, "client_id": str(uuid.uuid4())}),
+                  "originals": [(BytesIO(b"second original"), "second.pdf")]},
+        )
+        self.assertEqual(other_original.status_code, 201, other_original.get_json())
+
+    def test_conflicting_queue_entry_merges_with_matching_server_document(self):
+        from PyQt6.QtWidgets import QLabel
+
+        server_document = {
+            "id": 38, "client_id": "server-client", "sync_version": 3,
+            "supplier_name": "BEIJER BYGGMATERIAL AB", "invoice_number": "260414428128",
+            "document_date": "2026-10-28", "currency_code": "SEK",
+            "gross_amount": "139629.77", "vat_amount": "27926.00", "net_amount": "111703.77",
+            "verification_status": "draft", "allocations": [], "attachments": [],
+        }
+        local_client = str(uuid.uuid4())
+        harness = SimpleNamespace()
+        self.desktop.SmartReportApp.queue_expense_document_operation(
+            harness, local_client, "upsert", {
+                "supplier_name": "Beijer Byggmaterial AB",
+                "invoice_number": "260414428128",
+                "document_date": "2026-10-28",
+                "currency_code": "SEK",
+                "gross_amount": "139629.77",
+                "vat_amount": "27926.00",
+                "verification_status": "draft",
+                "allocations": [],
+            },
+        )
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute(
+            "UPDATE expense_document_outbox SET state='conflict', last_error=? WHERE client_id=?",
+            ("Документ изменился на сервере.", local_client),
+        )
+        desktop_conn.commit()
+        desktop_conn.close()
+
+        def fake_request(method, url, **kwargs):
+            return SimpleNamespace(
+                status_code=200, ok=True, headers={},
+                json=lambda: {"ok": True, "documents": [dict(server_document)]},
+            )
+
+        host = SimpleNamespace(exp_api_status_lbl=QLabel(), _expense_objects=[])
+        with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+            documents, online = self.desktop.SmartReportApp._expense_document_snapshot(host)
+        self.assertTrue(online)
+        self.assertEqual(len(documents), 1)
+        merged = documents[0]
+        self.assertEqual(merged["id"], 38)
+        self.assertEqual(merged["sync_state"], "conflict")
+        self.assertEqual(merged["local_conflict_payload"]["client_id"], local_client)
+
+    def test_net_invoice_dialog_fills_unambiguous_objects_and_keeps_type_in_draft(self):
+        class Response:
+            def __init__(self, response):
+                self.response = response
+                self.status_code = response.status_code
+                self.ok = response.status_code < 400
+
+            def json(self):
+                return self.response.get_json()
+
+        def fake_request(method, url, **kwargs):
+            response = self.server_client.open(
+                urlsplit(url).path, method=method,
+                headers=kwargs.get("headers", {}), query_string=kwargs.get("params"),
+                json=kwargs.get("json"), data=kwargs.get("data"),
+            )
+            return Response(response)
+
+        desktop_conn = self.desktop.get_db_connection()
+        desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,is_active)
+            VALUES ('Renatur','Proposal object','p1035',0,0,?,8101,1)
+        """, (str(uuid.uuid4()),))
+        desktop_conn.execute("""
+            INSERT INTO objects (company,name,markning,rate,transport_rate,sync_id,server_id,is_active)
+            VALUES ('Renatur','Proposal object archived twin','p1035',0,0,?,8102,0)
+        """, (str(uuid.uuid4()),))
+        desktop_conn.commit()
+        desktop_conn.close()
+        parsed = {
+            "supplier_name": "BEIJER BYGGMATERIAL AB",
+            "invoice_number": "260414428128",
+            "document_date": "2026-10-28",
+            "currency_code": "SEK",
+            "net_amount": "100.00",
+            "vat_amount": "25.00",
+            "rounding_amount": "0.00",
+            "amount_due": "125.00",
+            "document_type": "invoice",
+            "raw_text": "Fakturadatum: 2026-10-28",
+            "order_proposals": [
+                {"project_code": "P1035", "original_marker": "P1035", "order_id": "A-1",
+                 "net_amount": "60.00", "ambiguous": False, "sources": []},
+                {"project_code": "P9999", "original_marker": "P9999", "order_id": "A-2",
+                 "net_amount": "40.00", "ambiguous": False, "sources": []},
+            ],
+        }
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+
+            def fill_and_save(dialog):
+                table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+                dialog.findChild(
+                    self.desktop.QPushButton, "invoiceApplyObjectProposal").click()
+                self.assertEqual(table.cellWidget(0, 2).currentData(), "object")
+                self.assertEqual(table.cellWidget(0, 3).currentData(), 8101)
+                self.assertEqual(table.cellWidget(1, 2).currentData(), "unselected")
+                dialog.findChild(self.desktop.QPushButton, "invoiceSaveDraft").click()
+                return dialog.result()
+
+            with patch.object(self.desktop.QDialog, "exec", new=fill_and_save), \
+                 patch.object(window, "background_sync_with_cloud"), \
+                 patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(self.desktop.requests, "request", side_effect=fake_request):
+                window._expense_document_review_dialog(
+                    document=None, source_paths=[], parsed_fields=parsed,
+                    recognition_message="test",
+                )
+            desktop_conn = self.desktop.get_db_connection()
+            payload = json.loads(desktop_conn.execute(
+                "SELECT payload_json FROM expense_document_outbox").fetchone()[0])
+            desktop_conn.close()
+            self.assertEqual(payload["document_type"], "invoice")
+            self.assertEqual(payload["verification_status"], "draft")
+            self.assertEqual(payload["allocations"][0]["destination"], "object")
+            self.assertEqual(payload["allocations"][0]["object_id"], 8101)
+            self.assertEqual(payload["allocations"][1]["destination"], "unselected")
+            self.assertIsNone(payload["allocations"][1]["object_id"])
+            self.assertTrue(
+                self.desktop.SmartReportApp._expense_has_assignment(payload))
+        finally:
+            window.close()
+            window.deleteLater()
 
     def test_expense_outbox_offline_lost_ack_attachment_and_delete(self):
         from reportlab.pdfgen import canvas

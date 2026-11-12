@@ -2560,7 +2560,7 @@ def requeue_expense_document_restore(queued, payload, result):
         if conn.execute("SELECT 1 FROM expense_document_outbox WHERE client_id = ?",
                         (original_client_id,)).fetchone():
             conn.rollback()
-            return False
+            return None
         changed = conn.execute("""
             UPDATE expense_document_outbox
             SET client_id = ?, server_document_id = ?, server_version = ?, revision = revision + 1,
@@ -2572,7 +2572,18 @@ def requeue_expense_document_restore(queued, payload, result):
             datetime.now(timezone.utc).isoformat(), old_client_id, int(queued["revision"]),
         )).rowcount
         conn.commit()
-        return bool(changed)
+        if not changed:
+            return None
+        # Повтор в том же проходе: карточка восстанавливается сразу после сохранения черновика.
+        return {
+            "client_id": original_client_id,
+            "operation": "upsert",
+            "server_document_id": int(result["existing_document_id"]),
+            "server_version": int(result["current_version"]),
+            "revision": int(queued["revision"]) + 1,
+            "payload_json": json.dumps(restore_payload, ensure_ascii=False),
+            "attachment_paths_json": queued["attachment_paths_json"],
+        }
     except Exception:
         conn.rollback()
         raise
@@ -3417,7 +3428,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             and payload.get("verification_status") != "confirmed"
                             and result.get("existing_client_id") and type(result.get("existing_document_id")) is int
                             and type(result.get("current_version")) is int):
-                        if requeue_expense_document_restore(queued, payload, result):
+                        restored_row = requeue_expense_document_restore(queued, payload, result)
+                        if restored_row is not None:
+                            if getattr(self, "_selected_expense_identity", None) == queued["client_id"]:
+                                self._selected_expense_identity = restored_row["client_id"]
+                            rows.append(restored_row)
                             continue
                     error = str(result.get("error") or f"Сервер вернул HTTP {status_code}.")
                     conflict = status_code in (400, 404, 409, 410, 422)
@@ -8979,10 +8994,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         issues_label.setObjectName("invoiceIssues")
         issues_label.setWordWrap(True)
         row_actions = QHBoxLayout()
+        apply_proposal_button = QPushButton("Заполнить форму предложением")
+        apply_proposal_button.setObjectName("invoiceApplyObjectProposal")
+        apply_proposal_button.setToolTip(
+            "Подставить объекты в строки без назначения по однозначным маркировкам PDF. "
+            "Неоднозначные и неизвестные маркировки остаются для ручного выбора; ничего не сохраняется."
+        )
         add_row_button = QPushButton("Добавить строку")
         add_row_button.setObjectName("invoiceAddAllocation")
         remove_row_button = QPushButton("Удалить строку")
         remove_row_button.setObjectName("invoiceRemoveAllocation")
+        row_actions.addWidget(apply_proposal_button)
         row_actions.addWidget(add_row_button)
         row_actions.addWidget(remove_row_button)
         row_actions.addWidget(distribution, 1)
@@ -9138,6 +9160,42 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         ambiguity_reviewed.toggled.connect(refresh)
         tax_reviewed.toggled.connect(refresh)
         due_reviewed.toggled.connect(refresh)
+        def apply_object_proposal():
+            filled = left_manual = 0
+            for index, original in enumerate(source_rows):
+                destination_combo = table.cellWidget(index, 2)
+                object_combo = table.cellWidget(index, 3)
+                if destination_combo is None or object_combo is None:
+                    continue
+                if destination_combo.currentData() != "unselected":
+                    continue
+                code = str(
+                    original.get("project_code") or original.get("original_marker")
+                    or (table.item(index, 0).text().strip() if table.item(index, 0) else "")
+                )
+                candidates = [
+                    item for item in objects
+                    if not is_service_category(item) and item.get("is_active")
+                    and object_marking_matches(code, item.get("markning"))
+                ]
+                if len(candidates) != 1:
+                    left_manual += 1
+                    continue
+                selected_index = object_combo.findData(int(candidates[0]["id"]))
+                if selected_index < 0:
+                    left_manual += 1
+                    continue
+                destination_combo.setCurrentIndex(max(0, destination_combo.findData("object")))
+                object_combo.setCurrentIndex(selected_index)
+                filled += 1
+            refresh()
+            QMessageBox.information(
+                dialog, "Предложение по маркировкам",
+                f"Объекты подставлены: {filled}. Оставлено для ручного выбора: {left_manual}. "
+                "Проверьте строки; ничего не сохранено и не подтверждено.",
+            )
+
+        apply_proposal_button.clicked.connect(apply_object_proposal)
         add_row_button.clicked.connect(lambda: append_row())
         remove_row_button.clicked.connect(remove_row)
 
