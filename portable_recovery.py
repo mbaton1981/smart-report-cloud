@@ -135,6 +135,39 @@ def table_hashes(conn):
     }
 
 
+def verify_object_documents(directory):
+    root = Path(directory) / "profile" / "object_documents"
+    database = root / "object_records.sqlite3"
+    if not database.is_file():
+        return {"present": False, "integrity": True, "files": 0, "records": 0}
+    try:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            if not integrity:
+                raise RecoveryError("Local object-document database integrity check failed.")
+            if conn.execute("PRAGMA application_id").fetchone()[0] != 0x534D4F42:
+                raise RecoveryError("Local object-document database identity mismatch.")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != 1:
+                raise RecoveryError("Unsupported local object-document database version.")
+            file_rows = conn.execute("SELECT relative_path,sha256 FROM files").fetchall()
+            records = (
+                conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+                + conn.execute("SELECT COUNT(*) FROM agreements").fetchone()[0]
+            )
+        for relative_path, expected_hash in file_rows:
+            relative = safe_name(relative_path)
+            path = root.joinpath(*relative.parts).resolve(strict=True)
+            try:
+                path.relative_to(root.resolve(strict=True))
+            except ValueError as error:
+                raise RecoveryError("Local object attachment path escapes its storage.") from error
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+                raise RecoveryError("Local object attachment is missing or has a hash mismatch.")
+        return {"present": True, "integrity": True, "files": len(file_rows), "records": records}
+    except (OSError, sqlite3.Error, KeyError) as error:
+        raise RecoveryError("Local object-document restore verification failed.") from error
+
+
 def verify_server(directory):
     """Boot the bundled compatible server against the restored copy, never production."""
     directory = Path(directory).resolve()
@@ -234,6 +267,7 @@ def main():
                     result = verify_server(destination)
                 finally:
                     os.chdir(original_cwd)
+                result["object_documents"] = verify_object_documents(destination)
                 print(json.dumps(result))
         else:
             if not args.destination:

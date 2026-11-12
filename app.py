@@ -11864,10 +11864,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_detail_meta.setWordWrap(True)
         detail_layout.addWidget(self.object_detail_title)
         detail_layout.addWidget(self.object_detail_meta)
+        self.object_section_tabs = QTabWidget()
+        self.object_section_tabs.setUsesScrollButtons(True)
+        self.object_section_tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        overview_page = QWidget()
+        overview_layout = QVBoxLayout(overview_page)
+        overview_layout.setContentsMargins(0, 0, 0, 0)
         customer_terms_button = QPushButton("Прежние клиентские условия…")
         customer_terms_button.setObjectName("customerTermsButton")
         customer_terms_button.clicked.connect(self.customer_terms_dialog)
-        detail_layout.addWidget(customer_terms_button)
+        overview_layout.addWidget(customer_terms_button)
 
         period_row = QHBoxLayout()
         self.object_all_period = QCheckBox("За весь объект")
@@ -11882,12 +11888,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         period_row.addWidget(self.object_date_from)
         period_row.addWidget(QLabel("по"))
         period_row.addWidget(self.object_date_to)
-        detail_layout.addLayout(period_row)
-        desktop_theme.adapt_box_layout(detail, period_row, compact_width=620)
+        overview_layout.addLayout(period_row)
 
         self.object_overview_status = QLabel("Выберите объект для загрузки сводки.")
         self.object_overview_status.setWordWrap(True)
-        detail_layout.addWidget(self.object_overview_status)
+        overview_layout.addWidget(self.object_overview_status)
         metrics = QGridLayout()
         self.object_hours_value = QLabel("—")
         self.object_employees_value = QLabel("—")
@@ -11903,15 +11908,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         ):
             caption = QLabel(label)
             caption.setWordWrap(True)
-            value.setStyleSheet("font-size: 16px; font-weight: 600")
+            value.setStyleSheet("font-size: 16px; font-weight: 700")
             metrics.addWidget(caption, row * 2, column)
             metrics.addWidget(value, row * 2 + 1, column)
-        detail_layout.addLayout(metrics)
+        overview_layout.addLayout(metrics)
         self.object_expense_status = QLabel(
             "Расходы учитываются только по подтверждённым долям распределения."
         )
         self.object_expense_status.setWordWrap(True)
-        detail_layout.addWidget(self.object_expense_status)
+        overview_layout.addWidget(self.object_expense_status)
 
         actions = QHBoxLayout()
         self.object_shifts_button = QPushButton("Смены")
@@ -11923,8 +11928,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         actions.addWidget(self.object_shifts_button)
         actions.addWidget(self.object_expenses_button)
         actions.addWidget(self.object_report_button)
-        detail_layout.addLayout(actions)
-        detail_layout.addStretch(1)
+        overview_layout.addLayout(actions)
+        overview_layout.addStretch(1)
+        self.object_section_tabs.addTab(overview_page, "Обзор")
+        from object_card_ui import ObjectAgreementsPage, ObjectDocumentsPage
+        from object_records import ObjectRecordStore
+
+        self.object_record_store = ObjectRecordStore(
+            desktop_auth.app_data_dir() / "object_documents"
+        )
+        self.object_documents_page = ObjectDocumentsPage(self.object_record_store)
+        self.object_agreements_page = ObjectAgreementsPage(self.object_record_store)
+        self.object_section_tabs.addTab(self.object_documents_page, "Документы")
+        self.object_section_tabs.addTab(self.object_agreements_page, "Договорённости")
+        detail_layout.addWidget(self.object_section_tabs, 1)
         splitter.addWidget(detail)
         splitter.setChildrenCollapsible(False)
         splitter.setSizes([650, 540])
@@ -13204,6 +13221,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self._object_overview_request_id = getattr(self, "_object_overview_request_id", 0) + 1
             self.object_detail_title.setText("Выберите объект")
             self.object_detail_meta.setText("Название и маркировка объекта появятся здесь.")
+            self.object_documents_page.set_object(None, "", "")
+            self.object_agreements_page.set_object(None, "", "")
             self.object_overview_status.setText("Выберите объект для загрузки сводки.")
             for value in (
                 self.object_hours_value, self.object_employees_value,
@@ -13239,6 +13258,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "Исторические записи не переоцениваются по этим ставкам. "
             "Отдельного поля адреса в справочнике нет."
         )
+        object_key = (
+            f"sync:{sync_id}" if sync_id else
+            f"local:{hashlib.sha256(str(Path(DB_FILE).resolve()).casefold().encode('utf-8')).hexdigest()[:16]}:{object_id}"
+        )
+        object_label = self.table_objects.item(selected_row, 1).text()
+        self.object_documents_page.set_object(object_key, object_label, company)
+        self.object_agreements_page.set_object(object_key, object_label, company)
         self.object_shifts_button.setEnabled(True)
         self.object_expenses_button.setEnabled(server_id is not None)
         self.object_expenses_button.setToolTip(

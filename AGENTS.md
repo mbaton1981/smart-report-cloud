@@ -3,8 +3,8 @@
 - Отвечай пользователю по-русски, если он явно не попросил другой язык.
 - Этот клон (`smart-report-cloud-ob-worktree`, ветка `main`) — **основной checkout** для правок,
   тестов и выпусков. `app.py` — настольное приложение PyQt6; `server.py` — Flask API.
-- Закреплённые пути: установка `%LOCALAPPDATA%\Programs\SmartReport-<версия>` (текущая 1.0.68,
-  откаты 1.0.66/1.0.67); профиль рабочих данных `C:\Users\mbato\AppData\Local\SmartReport-1.0.9`;
+- Закреплённые пути: установка `%LOCALAPPDATA%\Programs\SmartReport-<версия>` (текущая 1.0.69,
+  откаты 1.0.67/1.0.68); профиль рабочих данных `C:\Users\mbato\AppData\Local\SmartReport-1.0.9`;
   запуск — существующие ярлыки «SmartReport» (рабочий стол и «Пуск») через
   `launch_existing_profile.ps1`; выпуск — `packaging\build_installer.ps1` из чистого дерева,
   артефакты в OneDrive `..\installer\`. Render: Auto-Deploy отключён, деплой вручную и только

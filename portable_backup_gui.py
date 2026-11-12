@@ -40,6 +40,7 @@ class BackupWorker(QThread):
             os.environ["SMARTREPORT_DB_FILE"] = str(args.profile / "smart_report.db")
             import desktop_auth
             import server_backup
+            from object_records import export_backup_files
             from sync_dataset import file_dataset
             from cryptography.fernet import Fernet
 
@@ -109,6 +110,9 @@ class BackupWorker(QThread):
                         for path in snapshot.rglob("*")
                         if path.is_file() and not path.name.endswith(("-wal", "-shm"))
                     })
+                    files.update(export_backup_files(
+                        desktop_auth.app_data_dir() / "object_documents"
+                    ))
                     stage = "Шифрование и проверка записанной версии"
                     self.progress.emit(stage)
                     bundle = recovery.publish(args.destination, files, self.password)
@@ -128,7 +132,8 @@ class BackupWorker(QThread):
                     if check.returncode:
                         raise recovery.RecoveryError("Independent verifier failed.")
                     result = json.loads(check.stdout.decode("utf-8"))
-                    if result["dpapi_used"] or not result["all_business_table_hashes_unchanged"]:
+                    if (result["dpapi_used"] or not result["all_business_table_hashes_unchanged"]
+                            or not result["object_documents"]["integrity"]):
                         raise recovery.RecoveryError("Independent verification did not pass.")
                 created.append({
                     "file": bundle.name, "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
@@ -187,8 +192,9 @@ def main():
     dialog.setMinimumWidth(620)
     layout = QVBoxLayout(dialog)
     description = QLabel(
-        "Создать две новые зашифрованные версии базы, ключа и конфигурации.\n"
-        "Рабочие данные не изменяются. Старые копии не удаляются.\n\n"
+        "Создать две новые зашифрованные версии серверной базы и локальных документов объектов.\n"
+        "Рабочие данные не изменяются. Пароль ящика info в копию не включается.\n"
+        "Старые копии не удаляются.\n\n"
         "1. Создайте и сохраните уникальный длинный пароль в менеджере паролей.\n"
         "2. Убедитесь, что менеджер доступен без этого компьютера и Windows.\n"
         "3. Введите пароль ниже (не в переписку). Минимум 16 символов.\n\n"
@@ -232,7 +238,7 @@ def main():
             status.setText("Проверено: две версии. Осталось подтвердить загрузку OneDrive.")
             QMessageBox.information(
                 dialog, "Копии созданы и проверены",
-                "Обе версии расшифрованы и база с карточками открыта в чистой среде без DPAPI.\n\n"
+            "Обе версии расшифрованы; база и локальные документы объектов проверены в чистой среде.\n\n"
                 "ВАЖНО: проверьте загрузку через сайт OneDrive с другого устройства. "
                 "Локальная папка не подтверждает загрузку в облако.\n"
                 "Пароль храните только в своём менеджере паролей.",

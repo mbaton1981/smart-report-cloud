@@ -76,6 +76,12 @@ class CatalogSyncTests(unittest.TestCase):
             cleanup_new_top_level_widgets, self.qt_app, self._qt_widgets_before)
         self._case = tempfile.TemporaryDirectory(prefix="smartreport-catalog-test-")
         root = Path(self._case.name)
+        previous_data_dir = os.environ.get("SMARTREPORT_DATA_DIR")
+        os.environ["SMARTREPORT_DATA_DIR"] = str(root / "profile")
+        self.addCleanup(
+            lambda value=previous_data_dir: os.environ.pop("SMARTREPORT_DATA_DIR", None)
+            if value is None else os.environ.__setitem__("SMARTREPORT_DATA_DIR", value)
+        )
         self.server.DB_FILE = str(root / "server.db")
         self.desktop.DB_FILE = str(root / "desktop.db")
         self.server.init_cloud_db()
@@ -123,6 +129,200 @@ class CatalogSyncTests(unittest.TestCase):
         window._expense_online = True
         window.tab_sprav = self.desktop.QWidget()
         window.setup_sprav_tab()
+
+    def test_object_card_sections_reload_files_mail_and_agreements_for_selected_object(self):
+        import object_card_ui
+        from object_card_ui import ObjectAgreementsPage, ObjectDocumentsPage
+        from info_mail import MailAttachment, MailContent, MailMessage, MailboxSettings
+
+        self.assertEqual(
+            object_card_ui._format_stockholm_datetime("2026-11-12T10:00:00+00:00"),
+            "12.11.2026 11:00",
+        )
+        self.assertEqual(
+            object_card_ui._format_stockholm_datetime("2026-07-12T10:00:00+00:00"),
+            "12.07.2026 12:00",
+        )
+        sync_id = str(uuid.uuid4())
+        object_key = f"sync:{sync_id}"
+        source = Path(self._case.name) / "object-contract.pdf"
+        source.write_bytes(b"%PDF-1.4 object card test")
+        connection = self.desktop.get_db_connection()
+        connection.execute(
+            """INSERT INTO objects (company,name,markning,rate,transport_rate,is_active,sync_id,server_id)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            ("Renatur", "Object card test", "p9999", 500, 35, 1, sync_id, 21999),
+        )
+        connection.commit()
+        connection.close()
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._setup_catalog_window(window)
+        self.assertEqual(
+            [window.object_section_tabs.tabText(index) for index in range(3)],
+            ["Обзор", "Документы", "Договорённости"],
+        )
+        window.object_documents_page.set_object(object_key, "Object card test", "Renatur")
+        window.object_agreements_page.set_object(object_key, "Object card test", "Renatur")
+        with patch.object(
+            self.desktop.QFileDialog, "getOpenFileNames", return_value=([str(source)], ""),
+        ), patch("object_card_ui.AddDocumentDialog") as add_document:
+            add_document.return_value.exec.return_value = self.desktop.QDialog.DialogCode.Accepted
+            add_document.return_value.category.currentText.return_value = "Договор"
+            window.object_documents_page._add_files()
+
+        with patch("object_card_ui.AddAgreementDialog") as add_agreement:
+            add_agreement.return_value.exec.return_value = self.desktop.QDialog.DialogCode.Accepted
+            add_agreement.return_value.agreement_date.date.return_value.toString.return_value = "2026-11-12"
+            add_agreement.return_value.text.toPlainText.return_value = "One shelf approved."
+            add_agreement.return_value.agreed.isChecked.return_value = True
+            add_agreement.return_value.attachment_path.text.return_value = str(source)
+            window.object_agreements_page._add()
+
+        settings = MailboxSettings(
+            "info@example.test", "imap.example.test", 993, "SSL/TLS", "INBOX", "Sent",
+        )
+        message = MailMessage(
+            "5", "1", "INBOX", "client@example.test", "Extra work",
+            "2026-11-12T10:00:00+00:00", "<object-card-email>", 100,
+        )
+        content = MailContent(
+            "object-card-email", "client@example.test", "Extra work",
+            "2026-11-12T10:00:00+00:00", "Please add one shelf.",
+            (MailAttachment(1, "request.pdf", "application/pdf", b"%PDF-1.4 mail"),),
+        )
+        with patch.object(object_card_ui.info_mail, "load_settings", return_value=(settings, "test-password")), \
+                patch.object(object_card_ui.info_mail, "list_messages", return_value=[message]), \
+                patch.object(object_card_ui.info_mail, "fetch_message", return_value=content), \
+                patch.object(self.desktop.QMessageBox, "information"):
+            connection_dialog = object_card_ui.InfoMailConnectionDialog(window)
+            self.assertGreaterEqual(connection_dialog.width(), 720)
+            self.assertGreaterEqual(connection_dialog.email.minimumWidth(), 360)
+            self.assertGreaterEqual(connection_dialog.host.minimumWidth(), 360)
+            self.assertEqual(
+                connection_dialog.findChild(object_card_ui.QDialogButtonBox)
+                .button(object_card_ui.QDialogButtonBox.StandardButton.Cancel).text(),
+                "Отмена",
+            )
+            connection_dialog.close()
+            picker = object_card_ui.InfoMailPickerDialog(
+                window.object_record_store, object_key, "Object card test", "Renatur", window,
+            )
+            self.assertEqual(
+                picker.findChild(object_card_ui.QDialogButtonBox)
+                .button(object_card_ui.QDialogButtonBox.StandardButton.Cancel).text(),
+                "Отмена",
+            )
+            picker._load_messages()
+            self.assertEqual(picker.message_table.item(0, 0).text(), "12.11.2026 11:00")
+            picker.confirm_binding.setChecked(True)
+            picker._save_selected()
+            picker.close()
+
+        window.object_documents_page.refresh()
+        window.object_agreements_page.refresh()
+        self.assertEqual(window.object_documents_page.table.rowCount(), 3)
+        self.assertEqual(window.object_agreements_page.table.rowCount(), 1)
+        self.assertTrue(window.object_documents_page.table.isColumnHidden(3))
+        offer_path = Path(self._case.name) / "object-offer.pdf"
+        offer_path.write_bytes(b"%PDF-1.4 offer")
+        window.object_record_store.add_file(
+            object_key, "Object card test", "Renatur", offer_path, "Оферта",
+            offer_version=2, offer_status="Согласована",
+        )
+        window.object_documents_page.refresh()
+        self.assertFalse(window.object_documents_page.table.isColumnHidden(3))
+        offer_row = next(
+            index for index, document in enumerate(window.object_documents_page._documents)
+            if document["category"] == "Оферта"
+        )
+        self.assertEqual(
+            window.object_documents_page.table.item(offer_row, 3).text(),
+            "v2 · Согласована",
+        )
+        document_header = window.object_documents_page.table.horizontalHeader()
+        agreement_table = window.object_agreements_page.table
+        agreement_header = agreement_table.horizontalHeader()
+        self.assertEqual(
+            document_header.sectionResizeMode(1),
+            self.desktop.QHeaderView.ResizeMode.Stretch,
+        )
+        self.assertEqual(
+            agreement_header.sectionResizeMode(1),
+            self.desktop.QHeaderView.ResizeMode.Stretch,
+        )
+        self.assertTrue(agreement_table.wordWrap())
+        self.assertEqual(agreement_table.textElideMode(), self.desktop.Qt.TextElideMode.ElideNone)
+
+        email_row = next(
+            index for index, document in enumerate(window.object_documents_page._documents)
+            if document["email_part"] == -1
+        )
+        window.object_documents_page.table.selectRow(email_row)
+        self.assertEqual(window.object_documents_page.open_button.text(), "Читать письмо")
+        self.assertEqual(
+            window.object_documents_page.table.item(email_row, 1).text(),
+            "Extra work",
+        )
+        self.assertEqual(
+            window.object_documents_page.table.item(email_row, 1).toolTip(),
+            "Extra work",
+        )
+        opened_dialogs = []
+        with patch.object(
+            object_card_ui.QDialog, "exec",
+            new=lambda dialog: opened_dialogs.append(dialog) or 0,
+        ):
+            window.object_documents_page._open_selected()
+        self.assertEqual(
+            opened_dialogs[-1].findChild(object_card_ui.QDialogButtonBox)
+            .button(object_card_ui.QDialogButtonBox.StandardButton.Close).text(),
+            "Закрыть",
+        )
+        self.assertEqual(
+            opened_dialogs[-1].findChild(object_card_ui.QTextEdit).toPlainText(),
+            "Please add one shelf.",
+        )
+        self.assertIn(
+            "Тема: Extra work",
+            opened_dialogs[-1].findChild(object_card_ui.QLabel).text(),
+        )
+
+        window.object_agreements_page.table.selectRow(0)
+        self.assertTrue(window.object_agreements_page.open_record_button.isEnabled())
+        with patch.object(
+            object_card_ui.QDialog, "exec",
+            new=lambda dialog: opened_dialogs.append(dialog) or 0,
+        ):
+            window.object_agreements_page._open_record()
+        self.assertEqual(
+            opened_dialogs[-1].findChild(object_card_ui.QTextEdit).toPlainText(),
+            "One shelf approved.",
+        )
+        self.assertEqual(
+            opened_dialogs[-1].findChild(object_card_ui.QDialogButtonBox)
+            .button(object_card_ui.QDialogButtonBox.StandardButton.Close).text(),
+            "Закрыть",
+        )
+        for dialog in opened_dialogs:
+            dialog.deleteLater()
+        window.close()
+        self.qt_app.processEvents()
+
+        reopened = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(reopened)
+        self._setup_catalog_window(reopened)
+        reopened.object_documents_page.set_object(object_key, "Object card test", "Renatur")
+        reopened.object_agreements_page.set_object(object_key, "Object card test", "Renatur")
+        self.assertIsInstance(reopened.object_documents_page, ObjectDocumentsPage)
+        self.assertIsInstance(reopened.object_agreements_page, ObjectAgreementsPage)
+        self.assertEqual(reopened.object_documents_page.table.rowCount(), 4)
+        self.assertEqual(reopened.object_agreements_page.table.rowCount(), 1)
+        self.assertEqual(
+            reopened.object_agreements_page.table.item(0, 1).text(),
+            "One shelf approved.",
+        )
 
     def test_objects_tab_separates_service_categories_and_filters_same_names_by_company(self):
         self._add_company("Object test")
