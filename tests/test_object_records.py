@@ -145,6 +145,84 @@ class ObjectRecordTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_documents(self.one)), 2)
         self.assertEqual(len(self.store.list_documents(self.two)), 2)
 
+    def test_removing_email_attachment_unlinks_its_group_only_and_allows_readd(self):
+        payload = b"%PDF-1.4 shared attachment"
+        attachment = {"part": 1, "filename": "request.pdf", "content": payload}
+        self.store.add_email(
+            self.one, "Site", "Client", email_key="removable-message",
+            sender="client@example.test", subject="Request", email_date="2026-11-12",
+            body="Please add one shelf.", attachments=[attachment],
+        )
+        manual_source = self.root / "manual-copy.pdf"
+        manual_source.write_bytes(payload)
+        manual_document_id = self.store.add_file(
+            self.one, "Site", "Client", manual_source, "Фото",
+        )
+        agreement_id = self.store.add_agreement(
+            self.one, "Site", "Client", "2026-11-12", "Keep this agreement.",
+            True, manual_source,
+        )
+        other_object = self.store.add_email(
+            self.two, "Other site", "Other client", email_key="removable-message",
+            sender="client@example.test", subject="Request", email_date="2026-11-12",
+            body="Please add one shelf.", attachments=[attachment],
+        )
+
+        attachment_row = next(
+            row for row in self.store.list_documents(self.one)
+            if row["email_part"] == 1
+        )
+        self.assertEqual(self.store.remove_document(attachment_row["id"]), 2)
+
+        reopened = ObjectRecordStore(self.root / "object_documents")
+        one_documents = reopened.list_documents(self.one)
+        self.assertEqual([row["id"] for row in one_documents], [manual_document_id])
+        self.assertEqual(one_documents[0]["category"], "Фото")
+        self.assertEqual(
+            reopened.file_path(one_documents[0]["relative_path"], one_documents[0]["sha256"])
+            .read_bytes(),
+            payload,
+        )
+        self.assertEqual(len(reopened.list_agreements(self.one)), 1)
+        self.assertEqual(reopened.list_agreements(self.one)[0]["id"], agreement_id)
+        self.assertEqual(len(reopened.list_documents(self.two)), 2)
+        self.assertTrue(other_object[1])
+
+        readded = reopened.add_email(
+            self.one, "Site", "Client", email_key="removable-message",
+            sender="client@example.test", subject="Request", email_date="2026-11-12",
+            body="Please add one shelf.", attachments=[attachment],
+        )
+        self.assertTrue(readded[1])
+        self.assertEqual(readded[2], 1)
+        self.assertEqual(len(reopened.list_documents(self.one)), 3)
+        duplicate = reopened.add_email(
+            self.one, "Site", "Client", email_key="removable-message",
+            sender="client@example.test", subject="Request", email_date="2026-11-12",
+            body="Please add one shelf.", attachments=[attachment],
+        )
+        self.assertFalse(duplicate[1])
+        self.assertEqual(duplicate[2], 0)
+        self.assertEqual(len(reopened.list_documents(self.one)), 3)
+
+    def test_removing_a_file_keeps_other_links_to_the_same_stored_content(self):
+        source = self.root / "shared-file.pdf"
+        source.write_bytes(b"%PDF-1.4 shared")
+        first_id = self.store.add_file(self.one, "Site", "Client", source, "Договор")
+        second_id = self.store.add_file(self.one, "Site", "Client", source, "Фото")
+        self.store.add_file(self.two, "Other site", "Other client", source, "Фото")
+
+        self.assertEqual(self.store.remove_document(first_id), 1)
+
+        one_documents = self.store.list_documents(self.one)
+        self.assertEqual([row["id"] for row in one_documents], [second_id])
+        self.assertEqual(len(self.store.list_documents(self.two)), 1)
+        self.assertEqual(
+            self.store.file_path(one_documents[0]["relative_path"], one_documents[0]["sha256"])
+            .read_bytes(),
+            b"%PDF-1.4 shared",
+        )
+
     def test_info_mail_reads_headers_and_body_with_read_only_peek_commands(self):
         settings = info_mail.MailboxSettings(
             "info@example.test", "imap.example.test", 993, "SSL/TLS", "INBOX", "Sent",

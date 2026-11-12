@@ -1,6 +1,7 @@
 """Document and agreement sections embedded in the object card."""
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -218,6 +219,12 @@ class InfoMailPickerDialog(QDialog):
         self.object_label = object_label
         self.company = company
         self.setWindowTitle("Добавить письмо из ящика info")
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self.setMinimumSize(720, 520)
         self.resize(820, 650)
         self._settings = None
         self._password = ""
@@ -252,6 +259,7 @@ class InfoMailPickerDialog(QDialog):
         self.message_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.message_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.message_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.message_table.setMinimumHeight(90)
         message_header = self.message_table.horizontalHeader()
         message_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         message_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -261,10 +269,11 @@ class InfoMailPickerDialog(QDialog):
         self.message_body = QTextEdit()
         self.message_body.setReadOnly(True)
         self.message_body.setPlaceholderText("Выберите письмо, чтобы просмотреть текст и вложения.")
+        self.message_body.setMinimumHeight(120)
         layout.addWidget(self.message_body, 2)
         self.attachment_list = QListWidget()
-        self.attachment_list.setMaximumHeight(130)
-        layout.addWidget(self.attachment_list)
+        self.attachment_list.setMinimumHeight(70)
+        layout.addWidget(self.attachment_list, 1)
         self.confirm_binding = QCheckBox(f"Подтверждаю привязку письма к объекту «{object_label}»")
         self.confirm_binding.setEnabled(False)
         self.confirm_binding.toggled.connect(self._update_save_enabled)
@@ -428,11 +437,14 @@ class ObjectDocumentsPage(QWidget):
         self.add_mail_button.clicked.connect(self._add_email)
         self.open_button = QPushButton("Открыть")
         self.open_button.clicked.connect(self._open_selected)
+        self.remove_button = QPushButton("Убрать из объекта")
+        self.remove_button.clicked.connect(self._remove_selected)
         self.offer_status_button = QPushButton("Статус оферты…")
         self.offer_status_button.clicked.connect(self._change_offer_status)
         actions.addWidget(self.add_file_button)
         actions.addWidget(self.add_mail_button)
         actions.addWidget(self.open_button)
+        actions.addWidget(self.remove_button)
         actions.addWidget(self.offer_status_button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -485,6 +497,7 @@ class ObjectDocumentsPage(QWidget):
         self.add_file_button.setEnabled(self.object_key is not None)
         self.add_mail_button.setEnabled(self.object_key is not None)
         self.open_button.setEnabled(selected)
+        self.remove_button.setEnabled(selected)
         row = self.table.currentRow()
         if 0 <= row < len(self._documents):
             self.open_button.setText(
@@ -495,6 +508,48 @@ class ObjectDocumentsPage(QWidget):
         self.offer_status_button.setEnabled(
             0 <= row < len(self._documents) and self._documents[row]["category"] == "Оферта"
         )
+
+    def _remove_selected(self):
+        row = self.table.currentRow()
+        if not 0 <= row < len(self._documents):
+            return
+        document = self._documents[row]
+        if document["email_key"] is not None:
+            email_title = next(
+                (
+                    item["title"] for item in self._documents
+                    if item["email_key"] == document["email_key"] and item["email_part"] == -1
+                ),
+                document["title"],
+            )
+            message = (
+                f"Убрать письмо «{email_title}» и добавленные вместе с ним вложения "
+                f"из объекта «{self.object_label}»?\n\n"
+                "Будет удалена только привязка к этому объекту. Оригинал письма в info и "
+                "связи с другими объектами сохраняются; отдельно добавленные документы "
+                "не затрагиваются."
+            )
+        else:
+            message = (
+                f"Убрать файл «{document['title']}» из объекта «{self.object_label}»?\n\n"
+                "Будет удалена только привязка к этому объекту. Файл и возможные связи "
+                "с другими объектами сохраняются."
+            )
+        answer = QMessageBox.question(
+            self,
+            "Убрать из объекта",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.remove_document(document["id"])
+        except (ObjectRecordError, OSError, sqlite3.Error) as error:
+            _show_error(self, "Привязка не убрана", error)
+            return
+        self.refresh()
 
     def _change_offer_status(self):
         row = self.table.currentRow()
@@ -560,17 +615,25 @@ class ObjectDocumentsPage(QWidget):
             elif document["email_body"] is not None:
                 dialog = QDialog(self)
                 dialog.setWindowTitle(document["email_subject"] or "Текст письма")
-                dialog.resize(700, 500)
+                dialog.setWindowFlags(
+                    dialog.windowFlags()
+                    | Qt.WindowType.WindowMinimizeButtonHint
+                    | Qt.WindowType.WindowMaximizeButtonHint
+                )
+                dialog.setMinimumSize(620, 420)
+                dialog.resize(760, 560)
                 layout = QVBoxLayout(dialog)
                 header = QLabel(
                     f"От: {document['email_sender'] or '—'}\n"
                     f"Тема: {document['email_subject'] or '(без темы)'}\n"
                     f"Дата: {_format_stockholm_datetime(document['email_date'])} (Стокгольм)"
                 )
+                header.setWordWrap(True)
                 layout.addWidget(header)
                 body = QTextEdit()
                 body.setReadOnly(True)
                 body.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+                body.setMinimumSize(240, 160)
                 body.setPlainText(document["email_body"])
                 layout.addWidget(body, 1)
                 buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)

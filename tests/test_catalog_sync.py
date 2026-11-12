@@ -209,6 +209,12 @@ class CatalogSyncTests(unittest.TestCase):
             picker = object_card_ui.InfoMailPickerDialog(
                 window.object_record_store, object_key, "Object card test", "Renatur", window,
             )
+            window_hints = (
+                self.desktop.Qt.WindowType.WindowMinimizeButtonHint
+                | self.desktop.Qt.WindowType.WindowMaximizeButtonHint
+            )
+            self.assertEqual(picker.windowFlags() & window_hints, window_hints)
+            self.assertGreaterEqual(picker.minimumSize().height(), 520)
             self.assertEqual(
                 picker.findChild(object_card_ui.QDialogButtonBox)
                 .button(object_card_ui.QDialogButtonBox.StandardButton.Cancel).text(),
@@ -216,13 +222,24 @@ class CatalogSyncTests(unittest.TestCase):
             )
             picker._load_messages()
             self.assertEqual(picker.message_table.item(0, 0).text(), "12.11.2026 11:00")
+            self.assertEqual(picker.attachment_list.count(), 1)
+            picker_layout = picker.layout()
+            self.assertEqual(picker_layout.stretch(picker_layout.indexOf(picker.message_table)), 1)
+            self.assertEqual(picker_layout.stretch(picker_layout.indexOf(picker.message_body)), 2)
+            self.assertEqual(picker_layout.stretch(picker_layout.indexOf(picker.attachment_list)), 1)
+            self.assertGreater(picker.attachment_list.maximumHeight(), 130)
             picker.confirm_binding.setChecked(True)
             picker._save_selected()
             picker.close()
 
+        mail_attachment_path = Path(self._case.name) / "separately-added-mail-attachment.pdf"
+        mail_attachment_path.write_bytes(b"%PDF-1.4 mail")
+        manual_document_id = window.object_record_store.add_file(
+            object_key, "Object card test", "Renatur", mail_attachment_path, "Фото",
+        )
         window.object_documents_page.refresh()
         window.object_agreements_page.refresh()
-        self.assertEqual(window.object_documents_page.table.rowCount(), 3)
+        self.assertEqual(window.object_documents_page.table.rowCount(), 4)
         self.assertEqual(window.object_agreements_page.table.rowCount(), 1)
         self.assertTrue(window.object_documents_page.table.isColumnHidden(3))
         offer_path = Path(self._case.name) / "object-offer.pdf"
@@ -275,18 +292,85 @@ class CatalogSyncTests(unittest.TestCase):
             new=lambda dialog: opened_dialogs.append(dialog) or 0,
         ):
             window.object_documents_page._open_selected()
+        reader = opened_dialogs[-1]
+        self.assertEqual(reader.windowFlags() & window_hints, window_hints)
+        self.assertGreaterEqual(reader.minimumSize().height(), 420)
         self.assertEqual(
-            opened_dialogs[-1].findChild(object_card_ui.QDialogButtonBox)
+            reader.findChild(object_card_ui.QDialogButtonBox)
             .button(object_card_ui.QDialogButtonBox.StandardButton.Close).text(),
             "Закрыть",
         )
         self.assertEqual(
-            opened_dialogs[-1].findChild(object_card_ui.QTextEdit).toPlainText(),
+            reader.findChild(object_card_ui.QTextEdit).toPlainText(),
             "Please add one shelf.",
         )
         self.assertIn(
             "Тема: Extra work",
-            opened_dialogs[-1].findChild(object_card_ui.QLabel).text(),
+            reader.findChild(object_card_ui.QLabel).text(),
+        )
+        reader_body = reader.findChild(object_card_ui.QTextEdit)
+        reader_layout = reader.layout()
+        self.assertEqual(reader_layout.stretch(reader_layout.indexOf(reader_body)), 1)
+
+        page = window.object_documents_page
+        self.assertEqual(page.remove_button.text(), "Убрать из объекта")
+        self.assertTrue(page.remove_button.isEnabled())
+        with patch.object(
+            object_card_ui.QMessageBox,
+            "question",
+            return_value=object_card_ui.QMessageBox.StandardButton.No,
+        ) as confirm_remove:
+            page._remove_selected()
+        confirmation = confirm_remove.call_args.args[2]
+        self.assertIn("Убрать письмо «Extra work»", confirmation)
+        self.assertIn("только привязка к этому объекту", confirmation)
+        self.assertIn("Оригинал письма в info", confirmation)
+        self.assertIn("отдельно добавленные документы не затрагиваются", confirmation)
+        self.assertEqual(page.table.rowCount(), 5)
+        with patch.object(
+            object_card_ui.QMessageBox,
+            "question",
+            return_value=object_card_ui.QMessageBox.StandardButton.Yes,
+        ):
+            page._remove_selected()
+        self.assertEqual(page.table.rowCount(), 3)
+        remaining_email_rows = [
+            document for document in page._documents if document["email_key"] is not None
+        ]
+        self.assertEqual(remaining_email_rows, [])
+        remaining_manual = next(
+            document for document in page._documents if document["id"] == manual_document_id
+        )
+        self.assertEqual(remaining_manual["category"], "Фото")
+
+        readded = window.object_record_store.add_email(
+            object_key, "Object card test", "Renatur",
+            email_key=content.key, sender=content.sender, subject=content.subject,
+            email_date=content.sent_at, body=content.body,
+            attachments=[{
+                "part": attachment.part,
+                "filename": attachment.filename,
+                "content": attachment.content,
+            } for attachment in content.attachments],
+        )
+        self.assertTrue(readded[1])
+        self.assertEqual(readded[2], 1)
+        page.refresh()
+        self.assertEqual(page.table.rowCount(), 5)
+        manual_row = next(
+            index for index, document in enumerate(page._documents)
+            if document["id"] == manual_document_id
+        )
+        page.table.selectRow(manual_row)
+        with patch.object(
+            object_card_ui.QMessageBox,
+            "question",
+            return_value=object_card_ui.QMessageBox.StandardButton.No,
+        ) as confirm_file_remove:
+            page._remove_selected()
+        self.assertIn(
+            "Файл и возможные связи с другими объектами сохраняются",
+            confirm_file_remove.call_args.args[2],
         )
 
         window.object_agreements_page.table.selectRow(0)
@@ -317,12 +401,14 @@ class CatalogSyncTests(unittest.TestCase):
         reopened.object_agreements_page.set_object(object_key, "Object card test", "Renatur")
         self.assertIsInstance(reopened.object_documents_page, ObjectDocumentsPage)
         self.assertIsInstance(reopened.object_agreements_page, ObjectAgreementsPage)
-        self.assertEqual(reopened.object_documents_page.table.rowCount(), 4)
+        self.assertEqual(reopened.object_documents_page.table.rowCount(), 5)
         self.assertEqual(reopened.object_agreements_page.table.rowCount(), 1)
         self.assertEqual(
             reopened.object_agreements_page.table.item(0, 1).text(),
             "One shelf approved.",
         )
+        reopened.close()
+        self.qt_app.processEvents()
 
     def test_objects_tab_separates_service_categories_and_filters_same_names_by_company(self):
         self._add_company("Object test")

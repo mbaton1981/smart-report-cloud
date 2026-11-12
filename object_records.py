@@ -338,6 +338,28 @@ class ObjectRecordStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def remove_document(self, document_id: str) -> int:
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ObjectRecordError("Не удалось определить удаляемую привязку.")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT object_key,email_key FROM documents WHERE id=?",
+                (document_id,),
+            ).fetchone()
+            if not row:
+                raise ObjectRecordError("Запись больше не найдена. Обновите список документов.")
+            if row["email_key"] is not None:
+                cursor = connection.execute(
+                    "DELETE FROM documents WHERE object_key=? AND email_key=?",
+                    (row["object_key"], row["email_key"]),
+                )
+            else:
+                cursor = connection.execute(
+                    "DELETE FROM documents WHERE id=?",
+                    (document_id,),
+                )
+            return cursor.rowcount
+
     def list_agreements(self, object_key: str) -> list[dict]:
         with self._connection() as connection:
             rows = connection.execute(
