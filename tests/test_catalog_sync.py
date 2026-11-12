@@ -1,3 +1,4 @@
+import gc
 import os
 import json
 import subprocess
@@ -92,6 +93,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         self.assertTrue(QThreadPool.globalInstance().waitForDone(10000),
                         "Background catalog reads must finish before deleting their database")
+        gc.collect()  # отпускает соединения SQLite, оставшиеся в циклах ссылок тестового окна
         self._case.cleanup()
 
     def _wait_for_employee_status(self, window, timeout=3):

@@ -162,6 +162,53 @@ class DesktopThemeTests(unittest.TestCase):
             tabs.close()
             paused_table.deleteLater()
 
+    def test_switch_does_not_remeasure_content_sized_table_columns(self):
+        import desktop_ui
+
+        table = desktop_ui.ReportTable(150, 8)
+        table.setHorizontalHeaderLabels(["Дата", "Поставщик", "Сумма", "Часы", "Статус", "Объект", "НДС", "Источник"])
+        for row in range(150):
+            for column in range(8):
+                table.setItem(row, column, QTableWidgetItem(f"Запись {row}-{column} " + "текст " * (row % 4)))
+        table.resize(1100, 500)
+        table.show()
+        self.application.processEvents()
+        table.refresh_layout()
+        self.application.processEvents()
+        table.selectRow(40)
+        table.verticalScrollBar().setValue(300)
+        self.application.processEvents()
+        table.refresh_layout()
+        self.application.processEvents()
+        header = table.horizontalHeader()
+        modes = [header.sectionResizeMode(index) for index in range(8)]
+        widths = [header.sectionSize(index) for index in range(8)]
+        scroll = table.verticalScrollBar().value()
+        measured = []
+        original = desktop_ui.TableDelegate.sizeHint
+
+        def counted(delegate, option, index):
+            measured.append(1)
+            return original(delegate, option, index)
+
+        try:
+            for _ in range(2):
+                self.assertTrue(self.manager.toggle())
+                self.application.processEvents()
+            with patch.object(desktop_ui.TableDelegate, "sizeHint", counted):
+                for _ in range(4):
+                    self.assertTrue(self.manager.toggle())
+                    self.application.processEvents()
+            # Одно перемеривание после смены стиля допустимо; раньше шло в два раза больше.
+            self.assertLess(len(measured), 4 * 150 * 8)
+            self.assertEqual([header.sectionResizeMode(index) for index in range(8)], modes)
+            self.assertEqual([header.sectionSize(index) for index in range(8)], widths)
+            self.assertEqual(table.currentRow(), 40)
+            self.assertEqual(table.verticalScrollBar().value(), scroll)
+        finally:
+            table.close()
+            table.deleteLater()
+
     def test_header_button_is_right_of_brand_and_deleted_buttons_do_not_break_toggle(self):
         panel = theme.header()
         panel.show()

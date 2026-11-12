@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import re
 
@@ -10,7 +11,7 @@ from PyQt6.QtGui import (
     QBrush, QColor, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QBoxLayout, QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QApplication, QBoxLayout, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QPushButton, QSplitter, QTableWidget,
 )
 
@@ -463,6 +464,32 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url("__CHEVRON__"); }
 """
 
 
+@contextmanager
+def _paused_layout(application):
+    """Смена стиля заставляет заголовки таблиц с ResizeToContents десятки раз мерить все ячейки.
+
+    На время смены стиля замеры отключаются, а прежние режимы и ширины возвращаются без пересчёта.
+    """
+    headers = [(header, [header.sectionResizeMode(index) for index in range(header.count())])
+               for header in application.allWidgets() if isinstance(header, QHeaderView)]
+    windows = [window for window in application.topLevelWidgets() if window.isVisible() and window.updatesEnabled()]
+    for header, modes in headers:
+        for index, mode in enumerate(modes):
+            if mode == QHeaderView.ResizeMode.ResizeToContents:
+                header.setSectionResizeMode(index, QHeaderView.ResizeMode.Interactive)
+    for window in windows:
+        window.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        for header, modes in headers:
+            for index, mode in enumerate(modes):
+                if mode == QHeaderView.ResizeMode.ResizeToContents and index < header.count():
+                    header.setSectionResizeMode(index, mode)
+        for window in windows:
+            window.setUpdatesEnabled(True)
+
+
 class ThemeManager(QObject):
     changed = pyqtSignal(str)
 
@@ -504,7 +531,12 @@ class ThemeManager(QObject):
 
     def apply(self):
         self.application.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
-        self.application.setStyleSheet(self.stylesheet())
+        with _paused_layout(self.application):
+            self.application.setStyleSheet(self.stylesheet())
+            self._recolor_widgets()
+        self.changed.emit(self.name)
+
+    def _recolor_widgets(self):
         from PyQt6.QtWidgets import QTableWidget
         brushes = {}
         for widget in self.application.allWidgets():
@@ -544,7 +576,6 @@ class ThemeManager(QObject):
                 if was_enabled:
                     widget.setUpdatesEnabled(True)
                     widget.viewport().update()
-        self.changed.emit(self.name)
 
     def register_color_table(self, table):
         if getattr(table, "_smartreport_color_manager", None) is self:
