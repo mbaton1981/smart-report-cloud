@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import shutil
 import traceback
@@ -2543,6 +2543,43 @@ def create_half_hour_time_field(default_time):
     return field
 
 
+def requeue_expense_document_restore(queued, payload, result):
+    """Переводит повторную загрузку удалённого оригинала в восстановление исходной записи."""
+    old_client_id = queued["client_id"]
+    original_client_id = str(result["existing_client_id"])
+    restore_payload = {
+        **payload,
+        "client_id": original_client_id,
+        "restore_deleted": True,
+        "restore_operation_id": str(payload.get("restore_operation_id") or old_client_id),
+    }
+    restore_payload.pop("expected_version", None)
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM expense_document_outbox WHERE client_id = ?",
+                        (original_client_id,)).fetchone():
+            conn.rollback()
+            return False
+        changed = conn.execute("""
+            UPDATE expense_document_outbox
+            SET client_id = ?, server_document_id = ?, server_version = ?, revision = revision + 1,
+                payload_json = ?, state = 'pending', last_error = NULL, updated_at = ?
+            WHERE client_id = ? AND revision = ?
+        """, (
+            original_client_id, int(result["existing_document_id"]), int(result["current_version"]),
+            json.dumps(restore_payload, ensure_ascii=False),
+            datetime.now(timezone.utc).isoformat(), old_client_id, int(queued["revision"]),
+        )).rowcount
+        conn.commit()
+        return bool(changed)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3238,6 +3275,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def _sync_expense_document_outbox(self):
         conn = get_db_connection()
+        # Прежние версии пометили дубль с удалённой записью как конфликт; сервер теперь отвечает deleted_original.
+        conn.execute("""
+            UPDATE expense_document_outbox SET state = 'pending', last_error = NULL
+            WHERE state = 'conflict' AND operation = 'upsert' AND server_document_id IS NULL
+              AND last_error LIKE 'Такая фактура уже есть в архиве%'
+        """)
+        conn.commit()
         rows = conn.execute("""
             SELECT client_id, operation, server_document_id, server_version, revision,
                    payload_json, attachment_paths_json
@@ -3368,6 +3412,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     raise ValueError("Некорректный ACK сервера; очередь и оригиналы сохранены для повтора.")
                 status_code = int(response.status_code)
                 if not 200 <= status_code < 300 or result.get("ok") is not True:
+                    if (status_code == 409 and result.get("code") == "deleted_original"
+                            and queued["operation"] == "upsert"
+                            and payload.get("verification_status") != "confirmed"
+                            and result.get("existing_client_id") and type(result.get("existing_document_id")) is int
+                            and type(result.get("current_version")) is int):
+                        if requeue_expense_document_restore(queued, payload, result):
+                            continue
                     error = str(result.get("error") or f"Сервер вернул HTTP {status_code}.")
                     conflict = status_code in (400, 404, 409, 410, 422)
                     error_conn = get_db_connection()
@@ -7548,7 +7599,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         status_label = self._expense_register_status_label(document)
         if status == "ignored":
             status_label = f"Исключён — {document.get('exclusion_reason') or 'Не фактура'}"
-        if status == "requires_review" and document.get("allocations"):
+        if status == "requires_review" and SmartReportApp._expense_has_assignment(document):
             status_label = "Назначено · ждёт проверки"
         self.exp_detail_status.setText(status_label)
         tone = self._expense_register_row_tone(document)
@@ -7568,7 +7619,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "border-radius: 8px; padding: 4px 7px; font-size: 12px; font-weight: 650; }",
         )
 
-        allocated = bool(document.get("allocations"))
+        allocated = SmartReportApp._expense_has_assignment(document)
         verified = status == "accounted"
         if status == "ignored":
             self.exp_detail_progress.setText("Исключён — не фактура")
@@ -8124,7 +8175,22 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         merged = [doc for doc in documents if doc.get("client_id") not in deleted_clients]
         positions = {doc.get("client_id"): index for index, doc in enumerate(merged)}
+        by_server_id = {doc.get("id"): index for index, doc in enumerate(merged) if isinstance(doc.get("id"), int)}
+
+        def identity(doc):
+            parts = tuple(str(doc.get(key) or "").strip().casefold() for key in (
+                "supplier_name", "invoice_number", "document_date", "currency_code", "gross_amount"))
+            return parts if all(parts[:3]) and parts[4] else None
+
+        by_identity = {identity(doc): index for index, doc in enumerate(merged) if identity(doc)}
         for client_id, pending in pending_by_client.items():
+            # Одна фактура не должна считаться дважды из очереди и серверного реестра.
+            if client_id not in positions:
+                match = by_server_id.get(pending.get("server_document_id"))
+                if match is None and identity(pending):
+                    match = by_identity.get(identity(pending))
+                if match is not None:
+                    positions[client_id] = match
             if client_id in positions:
                 remote_document = merged[positions[client_id]]
                 if pending.get("sync_state") == "conflict":
@@ -8352,6 +8418,26 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_docs_state_legend_lbl.setText("Цвета: " + " · ".join(entries))
 
     @staticmethod
+    def _expense_has_assignment(document):
+        return any(
+            item.get("destination") in {"object", "company"}
+            and not (item.get("destination") == "object" and item.get("object_id") is None)
+            for item in document.get("allocations") or []
+        )
+
+    @staticmethod
+    def _expense_document_type(document):
+        explicit = document.get("confirmed_type") or document.get("document_type")
+        if explicit and explicit not in {"manual", "unclassified"}:
+            return explicit
+        # Сервер не хранит тип: распознанная фактура с номером, поставщиком и суммой остаётся фактурой.
+        if (document.get("invoice_number") and document.get("supplier_name")
+                and document.get("gross_amount") is not None
+                and not non_invoice_document_type(str(document.get("recognized_text") or ""))):
+            return "invoice"
+        return explicit or "unclassified"
+
+    @staticmethod
     def _expense_register_is_unallocated(document):
         if SmartReportApp._expense_register_status_key(document) == "ignored":
             return False
@@ -8544,7 +8630,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 "transfer": "Ошибка передачи",
             }[self._expense_register_status_key(document)]
             if (self._expense_register_status_key(document) == "requires_review"
-                    and allocations):
+                    and SmartReportApp._expense_has_assignment(document)):
                 short_status = "Назначено · ждёт проверки"
             if (self._expense_register_status_key(document) == "transfer"
                     and document.get("sync_state") in {"pending", "unverified"}):
@@ -8552,7 +8638,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if self._expense_register_status_key(document) == "ignored":
                 reason = document.get("exclusion_reason") or "Не фактура"
                 short_status = f"Исключён — {reason}"
-            document_type = document.get("confirmed_type") or document.get("document_type")
+            document_type = SmartReportApp._expense_document_type(document)
             type_labels = {
                 "invoice": "Фактура", "receipt": "Чек", "tax_decision": "Решение",
                 "order_confirmation": "Подтверждение заказа", "credit_note": "Кредитная фактура",
@@ -9085,6 +9171,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                        "currency_code": current["currency_code"].upper() or "UNKNOWN",
                        "gross_amount": decimal_text(net + vat) if net is not None and vat is not None else None,
                        "verification_status": status, "allocations": rows, "order_proposals": rows,
+                       "document_type": fields.get("document_type") or non_invoice_type or "invoice",
                        "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
                        "document_comment": fields.get("document_comment") or "",
                        "expense_category": fields.get("expense_category") or "Прочие расходы"}

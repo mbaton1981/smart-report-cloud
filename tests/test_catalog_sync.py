@@ -1148,6 +1148,82 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         conn.close()
 
+    def test_assignment_and_type_reflect_real_state_of_unselected_draft(self):
+        app = self.desktop.SmartReportApp
+        draft = {
+            "supplier_name": "BEIJER BYGGMATERIAL AB", "invoice_number": "260414428128",
+            "gross_amount": "139629.77", "verification_status": "draft",
+            "allocations": [{"destination": "unselected", "object_id": None}],
+        }
+        self.assertFalse(app._expense_has_assignment(draft))
+        self.assertTrue(app._expense_has_assignment({"allocations": [{"destination": "object", "object_id": 3}]}))
+        self.assertTrue(app._expense_has_assignment({"allocations": [{"destination": "company", "object_id": None}]}))
+        self.assertEqual(app._expense_document_type(draft), "invoice")
+        self.assertEqual(app._expense_document_type({"supplier_name": "X"}), "unclassified")
+
+    def test_deleted_invoice_reupload_restores_same_record_without_conflict(self):
+        from reportlab.pdfgen import canvas
+
+        path = Path(self._case.name) / "beijer.pdf"
+        pdf = canvas.Canvas(str(path))
+        pdf.drawString(40, 760, "Beijer 260414428128")
+        pdf.save()
+        original_bytes = path.read_bytes()
+        first_client = str(uuid.uuid4())
+        fields = {
+            "supplier_name": "BEIJER BYGGMATERIAL AB", "invoice_number": "260414428128",
+            "document_date": "2026-10-28", "currency_code": "SEK", "document_type": "invoice",
+            "net_amount": "100.00", "vat_amount": "25.00", "gross_amount": "125.00",
+            "verification_status": "draft", "allocations": [],
+        }
+        harness = SimpleNamespace()
+        queue = self.desktop.SmartReportApp.queue_expense_document_operation
+
+        def fake_request(method, url, headers=None, timeout=None, **kwargs):
+            data = dict(kwargs.get("data") or {})
+            files = kwargs.get("files") or []
+            if files:
+                data["originals"] = [(stream, name, kind) for _f, (name, stream, kind) in files]
+                response = self.server_client.open(urlsplit(url).path, method=method, headers=headers, data=data)
+            else:
+                response = self.server_client.open(
+                    urlsplit(url).path, method=method, headers=headers, json=kwargs.get("json"))
+            return SimpleNamespace(status_code=response.status_code, json=response.get_json)
+
+        def outbox_rows():
+            conn = self.desktop.get_db_connection()
+            try:
+                return [dict(row) for row in conn.execute(
+                    "SELECT client_id, state, server_document_id, last_error FROM expense_document_outbox")]
+            finally:
+                conn.close()
+
+        with patch.object(self.desktop.requests, "request", side_effect=fake_request):
+            queue(harness, first_client, "upsert", {**fields, "client_id": first_client}, attachment_paths=[path])
+            self.assertEqual(self.desktop.SmartReportApp._sync_expense_document_outbox(harness)["synced"], 1)
+            server_conn = self.server.get_db_connection()
+            identifier = server_conn.execute(
+                "SELECT id FROM expense_documents WHERE client_id = ?", (first_client,)).fetchone()[0]
+            server_conn.close()
+            queue(harness, first_client, "delete", {"client_id": first_client}, server_document_id=identifier,
+                  server_version=1)
+            self.assertEqual(self.desktop.SmartReportApp._sync_expense_document_outbox(harness)["synced"], 1)
+
+            second_client = str(uuid.uuid4())
+            path.write_bytes(original_bytes)
+            queue(harness, second_client, "upsert", {**fields, "client_id": second_client}, attachment_paths=[path])
+            self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
+            self.assertEqual([row["state"] for row in outbox_rows()], ["pending"])
+            self.assertEqual(outbox_rows()[0]["client_id"], first_client, outbox_rows())
+            self.assertEqual(self.desktop.SmartReportApp._sync_expense_document_outbox(harness)["synced"], 1)
+
+        self.assertEqual(outbox_rows(), [])
+        server_conn = self.server.get_db_connection()
+        rows = server_conn.execute(
+            "SELECT id, client_id, is_deleted, verification_status FROM expense_documents").fetchall()
+        server_conn.close()
+        self.assertEqual([tuple(row) for row in rows], [(identifier, first_client, 0, "draft")])
+
     def test_expense_outbox_offline_lost_ack_attachment_and_delete(self):
         from reportlab.pdfgen import canvas
 

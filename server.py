@@ -1933,6 +1933,7 @@ def expense_document_create_api():
                 SELECT id FROM expense_documents
                 WHERE supplier_name = ? COLLATE NOCASE AND invoice_number = ?
                   AND document_date = ? AND currency_code = ? AND gross_amount = ?
+                  AND is_deleted = 0
                 ORDER BY id LIMIT 1
             """, (
                 fields["supplier_name"], fields["invoice_number"], fields["document_date"],
@@ -2184,7 +2185,7 @@ def expense_document_update_api(document_id):
                 SELECT id FROM expense_documents
                 WHERE supplier_name = ? COLLATE NOCASE AND invoice_number = ?
                   AND document_date = ? AND currency_code = ? AND gross_amount = ?
-                  AND id <> ?
+                  AND id <> ? AND is_deleted = 0
                 ORDER BY id LIMIT 1
             """, (
                 fields["supplier_name"], fields["invoice_number"], fields["document_date"],

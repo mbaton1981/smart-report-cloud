@@ -229,6 +229,30 @@ class AuthLoginTests(unittest.TestCase):
         saved_again = self.client.get(f"/api/expense-documents/{identifier}", headers=headers).get_json()["document"]
         self.assertEqual(saved_again["gross_amount"], "12761.25")
 
+    def test_reupload_of_deleted_invoice_with_same_metadata_reports_deleted_original(self):
+        from io import BytesIO
+        import uuid
+        headers = self._bearer(self._token())
+        original = self._invoice_pdf(6002)
+        fields = {"verification_status": "draft", "supplier_name": "BEIJER BYGGMATERIAL AB",
+                  "invoice_number": "260414428128", "document_date": "2026-10-28",
+                  "currency_code": "SEK", "net_amount": "111703.77", "vat_amount": "27926.00",
+                  "gross_amount": "139629.77"}
+        created = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps({"client_id": str(uuid.uuid4()), **fields}),
+            "original": (BytesIO(original), "invoice.pdf")})
+        self.assertEqual(created.status_code, 201, created.get_json())
+        identifier = created.get_json()["document"]["id"]
+        self.assertEqual(self.client.delete(f"/api/expense-documents/{identifier}", headers=headers,
+                                           json={"expected_version": 1}).status_code, 200)
+        again = self.client.post("/api/expense-documents", headers=headers, data={
+            "payload": json.dumps({"client_id": str(uuid.uuid4()), **fields}),
+            "original": (BytesIO(original), "invoice-again.pdf")})
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(again.get_json()["code"], "deleted_original")
+        self.assertEqual(again.get_json()["existing_document_id"], identifier)
+        self.assertEqual(self._query("SELECT COUNT(*) FROM expense_documents")[0][0], 1)
+
     def test_invoice_date_filter_keeps_undated_documents_visible(self):
         connection = sqlite3.connect(self.server.DB_FILE)
         try:
