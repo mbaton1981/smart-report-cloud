@@ -237,11 +237,18 @@ class IncomingStore(OfflineReviewStore):
                 if self.action(document_id)[1] in ("ignore", "later"):
                     raise ReviewError("Статус изменён: сначала выберите «Учесть как расход».")
                 if self.card(document_id) is None:
-                    self._check_existing_register(document_id, reviewed)
+                    linked_client = self._check_existing_register(document_id, reviewed)
+                    if linked_client and self.conn.execute(
+                            "SELECT 1 FROM register WHERE client_id=?", (linked_client,)).fetchone():
+                        raise ReviewError("Этот оригинал уже связан с другой карточкой. "
+                                          "Нужна ручная сверка, второй расход не создан.")
+                    # Совпавший оригинал связывает карточку с существующей записью реестра:
+                    # перенос обновляет её по текущей версии, второй расход не создаётся.
                     self.conn.execute("""INSERT INTO register
                         (document_id,client_id,revision,business_key,payload_json,sha256,debt_amount,created_at)
                         VALUES (?,?,?,?,?,?,?,?)""", (
-                            document_id, uuid.uuid4().hex, revision, str(document_id), packed(reviewed),
+                            document_id, linked_client or uuid.uuid4().hex, revision, str(document_id),
+                            packed(reviewed),
                             digest(self.original(document_id).read_bytes()), "0.00",
                             datetime.now(timezone.utc).isoformat()))
             card = self.card(document_id)
@@ -571,8 +578,16 @@ class IncomingStore(OfflineReviewStore):
             snapshot = self.host.incoming_register_snapshot()
         except ValueError as error:
             raise ReviewError(str(error)) from error
+        sha256 = self.conn.execute("SELECT sha256 FROM documents WHERE id=?",
+                                   (document_id,)).fetchone()[0]
+        linked_client = next(
+            (existing.get("client_id") for existing in snapshot
+             if any(row.get("sha256") == sha256 for row in existing.get("attachments") or [])),
+            None)
+        skipped = {client for client in ((own["client_id"] if own else None), linked_client) if client}
         for existing in snapshot:
-            if own and existing.get("client_id") == own["client_id"]:
+            if existing.get("client_id") in skipped:
+                # Запись с тем же оригиналом — это тот же документ, а не второй расход.
                 continue
             if (str(existing.get("supplier_name") or "").strip().casefold() ==
                     str(payload.get("supplier_name") or "").strip().casefold()
@@ -583,9 +598,7 @@ class IncomingStore(OfflineReviewStore):
                         and existing.get("gross_amount") == payload.get("gross_amount"))):
                 raise ReviewError("В обычном реестре или очереди уже есть такая фактура. "
                                   "Нужна ручная сверка, второй расход не создан.")
-            if any(row.get("sha256") == self.conn.execute(
-                    "SELECT sha256 FROM documents WHERE id=?", (document_id,)).fetchone()[0]
-                   for row in existing.get("attachments", [])):
+            if any(row.get("sha256") == sha256 for row in existing.get("attachments", [])):
                 raise ReviewError("Этот PDF уже есть в реестре. Второй расход не создан.")
         for row in self.conn.execute("SELECT document_id,payload_json FROM register WHERE document_id<>?",
                                      (document_id,)):
@@ -595,6 +608,7 @@ class IncomingStore(OfflineReviewStore):
                          or other.get("document_date") == payload["document_date"]
                          and other.get("gross_amount") == payload["gross_amount"])):
                 raise ReviewError("Возможный повтор покупки с другим PDF. Нужна ручная сверка.")
+        return linked_client
 
     def deliver(self, card):
         delivered = self.conn.execute(

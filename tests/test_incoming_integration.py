@@ -181,6 +181,60 @@ class IncomingIntegrationTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM expense_documents").fetchone()[0], 0)
         conn.close()
 
+    def test_incoming_copy_of_existing_document_links_and_updates_instead_of_duplicate(self):
+        # Серверная запись с тем же оригиналом уже есть (сценарий Beijer №260414428128).
+        content = pdf("Isolated integration 1")
+        created = self.server_client.post(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+            data={"payload": json.dumps({
+                **{key: self.fields[key] for key in (
+                    "supplier_name", "invoice_number", "document_date", "currency_code",
+                    "vat_amount", "gross_amount")},
+                "client_id": "existing-client", "verification_status": "draft",
+                "allocations": [],
+            }), "originals": [(BytesIO(content), "invoice.pdf")]},
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        server_id = created.get_json()["document"]["id"]
+        self.host.incoming_register_snapshot = lambda: self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+
+        # Открыть документ, заполнить назначение, сохранить черновик, открыть повторно.
+        revision = self.approve(1)
+        reopened_revision, reopened = self.store.latest(1)
+        self.assertEqual(reopened_revision, revision)
+        self.assertEqual(reopened["object_id"], self.object_id)
+
+        # Подтверждение расхода связывает карточку с существующей записью, а не создаёт дубль.
+        card = self.store.transfer(1, revision)
+        self.assertEqual(card["client_id"], "existing-client")
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        self.assertIn(("PUT", f"/api/expense-documents/{server_id}"), self.calls)
+
+        conn = self.server.get_db_connection()
+        rows = conn.execute(
+            "SELECT id, client_id, verification_status, sync_version, is_deleted FROM expense_documents"
+        ).fetchall()
+        attachments = conn.execute(
+            "SELECT COUNT(*) FROM expense_document_attachments WHERE document_id=?",
+            (server_id,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], server_id)
+        self.assertEqual(rows[0]["client_id"], "existing-client")
+        self.assertEqual(rows[0]["verification_status"], "confirmed")
+        self.assertEqual(rows[0]["is_deleted"], 0)
+        self.assertGreater(rows[0]["sync_version"], 1)
+        self.assertEqual(attachments, 1)
+
+        # Повторное открытие после синхронизации показывает учтённую запись.
+        _after_revision, after = self.store.current_review(1)
+        self.assertEqual(after["server_version"], rows[0]["sync_version"])
+        status, accounted = self.store.accounting_status(1)
+        self.assertTrue(accounted, status)
+
     def test_nordea_and_existing_register_duplicate_block_before_outbox(self):
         revision = self.approve(3)
         with self.assertRaises(ReviewError):
