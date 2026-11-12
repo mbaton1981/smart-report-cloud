@@ -1087,6 +1087,30 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 2)
         server_conn.close()
 
+    def test_net_register_document_with_incoming_copy_opens_register_card(self):
+        host = SimpleNamespace(calls=[], table_supplier_documents=None)
+        host._selected_expense_document = lambda table, notify=True: host.document
+        host.open_incoming_documents = lambda incoming_id=None: host.calls.append(("incoming", incoming_id))
+        host._expense_document_review_dialog = lambda **kw: host.calls.append(
+            ("dialog", kw.get("assignment_only", False)))
+        review = self.desktop.SmartReportApp.review_selected_document
+        assign = self.desktop.SmartReportApp.assign_selected_expense_document
+
+        # Net-фактура общего реестра с входящей копией ведётся своей карточкой.
+        host.document = {"id": 38, "allocation_basis": "net",
+                         "incoming_document_id": 30, "client_id": "net-client"}
+        review(host)
+        assign(host)
+        self.assertEqual(host.calls, [("dialog", False), ("dialog", True)])
+
+        host.calls.clear()
+        host.document = {"id": "incoming:30", "incoming_document_id": 30, "client_id": "local"}
+        review(host)
+        host.document = {"id": 44, "allocation_basis": "gross", "usage": "object_cost",
+                         "incoming_document_id": 31, "client_id": "cost-client"}
+        review(host)
+        self.assertEqual(host.calls, [("incoming", 30), ("incoming", 31)])
+
     def test_expense_schema_upgrade_preserves_allocations_and_original_metadata(self):
         conn = self.server.get_db_connection()
         object_id = conn.execute("""

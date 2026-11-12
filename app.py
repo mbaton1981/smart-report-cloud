@@ -7655,9 +7655,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                  "Сверьте реквизиты с оригиналом и подтвердите расход после проверки.")
             )
 
-        incoming_id = document.get("incoming_document_id")
-        self.exp_assign_button.setEnabled(not verified and incoming_id is None)
-        if incoming_id is not None:
+        prefers_incoming = SmartReportApp._expense_document_prefers_incoming_review(document)
+        self.exp_assign_button.setEnabled(not verified)
+        if prefers_incoming:
             self.exp_assign_button.setText("Назначение во входящих документах")
             self.exp_assign_button.setToolTip(
                 "Откройте проверку входящего документа, чтобы изменить назначение."
@@ -7735,9 +7735,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         document = self._selected_expense_document(self.table_supplier_documents, notify=False)
         if not document:
             return
-        incoming_id = document.get("incoming_document_id")
-        if incoming_id is not None:
-            self.open_incoming_documents(incoming_id)
+        if SmartReportApp._expense_document_prefers_incoming_review(document):
+            self.open_incoming_documents(document["incoming_document_id"])
             return
         self._expense_document_review_dialog(document=document, assignment_only=True)
 
@@ -9863,12 +9862,22 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             return None
         return document
 
+    @staticmethod
+    def _expense_document_prefers_incoming_review(document):
+        """Net-фактура общего реестра ведётся своей карточкой: перенос из входящих
+        не умеет распределение без НДС, и сервер отклонит его подтверждение."""
+        if document.get("incoming_document_id") is None:
+            return False
+        if document.get("usage") == "object_cost":
+            return True
+        return not (isinstance(document.get("id"), int)
+                    and document.get("allocation_basis") == "net")
+
     def review_selected_document(self, *_):
         document = self._selected_expense_document(self.table_supplier_documents)
         if document:
-            incoming_id = document.get("incoming_document_id")
-            if incoming_id is not None:
-                self.open_incoming_documents(incoming_id)
+            if SmartReportApp._expense_document_prefers_incoming_review(document):
+                self.open_incoming_documents(document["incoming_document_id"])
             else:
                 self._expense_document_review_dialog(document=document)
 
