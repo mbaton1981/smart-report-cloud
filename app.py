@@ -15193,9 +15193,10 @@ if __name__ == "__main__":
         input_safety.install_wheel_guard(app)
         desktop_theme.ensure_theme(DARK_THEME_QSS)
         resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-        icon_path = next((p for p in (resource_dir / "Logo.ico", Path("logo.ico")) if p.exists()), None)
-        if icon_path:
-            app.setWindowIcon(QIcon(str(icon_path)))
+        icon_path = resource_dir / "assets" / "bygger-mark.png"
+        if not icon_path.is_file():
+            raise FileNotFoundError(f"Application logo is missing: {icon_path}")
+        app.setWindowIcon(QIcon(str(icon_path)))
         from desktop_login import ensure_login
         if not ensure_login():
             sys.exit(0)
@@ -15203,9 +15204,11 @@ if __name__ == "__main__":
         if desktop_auth.current_user().get("role") == "accountant":
             from employee_cards_ui import AccountantDirectory
             directory = AccountantDirectory()
+            directory.setWindowIcon(app.windowIcon())
             directory.show()
             sys.exit(app.exec())
         window = SmartReportApp()
+        window.setWindowIcon(app.windowIcon())
         window.show()
         if ASSISTANT_CANDIDATE:
             QTimer.singleShot(0, window.open_assistant)

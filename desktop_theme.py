@@ -8,7 +8,7 @@ import re
 
 from PyQt6.QtCore import QEvent, QIODevice, QObject, QPointF, QRectF, QSaveFile, QSignalBlocker, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap,
+    QBrush, QColor, QFontDatabase, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QBoxLayout, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
@@ -259,18 +259,14 @@ def _canvas(size, scale=3):
     return pixmap, painter
 
 
-def _logo():
-    pixmap, painter = _canvas(32)
-    gradient = QLinearGradient(0, 0, 32, 32)
-    gradient.setColorAt(0, QColor("#4f86b5"))
-    gradient.setColorAt(1, QColor("#36628a"))
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(gradient)
-    painter.drawRoundedRect(QRectF(0, 0, 32, 32), 8, 8)
-    painter.setBrush(QColor("#f3f8fc"))
-    for x, y, height in ((8, 18.5, 6.5), (14.25, 13, 12), (20.5, 7.5, 17.5)):
-        painter.drawRoundedRect(QRectF(x, y, 3.5, height), 1.5, 1.5)
-    painter.end()
+def _brand_wordmark():
+    import sys
+
+    resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    path = resource_dir / "assets" / "bygger-wordmark.png"
+    pixmap = QPixmap(str(path))
+    if pixmap.isNull():
+        raise FileNotFoundError(f"Unable to load brand wordmark: {path}")
     return pixmap
 
 
@@ -457,11 +453,15 @@ QPushButton#successAction { background-color: #276749; color: #ffffff; border-co
 QPushButton#successAction:disabled { background-color: #252b35; color: #718096; border-color: #323946; }
 QLabel#smartreportBrand { font-size: 18px; font-weight: 600; color: #eef3f8; }
 QLabel#smartreportCaption { color: #8e9db0; font-size: 12px; }
+QLabel#smartreportProductCaption { color: #8e9db0; font-size: 11px; }
+QFrame#smartreportBrandPlate { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 6px; }
 """
 LIGHT_EXTRA = """
 QFrame#smartreportHeader { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 10px; }
+QFrame#smartreportBrandPlate { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 6px; }
 QLabel#smartreportBrand { color: #1f3447; }
 QLabel#smartreportCaption { color: #6d8193; }
+QLabel#smartreportProductCaption { color: #6d8193; }
 QPushButton#themeToggle { background-color: #f2f6f9; color: #2c4052; border: 1px solid #d3dee7; }
 QPushButton#themeToggle:hover { background-color: #e8f0f6; border-color: #4a7398; }
 QTabBar::tab { background-color: transparent; color: #4f6577; border-bottom: 3px solid transparent; }
@@ -695,15 +695,28 @@ def header(parent=None):
     panel = QFrame(parent)
     panel.setObjectName("smartreportHeader")
     row = QHBoxLayout(panel)
-    row.setContentsMargins(14, 8, 14, 8)
+    row.setContentsMargins(14, 4, 14, 4)
     row.setSpacing(10)
-    icon = QLabel()
-    icon.setPixmap(_logo())
-    icon.setAccessibleName("Логотип SmartReport")
-    row.addWidget(icon)
-    brand = QLabel("SmartReport")
+    brand_plate = QFrame(panel)
+    brand_plate.setObjectName("smartreportBrandPlate")
+    plate_layout = QHBoxLayout(brand_plate)
+    plate_layout.setContentsMargins(4, 0, 4, 0)
+    brand = QLabel(brand_plate)
     brand.setObjectName("smartreportBrand")
-    row.addWidget(brand)
+    brand.setAccessibleName("BYGGER OCH RENOVERAR")
+    source = _brand_wordmark()
+    wordmark = source.scaled(
+        QSize(208, 44),
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    brand.setPixmap(wordmark)
+    brand.setFixedSize(wordmark.size())
+    plate_layout.addWidget(brand)
+    row.addWidget(brand_plate)
+    product_caption = QLabel("SmartReport")
+    product_caption.setObjectName("smartreportProductCaption")
+    row.addWidget(product_caption)
     toggle = ThemeToggle(manager)
     row.addSpacing(12)
     row.addWidget(toggle)

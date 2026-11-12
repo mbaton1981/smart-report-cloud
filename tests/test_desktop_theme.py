@@ -223,6 +223,40 @@ class DesktopThemeTests(unittest.TestCase):
         self.application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.assertTrue(self.manager.toggle())
 
+    def test_brand_wordmark_and_product_caption_fit_in_both_themes(self):
+        panel = theme.header()
+        assistant = QPushButton("ИИ-помощник", panel)
+        panel.layout().addWidget(assistant)
+        panel.resize(1240, 58)
+        panel.show()
+        self.application.processEvents()
+
+        brand = panel.findChild(QLabel, "smartreportBrand")
+        caption = panel.findChild(QLabel, "smartreportProductCaption")
+        button = panel.findChild(QPushButton, "themeToggle")
+        self.assertEqual(brand.accessibleName(), "BYGGER OCH RENOVERAR")
+        self.assertEqual(caption.text(), "SmartReport")
+        self.assertLessEqual(
+            abs(brand.pixmap().width() / brand.pixmap().height() - 3223 / 768),
+            1 / brand.pixmap().height(),
+        )
+        for expected_theme in ("light", "dark"):
+            if self.manager.name != expected_theme:
+                self.assertTrue(self.manager.toggle())
+            self.application.processEvents()
+            self.assertIn(
+                "QFrame#smartreportBrandPlate { background-color: #ffffff;",
+                self.manager.stylesheet(),
+            )
+            for widget in (brand, caption, button, assistant):
+                self.assertTrue(widget.isVisible())
+                self.assertGreaterEqual(widget.geometry().left(), 0)
+                self.assertGreaterEqual(widget.geometry().top(), 0)
+                self.assertLessEqual(widget.geometry().right(), panel.width())
+                self.assertLessEqual(widget.geometry().bottom(), panel.height())
+            self.assertLessEqual(panel.height(), 58)
+        panel.deleteLater()
+
     def test_dense_control_rows_stack_below_their_width_threshold(self):
         owner = QWidget()
         row = QHBoxLayout(owner)
