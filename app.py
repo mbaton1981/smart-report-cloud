@@ -2543,6 +2543,18 @@ def create_half_hour_time_field(default_time):
     return field
 
 
+def stockholm_month_bounds(offset_months=0):
+    """Первый и последний день календарного месяца по времени Стокгольма (ISO-даты)."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    month_index = today.month - 1 + offset_months
+    start = today.replace(year=today.year + month_index // 12,
+                          month=month_index % 12 + 1, day=1)
+    end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
 def requeue_expense_document_restore(queued, payload, result):
     """Переводит повторную загрузку удалённого оригинала в восстановление исходной записи."""
     old_client_id = queued["client_id"]
@@ -2798,18 +2810,39 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         save_btn = QPushButton("Сохранить смену")
         save_btn.setObjectName("primaryAction")
-        save_btn.clicked.connect(self.save_shift)
-        card_layout.addRow(save_btn)
+        save_btn.clicked.connect(self._save_shift_from_dialog)
+        cancel_shift_btn = QPushButton("Отмена")
+        cancel_shift_btn.setToolTip("Закрыть без сохранения; введённые значения остаются в форме.")
+        form_actions = QHBoxLayout()
+        form_actions.addWidget(save_btn, 1)
+        form_actions.addWidget(cancel_shift_btn)
+        card_layout.addRow(form_actions)
 
-        layout.addWidget(card)
-        
+        # Форма ручного ввода целиком живёт в отдельном окне «Добавить смену»;
+        # отмена ничего не записывает, значения сохраняются до следующего открытия.
+        self.shift_form_dialog = QDialog(self)
+        self.shift_form_dialog.setWindowTitle("Добавить смену")
+        self.shift_form_dialog.setMinimumSize(620, 560)
+        dialog_layout = QVBoxLayout(self.shift_form_dialog)
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        form_scroll.setWidget(card)
+        dialog_layout.addWidget(form_scroll)
+        cancel_shift_btn.clicked.connect(self.shift_form_dialog.reject)
+
         control_card = QFrame()
         control_card.setObjectName("card")
+        control_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         desktop_theme.apply_style(control_card, "QFrame#card { background-color: #242933; border: 1px solid #3182ce; border-radius: 8px; margin-top: 5px; }")
         c_layout = QVBoxLayout(control_card)
         c_layout.setSpacing(8)
 
         btn_row = QHBoxLayout()
+        add_shift_btn = QPushButton("Добавить смену")
+        add_shift_btn.setObjectName("primaryAction")
+        add_shift_btn.setToolTip("Открыть форму ручного ввода смены в отдельном окне")
+        add_shift_btn.clicked.connect(self.open_add_shift_dialog)
         refresh_shifts_btn = QPushButton("Обновить данные")
         refresh_shifts_btn.setObjectName("secondaryAction")
         refresh_shifts_btn.clicked.connect(self.load_shifts_history)
@@ -2832,6 +2865,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.reopen_shift_btn.setEnabled(False)
         self.reopen_shift_btn.clicked.connect(self.reopen_selected_shift)
 
+        btn_row.addWidget(add_shift_btn)
         btn_row.addWidget(refresh_shifts_btn)
         btn_row.addWidget(sync_cloud_btn)
         btn_row.addWidget(edit_shift_btn)
@@ -2848,10 +2882,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         filter_date_row = QHBoxLayout()
         filter_select_row = QHBoxLayout()
         
-        self.filter_date_from = create_date_field("2026-10-01")
+        # При запуске журнал показывает текущий календарный месяц по времени Стокгольма;
+        # выбранный пользователем период в течение сессии не сбрасывается.
+        month_start, month_end = stockholm_month_bounds()
+        self.filter_date_from = create_date_field(month_start)
         self.filter_date_from.dateChanged.connect(self.apply_shifts_filters)
 
-        self.filter_date_to = create_date_field("2026-10-31")
+        self.filter_date_to = create_date_field(month_end)
         self.filter_date_to.dateChanged.connect(self.apply_shifts_filters)
 
         self.filter_emp = QComboBox()
@@ -2876,6 +2913,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         filter_date_row.addWidget(self.filter_date_from, 1)
         filter_date_row.addWidget(QLabel("<b>по:</b>"))
         filter_date_row.addWidget(self.filter_date_to, 1)
+        this_month_btn = QPushButton("Этот месяц")
+        this_month_btn.setObjectName("shiftsThisMonth")
+        this_month_btn.clicked.connect(lambda: self.set_shift_period_month(0))
+        last_month_btn = QPushButton("Прошлый месяц")
+        last_month_btn.setObjectName("shiftsLastMonth")
+        last_month_btn.clicked.connect(lambda: self.set_shift_period_month(-1))
+        filter_date_row.addWidget(this_month_btn)
+        filter_date_row.addWidget(last_month_btn)
 
         for filter_combo in (self.filter_emp, self.filter_comp, self.filter_obj, self.filter_status):
             filter_combo.setMinimumContentsLength(9)
@@ -2930,8 +2975,23 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.table_shifts.cellDoubleClicked.connect(lambda *_: self.edit_shift())
         self.table_shifts.itemSelectionChanged.connect(self.update_reopen_shift_action)
         self.table_shifts.currentCellChanged.connect(self.update_reopen_shift_action)
-        layout.addWidget(self.table_shifts)
+        layout.addWidget(self.table_shifts, 1)
         self.load_shifts_history()
+
+    def open_add_shift_dialog(self, *_):
+        """Открывает форму ручного ввода смены; отмена ничего не записывает."""
+        self.load_dropdowns(refresh_tables=False)
+        self.shift_form_dialog.exec()
+
+    def _save_shift_from_dialog(self, *_):
+        if self.save_shift():
+            self.shift_form_dialog.accept()
+
+    def set_shift_period_month(self, offset_months):
+        start, end = stockholm_month_bounds(offset_months)
+        self.filter_date_from.setDate(QDate.fromString(start, "yyyy-MM-dd"))
+        self.filter_date_to.setDate(QDate.fromString(end, "yyyy-MM-dd"))
+        self.apply_shifts_filters()
 
     def update_ob_form_visibility(self, *_):
         is_ob = self.record_type_cb.currentData() == RECORD_TYPE_OB
@@ -14027,6 +14087,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         else:
             QMessageBox.information(self, "Сохранено локально", "Запись сохранена отдельно от рабочих часов. Сервер не поддерживает этот тип, поэтому запись остаётся в локальной очереди.")
         self.load_shifts_history()
+        return True
 
     def load_shifts_history(self):
         try:

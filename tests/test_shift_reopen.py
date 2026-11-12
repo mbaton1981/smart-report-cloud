@@ -133,6 +133,71 @@ class ReopenShiftTests(unittest.TestCase):
         self.assertEqual(self.local_rows()["reopen-target"]["invoiced"], 0)
         self.assertFalse(self.server_rows()["reopen-target"]["is_deleted"])
 
+    def test_hours_tab_stockholm_month_quick_periods_and_add_shift_dialog(self):
+        self.closed()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        self.addCleanup(window.deleteLater)
+        window.tab_hours = self.desktop.QWidget()
+        window.setCentralWidget(window.tab_hours)
+        window.load_dropdowns = lambda **kwargs: None
+        with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}):
+            window.setup_hours_tab()
+
+        # Запуск: текущий календарный месяц по времени Стокгольма, а не прежний октябрь.
+        start, end = self.desktop.stockholm_month_bounds()
+        self.assertEqual(window.filter_date_from.text(), start)
+        self.assertEqual(window.filter_date_to.text(), end)
+
+        # Быстрый выбор «Прошлый месяц»; произвольный период остаётся доступным.
+        window.set_shift_period_month(-1)
+        previous_start, previous_end = self.desktop.stockholm_month_bounds(-1)
+        self.assertEqual(window.filter_date_from.text(), previous_start)
+        self.assertEqual(window.filter_date_to.text(), previous_end)
+
+        # Выбранный период сохраняется при обновлении журнала и синхронизации.
+        window.load_shifts_history()
+        self.assertEqual(window.filter_date_from.text(), previous_start)
+        self.assertEqual(window.filter_date_to.text(), previous_end)
+
+        # Добавление смены через отдельное окно обновляет журнал.
+        conn = self.desktop.get_db_connection()
+        conn.execute("INSERT INTO objects (company,name,markning,rate,transport_rate,is_active) "
+                     "VALUES ('Renatur','Dialog object','p-dialog',500,0,1)")
+        conn.commit()
+        rows_before = conn.execute("SELECT COUNT(*) FROM shifts").fetchone()[0]
+        conn.close()
+        window.emp_cb.addItem("Dialog Employee")
+        window.comp_cb.setCurrentText("Renatur")
+        window.obj_cb.addItem("Dialog object")
+        window.obj_cb.setCurrentText("Dialog object")
+        window.date_input.setDate(self.desktop.QDate.fromString(previous_start, "yyyy-MM-dd"))
+        window.hours_input.setText("8.0")
+        table_rows_before = window.table_shifts.rowCount()
+        with patch.object(self.desktop.QMessageBox, "information"), \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(window, "background_sync_with_cloud"):
+            window._save_shift_from_dialog()
+        self.assertEqual(warning.call_count, 0,
+                         warning.call_args_list and warning.call_args_list[0].args)
+        self.assertEqual(window.shift_form_dialog.result(),
+                         self.desktop.QDialog.DialogCode.Accepted)
+        self.assertEqual(window.table_shifts.rowCount(), table_rows_before + 1)
+        conn = self.desktop.get_db_connection()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM shifts").fetchone()[0], rows_before + 1)
+        conn.close()
+        # Период не сброшен после сохранения и обновления журнала.
+        self.assertEqual(window.filter_date_from.text(), previous_start)
+
+        # Отмена ничего не записывает.
+        window.hours_input.setText("5.5")
+        window.shift_form_dialog.reject()
+        conn = self.desktop.get_db_connection()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM shifts").fetchone()[0], rows_before + 1)
+        conn.close()
+        self.assertEqual(window.table_shifts.rowCount(), table_rows_before + 1)
+
     def test_real_hours_tab_mouse_selection_enables_reopen_for_first_current_row(self):
         from PyQt6.QtCore import Qt
         from PyQt6.QtTest import QTest
@@ -146,6 +211,9 @@ class ReopenShiftTests(unittest.TestCase):
         window.load_dropdowns = lambda **kwargs: None
         with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}):
             window.setup_hours_tab()
+            # Журнал по умолчанию показывает текущий месяц; тестовые смены — октябрь 2026.
+            window.filter_date_from.setDate(self.desktop.QDate.fromString("2026-10-01", "yyyy-MM-dd"))
+            window.filter_date_to.setDate(self.desktop.QDate.fromString("2026-10-31", "yyyy-MM-dd"))
             window.resize(1450, 1000)
             window.show()
             self.qt_app.processEvents()
