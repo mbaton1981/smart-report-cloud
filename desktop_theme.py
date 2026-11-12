@@ -8,11 +8,11 @@ import re
 
 from PyQt6.QtCore import QEvent, QIODevice, QObject, QPointF, QRectF, QSaveFile, QSignalBlocker, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+    QBrush, QColor, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QBoxLayout, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
-    QPushButton, QSplitter, QTableWidget,
+    QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableWidget,
 )
 
 COLORS = {
@@ -31,9 +31,18 @@ COLORS = {
     "#276749": "#4f705c", "#38a169": "#61836b", "#c6f6d5": "#8fb19a",
     "#68d391": "#376b4b", "#f6ad55": "#885c21", "#fca5a5": "#9c3e46",
     "#cbd5e1": "#52697b", "#cbd5e0": "#b9cad7",
+    "#24445f": "#dcecf8", "#254c39": "#dcf1e4",
+    "#dbeafe": "#16314a", "#d5f5e3": "#12351f",
 }
 BACKGROUND_ROLE = int(Qt.ItemDataRole.UserRole) + 271
 FOREGROUND_ROLE = BACKGROUND_ROLE + 1
+SHIFT_CONFIRMED_BG, SHIFT_CONFIRMED_FG = "#24445f", "#dbeafe"
+SHIFT_INVOICED_BG, SHIFT_INVOICED_FG = "#254c39", "#d5f5e3"
+# Цвет выделенной строки статуса: тёмная тема (фон, текст), светлая тема (фон, текст).
+STATUS_SELECTION = {
+    SHIFT_CONFIRMED_BG: (("#3a6ea5", "#ffffff"), ("#7fb0d8", "#0f2638")),
+    SHIFT_INVOICED_BG: (("#2f7a54", "#ffffff"), ("#86c7a1", "#0f2a1a")),
+}
 
 
 def current_theme():
@@ -181,6 +190,38 @@ def item_color(item, value, *, foreground=False):
     table = item.tableWidget()
     if table is not None:
         register_table_color_item(table, item)
+
+
+class StatusRowDelegate(QStyledItemDelegate):
+    """Выделенная строка статуса остаётся читаемой и отличается от обычной окраски статуса."""
+
+    _override = None
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if self._override is None:
+            return
+        background, foreground = (QColor(value) for value in self._override)
+        option.backgroundBrush = QBrush(background)
+        palette = QPalette(option.palette)
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+            palette.setColor(group, QPalette.ColorRole.Text, foreground)
+        option.palette = palette
+
+    def paint(self, painter, option, index):
+        status = index.data(BACKGROUND_ROLE)
+        selection = STATUS_SELECTION.get(str(status).lower()) if status else None
+        if selection is None or not option.state & QStyle.StateFlag.State_Selected:
+            super().paint(painter, option, index)
+            return
+        # Без State_Selected общий стиль таблицы не перекрывает цвет выделения статуса.
+        option = QStyleOptionViewItem(option)
+        option.state &= ~(QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_MouseOver)
+        self._override = selection[current_theme() == "light"]
+        try:
+            super().paint(painter, option, index)
+        finally:
+            self._override = None
 
 
 def register_table_color_item(table, item):

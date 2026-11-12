@@ -312,6 +312,28 @@ class DesktopThemeTests(unittest.TestCase):
             a, b = sorted((luminance(foreground), luminance(background)))
             self.assertGreaterEqual((b + .05) / (a + .05), 4.5, (foreground, background))
 
+    def test_shift_status_colors_are_readable_and_selection_differs_in_both_themes(self):
+        def luminance(value):
+            channels = [int(value[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            linear = [v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4 for v in channels]
+            return sum(a * b for a, b in zip(linear, (.2126, .7152, .0722)))
+
+        def contrast(first, second):
+            a, b = sorted((luminance(first), luminance(second)))
+            return (b + .05) / (a + .05)
+
+        for background, foreground in ((theme.SHIFT_CONFIRMED_BG, theme.SHIFT_CONFIRMED_FG),
+                                       (theme.SHIFT_INVOICED_BG, theme.SHIFT_INVOICED_FG)):
+            selection = theme.STATUS_SELECTION[background]
+            for index, light in enumerate((False, True)):
+                row_background = theme.COLORS[background] if light else background
+                row_foreground = theme.COLORS[foreground] if light else foreground
+                self.assertGreaterEqual(contrast(row_foreground, row_background), 4.5)
+                self.assertGreaterEqual(contrast(*selection[index]), 4.5)
+                self.assertGreaterEqual(contrast(selection[index][0], row_background), 1.5)
+        self.assertEqual(theme.COLORS[theme.SHIFT_CONFIRMED_BG], "#dcecf8")
+        self.assertEqual(theme.COLORS[theme.SHIFT_INVOICED_BG], "#dcf1e4")
+
     def test_theme_does_not_rewrite_pdf_bytes_or_readonly_fields(self):
         from io import BytesIO
         from reportlab.pdfgen.canvas import Canvas

@@ -2972,6 +2972,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.table_shifts.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.table_shifts.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_shifts.setAlternatingRowColors(True)
+        self.table_shifts.setItemDelegate(desktop_theme.StatusRowDelegate(self.table_shifts))
         self.table_shifts.cellDoubleClicked.connect(lambda *_: self.edit_shift())
         self.table_shifts.itemSelectionChanged.connect(self.update_reopen_shift_action)
         self.table_shifts.currentCellChanged.connect(self.update_reopen_shift_action)
@@ -14223,9 +14224,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     elif col_idx in (2, 3, 4, 7, 10) and val:
                         it.setToolTip(str(val))
                     if is_inv:
-                        desktop_theme.item_color(it, "#1c4532")
+                        desktop_theme.item_color(it, desktop_theme.SHIFT_INVOICED_BG)
+                        desktop_theme.item_color(it, desktop_theme.SHIFT_INVOICED_FG, foreground=True)
                     elif hours_confirmed:
-                        desktop_theme.item_color(it, "#2b6cb0")
+                        desktop_theme.item_color(it, desktop_theme.SHIFT_CONFIRMED_BG)
+                        desktop_theme.item_color(it, desktop_theme.SHIFT_CONFIRMED_FG, foreground=True)
                     self.table_shifts.setItem(row_idx, col_idx, it)
             desktop_theme.refresh_table_item_colors(table)
             self.load_dropdowns(refresh_tables=False)
