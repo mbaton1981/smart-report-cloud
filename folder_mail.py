@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import imaplib
+import json
+import os
 import re
 import ssl
+import tempfile
 from datetime import date, timedelta
 from email import policy
 from email.parser import BytesParser
+from pathlib import Path
 from threading import Event
 from time import monotonic
 
@@ -18,10 +22,50 @@ from offline_review import ReviewError
 FOLDER = "INBOX"
 RECENT_DAYS = 14
 IMPORT_START_DATE = date(2026, 11, 1)
+REMINDER_STATE_KEYS = frozenset({"last_successful_check", "last_suggestion_date"})
 
 
 class FolderError(ReviewError):
     pass
+
+
+def reminder_state_path():
+    from desktop_auth import app_data_dir
+    return app_data_dir() / "mail_reminder_state.json"
+
+
+def load_reminder_state():
+    try:
+        state = json.loads(reminder_state_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as error:
+        raise FolderError("reminder_state") from error
+    if (not isinstance(state, dict)
+            or any(key in state and not isinstance(state[key], str) for key in REMINDER_STATE_KEYS)):
+        raise FolderError("reminder_state")
+    return state
+
+
+def save_reminder_state(**updates):
+    if (not updates or not set(updates).issubset(REMINDER_STATE_KEYS)
+            or any(not isinstance(value, str) or not value for value in updates.values())):
+        raise ValueError("Invalid mail reminder state.")
+    path = reminder_state_path()
+    state = load_reminder_state()
+    state.update(updates)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                prefix=path.name + ".", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(state, output, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def checked(response, stage):
@@ -293,6 +337,7 @@ def create_import_dialog(window, start, end, *, archive=False):
             self.stop_event = Event()
             self.report = None
             self.successful = False
+            self._completion_callbacks = []
             super().__init__(self.operation, offline=False, parent=window)
             self.progress_signal = Progress(self)
             self.progress_signal.updated.connect(self.show_progress)
@@ -367,6 +412,18 @@ def create_import_dialog(window, start, end, *, archive=False):
             window.reload_documents()
             if self.report:
                 window.status.setText(self.status.text())
+            completed = bool(
+                self.successful and self.report and not self.report.get("stopped")
+                and self.report.get("phase") == "finished"
+                and self.report.get("completed") == self.report.get("total")
+            )
+            callbacks, self._completion_callbacks = self._completion_callbacks, []
+            for callback in callbacks:
+                callback(completed, self.report)
+
+        def add_completion_callback(self, callback):
+            if callback is not None and callback not in self._completion_callbacks:
+                self._completion_callbacks.append(callback)
 
         def reject(self):
             if self.worker is not None:
@@ -386,21 +443,24 @@ def create_import_dialog(window, start, end, *, archive=False):
     return FolderDialog()
 
 
-def open_import_dialog(window, *, archive=False):
+def open_import_dialog(window, *, archive=False, on_complete=None):
     if date.today() < IMPORT_START_DATE:
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.information(window, "Получение с 01.11.2026", ERRORS["import_not_started"])
         return
     existing = getattr(window, "_mail_import_dialog", None)
     if existing is not None and existing.isVisible():
+        existing.add_completion_callback(on_complete)
         existing.raise_()
         existing.activateWindow()
-        return
+        return existing
     if not window.keep_unsaved():
         return
     period = archive_period(window) if archive else recent_period()
     if period is None:
         return
     dialog = create_import_dialog(window, *period, archive=archive)
+    dialog.add_completion_callback(on_complete)
     window._mail_import_dialog = dialog
     dialog.show()
+    return dialog

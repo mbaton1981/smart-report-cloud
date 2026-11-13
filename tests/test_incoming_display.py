@@ -1,12 +1,15 @@
 import json
+import tempfile
 import unittest
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QBoxLayout
+from PyQt6.QtWidgets import QBoxLayout, QWidget
 
 import test_incoming_integration as integration
+import desktop_theme
 from offline_review import ReviewError
 
 
@@ -16,6 +19,7 @@ class IncomingDisplayTests(unittest.TestCase):
     _add_company = integration.IncomingIntegrationTests._add_company
     setUp = integration.IncomingIntegrationTests.setUp
     stage = integration.IncomingIntegrationTests.stage
+    approve = integration.IncomingIntegrationTests.approve
 
     def test_document_preview_controls_reflow_in_small_dialog(self):
         dialogs = (
@@ -35,13 +39,153 @@ class IncomingDisplayTests(unittest.TestCase):
                 ))
                 dialog.close()
 
-    def open_window(self):
+    def open_window(self, document_id=None, *, select_first=True):
         from offline_review_ui import OfflineReviewWindow
-        window = OfflineReviewWindow(self.store, integrated=True)
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=document_id)
         self.addCleanup(window.close)
         window.show()
+        if document_id is None and select_first and window.selector.count():
+            default_index = window.selector.findData(1)
+            if default_index >= 0:
+                window.selector.setCurrentIndex(default_index)
         self.qt_app.processEvents()
         return window
+
+    def test_incoming_defaults_to_new_unprocessed_documents_without_preview(self):
+        revision = self.approve(2)
+        self.store.transfer(2, revision)
+        window = self.open_window(select_first=False)
+
+        visible_ids = [window.selector.itemData(i) for i in range(window.selector.count())]
+        self.assertEqual(visible_ids, [3, 1])
+        self.assertIsNone(window.selector.currentData())
+        self.assertIsNone(window.document_id)
+        self.assertIsNone(window.gallery)
+        self.assertTrue(window.empty_state.isVisible())
+        self.assertIn("Выберите документ", window.empty_state.text())
+
+        window.show_all_states.setChecked(True)
+        self.assertEqual(
+            [window.selector.itemData(i) for i in range(window.selector.count())], [3, 2, 1])
+        self.assertIsNone(window.selector.currentData())
+
+    def test_registered_document_opens_explicitly_even_when_accounted(self):
+        revision = self.approve(2)
+        self.store.transfer(2, revision)
+        window = self.open_window(document_id=2)
+
+        self.assertEqual(window.selector.currentData(), 2)
+        self.assertEqual(window.document_id, 2)
+        self.assertIsNotNone(window.gallery)
+        self.assertFalse(window.empty_state.isVisible())
+
+    def test_expense_mail_reminder_uses_both_themes_and_does_not_mark_failed_check(self):
+        from datetime import date
+        import folder_mail
+        from desktop_theme import ThemeManager
+
+        entry_calls = []
+        tab_host = SimpleNamespace(
+            load_dropdowns=lambda **_kwargs: None,
+            load_expense_document_filters=lambda: None,
+            load_expense_documents=lambda: None,
+            exp_document_tabs=SimpleNamespace(currentIndex=lambda: 0),
+            _maybe_show_mail_reminder=lambda: entry_calls.append(True),
+        )
+        self.desktop.SmartReportApp.on_tab_changed(tab_host, 3)
+        self.assertEqual(entry_calls, [True])
+
+        host = QWidget()
+        host.tab_expenses = QWidget()
+        host.tab_object_expenses = QWidget()
+        mail_check_calls = []
+        host.open_mail_queue = lambda *_args: mail_check_calls.append(True)
+        host._format_mail_check_time = lambda value: (
+            self.desktop.SmartReportApp._format_mail_check_time(host, value))
+        methods = (
+            "upload_expense_document", "open_manual_document_dialog",
+            "open_incoming_documents", "reprocess_selected_document", "calculate_allocation_vat",
+            "review_selected_document", "open_selected_document_original",
+            "assign_selected_expense_document", "expense_detail_primary_action",
+            "delete_selected_expense_document", "_update_expense_register_legend",
+            "_on_expense_view_changed", "load_expense_document_filters", "load_expense_documents",
+            "load_object_expense_overview", "_update_expense_detail", "_on_expense_row_changed",
+        )
+        for name in methods:
+            setattr(host, name, lambda *_args, **_kwargs: None)
+        previous = getattr(self.qt_app, "_smartreport_theme", None)
+        previous_style = self.qt_app.styleSheet()
+        with tempfile.TemporaryDirectory() as temp:
+            manager = ThemeManager(
+                self.qt_app, self.desktop.DARK_THEME_QSS, Path(temp) / "appearance.json")
+            self.qt_app._smartreport_theme = manager
+            self.desktop.SmartReportApp.setup_expenses_tab(host)
+            self.addCleanup(manager.deleteLater)
+            self.addCleanup(
+                lambda: setattr(self.qt_app, "_smartreport_theme", previous)
+                if previous is not None else delattr(self.qt_app, "_smartreport_theme")
+                if hasattr(self.qt_app, "_smartreport_theme") else None)
+            self.addCleanup(lambda: self.qt_app.setStyleSheet(previous_style))
+
+            for name, background in (("dark", "#26394b"), ("light", "#e4f2ff")):
+                manager.name = name
+                manager.apply()
+                self.assertIn(background, host.mail_reminder_banner.styleSheet())
+            window = self.open_window(select_first=False)
+            self.assertTrue(window.empty_state.isVisible())
+            for name, background in (("dark", "#242933"), ("light", "#f7f9fb")):
+                manager.name = name
+                manager.apply()
+                self.assertIn(background, window.empty_state.styleSheet())
+            self.assertEqual(host.mail_reminder_title.text(), "Проверить новые фактуры в почте?")
+            self.assertEqual(host.mail_reminder_check.text(), "Проверить")
+            self.assertEqual(host.mail_reminder_later.text(), "Позже")
+            self.assertIn("Проверить почту", host.exp_actions)
+            host.mail_reminder_check.click()
+            self.assertEqual(mail_check_calls, [True])
+
+            stamp = "2026-11-12T12:30:00+00:00"
+            with patch.object(folder_mail, "load_reminder_state", return_value={
+                    "last_successful_check": stamp, "last_suggestion_date": None}) as load, \
+                    patch.object(folder_mail, "save_reminder_state") as save:
+                self.desktop.SmartReportApp._maybe_show_mail_reminder(host)
+                load.assert_called_once_with()
+                save.assert_called_once_with(last_suggestion_date=date.today().isoformat())
+            self.assertIn("12.11.2026", host.mail_reminder_last_check.text())
+
+            host.mail_reminder_later.click()
+            self.assertTrue(host.mail_reminder_banner.isHidden())
+            host._mail_reminder_shown_today = None
+            with patch.object(folder_mail, "load_reminder_state", return_value={
+                    "last_suggestion_date": date.today().isoformat()}) as load, \
+                    patch.object(folder_mail, "save_reminder_state") as save:
+                self.desktop.SmartReportApp._maybe_show_mail_reminder(host)
+                load.assert_called_once_with()
+                save.assert_not_called()
+            self.assertTrue(host.mail_reminder_banner.isHidden())
+
+            with patch.object(folder_mail, "save_reminder_state") as save:
+                self.desktop.SmartReportApp.mail_import_completed(host, False, None)
+                save.assert_not_called()
+            self.assertIn("не изменено", host.mail_reminder_result.text())
+
+            with patch.object(folder_mail, "save_reminder_state") as save:
+                self.desktop.SmartReportApp.mail_import_completed(
+                    host, True, {
+                        "new_drafts": 4, "phase": "finished", "completed": 2,
+                        "total": 2, "stopped": False,
+                    })
+                save.assert_called_once()
+            self.assertIn("Новых документов: 4", host.mail_reminder_result.text())
+            with patch.object(folder_mail, "save_reminder_state") as save:
+                self.desktop.SmartReportApp.mail_import_completed(
+                    host, True, {
+                        "new_drafts": 1, "phase": "finished", "completed": 1,
+                        "total": 2, "stopped": False,
+                    })
+                save.assert_not_called()
+            self.assertIn("не изменено", host.mail_reminder_result.text())
+        host.close()
 
     def background_refresh(self, window):
         self.host._incoming_viewer = window
@@ -542,10 +686,12 @@ class IncomingDisplayTests(unittest.TestCase):
         from test_mail_automation import pdf
         self.store.add_pdf(pdf("No recognizable fields"), "unknown.pdf", {"fields": {}, "state": "failed"})
         window = self.open_window()
-        label = window.selector.itemText(window.selector.count() - 1)
+        document_id = self.store.documents()[-1]["id"]
+        row = window.selector.findData(document_id)
+        label = window.selector.itemText(row)
         for value in ("Поставщик не распознан", "Дата не распознана", "Сумма не определена — нужна проверка"):
             self.assertIn(value, label)
-        window.selector.setCurrentIndex(window.selector.count() - 1)
+        window.selector.setCurrentIndex(row)
         self.assertEqual(window.inputs["gross_amount"].text(), "")
         self.assertIn("Сумма не определена — нужна проверка", window.classification.text())
 

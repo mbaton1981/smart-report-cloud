@@ -89,7 +89,7 @@ class OfflineReviewWindow(QDialog):
         banner.setWordWrap(True)
         layout.addWidget(banner)
         if integrated:
-            self.show_all_states = QCheckBox("Все состояния (включая исключённые)")
+            self.show_all_states = QCheckBox("Все документы (включая учтённые и исключённые)")
             self.show_all_states.toggled.connect(lambda _checked: self.reload_documents())
             layout.addWidget(self.show_all_states)
         self.selector = QComboBox()
@@ -103,11 +103,9 @@ class OfflineReviewWindow(QDialog):
             )
         self._label_signatures = {}
         self._label_token = None
-        for doc in store.documents():
-            if (not integrated or self.show_all_states.isChecked()
-                    or doc["id"] == self.explicit_document_id
-                    or store.action(doc["id"])[1] != "ignore"):
-                self.selector.addItem("", doc["id"])
+        for doc in self._visible_documents():
+            self.selector.addItem("", doc["id"])
+        self.selector.setCurrentIndex(self.selector.findData(document_id))
         layout.addWidget(self.selector)
         self.classification = QLabel()
         self.classification.setWordWrap(True)
@@ -122,6 +120,16 @@ class OfflineReviewWindow(QDialog):
         self.preview_host = QWidget()
         self.preview_host.setMinimumWidth(220)
         self.preview_layout = QVBoxLayout(self.preview_host)
+        self.empty_state = QLabel()
+        self.empty_state.setObjectName("incomingEmptyState")
+        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state.setWordWrap(True)
+        desktop_theme.apply_style(
+            self.empty_state,
+            "QLabel { color: #a0aec0; background-color: #242933; "
+            "border: 1px dashed #4a5568; border-radius: 8px; padding: 18px; }",
+        )
+        self.preview_layout.addWidget(self.empty_state)
         self.splitter.addWidget(self.preview_host)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -313,6 +321,18 @@ class OfflineReviewWindow(QDialog):
         self.transfer_button.clicked.connect(self.confirm_transfer)
         self.registry_button.clicked.connect(self.show_registry)
         self.select_document()
+        self.refresh_document_labels()
+
+    def _visible_documents(self):
+        documents = sorted(self.store.documents(), key=lambda item: item["id"], reverse=True)
+        if not self.integrated or self.show_all_states.isChecked():
+            return documents
+        return [
+            document for document in documents
+            if document["id"] == self.explicit_document_id
+            or (self.store.action(document["id"])[1] != "ignore"
+                and self.store.card(document["id"]) is None)
+        ]
 
     def payload(self):
         result = {**{key: widget.text().strip() or None for key, widget in self.inputs.items()},
@@ -676,27 +696,19 @@ class OfflineReviewWindow(QDialog):
         dirty = hasattr(self, "loaded_payload") and self.payload() != self.loaded_payload
         self.selector.blockSignals(True)
         selected = self.selector.currentData()
-        visible = {
-            doc["id"] for doc in self.store.documents()
-            if (not self.integrated or self.show_all_states.isChecked()
-                or doc["id"] == self.explicit_document_id
-                or self.store.action(doc["id"])[1] != "ignore")
-        }
-        for index in range(self.selector.count() - 1, -1, -1):
-            if self.selector.itemData(index) not in visible:
-                self.selector.removeItem(index)
-        existing = {self.selector.itemData(index) for index in range(self.selector.count())}
-        for doc in self.store.documents():
-            if doc["id"] in visible and doc["id"] not in existing:
-                self.selector.addItem("", doc["id"])
-                self._label_token = None
+        documents = self._visible_documents()
+        visible = {doc["id"] for doc in documents}
+        self.selector.clear()
+        for doc in documents:
+            self.selector.addItem("", doc["id"])
+        self._label_token = None
+        self._label_signatures = {}
         preferred = document_id if document_id in visible else selected
-        self.selector.setCurrentIndex(max(0, self.selector.findData(preferred)))
+        self.selector.setCurrentIndex(self.selector.findData(preferred))
         self.selector.blockSignals(False)
         if not dirty:
             self.select_document()
-        else:
-            self.refresh_document_labels()
+        self.refresh_document_labels()
 
     def refresh_server_review(self):
         self.refresh_objects()
@@ -774,13 +786,36 @@ class OfflineReviewWindow(QDialog):
     def select_document(self):
         self.document_id = self.selector.currentData()
         if self.document_id is None:
+            if self.gallery is not None:
+                self.preview_layout.removeWidget(self.gallery)
+                self.gallery.hide()
+                self.gallery.close()
+                self.gallery.deleteLater()
+                self.gallery = None
+            self.preview_document_id = None
+            self.empty_state.setText(
+                "Нет необработанных документов. Включите фильтр «Все документы», "
+                "чтобы просмотреть учтённые и исключённые."
+                if self.integrated and self.selector.count() == 0 else
+                "Выберите документ в списке. Предпросмотр появится после выбора."
+            )
+            self.empty_state.show()
+            self.classification.setText("Документ не выбран.")
+            self.order_number_label.clear()
+            for field in self.inputs.values():
+                field.blockSignals(True)
+                field.clear()
+                field.blockSignals(False)
             self.save_button.setEnabled(False)
             self.transfer_button.setEnabled(False)
+            self.financial_panel.hide()
             if self.integrated:
-                self.financial_panel.hide()
                 for button in (self.ignore_button, self.later_button, self.expense_button):
                     button.setEnabled(False)
+            self.status.setText(self.empty_state.text())
             return
+        self.empty_state.hide()
+        self.financial_panel.show()
         for key in self._validation_styles:
             self._clear_validation_field(key)
         self.checked.setStyleSheet("")

@@ -190,6 +190,34 @@ class FolderMailUITests(unittest.TestCase):
         with patch.object(folder_mail, "create_import_dialog", side_effect=AssertionError("No duplicate")):
             folder_mail.open_import_dialog(self.window, archive=True)
 
+    def test_completion_callback_requires_finished_check_and_ignores_connection_failure(self):
+        complete_report = {
+            "phase": "finished", "completed": 2, "total": 2, "stopped": False,
+            "new_drafts": 3, "messages": 2, "skipped": 0, "duplicates": 0,
+            "excluded": 0, "without_pdf": 0, "recognition_failed": 0,
+            "start": "2026-11-02", "end": "2026-11-15",
+        }
+        successful = folder_mail.create_import_dialog(self.window, *folder_mail.recent_period())
+        self.addCleanup(successful.close)
+        outcomes = []
+        successful.add_completion_callback(lambda ok, report: outcomes.append((ok, report)))
+        with patch.object(folder_mail, "import_folder", return_value=complete_report):
+            successful.password.setText("isolated-only")
+            successful.accept()
+            self.finish(successful)
+        self.assertEqual(outcomes, [(True, complete_report)])
+
+        failed = folder_mail.create_import_dialog(self.window, *folder_mail.recent_period())
+        self.addCleanup(failed.close)
+        failed_outcomes = []
+        failed.add_completion_callback(lambda ok, report: failed_outcomes.append((ok, report)))
+        with patch.object(folder_mail, "import_folder",
+                          side_effect=folder_mail.FolderError("network")):
+            failed.password.setText("isolated-only")
+            failed.accept()
+            self.finish(failed)
+        self.assertEqual(failed_outcomes, [(False, None)])
+
     def test_invalid_archive_does_not_reach_confirmation_or_mail(self):
         def choose_invalid(dialog):
             today = date.today()

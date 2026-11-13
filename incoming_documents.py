@@ -721,11 +721,13 @@ def open_incoming(host, root, document_id=None):
     mail = QPushButton(mail_caption())
     mail.setObjectName("incoming_receive_mail")
     mail.setToolTip("По дате получения письма. Обработанные UID пропускаются без скачивания и OCR.")
-    mail.clicked.connect(lambda: open_import_dialog(window))
+    mail.clicked.connect(lambda: open_import_dialog(
+        window, on_complete=getattr(host, "mail_import_completed", None)))
     window.layout().insertWidget(1, mail)
     archive = QPushButton("Загрузить архив")
     archive.setObjectName("incoming_mail_archive")
-    archive.clicked.connect(lambda: open_import_dialog(window, archive=True))
+    archive.clicked.connect(lambda: open_import_dialog(
+        window, archive=True, on_complete=getattr(host, "mail_import_completed", None)))
     window.layout().insertWidget(2, archive)
     files = QPushButton("Открыть PDF и распознать")
 

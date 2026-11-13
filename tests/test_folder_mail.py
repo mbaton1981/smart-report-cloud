@@ -6,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from folder_mail import FOLDER, HOST, ADDRESS, FolderError, import_folder
+from folder_mail import (
+    FOLDER, HOST, ADDRESS, FolderError, import_folder, load_reminder_state,
+    save_reminder_state,
+)
 from incoming_documents import IncomingStore
 from test_mail_automation import eml, pdf, recognized
 
@@ -89,6 +92,22 @@ class FolderMailTests(unittest.TestCase):
 
     def run_import(self):
         return import_folder(self.store, "isolated-only", client_factory=FolderIMAP, recognizer=recognized)
+
+    def test_reminder_state_roundtrips_and_rejects_corruption(self):
+        state_path = Path(self.temp.name) / "mail_reminder_state.json"
+        with patch("folder_mail.reminder_state_path", return_value=state_path):
+            save_reminder_state(last_suggestion_date="2026-11-13")
+            save_reminder_state(last_successful_check="2026-11-13T15:00:00+00:00")
+            self.assertEqual(load_reminder_state(), {
+                "last_suggestion_date": "2026-11-13",
+                "last_successful_check": "2026-11-13T15:00:00+00:00",
+            })
+            state_path.write_text("{broken", encoding="utf-8")
+            with self.assertRaises(FolderError):
+                load_reminder_state()
+            with self.assertRaises(FolderError):
+                save_reminder_state(last_suggestion_date="2026-11-14")
+            self.assertEqual(state_path.read_text(encoding="utf-8"), "{broken")
 
     def test_all_folder_messages_no_five_cap_and_replay_zero_new(self):
         self.assertEqual(self.run_import()["new_drafts"], 7)

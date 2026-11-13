@@ -2725,6 +2725,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.load_expense_documents()
             if self.exp_document_tabs.currentIndex() == 1:
                 self.load_object_expense_overview()
+            self._maybe_show_mail_reminder()
         elif index == 5:
             self.load_objects_table()
         elif index == 6:
@@ -7204,6 +7205,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         action_items = (
             ("Загрузить PDF / фото", self.upload_expense_document),
             ("Добавить вручную", self.open_manual_document_dialog),
+            ("Проверить почту", self.open_mail_queue),
             ("Открыть входящие", self.open_incoming_documents),
             ("Распознать сохранённый оригинал", self.reprocess_selected_document),
             ("НДС по позициям", lambda: self.calculate_allocation_vat(self.table_supplier_documents)),
@@ -7214,7 +7216,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         from incoming_documents import enabled as incoming_enabled
         self.exp_actions = {}
         for label, callback in action_items:
-            if label == "Открыть входящие" and not incoming_enabled():
+            if label in {"Проверить почту", "Открыть входящие"} and not incoming_enabled():
                 continue
             action = actions_menu.addAction(label)
             action.triggered.connect(lambda _checked=False, handler=callback: handler())
@@ -7227,6 +7229,43 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         actions_button.setToolTip("Загрузка, распознавание и другие действия с расходами")
         title_row.addWidget(actions_button, 0, Qt.AlignmentFlag.AlignTop)
         page_layout.addLayout(title_row)
+
+        self.mail_reminder_banner = QFrame(self.exp_documents_page)
+        self.mail_reminder_banner.setObjectName("mailReminderBanner")
+        desktop_theme.apply_style(
+            self.mail_reminder_banner,
+            "QFrame#mailReminderBanner { background-color: #26394b; "
+            "border: 1px solid #2b6cb0; border-radius: 7px; }",
+        )
+        reminder_layout = QHBoxLayout(self.mail_reminder_banner)
+        reminder_layout.setContentsMargins(12, 8, 12, 8)
+        reminder_layout.setSpacing(10)
+        reminder_text = QVBoxLayout()
+        self.mail_reminder_title = QLabel("Проверить новые фактуры в почте?")
+        self.mail_reminder_title.setStyleSheet("font-weight: 700;")
+        self.mail_reminder_last_check = QLabel("Последняя успешная проверка: ещё не выполнялась")
+        self.mail_reminder_last_check.setWordWrap(True)
+        desktop_theme.apply_style(
+            self.mail_reminder_last_check, "QLabel { color: #a0aec0; }")
+        self.mail_reminder_result = QLabel("")
+        self.mail_reminder_result.setWordWrap(True)
+        desktop_theme.apply_style(
+            self.mail_reminder_result, "QLabel { color: #a0aec0; }")
+        reminder_text.addWidget(self.mail_reminder_title)
+        reminder_text.addWidget(self.mail_reminder_last_check)
+        reminder_text.addWidget(self.mail_reminder_result)
+        reminder_layout.addLayout(reminder_text, 1)
+        self.mail_reminder_check = QPushButton("Проверить")
+        self.mail_reminder_check.setObjectName("primaryAction")
+        self.mail_reminder_check.clicked.connect(self.open_mail_queue)
+        self.mail_reminder_later = QPushButton("Позже")
+        self.mail_reminder_later.setObjectName("secondaryAction")
+        self.mail_reminder_later.clicked.connect(self.mail_reminder_banner.hide)
+        reminder_layout.addWidget(self.mail_reminder_check)
+        reminder_layout.addWidget(self.mail_reminder_later)
+        desktop_theme.adapt_box_layout(self.mail_reminder_banner, reminder_layout, compact_width=900)
+        self.mail_reminder_banner.hide()
+        page_layout.addWidget(self.mail_reminder_banner)
 
         self.exp_metrics = {}
         self.exp_metric_labels = {}
@@ -7894,8 +7933,81 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.review_selected_document()
 
     def open_mail_queue(self):
-        QMessageBox.information(self, "Почта отключена", "Почтовое получение в интеграционный кандидат не включено.")
-        return
+        from incoming_documents import enabled
+        if not enabled():
+            self.open_incoming_documents()
+            return
+        self.open_incoming_documents()
+        viewer = getattr(self, "_incoming_viewer", None)
+        if viewer is None:
+            return
+        from folder_mail import open_import_dialog
+        return open_import_dialog(viewer, on_complete=self.mail_import_completed)
+
+    def _format_mail_check_time(self, value):
+        if not value:
+            return "Последняя успешная проверка: ещё не выполнялась"
+        try:
+            checked_at = datetime.fromisoformat(value)
+            if checked_at.tzinfo is None:
+                raise ValueError("timezone missing")
+        except ValueError:
+            logging.warning("Invalid saved mail check timestamp")
+            return "Последняя успешная проверка: дата недоступна"
+        return "Последняя успешная проверка: " + checked_at.astimezone().strftime("%d.%m.%Y %H:%M")
+
+    def _maybe_show_mail_reminder(self):
+        from folder_mail import FolderError, load_reminder_state, save_reminder_state
+        today = date.today().isoformat()
+        if getattr(self, "_mail_reminder_shown_today", None) == today:
+            return
+        self._mail_reminder_shown_today = today
+        try:
+            state = load_reminder_state()
+        except (FolderError, OSError, ValueError):
+            logging.exception("Не удалось прочитать состояние напоминания о почте")
+            self.mail_reminder_last_check.setText(
+                "Последняя успешная проверка: состояние недоступно")
+            self.mail_reminder_result.setText(
+                "Не удалось прочитать состояние проверки почты.")
+            self.mail_reminder_banner.show()
+            return
+        self.mail_reminder_last_check.setText(
+            self._format_mail_check_time(state.get("last_successful_check")))
+        if state.get("last_suggestion_date") == today:
+            return
+        self.mail_reminder_banner.show()
+        try:
+            save_reminder_state(last_suggestion_date=today)
+        except (FolderError, OSError, ValueError):
+            logging.exception("Не удалось сохранить дату напоминания о почте")
+            self.mail_reminder_result.setText(
+                "Не удалось сохранить дату напоминания; проверку можно запустить вручную.")
+
+    def mail_import_completed(self, successful, report):
+        from folder_mail import FolderError, save_reminder_state
+        successful = bool(
+            successful and report and not report.get("stopped")
+            and report.get("phase") == "finished"
+            and report.get("completed") == report.get("total")
+        )
+        if not successful:
+            self.mail_reminder_result.setText(
+                "Проверка не завершена. Время последней успешной проверки не изменено.")
+            return
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            save_reminder_state(last_successful_check=timestamp)
+        except (FolderError, OSError, ValueError):
+            logging.exception("Почта проверена, но время успешной проверки не сохранено")
+            self.mail_reminder_result.setText(
+                f"Новых документов: {report.get('new_drafts', 0)}. "
+                "Не удалось сохранить время проверки.")
+            return
+        self.mail_reminder_last_check.setText(self._format_mail_check_time(timestamp))
+        self.mail_reminder_result.setText(
+            f"Проверка завершена. Новых документов: {report.get('new_drafts', 0)}. "
+            "Расходы не подтверждены и не распределены.")
 
     def incoming_register_snapshot(self):
         cached = getattr(self, "_expense_read_cache", {})
@@ -7960,7 +8072,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             viewer.finished.connect(lambda: setattr(self, "_incoming_viewer", None))
         if document_id is not None:
             viewer.reload_documents(document_id=document_id)
-            viewer.selector.setCurrentIndex(max(0, viewer.selector.findData(document_id)))
+            index = viewer.selector.findData(document_id)
+            if index >= 0:
+                viewer.selector.setCurrentIndex(index)
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
