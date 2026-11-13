@@ -76,6 +76,176 @@ class ReopenShiftTests(unittest.TestCase):
         finally:
             c.close()
 
+    def test_journal_filters_before_limit_and_company_controls_object_choices(self):
+        self._add_company("Other")
+        c = self.desktop.get_db_connection()
+        self.addCleanup(c.close)
+        c.execute("INSERT INTO employees(name,is_active) VALUES ('Filter Person',1)")
+        c.executemany(
+            "INSERT INTO objects(company,name,markning,is_active,sync_id) VALUES (?,?,?,1,?)",
+            [("Renatur", "Current object", "a", "object-a"),
+             ("Other", "Other object", "b", "object-b")],
+        )
+        c.execute("INSERT INTO object_name_history(sync_id,company,name) VALUES ('object-a','Renatur','Old object')")
+        c.executemany(
+            "INSERT INTO shifts(date,employee,company,object_name,hours,rate,invoiced,hours_confirmed,sync_id,entry_type) "
+            "VALUES ('2026-11-09',?,?,?,?,0,?,?,?,'work')",
+            [("Filter Person", "Renatur", "Old object", 8, 0, 0, "shift-a"),
+             ("Filter Person", "Renatur", "Current object", 8, 0, 1, "shift-b"),
+             ("Filter Person", "Renatur", "Current object", 8, 1, 1, "shift-c"),
+             ("Filter Person", "Other", "Other object", 8, 0, 0, "shift-d"),
+             ("Filter Person", "", "", 8, 0, 0, "shift-empty")],
+        )
+        c.executemany(
+            "INSERT INTO shifts(date,employee,company,object_name,hours,rate,invoiced,sync_id,entry_type) "
+            "VALUES ('2026-11-10','Other person','Other','Other object',8,0,0,?,'work')",
+            [(f"filler-{i}",) for i in range(205)],
+        )
+        c.commit()
+        c.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        self.addCleanup(window.deleteLater)
+        window.tab_hours = self.desktop.QWidget()
+        window.setCentralWidget(window.tab_hours)
+        with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}), \
+                patch.object(self.desktop.QMessageBox, "critical") as critical:
+            window.setup_hours_tab()
+            window.filter_date_from.setDate(self.desktop.QDate(2026, 11, 1))
+            window.filter_date_to.setDate(self.desktop.QDate(2026, 11, 30))
+            def ids():
+                return {window.table_shifts.item(i, 0).data(self.desktop.Qt.ItemDataRole.UserRole + 1)
+                        for i in range(window.table_shifts.rowCount())}
+            self.assertEqual(len(ids()), 200)
+            self.assertNotIn("shift-a", ids())
+            window.filter_emp.setCurrentText("Filter Person")
+            self.assertEqual(ids(), {"shift-a", "shift-b", "shift-c", "shift-d", "shift-empty"})
+            window.filter_emp.setCurrentIndex(0)
+            window.filter_comp.setCurrentText("Renatur")
+            self.assertEqual(ids(), {"shift-a", "shift-b", "shift-c"})
+            window.filter_comp.setCurrentIndex(0)
+            window.filter_status.setCurrentText("Часы подтверждены")
+            self.assertEqual(ids(), {"shift-b"})
+            window.filter_status.setCurrentText("Выставлен в счёт")
+            self.assertEqual(ids(), {"shift-c"})
+            window.filter_status.setCurrentIndex(0)
+            window.filter_obj.setCurrentIndex(window.filter_obj.findData("object-a"))
+            self.assertEqual(ids(), {"shift-a", "shift-b", "shift-c"})
+            window.filter_emp.setCurrentText("Filter Person")
+            window.filter_comp.setCurrentText("Renatur")
+            self.assertEqual(window.filter_obj.currentData(), "object-a")
+            self.assertEqual(window.filter_obj.findData("object-b"), -1)
+            window.filter_status.setCurrentText("В работе")
+            self.assertEqual(ids(), {"shift-a"})
+            window.filter_status.setCurrentText("Часы подтверждены")
+            self.assertEqual(ids(), {"shift-b"})
+            window.filter_status.setCurrentText("Выставлен в счёт")
+            self.assertEqual(ids(), {"shift-c"})
+            window.filter_status.setCurrentIndex(0)
+            window.filter_obj.setCurrentIndex(0)
+            self.assertEqual(ids(), {"shift-a", "shift-b", "shift-c"})
+            window.filter_comp.setCurrentIndex(0)
+            self.assertEqual(ids(), {"shift-a", "shift-b", "shift-c", "shift-d", "shift-empty"})
+            window.filter_emp.setCurrentIndex(0)
+            self.assertEqual(len(ids()), 200)
+            critical.assert_not_called()
+
+    def test_new_ob_hides_work_time_editor_preserving_unsaved_work_draft(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        self.addCleanup(window.deleteLater)
+        window.tab_hours = self.desktop.QWidget()
+        window.setCentralWidget(window.tab_hours)
+        with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}):
+            window.setup_hours_tab()
+            window._new_time_facts = {"draft": "preserved"}
+            window.record_type_cb.setCurrentIndex(window.record_type_cb.findData("ob"))
+            self.assertTrue(all(widget.isHidden() for widget in window._work_time_widgets))
+            self.assertFalse(window.ob_start_time.isHidden())
+            with patch.object(self.desktop.QMessageBox, "question",
+                              return_value=self.desktop.QMessageBox.StandardButton.No):
+                self.assertIsNone(window.save_shift())
+            self.assertEqual(window._new_time_facts, {"draft": "preserved"})
+            window.record_type_cb.setCurrentIndex(window.record_type_cb.findData("work"))
+            self.assertTrue(all(not widget.isHidden() for widget in window._work_time_widgets))
+            self.assertEqual(window._new_time_facts, {"draft": "preserved"})
+
+    def test_desktop_work_and_ob_save_sync_and_reopen_in_journal(self):
+        self.worker()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        self.addCleanup(window.deleteLater)
+        window.tab_hours = self.desktop.QWidget()
+        window.setCentralWidget(window.tab_hours)
+        with patch.object(self.desktop.desktop_auth, "current_user", return_value={"role": "admin"}), \
+                patch.object(window, "background_sync_with_cloud"), \
+                patch.object(self.desktop.QMessageBox, "information"), \
+                patch.object(self.desktop.QMessageBox, "warning") as warning, \
+                patch.object(self.desktop.QMessageBox, "critical") as critical, \
+                patch.object(self.desktop.QMessageBox, "question",
+                             return_value=self.desktop.QMessageBox.StandardButton.Yes):
+            window.setup_hours_tab()
+            window.date_input.setDate(self.desktop.QDate(2026, 10, 20))
+            window.filter_date_from.setDate(self.desktop.QDate(2026, 10, 1))
+            window.filter_date_to.setDate(self.desktop.QDate(2026, 10, 31))
+            window.emp_cb.setCurrentText("Travel Test")
+            window.comp_cb.setCurrentText("Renatur")
+            window.obj_cb.setCurrentIndex(window.obj_cb.findData("Travel B"))
+            for invalid in ("0", "0.25", "8.25", "24.5"):
+                window.hours_input.setText(invalid)
+                self.assertIsNone(window.save_shift())
+                self.assertTrue(warning.called)
+                warning.reset_mock()
+            c = self.desktop.get_db_connection()
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM shifts").fetchone()[0], 0)
+            c.close()
+            window.hours_input.setText("8")
+            window.trans_input.setChecked(True)
+            self.assertTrue(window.save_shift())
+            window._new_time_facts = {"draft": "preserved until confirmed"}
+            window.record_type_cb.setCurrentIndex(window.record_type_cb.findData("ob"))
+            window.ob_start_time.setCurrentText("16:00")
+            window.ob_end_time.setCurrentText("20:00")
+            self.assertTrue(window.save_shift())
+            self.assertIsNone(window._new_time_facts)
+            c = self.desktop.get_db_connection()
+            local = [dict(row) for row in c.execute("SELECT * FROM shifts ORDER BY id")]
+            c.close()
+            self.assertEqual([(r["entry_type"], r["hours"], r["transport"]) for r in local],
+                             [("work", 8, 1), ("ob", 4, 1)])
+            self.assertIsNone(local[1]["time_facts"])
+            self.worker()
+            self.worker()
+            remote = self.server_rows()
+            for row in local:
+                self.assertIn(row["sync_id"], remote)
+                self.assertEqual(remote[row["sync_id"]]["hours"], row["hours"])
+                self.assertEqual(remote[row["sync_id"]]["transport"], 1)
+            window.load_shifts_history()
+            self.assertEqual(window.table_shifts.rowCount(), 2)
+            self.assertEqual({window.table_shifts.item(i, 0).data(self.desktop.Qt.ItemDataRole.UserRole + 1)
+                              for i in range(2)}, {row["sync_id"] for row in local})
+            ob_row = next(i for i in range(2) if window.table_shifts.item(i, 5).text() == "OB")
+            self.assertEqual(window.table_shifts.item(ob_row, 6).text(), "4.0")
+            self.assertIn("16:00", window.table_shifts.item(ob_row, 7).text())
+            for i in range(2):
+                expected_type = "ob" if window.table_shifts.item(i, 5).text() == "OB" else "work"
+                window.table_shifts.setCurrentCell(i, 1)
+                def inspect(dialog):
+                    kind = next(combo for combo in dialog.findChildren(self.desktop.QComboBox)
+                                if combo.findData("ob") >= 0 and combo.findData("work") >= 0)
+                    self.assertEqual(kind.currentData(), expected_type)
+                    hours = dialog.findChild(self.desktop.QDoubleSpinBox, "edit_shift_hours")
+                    self.assertEqual(hours.value(), 4 if expected_type == "ob" else 8)
+                    return self.desktop.QDialog.DialogCode.Rejected
+                with patch.object(self.desktop.QDialog, "exec", inspect):
+                    window.edit_shift()
+            warning.assert_not_called()
+            critical.assert_not_called()
+
     def gui_reopen(self, window, mode=None, role="admin", saved_role=None):
         def post(url, **kwargs):
             if mode == "offline":
@@ -163,6 +333,7 @@ class ReopenShiftTests(unittest.TestCase):
 
         # Добавление смены через отдельное окно обновляет журнал.
         conn = self.desktop.get_db_connection()
+        conn.execute("INSERT INTO employees (name,is_active) VALUES ('Dialog Employee',1)")
         conn.execute("INSERT INTO objects (company,name,markning,rate,transport_rate,is_active) "
                      "VALUES ('Renatur','Dialog object','p-dialog',500,0,1)")
         conn.commit()

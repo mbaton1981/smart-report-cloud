@@ -1538,7 +1538,7 @@ def verify_new_shift_prices_ram(app_module, work_dir, out_path):
         window.record_type_cb = QComboBox()
         window.record_type_cb.addItem("Work", "work")
         window.hours_input, window.rate_input = QLineEdit("0.5"), QLineEdit("")
-        window.trans_input, window.comment_input = QLineEdit("0"), QLineEdit("RAM acceptance only")
+        window.trans_input, window.comment_input = app_module.QCheckBox(), QLineEdit("RAM acceptance only")
         with patch.object(window, "background_sync_with_cloud"), \
                 patch.object(window, "load_shifts_history"), \
                 patch.object(QMessageBox, "information"), \

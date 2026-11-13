@@ -2762,9 +2762,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.rate_input.setMaximumWidth(220)
         self.rate_input.setPlaceholderText("Автоматически из договора / справочника")
         self.rate_input.setToolTip("Оставьте пустым для автоматической цены. Введённая цена сохраняется как ручная.")
-        self.trans_input = QLineEdit("0")
-        self.trans_input.setMaximumWidth(140)
-        self.trans_input.setPlaceholderText("1 = включить транспорт объекта")
+        self.trans_input = QCheckBox("Учитывать поездку")
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Описание выполненных работ...")
         self.ob_start_time = create_half_hour_time_field("16:00")
@@ -2791,8 +2789,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         card_layout.addRow(new_time_row)
         self.new_time_status = QLabel("Только часы; фактические интервалы не заданы.")
         card_layout.addRow(self.new_time_status)
+        self._work_time_widgets = (new_time_button, clear_time_button, self.new_time_status)
         card_layout.addRow("Клиентская ставка (SEK/ч):", self.rate_input)
-        card_layout.addRow("Транспорт (0 или 1):", self.trans_input)
+        card_layout.addRow("Транспорт:", self.trans_input)
         card_layout.addRow("Описание работ (Журнал):", self.comment_input)
         card_layout.addRow("Время начала:", self.ob_start_time)
         card_layout.addRow("Время окончания:", self.ob_end_time)
@@ -2887,28 +2886,28 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         # выбранный пользователем период в течение сессии не сбрасывается.
         month_start, month_end = stockholm_month_bounds()
         self.filter_date_from = create_date_field(month_start)
-        self.filter_date_from.dateChanged.connect(self.apply_shifts_filters)
+        self.filter_date_from.dateChanged.connect(self._shift_filter_changed)
 
         self.filter_date_to = create_date_field(month_end)
-        self.filter_date_to.dateChanged.connect(self.apply_shifts_filters)
+        self.filter_date_to.dateChanged.connect(self._shift_filter_changed)
 
         self.filter_emp = QComboBox()
         self.filter_emp.addItem("-- Все сотрудники --")
-        self.filter_emp.currentIndexChanged.connect(self.apply_shifts_filters)
+        self.filter_emp.currentIndexChanged.connect(self._shift_filter_changed)
 
         self.filter_comp = QComboBox()
         self.filter_comp.addItem("-- Все фирмы --")
-        self.filter_comp.currentIndexChanged.connect(self.apply_shifts_filters)
+        self.filter_comp.currentIndexChanged.connect(self._shift_company_filter_changed)
 
         self.filter_obj = QComboBox()
         self.filter_obj.addItem("-- Все объекты --")
-        self.filter_obj.currentIndexChanged.connect(self.apply_shifts_filters)
+        self.filter_obj.currentIndexChanged.connect(self._shift_filter_changed)
 
         self.filter_status = QComboBox()
         self.filter_status.addItems([
             "-- Все статусы --", "В работе", "Часы подтверждены", "Выставлен в счёт",
         ])
-        self.filter_status.currentIndexChanged.connect(self.apply_shifts_filters)
+        self.filter_status.currentIndexChanged.connect(self._shift_filter_changed)
 
         filter_date_row.addWidget(QLabel("<b>Период с:</b>"))
         filter_date_row.addWidget(self.filter_date_from, 1)
@@ -2997,6 +2996,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def update_ob_form_visibility(self, *_):
         is_ob = self.record_type_cb.currentData() == RECORD_TYPE_OB
+        is_work = self.record_type_cb.currentData() == RECORD_TYPE_WORK
+        for widget in self._work_time_widgets:
+            widget.setVisible(is_work)
         for widget in self._ob_form_widgets:
             widget.setVisible(is_ob)
             label = self.hours_form_layout.labelForField(widget)
@@ -3053,44 +3055,59 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "<br><small>Начальные тарифы требуют подтверждения по применяемому kollektivavtal.</small>"
         )
 
+    def _shift_company_filter_changed(self, *_):
+        if hasattr(self, "filter_obj"):
+            conn = get_db_connection()
+            try:
+                self._refresh_shift_object_filter(conn.cursor())
+            finally:
+                conn.close()
+        self._shift_filter_changed()
+
+    def _shift_filter_changed(self, *_):
+        if hasattr(self, "table_shifts"):
+            self.load_shifts_history()
+
     def apply_shifts_filters(self):
+        self._shift_filter_changed()
+
+    def _shift_history_query(self, cursor):
         d_from = self.filter_date_from.text().strip()
         d_to = self.filter_date_to.text().strip()
         warning = getattr(self, "shift_period_warning", None)
         if warning is not None:
             warning.setVisible(input_safety.period_reversed(d_from, d_to))
-        
+
+        clauses = ["date >= ?", "date <= ?"]
+        params = [d_from, d_to]
         emp_val = self.filter_emp.currentText()
         comp_val = self.filter_comp.currentText()
         obj_sync_id = self.filter_obj.currentData()
         status_val = self.filter_status.currentText()
-
-        for row in range(self.table_shifts.rowCount()):
-            match = True
-            date_cell = self.table_shifts.item(row, 1).text()
-            emp_cell = self.table_shifts.item(row, 2).text()
-            comp_cell = self.table_shifts.item(row, 3).text()
-            shift_identity = self.table_shifts.item(row, 0)
-            status_cell = self.table_shifts.item(row, 11).text()
-
-            if d_from and d_to and not (d_from <= date_cell <= d_to):
-                match = False
-            if emp_val != "-- Все сотрудники --" and emp_cell != emp_val:
-                match = False
-            if comp_val != "-- Все фирмы --" and comp_cell != comp_val:
-                match = False
-            if obj_sync_id is not None and (
-                    shift_identity is None
-                    or shift_identity.data(Qt.ItemDataRole.UserRole + 1) != obj_sync_id):
-                match = False
-            if status_val == "В работе" and "В работе" not in status_cell:
-                match = False
-            elif status_val == "Часы подтверждены" and "Часы подтверждены" not in status_cell:
-                match = False
-            elif status_val == "Выставлен в счёт" and "Выставлен" not in status_cell:
-                match = False
-
-            self.table_shifts.setRowHidden(row, not match)
+        if emp_val and emp_val != "-- Все сотрудники --":
+            clauses.append("employee = ?")
+            params.append(emp_val)
+        if comp_val and comp_val != "-- Все фирмы --":
+            clauses.append("company = ?")
+            params.append(comp_val)
+        if obj_sync_id:
+            obj = cursor.execute("SELECT * FROM objects WHERE sync_id = ?", (obj_sync_id,)).fetchone()
+            if obj is None:
+                clauses.append("0")
+            else:
+                names = sorted(invoice_object_names(cursor, dict(obj)))
+                clauses.extend(["company = ?", "object_name IN (" + ",".join("?" for _ in names) + ")"])
+                params.extend([obj["company"], *names])
+        if status_val == "В работе":
+            clauses.append("COALESCE(invoiced, 0) <> 1 AND COALESCE(hours_confirmed, 0) = 0")
+        elif status_val == "Часы подтверждены":
+            clauses.append("COALESCE(invoiced, 0) <> 1 AND COALESCE(hours_confirmed, 0) <> 0")
+        elif status_val == "Выставлен в счёт":
+            clauses.append("invoiced = 1")
+        return cursor.execute(
+            "SELECT * FROM shifts WHERE " + " AND ".join(clauses) + " ORDER BY id DESC LIMIT 200",
+            params,
+        ).fetchall()
 
     def reload_input_objects(self, *_):
         record_type = self.record_type_cb.currentData()
@@ -12852,6 +12869,30 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.load_dropdowns()
         self.background_sync_with_cloud()
 
+    def _refresh_shift_object_filter(self, cursor):
+        if self.filter_obj.view().isVisible():
+            return
+        selected = self.filter_obj.currentData()
+        company = self.filter_comp.currentText()
+        query = "SELECT sync_id, name, company FROM objects WHERE is_active = 1"
+        params = ()
+        if company and company != "-- Все фирмы --":
+            query += " AND company = ?"
+            params = (company,)
+        rows = cursor.execute(query + " ORDER BY company, name, id", params).fetchall()
+        items = [("-- Все объекты --", None)] + [
+            (f"{row[1]} · {row[2]}", row[0]) for row in rows if row[0]
+        ]
+        if desktop_ui.combo_items_need_refresh(self.filter_obj, items):
+            blocked = self.filter_obj.blockSignals(True)
+            try:
+                self.filter_obj.clear()
+                for label, value in items:
+                    self.filter_obj.addItem(label, value)
+                self.filter_obj.setCurrentIndex(max(0, self.filter_obj.findData(selected)))
+            finally:
+                self.filter_obj.blockSignals(blocked)
+
     def load_dropdowns(self, refresh_tables=True):
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -12890,44 +12931,33 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             cursor.execute("SELECT name FROM employees ORDER BY name")
             items = ["-- Все сотрудники --"] + [row[0] for row in cursor.fetchall()]
             if desktop_ui.combo_items_need_refresh(self.filter_emp, [(name,) for name in items]):
-                self.filter_emp.clear()
-                self.filter_emp.addItems(items)
-                idx = self.filter_emp.findText(curr_emp)
-                if idx >= 0:
-                    self.filter_emp.setCurrentIndex(idx)
+                blocked = self.filter_emp.blockSignals(True)
+                try:
+                    self.filter_emp.clear()
+                    self.filter_emp.addItems(items)
+                    idx = self.filter_emp.findText(curr_emp)
+                    if idx >= 0:
+                        self.filter_emp.setCurrentIndex(idx)
+                finally:
+                    self.filter_emp.blockSignals(blocked)
 
         if hasattr(self, 'filter_comp') and not self.filter_comp.view().isVisible():
             curr_comp = self.filter_comp.currentText()
             cursor.execute("SELECT name FROM companies ORDER BY name")
             items = ["-- Все фирмы --"] + [row[0] for row in cursor.fetchall()]
             if desktop_ui.combo_items_need_refresh(self.filter_comp, [(name,) for name in items]):
-                self.filter_comp.clear()
-                self.filter_comp.addItems(items)
-                idx = self.filter_comp.findText(curr_comp)
-                if idx >= 0:
-                    self.filter_comp.setCurrentIndex(idx)
+                blocked = self.filter_comp.blockSignals(True)
+                try:
+                    self.filter_comp.clear()
+                    self.filter_comp.addItems(items)
+                    idx = self.filter_comp.findText(curr_comp)
+                    if idx >= 0:
+                        self.filter_comp.setCurrentIndex(idx)
+                finally:
+                    self.filter_comp.blockSignals(blocked)
 
         if hasattr(self, 'filter_obj') and not self.filter_obj.view().isVisible():
-            selected_sync_id = self.filter_obj.currentData()
-            cursor.execute("""
-                SELECT sync_id, name, company FROM objects
-                WHERE is_active = 1 ORDER BY company, name, id
-            """)
-            object_items = [
-                (f"{row[1]} · {row[2]}", row[0])
-                for row in cursor.fetchall() if row[0]
-            ]
-            expected_items = [("-- Все объекты --", None), *object_items]
-            if desktop_ui.combo_items_need_refresh(
-                self.filter_obj, [(label, value) for label, value in expected_items]
-            ):
-                blocked = self.filter_obj.blockSignals(True)
-                self.filter_obj.clear()
-                for label, value in expected_items:
-                    self.filter_obj.addItem(label, value)
-                selected_index = self.filter_obj.findData(selected_sync_id)
-                self.filter_obj.setCurrentIndex(max(0, selected_index))
-                self.filter_obj.blockSignals(blocked)
+            self._refresh_shift_object_filter(cursor)
 
         if hasattr(self, "object_filter_company"):
             selected_company = self.object_filter_company.currentData()
@@ -14247,8 +14277,33 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         comp = self.comp_cb.currentText()
         obj_name = self.obj_cb.currentData() or self.obj_cb.currentText()
         record_type = self.record_type_cb.currentData() or RECORD_TYPE_WORK
+        try:
+            shift_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            QMessageBox.warning(self, "Ошибка", "Некорректная дата (ожидается формат YYYY-MM-DD).")
+            return
+        if shift_date > datetime.now().date() + timedelta(days=7):
+            QMessageBox.warning(self, "Ошибка", "Нельзя отправлять смены более чем на 7 дней вперёд.")
+            return
+        if record_type != RECORD_TYPE_WORK and getattr(self, "__dict__", {}).get("_new_time_facts") is not None:
+            answer = QMessageBox.question(
+                self, "Фактическое время работы",
+                "Ранее введённые интервалы работы не войдут в эту запись и будут очищены после сохранения. Продолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         conn = get_db_connection()
         cursor = conn.cursor()
+        if not cursor.execute("SELECT 1 FROM employees WHERE name=? AND is_active=1", (emp,)).fetchone():
+            conn.close()
+            QMessageBox.warning(self, "Ошибка", "Указанный сотрудник не найден или неактивен.")
+            return
+        if not cursor.execute("SELECT 1 FROM companies WHERE name=?", (comp,)).fetchone():
+            conn.close()
+            QMessageBox.warning(self, "Ошибка", "Указанная фирма не найдена.")
+            return
         ob_result = None
         if record_type == RECORD_TYPE_OB:
             if not ob_schema_ready(cursor):
@@ -14305,7 +14360,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         else:
             rate_val = 0.0
 
-        trans_val = parse_float(self.trans_input.text(), 0.0)
+        trans_val = float(self.trans_input.isChecked())
         comment = self.comment_input.text().strip()
         customer_base_rate = rate_val if rate_input_str else None
         if record_type == RECORD_TYPE_OB:
@@ -14320,7 +14375,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Клиентская ставка должна быть от 0 до 100000 SEK.")
             return
         if (not math.isfinite(hours_val) or not math.isfinite(rate_val)
-                or hours_val < 0 or not 0 <= rate_val <= 100000
+                or not 0 < hours_val <= 24 or not 0 <= rate_val <= 100000
                 or not math.isfinite(trans_val) or not 0 <= trans_val <= 10000):
             conn.close()
             QMessageBox.warning(self, "Ошибка", "Проверьте часы, ставку и транспорт (от 0 до 10000)!")
@@ -14329,11 +14384,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         quote = None
         facts = None
         try:
-            supplied_facts = getattr(self, "__dict__", {}).get("_new_time_facts")
+            supplied_facts = (
+                getattr(self, "__dict__", {}).get("_new_time_facts")
+                if record_type == RECORD_TYPE_WORK else None
+            )
             if supplied_facts is not None:
-                if record_type != RECORD_TYPE_WORK:
-                    raise ValueError("Для фактического времени выберите «Работа» или явно нажмите «Только часы».")
                 facts = customer_intervals.time_facts(supplied_facts, date, hours_val)
+            elif record_type != RECORD_TYPE_OB and (hours_val < 0.5 or hours_val % 0.5 != 0):
+                raise ValueError("Часы должны быть от 0.5 до 24 с шагом 0.5.")
         except ValueError as error:
             conn.close()
             QMessageBox.warning(self, "Фактическое время", str(error))
@@ -14387,7 +14445,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         enqueue_shift_operation(cursor, sync_id, 'upsert', 0, payload)
         conn.commit()
         conn.close()
-        if facts is not None:
+        if getattr(self, "__dict__", {}).get("_new_time_facts") is not None:
             self.clear_new_time_facts()
         
         if record_type in (
@@ -14422,27 +14480,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             conn = get_db_connection()
             cursor = conn.cursor()
             has_ob_schema = ob_schema_ready(cursor)
-            selected_object_sync_id = (
-                self.filter_obj.currentData()
-                if hasattr(self, "filter_obj") else None
-            )
-            if selected_object_sync_id:
-                object_row = cursor.execute(
-                    "SELECT * FROM objects WHERE sync_id = ?", (selected_object_sync_id,)
-                ).fetchone()
-                if object_row is None:
-                    rows = []
-                else:
-                    names = invoice_object_names(cursor, dict(object_row))
-                    marks = ",".join("?" for _ in names)
-                    date_from = self.filter_date_from.text().strip()
-                    date_to = self.filter_date_to.text().strip()
-                    rows = cursor.execute(
-                        f"SELECT * FROM shifts WHERE company = ? AND object_name IN ({marks}) "
-                        "AND entry_type IN ('work', 'ob') AND date >= ? AND date <= ? "
-                        "ORDER BY id DESC LIMIT 200",
-                        (object_row["company"], *names, date_from, date_to),
-                    ).fetchall()
+            if all(hasattr(self, name) for name in (
+                "filter_date_from", "filter_date_to", "filter_emp", "filter_comp",
+                "filter_obj", "filter_status",
+            )):
+                rows = self._shift_history_query(cursor)
             else:
                 rows = cursor.execute("SELECT * FROM shifts ORDER BY id DESC LIMIT 200").fetchall()
             delete_states = {
@@ -14560,7 +14602,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 self.load_companies_table()
                 self.load_objects_table()
                 self.load_employees_table()
-            self.apply_shifts_filters()
             selection_model = table.selectionModel()
             for row_idx, row in enumerate(rows):
                 if str(row["id"]) in selected_shift_ids:

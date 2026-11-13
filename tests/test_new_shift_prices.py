@@ -67,7 +67,8 @@ class NewShiftPricesTests(unittest.TestCase):
         window.record_type_cb.addItem("Work", "work")
         window.hours_input = d.QLineEdit(str(hours))
         window.rate_input = d.QLineEdit(rate)
-        window.trans_input = d.QLineEdit(str(transport))
+        window.trans_input = d.QCheckBox()
+        window.trans_input.setChecked(bool(transport))
         window.comment_input = d.QLineEdit("Synthetic")
         with patch.object(window, "background_sync_with_cloud"), \
                 patch.object(window, "load_shifts_history"), \
