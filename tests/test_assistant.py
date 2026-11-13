@@ -2990,6 +2990,19 @@ class AssistantUiTests(unittest.TestCase):
         self.assertIn("Серверные смены: не удалось проверить", output)
         self.assertIn("серверные данные недоступны", output)
         self.assertIn("текущая неделя ещё не завершена", output)
+        dialog.output.clear()
+        dialog.attention_periods["hours"] = ("2026-11-09", "2026-11-15")
+        with patch("assistant_attention.datetime") as clock, \
+                patch("assistant_attention.missing_hours", return_value=(
+                    [], ["Результат предварительный: текущая неделя ещё не завершена."])):
+            clock.now.return_value = datetime(2026, 11, 13, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            dialog.attention_received({
+                "local": dict(rows=[], employees=employees, pending=[], company="", object_name=""),
+                "hours": [], "prices": None, "employee_status": {
+                    "table": {"rows": [["Без внесённых часов", item["name"]] for item in employees]}},
+                "documents": None, "errors": [], "hours_only": True,
+            })
+        self.assertEqual(dialog.output.toPlainText().count("предварительн"), 1)
 
     def test_attention_offline_result_and_shift_navigation_by_id(self):
         from assistant_ui import AssistantDialog, RequestWorker

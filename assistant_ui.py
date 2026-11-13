@@ -1409,7 +1409,9 @@ class AssistantDialog(QDialog):
             assistant_attention.ZoneInfo("Europe/Stockholm")).date()
         week_start = (today_date - assistant_attention.timedelta(days=today_date.weekday())).isoformat()
         week_end = (today_date + assistant_attention.timedelta(days=6 - today_date.weekday())).isoformat()
-        if self.attention_periods["hours"][0] <= week_end and self.attention_periods["hours"][1] >= week_start:
+        if (self.attention_periods["hours"][0] <= week_end
+                and self.attention_periods["hours"][1] >= week_start
+                and not any("предварительн" in warning.casefold() for warning in hour_warnings)):
             lines.append("Результат по часам предварительный: текущая неделя ещё не завершена.")
         checked_at = assistant_attention.datetime.now(
             assistant_attention.ZoneInfo("Europe/Stockholm")).strftime("%Y-%m-%d %H:%M")
