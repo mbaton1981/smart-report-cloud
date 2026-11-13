@@ -2852,6 +2852,173 @@ class AssistantUiTests(unittest.TestCase):
             self._qt_widgets_before,
         )
 
+    def test_project_result_unknowns_and_stale_response(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.window._expense_register_status_key = Mock(return_value="confirmed")
+        dialog.window._expense_register_is_unallocated = Mock(return_value=False)
+        dialog.window._expense_register_unallocated_amount = Mock(return_value=0)
+        dialog.project_generation = 3
+        dialog.project_active = True
+        data = {
+            "object": {"name": "Project", "company": "A", "markning": "p1000", "server_id": 1},
+            "period": ("2026-11-01", "2026-11-30"),
+            "shifts": {"hours": 8, "employees": 1, "ordinary": 6, "ob": 2,
+                       "statuses": {"В работе": 2}, "total": None, "known_subtotal": 400,
+                       "unknown_records": 1, "work_amount": None, "ob_amount": None,
+                       "transport_amount": 0, "issues": [], "incomplete_fixed": False},
+            "expenses": {"totals": {"USD": {"net_amount": None, "vat_amount": None,
+                                            "gross_amount": 10}},
+                         "unknown": {("USD", "net_amount"), ("USD", "vat_amount")},
+                         "linked": [], "undated": []},
+            "documents": [], "online": False, "errors": ["Сервер недоступен."],
+        }
+        dialog.project_received(data, 2)
+        self.assertIsNone(dialog.project_result)
+        dialog.project_received(data, 3)
+        message = dialog.chat_messages[-1][1]
+        self.assertIn("непосчитанных записей: 1", message)
+        self.assertIn("без НДС: неизвестно", message)
+        self.assertIn("НДС: неизвестно", message)
+        self.assertIn("расходы неполные", message)
+        dialog.date_from.setDate(dialog.date_from.date().addDays(-1))
+        self.assertIsNone(dialog.project_result)
+        dialog.project_received(data, 3)
+        self.assertIsNone(dialog.project_result)
+
+    def test_project_period_followup_survives_manual_period_change(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        obj = {"id": 1, "sync_id": "project-one", "name": "Project",
+               "company": "A", "markning": "p1000", "server_id": 1}
+        dialog.project_selected = obj
+        dialog.project_mode = True
+        dialog.project_active = True
+        dialog.date_from.setDate(dialog.date_from.date().addDays(-1))
+        self.assertFalse(dialog.project_active)
+        dialog.input.setPlainText("за ноябрь 2026")
+        with patch.object(dialog, "start_project") as start:
+            dialog.command()
+        start.assert_called_once_with(obj, ("2026-11-01", "2026-11-30"))
+        dialog.project_pending = ([obj], None)
+        dialog.new_conversation()
+        self.assertIsNone(dialog.project_pending)
+
+    def test_project_worker_reports_unavailable_sources(self):
+        from assistant_ui import ProjectWorker
+        from PyQt6.QtWidgets import QWidget
+        from customer_report import prepare_customer_costs
+        window = QWidget()
+        window._expense_document_snapshot = Mock(return_value=([], False))
+        window._local_incoming_expense_documents = Mock(side_effect=ValueError("недоступны"))
+        report = {"journal_rows": [], "journal_segments": {}, "totals": {"without_ob_hours": 0},
+                  "warnings": []}
+        prepare_customer_costs(report)
+        window._read_object_overview = Mock(return_value={
+            "journal_rows": [], "journal_segments": {}, "customer_report": report,
+            "hours": 0, "employees": 0,
+        })
+        app = Mock()
+        app.request_expense_api.side_effect = requests.ConnectionError("нет связи")
+        obj = {"id": 1, "sync_id": "project", "server_id": 1}
+        worker = ProjectWorker(window, app, obj, ("2026-11-01", "2026-11-30"))
+        received = []
+        worker.ready.connect(received.append)
+        worker.run()
+        self.assertFalse(received[0]["online"])
+        self.assertEqual(len(received[0]["errors"]), 2)
+        self.assertIn("не удалось проверить", received[0]["errors"][0])
+        self.assertIn("не удалось проверить", received[0]["errors"][1])
+        window._read_object_overview.assert_called_once()
+
+    def test_project_object_choice_and_selected_context(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QTabWidget, QTableWidget, QTableWidgetItem, QWidget
+        window = QWidget()
+        window.tabs = QTabWidget(window)
+        window.tab_objects = QWidget()
+        window.tabs.addTab(window.tab_objects, "Objects")
+        window.table_objects = QTableWidget(2, 1)
+        window.table_objects.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        for index, sync_id in enumerate(("main", "extra")):
+            item = QTableWidgetItem(sync_id)
+            item.setData(Qt.ItemDataRole.UserRole, index + 1)
+            item.setData(Qt.ItemDataRole.UserRole + 2, sync_id)
+            window.table_objects.setItem(index, 0, item)
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "isolated.sqlite")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("CREATE TABLE objects(id, sync_id, server_id, name, company, markning, is_active)")
+                conn.executemany("INSERT INTO objects VALUES(?,?,?,?,?,?,?)", [
+                    (1, "main", 1, "Tomteboda", "A", "p1000", 1),
+                    (2, "extra", 2, "Tomteboda ÄTA", "A", "p1001", 1),
+                ])
+                conn.commit()
+            with patch.object(RequestWorker, "start"):
+                dialog = AssistantDialog(window)
+            self.addCleanup(dialog.close)
+            dialog.database = database
+            with patch.object(dialog, "start_project") as start:
+                dialog.resolve_project("Что по Tomteboda?", None)
+                start.assert_not_called()
+                self.assertEqual(len(dialog.project_pending[0]), 2)
+                window.table_objects.selectRow(1)
+                dialog.resolve_project("Сколько часов и расходов по этому объекту?", None)
+                self.assertEqual(start.call_args.args[0]["sync_id"], "extra")
+
+    def test_project_issue_opens_exact_shift_with_object_and_period(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtCore import QDate, Qt
+        from PyQt6.QtWidgets import QComboBox, QDateEdit, QTabWidget, QTableWidget, QTableWidgetItem, QWidget
+        window = QWidget()
+        window.tabs = QTabWidget(window)
+        window.tab_hours = QWidget()
+        window.tabs.addTab(window.tab_hours, "Hours")
+        window.filter_date_from, window.filter_date_to = QDateEdit(), QDateEdit()
+        window.filter_emp = QComboBox()
+        window.filter_emp.addItems(["All", "Alice"])
+        window.filter_comp = QComboBox()
+        window.filter_comp.addItems(["All", "A"])
+        window.filter_obj = QComboBox()
+        window.filter_obj.addItem("All", None)
+        window.filter_obj.addItem("Project · A", "project")
+        window.filter_status = QComboBox()
+        window.filter_status.addItem("All")
+        window.table_shifts = QTableWidget(1, 2)
+
+        def load():
+            item = QTableWidgetItem("1")
+            item.setData(Qt.ItemDataRole.UserRole + 1, "shift-two")
+            window.table_shifts.setItem(0, 0, item)
+            window.table_shifts.setItem(0, 1, QTableWidgetItem("Alice"))
+
+        window.load_shifts_history = load
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(window)
+        self.addCleanup(dialog.close)
+        dialog.project_result = {
+            "object": {"name": "Project", "company": "A", "sync_id": "project"},
+            "period": ("2026-11-01", "2026-11-30"), "documents": [],
+            "issues": [{"kind": "shift", "id": "shift-two", "date": "2026-11-02",
+                        "employee": "Alice", "reason": "Цена неизвестна"}],
+        }
+        dialog.project_action("issues")
+        dialog.table.selectRow(0)
+        dialog.record_details()
+        self.assertEqual(window.filter_comp.currentText(), "A")
+        self.assertEqual(window.filter_obj.currentData(), "project")
+        self.assertEqual(window.filter_date_from.date(), QDate(2026, 11, 1))
+        self.assertEqual(window.filter_date_to.date(), QDate(2026, 11, 30))
+        self.assertEqual(window.table_shifts.item(0, 0).data(Qt.ItemDataRole.UserRole + 1), "shift-two")
+        self.assertEqual(window.table_shifts.currentRow(), 0)
+
     def test_attention_request_routes_locally_without_inheriting_filters(self):
         from assistant_ui import AssistantDialog, AttentionWorker, RequestWorker
         from PyQt6.QtWidgets import QWidget

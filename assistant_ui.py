@@ -33,6 +33,7 @@ from sync_dataset import HEADER, file_dataset, require_response_dataset
 from assistant_actions import CAPABILITIES, REPORT_ACTIONS
 from assistant_desktop import DesktopActionError, local_result, native_action
 import assistant_attention
+import assistant_project
 
 
 class AssistantClientError(ValueError):
@@ -269,6 +270,52 @@ class AttentionWorker(QThread):
         except (requests.RequestException, RuntimeError, ValueError, KeyError, AttributeError) as error:
             result["errors"].append("Серверные документы: не удалось проверить: " + str(error))
         self.ready.emit(result)
+
+
+class ProjectWorker(QThread):
+    ready = pyqtSignal(dict)
+
+    def __init__(self, window, app, obj, period, parent=None):
+        super().__init__(parent)
+        self.window, self.app, self.obj, self.period = window, app, obj, period
+
+    def run(self):
+        errors = []
+        documents = None
+        try:
+            response = self.app.request_expense_api("GET", "/api/expense-documents")
+            if not isinstance(response, dict):
+                raise ValueError("Некорректный ответ реестра документов.")
+            documents = response.get("documents")
+            if not isinstance(documents, list) or any(not isinstance(item, dict) for item in documents):
+                raise ValueError("Некорректный список документов.")
+            if len(documents) >= 1000:
+                errors.append("Реестр ограничен 1000 документами; расходы могут быть неполными.")
+        except (requests.RequestException, RuntimeError, ValueError, KeyError) as error:
+            errors.append("Серверные документы: не удалось проверить: " + str(error))
+        try:
+            merged, _online = self.window._expense_document_snapshot(
+                server_snapshot=(documents or [], documents is not None))
+            incoming = self.window._local_incoming_expense_documents(readonly=True)
+            merged = self.window._merge_incoming_expense_documents(merged, incoming)
+        except (sqlite3.Error, OSError, ValueError, KeyError) as error:
+            merged = list(documents or [])
+            errors.append("Локальные документы: не удалось проверить: " + str(error))
+        try:
+            start, end = self.period if self.period else (None, None)
+            overview = self.window._read_object_overview(
+                self.obj["id"], self.obj["sync_id"], self.obj["server_id"],
+                start, end, merged, documents is not None, documents is not None,
+            )
+            summary = assistant_project.shift_summary(overview, self.period)
+            expenses = assistant_project.expense_summary(merged, self.obj["server_id"], self.period)
+            errors.extend(expenses["errors"])
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
+            self.ready.emit({"error": "Не удалось построить сводку объекта: " + str(error)})
+            return
+        self.ready.emit(dict(object=self.obj, period=self.period, overview=overview,
+                             shifts=summary, expenses=expenses, documents=merged,
+                             errors=errors, online=documents is not None))
 
 
 def result_text(result):
@@ -641,6 +688,11 @@ class AssistantDialog(QDialog):
         self.workflow_results = []
         self.attention = None
         self.attention_expanded = False
+        self.project_result = None
+        self.project_pending = None
+        self.project_generation = 0
+        self.project_active = False
+        self.project_mode = False
         app_module = sys.modules.get(window.__class__.__module__)
         self.assistant_candidate = bool(getattr(app_module, "ASSISTANT_CANDIDATE", False))
         self.database = getattr(app_module, "DB_FILE", None)
@@ -727,14 +779,22 @@ class AssistantDialog(QDialog):
         self.company, self.object_name = QLineEdit(), QLineEdit()
         self.company.setPlaceholderText("Все фирмы")
         self.object_name.setPlaceholderText("Все объекты")
-        filters.addWidget(QLabel("С:"))
+        for field in (self.company, self.object_name):
+            field.textChanged.connect(self.project_scope_changed)
+        self.date_from_label = QLabel("С:")
+        self.date_to_label = QLabel("По:")
+        filters.addWidget(self.date_from_label)
         filters.addWidget(self.date_from)
-        filters.addWidget(QLabel("По:"))
+        filters.addWidget(self.date_to_label)
         filters.addWidget(self.date_to)
         filters.addWidget(self.employee)
         filters.addWidget(self.company)
         filters.addWidget(self.object_name)
         layout.addLayout(filters)
+        self.project_all = QCheckBox("За весь объект")
+        self.project_all.setVisible(False)
+        self.project_all.toggled.connect(self.project_period_changed)
+        layout.addWidget(self.project_all)
         desktop_theme.adapt_box_layout(content, filters, compact_width=1080)
         shortcuts = QHBoxLayout()
         attention_button = QPushButton("Требует внимания")
@@ -841,6 +901,15 @@ class AssistantDialog(QDialog):
         self.show_all_attention.setVisible(False)
         self.show_all_attention.clicked.connect(self.expand_attention)
         tools.addWidget(self.show_all_attention)
+        self.project_buttons = []
+        for caption, action in (
+                ("Открыть объект", "object"), ("Показать смены", "shifts"),
+                ("Показать расходы", "expenses"), ("Что требует проверки", "issues")):
+            button = QPushButton(caption)
+            button.setVisible(False)
+            button.clicked.connect(lambda checked=False, action=action: self.project_action(action))
+            self.project_buttons.append(button)
+            tools.addWidget(button)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setMinimumHeight(150)
@@ -939,6 +1008,14 @@ class AssistantDialog(QDialog):
         self.context = None
         self.result = None
         self.attention = None
+        self.invalidate_project()
+        self.project_all.setVisible(False)
+        with QSignalBlocker(self.project_all):
+            self.project_all.setChecked(False)
+        self.project_period_changed()
+        self.project_selected = None
+        self.project_pending = None
+        self.project_mode = False
         self.show_all_attention.setVisible(False)
         self.auto_report = False
         self.choices = []
@@ -971,6 +1048,14 @@ class AssistantDialog(QDialog):
             widget.setVisible(False)
 
     def choose_answer(self):
+        if self.project_pending is not None:
+            selected = self.clarification_choice.currentIndex()
+            choices, period = self.project_pending
+            if 0 <= selected < len(choices):
+                self.project_pending = None
+                self.clear_clarification()
+                self.start_project(choices[selected], period)
+            return
         if self.choices:
             self.input.setPlainText(str(self.clarification_choice.currentIndex() + 1))
             self.command()
@@ -1207,6 +1292,13 @@ class AssistantDialog(QDialog):
         if self.audio is not None or self.worker and self.worker.isRunning():
             self.state.setText("Сначала завершите текущую запись или запрос.")
             return
+        if self.project_active:
+            self.invalidate_project()
+        self.project_mode = False
+        self.project_all.setVisible(False)
+        with QSignalBlocker(self.project_all):
+            self.project_all.setChecked(False)
+        self.project_period_changed()
         self.result = None
         self.attention = None
         self.table.setVisible(False)
@@ -1249,12 +1341,272 @@ class AssistantDialog(QDialog):
         self.worker.start()
 
     def hours_period_changed(self):
+        if self.project_active:
+            self.invalidate_project()
         if self.attention and self.attention.get("overview") is not None:
             self.attention = None
             self.table.setVisible(False)
             self.open_records.setEnabled(False)
             self.result_heading.clear()
             self.state.setText("Период изменён; отправьте новый запрос для обновления таблицы.")
+
+    def project_period_changed(self):
+        show_dates = not self.project_all.isChecked()
+        for field in (self.date_from, self.date_to, self.date_from_label, self.date_to_label):
+            field.setVisible(show_dates)
+        if self.project_active:
+            self.invalidate_project()
+
+    def project_scope_changed(self):
+        if self.project_active:
+            self.invalidate_project()
+        self.project_selected = None
+
+    def invalidate_project(self):
+        self.project_generation += 1
+        self.project_active = False
+        self.project_result = None
+        self.table.setVisible(False)
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.result_heading.clear()
+        self.open_records.setEnabled(False)
+        for button in self.project_buttons:
+            button.setVisible(False)
+        self.state.setText("Параметры изменены; отправьте новый запрос.")
+
+    def resolve_project(self, text, period):
+        if not self.database or not Path(self.database).is_file():
+            raise ValueError("Локальный профиль недоступен; объект не определён.")
+        conn = sqlite3.connect(Path(self.database).resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            objects = [dict(row) for row in conn.execute(
+                "SELECT id,sync_id,server_id,name,company,markning,is_active FROM objects")]
+        finally:
+            conn.close()
+        named = assistant_project.project_candidates(text, objects)
+        if (re.search(r"\b(?:этот|этому|этого)\s+объект\w*", text.casefold()) or
+                (not named and re.fullmatch(r"\s*сколько\s+заработал\w*\s*[?.!]*", text.casefold())
+                 and getattr(self, "project_selected", None))):
+            selected = getattr(self, "project_selected", None)
+            matches = []
+            if getattr(self.window, "tabs", None) is not None \
+                    and self.window.tabs.currentWidget() is getattr(self.window, "tab_objects", None):
+                table = self.window.table_objects
+                rows = table.selectionModel().selectedRows()
+                if len(rows) == 1:
+                    item = table.item(rows[0].row(), 0)
+                    if item:
+                        matches = [obj for obj in objects
+                                   if obj["id"] == item.data(Qt.ItemDataRole.UserRole)
+                                   and obj["sync_id"] == item.data(Qt.ItemDataRole.UserRole + 2)]
+            if not matches:
+                matches = [obj for obj in objects if selected and obj["id"] == selected["id"]
+                           and obj["sync_id"] == selected["sync_id"]]
+            if not matches and self.object_name.text().strip():
+                matches = [obj for obj in objects if obj["name"] == self.object_name.text().strip()
+                           and (not self.company.text().strip() or
+                                obj["company"] == self.company.text().strip())]
+        else:
+            matches = named
+        if not matches:
+            raise ValueError("Объект не найден однозначно. Укажите название или маркировку.")
+        if len(matches) > 1:
+            self.project_pending = (matches, period)
+            self.clarification_choice.clear()
+            self.clarification_choice.addItems([
+                f'{obj["name"]} · {obj["company"]} · {obj["markning"] or "без маркировки"}'
+                for obj in matches
+            ])
+            self.clarification_choice.setVisible(True)
+            self.choose_clarification.setVisible(True)
+            self.append_message("SmartReport", "Нашлось несколько объектов. Выберите нужный.")
+            self.state.setText("Выберите объект; автоматический выбор не выполнен.")
+            return
+        self.start_project(matches[0], period)
+
+    def start_project(self, obj, period):
+        from assistant_desktop import application
+        if not desktop_auth.current_token() or desktop_auth.current_user().get("role") != "admin":
+            self.failed("Для сводки нужен личный вход администратора.")
+            return
+        self.project_generation += 1
+        generation = self.project_generation
+        self.project_selected = obj
+        self.project_mode = True
+        self.project_active = False
+        self.project_result = None
+        self.attention = None
+        self.result = None
+        self.table.setVisible(False)
+        self.result_heading.clear()
+        self.show_all_attention.setVisible(False)
+        self.clear_clarification()
+        self.project_all.setVisible(True)
+        with QSignalBlocker(self.project_all), QSignalBlocker(self.date_from), QSignalBlocker(self.date_to):
+            self.project_all.setChecked(period is None)
+            if period:
+                self.date_from.setDate(QDate.fromString(period[0], "yyyy-MM-dd"))
+                self.date_to.setDate(QDate.fromString(period[1], "yyyy-MM-dd"))
+        self.project_period_changed()
+        with QSignalBlocker(self.company), QSignalBlocker(self.object_name):
+            self.company.setText(obj["company"])
+            self.object_name.setText(obj["name"])
+        self.project_active = True
+        for button in self.project_buttons:
+            button.setVisible(False)
+        self.pdf.setEnabled(False)
+        self.native.setEnabled(False)
+        self.open_records.setEnabled(False)
+        self.send.setEnabled(False)
+        self.voice.setEnabled(False)
+        self.state.setText("Загружаю сведения объекта; данные не изменяются.")
+        try:
+            app = application(self.window)
+        except DesktopActionError as error:
+            self.failed(str(error))
+            self.finished()
+            return
+        self.worker = ProjectWorker(self.window, app, obj, period, self)
+        self.worker.ready.connect(lambda data: self.project_received(data, generation))
+        self.worker.finished.connect(self.finished)
+        self.worker.start()
+
+    def project_received(self, data, generation):
+        if generation != self.project_generation:
+            return
+        if data.get("error"):
+            self.failed(data["error"])
+            return
+        self.project_result = data
+        obj, shifts, expenses = data["object"], data["shifts"], data["expenses"]
+        period = "за весь объект" if data["period"] is None else " — ".join(data["period"])
+        hours_split = ("разделение обычных и OB-часов не проверено" if shifts["ordinary"] is None else
+                       f'обычные: {shifts["ordinary"]:g} ч, OB: {shifts["ob"]:g} ч')
+        lines = [f'{obj["name"]} · {obj["company"]} · {obj["markning"] or "без маркировки"} · {period}',
+                 f'Часы в локальном профиле: {shifts["hours"]:g} ч, сотрудников: {shifts["employees"]}; '
+                 f'{hours_split}.',
+                 "Статусы записей: " + "; ".join(f"{key}: {value}" for key, value in shifts["statuses"].items()) + "."]
+        amount = shifts["total"]
+        if amount is None:
+            known = shifts["known_subtotal"]
+            lines.append("Стоимость для клиента по локальным сменам без НДС: частично известный подытог " +
+                         ("не определён" if known is None else f"{known:,.2f} SEK") +
+                         f'; итог неизвестен; непосчитанных записей: {shifts["unknown_records"]}.')
+        else:
+            lines.append(f"Стоимость для клиента по локальным сменам без НДС: {amount:,.2f} SEK.")
+        if shifts["incomplete_fixed"]:
+            lines.append("Фиксированная цена не включена: выбран не весь подтверждённый период или состав.")
+        for key, label in (("work_amount", "Работа / фиксированная цена"),
+                           ("ob_amount", "Клиентские доплаты"), ("transport_amount", "Транспорт")):
+            value = shifts[key]
+            lines.append(f'{label}: ' + ("не определено" if value is None else f"{value:,.2f} SEK") + ".")
+        lines.append("Расчётная стоимость не означает выставленную фактуру, оплату или прибыль.")
+        lines.append("Для прибыли также нужны зарплата, взносы, накладные и другие затраты.")
+        if obj["server_id"] is None:
+            lines.append("Подтверждённые расходы: не удалось полностью проверить.")
+        elif not expenses["totals"] and data["online"]:
+            lines.append("Подтверждённые доли расходов: нет в доступном реестре.")
+        elif not expenses["totals"]:
+            lines.append("Подтверждённые расходы: не удалось проверить.")
+        else:
+            for currency, amounts in expenses["totals"].items():
+                values = []
+                for field, caption in (("net_amount", "без НДС"), ("vat_amount", "НДС"),
+                                       ("gross_amount", "с НДС")):
+                    suffix = " + неизвестные доли" if (currency, field) in expenses["unknown"] else ""
+                    value = amounts[field]
+                    values.append(f"{caption}: " + ("неизвестно" if value is None else f"{value:,.2f}{suffix}"))
+                lines.append(f"Подтверждённые доли · {currency}: " + "; ".join(values) + ".")
+            if not data["online"]:
+                lines.append("Показанные расходы неполные: сервер недоступен.")
+        unconfirmed = sum(doc.get("verification_status") != "confirmed" or
+                          doc.get("sync_state") in ("pending", "conflict", "unverified") or
+                          bool(doc.get("sync_error")) for doc in expenses["linked"])
+        if unconfirmed:
+            lines.append(f"Связанных неподтверждённых документов: {unconfirmed}; в расходы не включены.")
+        review, allocation = assistant_attention.document_issues(
+            expenses["linked"], self.window._expense_register_status_key,
+            self.window._expense_register_is_unallocated,
+            self.window._expense_register_unallocated_amount, data["period"])
+        data["issues"] = shifts["issues"] + review + allocation
+        lines.append(f'Требуют проверки в доступных данных: клиентские условия — {len(shifts["issues"])}, '
+                     f'документы — {len(review)}, распределение — {len(allocation)}.')
+        if expenses["undated"]:
+            lines.append(f'Связанных документов без даты: {len(expenses["undated"])}; период определить нельзя.')
+        lines.append("Смены и условия — локальный профиль; полнота и время последней синхронизации не проверены. "
+                     "Расходы — " + ("ответ сервера" if data["online"] else "только доступные локальные данные") + ".")
+        lines.extend(data["errors"])
+        self.append_message("SmartReport", "\n".join(lines))
+        self.result_heading.setText(f'{obj["name"]} · {period}')
+        self.state.setText("Готово; для подробностей выберите действие. Данные не изменены.")
+        for button in self.project_buttons:
+            button.setVisible(True)
+
+    def project_action(self, action):
+        data = self.project_result
+        if data is None:
+            return
+        if action == "issues":
+            records = data["issues"]
+            self.table.setSortingEnabled(False)
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setColumnCount(4)
+            self.table.setHorizontalHeaderLabels(["Дата", "Запись", "Причина", "Раздел"])
+            self.table.setRowCount(len(records))
+            for index, record in enumerate(records):
+                name = record.get("employee") or record.get("supplier") or "Документ"
+                for column, value in enumerate((record.get("date") or "Дата неизвестна", name,
+                                                record.get("reason") or "Требует проверки",
+                                                "Смена" if record["kind"] == "shift" else "Документ")):
+                    item = QTableWidgetItem(str(value))
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, record)
+                    self.table.setItem(index, column, item)
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
+            self.table.resizeColumnsToContents()
+            self.table.setVisible(bool(records))
+            self.open_records.setEnabled(bool(records))
+            self.state.setText("Выберите запись для перехода." if records else
+                               "В доступных данных связанных замечаний нет; см. ограничения источников.")
+            return
+        window, obj = self.window, data["object"]
+        if window.table_objects.state() == QAbstractItemView.State.EditingState:
+            self.state.setText("Завершите редактирование объекта перед переходом.")
+            return
+        window.object_search.clear()
+        window.object_filter_company.setCurrentIndex(0)
+        if not obj["is_active"]:
+            window.show_archived_objects_check.setChecked(True)
+        window.load_objects_table()
+        table = window.table_objects
+        matches = [row for row in range(table.rowCount())
+                   if table.item(row, 0) and table.item(row, 0).data(Qt.ItemDataRole.UserRole) == obj["id"]
+                   and table.item(row, 0).data(Qt.ItemDataRole.UserRole + 2) == obj["sync_id"]]
+        if len(matches) != 1:
+            self.state.setText("Объект не найден однозначно; другая карточка не открыта.")
+            return
+        table.setCurrentCell(matches[0], 0)
+        table.selectRow(matches[0])
+        period = data["period"]
+        window.object_all_period.setChecked(period is None)
+        if period:
+            window.object_date_from.setDate(QDate.fromString(period[0], "yyyy-MM-dd"))
+            window.object_date_to.setDate(QDate.fromString(period[1], "yyyy-MM-dd"))
+        if action == "object":
+            window.tabs.setCurrentWidget(window.tab_objects)
+        elif action == "shifts":
+            window.filter_emp.setCurrentIndex(0)
+            window.filter_status.setCurrentIndex(0)
+            if not window.open_selected_object_shifts():
+                return
+        elif action == "expenses":
+            if not window.open_selected_object_expenses():
+                return
+        self.hide()
 
     def attention_received(self, data):
         local = data["local"]
@@ -1658,6 +2010,8 @@ class AssistantDialog(QDialog):
                 return
             date = record.get("date")
             start, end = (date, date) if date else ("1900-01-01", "2999-12-31")
+            if self.attention.get("project"):
+                start, end = self.attention.get("project_period") or ("1900-01-01", "2999-12-31")
             window._selected_expense_identity = identity
             if self.attention["documents"] is not None:
                 window._expense_read_cache[(start, end)] = list(self.attention["documents"])
@@ -1668,7 +2022,13 @@ class AssistantDialog(QDialog):
             blockers = [QSignalBlocker(field) for field in fields]
             window.exp_date_from.setText(start)
             window.exp_date_to.setText(end)
-            window.exp_filter_object.setCurrentIndex(0)
+            project = self.attention.get("project")
+            object_index = window.exp_filter_object.findData(project["server_id"]) if project else 0
+            if object_index < 0:
+                del blockers
+                self.state.setText("Объект не найден в фильтре расходов; переход не выполнен.")
+                return
+            window.exp_filter_object.setCurrentIndex(object_index)
             window.exp_filter_unallocated.setChecked(False)
             status = window.exp_filter_status.findData("all")
             if status >= 0:
@@ -1697,6 +2057,8 @@ class AssistantDialog(QDialog):
 
         period = ((record["date"], record["date"]) if record.get("date") else self.attention["periods"]["hours"]) if record["kind"] == "employee" else (
             record.get("date"), record.get("date"))
+        if self.attention.get("project"):
+            period = self.attention.get("project_period") or ("1900-01-01", "2999-12-31")
         start, end = (QDate.fromString(value or "", "yyyy-MM-dd") for value in period)
         if not start.isValid() or not end.isValid():
             self.state.setText("Дата записи недоступна; переход не выполнен.")
@@ -1708,8 +2070,9 @@ class AssistantDialog(QDialog):
             self.state.setText("Сотрудник не найден однозначно в журнале; другая запись не открыта.")
             return
         employee_index = employee_matches[0]
-        company = self.attention["company"] if record["kind"] == "employee" else ""
-        obj = self.attention["object_name"] if record["kind"] == "employee" else ""
+        project = self.attention.get("project")
+        company = self.attention["company"] if record["kind"] == "employee" or project else ""
+        obj = self.attention["object_name"] if record["kind"] == "employee" or project else ""
         company_matches = [index for index in range(1, window.filter_comp.count())
                            if window.filter_comp.itemText(index) == company] if company else [0]
         if len(company_matches) != 1:
@@ -1740,7 +2103,8 @@ class AssistantDialog(QDialog):
             label = f"{obj} · {company}"
             object_matches = [index for index in range(1, window.filter_obj.count())
                               if window.filter_obj.itemText(index) == label
-                              and window.filter_obj.itemData(index)]
+                              and window.filter_obj.itemData(index)
+                              and (not project or window.filter_obj.itemData(index) == project["sync_id"])]
             if len(object_matches) != 1:
                 del blockers
                 self.state.setText("Объект не найден однозначно в журнале; переход не выполнен.")
@@ -1788,6 +2152,13 @@ class AssistantDialog(QDialog):
         if self.date_from.date() > self.date_to.date():
             self.failed("Начальная дата должна быть не позже конечной.")
             return
+        if self.project_active:
+            self.invalidate_project()
+        self.project_mode = False
+        self.project_all.setVisible(False)
+        with QSignalBlocker(self.project_all):
+            self.project_all.setChecked(False)
+        self.project_period_changed()
         self.result = None
         self.attention = None
         self.table.setVisible(False)
@@ -1812,6 +2183,45 @@ class AssistantDialog(QDialog):
         self.result = None
         self.pdf.setEnabled(False)
         self.append_message("Вы", text)
+        if self.project_pending is not None and text.isdecimal():
+            choices, period = self.project_pending
+            index = int(text) - 1
+            if 0 <= index < len(choices):
+                self.project_pending = None
+                self.input.clear()
+                self.start_project(choices[index], period)
+                return
+        if assistant_project.project_request(text):
+            self.input.clear()
+            self.project_pending = None
+            self.clear_clarification()
+            if self.project_active:
+                self.invalidate_project()
+            try:
+                period = assistant_project.project_period(text)
+                self.resolve_project(text, period)
+            except (ValueError, sqlite3.Error, OSError) as error:
+                self.failed(str(error))
+            return
+        if (self.project_mode and self.project_selected and re.fullmatch(
+                r"\s*(?:а\s+)?(?:за\s+.+|с\s+.+\s+по\s+.+)\s*[?.!]*", text.casefold())):
+            try:
+                period = assistant_project.project_period(text)
+                if period is None and not re.search(r"\bза\s+весь\s+объект\b", text.casefold()):
+                    raise ValueError("Укажите период.")
+                obj = self.project_selected
+                self.input.clear()
+                self.start_project(obj, period)
+            except (ValueError, sqlite3.Error, OSError) as error:
+                self.failed(str(error))
+            return
+        if self.project_active:
+            self.invalidate_project()
+        self.project_mode = False
+        self.project_all.setVisible(False)
+        with QSignalBlocker(self.project_all):
+            self.project_all.setChecked(False)
+        self.project_period_changed()
         if assistant_attention.is_attention_request(text):
             self.input.clear()
             self.start_attention(text, already_appended=True)
@@ -1872,6 +2282,21 @@ class AssistantDialog(QDialog):
             self.failed("Не удалось открыть штатный раздел текущего профиля. Ничего не сохранено помощником.")
 
     def record_details(self):
+        if self.project_result is not None:
+            previous = self.attention
+            self.attention = {
+                "overview": None, "company": self.project_result["object"]["company"],
+                "object_name": self.project_result["object"]["name"],
+                "documents": self.project_result["documents"],
+                "periods": {"hours": self.project_result["period"]},
+                "project": self.project_result["object"],
+                "project_period": self.project_result["period"],
+            }
+            try:
+                self.open_attention_record()
+            finally:
+                self.attention = previous
+            return
         if self.attention is not None:
             self.open_attention_record()
             return

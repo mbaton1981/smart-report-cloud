@@ -13799,6 +13799,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 "expense_snapshot_available": expense_snapshot_available,
                 "expense_linked": server_id is not None,
                 "has_work_rows": bool(journal_rows),
+                "journal_rows": journal_rows,
+                "journal_segments": journal_segments,
+                "customer_report": report,
             }
         finally:
             conn.close()
@@ -13920,7 +13923,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         try:
             object_row = self._selected_object_for_navigation()
             if object_row is None:
-                return
+                return False
             start, end = self._object_link_period(object_row)
             self.filter_date_from.setDate(QDate.fromString(start, "yyyy-MM-dd"))
             self.filter_date_to.setDate(QDate.fromString(end, "yyyy-MM-dd"))
@@ -13932,14 +13935,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.tabs.setCurrentIndex(0)
             self.load_shifts_history()
             self.apply_shifts_filters()
+            return True
         except (ValueError, sqlite3.Error) as error:
             QMessageBox.warning(self, "Переход к сменам", str(error))
+            return False
 
     def open_selected_object_expenses(self):
         try:
             object_row = self._selected_object_for_navigation()
             if object_row is None:
-                return
+                return False
             if object_row["server_id"] is None:
                 raise ValueError("Объект ещё не связан с реестром расходов.")
             self.load_expense_document_filters()
@@ -13954,8 +13959,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.exp_document_tabs.setCurrentIndex(1)
             self.tabs.setCurrentIndex(3)
             self.load_object_expense_overview()
+            return True
         except (ValueError, sqlite3.Error) as error:
             QMessageBox.warning(self, "Переход к расходам", str(error))
+            return False
 
     def open_selected_object_report(self):
         try:

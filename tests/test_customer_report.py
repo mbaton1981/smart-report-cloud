@@ -127,6 +127,23 @@ class CustomerReportTests(unittest.TestCase):
         )
         return PdfReader(output)
 
+    def test_project_assistant_matches_object_and_customer_report(self):
+        from assistant_project import shift_summary
+
+        self.shift(hours=3, rate=400)
+        self.ob(transport=1)
+        report = self.window.generate_invoice()
+        overview = self.window._read_object_overview(
+            39, "object-t", None, "2026-10-01", "2026-10-31", [], False, False)
+        summary = shift_summary(overview, ("2026-10-01", "2026-10-31"))
+        self.assertEqual(summary["hours"], overview["hours"])
+        self.assertEqual(summary["hours"], report["totals"]["hours"])
+        self.assertEqual(summary["ordinary"], report["totals"]["without_ob_hours"])
+        self.assertEqual(summary["ob"], 2)
+        self.assertEqual(summary["known_subtotal"], report["totals"]["known_subtotal"])
+        self.assertEqual(summary["total"], report["totals"]["invoice_total"])
+        self.assertEqual(summary["unknown_records"], 1)
+
     def test_existing_ob_shape_objects_transport_and_pdf_separation(self):
         self.ob()
         self.shift(object_name="HOTEL Djurgården", transport=1)
