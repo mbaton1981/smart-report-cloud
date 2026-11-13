@@ -79,6 +79,41 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIsNotNone(window.gallery)
         self.assertFalse(window.empty_state.isVisible())
 
+    def test_explicit_navigation_preserves_unsaved_card_until_confirmed(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        window = self.open_window(document_id=1)
+        host = QWidget()
+        self.addCleanup(host.deleteLater)
+        host._incoming_viewer = window
+        window.inputs["supplier_name"].setText("Unsaved correction")
+        with patch("offline_review_ui.QMessageBox.question",
+                   return_value=QMessageBox.StandardButton.Cancel):
+            self.desktop.SmartReportApp.open_incoming_documents(host, 2)
+        self.assertEqual(window.document_id, 1)
+        self.assertEqual(window.selector.currentData(), 1)
+        self.assertEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
+
+        with patch("offline_review_ui.QMessageBox.question",
+                   return_value=QMessageBox.StandardButton.Discard):
+            self.desktop.SmartReportApp.open_incoming_documents(host, 2)
+        self.assertEqual(window.document_id, 2)
+        self.assertEqual(window.selector.currentData(), 2)
+        self.assertNotEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
+
+        window.inputs["supplier_name"].setText("Saved correction")
+        with patch("offline_review_ui.QMessageBox.question",
+                   return_value=QMessageBox.StandardButton.Save):
+            self.desktop.SmartReportApp.open_incoming_documents(host, 1)
+        self.assertEqual(window.document_id, 1)
+        self.assertEqual(self.store.latest(2)[1]["supplier_name"], "Saved correction")
+
+        with patch("app.QMessageBox.warning") as warning:
+            self.desktop.SmartReportApp.open_incoming_documents(host, 99999)
+        warning.assert_called_once()
+        self.assertEqual(window.document_id, 1)
+        self.assertEqual(window.selector.currentData(), 1)
+
     def test_expense_mail_reminder_uses_both_themes_and_does_not_mark_failed_check(self):
         from datetime import date
         import folder_mail

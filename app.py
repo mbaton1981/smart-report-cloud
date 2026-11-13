@@ -8078,6 +8078,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             QMessageBox.information(self, "Входящие документы", "Функция выключена; фоновых запусков нет.")
             return
         viewer = getattr(self, "_incoming_viewer", None)
+        if viewer is not None and document_id is not None:
+            try:
+                exists = any(row["id"] == document_id for row in viewer.store.documents())
+            except (OSError, sqlite3.Error, ValueError) as error:
+                logging.exception("Не удалось найти входящий документ")
+                QMessageBox.warning(self, "Входящие документы", f"Не удалось найти документ: {error}")
+                return
+            if not exists:
+                QMessageBox.warning(self, "Входящие документы", "Документ не найден. Текущая карточка не изменена.")
+                return
+            if viewer.document_id != document_id and not viewer.keep_unsaved():
+                return
         if viewer is None:
             try:
                 viewer = open_incoming(self, self._incoming_documents_root(), document_id=document_id)
@@ -8092,6 +8104,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             index = viewer.selector.findData(document_id)
             if index >= 0:
                 viewer.selector.setCurrentIndex(index)
+                if viewer.document_id != document_id:
+                    viewer.select_document()
+            else:
+                QMessageBox.warning(self, "Входящие документы", "Документ не найден. Текущая карточка не изменена.")
+                return
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
