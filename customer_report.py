@@ -32,6 +32,7 @@ TYPE_LABELS = {
     "work": "Arbete", "ob": "Arbete med OB", "atf": "Arbetstidsförkortning",
     "sick": "Sjukfrånvaro", "vacation": "Semester", "holiday": "Röda dagar",
 }
+REPORT_ISSUER_NAME = "Bygger och renoverar i Sthlm AB"
 
 
 def positive_rate(value):
@@ -253,6 +254,24 @@ def write_customer_pdf(
             "CustomerTitle", fontName=bold_font,
             fontSize=16 if activity_only else 17, leading=19 if activity_only else 21,
         ),
+        "issuer": ParagraphStyle(
+            "ActivityReportIssuer", fontName=bold_font, fontSize=11, leading=13,
+        ),
+        "object_title": ParagraphStyle(
+            "ActivityReportObject", fontName=bold_font, fontSize=13, leading=16,
+        ),
+        "meta": ParagraphStyle(
+            "ActivityReportMeta", fontName=font, fontSize=9, leading=11,
+        ),
+        "repeat_issuer": ParagraphStyle(
+            "ActivityReportRepeatIssuer", fontName=bold_font, fontSize=8.5, leading=10,
+        ),
+        "repeat_object": ParagraphStyle(
+            "ActivityReportRepeatObject", fontName=font, fontSize=8.5, leading=10,
+        ),
+        "repeat_period": ParagraphStyle(
+            "ActivityReportRepeatPeriod", fontName=font, fontSize=8, leading=9,
+        ),
         "summary_value": ParagraphStyle(
             "CustomerSummaryValue", fontName=bold_font, fontSize=11, leading=12,
         ),
@@ -265,13 +284,25 @@ def write_customer_pdf(
         styles[name + "_number"] = ParagraphStyle(
             "Customer" + name + "Number", parent=styles[name], alignment=TA_RIGHT,
         )
-    width, _height = landscape(A4)
+    width, page_height = landscape(A4)
     available = width - 72
 
     def paragraph(value, style="body"):
         return Paragraph(escape(str(value)).replace("\n", "<br/>"), styles[style])
 
     def heading(title):
+        if activity_only:
+            return [
+                paragraph(REPORT_ISSUER_NAME, "issuer"),
+                paragraph(title, "title"),
+                paragraph(f"Objekt: {report['object']}", "object_title"),
+                paragraph(
+                    f"Beställare: {report['company']}   |   "
+                    f"Period: {report['date_from']} – {report['date_to']}",
+                    "meta",
+                ),
+                Spacer(1, 8),
+            ]
         return [
             paragraph(title, "title"),
             paragraph(
@@ -579,14 +610,46 @@ def write_customer_pdf(
     def footer(canvas, doc):
         canvas.saveState()
         canvas.setFont(font, 9)
-        canvas.drawString(36, 17, f"{report['company']} | {report['date_from']} – {report['date_to']}")
+        if not activity_only:
+            canvas.drawString(
+                36, 17, f"{report['company']} | {report['date_from']} – {report['date_to']}",
+            )
         canvas.drawRightString(width - 36, 17, f"Sida {doc.page}")
         canvas.restoreState()
+
+    repeating_header = []
+    if activity_only:
+        repeating_header = [
+            paragraph(REPORT_ISSUER_NAME, "repeat_issuer"),
+            paragraph(f"Objekt: {report['object']}", "repeat_object"),
+            paragraph(f"Period: {report['date_from']} – {report['date_to']}", "repeat_period"),
+        ]
+
+    def draw_repeating_header(canvas, doc):
+        canvas.saveState()
+        y = page_height - 16
+        for item in repeating_header:
+            _, item_height = item.wrap(available, page_height)
+            y -= item_height
+            item.drawOn(canvas, doc.leftMargin, y)
+            y -= 2
+        canvas.restoreState()
+
+    repeating_header_height = 0
+    for item in repeating_header:
+        _, item_height = item.wrap(available, page_height)
+        repeating_header_height += item_height + 2
+    top_margin = max(30, repeating_header_height + 30) if activity_only else 30
+
+    def later_page(canvas, doc):
+        if activity_only:
+            draw_repeating_header(canvas, doc)
+        footer(canvas, doc)
 
     document = SimpleDocTemplate(
         os.fspath(filepath) if isinstance(filepath, os.PathLike) else filepath,
         pagesize=landscape(A4), leftMargin=36, rightMargin=36,
-        topMargin=30, bottomMargin=32,
+        topMargin=top_margin, bottomMargin=32,
         title="Arbetstidsrapport" if activity_only else "Fakturaunderlag och arbetsjournal",
     )
-    document.build(story, onFirstPage=footer, onLaterPages=footer)
+    document.build(story, onFirstPage=footer, onLaterPages=later_page)

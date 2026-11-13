@@ -150,6 +150,7 @@ class CustomerReportTests(unittest.TestCase):
         self.assertIn("Montering", journal)
         self.assertNotIn("SEK", journal)
         self.assertNotIn("245", journal)
+        self.assertNotIn("Bygger och renoverar i Sthlm AB", first + journal)
         for forbidden in ("Löneunderlag", "1 229", "983", "Начисления", "HOTEL"):
             self.assertNotIn(forbidden, first + journal)
         self.assertEqual(self.window.table_dagbok.rowCount(), 1)
@@ -344,6 +345,51 @@ class CustomerReportTests(unittest.TestCase):
         self.assertIn("Faktisk tid", text)
         for forbidden in ("OB1", "OB2", "Övertid", "SEK", "245,8", "№1", "Pris (", "tillägg – OB"):
             self.assertNotIn(forbidden, text)
+
+    def test_activity_pdf_first_page_has_distinct_issuer_object_and_customer_details(self):
+        self.shift()
+        report = self.window.generate_activity_report()
+        pages = self.pdf(report, activity_only=True).pages
+        self.assertEqual(len(pages), 1)
+        text = " ".join(pages[0].extract_text().split())
+        issuer = "Bygger och renoverar i Sthlm AB"
+        self.assertIn(issuer, text)
+        self.assertIn("Arbetstidsrapport", text)
+        self.assertIn("Objekt: Tomteboda ÄTA", text)
+        self.assertIn("Beställare: Renatur", text)
+        self.assertIn("Period: 2026-10-01 – 2026-10-31", text)
+        self.assertLess(text.index(issuer), text.index("Arbetstidsrapport"))
+        self.assertLess(text.index("Arbetstidsrapport"), text.index("Objekt:"))
+        self.assertLess(text.index("Objekt:"), text.index("Beställare:"))
+
+    def test_activity_pdf_wraps_long_object_and_repeats_header_on_later_pages(self):
+        object_name = (
+            "Tallvagen 11 1:116, Lidingö Kjell ÄTA — "
+            "renovering och kompletterande arbeten i befintlig byggnad, "
+            "inklusive gemensamma utrymmen, installationer, materialleveranser, "
+            "markarbeten, samordning och avslutande besiktning"
+        )
+        self.conn.execute("UPDATE objects SET name=? WHERE id=39", (object_name,))
+        self.conn.commit()
+        for index in range(75):
+            self.shift(
+                day="2026-10-21" if index % 2 == 0 else "2026-10-22",
+                name=f"Employee {index:02d}", object_name=object_name,
+            )
+        report = self.window.generate_activity_report()
+        pdf = self.pdf(report, activity_only=True)
+        self.assertGreater(len(pdf.pages), 1)
+        issuer = "Bygger och renoverar i Sthlm AB"
+        for page in pdf.pages:
+            text = " ".join(page.extract_text().split())
+            self.assertIn(issuer, text)
+            self.assertIn("Objekt:", text)
+            self.assertIn("Period: 2026-10-01 – 2026-10-31", text)
+            self.assertIn("Datum", text)
+        normalized_object_name = " ".join(object_name.split())
+        for page in pdf.pages:
+            text = " ".join(page.extract_text().split())
+            self.assertIn(normalized_object_name, text)
 
     def test_activity_pdf_separates_ordinary_ob_and_transport_without_double_count(self):
         ordinary_id = self.shift(
