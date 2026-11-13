@@ -2891,6 +2891,81 @@ class AssistantUiTests(unittest.TestCase):
         self.assertNotIn("Unrelated", dialog.worker.text)
         self.assertTrue(dialog.table.isHidden())
 
+    def test_hours_period_followup_starts_once_and_updates_fields(self):
+        from assistant_ui import AssistantDialog, AttentionWorker, RequestWorker
+        from PyQt6.QtCore import QDate
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.attention = {"overview": {}, "company": "Firm", "object_name": "X"}
+        dialog.table.setVisible(True)
+        dialog.input.setPlainText("За прошлую неделю")
+        with patch("assistant_ui.desktop_auth.current_token", return_value="token"), \
+                patch("assistant_ui.desktop_auth.current_user", return_value={"role": "admin"}), \
+                patch("assistant_desktop.application", return_value=self.desktop), \
+                patch("assistant_attention._week_period", return_value=("2026-11-02", "2026-11-08")), \
+                patch.object(AttentionWorker, "start") as start:
+            dialog.command()
+        start.assert_called_once()
+        self.assertEqual(dialog.worker.scope, ("Firm", "X"))
+        self.assertEqual(dialog.date_from.date(), QDate(2026, 11, 2))
+        self.assertEqual(dialog.date_to.date(), QDate(2026, 11, 8))
+        self.assertTrue(dialog.table.isHidden())
+
+    def test_hours_followup_keeps_scope_when_local_read_fails(self):
+        from assistant_ui import AttentionWorker
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = str(Path(temp.name) / "empty.sqlite")
+        sqlite3.connect(path).close()
+        periods = {"hours": ("2026-11-02", "2026-11-08"),
+                   "prices": ("2026-11-02", "2026-11-08"), "documents": None}
+        worker = AttentionWorker(path, Mock(), "За прошлую неделю", periods,
+                                 hours_only=True, scope=("Firm", "X"))
+        received = []
+        worker.ready.connect(received.append)
+        with patch("assistant_ui.request_api", side_effect=[
+                {"result": {"table": {"rows": []}}}, {"result": {"records": []}}]) as api:
+            worker.run()
+        self.assertFalse(received[0]["local_available"])
+        self.assertEqual((received[0]["local"]["company"], received[0]["local"]["object_name"]),
+                         ("Firm", "X"))
+        self.assertEqual(api.call_args_list[1].args[1]["plan"]["object_name"], "X")
+
+    def test_hours_overview_deduplicates_synced_rows_and_displays_all_weeks(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.attention_periods = {"hours": ("2026-11-02", "2026-11-15"),
+                                    "prices": ("2026-11-02", "2026-11-15"), "documents": None}
+        base = dict(employee="Alice", date="2026-11-02", entry_type="work", hours=4,
+                    company="Firm", object_name="X")
+        remote = [dict(base, id="same"), dict(base, id="ob", entry_type="ob", hours=2),
+                  dict(base, id="later", date="2026-11-10", hours=7),
+                  dict(base, id="leave", date="2026-11-04", entry_type="vacation", hours=8)]
+        local = [dict(base, sync_id="same")]
+        with patch("assistant_attention.datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 13, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
+            dialog.attention_received({
+                "local": dict(rows=local, employees=[{"name": "Alice", "is_active": 1}],
+                              pending=[], company="Firm", object_name="X"),
+                "hours": remote, "employee_status": {"table": {"rows": [["Внесли часы", "Alice"]]}},
+                "prices": None, "documents": None, "errors": [], "hours_only": True,
+            })
+        self.assertEqual(dialog.table.rowCount(), 2)
+        self.assertEqual(dialog.table.item(0, 1).text(), "2026-11-02\n6 ч")
+        self.assertEqual(dialog.table.item(0, 3).text(), "2026-11-04\nОтпуск")
+        self.assertEqual(dialog.table.item(1, 2).text(), "2026-11-10\n7 ч")
+        self.assertEqual(dialog.table.item(1, 7).text(), "2026-11-15\nЕщё не наступил")
+        output = dialog.output.toPlainText()
+        self.assertIn("рабочих часов: 13 ч", output)
+        self.assertIn("У всех проверенных активных сотрудников есть записи", output)
+        self.assertIn("Полноту заполнения без рабочего графика подтвердить нельзя", output)
+        self.assertNotIn("замечаний нет", output)
+
     def test_result_rows_remain_intact_when_sorting_is_enabled(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtCore import Qt
@@ -2972,8 +3047,8 @@ class AssistantUiTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         dialog.database = str(Path(temp.name) / "isolated.sqlite")
-        with sqlite3.connect(dialog.database):
-            pass
+        conn = sqlite3.connect(dialog.database)
+        conn.close()
         dialog.attention_periods = {"hours": ("2026-11-02", "2026-11-08"),
                                     "prices": ("2026-11-01", "2026-11-30"), "documents": None}
         employees = [{"name": name, "is_active": 1} for name in ("Alice", "Bob", "Carol")]
@@ -2987,19 +3062,27 @@ class AssistantUiTests(unittest.TestCase):
                                    ["Внесли часы", "Carol"]]}},
             "documents": None, "errors": [], "hours_only": True,
         })
-        self.assertIn("Нет записей часов: 1", dialog.output.toPlainText())
+        self.assertIn("совсем без записей рабочих часов — 1", dialog.output.toPlainText())
         self.assertNotIn("Документы с одной", dialog.output.toPlainText())
-        self.assertEqual(dialog.table.rowCount(), 1)
-        self.assertEqual(dialog.table.item(0, 1).text(), "2026-11-02 — 2026-11-08")
-        self.assertEqual(dialog.table.item(0, 2).text(), "Bob")
-        dialog.table.selectRow(0)
+        self.assertEqual(dialog.table.rowCount(), 3)
+        self.assertEqual(dialog.table.item(0, 0).text(), "Bob")
+        self.assertEqual(dialog.table.item(0, 2).text(), "Нет записи")
+        self.assertEqual(dialog.table.item(1, 2).text(), "8 ч")
+        self.assertIn("За пятницу 2026-11-06 записей рабочих часов нет", dialog.output.toPlainText())
+        dialog.table.setCurrentCell(0, 2)
         dialog.open_attention_record()
         self.assertEqual(window.filter_emp.currentText(), "Bob")
         self.assertEqual(window.filter_comp.currentText(), "Firm")
         self.assertEqual(window.filter_obj.currentData(), "object-id", dialog.state.text())
-        self.assertEqual(window.filter_date_from.date(), QDate(2026, 11, 2))
-        self.assertEqual(window.filter_date_to.date(), QDate(2026, 11, 8))
+        self.assertEqual(window.filter_date_from.date(), QDate(2026, 11, 3))
+        self.assertEqual(window.filter_date_to.date(), QDate(2026, 11, 3))
         self.assertEqual(window.table_shifts.currentRow(), -1)
+        dialog.table.setCurrentCell(1, 2)
+        dialog.open_attention_record()
+        self.assertEqual(window.filter_emp.currentText(), "Alice")
+        self.assertEqual(window.filter_date_from.date(), QDate(2026, 11, 3))
+        self.assertEqual(window.table_shifts.currentRow(), -1)
+        dialog.table.setCurrentCell(0, 2)
         window.filter_emp.addItem(" bob ")
         dialog.open_attention_record()
         self.assertIn("не найден однозначно", dialog.state.text())
@@ -3014,15 +3097,14 @@ class AssistantUiTests(unittest.TestCase):
                 "errors": ["Серверные смены: не удалось проверить."], "hours_only": True,
             })
         output = dialog.output.toPlainText()
-        self.assertIn("Нет записей часов: 2", output)
+        self.assertIn("Данные неполные", output)
         self.assertIn("Серверные смены: не удалось проверить", output)
-        self.assertIn("серверные данные недоступны", output)
-        self.assertIn("текущая неделя ещё не завершена", output)
+        self.assertIn("серверные данные недоступны или неполны", output)
+        self.assertIn("Данные неполные", dialog.table.item(0, 1).text())
+        self.assertNotIn("Нет записи", dialog.table.item(0, 1).text())
         dialog.output.clear()
         dialog.attention_periods["hours"] = ("2026-11-09", "2026-11-15")
-        with patch("assistant_attention.datetime") as clock, \
-                patch("assistant_attention.missing_hours", return_value=(
-                    [], ["Результат предварительный: текущая неделя ещё не завершена."])):
+        with patch("assistant_attention.datetime") as clock:
             clock.now.return_value = datetime(2026, 11, 13, 12, tzinfo=ZoneInfo("Europe/Stockholm"))
             dialog.attention_received({
                 "local": dict(rows=[], employees=employees, pending=[], company="", object_name=""),
@@ -3030,7 +3112,12 @@ class AssistantUiTests(unittest.TestCase):
                     "table": {"rows": [["Без внесённых часов", item["name"]] for item in employees]}},
                 "documents": None, "errors": [], "hours_only": True,
             })
-        self.assertEqual(dialog.output.toPlainText().count("предварительн"), 1)
+        self.assertIn("Текущая неделя предварительная", dialog.output.toPlainText())
+        self.assertIn("сегодня, предварительно", dialog.table.item(0, 5).text())
+        self.assertEqual(dialog.table.item(0, 6).text(), "Ещё не наступил")
+        dialog.date_from.setDate(QDate(2026, 10, 1))
+        self.assertTrue(dialog.table.isHidden())
+        self.assertIn("Период изменён", dialog.state.text())
 
     def test_attention_offline_result_and_shift_navigation_by_id(self):
         from assistant_ui import AssistantDialog, RequestWorker

@@ -1,5 +1,6 @@
 """Deterministic, read-only preparation of the director's attention list."""
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 import re
 
@@ -21,7 +22,8 @@ def is_missing_hours_request(text):
     noun = r"(?:свои\w*\s+)?(?:час(?:ы|ов|ам|ами)|табел\w*|отч[её]т\w*\s+(?:по|о)\s+час\w*)"
     return bool(re.search(
         rf"\b{subject}\b.*?\b{missing}\s+{noun}\b|"
-        rf"\b{subject}\b.*?\bне\s+отчитал\w*\s+по\s+час\w*\b",
+        rf"\b{subject}\b.*?\bне\s+отчитал\w*\s+по\s+час\w*\b|"
+        r"\bу\s+кого\b.*?\bдн(?:и|ей|я)\s+без\s+запис\w*",
         normalized))
 
 
@@ -174,6 +176,80 @@ def missing_hours(employees, rows, period, company="", object_name=""):
         return missing, warnings
     finally:
         conn.close()
+
+
+def hours_weekly_overview(employees, rows, period, *, company="", object_name="", complete=True, today=None):
+    """Aggregate saved work records by employee and calendar day without inferring schedules."""
+    today = today or datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    start, end = (date.fromisoformat(value) for value in period)
+    if start > end:
+        raise ValueError("Начальная дата позже конечной.")
+    if (end - start).days > 366:
+        raise ValueError("Период превышает допустимый сервером предел — 366 дней разницы между датами.")
+    normalize = lambda value: " ".join(str(value or "").split()).casefold()
+    profiles = {}
+    for employee in employees:
+        key = normalize(employee.get("name"))
+        if not key or key in profiles:
+            raise ValueError("Сотрудники не определены однозначно.")
+        profiles[key] = {"name": employee["name"], "active": bool(employee["is_active"]),
+                         "linked": True, "days": {}}
+    absence = {"vacation": "Отпуск", "sick": "Больничный", "atf": "АТФ",
+               "holiday": "Красный день"}
+    unlinked, unknown_types = set(), set()
+    for row in rows:
+        if company and row.get("company") != company or object_name and row.get("object_name") != object_name:
+            continue
+        day = date.fromisoformat(str(row.get("date") or ""))
+        if not start <= day <= end:
+            continue
+        key = normalize(row.get("employee"))
+        kind = row.get("entry_type")
+        if kind == "transport":
+            continue
+        if key not in profiles:
+            name = str(row.get("employee") or "Имя не указано")
+            unlinked.add(name)
+            profiles[key] = {"name": name, "active": False, "linked": False, "days": {}}
+        entry = profiles[key]["days"].setdefault(
+            day, {"hours": Decimal(0), "work": False, "absence": set(), "unknown": False})
+        if kind in ("work", "ob"):
+            try:
+                hours = Decimal(str(row["hours"]))
+                if not hours.is_finite() or hours < 0:
+                    raise ValueError
+            except (KeyError, InvalidOperation, ValueError):
+                raise ValueError(f"Некорректные рабочие часы: {profiles[key]['name']}, {day.isoformat()}.")
+            entry["hours"] += hours
+            entry["work"] = True
+        elif kind in absence:
+            entry["absence"].add(absence[kind])
+        else:
+            entry["unknown"] = True
+            unknown_types.add(str(kind or "не указан"))
+    active = [p for p in profiles.values() if p["active"]]
+    historical = [p for p in profiles.values() if not p["active"] and p["days"]]
+    if unlinked or unknown_types:
+        complete = False
+    active.sort(key=lambda p: (any(d["work"] for d in p["days"].values()), p["name"].casefold()))
+    historical.sort(key=lambda p: p["name"].casefold())
+    weeks = []
+    monday = start - timedelta(days=start.weekday())
+    while monday <= end:
+        days = [monday + timedelta(days=index) for index in range(7)]
+        weeks.append(days)
+        monday += timedelta(days=7)
+    total = sum((entry["hours"] for profile in active + historical
+                 for entry in profile["days"].values()), Decimal(0))
+    empty_dates = [day for week in weeks for day in week
+                   if start <= day <= end and day <= today and not any(
+                       profile["days"].get(day, {}).get("work") for profile in active + historical)]
+    return {"active": active, "historical": historical, "weeks": weeks, "total": total,
+            "without": sum(not any(entry["work"] for entry in profile["days"].values()) for profile in active),
+            "with_hours": sum(any(entry["hours"] > 0 for entry in profile["days"].values()) for profile in active),
+            "empty_dates": empty_dates if complete else [], "complete": complete,
+            "today": today, "start": start, "end": end, "unlinked": sorted(unlinked),
+            "unknown_types": sorted(unknown_types)}
 
 
 def document_issues(documents, status_key, unallocated, remaining, period=None):

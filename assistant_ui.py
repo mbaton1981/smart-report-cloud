@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import struct
 from pathlib import Path
@@ -127,10 +128,11 @@ class RequestWorker(QThread):
 class AttentionWorker(QThread):
     ready = pyqtSignal(dict)
 
-    def __init__(self, database, app, text, periods, parent=None, *, hours_only=False):
+    def __init__(self, database, app, text, periods, parent=None, *, hours_only=False, scope=None):
         super().__init__(parent)
         self.database, self.app, self.text, self.periods = database, app, text, periods
         self.hours_only = hours_only
+        self.scope = scope
 
     def run(self):
         result = {"errors": [], "local": None, "local_available": False, "hours": None, "prices": None,
@@ -148,7 +150,8 @@ class AttentionWorker(QThread):
                 conn.execute("BEGIN")
                 objects = [dict(row) for row in conn.execute(
                     "SELECT company,name FROM objects WHERE is_active=1")]
-                company, obj = assistant_attention.scope_for_text(self.text, objects)
+                company, obj = (self.scope if self.scope is not None
+                                else assistant_attention.scope_for_text(self.text, objects))
                 start = (self.periods["hours"][0] if self.hours_only else
                          min(self.periods["hours"][0], self.periods["prices"][0]))
                 end = (self.periods["hours"][1] if self.hours_only else
@@ -166,7 +169,8 @@ class AttentionWorker(QThread):
                     else:
                         result["errors"].append("Локальные OB-сегменты отсутствуют; часть цен нельзя проверить.")
                 for row in rows:
-                    row["entry_type"] = row.get("entry_type") or "work"
+                    if not self.hours_only:
+                        row["entry_type"] = row.get("entry_type") or "work"
                     row["_attention_segments"] = segments.get(row.get("sync_id"), [])
                 employees = [dict(row) for row in conn.execute(
                     "SELECT id,name,is_active FROM employees")]
@@ -184,8 +188,9 @@ class AttentionWorker(QThread):
             return
         except (OSError, sqlite3.Error) as error:
             result["errors"].append("Локальные смены и справочники: не удалось проверить: " + str(error))
-            result["local"] = dict(rows=[], employees=[], pending=[], company="", object_name="")
-            if any(word in self.text.casefold() for word in ("объект", "фирм", "компан")):
+            company, obj = self.scope if self.scope is not None else ("", "")
+            result["local"] = dict(rows=[], employees=[], pending=[], company=company, object_name=obj)
+            if self.scope is None and any(word in self.text.casefold() for word in ("объект", "фирм", "компан")):
                 result["errors"].append("Не удалось определить область по локальному справочнику.")
                 self.ready.emit(result)
                 return
@@ -716,6 +721,7 @@ class AssistantDialog(QDialog):
         for field in (self.date_from, self.date_to):
             field.setDisplayFormat("dd.MM.yyyy")
             field.setCalendarPopup(True)
+            field.dateChanged.connect(self.hours_period_changed)
         self.employee = QLineEdit()
         self.employee.setPlaceholderText("Все сотрудники (или точное ФИО)")
         self.company, self.object_name = QLineEdit(), QLineEdit()
@@ -1162,6 +1168,7 @@ class AssistantDialog(QDialog):
             headers, rows = result_table(self.result)
             sorting = self.table.isSortingEnabled()
             self.table.setSortingEnabled(False)
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setColumnCount(len(headers))
             self.table.setHorizontalHeaderLabels(headers)
             self.table.setRowCount(len(rows))
@@ -1193,7 +1200,7 @@ class AssistantDialog(QDialog):
         if 0 <= index < len(self.workflow_results):
             self.received(dict(result=self.workflow_results[index], _repeat=True))
 
-    def start_attention(self, text, already_appended=False, *, hours_only=False):
+    def start_attention(self, text, already_appended=False, *, hours_only=False, scope=None):
         if self.assistant_candidate:
             self.state.setText("Сводка недоступна в изолированном кандидате.")
             return
@@ -1217,6 +1224,10 @@ class AssistantDialog(QDialog):
             self.state.setText(str(error))
             self.append_message("SmartReport", str(error))
             return
+        if hours_only:
+            with QSignalBlocker(self.date_from), QSignalBlocker(self.date_to):
+                self.date_from.setDate(QDate.fromString(periods["hours"][0], "yyyy-MM-dd"))
+                self.date_to.setDate(QDate.fromString(periods["hours"][1], "yyyy-MM-dd"))
         if not already_appended:
             self.append_message("Вы", text)
         self.send.setEnabled(False)
@@ -1231,10 +1242,19 @@ class AssistantDialog(QDialog):
             self.finished()
             return
         self.attention_periods = periods
-        self.worker = AttentionWorker(self.database, app, text, periods, self, hours_only=hours_only)
+        self.worker = AttentionWorker(self.database, app, text, periods, self,
+                                      hours_only=hours_only, scope=scope)
         self.worker.ready.connect(self.attention_received)
         self.worker.finished.connect(self.finished)
         self.worker.start()
+
+    def hours_period_changed(self):
+        if self.attention and self.attention.get("overview") is not None:
+            self.attention = None
+            self.table.setVisible(False)
+            self.open_records.setEnabled(False)
+            self.result_heading.clear()
+            self.state.setText("Период изменён; отправьте новый запрос для обновления таблицы.")
 
     def attention_received(self, data):
         local = data["local"]
@@ -1293,6 +1313,32 @@ class AssistantDialog(QDialog):
                 errors.append("Одинаковые имена сотрудников неоднозначны; проверка неполная.")
             employees = [item for item in employees if normalize(item["name"]) not in duplicate_names]
         remote_hours, local_hours = combined(data["hours"])
+        if data.get("hours_only"):
+            if status:
+                historical = [{"name": row[1], "is_active": 0}
+                              for row in status.get("table", {}).get("rows", [])
+                              if row[0] == "Исторические записи"]
+                known = {normalize(item["name"]) for item in employees}
+                historical.extend(item for item in local["employees"]
+                                  if not item["is_active"] and normalize(item["name"]) not in known
+                                  and normalize(item["name"]) not in {normalize(p["name"]) for p in historical})
+                employees = employees + historical
+            try:
+                overview = assistant_attention.hours_weekly_overview(
+                    employees, remote_hours + local_hours, self.attention_periods["hours"],
+                    company=company, object_name=obj,
+                    complete=bool(data.get("local_available", True) and status is not None
+                                  and data["hours"] is not None and not errors))
+            except (ValueError, KeyError, TypeError) as error:
+                self.failed("Обзор часов не удалось построить: " + str(error))
+                return
+            if overview["unlinked"]:
+                errors.append("Записи без однозначной связи с сотрудником: " +
+                              ", ".join(overview["unlinked"]) + ".")
+            if overview["unknown_types"]:
+                errors.append("Неизвестные типы записей: " + ", ".join(overview["unknown_types"]) + ".")
+            self.display_hours_overview(data, errors, overview)
+            return
         try:
             if data["hours"] is None and status and (company or obj):
                 missing, hour_warnings = [], []
@@ -1318,10 +1364,6 @@ class AssistantDialog(QDialog):
         except (sqlite3.Error, ValueError, KeyError) as error:
             missing, hour_warnings = [], []
             errors.append("Часы: не удалось проверить: " + str(error))
-        if data.get("hours_only"):
-            self.display_attention(data, errors, hour_warnings,
-                                   [("Нет записей часов", missing)], [], [])
-            return
         remote_prices, local_prices = combined(data["prices"])
         start, end = self.attention_periods["prices"]
         local_prices = [row for row in local_prices if start <= row["date"] <= end
@@ -1383,6 +1425,119 @@ class AssistantDialog(QDialog):
                     ("Документы требуют проверки", review), ("Не завершено распределение", allocation)]
         self.display_attention(data, errors, hour_warnings, sections, review, allocation)
 
+    def display_hours_overview(self, data, errors, overview):
+        company, obj = data["local"]["company"], data["local"]["object_name"]
+        scope = " / ".join(part for part in (company, obj) if part) or "все фирмы и объекты"
+        self.employee.clear()
+        self.company.setText(company)
+        self.object_name.setText(obj)
+        self.attention = dict(overview=overview, periods=self.attention_periods,
+                              company=company, object_name=obj)
+        self.attention_rows = overview["active"] + overview["historical"]
+        self.attention_expanded = True
+        start, end = self.attention_periods["hours"]
+        display = lambda value: format(value.normalize(), "f") if value else "0"
+        lines = [f"Обзор записей часов · {start} — {end} · область: {scope}."]
+        if company or obj:
+            lines.append("Показаны только записи в выбранной области; отсутствие здесь не означает отсутствие работы вообще.")
+        if overview["complete"]:
+            lines.append(f"Активные сейчас: совсем без записей рабочих часов — {overview['without']}; "
+                         f"с рабочими часами — {overview['with_hours']}.")
+            if overview["active"] and not overview["without"]:
+                lines.append("У всех проверенных активных сотрудников есть записи за период. "
+                             "Полноту заполнения без рабочего графика подтвердить нельзя. Ниже — часы по дням.")
+            if overview["empty_dates"]:
+                weekdays = ("понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье")
+                lines.extend(f"За {weekdays[day.weekday()]} {day.isoformat()} записей рабочих часов нет."
+                             for day in overview["empty_dates"])
+        else:
+            lines.append("Данные неполные: отсутствие записей и общую заполненность определить нельзя.")
+            lines.append(f"По доступным данным: сотрудников с рабочими часами — {overview['with_hours']}.")
+        lines.append(f"{'Всего зарегистрировано' if overview['complete'] else 'По доступным данным зарегистрировано'} "
+                     f"рабочих часов: {display(overview['total'])} ч, включая исторические записи.")
+        lines.append("Без рабочего графика нельзя определить пропущенные дни. "
+                     "Неактивные сейчас сотрудники с записями показаны отдельно; "
+                     "текущий статус не устанавливает их занятость в прошлом.")
+        week_start = overview["today"] - assistant_attention.timedelta(days=overview["today"].weekday())
+        if overview["start"] <= week_start + assistant_attention.timedelta(days=6) and overview["end"] >= week_start:
+            lines.append("Текущая неделя предварительная; сегодняшний день ещё не завершён.")
+        checked_at = assistant_attention.datetime.now(
+            assistant_attention.ZoneInfo("Europe/Stockholm")).strftime("%Y-%m-%d %H:%M")
+        server = "серверные данные получены" if data["hours"] is not None and data["employee_status"] is not None \
+            else "серверные данные недоступны или неполны"
+        local = "локальный профиль прочитан" if data.get("local_available", True) else "локальный профиль недоступен"
+        lines.append(f"Источники: {server}, {local}; запрос {checked_at} (Стокгольм); "
+                     "время последней синхронизации профиля неизвестно.")
+        if errors:
+            lines.append("Проверка неполная:\n" + "\n".join(errors))
+        self.append_message("SmartReport", "\n".join(lines))
+        self.result_heading.setText(f"Часы по дням · {start} — {end} · {scope}")
+        self.show_all_attention.setVisible(False)
+        self.table.setSortingEnabled(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        weekdays = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+        single_week = len(overview["weeks"]) == 1
+        headers = ["Сотрудник"] + [
+            (f"{name}, {overview['weeks'][0][i].isoformat()}"
+             if overview["start"] <= overview["weeks"][0][i] <= overview["end"] else f"{name} · вне периода")
+            if single_week else name
+            for i, name in enumerate(weekdays)
+        ] + ["Всего часов" if single_week else "Часов за неделю",
+             "Дней с рабочими часами"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(self.attention_rows) * len(overview["weeks"]))
+        row_index = 0
+        for profile in self.attention_rows:
+            for week in overview["weeks"]:
+                label = profile["name"]
+                if not profile["active"]:
+                    label += " · " + ("неактивен сейчас" if profile["linked"] else "нет связи со справочником")
+                if not single_week:
+                    label += f"\n{week[0].isoformat()} — {week[-1].isoformat()}"
+                self.table.setItem(row_index, 0, QTableWidgetItem(label))
+                total = Decimal(0)
+                days_with_hours = 0
+                for column, day in enumerate(week, 1):
+                    if not overview["start"] <= day <= overview["end"]:
+                        self.table.setItem(row_index, column, QTableWidgetItem("—"))
+                        continue
+                    entry = profile["days"].get(day)
+                    parts = []
+                    if day > overview["today"]:
+                        parts.append("Ещё не наступил")
+                    if entry and entry["work"]:
+                        parts.append(display(entry["hours"]) + " ч")
+                        total += entry["hours"]
+                        days_with_hours += int(entry["hours"] > 0)
+                    if entry and entry["absence"]:
+                        parts.extend(sorted(entry["absence"]))
+                    if entry and entry["unknown"]:
+                        parts.append("Тип записи не определён")
+                    if not parts:
+                        parts.append("Нет записи" if overview["complete"] else "Данные неполные")
+                    elif not overview["complete"] and day <= overview["today"]:
+                        parts.append("данные неполные")
+                    if day == overview["today"]:
+                        parts.append("сегодня, предварительно")
+                    value = "; ".join(parts)
+                    if not single_week:
+                        value = day.isoformat() + "\n" + value
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.ItemDataRole.UserRole,
+                                 {"kind": "employee", "employee": profile["name"], "date": day.isoformat()})
+                    self.table.setItem(row_index, column, item)
+                self.table.setItem(row_index, 8, QTableWidgetItem(display(total) + ("*" if not overview["complete"] else "")))
+                self.table.setItem(row_index, 9, QTableWidgetItem(str(days_with_hours) + ("*" if not overview["complete"] else "")))
+                row_index += 1
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.table.resizeColumnsToContents()
+        self.table.resizeRowsToContents()
+        self.table.setVisible(bool(self.attention_rows))
+        self.open_records.setEnabled(bool(self.attention_rows))
+        self.state.setText("Готово; выберите ячейку дня для перехода. Данные не изменены.")
+
     def display_attention(self, data, errors, hour_warnings, sections, review, allocation):
         company, obj = data["local"]["company"], data["local"]["object_name"]
         unique = {(row.get("client_id") or row.get("id") or row.get("incoming_document_id"))
@@ -1443,6 +1598,7 @@ class AssistantDialog(QDialog):
         self.attention_rows = rows
         sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Раздел", "Дата", "Запись", "Причина"])
         self.table.setRowCount(len(rows))
@@ -1478,8 +1634,15 @@ class AssistantDialog(QDialog):
 
     def open_attention_record(self):
         index = self.table.currentRow()
-        item = self.table.item(index, 0) if index >= 0 else None
-        record = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if self.attention.get("overview") is not None:
+            item = self.table.item(index, self.table.currentColumn()) if index >= 0 else None
+            record = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if not isinstance(record, dict):
+                self.state.setText("Выберите ячейку дня в таблице.")
+                return
+        else:
+            item = self.table.item(index, 0) if index >= 0 else None
+            record = item.data(Qt.ItemDataRole.UserRole) if item else None
         if not isinstance(record, dict):
             self.state.setText("Выберите строку сводки.")
             return
@@ -1532,7 +1695,7 @@ class AssistantDialog(QDialog):
             self.state.setText("Документ не найден в реестре; другая запись не открыта.")
             return
 
-        period = self.attention["periods"]["hours"] if record["kind"] == "employee" else (
+        period = ((record["date"], record["date"]) if record.get("date") else self.attention["periods"]["hours"]) if record["kind"] == "employee" else (
             record.get("date"), record.get("date"))
         start, end = (QDate.fromString(value or "", "yyyy-MM-dd") for value in period)
         if not start.isValid() or not end.isValid():
@@ -1656,6 +1819,13 @@ class AssistantDialog(QDialog):
         if assistant_attention.is_missing_hours_request(text):
             self.input.clear()
             self.start_attention(text, already_appended=True, hours_only=True)
+            return
+        if (self.attention and self.attention.get("overview") is not None and re.fullmatch(
+                r"\s*(?:а\s+)?(?:(?:за\s+)?(?:прошл\w*|предыдущ\w*|эт\w*|текущ\w*)\s+недел\w*|"
+                r"с\s+.+?\s+по\s+.+?|за\s+\d{4}-\d{2}-\d{2})\s*[?.!]*", text.casefold())):
+            scope = (self.attention["company"], self.attention["object_name"])
+            self.input.clear()
+            self.start_attention(text, already_appended=True, hours_only=True, scope=scope)
             return
         self.attention = None
         self.table.setVisible(False)

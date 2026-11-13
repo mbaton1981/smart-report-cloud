@@ -7,6 +7,9 @@ import assistant_attention as attention
 class AttentionTests(unittest.TestCase):
     def test_questions_about_missing_hours_are_recognized_without_guessing_other_requests(self):
         for text in ("Кто ещё не сдал свои часы за эту неделю?",
+                     "Кто не внёс часы за прошлую неделю?",
+                     "Кто не заполнил часы?",
+                     "У кого есть дни без записей?",
                      "Кто не заполнил табель за прошлую неделю?",
                      "Кто не отчитался по часам?"):
             self.assertTrue(attention.is_missing_hours_request(text), text)
@@ -40,6 +43,52 @@ class AttentionTests(unittest.TestCase):
         ]
         missing, _warnings = attention.missing_hours(employees, rows, ("2026-11-02", "2026-11-08"))
         self.assertEqual([row["employee"] for row in missing], ["Carol"])
+
+    def test_weekly_overview_combines_work_without_inventing_a_schedule(self):
+        employees = [{"name": name, "is_active": active} for name, active in (
+            ("Alice", 1), ("Bob", 1), ("Historical", 0))]
+        def row(name, day, kind, hours, obj="X"):
+            return dict(employee=name, date=day, entry_type=kind, hours=hours,
+                        company="Firm", object_name=obj)
+        rows = [row("Alice", "2026-11-02", "work", 4),
+                row("Alice", "2026-11-02", "ob", 2, "Y"),
+                row("Alice", "2026-11-03", "work", 7),
+                row("Alice", "2026-11-04", "vacation", 8),
+                row("Bob", "2026-11-06", "transport", 9),
+                row("Historical", "2026-11-02", "work", 3)]
+        result = attention.hours_weekly_overview(
+            employees, rows, ("2026-11-02", "2026-11-08"), today=date(2026, 11, 13))
+        self.assertEqual([item["name"] for item in result["active"]], ["Bob", "Alice"])
+        self.assertEqual(result["without"], 1)
+        self.assertEqual(result["with_hours"], 1)
+        self.assertEqual(result["total"], 16)
+        alice = result["active"][1]
+        self.assertEqual(alice["days"][date(2026, 11, 2)]["hours"], 6)
+        self.assertEqual(alice["days"][date(2026, 11, 4)]["absence"], {"Отпуск"})
+        self.assertEqual([p["name"] for p in result["historical"]], ["Historical"])
+        self.assertIn(date(2026, 11, 6), result["empty_dates"])
+        scoped = attention.hours_weekly_overview(
+            employees, rows, ("2026-11-02", "2026-11-08"),
+            company="Firm", object_name="X", today=date(2026, 11, 13))
+        self.assertEqual(scoped["active"][1]["days"][date(2026, 11, 2)]["hours"], 4)
+        self.assertEqual(scoped["total"], 14)
+
+    def test_weekly_overview_preserves_all_weeks_and_incomplete_data(self):
+        employees = [{"name": "Alice", "is_active": 1}]
+        result = attention.hours_weekly_overview(
+            employees, [], ("2026-11-02", "2026-11-15"),
+            complete=False, today=date(2026, 11, 13))
+        self.assertEqual(len(result["weeks"]), 2)
+        self.assertEqual(result["weeks"][1][-1], date(2026, 11, 15))
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["empty_dates"], [])
+        row = dict(employee="Alice", date="2026-11-02", entry_type=None, hours=8,
+                   company="Firm", object_name="X")
+        unknown = attention.hours_weekly_overview(
+            employees, [row], ("2026-11-02", "2026-11-08"), today=date(2026, 11, 13))
+        self.assertFalse(unknown["complete"])
+        self.assertEqual(unknown["total"], 0)
+        self.assertTrue(unknown["active"][0]["days"][date(2026, 11, 2)]["unknown"])
 
     def test_prices_use_saved_snapshot_and_distinguish_zero(self):
         row = dict(sync_id="one", date="2026-11-02", company="A", object_name="X",
