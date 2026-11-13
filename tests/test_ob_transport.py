@@ -144,6 +144,31 @@ class OBTransportTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_new_ob_object_list_excludes_service_categories_but_keeps_legacy_edit_selection(self):
+        conn = self.desktop.get_db_connection()
+        conn.executemany(
+            "INSERT INTO objects(company,name,markning,is_active,service_type) VALUES ('Renatur',?,?,1,?)",
+            [("Travel B", "project", None),
+             ("Arbetstidsförkortning", "p1000", "atf"),
+             ("Sjuk", "p1001", None)],
+        )
+        conn.commit()
+        conn.close()
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        self.addCleanup(window.deleteLater)
+        combo = self.desktop.QComboBox()
+        window.load_objects_for_company("Renatur", combo, "ob")
+        self.assertGreaterEqual(combo.findData("Travel B"), 0)
+        self.assertEqual(combo.findData("Arbetstidsförkortning"), -1)
+        self.assertEqual(combo.findData("Sjuk"), -1)
+        combo.clear()
+        window.load_objects_for_company(
+            "Renatur", combo, "ob", archived_object_name="Arbetstidsförkortning",
+        )
+        self.assertEqual(combo.currentData(), "Arbetstidsförkortning")
+
     def test_server_history_preview_pdf_and_csv_show_travel_once_per_record(self):
         self.submit("work-report", "work", "Travel A", 1)
         self.submit("ob-report", "ob", "Travel B", 1)

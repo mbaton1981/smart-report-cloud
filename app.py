@@ -11874,11 +11874,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         WHERE a.company = ? AND a.name = ? AND o.service_type = ?
                     """, (comp_name or "", archived_object_name, record_type)).fetchall()
                     rows.extend(aliases)
-            elif record_type == RECORD_TYPE_WORK:
+            elif record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB):
                 rows = [
                     row for row in rows
-                    if row["service_type"] is None
-                    and legacy_service_type(row["name"], row["markning"]) is None
+                    if (row["service_type"] is None
+                        and legacy_service_type(row["name"], row["markning"]) is None)
+                    or (record_type == RECORD_TYPE_OB
+                        and archived_object_name is not None
+                        and row["name"] == archived_object_name)
                 ]
         finally:
             conn.close()
