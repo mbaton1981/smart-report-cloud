@@ -31,9 +31,14 @@ import desktop_theme
 from sync_dataset import HEADER, file_dataset, require_response_dataset
 from assistant_actions import CAPABILITIES, REPORT_ACTIONS
 from assistant_desktop import DesktopActionError, local_result, native_action
+import assistant_attention
 
 
 class AssistantClientError(ValueError):
+    pass
+
+
+class AssistantAuthorizationError(AssistantClientError):
     pass
 
 
@@ -54,7 +59,7 @@ def request_api(path, payload=None, audio=None, database=None, audio_terms=None)
         raise AssistantClientError("Помощнику требуется HTTPS.")
     token = desktop_auth.current_token()
     if not token:
-        raise AssistantClientError("Выполните личный вход администратора. Общий ключ синхронизации не подходит.")
+        raise AssistantAuthorizationError("Выполните личный вход администратора. Общий ключ синхронизации не подходит.")
     database = database or os.environ.get("SMARTREPORT_DB_FILE")
     if not database:
         raise AssistantClientError("Не определена база текущего окна SmartReport. Закройте и откройте помощника из программы.")
@@ -76,16 +81,20 @@ def request_api(path, payload=None, audio=None, database=None, audio_terms=None)
         response = requests.request("POST" if payload is not None or audio is not None else "GET",
                                     base + "/api/assistant/" + path, headers=headers, json=payload,
                                     data=request_data, files=files, timeout=(10, 75), allow_redirects=False)
+        if response.status_code in (401, 403):
+            raise AssistantAuthorizationError("Нет доступа. Нужен действующий личный вход администратора.")
         require_response_dataset(response, dataset)
         if response.status_code in (404, 405):
             raise AssistantClientError("На сервере ещё нет помощника. Обычная программа работает; требуется обновление сервера.")
-        if response.status_code in (401, 403):
-            raise AssistantClientError("Нет доступа. Нужен действующий личный вход администратора.")
         if response.status_code not in (200, 400, 413):
             raise AssistantClientError("Сервер помощника недоступен. Обычная программа продолжает работать.")
         data = response.json()
+        if not isinstance(data, dict):
+            raise AssistantClientError("Некорректный ответ помощника; ничего не изменено.")
         if data.get("ok") is not True:
             # Server errors are controlled messages; never show raw HTTP/provider content.
+            if str(data.get("error", "")).startswith("Помощник выключен."):
+                raise AssistantAuthorizationError(data["error"])
             raise AssistantClientError(data.get("error", "Операция не подтверждена."))
         return data
     except (requests.RequestException, RuntimeError):
@@ -113,6 +122,141 @@ class RequestWorker(QThread):
             ))
         except AssistantClientError as error:
             self.failed.emit(str(error))
+
+
+class AttentionWorker(QThread):
+    ready = pyqtSignal(dict)
+
+    def __init__(self, database, app, text, periods, parent=None):
+        super().__init__(parent)
+        self.database, self.app, self.text, self.periods = database, app, text, periods
+
+    def run(self):
+        result = {"errors": [], "local": None, "local_available": False, "hours": None, "prices": None,
+                  "employee_status": None, "documents": None}
+        try:
+            if not self.database:
+                raise ValueError("Не определена база текущего профиля.")
+            path = Path(self.database)
+            if not path.is_file():
+                raise ValueError("Локальная база текущего профиля отсутствует.")
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("BEGIN")
+                objects = [dict(row) for row in conn.execute(
+                    "SELECT company,name FROM objects WHERE is_active=1")]
+                company, obj = assistant_attention.scope_for_text(self.text, objects)
+                start = min(self.periods["hours"][0], self.periods["prices"][0])
+                end = max(self.periods["hours"][1], self.periods["prices"][1])
+                rows = [dict(row) for row in conn.execute(
+                    "SELECT * FROM shifts WHERE date>=? AND date<=?", (start, end))]
+                segments = {}
+                if conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ob_segments'").fetchone():
+                    for segment in conn.execute(
+                            "SELECT o.* FROM ob_segments o JOIN shifts s ON s.sync_id=o.shift_id "
+                            "WHERE s.date>=? AND s.date<=?", (start, end)):
+                        segments.setdefault(segment["shift_id"], []).append(dict(segment))
+                else:
+                    result["errors"].append("Локальные OB-сегменты отсутствуют; часть цен нельзя проверить.")
+                for row in rows:
+                    row["entry_type"] = row.get("entry_type") or "work"
+                    row["_attention_segments"] = segments.get(row.get("sync_id"), [])
+                employees = [dict(row) for row in conn.execute(
+                    "SELECT id,name,is_active FROM employees")]
+                pending = {row[0] for row in conn.execute(
+                    "SELECT DISTINCT sync_id FROM shift_sync_outbox "
+                    "WHERE state IN ('pending','blocked','conflict')")}
+                result["local"] = dict(rows=rows, employees=employees, pending=list(pending),
+                                       company=company, object_name=obj)
+                result["local_available"] = True
+            finally:
+                conn.close()
+        except ValueError as error:
+            result["errors"].append("Локальные смены и справочники: не удалось проверить: " + str(error))
+            self.ready.emit(result)
+            return
+        except (OSError, sqlite3.Error) as error:
+            result["errors"].append("Локальные смены и справочники: не удалось проверить: " + str(error))
+            result["local"] = dict(rows=[], employees=[], pending=[], company="", object_name="")
+            if any(word in self.text.casefold() for word in ("объект", "фирм", "компан")):
+                result["errors"].append("Не удалось определить область по локальному справочнику.")
+                self.ready.emit(result)
+                return
+
+        company, obj = result["local"]["company"], result["local"]["object_name"]
+        start, end = self.periods["hours"]
+        try:
+            response = request_api("command", {
+                "text": f"Кто не внёс часы с {start} по {end}?",
+                "operation_id": str(uuid.uuid4()),
+            }, database=self.database)
+            status = response["result"]
+            if not isinstance(status, dict) or not isinstance(status.get("table"), dict):
+                raise AssistantClientError("Некорректный ответ о сотрудниках.")
+            status_rows = status["table"].get("rows")
+            if not isinstance(status_rows, list) or any(
+                    not isinstance(row, list) or len(row) < 2
+                    or not isinstance(row[0], str) or not isinstance(row[1], str)
+                    for row in status_rows):
+                raise AssistantClientError("Некорректный список сотрудников.")
+            result["employee_status"] = status
+        except AssistantAuthorizationError as error:
+            result["local"] = None
+            result["errors"].append(str(error))
+            self.ready.emit(result)
+            return
+        except (AssistantClientError, KeyError) as error:
+            result["errors"].append("Серверные сотрудники: не удалось проверить: " + str(error))
+
+        def search(period):
+            response = request_api("inspect", {
+                "plan": dict(purpose="search", date_from=period[0], date_to=period[1],
+                             employee="", company=company, object_name=obj),
+                "operation_id": str(uuid.uuid4()),
+            }, database=self.database)
+            payload = response["result"]
+            if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+                raise AssistantClientError("Некорректный список смен.")
+            required = {"id", "date", "employee", "company", "object_name", "entry_type",
+                        "hours", "customer_rate", "travel_rate", "trips", "fixed"}
+            if any(not isinstance(row, dict) or not required.issubset(row)
+                   or not isinstance(row["date"], str) or not row["id"]
+                   for row in payload["records"]):
+                raise AssistantClientError("Некорректная запись смены.")
+            return payload["records"]
+
+        if result["employee_status"] is not None:
+            for key in ("hours", "prices"):
+                if key == "prices" and self.periods["prices"] == self.periods["hours"]:
+                    result[key] = result["hours"]
+                    continue
+                try:
+                    result[key] = search(self.periods[key])
+                except AssistantAuthorizationError as error:
+                    result["local"] = None
+                    result["errors"].append(str(error))
+                    self.ready.emit(result)
+                    return
+                except (AssistantClientError, KeyError) as error:
+                    result["errors"].append(
+                        f"Серверные смены ({key}): не удалось проверить: {error}")
+        else:
+            result["errors"].append("Серверные смены: не удалось проверить.")
+        try:
+            response = self.app.request_expense_api("GET", "/api/expense-documents")
+            if not isinstance(response, dict) or not isinstance(response.get("documents"), list) \
+                    or any(not isinstance(row, dict) for row in response["documents"]):
+                raise ValueError("Некорректный список документов.")
+            result["documents"] = response["documents"]
+            if len(result["documents"]) >= 1000:
+                result["errors"].append("Серверный реестр ограничен 1000 документами; "
+                                        "старые документы могли не попасть в проверку.")
+        except (requests.RequestException, RuntimeError, ValueError, KeyError) as error:
+            result["errors"].append("Серверные документы: не удалось проверить: " + str(error))
+        self.ready.emit(result)
 
 
 def result_text(result):
@@ -483,6 +627,8 @@ class AssistantDialog(QDialog):
         self.capability_data = []
         self.auto_report = False
         self.workflow_results = []
+        self.attention = None
+        self.attention_expanded = False
         app_module = sys.modules.get(window.__class__.__module__)
         self.assistant_candidate = bool(getattr(app_module, "ASSISTANT_CANDIDATE", False))
         self.database = getattr(app_module, "DB_FILE", None)
@@ -578,6 +724,10 @@ class AssistantDialog(QDialog):
         layout.addLayout(filters)
         desktop_theme.adapt_box_layout(content, filters, compact_width=1080)
         shortcuts = QHBoxLayout()
+        attention_button = QPushButton("Требует внимания")
+        attention_button.clicked.connect(lambda: self.start_attention("Что требует моего внимания?"))
+        attention_button.setEnabled(not self.assistant_candidate)
+        shortcuts.addWidget(attention_button)
         for text, purpose in (("Кто сколько отработал", "hours_summary"), ("Дубли и пропущенные ставки", "anomalies"),
                               ("Проверить транспорт", "transport_check")):
             button = QPushButton(text)
@@ -674,6 +824,10 @@ class AssistantDialog(QDialog):
         self.open_records.setEnabled(False)
         self.open_records.clicked.connect(self.record_details)
         tools.addWidget(self.open_records)
+        self.show_all_attention = QPushButton("Показать все")
+        self.show_all_attention.setVisible(False)
+        self.show_all_attention.clicked.connect(self.expand_attention)
+        tools.addWidget(self.show_all_attention)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setMinimumHeight(150)
@@ -771,6 +925,8 @@ class AssistantDialog(QDialog):
             return
         self.context = None
         self.result = None
+        self.attention = None
+        self.show_all_attention.setVisible(False)
         self.auto_report = False
         self.choices = []
         self.workflow_results = []
@@ -845,7 +1001,8 @@ class AssistantDialog(QDialog):
         self.voice.setEnabled(True)
         self.workflow_choice.setEnabled(True)
         self.native.setEnabled(bool(self.result and "native_action" in self.result))
-        self.open_records.setEnabled(bool(self.result and self.result["records"] and "table" not in self.result))
+        self.open_records.setEnabled(bool(self.attention and self.attention_rows) or bool(
+            self.result and self.result["records"] and "table" not in self.result))
         if self.auto_report:
             self.auto_report = False
             self.report()
@@ -1024,6 +1181,367 @@ class AssistantDialog(QDialog):
         if 0 <= index < len(self.workflow_results):
             self.received(dict(result=self.workflow_results[index], _repeat=True))
 
+    def start_attention(self, text, already_appended=False):
+        if self.assistant_candidate:
+            self.state.setText("Сводка недоступна в изолированном кандидате.")
+            return
+        if self.audio is not None or self.worker and self.worker.isRunning():
+            self.state.setText("Сначала завершите текущую запись или запрос.")
+            return
+        if not desktop_auth.current_token() or desktop_auth.current_user().get("role") != "admin":
+            self.state.setText("Для сводки нужен личный вход администратора.")
+            return
+        try:
+            periods = assistant_attention.periods(text)
+        except ValueError as error:
+            self.state.setText(str(error))
+            self.append_message("SmartReport", str(error))
+            return
+        if not already_appended:
+            self.append_message("Вы", text)
+        self.result = None
+        self.attention = None
+        self.show_all_attention.setVisible(False)
+        self.pdf.setEnabled(False)
+        self.native.setEnabled(False)
+        self.open_records.setEnabled(False)
+        self.send.setEnabled(False)
+        self.voice.setEnabled(False)
+        self.workflow_choice.setEnabled(False)
+        self.state.setText("Проверяю доступные источники; ничего не изменяется.")
+        from assistant_desktop import application
+        try:
+            app = application(self.window)
+        except DesktopActionError as error:
+            self.failed(str(error))
+            self.finished()
+            return
+        self.attention_periods = periods
+        self.worker = AttentionWorker(self.database, app, text, periods, self)
+        self.worker.ready.connect(self.attention_received)
+        self.worker.finished.connect(self.finished)
+        self.worker.start()
+
+    def attention_received(self, data):
+        local = data["local"]
+        if local is None:
+            self.failed("\n".join(data["errors"]))
+            return
+        errors = list(data["errors"])
+        company, obj = local["company"], local["object_name"]
+        pending = set(local["pending"])
+        local_rows = local["rows"]
+        overrides = {row["sync_id"] for row in local_rows if row.get("sync_id") in pending}
+        if pending:
+            errors.append("Есть несинхронизированные или конфликтующие изменения смен; "
+                          "локальные записи показаны отдельно от подтверждённого состояния сервера.")
+
+        def combined(remote):
+            server_ids = {row["id"] for row in remote or []}
+            local_only = [row for row in local_rows
+                          if not row.get("sync_id") or row["sync_id"] not in server_ids
+                          or row["sync_id"] in overrides]
+            return [row for row in remote or [] if row["id"] not in overrides], local_only
+
+        employees = local["employees"]
+        status = data["employee_status"]
+        normalize = lambda name: " ".join(str(name or "").split()).casefold()
+        if status:
+            candidates = [
+                {"name": row[1], "is_active": 1}
+                for row in status.get("table", {}).get("rows", [])
+                if row[0] in ("Без внесённых часов", "Внесли часы")
+            ]
+            ambiguous = status.get("employees_with_ambiguous_records")
+            if ambiguous:
+                errors.append("Неоднозначные сотрудники на сервере: проверка неполная.")
+            counts = {}
+            for item in candidates:
+                name = normalize(item["name"])
+                counts[name] = counts.get(name, 0) + 1
+            duplicate_names = {name for name, count in counts.items() if not name or count > 1}
+            if duplicate_names:
+                errors.append("Одинаковые имена сотрудников неоднозначны; проверка неполная.")
+            server_employees = [item for item in candidates if normalize(item["name"]) not in duplicate_names]
+            server_names = {normalize(item["name"]) for item in server_employees}
+            extra = [item for item in employees if item["is_active"]
+                     and normalize(item["name"]) not in server_names]
+            if extra:
+                errors.append("Локальный и серверный справочники сотрудников различаются.")
+            employees = server_employees
+        else:
+            counts = {}
+            for item in employees:
+                name = normalize(item["name"])
+                counts[name] = counts.get(name, 0) + 1
+            duplicate_names = {name for name, count in counts.items() if not name or count > 1}
+            if duplicate_names:
+                errors.append("Одинаковые имена сотрудников неоднозначны; проверка неполная.")
+            employees = [item for item in employees if normalize(item["name"]) not in duplicate_names]
+        remote_hours, local_hours = combined(data["hours"])
+        try:
+            if data["hours"] is None and status and (company or obj):
+                missing, hour_warnings = [], []
+                errors.append("Нет полного списка серверных смен: сотрудников без часов "
+                              "для выбранной области определить не удалось.")
+            elif data["hours"] is None and status:
+                start, end = self.attention_periods["hours"]
+                local_worked = {" ".join(str(row.get("employee") or "").split()).casefold()
+                                for row in local_hours
+                                if row.get("entry_type") in ("work", "ob")
+                                and start <= row["date"] <= end}
+                missing = [
+                    {"kind": "employee", "employee": row[1], "reason": "Нет записей часов за период"}
+                    for row in status.get("table", {}).get("rows", [])
+                    if row[0] == "Без внесённых часов"
+                    and " ".join(row[1].split()).casefold() not in local_worked
+                    and " ".join(row[1].split()).casefold() not in duplicate_names
+                ]
+                hour_warnings = ["Без графика отсутствие записи не доказывает отсутствие работы."]
+            else:
+                missing, hour_warnings = assistant_attention.missing_hours(
+                    employees, remote_hours + local_hours, self.attention_periods["hours"], company, obj)
+        except (sqlite3.Error, ValueError, KeyError) as error:
+            missing, hour_warnings = [], []
+            errors.append("Часы: не удалось проверить: " + str(error))
+        remote_prices, local_prices = combined(data["prices"])
+        start, end = self.attention_periods["prices"]
+        local_prices = [row for row in local_prices if start <= row["date"] <= end
+                        and (not company or row["company"] == company)
+                        and (not obj or row["object_name"] == obj)]
+        try:
+            remote_issues, remote_unverified = assistant_attention.remote_price_issues(remote_prices)
+            prices = remote_issues + assistant_attention.price_issues(local_prices)
+            if remote_unverified:
+                errors.append(f"Клиентские условия интервалов не удалось полностью проверить "
+                              f"для серверных смен: {len(remote_unverified)}.")
+            if any(row.get("unverified") for row in prices):
+                errors.append("Некоторые клиентские условия не удалось полностью проверить.")
+        except (ValueError, KeyError, TypeError) as error:
+            prices = []
+            errors.append("Клиентские цены: не удалось проверить: " + str(error))
+
+        try:
+            server = data["documents"]
+            if server is None:
+                server = getattr(self.window, "_expense_read_cache", {}).get((None, None), [])
+            if data.get("local_available", True):
+                documents, _online = self.window._expense_document_snapshot(
+                    server_snapshot=(server, data["documents"] is not None))
+            else:
+                documents = list(server)
+        except (sqlite3.Error, OSError, ValueError, KeyError) as error:
+            documents = list(server or [])
+            errors.append("Локальная очередь расходов: не удалось проверить: " + str(error))
+        try:
+            incoming = self.window._local_incoming_expense_documents(readonly=True)
+            documents = self.window._merge_incoming_expense_documents(documents, incoming)
+        except (sqlite3.Error, OSError, ValueError, KeyError) as error:
+            errors.append("Локальные входящие: не удалось проверить: " + str(error))
+        try:
+            if company or obj:
+                errors.append("Для документов без однозначного назначения область определить нельзя; "
+                              "они показаны вместе с выбранной областью.")
+                object_map = {item["id"]: item for item in getattr(self.window, "_expense_objects", [])}
+                def in_scope(document):
+                    assignments = document.get("allocations") or []
+                    if not assignments:
+                        return True
+                    known = [object_map.get(part.get("object_id")) for part in assignments]
+                    if any(item is None for item in known):
+                        return True
+                    return any(item.get("company") == company and
+                               (not obj or item.get("name") == obj) for item in known)
+                documents = [document for document in documents if in_scope(document)]
+            review, allocation = assistant_attention.document_issues(
+                documents, self.window._expense_register_status_key,
+                self.window._expense_register_is_unallocated,
+                self.window._expense_register_unallocated_amount,
+                self.attention_periods["documents"])
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            review, allocation = [], []
+            errors.append("Документы и распределение: не удалось проверить: " + str(error))
+        unique = {(row.get("client_id") or row.get("id") or row.get("incoming_document_id"))
+                  for row in review + allocation}
+        sections = [("Нет записей часов", missing), ("Проверить клиентскую цену", prices),
+                    ("Документы требуют проверки", review), ("Не завершено распределение", allocation)]
+        self.attention = dict(sections=sections, periods=self.attention_periods,
+                              company=company, object_name=obj, errors=errors,
+                              documents=data["documents"], unique_count=len(unique))
+        self.attention_expanded = False
+        scope = " / ".join(part for part in (company, obj) if part) or "все фирмы и объекты"
+        lines = [f"Требует внимания · область: {scope}."]
+        for title, rows in sections:
+            period = (self.attention_periods["hours"] if title == "Нет записей часов" else
+                      self.attention_periods["prices"] if title == "Проверить клиентскую цену" else
+                      self.attention_periods["documents"])
+            label = f"{period[0]} — {period[1]}" if period else "все даты"
+            lines.append(f"— {title}: {len(rows)} · {label}.")
+        lines.append(f"Документов с одной или обеими причинами: {len(unique)}.")
+        undated = {(row.get("client_id") or row.get("id") or row.get("incoming_document_id"))
+                   for row in review + allocation if not row.get("date")}
+        if undated:
+            lines.append(f"Без даты: {len(undated)} документов; они включены независимо от периода.")
+        lines.extend(hour_warnings)
+        today = assistant_attention.datetime.now(
+            assistant_attention.ZoneInfo("Europe/Stockholm")).date().isoformat()
+        if self.attention_periods["hours"][0] <= today <= self.attention_periods["hours"][1]:
+            lines.append("Результат по часам предварительный: текущая неделя ещё не завершена.")
+        checked_at = assistant_attention.datetime.now(
+            assistant_attention.ZoneInfo("Europe/Stockholm")).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"Источники: доступные серверные данные (запрос {checked_at}, Стокгольм) "
+                     "и локальный профиль; время последней синхронизации профиля неизвестно.")
+        if errors:
+            lines.append("Проверка неполная:\n" + "\n".join(errors))
+        elif not any(rows for _title, rows in sections):
+            lines.append("По выполненным проверкам замечаний нет; это не проверка всей бухгалтерии.")
+        self.append_message("SmartReport", "\n".join(lines))
+        self.result_heading.setText("Требует внимания · " + scope)
+        self.render_attention()
+        self.state.setText("Готово; выберите строку для перехода. Данные не изменены.")
+
+    def render_attention(self):
+        rows = []
+        for title, records in self.attention["sections"]:
+            for record in records if self.attention_expanded else records[:3]:
+                rows.append((title, record))
+        self.attention_rows = rows
+        sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Раздел", "Дата", "Запись", "Причина"])
+        self.table.setRowCount(len(rows))
+        for index, (title, record) in enumerate(rows):
+            label = (" / ".join(str(record.get(key) or "") for key in ("employee", "object_name")).strip(" /")
+                     if record["kind"] != "document" else
+                     " / ".join(str(record.get(key) or "") for key in ("supplier", "number")).strip(" /"))
+            values = [title, record.get("date") or "Дата не указана", label or "Не указано", record["reason"]]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, record)
+                self.table.setItem(index, column, item)
+        self.table.setSortingEnabled(sorting)
+        self.table.resizeColumnsToContents()
+        for column in range(4):
+            self.table.setColumnWidth(column, min(310, self.table.columnWidth(column)))
+        self.table.resizeRowsToContents()
+        self.table.setVisible(bool(rows))
+        self.open_records.setEnabled(bool(rows))
+        self.show_all_attention.setVisible(not self.attention_expanded and any(
+            len(records) > 3 for _title, records in self.attention["sections"]))
+
+    def expand_attention(self):
+        if self.attention:
+            self.attention_expanded = True
+            self.render_attention()
+
+    def open_attention_record(self):
+        index = self.table.currentRow()
+        item = self.table.item(index, 0) if index >= 0 else None
+        record = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(record, dict):
+            self.state.setText("Выберите строку сводки.")
+            return
+        window = self.window
+        if record["kind"] == "document":
+            incoming_id = record.get("incoming_document_id")
+            if incoming_id is not None:
+                window.open_incoming_documents(incoming_id)
+                return
+            identity = record.get("client_id") or record.get("id")
+            if identity is None:
+                self.state.setText("У документа нет устойчивого идентификатора; запись не открыта.")
+                return
+            date = record.get("date")
+            start, end = (date, date) if date else ("1900-01-01", "2999-12-31")
+            window._selected_expense_identity = identity
+            if self.attention["documents"] is not None:
+                window._expense_read_cache[(start, end)] = list(self.attention["documents"])
+            fields = [window.exp_date_from, window.exp_date_to, window.exp_filter_object,
+                      window.exp_filter_unallocated, window.exp_filter_status]
+            if hasattr(window, "exp_search"):
+                fields.append(window.exp_search)
+            blockers = [QSignalBlocker(field) for field in fields]
+            window.exp_date_from.setText(start)
+            window.exp_date_to.setText(end)
+            window.exp_filter_object.setCurrentIndex(0)
+            window.exp_filter_unallocated.setChecked(False)
+            status = window.exp_filter_status.findData("all")
+            if status >= 0:
+                window.exp_filter_status.setCurrentIndex(status)
+            if hasattr(window, "exp_search"):
+                window.exp_search.clear()
+            del blockers
+            window.table_supplier_documents.clearSelection()
+            window.table_supplier_documents.setCurrentCell(-1, -1)
+            window.tabs.setCurrentWidget(window.tab_expenses)
+            window.load_expense_documents()
+            table = window.table_supplier_documents
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                document = item.data(Qt.ItemDataRole.UserRole) if item else None
+                if isinstance(document, dict) and identity in (document.get("id"), document.get("client_id")):
+                    table.selectRow(row)
+                    table.setCurrentCell(row, 1)
+                    table.scrollToItem(table.item(row, 1))
+                    self.hide()
+                    return
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
+            self.state.setText("Документ не найден в реестре; другая запись не открыта.")
+            return
+
+        period = self.attention["periods"]["hours"] if record["kind"] == "employee" else (
+            record.get("date"), record.get("date"))
+        start, end = (QDate.fromString(value or "", "yyyy-MM-dd") for value in period)
+        if not start.isValid() or not end.isValid():
+            self.state.setText("Дата записи недоступна; переход не выполнен.")
+            return
+        employee_index = window.filter_emp.findText(record.get("employee") or "")
+        if employee_index < 0:
+            self.state.setText("Сотрудник не найден в журнале; другая запись не открыта.")
+            return
+        blockers = [QSignalBlocker(field) for field in (
+            window.filter_date_from, window.filter_date_to, window.filter_emp,
+            window.filter_comp, window.filter_obj, window.filter_status)]
+        window.filter_date_from.setDate(start)
+        window.filter_date_to.setDate(end)
+        window.filter_emp.setCurrentIndex(employee_index)
+        window.filter_comp.setCurrentIndex(0)
+        window.filter_obj.setCurrentIndex(0)
+        window.filter_status.setCurrentIndex(0)
+        del blockers
+        table = window.table_shifts
+        table.clearSelection()
+        table.setCurrentCell(-1, -1)
+        window.load_shifts_history()
+        if record["kind"] == "employee":
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
+            window.tabs.setCurrentWidget(window.tab_hours)
+            self.hide()
+            return
+        identity = record.get("id")
+        if not identity:
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
+            self.state.setText("У смены нет устойчивого идентификатора; другая запись не открыта.")
+            return
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            local_identity = f"local:{item.data(Qt.ItemDataRole.UserRole)}" if item else None
+            if item and (item.data(Qt.ItemDataRole.UserRole + 1) == identity or local_identity == identity):
+                table.selectRow(row)
+                table.setCurrentCell(row, 1)
+                table.scrollToItem(table.item(row, 1))
+                window.tabs.setCurrentWidget(window.tab_hours)
+                self.hide()
+                return
+        table.clearSelection()
+        table.setCurrentCell(-1, -1)
+        self.state.setText("Смена не найдена в локальном журнале; другая запись не открыта.")
+
     def quick_action(self, purpose):
         if self.assistant_candidate and purpose not in CANDIDATE_READ_ACTIONS:
             self.failed("В кандидате доступны только чтение, проверки и предпросмотр зарплатного/клиентского PDF.")
@@ -1032,6 +1550,8 @@ class AssistantDialog(QDialog):
             self.failed("Начальная дата должна быть не позже конечной.")
             return
         self.result = None
+        self.attention = None
+        self.show_all_attention.setVisible(False)
         self.pdf.setEnabled(False)
         self.append_message("Вы", CAPABILITIES[purpose][0])
         self.call("inspect", dict(plan=self.selection(purpose),
@@ -1051,6 +1571,12 @@ class AssistantDialog(QDialog):
             self.state.setText("Дождитесь ответа на предыдущую задачу.")
             return
         self.append_message("Вы", text)
+        if assistant_attention.is_attention_request(text):
+            self.input.clear()
+            self.start_attention(text, already_appended=True)
+            return
+        self.attention = None
+        self.show_all_attention.setVisible(False)
         if self.choices and text.isdecimal() and 1 <= int(text) <= len(self.choices):
             plan = self.context["plan"].copy()
             plan.update({
@@ -1092,6 +1618,9 @@ class AssistantDialog(QDialog):
             self.failed("Не удалось открыть штатный раздел текущего профиля. Ничего не сохранено помощником.")
 
     def record_details(self):
+        if self.attention is not None:
+            self.open_attention_record()
+            return
         if not self.result or "table" in self.result:
             return
         index = self.table.currentRow()

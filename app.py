@@ -8382,14 +8382,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if online:
             self.exp_api_status_lbl.setText("Общий реестр доступен.")
 
-    def _expense_document_snapshot(self, date_from=None, date_to=None, fresh=False):
+    def _expense_document_snapshot(self, date_from=None, date_to=None, fresh=False, *, server_snapshot=None):
         params = {}
         if date_from:
             params["date_from"] = date_from
         if date_to:
             params["date_to"] = date_to
         online = True
-        if getattr(self, "_async_expense_reads", False) and not fresh:
+        if server_snapshot is not None:
+            documents, online = list(server_snapshot[0]), bool(server_snapshot[1])
+        elif getattr(self, "_async_expense_reads", False) and not fresh:
             key = (date_from, date_to)
             documents = list(self._expense_read_cache.get(key, []))
             online = self._expense_online
@@ -8512,6 +8514,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 or (not date_from or str(doc["document_date"]) >= date_from)
                 and (not date_to or str(doc["document_date"]) <= date_to)
             ]
+        if server_snapshot is not None:
+            return merged, online
         if getattr(self, "_async_expense_reads", False):
             if self._expense_read_busy:
                 self.exp_api_status_lbl.setText(f"Показаны доступные данные; обновление в фоне. В очереди: {len(queued)}.")
@@ -8525,17 +8529,19 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
         return merged, online
 
-    def _local_incoming_expense_documents(self, date_from=None, date_to=None):
+    def _local_incoming_expense_documents(self, date_from=None, date_to=None, *, readonly=False):
         self._incoming_expense_documents_outside_period = 0
         from incoming_documents import IncomingStore, enabled as incoming_enabled
         if not incoming_enabled():
+            if readonly:
+                raise ValueError("Входящие документы отключены; проверить локальные черновики не удалось.")
             return []
         root = self._incoming_documents_root()
-        if not (root / "review.sqlite3").is_file():
+        if not readonly and not (root / "review.sqlite3").is_file():
             return []
         store = None
         try:
-            store = IncomingStore(root, self)
+            store = IncomingStore.open_readonly(root, self) if readonly else IncomingStore(root, self)
             object_names = {
                 int(item["id"]): str(item["name"])
                 for item in getattr(self, "_expense_objects", [])
@@ -8617,6 +8623,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         except (OSError, sqlite3.Error, ValueError) as error:
             self._incoming_expense_documents_outside_period = 0
             logging.exception("Не удалось прочитать локальные входящие документы")
+            if readonly:
+                raise
             self.exp_api_status_lbl.setText(
                 f"Локальные входящие документы не загружены; проверьте профиль и базу. {error}")
             return []
@@ -8626,6 +8634,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def _expense_register_snapshot(self, date_from=None, date_to=None, fresh=False):
         documents, online = self._expense_document_snapshot(date_from, date_to, fresh)
+        incoming = self._local_incoming_expense_documents(date_from, date_to)
+        return SmartReportApp._merge_incoming_expense_documents(documents, incoming), online
+
+    @staticmethod
+    def _merge_incoming_expense_documents(documents, incoming_documents):
         positions = {
             document.get("client_id"): index
             for index, document in enumerate(documents) if document.get("client_id")
@@ -8636,7 +8649,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 sha256 = attachment.get("sha256")
                 if sha256:
                     sha_positions.setdefault(sha256, index)
-        for incoming in self._local_incoming_expense_documents(date_from, date_to):
+        for incoming in incoming_documents:
             client_id = incoming.get("client_id")
             index = positions.get(client_id)
             if index is None:
@@ -8650,7 +8663,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 document["incoming_local"] = True
                 continue
             documents.append(incoming)
-        return documents, online
+        return documents
 
     @staticmethod
     def _expense_register_status_key(document):

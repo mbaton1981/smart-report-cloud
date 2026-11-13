@@ -136,6 +136,179 @@ class IncomingIntegrationTests(unittest.TestCase):
         self.assertFalse(root.exists())
         host.close()
 
+    def test_attention_incoming_reader_is_readonly_and_reports_missing_or_invalid_store(self):
+        from contextlib import closing
+        import sqlite3
+        import hashlib
+
+        root = self.store.root
+        before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.iterdir() if p.is_file()}
+        reader = IncomingStore.open_readonly(root, self.host)
+        try:
+            self.assertEqual(len(reader.documents()), 3)
+            self.assertEqual(reader.latest(1), self.store.latest(1))
+            with self.assertRaises(sqlite3.OperationalError):
+                reader.conn.execute("DELETE FROM documents")
+        finally:
+            reader.close()
+        after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in root.iterdir() if p.is_file()}
+        self.assertEqual(before, after)
+        missing = root.parent / "missing-incoming"
+        with self.assertRaisesRegex(ReviewError, "отсутствует"):
+            IncomingStore.open_readonly(missing, self.host)
+        self.assertFalse(missing.exists())
+        invalid = root.parent / "invalid-incoming"
+        invalid.mkdir()
+        with closing(sqlite3.connect(invalid / "review.sqlite3")) as conn:
+            conn.execute("CREATE TABLE unrelated (id INTEGER)")
+            conn.commit()
+        with self.assertRaisesRegex(ReviewError, "неверный тип"):
+            IncomingStore.open_readonly(invalid, self.host)
+
+    def test_attention_incoming_snapshot_propagates_read_errors(self):
+        root = self.store.root
+        self.host._incoming_documents_root = lambda: root
+        snapshot = self.desktop.SmartReportApp._local_incoming_expense_documents(
+            self.host, readonly=True)
+        self.assertEqual({row["incoming_document_id"] for row in snapshot}, {1, 2, 3})
+        self.assertEqual(snapshot[0]["supplier_name"], self.store.latest(1)[1]["supplier_name"])
+        self.host._incoming_documents_root = lambda: root.parent / "missing-incoming"
+        with self.assertRaisesRegex(ReviewError, "проверить"):
+            self.desktop.SmartReportApp._local_incoming_expense_documents(
+                self.host, readonly=True)
+
+    def test_attention_reader_does_not_create_wal_sidecars(self):
+        root = Path(self._case.name) / "wal-incoming"
+        store = IncomingStore(root, self.host)
+        try:
+            self.assertEqual(store.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            store.conn.execute("PRAGMA user_version=1")
+            store.conn.commit()
+            reader = IncomingStore.open_readonly(root, self.host)
+            try:
+                self.assertEqual(reader.documents(), [])
+            finally:
+                reader.close()
+        finally:
+            store.close()
+        before = sorted(path.name for path in root.iterdir())
+        self.assertNotIn("review.sqlite3-wal", before)
+        self.assertNotIn("review.sqlite3-shm", before)
+        with self.assertRaisesRegex(ReviewError, "WAL"):
+            IncomingStore.open_readonly(root, self.host)
+        self.assertEqual(before, sorted(path.name for path in root.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "Safe active WAL reads are supported only on Windows")
+    def test_attention_reader_keeps_consistent_active_wal_snapshot(self):
+        self.assertEqual(self.store.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        revision, payload = self.store.latest(1)
+        payload["supplier_name"] = "before"
+        self.store.save(1, payload, revision)
+        reader = IncomingStore.open_readonly(self.store.root, self.host)
+        try:
+            revision, before = reader.latest(1)
+            self.assertEqual(before["supplier_name"], "before")
+            revision_writer, changed = self.store.latest(1)
+            changed["supplier_name"] = "after"
+            self.store.save(1, changed, revision_writer)
+            self.assertEqual(reader.latest(1), (revision, before))
+        finally:
+            reader.close()
+        reader = IncomingStore.open_readonly(self.store.root, self.host)
+        try:
+            self.assertEqual(reader.latest(1)[1]["supplier_name"], "after")
+        finally:
+            reader.close()
+
+    @unittest.skipUnless(os.name == "nt", "Safe active WAL reads are supported only on Windows")
+    def test_attention_wal_reader_survives_writer_closing(self):
+        self.assertEqual(self.store.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        revision, payload = self.store.latest(1)
+        payload["supplier_name"] = "WAL value"
+        self.store.save(1, payload, revision)
+        reader = IncomingStore.open_readonly(self.store.root, self.host)
+        try:
+            self.store.close()
+            second = IncomingStore.open_readonly(self.store.root, self.host)
+            try:
+                self.assertEqual(reader.latest(1)[1]["supplier_name"], "WAL value")
+                self.assertEqual(second.latest(1)[1]["supplier_name"], "WAL value")
+            finally:
+                second.close()
+        finally:
+            reader.close()
+
+    def test_attention_documents_share_identity_and_allocation_rules(self):
+        import assistant_attention
+
+        app = self.desktop.SmartReportApp
+        sha = "a" * 64
+        accounted = {
+            "id": 10, "client_id": "accounted", "verification_status": "confirmed",
+            "supplier_name": "A", "document_date": "2026-11-02", "gross_amount": "100",
+            "currency_code": "SEK", "attachments": [{"sha256": sha}],
+            "allocations": [{"destination": "company", "object_id": None, "gross_amount": "100"}],
+        }
+        linked = {"id": "incoming:1", "client_id": "incoming:1", "incoming_document_id": 1,
+                  "incoming_action": None, "original_sha256": sha}
+        partial = {
+            "id": 11, "client_id": "partial", "verification_status": "draft",
+            "supplier_name": "B", "document_date": None, "gross_amount": "100",
+            "currency_code": "USD",
+            "allocations": [{"destination": "company", "object_id": None, "gross_amount": "25"}],
+        }
+        unknown = {"id": 12, "client_id": "unknown", "verification_status": "draft",
+                   "supplier_name": "C", "document_date": None, "gross_amount": None,
+                   "currency_code": None, "allocations": []}
+        ignored = {"id": 13, "verification_status": "ignored", "gross_amount": "50"}
+        documents = app._merge_incoming_expense_documents(
+            [accounted, partial, unknown, ignored], [linked])
+        self.assertEqual(len(documents), 4)
+        review, allocation = assistant_attention.document_issues(
+            documents, app._expense_register_status_key, app._expense_register_is_unallocated,
+            app._expense_register_unallocated_amount, ("2026-11-01", "2026-11-30"))
+        self.assertEqual({row["id"] for row in review}, {11, 12})
+        self.assertEqual({row["id"] for row in allocation}, {11, 12})
+        self.assertIn("75", next(row["reason"] for row in allocation if row["id"] == 11))
+        self.assertIn("USD", next(row["reason"] for row in allocation if row["id"] == 11))
+        self.assertIn("неизвестен", next(row["reason"] for row in allocation if row["id"] == 12))
+
+    def test_attention_worker_retains_local_data_when_server_unavailable(self):
+        from assistant_ui import AttentionWorker, AssistantClientError
+
+        periods = {"hours": ("2026-11-02", "2026-11-08"),
+                   "prices": ("2026-11-01", "2026-11-30"), "documents": None}
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("offline")
+
+        self.host.request_expense_api = unavailable
+        worker = AttentionWorker(self.desktop.DB_FILE, self.host, "Что нужно проверить?", periods)
+        received = []
+        worker.ready.connect(received.append)
+        with patch("assistant_ui.request_api", side_effect=AssistantClientError("offline")), \
+                patch.object(socket.socket, "connect", side_effect=AssertionError("Network forbidden")):
+            worker.run()
+        self.assertIsNotNone(received[0]["local"])
+        self.assertIsNone(received[0]["documents"])
+        self.assertTrue(any("не удалось проверить" in error for error in received[0]["errors"]))
+
+    def test_attention_worker_does_not_bypass_explicit_access_denial(self):
+        from assistant_ui import AttentionWorker, AssistantAuthorizationError
+
+        periods = {"hours": ("2026-11-02", "2026-11-08"),
+                   "prices": ("2026-11-01", "2026-11-30"), "documents": None}
+        self.host.request_expense_api = unittest.mock.Mock()
+        worker = AttentionWorker(self.desktop.DB_FILE, self.host, "Что нужно проверить?", periods)
+        received = []
+        worker.ready.connect(received.append)
+        with patch("assistant_ui.request_api", side_effect=AssistantAuthorizationError("Нет доступа")):
+            worker.run()
+        self.assertIsNone(received[0]["local"])
+        self.assertIn("Нет доступа", received[0]["errors"][0])
+        self.host.request_expense_api.assert_not_called()
+
     def test_invoice_normal_outbox_server_original_lost_ack_and_retry(self):
         revision = self.approve()
         card = self.store.transfer(1, revision)

@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import ExitStack
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 from expense_documents import decimal_text, parse_invoice_money
-from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification, digest, packed
+from offline_review import APPLICATION_ID, EDITABLE, OfflineReviewStore, ReviewError, current_classification, digest, packed
 
 
 def enabled():
@@ -17,6 +18,41 @@ def enabled():
 
 
 class IncomingStore(OfflineReviewStore):
+    @classmethod
+    def open_readonly(cls, root: Path, host):
+        root = Path(root)
+        if not root.is_absolute():
+            raise ReviewError("Не определён абсолютный путь входящих документов.")
+        root = root.resolve()
+        path = root / "review.sqlite3"
+        if not path.is_file():
+            raise ReviewError("Локальная база входящих документов отсутствует; проверить её не удалось.")
+        with path.open("rb") as database:
+            header = database.read(20)
+        with ExitStack() as pins:
+            if header[18:20] == b"\x02\x02":
+                if os.name != "nt":
+                    raise ReviewError("Безопасное чтение активной WAL-базы доступно только в Windows.")
+                try:
+                    pins.enter_context(Path(str(path) + "-wal").open("rb"))
+                    pins.enter_context(Path(str(path) + "-shm").open("rb"))
+                except FileNotFoundError:
+                    raise ReviewError("База входящих использует WAL, но служебные файлы недоступны; "
+                                      "проверить её без изменений не удалось.") from None
+            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=15)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("BEGIN")
+                if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
+                    raise ReviewError("Локальная база входящих документов имеет неверный тип.")
+                instance = cls.__new__(cls)
+                instance.host, instance.root, instance.conn = host, root, conn
+                return instance
+            except (sqlite3.Error, ReviewError):
+                conn.close()
+                raise
+
     def __init__(self, root: Path, host):
         self.host = host
         super().__init__(root)

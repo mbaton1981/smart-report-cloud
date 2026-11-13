@@ -21,7 +21,6 @@ import wave
 import unicodedata
 
 import requests
-from flask import jsonify, request
 from pypdf.errors import PyPdfError
 
 from customer_pricing import row_prices
@@ -2605,6 +2604,8 @@ def send_mail(conn, actor, data, smtp_factory=None):
 
 
 def register_assistant(app, connect, authenticate):
+    from flask import jsonify, request
+
     @app.before_request
     def assistant_boundary():
         if not request.path.startswith("/api/assistant/"):

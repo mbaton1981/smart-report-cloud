@@ -1071,6 +1071,67 @@ class AssistantApiTests(unittest.TestCase):
             )
             provider.assert_not_called()
 
+    def test_attention_employee_request_uses_existing_deterministic_status(self):
+        with patch("assistant_api.requests.post") as provider:
+            response = self.post("command", {
+                "text": "Кто не внёс часы с 2026-10-19 по 2026-10-25?",
+                "operation_id": str(uuid.uuid4()),
+            })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertIn("employees_without_hours", response.get_json()["result"])
+        provider.assert_not_called()
+
+    def test_attention_worker_uses_isolated_server_without_model(self):
+        from assistant_ui import AttentionWorker, AssistantClientError
+
+        self.fixture_shift()
+        periods = {"hours": ("2026-10-19", "2026-10-25"),
+                   "prices": ("2026-10-01", "2026-10-31"), "documents": None}
+
+        def request_local(path, payload=None, **_kwargs):
+            response = self.post(path, payload)
+            if response.status_code != 200:
+                raise AssistantClientError(str(response.get_json()))
+            return response.get_json()
+
+        fake_app = Mock()
+        fake_app.request_expense_api.return_value = {"documents": []}
+        worker = AttentionWorker(self.desktop.DB_FILE, fake_app, "Что нужно проверить?", periods)
+        received = []
+        worker.ready.connect(received.append)
+        with patch("assistant_ui.request_api", side_effect=request_local), \
+                patch("assistant_api.requests.post") as provider:
+            worker.run()
+        provider.assert_not_called()
+        self.assertEqual(received[0]["errors"], [])
+        self.assertIsNotNone(received[0]["employee_status"])
+        self.assertEqual(len(received[0]["hours"]), 1)
+        self.assertEqual(len(received[0]["prices"]), 1)
+
+    def test_attention_worker_reports_invalid_server_shapes(self):
+        from assistant_ui import AttentionWorker
+
+        periods = {"hours": ("2026-10-19", "2026-10-25"),
+                   "prices": ("2026-10-19", "2026-10-25"), "documents": None}
+        fake_app = Mock()
+        fake_app.request_expense_api.return_value = {"documents": None}
+        worker = AttentionWorker(self.desktop.DB_FILE, fake_app, "Что нужно проверить?", periods)
+        received = []
+        worker.ready.connect(received.append)
+        with patch("assistant_ui.request_api", return_value={"result": {"table": {"rows": [None]}}}):
+            worker.run()
+        self.assertIsNone(received[-1]["employee_status"])
+        self.assertIsNone(received[-1]["documents"])
+        self.assertTrue(any("Серверные сотрудники: не удалось проверить" in error
+                            for error in received[-1]["errors"]))
+        self.assertTrue(any("Серверные документы: не удалось проверить" in error
+                            for error in received[-1]["errors"]))
+        with patch("assistant_ui.request_api", side_effect=[
+                {"result": {"table": {"rows": []}}}, {"result": {"records": [None]}}]):
+            worker.run()
+        self.assertIsNone(received[-1]["hours"])
+        self.assertTrue(any("Серверные смены" in error for error in received[-1]["errors"]))
+
     def test_director_submission_status_counts_active_profiles_and_work_days(self):
         with closing(self.server.get_db_connection()) as conn:
             conn.execute("UPDATE meta_employees SET is_active=0")
@@ -2755,6 +2816,149 @@ class AssistantUiTests(unittest.TestCase):
             self._qt_application,
             self._qt_widgets_before,
         )
+
+    def test_attention_request_routes_locally_without_inheriting_filters(self):
+        from assistant_ui import AssistantDialog, AttentionWorker, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.company.setText("Unrelated firm")
+        dialog.object_name.setText("Unrelated object")
+        dialog.input.setPlainText("Что требует моего внимания?")
+        with patch("assistant_ui.desktop_auth.current_token", return_value="test-token"), \
+                patch("assistant_ui.desktop_auth.current_user", return_value={"role": "admin"}), \
+                patch("assistant_desktop.application", return_value=self.desktop), \
+                patch.object(AttentionWorker, "start") as start:
+            dialog.command()
+        start.assert_called_once()
+        self.assertIsInstance(dialog.worker, AttentionWorker)
+        self.assertEqual(dialog.worker.text, "Что требует моего внимания?")
+        self.assertIsNone(dialog.worker.periods["documents"])
+        self.assertNotIn("Unrelated", dialog.worker.text)
+
+    def test_attention_offline_result_and_shift_navigation_by_id(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtCore import QDate, Qt
+        from PyQt6.QtWidgets import QComboBox, QDateEdit, QTabWidget, QTableWidget, QTableWidgetItem, QWidget
+
+        window = QWidget()
+        window.tabs = QTabWidget(window)
+        window.tab_hours = QWidget()
+        window.tabs.addTab(window.tab_hours, "Hours")
+        window.filter_date_from = QDateEdit()
+        window.filter_date_to = QDateEdit()
+        window.filter_emp = QComboBox()
+        window.filter_emp.addItems(["-- Все сотрудники --", "Alice", "Bob"])
+        window.filter_comp = QComboBox()
+        window.filter_comp.addItems(["-- Все фирмы --", "Old filter"])
+        window.filter_obj = QComboBox()
+        window.filter_obj.addItem("-- Все объекты --")
+        window.filter_status = QComboBox()
+        window.filter_status.addItems(["-- Все статусы --", "Old status"])
+        window.filter_comp.setCurrentIndex(1)
+        window.filter_status.setCurrentIndex(1)
+        window.table_shifts = QTableWidget(0, 2)
+
+        def load():
+            table = window.table_shifts
+            table.setSortingEnabled(False)
+            table.setRowCount(2)
+            for index, (identity, label) in enumerate((("other", "Z"), ("wanted", "A"))):
+                item = QTableWidgetItem(str(index))
+                item.setData(Qt.ItemDataRole.UserRole + 1, identity)
+                table.setItem(index, 0, item)
+                table.setItem(index, 1, QTableWidgetItem(label))
+            table.setSortingEnabled(True)
+            table.sortItems(1, Qt.SortOrder.DescendingOrder)
+
+        window.load_shifts_history = load
+        window._expense_objects = []
+        window._expense_document_snapshot = lambda **_kwargs: ([{
+            "id": 2, "client_id": "doc", "verification_status": "draft",
+            "incoming_document_id": 7,
+            "supplier_name": "Supplier", "gross_amount": None, "currency_code": None,
+            "allocations": [],
+        }], False)
+        window.open_incoming_documents = Mock()
+        window._local_incoming_expense_documents = Mock(side_effect=ValueError("unavailable"))
+        app = self.desktop.SmartReportApp
+        for name in ("_merge_incoming_expense_documents", "_expense_register_status_key",
+                     "_expense_register_is_unallocated", "_expense_register_unallocated_amount"):
+            setattr(window, name, getattr(app, name))
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(window)
+        self.addCleanup(dialog.close)
+        dialog.attention_periods = {"hours": ("2026-11-02", "2026-11-08"),
+                                    "prices": ("2026-11-01", "2026-11-30"), "documents": None}
+        row = dict(sync_id="wanted", date="2026-11-03", employee="Alice", company="Firm",
+                   object_name="X", entry_type="work", hours=8, rate=0, transport=0)
+        dialog.attention_received({
+            "local": dict(rows=[row], employees=[{"name": "Alice", "is_active": 1},
+                                                 {"name": "Bob", "is_active": 1}],
+                          pending=[], company="", object_name=""),
+            "hours": None, "prices": None, "employee_status": None, "documents": None,
+            "errors": ["Сервер: не удалось проверить."],
+        })
+        output = dialog.output.toPlainText()
+        self.assertIn("Проверка неполная", output)
+        self.assertIn("Локальные входящие: не удалось проверить", output)
+        self.assertIn("Документы требуют проверки: 1", output)
+        dialog.table.setSortingEnabled(True)
+        dialog.table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        def find_kind(kind):
+            return next(i for i in range(dialog.table.rowCount())
+                        if dialog.table.item(i, 0).data(Qt.ItemDataRole.UserRole)["kind"] == kind)
+
+        dialog.table.selectRow(find_kind("document"))
+        dialog.open_attention_record()
+        window.open_incoming_documents.assert_called_once_with(7)
+        shift_index = find_kind("shift")
+        dialog.table.selectRow(shift_index)
+        dialog.open_attention_record()
+        selected = window.table_shifts.item(window.table_shifts.currentRow(), 0)
+        self.assertEqual(selected.data(Qt.ItemDataRole.UserRole + 1), "wanted")
+        self.assertEqual(window.filter_comp.currentIndex(), 0)
+        self.assertEqual(window.filter_status.currentIndex(), 0)
+        self.assertEqual(window.filter_date_from.date(), QDate(2026, 11, 3))
+        item = dialog.table.item(shift_index, 0)
+        item.setData(Qt.ItemDataRole.UserRole, {**item.data(Qt.ItemDataRole.UserRole), "id": "missing"})
+        dialog.open_attention_record()
+        self.assertEqual(window.table_shifts.currentRow(), -1)
+        self.assertIn("не найдена", dialog.state.text())
+        dialog.attention_received({
+            "local": dict(rows=[], employees=[{"name": "Alice", "is_active": 1},
+                                              {"name": "Bob", "is_active": 1}],
+                          pending=[], company="", object_name=""),
+            "hours": None, "prices": None, "documents": None,
+            "employee_status": {"table": {"rows": [
+                ["Внесли часы", "Alice"], ["Без внесённых часов", "Bob"]]}},
+            "errors": ["Серверные смены: больше 500 записей."],
+        })
+        missing = dict(dialog.attention["sections"])["Нет записей часов"]
+        self.assertEqual([row["employee"] for row in missing], ["Bob"])
+        dialog.attention_received({
+            "local": dict(rows=[], employees=[{"name": "Locally active", "is_active": 1}],
+                          pending=[], company="", object_name=""),
+            "hours": None, "prices": None, "documents": None,
+            "employee_status": {"table": {"rows": [
+                ["Без внесённых часов", "Bob"], ["Без внесённых часов", " Same Name "],
+                ["Без внесённых часов", "same   name"]]}},
+            "errors": ["Серверные смены: больше 500 записей."],
+        })
+        missing = dict(dialog.attention["sections"])["Нет записей часов"]
+        self.assertEqual([row["employee"] for row in missing], ["Bob"])
+        self.assertIn("неоднозначны", dialog.output.toPlainText())
+        self.assertIn("справочники сотрудников различаются", dialog.output.toPlainText())
+        dialog.attention_received({
+            "local": dict(rows=[], employees=[{"name": "Same Name", "is_active": 1},
+                                              {"name": "same   name", "is_active": 0}],
+                          pending=[], company="", object_name=""),
+            "hours": None, "prices": None, "documents": None,
+            "employee_status": None, "errors": ["Сервер недоступен."],
+        })
+        self.assertEqual(dict(dialog.attention["sections"])["Нет записей часов"], [])
+        self.assertIn("неоднозначны", dialog.output.toPlainText())
 
     def test_employee_choice_continues_original_action_and_period_without_reentry(self):
         from assistant_ui import AssistantDialog, RequestWorker
