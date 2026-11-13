@@ -1131,6 +1131,12 @@ class AssistantApiTests(unittest.TestCase):
             worker.run()
         self.assertIsNone(received[-1]["hours"])
         self.assertTrue(any("Серверные смены" in error for error in received[-1]["errors"]))
+        fake_app.request_expense_api.side_effect = AttributeError("invalid error response")
+        with patch("assistant_ui.request_api", return_value={"result": {"table": {"rows": [None]}}}):
+            worker.run()
+        self.assertIsNone(received[-1]["documents"])
+        self.assertTrue(any("Серверные документы: не удалось проверить" in error
+                            for error in received[-1]["errors"]))
 
     def test_director_submission_status_counts_active_profiles_and_work_days(self):
         with closing(self.server.get_db_connection()) as conn:

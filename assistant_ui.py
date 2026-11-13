@@ -254,7 +254,7 @@ class AttentionWorker(QThread):
             if len(result["documents"]) >= 1000:
                 result["errors"].append("Серверный реестр ограничен 1000 документами; "
                                         "старые документы могли не попасть в проверку.")
-        except (requests.RequestException, RuntimeError, ValueError, KeyError) as error:
+        except (requests.RequestException, RuntimeError, ValueError, KeyError, AttributeError) as error:
             result["errors"].append("Серверные документы: не удалось проверить: " + str(error))
         self.ready.emit(result)
 
