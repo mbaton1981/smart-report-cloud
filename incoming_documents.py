@@ -617,8 +617,9 @@ class IncomingStore(OfflineReviewStore):
             return card
         payload = json.loads(card["payload_json"])
         base = self.base(card["document_id"])
+        document_type = payload.get("confirmed_type") or base.get("document_type") or "manual"
         payload.update(
-            client_id=card["client_id"], document_type="manual", allocation_basis="gross", usage="object_cost",
+            client_id=card["client_id"], document_type=document_type, allocation_basis="gross", usage="object_cost",
             cost_operation_id=f"{card['client_id']}:{card['revision']}",
             verification_status="confirmed",
             recognized_text=base.get("raw_text") or "",

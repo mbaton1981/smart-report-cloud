@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import re
 import sys
 import requests
 
@@ -10,7 +11,7 @@ from expense_documents import (
 
 
 def recognize_invoice(paths, parser=None, ai_fallback=None):
-    from expense_documents import extract_local_document
+    from expense_documents import extract_local_document, ocr_pdf_heading
 
     pages, text_parts, errors, methods = [], [], [], set()
     for attachment_index, source in enumerate(paths):
@@ -26,6 +27,27 @@ def recognize_invoice(paths, parser=None, ai_fallback=None):
                 })
         except Exception as error:
             errors.append(f"{Path(source).name}: {type(error).__name__}: {error}")
+    for attachment_index, source in enumerate(paths):
+        if Path(source).suffix.casefold() != ".pdf":
+            continue
+        attached_pages = [page for page in pages if page["attachment_index"] == attachment_index]
+        text = "\n".join(page["text"] for page in attached_pages)
+        if (not attached_pages or re.search(r"^\s*(?:Receipt|Kvitto|Kassakvitto)\s*$",
+                                            text, re.IGNORECASE | re.MULTILINE)
+                or not re.search(r"\bTransaction\s+ID\b", text, re.IGNORECASE)):
+            continue
+        try:
+            heading = ocr_pdf_heading(source)
+        except (OSError, RuntimeError, ValueError) as error:
+            errors.append(f"{Path(source).name}: OCR заголовка: {type(error).__name__}: {error}")
+            continue
+        if heading.strip():
+            attached_pages[0]["text"] = heading.strip() + "\n" + attached_pages[0]["text"]
+            methods.add("локальный OCR заголовка")
+            text_parts[attachment_index] = (
+                f"--- {Path(source).name} ---\n"
+                + "\n\n".join(page["text"] for page in attached_pages)
+            )
     fields = (parser or parse_invoice_pages)(pages) if pages else {}
     proposals = parse_project_order_allocations(pages)
     fields.setdefault("order_proposals", proposals["orders"])

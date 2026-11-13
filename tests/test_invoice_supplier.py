@@ -178,6 +178,66 @@ class InvoiceSupplierTests(unittest.TestCase):
         self.assertEqual(fields["field_sources"]["supplier_name"][0]["kind"],
                          "seller_registration_block")
 
+    def test_receipt_totals_date_order_reference_and_stated_vat(self):
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "\n".join((
+                "Kvitto", "Kvittonummer: 8987285", "Datum: 20261112",
+                "Ordernummer: 32549051", "Belopp exkl. moms: 4 342,40 kr",
+                "Moms totalt: 1 085,60 kr", "Summa totalt: 5 428,00 kr",
+                "Betald via Svea Checkout",
+            )),
+            "elements": [
+                self.cell("Kvittonummer:", 10, 10, 75, 20),
+                self.cell("8987285", 80, 10, 130, 20),
+                self.cell("Datum:", 10, 30, 45, 40),
+                self.cell("20261112", 80, 30, 140, 40),
+                self.cell("Ordernummer:", 10, 50, 80, 60),
+                self.cell("32549051", 90, 50, 150, 60),
+                self.cell("Belopp exkl. moms:", 10, 70, 105, 80),
+                self.cell("4 342,40 kr", 120, 70, 185, 80),
+                self.cell("Moms", 10, 100, 40, 110),
+                self.cell("totalt:", 45, 100, 80, 110),
+                self.cell("1 085,60 kr", 90, 100, 150, 110),
+                self.cell("Summa totalt:", 10, 120, 80, 130),
+                self.cell("5 428,00 kr", 90, 120, 155, 130),
+            ],
+        }])
+        self.assertEqual(fields["document_type"], "receipt")
+        self.assertEqual(fields["invoice_number"], "8987285")
+        self.assertEqual(fields["order_number"], "32549051")
+        self.assertIsNone(fields["payment_reference"])
+        self.assertEqual(fields["document_date"], "2026-11-12")
+        self.assertEqual(fields["net_amount"], "4342.40")
+        self.assertEqual(fields["vat_amount"], "1085.60")
+        self.assertEqual(fields["gross_amount"], "5428.00")
+        self.assertFalse(any("НДС не указана" in warning for warning in fields["review_reasons"]))
+
+    def test_github_style_usd_receipt_keeps_transaction_id_separate_and_vat_unknown(self):
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "\n".join((
+                "Receipt", "Date 2026-11-12 03:31AM PST",
+                "Transaction ID ch_123456789",
+                "Description Amount",
+                "Copilot Max $100.00 USD",
+                "Copilot Usage $14.37 USD",
+                "Total $114.37 USD*",
+                "GitHub, Inc.",
+                "* VAT/GST paid directly by GitHub, where applicable",
+            )),
+        }])
+        self.assertEqual(fields["document_type"], "receipt")
+        self.assertEqual(fields["supplier_name"], "GitHub, Inc.")
+        self.assertEqual(fields["document_date"], "2026-11-12")
+        self.assertEqual(fields["payment_reference"], "ch_123456789")
+        self.assertIsNone(fields["invoice_number"])
+        self.assertEqual(fields["currency_code"], "USD")
+        self.assertEqual(fields["gross_amount"], "114.37")
+        self.assertIsNone(fields["net_amount"])
+        self.assertIsNone(fields["vat_amount"])
+        self.assertTrue(any("НДС не указана" in warning for warning in fields["review_reasons"]))
+
 
 if __name__ == "__main__":
     unittest.main()

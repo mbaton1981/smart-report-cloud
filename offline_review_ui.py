@@ -25,7 +25,7 @@ import desktop_theme
 
 LABELS = {
     "supplier_name": "Поставщик / продавец", "invoice_number": "Номер фактуры / чека",
-    "payment_reference": "OCR / reference", "document_date": "Дата документа",
+    "payment_reference": "OCR / reference / Transaction ID", "document_date": "Дата документа",
     "due_date": "Срок оплаты", "currency_code": "Валюта",
     "net_amount": "Нетто", "vat_amount": "НДС", "gross_amount": "Итог до округления / итог чека",
     "rounding_amount": "Указанное округление", "amount_due": "Долг / к оплате (не для чека)",
@@ -112,6 +112,9 @@ class OfflineReviewWindow(QDialog):
         self.classification = QLabel()
         self.classification.setWordWrap(True)
         layout.addWidget(self.classification)
+        self.order_number_label = QLabel()
+        self.order_number_label.setWordWrap(True)
+        layout.addWidget(self.order_number_label)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(9)
@@ -786,6 +789,10 @@ class OfflineReviewWindow(QDialog):
         self.loaded_review = payload
         self.server_version = payload.get("server_version")
         base = current_classification(self.store.base(self.document_id))
+        order_number = base.get("order_number")
+        self.order_number_label.setText(
+            f"Номер заказа (не номер фактуры/чека): {order_number}" if order_number else "")
+        self.order_number_label.setVisible(bool(order_number))
         if self.integrated:
             self.ignore_button.setText(
                 "Подтверждение заказа — не учитывать"
@@ -867,6 +874,13 @@ class OfflineReviewWindow(QDialog):
                     self.classification.text() + "\nПовторное распознавание нашло отличия: "
                     + " ".join(conflict_lines)
                     + " Существующие значения не изменены; сверьте оригинал."
+                )
+            recognition_reasons = list(dict.fromkeys(
+                str(reason) for reason in base.get("review_reasons") or [] if reason))
+            if recognition_reasons:
+                self.classification.setText(
+                    self.classification.text() + "\nПроверка распознавания: "
+                    + " ".join(recognition_reasons)
                 )
         if self.gallery and self.preview_document_id != self.document_id:
             self.gallery.hide()

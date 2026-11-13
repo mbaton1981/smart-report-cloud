@@ -22,6 +22,8 @@ def propose_object_allocations(fields, objects):
     grouped, seen = {}, set()
     for order in orders:
         marker = str(order.get("project_code") or order.get("original_marker") or "").strip()
+        if marker in {".", "-", "—"}:
+            marker = ""
         identifier = order.get("order_id")
         net, vat = (parse_invoice_money(order.get(key)) for key in ("net_amount", "vat_amount"))
         if (not identifier or identifier in seen or order.get("ambiguous")
@@ -38,8 +40,8 @@ def propose_object_allocations(fields, objects):
             result["errors"].append(f"{marker}: позиции не подтверждают сумму и НДС заказа.")
             continue
         known_marker = bool(re.fullmatch(r"[A-Za-z]*\s*\d(?:[A-Za-z0-9 -]*[A-Za-z0-9])?", marker))
-        key = normalize_object_marking(marker) if known_marker else f"unmarked:{identifier}"
-        part = grouped.setdefault(key, {"marker": marker if known_marker else "",
+        key = normalize_object_marking(marker) if known_marker else f"unmarked:{marker.casefold() or identifier}"
+        part = grouped.setdefault(key, {"marker": marker,
                                          "net": Decimal(0), "vat": Decimal(0),
                                          "pages": set(), "orders": []})
         part["net"] += net
@@ -66,7 +68,9 @@ def propose_object_allocations(fields, objects):
     for key in sorted(shares, key=lambda k: (-(shares[k] - cents[k]), k))[:count - sum(cents.values())]:
         cents[key] += 1
     for key, part in grouped.items():
-        matches = [obj for obj in objects if not is_service_category(obj) and object_marking_matches(
+        matches = [obj for obj in objects if part["marker"] and
+                   re.fullmatch(r"[A-Za-z]*\s*\d(?:[A-Za-z0-9 -]*[A-Za-z0-9])?", part["marker"])
+                   and not is_service_category(obj) and object_marking_matches(
             part["marker"], str(obj.get("markning") or "")
         )]
         options = [{
@@ -76,7 +80,13 @@ def propose_object_allocations(fields, objects):
             "is_active": str(obj.get("is_active", 1)).strip().casefold() not in {"0", "false", "no"},
         } for obj in matches]
         object_id = None
-        if len(options) == 1 and options[0]["is_active"]:
+        recognized_marker = bool(re.fullmatch(
+            r"[A-Za-z]*\s*\d(?:[A-Za-z0-9 -]*[A-Za-z0-9])?", part["marker"]))
+        if not recognized_marker:
+            warning = (f"Маркировка «{part['marker']}» не распознана — выберите вручную"
+                       if part["marker"] else
+                       "Неизвестная маркировка — выберите объект или общие расходы")
+        elif len(options) == 1 and options[0]["is_active"]:
             object_id = options[0]["id"]
             warning = ""
         elif not matches:

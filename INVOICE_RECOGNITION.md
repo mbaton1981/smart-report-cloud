@@ -1,5 +1,27 @@
 # Invoice Recognition and Net Allocations
 
+## Receipt identity, totals and currency-aware review
+
+Receipt parsing keeps the receipt/check number, order number and payment
+reference distinct. Compact `YYYYMMDD` dates are accepted. Swedish labels such
+as `Belopp exkl. moms`, `Moms totalt` and `Summa totalt` are read as net, VAT
+and gross respectively, including when a PDF layout separates a caption into
+adjacent text cells. A labelled total is checked against net plus VAT with a
+small rounding tolerance; an inconsistency remains visible for review.
+
+USD receipt amounts retain USD. When a receipt has an itemized Description /
+Amount table, its stated line total is checked against the document total.
+Absent VAT stays unknown and is shown as a review warning; no tax rate or net
+amount is inferred. If a transaction-ID receipt has a dense text layer but no
+text-layer heading, local OCR checks only the first-page heading area. OCR
+failure is reported and does not change the original PDF or mark a cost
+confirmed. Delivery to the ordinary expense registry preserves the reviewed
+document type; only the explicit review/transfer action confirms the expense.
+
+Order references that are not recognizable object markings, such as a
+textual project label, remain visible in allocation proposals but are never
+automatically assigned to an object or company costs.
+
 ## Missing-field AI fallback and saved gross-allocation VAT — 1.0.54
 
 The normal local parser/OCR remains first. When required invoice fields are

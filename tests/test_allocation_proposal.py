@@ -85,6 +85,20 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual(result["parts"][1]["warning"],
                          "Неизвестная маркировка — выберите объект или общие расходы")
 
+    def test_unrecognized_order_marker_is_visible_but_never_auto_assigned(self):
+        fields = beijer_fixture()
+        fields["order_proposals"] = [dict(fields["order_proposals"][0], project_code=None,
+                                          original_marker="ROMAN")]
+        fields["net_amount"] = "258.56"
+        fields["vat_amount"] = "64.64"
+        fields["rounding_amount"] = "0.00"
+        result = propose_object_allocations(fields, BEIJER_OBJECTS)
+        self.assertFalse(result["errors"])
+        self.assertEqual(result["parts"][0]["marker"], "ROMAN")
+        self.assertIsNone(result["parts"][0]["object_id"])
+        self.assertEqual(result["parts"][0]["warning"],
+                         "Маркировка «ROMAN» не распознана — выберите вручную")
+
     def test_unknown_and_duplicate_markers_never_select_random_object(self):
         for objects in (OBJECTS[:2], [*OBJECTS, {**OBJECTS[2], "id": 99}]):
             result = propose_object_allocations(fixture(), objects)

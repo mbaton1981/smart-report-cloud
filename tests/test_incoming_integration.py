@@ -278,7 +278,8 @@ class IncomingIntegrationTests(unittest.TestCase):
 
         conn = self.server.get_db_connection()
         rows = conn.execute(
-            "SELECT id, client_id, verification_status, sync_version, is_deleted FROM expense_documents"
+            "SELECT id, client_id, document_type, verification_status, sync_version, is_deleted "
+            "FROM expense_documents"
         ).fetchall()
         attachments = conn.execute(
             "SELECT COUNT(*) FROM expense_document_attachments WHERE document_id=?",
@@ -287,6 +288,7 @@ class IncomingIntegrationTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["id"], server_id)
         self.assertEqual(rows[0]["client_id"], "existing-client")
+        self.assertEqual(rows[0]["document_type"], "invoice")
         self.assertEqual(rows[0]["verification_status"], "confirmed")
         self.assertEqual(rows[0]["is_deleted"], 0)
         self.assertGreater(rows[0]["sync_version"], 1)
@@ -307,6 +309,19 @@ class IncomingIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "уже есть"):
             self.store.transfer(1, revision)
         self.assertIsNone(self.store.card(1))
+
+    def test_receipt_type_survives_transfer_and_sync(self):
+        revision = self.approve(2)
+        card = self.store.transfer(2, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        conn = self.server.get_db_connection()
+        row = conn.execute(
+            "SELECT document_type, verification_status FROM expense_documents WHERE client_id=?",
+            (card["client_id"],),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["document_type"], "receipt")
+        self.assertEqual(row["verification_status"], "confirmed")
 
     def test_handoff_crash_then_retry_same_client_and_original(self):
         revision = self.approve()
