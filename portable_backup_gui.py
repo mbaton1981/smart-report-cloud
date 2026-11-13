@@ -46,9 +46,7 @@ class BackupWorker(QThread):
 
             protected = args.protected_recovery
             key = desktop_auth._unprotect((protected / "card-key.dpapi").read_bytes())
-            config = json.loads(desktop_auth._unprotect((protected / "configuration.dpapi").read_bytes()))
-            required = ("SECRET_KEY", "SYNC_API_KEY", "ADMIN_PASSWORD", "ADMIN_USERNAME")
-            config = {name: config[name] for name in required if name in config}
+            local_profile_files = recovery.snapshot_local_profile(args.profile)
             archive_bytes = subprocess.check_output(
                 ["git", "-C", str(Path(__file__).parent), "archive", "--format=zip", args.commit]
             )
@@ -57,7 +55,6 @@ class BackupWorker(QThread):
                           if not name.endswith("/")}
             source.update({
                 "recovery/employee-card.key": key,
-                "recovery/configuration.json": json.dumps(config).encode(),
                 "recovery/release.json": json.dumps({"commit": args.commit}).encode(),
             })
             verifier = Path(__file__).with_name("portable_recovery.py")
@@ -113,6 +110,7 @@ class BackupWorker(QThread):
                     files.update(export_backup_files(
                         desktop_auth.app_data_dir() / "object_documents"
                     ))
+                    files.update(local_profile_files)
                     stage = "Шифрование и проверка записанной версии"
                     self.progress.emit(stage)
                     bundle = recovery.publish(args.destination, files, self.password)
@@ -133,7 +131,11 @@ class BackupWorker(QThread):
                         raise recovery.RecoveryError("Independent verifier failed.")
                     result = json.loads(check.stdout.decode("utf-8"))
                     if (result["dpapi_used"] or not result["all_business_table_hashes_unchanged"]
-                            or not result["object_documents"]["integrity"]):
+                            or not result["object_documents"]["integrity"]
+                            or not result["server_documents"]["verified"]
+                            or not result["local_profile"]["present"]
+                            or not result["local_profile"]["integrity"]
+                            or not result["local_profile"]["links_consistent"]):
                         raise recovery.RecoveryError("Independent verification did not pass.")
                 created.append({
                     "file": bundle.name, "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
@@ -142,6 +144,7 @@ class BackupWorker(QThread):
             proof = {
                 "format": 1, "compatible_commit": args.commit, "versions": created,
                 "password_stored": False, "decryption_custody": "Owner's independent password manager",
+                "passwords_or_tokens_included": False,
                 "onedrive_cloud_upload_confirmed": False,
                 "test_environment": "Fresh isolated venv, empty disposable Windows profile paths, "
                                     "network blocked by verifier; same physical host",
@@ -192,8 +195,9 @@ def main():
     dialog.setMinimumWidth(620)
     layout = QVBoxLayout(dialog)
     description = QLabel(
-        "Создать две новые зашифрованные версии серверной базы и локальных документов объектов.\n"
-        "Рабочие данные не изменяются. Пароль ящика info в копию не включается.\n"
+        "Создать две новые зашифрованные версии серверной базы, локальных черновиков и документов объектов.\n"
+        "Рабочие данные не изменяются. Пароли и API-токены в копию не включаются.\n"
+        "Ключ шифрования карточек сотрудника включается только в зашифрованный комплект.\n"
         "Старые копии не удаляются.\n\n"
         "1. Создайте и сохраните уникальный длинный пароль в менеджере паролей.\n"
         "2. Убедитесь, что менеджер доступен без этого компьютера и Windows.\n"
@@ -238,7 +242,8 @@ def main():
             status.setText("Проверено: две версии. Осталось подтвердить загрузку OneDrive.")
             QMessageBox.information(
                 dialog, "Копии созданы и проверены",
-            "Обе версии расшифрованы; база и локальные документы объектов проверены в чистой среде.\n\n"
+                "Обе версии восстановлены в изолированную временную папку; БД, локальные черновики, "
+                "оригиналы и документы объектов проверены, PDF открыты.\n\n"
                 "ВАЖНО: проверьте загрузку через сайт OneDrive с другого устройства. "
                 "Локальная папка не подтверждает загрузку в облако.\n"
                 "Пароль храните только в своём менеджере паролей.",
