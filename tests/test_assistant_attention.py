@@ -5,6 +5,14 @@ import assistant_attention as attention
 
 
 class AttentionTests(unittest.TestCase):
+    def test_questions_about_missing_hours_are_recognized_without_guessing_other_requests(self):
+        for text in ("Кто ещё не сдал свои часы за эту неделю?",
+                     "Кто не заполнил табель за прошлую неделю?",
+                     "Кто не отчитался по часам?"):
+            self.assertTrue(attention.is_missing_hours_request(text), text)
+        for text in ("Сколько часов сдали сотрудники?", "Кто не оплатил счёт?"):
+            self.assertFalse(attention.is_missing_hours_request(text), text)
+
     def test_requests_and_default_periods(self):
         for text in ("Что требует моего внимания?", "Что нужно проверить?",
                      "Что осталось незавершённым?", "Покажи проблемы за эту неделю"):

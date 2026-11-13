@@ -14,6 +14,17 @@ def is_attention_request(text):
         r"покажи проблемы)(?:\s|$)", text))
 
 
+def is_missing_hours_request(text):
+    normalized = " ".join(text.casefold().split())
+    subject = r"(?:кто|какие сотрудники|какие работники)"
+    missing = r"не\s+(?:сда\w*|сдал\w*|вн[её]с\w*|вв[её]л\w*|внос\w*|заполн\w*|подал\w*|отправил\w*)"
+    noun = r"(?:свои\w*\s+)?(?:час(?:ы|ов|ам|ами)|табел\w*|отч[её]т\w*\s+(?:по|о)\s+час\w*)"
+    return bool(re.search(
+        rf"\b{subject}\b.*?\b{missing}\s+{noun}\b|"
+        rf"\b{subject}\b.*?\bне\s+отчитал\w*\s+по\s+час\w*\b",
+        normalized))
+
+
 def periods(text, today=None):
     today = today or datetime.now(ZoneInfo("Europe/Stockholm")).date()
     explicit = explicit_date_period(text) or _week_period(text)
