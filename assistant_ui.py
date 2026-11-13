@@ -1169,6 +1169,8 @@ class AssistantDialog(QDialog):
                 for column, value in enumerate(cells):
                     self.table.setItem(index, column, QTableWidgetItem(value))
             self.table.setSortingEnabled(sorting)
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
             self.table.resizeColumnsToContents()
             for column in range(len(headers)):
                 self.table.setColumnWidth(column, min(310, self.table.columnWidth(column)))
@@ -1458,6 +1460,8 @@ class AssistantDialog(QDialog):
                     item.setData(Qt.ItemDataRole.UserRole, record)
                 self.table.setItem(index, column, item)
         self.table.setSortingEnabled(sorting)
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
         self.table.resizeColumnsToContents()
         for column in range(4):
             self.table.setColumnWidth(column, min(310, self.table.columnWidth(column)))

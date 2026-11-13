@@ -2911,6 +2911,34 @@ class AssistantUiTests(unittest.TestCase):
                      for row in range(dialog.table.rowCount())}
         self.assertEqual(displayed, {("Zoe", "8"), ("Alice", "4"), ("Bob", "6")})
 
+    def test_new_result_does_not_inherit_previous_row_selection(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.attention = {
+            "periods": {"hours": ("2026-11-02", "2026-11-08")},
+            "sections": [("Нет записей часов", [
+                {"kind": "employee", "employee": "Alice", "reason": "Нет записей часов за период"}])],
+        }
+        dialog.attention_expanded = False
+        dialog.render_attention()
+        dialog.table.selectRow(0)
+        dialog.attention["sections"] = [("Документы", [
+            {"kind": "document", "supplier": "Supplier", "reason": "Нужна проверка"}])]
+        dialog.render_attention()
+        self.assertEqual(dialog.table.currentRow(), -1)
+        self.assertEqual(dialog.table.selectedItems(), [])
+        dialog.table.selectRow(0)
+        dialog.received(dict(result={
+            "plan": plan("hours_summary"), "records": [],
+            "table": {"headers": ["Сотрудник"], "rows": [["Bob"]]},
+            "summary": "Проверка", "source": "Тест", "notice": "",
+        }))
+        self.assertEqual(dialog.table.currentRow(), -1)
+        self.assertEqual(dialog.table.selectedItems(), [])
+
     def test_missing_hours_result_and_navigation_keep_scope_and_reject_ambiguous_employee(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtCore import QDate
