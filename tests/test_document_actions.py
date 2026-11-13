@@ -319,7 +319,7 @@ class DocumentActionTests(unittest.TestCase):
         from PyQt6.QtWidgets import QMessageBox
         from offline_review_ui import OfflineReviewWindow
         self.tax()
-        window = OfflineReviewWindow(self.store, integrated=True)
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
         try:
             window.show()
             self.qt_app.processEvents()
@@ -370,7 +370,7 @@ class DocumentActionTests(unittest.TestCase):
     def test_ambiguous_tax_ui_selects_an_extracted_candidate(self):
         from offline_review_ui import OfflineReviewWindow
         self.tax(TAX_TEXT.replace("Totalt att betala (kronor) 1208", "Totalt att betala (kronor) 1250"))
-        window = OfflineReviewWindow(self.store, integrated=True)
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
         try:
             self.assertEqual(window.inputs["gross_amount"].text(), "")
             self.assertEqual(window.amount_choices.count(), 3)
@@ -400,7 +400,10 @@ class DocumentActionTests(unittest.TestCase):
         from offline_review_ui import OfflineReviewWindow
         card = self.store.transfer(2, self.approve(2))
         window = OfflineReviewWindow(self.store, integrated=True)
-        host = SimpleNamespace(open_incoming_documents=lambda: None, _incoming_viewer=window)
+        host = self.desktop.QWidget()
+        host._incoming_viewer = window
+        host.open_incoming_documents = lambda document_id=None: (
+            self.desktop.SmartReportApp.open_incoming_documents(host, document_id))
         try:
             self.assertTrue(self.desktop.SmartReportApp._expense_document_review_dialog(
                 host, document={"client_id": card["client_id"], "usage": "object_cost"}))
@@ -409,6 +412,7 @@ class DocumentActionTests(unittest.TestCase):
         finally:
             window.loaded_payload = window.payload()
             window.close()
+            host.deleteLater()
 
     def test_ignore_excludes_by_attachment_hash_and_restores_without_losing_original(self):
         from test_mail_automation import pdf

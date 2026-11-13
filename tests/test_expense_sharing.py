@@ -49,7 +49,7 @@ class ExpenseSharingTests(unittest.TestCase):
         from offline_review_ui import OfflineReviewWindow
         projects = self.configure_incoming()
         original = self.store.original(1).read_bytes()
-        window = OfflineReviewWindow(self.store, integrated=True)
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
         try:
             self.assertEqual(window.inputs["gross_amount"].text(), "125.00")
             self.assertEqual(window.inputs["vat_amount"].text(), "25.00")

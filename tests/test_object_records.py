@@ -316,7 +316,8 @@ class ObjectRecordTests(unittest.TestCase):
         restored = ObjectRecordStore(restored_root / "profile" / "object_documents")
         self.assertEqual(
             portable_recovery.verify_object_documents(restored_root),
-            {"present": True, "integrity": True, "files": 1, "records": 1},
+            {"present": True, "integrity": True, "files": 1, "records": 1,
+             "links": 1, "pdf_files": 0, "pdfs_readable": 0},
         )
         offer = restored.list_documents(self.one)[0]
         self.assertEqual((offer["offer_version"], offer["offer_status"]), (2, "Согласована"))

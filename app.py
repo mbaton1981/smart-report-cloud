@@ -9692,9 +9692,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 card = viewer.store.conn.execute(
                     "SELECT document_id FROM register WHERE client_id=?", (document.get("client_id"),)).fetchone()
                 if card is not None:
-                    if viewer.keep_unsaved():
-                        viewer.selector.setCurrentIndex(viewer.selector.findData(card["document_id"]))
-                        viewer.select_document()
+                    self.open_incoming_documents(card["document_id"])
                     return True
         server_document = dict(document)
         local_conflict_payload = document.get("local_conflict_payload")

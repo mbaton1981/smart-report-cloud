@@ -5761,6 +5761,9 @@ class CatalogSyncTests(unittest.TestCase):
         window.filter_obj.addItem("Current site", object_sync_id)
         window.filter_date_from = QLineEdit("2026-10-21")
         window.filter_date_to = QLineEdit("2026-10-23")
+        window.filter_emp = QComboBox()
+        window.filter_comp = QComboBox()
+        window.filter_status = QComboBox()
         window.tabs = QTabWidget()
         window.load_dropdowns = lambda **kwargs: None
         window.apply_shifts_filters = lambda: None

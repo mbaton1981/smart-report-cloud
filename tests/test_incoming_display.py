@@ -79,6 +79,17 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIsNotNone(window.gallery)
         self.assertFalse(window.empty_state.isVisible())
 
+    def test_returning_to_empty_selection_allows_switching_to_another_document(self):
+        window = self.open_window(document_id=1)
+        window.selector.setCurrentIndex(-1)
+        self.assertIsNone(window.document_id)
+        self.assertTrue(window.empty_state.isVisible())
+        window.inputs["supplier_name"].setText("not saved")
+        window.show_all_states.setChecked(True)
+        window.selector.setCurrentIndex(window.selector.findData(2))
+        self.assertEqual(window.document_id, 2)
+        self.assertNotEqual(window.inputs["supplier_name"].text(), "not saved")
+
     def test_explicit_navigation_preserves_unsaved_card_until_confirmed(self):
         from PyQt6.QtWidgets import QMessageBox
 

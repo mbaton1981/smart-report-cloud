@@ -105,7 +105,8 @@ class OfflineReviewWindow(QDialog):
         self._label_token = None
         for doc in self._visible_documents():
             self.selector.addItem("", doc["id"])
-        self.selector.setCurrentIndex(self.selector.findData(document_id))
+        if integrated or document_id is not None:
+            self.selector.setCurrentIndex(self.selector.findData(document_id))
         layout.addWidget(self.selector)
         self.classification = QLabel()
         self.classification.setWordWrap(True)
@@ -324,8 +325,11 @@ class OfflineReviewWindow(QDialog):
         self.refresh_document_labels()
 
     def _visible_documents(self):
-        documents = sorted(self.store.documents(), key=lambda item: item["id"], reverse=True)
-        if not self.integrated or self.show_all_states.isChecked():
+        documents = self.store.documents()
+        if not self.integrated:
+            return documents
+        documents = sorted(documents, key=lambda item: item["id"], reverse=True)
+        if self.show_all_states.isChecked():
             return documents
         return [
             document for document in documents
@@ -693,7 +697,8 @@ class OfflineReviewWindow(QDialog):
     def reload_documents(self, document_id=None):
         if document_id is not None:
             self.explicit_document_id = document_id
-        dirty = hasattr(self, "loaded_payload") and self.payload() != self.loaded_payload
+        dirty = (self.document_id is not None and hasattr(self, "loaded_payload")
+                 and self.payload() != self.loaded_payload)
         self.selector.blockSignals(True)
         selected = self.selector.currentData()
         documents = self._visible_documents()
@@ -777,7 +782,7 @@ class OfflineReviewWindow(QDialog):
         self.status.setText("Изменение объекта сохранено в очереди. Обновляется та же карточка, не новый расход.")
 
     def update_origins(self):
-        if not hasattr(self, "document_id"):
+        if getattr(self, "document_id", None) is None:
             return
         provenance = self.store.provenance(self.document_id, self.payload())
         for key, label in self.origins.items():
@@ -975,6 +980,8 @@ class OfflineReviewWindow(QDialog):
         self.refresh_document_labels()
 
     def keep_unsaved(self):
+        if getattr(self, "document_id", None) is None:
+            return True
         if self.integrated and getattr(self, "document_id", None) is not None and self.store.action(self.document_id)[1] in ("ignore", "later"):
             return True
         if not hasattr(self, "loaded_payload") or self.payload() == self.loaded_payload:
