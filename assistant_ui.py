@@ -693,6 +693,8 @@ class AssistantDialog(QDialog):
         self.project_generation = 0
         self.project_active = False
         self.project_mode = False
+        self.project_selected = None
+        self.project_intent = "summary"
         app_module = sys.modules.get(window.__class__.__module__)
         self.assistant_candidate = bool(getattr(app_module, "ASSISTANT_CANDIDATE", False))
         self.database = getattr(app_module, "DB_FILE", None)
@@ -1016,6 +1018,7 @@ class AssistantDialog(QDialog):
         self.project_selected = None
         self.project_pending = None
         self.project_mode = False
+        self.project_intent = "summary"
         self.show_all_attention.setVisible(False)
         self.auto_report = False
         self.choices = []
@@ -1387,42 +1390,53 @@ class AssistantDialog(QDialog):
         finally:
             conn.close()
         named = assistant_project.project_candidates(text, objects)
-        if (re.search(r"\b(?:этот|этому|этого)\s+объект\w*", text.casefold()) or
-                (not named and re.fullmatch(r"\s*сколько\s+заработал\w*\s*[?.!]*", text.casefold())
-                 and getattr(self, "project_selected", None))):
+        has_name = assistant_project.project_has_name(text, objects)
+        if has_name:
+            self.project_selected = None
+            with QSignalBlocker(self.company), QSignalBlocker(self.object_name):
+                self.company.clear()
+                self.object_name.clear()
+        explicit_this = re.search(r"\b(?:этот|этому|этого)\s+(?:объект|проект)\w*", text.casefold())
+        if not has_name:
             selected = getattr(self, "project_selected", None)
-            matches = []
-            if getattr(self.window, "tabs", None) is not None \
+            matches = [obj for obj in named if selected and obj["id"] == selected["id"]
+                       and obj["sync_id"] == selected["sync_id"]]
+            if (explicit_this or not matches) and getattr(self.window, "tabs", None) is not None \
                     and self.window.tabs.currentWidget() is getattr(self.window, "tab_objects", None):
                 table = self.window.table_objects
                 rows = table.selectionModel().selectedRows()
                 if len(rows) == 1:
                     item = table.item(rows[0].row(), 0)
                     if item:
-                        matches = [obj for obj in objects
+                        matches = [obj for obj in named
                                    if obj["id"] == item.data(Qt.ItemDataRole.UserRole)
                                    and obj["sync_id"] == item.data(Qt.ItemDataRole.UserRole + 2)]
-            if not matches:
-                matches = [obj for obj in objects if selected and obj["id"] == selected["id"]
-                           and obj["sync_id"] == selected["sync_id"]]
             if not matches and self.object_name.text().strip():
-                matches = [obj for obj in objects if obj["name"] == self.object_name.text().strip()
+                matches = [obj for obj in named if obj["name"] == self.object_name.text().strip()
                            and (not self.company.text().strip() or
                                 obj["company"] == self.company.text().strip())]
         else:
             matches = named
+        needs_choice = len(matches) > 1 or (has_name and matches and
+                         not assistant_project.project_exact_match(text, matches[0], objects))
+        if not has_name and not matches:
+            matches = named
+            needs_choice = True
         if not matches:
-            raise ValueError("Объект не найден однозначно. Укажите название или маркировку.")
-        if len(matches) > 1:
+            raise ValueError("Объект или фирма не найдены. Выберите объект в поле или уточните название/маркировку; "
+                             "поиск по всем объектам не выполнен.")
+        if needs_choice:
             self.project_pending = (matches, period)
             self.clarification_choice.clear()
-            self.clarification_choice.addItems([
-                f'{obj["name"]} · {obj["company"]} · {obj["markning"] or "без маркировки"}'
-                for obj in matches
-            ])
+            for obj in matches:
+                self.clarification_choice.addItem(
+                    f'{obj["name"]} · {obj["markning"] or "без маркировки"} · {obj["company"]}',
+                    obj["sync_id"])
             self.clarification_choice.setVisible(True)
             self.choose_clarification.setVisible(True)
-            self.append_message("SmartReport", "Нашлось несколько объектов. Выберите нужный.")
+            self.append_message("SmartReport", "Выберите объект из справочника; можно указать номер варианта:\n" +
+                                "\n".join(f'{index + 1}. {self.clarification_choice.itemText(index)}'
+                                          for index in range(len(matches))))
             self.state.setText("Выберите объект; автоматический выбор не выполнен.")
             return
         self.start_project(matches[0], period)
@@ -1438,6 +1452,8 @@ class AssistantDialog(QDialog):
         self.project_mode = True
         self.project_active = False
         self.project_result = None
+        self.context = None
+        self.choices = []
         self.attention = None
         self.result = None
         self.table.setVisible(False)
@@ -1454,6 +1470,7 @@ class AssistantDialog(QDialog):
         with QSignalBlocker(self.company), QSignalBlocker(self.object_name):
             self.company.setText(obj["company"])
             self.object_name.setText(obj["name"])
+        self.employee.clear()
         self.project_active = True
         for button in self.project_buttons:
             button.setVisible(False)
@@ -1544,10 +1561,35 @@ class AssistantDialog(QDialog):
         self.state.setText("Готово; для подробностей выберите действие. Данные не изменены.")
         for button in self.project_buttons:
             button.setVisible(True)
+        if self.project_intent != "summary":
+            self.project_action(self.project_intent)
 
     def project_action(self, action):
         data = self.project_result
         if data is None:
+            return
+        if action == "employees":
+            totals = {}
+            for row in data["overview"]["journal_rows"]:
+                totals[row["employee"]] = totals.get(row["employee"], 0.0) + float(row["hours"] or 0)
+            self.table.setSortingEnabled(False)
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setColumnCount(2)
+            self.table.setHorizontalHeaderLabels(["Сотрудник", "Часы"])
+            self.table.setRowCount(len(totals))
+            for index, (name, hours) in enumerate(sorted(totals.items())):
+                item = QTableWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, dict(kind="employee", employee=name))
+                self.table.setItem(index, 0, item)
+                self.table.setItem(index, 1, QTableWidgetItem(f"{hours:g}"))
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
+            self.table.resizeColumnsToContents()
+            self.table.setVisible(bool(totals))
+            self.open_records.setEnabled(bool(totals))
+            self.append_message("SmartReport", "Сотрудники и часы этого объекта в выбранном периоде:\n" +
+                                ("\n".join(f"{name}: {hours:g} ч" for name, hours in sorted(totals.items()))
+                                 if totals else "Рабочих записей в локальном профиле нет."))
             return
         if action == "issues":
             records = data["issues"]
@@ -2183,6 +2225,11 @@ class AssistantDialog(QDialog):
         self.result = None
         self.pdf.setEnabled(False)
         self.append_message("Вы", text)
+        normalized = " ".join(text.casefold().strip(" .!?").split())
+        period_only = bool(re.fullmatch(r"(?:а\s+)?(?:за\s+.+|с\s+.+\s+по\s+.+)", normalized))
+        follow_action = ("expenses" if re.fullmatch(
+            r"(?:покажи\s+)?расход\w*(?:\s+(?:за|с)\s+.+)?", normalized) else
+            "employees" if re.fullmatch(r"кто\s+там\s+работал\w*(?:\s+(?:за|с)\s+.+)?", normalized) else None)
         if self.project_pending is not None and text.isdecimal():
             choices, period = self.project_pending
             index = int(text) - 1
@@ -2191,30 +2238,64 @@ class AssistantDialog(QDialog):
                 self.input.clear()
                 self.start_project(choices[index], period)
                 return
-        if assistant_project.project_request(text):
-            self.input.clear()
-            self.project_pending = None
-            self.clear_clarification()
-            if self.project_active:
-                self.invalidate_project()
+            self.state.setText("Выберите номер из предложенного списка объектов.")
+            return
+        project_request = assistant_project.project_request(text)
+        if (self.project_pending is not None and not project_request and not period_only
+                and not follow_action and not re.search(r"\bсотрудник\w*|час\w*", normalized)):
+            choices, period = self.project_pending
+            matches = assistant_project.project_candidates(text, choices)
+            if len(matches) == 1 and assistant_project.project_exact_match(text, matches[0], choices):
+                self.project_pending = None
+                self.input.clear()
+                self.start_project(matches[0], period)
+            else:
+                self.state.setText("Выберите объект кнопкой или номером из списка; запрос и период сохранены.")
+            return
+        if project_request or ((self.project_mode or self.project_pending is not None)
+                               and (period_only or follow_action)):
             try:
-                period = assistant_project.project_period(text)
+                period = (self.project_pending[1] if self.project_pending is not None else
+                          None if self.project_all.isChecked() or not self.project_mode else
+                          (self.date_from.date().toString("yyyy-MM-dd"),
+                           self.date_to.date().toString("yyyy-MM-dd")))
+                if re.search(r"\b(?:за|с)\s+", normalized):
+                    period = assistant_project.project_period(text)
+                self.project_intent = (follow_action or
+                                       ("expenses" if re.search(r"\bрасход\w*", normalized) else
+                                        "employees" if re.search(r"\bкто\b.*\bработал\w*", normalized) else
+                                        "summary" if project_request and not re.match(r"^(?:теперь|а)\s+по", normalized)
+                                        else self.project_intent))
+                self.input.clear()
+                self.invalidate_project()
+                self.context = None
+                self.choices = []
+                self.attention = None
+                self.show_all_attention.setVisible(False)
+                self.employee.clear()
+                self.project_mode = True
+                self.project_all.setVisible(True)
+                with QSignalBlocker(self.project_all), QSignalBlocker(self.date_from), QSignalBlocker(self.date_to):
+                    self.project_all.setChecked(period is None)
+                    if period:
+                        self.date_from.setDate(QDate.fromString(period[0], "yyyy-MM-dd"))
+                        self.date_to.setDate(QDate.fromString(period[1], "yyyy-MM-dd"))
+                self.project_period_changed()
+                if self.project_pending is not None and not project_request:
+                    self.project_pending = (self.project_pending[0], period)
+                    self.state.setText("Период и действие сохранены. Выберите объект из списка.")
+                    return
+                if period_only and self.project_selected:
+                    self.start_project(self.project_selected, period)
+                    return
+                self.project_pending = None
+                self.clear_clarification()
                 self.resolve_project(text, period)
             except (ValueError, sqlite3.Error, OSError) as error:
                 self.failed(str(error))
             return
-        if (self.project_mode and self.project_selected and re.fullmatch(
-                r"\s*(?:а\s+)?(?:за\s+.+|с\s+.+\s+по\s+.+)\s*[?.!]*", text.casefold())):
-            try:
-                period = assistant_project.project_period(text)
-                if period is None and not re.search(r"\bза\s+весь\s+объект\b", text.casefold()):
-                    raise ValueError("Укажите период.")
-                obj = self.project_selected
-                self.input.clear()
-                self.start_project(obj, period)
-            except (ValueError, sqlite3.Error, OSError) as error:
-                self.failed(str(error))
-            return
+        self.project_pending = None
+        self.clear_clarification()
         if self.project_active:
             self.invalidate_project()
         self.project_mode = False

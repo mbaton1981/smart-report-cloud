@@ -8,6 +8,39 @@ from fixed_pricing import create_fixed, fixed_quote
 
 
 class ProjectRequestTests(unittest.TestCase):
+    def test_natural_project_requests_do_not_escape_to_employee_or_global_hours(self):
+        for text in ("Что у нас сейчас по Томтебуда Ренатур?",
+                     "Хочу сводку по объекту, по проекту",
+                     "Хочу сводку по проекту", "Дай сводку по Томтебоде",
+                     "Теперь по Badbacken"):
+            with self.subTest(text=text):
+                self.assertTrue(project_request(text))
+        for text in ("Кто сколько отработал?", "Покажи часы сотрудника Иван Иванов",
+                     "Сводка за неделю", "Покажи расходы фирмы Renatur"):
+            with self.subTest(text=text):
+                self.assertFalse(project_request(text))
+
+    def test_dictated_names_companies_and_marking_variants(self):
+        objects = [
+            {"id": 1, "name": "Tomteboda ÄTA", "company": "Renatur", "markning": "p1034"},
+            {"id": 2, "name": "Tomteboda ÄTA Rivning", "company": "Renatur", "markning": "p1038"},
+            {"id": 3, "name": "Tomteboda ÄTA", "company": "Other", "markning": "p2034"},
+            {"id": 4, "name": "Badbacken 5 ext", "company": "Privat", "markning": "p1022"},
+        ]
+        for text in ("Что по Томтебоде у Ренатура за ноябрь?",
+                     "Что у нас сейчас по Томтебуда Ренатур?",
+                     "Сводка по проекту Томтебода Renatur"):
+            with self.subTest(text=text):
+                self.assertEqual(project_candidates(text, objects), objects[:2])
+        self.assertEqual(project_candidates("Что по Tomteboda?", objects), objects[:3])
+        self.assertEqual(project_candidates("Что по Томтебода Эта Ривнинг у Ренатюр?", objects), objects[1:2])
+        for marking in ("p1038", "P1038", "p10-38", "п 1038"):
+            with self.subTest(marking=marking):
+                self.assertEqual(project_candidates("Что по " + marking, objects), objects[1:2])
+        self.assertEqual(project_candidates("Что по Tomteboda у неизвестной фирмы?", objects), [])
+        self.assertEqual(project_candidates("Что по Неизвестному?", objects), [])
+        self.assertEqual(project_candidates("Что по p9999 Tomteboda?", objects), [])
+
     def test_requests(self):
         for text in ("Что сейчас по Badbacken?", "Покажи состояние объекта p1022",
                      "Сколько часов и расходов по этому объекту?",

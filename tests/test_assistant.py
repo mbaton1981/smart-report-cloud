@@ -2852,6 +2852,139 @@ class AssistantUiTests(unittest.TestCase):
             self._qt_widgets_before,
         )
 
+    def test_dictated_project_conversation_keeps_ids_period_and_original_action(self):
+        from assistant_ui import AssistantDialog, ProjectWorker, RequestWorker
+        from assistant_project import project_period
+        from PyQt6.QtWidgets import QWidget
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "isolated.sqlite")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("CREATE TABLE objects(id, sync_id, server_id, name, company, markning, is_active)")
+                conn.executemany("INSERT INTO objects VALUES(?,?,?,?,?,?,?)", [
+                    (1, "ata", 11, "Tomteboda ÄTA", "Renatur", "p1034", 1),
+                    (2, "rivning", 12, "Tomteboda ÄTA Rivning", "Renatur", "p1038", 1),
+                    (3, "other", 13, "Tomteboda ÄTA", "Other", "p2034", 1),
+                    (4, "badbacken", 14, "Badbacken 5 ext", "Privat", "p1022", 1),
+                ])
+                conn.commit()
+            with patch.object(RequestWorker, "start"):
+                dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.database = database
+            dialog.window._expense_register_status_key = Mock(return_value="confirmed")
+            dialog.window._expense_register_is_unallocated = Mock(return_value=False)
+            dialog.window._expense_register_unallocated_amount = Mock(return_value=0)
+
+            def reply():
+                data = dict(
+                    object=dialog.worker.obj, period=dialog.worker.period,
+                    shifts=dict(hours=8, employees=1, ordinary=8, ob=0,
+                                statuses={"В работе": 1}, total=3200, known_subtotal=3200,
+                                unknown_records=0, work_amount=3200, ob_amount=0,
+                                transport_amount=0, issues=[], incomplete_fixed=False),
+                    overview={"journal_rows": [{"employee": "Test Employee", "hours": 8}]},
+                    expenses=dict(totals={}, unknown=set(), linked=[], undated=[]),
+                    documents=[], online=True, errors=[],
+                )
+                dialog.project_received(data, dialog.project_generation)
+
+            with patch.object(dialog, "call") as api, patch.object(ProjectWorker, "start"), \
+                    patch("desktop_auth.current_token", return_value="isolated-token"), \
+                    patch("desktop_auth.current_user", return_value={"role": "admin"}), \
+                    patch("assistant_desktop.application", return_value=Mock()):
+                dialog.employee.setText("Old Employee")
+                dialog.received({"text": "Что по Томтебоде у Ренатура за ноябрь 2026?"})
+                dialog.command()
+                api.assert_not_called()
+                self.assertEqual([obj["sync_id"] for obj in dialog.project_pending[0]], ["ata", "rivning"])
+                self.assertEqual(dialog.project_pending[1], ("2026-11-01", "2026-11-30"))
+                self.assertEqual(dialog.employee.text(), "")
+                self.assertEqual(dialog.clarification_choice.itemData(1), "rivning")
+                dialog.clarification_choice.setCurrentIndex(1)
+                dialog.choose_answer()
+                self.assertEqual(dialog.worker.obj["sync_id"], "rivning")
+                reply()
+                self.assertEqual(dialog.object_name.text(), "Tomteboda ÄTA Rivning")
+                self.assertEqual(dialog.company.text(), "Renatur")
+
+                dialog.input.setPlainText("А за прошлую неделю?")
+                dialog.command()
+                week = project_period("за прошлую неделю")
+                self.assertEqual(dialog.worker.period, week)
+                self.assertEqual(dialog.worker.obj["sync_id"], "rivning")
+                reply()
+                dialog.input.setPlainText("Покажи расходы")
+                dialog.command()
+                with patch.object(dialog, "project_action") as action:
+                    reply()
+                action.assert_called_once_with("expenses")
+                self.assertEqual(dialog.worker.period, week)
+
+                dialog.input.setPlainText("Кто там работал?")
+                dialog.command()
+                reply()
+                self.assertEqual(dialog.table.item(0, 0).text(), "Test Employee")
+                self.assertEqual(dialog.table.item(0, 1).text(), "8")
+                dialog.table.selectRow(0)
+                dialog.input.setPlainText("Теперь по Badbacken")
+                dialog.command()
+                self.assertEqual(dialog.worker.obj["sync_id"], "badbacken")
+                self.assertEqual(dialog.worker.period, week)
+                self.assertIsNone(dialog.project_result)
+                self.assertEqual(dialog.table.currentRow(), -1)
+                reply()
+                self.assertEqual(dialog.company.text(), "Privat")
+                self.assertIn("Badbacken", dialog.result_heading.text())
+                self.assertIn(week[0], dialog.result_heading.text())
+                api.assert_not_called()
+
+                dialog.input.setPlainText("Что по неизвестному объекту?")
+                dialog.command()
+                api.assert_not_called()
+                self.assertIsNone(dialog.project_result)
+                self.assertIsNone(dialog.project_selected)
+                self.assertEqual(dialog.object_name.text(), "")
+                dialog.input.setPlainText("Хочу сводку по объекту, по проекту")
+                dialog.command()
+                self.assertEqual(len(dialog.project_pending[0]), 4)
+                dialog.input.setPlainText("Покажи расходы")
+                dialog.command()
+                self.assertEqual(dialog.project_intent, "expenses")
+                self.assertEqual(dialog.project_pending[1], week)
+                dialog.input.setPlainText("p10-38")
+                dialog.command()
+                self.assertEqual(dialog.worker.obj["sync_id"], "rivning")
+                with patch.object(dialog, "project_action") as action:
+                    reply()
+                action.assert_called_once_with("expenses")
+                api.assert_not_called()
+
+    def test_approximate_single_object_requires_confirmation_and_employee_requests_still_route(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "isolated.sqlite")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("CREATE TABLE objects(id, sync_id, server_id, name, company, markning, is_active)")
+                conn.execute("INSERT INTO objects VALUES(1,'one',1,'Badbacken','Privat','p1022',1)")
+                conn.commit()
+            with patch.object(RequestWorker, "start"):
+                dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.database = database
+            dialog.input.setPlainText("Что по Бадбаккен?")
+            with patch.object(dialog, "start_project") as start, patch.object(dialog, "call") as api:
+                dialog.command()
+                start.assert_not_called()
+                api.assert_not_called()
+                self.assertEqual(dialog.project_pending[0][0]["sync_id"], "one")
+                dialog.choose_answer()
+                self.assertEqual(start.call_args.args[0]["sync_id"], "one")
+                dialog.input.setPlainText("Покажи часы сотрудника Иван Иванов")
+                dialog.command()
+                self.assertEqual(api.call_args.args[0], "command")
+                self.assertIn("Иван Иванов", api.call_args.args[1]["text"])
+
     def test_project_result_unknowns_and_stale_response(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtWidgets import QWidget

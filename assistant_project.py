@@ -3,12 +3,14 @@
 import calendar
 from datetime import datetime
 from decimal import Decimal
+from difflib import SequenceMatcher
 import re
 from zoneinfo import ZoneInfo
 
 import assistant_attention
 from assistant_api import (
-    _RUSSIAN_MONTH_PATTERN, _RUSSIAN_MONTHS, _week_period, explicit_date_period,
+    _RUSSIAN_MONTH_PATTERN, _RUSSIAN_MONTHS, _normalized_name_tokens,
+    _week_period, explicit_date_period,
 )
 from customer_report import prepare_customer_costs
 from expense_documents import allocation_breakdown, parse_decimal
@@ -17,10 +19,15 @@ from fixed_pricing import report_agreements
 
 def project_request(text):
     normalized = " ".join(text.casefold().split())
+    if re.search(r"\bсотрудник\w*", normalized):
+        return False
     return bool(
-        re.search(r"\bчто\s+(?:сейчас\s+)?по\s+", normalized)
-        or re.search(r"\b(?:состояни\w*|час\w*|расход\w*|заработал\w*)\b.*\bобъект\w*\b", normalized)
+        re.search(r"\bчто\s+(?:у\s+нас\s+)?(?:сейчас\s+)?по\s+", normalized)
+        or re.search(r"\b(?:сводк\w*|состояни\w*|ситуаци\w*)\s+по\s+(?!всем\b|фирм\w*|компан\w*)", normalized)
+        or re.search(r"\b(?:сводк\w*|состояни\w*|час\w*|расход\w*|заработал\w*)\b.*\b(?:объект|проект)\w*\b", normalized)
+        or re.search(r"\bкто\b.*\b(?:объект|проект)\w*\b", normalized)
         or re.search(r"\bсколько\s+заработал\w*\b", normalized)
+        or re.match(r"^теперь\s+по\s+(?!всем\b).+", normalized)
     )
 
 
@@ -30,7 +37,7 @@ def project_period(text, today=None):
     if explicit:
         return explicit
     normalized = text.casefold()
-    if re.search(r"\bза\s+весь\s+объект\b", normalized):
+    if re.search(r"\bза\s+весь\s+(?:объект|проект)\b", normalized):
         return None
     relative = re.search(r"\bза\s+(эт\w*|текущ\w*|прошл\w*|предыдущ\w*)\s+месяц\w*\b", normalized)
     if relative:
@@ -52,27 +59,79 @@ def project_period(text, today=None):
     return None
 
 
+def project_marking(text):
+    match = re.search(r"(?<!\w)[pп]\s*(\d+(?:[-–]\d+)*)(?!\w)", text.casefold())
+    return "p" + re.sub(r"[-–]", "", match.group(1)) if match else None
+
+
+def _tokens_match(query, candidate, approximate=True):
+    return bool(query) and all(any(
+        word == token or (approximate and min(len(word), len(token)) >= 4
+                          and SequenceMatcher(None, word, token).ratio() >= 0.78)
+        or (approximate and min(len(word), len(token)) >= 3
+            and re.sub(r"[aeouy]", "a", word) == re.sub(r"[aeouy]", "a", token))
+        for token in candidate) for word in query)
+
+
+def _project_query(text, objects):
+    normalized = " ".join(text.casefold().split())
+    normalized = re.split(r"\b(?:за|с)\s+", normalized, maxsplit=1)[0]
+    normalized = re.sub(
+        r"\b(?:что|у\s+нас|сейчас|хочу|дай|мне|пожалуйста|покажи|сводк\w*|состояни\w*|ситуаци\w*|сколько|"
+        r"час\w*|расход\w*|заработал\w*|кто|там|работал\w*|теперь|по|"
+        r"объект\w*|проект\w*|этому|этот|этого|фирм\w*|компан\w*|а|и)\b",
+        " ", normalized)
+    company_phrase = re.search(r"\bу\s+(.+)$", normalized)
+    company_query = _normalized_name_tokens(company_phrase.group(1)) if company_phrase else []
+    name_tokens = _normalized_name_tokens(normalized[:company_phrase.start()]
+                                         if company_phrase else normalized)
+    companies = sorted({str(obj.get("company") or "") for obj in objects})
+    matched = []
+    exact_company = True
+    for company in companies:
+        tokens = _normalized_name_tokens(company)
+        if company_query:
+            found = _tokens_match(company_query, tokens)
+            exact = _tokens_match(company_query, tokens, False)
+        else:
+            found = bool(tokens) and all(any(_tokens_match([word], [token])
+                                            for word in name_tokens) for token in tokens)
+            exact = all(token in name_tokens for token in tokens)
+        if found:
+            matched.append(company)
+            exact_company = exact_company and exact
+    if not company_phrase and matched:
+        company_tokens = {token for company in matched for token in _normalized_name_tokens(company)}
+        name_tokens = [word for word in name_tokens
+                       if not any(_tokens_match([word], [token]) for token in company_tokens)]
+    return name_tokens, matched if company_phrase or matched else None, exact_company
+
+
+def project_has_name(text, objects):
+    tokens, _companies, _exact = _project_query(text, objects)
+    return bool(tokens or project_marking(text))
+
+
+def project_exact_match(text, obj, objects):
+    marking = project_marking(text)
+    if marking:
+        return marking == project_marking(str(obj.get("markning") or ""))
+    tokens, _companies, exact_company = _project_query(text, objects)
+    return exact_company and _tokens_match(tokens, _normalized_name_tokens(obj["name"]), False)
+
+
 def project_candidates(text, objects):
     normalized = " ".join(text.casefold().split())
     identifiers = [obj for obj in objects if obj.get("sync_id") and re.search(
         r"(?<![\w-])" + re.escape(str(obj["sync_id"]).casefold()) + r"(?![\w-])", normalized)]
     if identifiers:
         return identifiers
-    marking = re.search(r"(?<!\w)p\d+(?!\w)", normalized)
+    marking = project_marking(text)
     if marking:
-        return [obj for obj in objects if str(obj.get("markning") or "").casefold() == marking.group()]
-    matches = []
-    for obj in objects:
-        name = " ".join(str(obj.get("name") or "").casefold().split())
-        if not name:
-            continue
-        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", normalized):
-            matches.append(obj)
-            continue
-        words = re.findall(r"[\w]+", name)
-        if words and re.search(r"(?<!\w)" + re.escape(words[0]) + r"(?!\w)", normalized):
-            matches.append(obj)
-    return matches
+        return [obj for obj in objects if project_marking(str(obj.get("markning") or "")) == marking]
+    tokens, companies, _exact = _project_query(text, objects)
+    return [obj for obj in objects if (companies is None or obj.get("company") in companies)
+            and (not tokens or _tokens_match(tokens, _normalized_name_tokens(obj.get("name") or "")))]
 
 
 def expense_summary(documents, object_id, period=None):
