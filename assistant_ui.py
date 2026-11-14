@@ -1103,7 +1103,8 @@ class AssistantDialog(QDialog):
         self.workflow_choice.setEnabled(True)
         self.native.setEnabled(bool(self.result and "native_action" in self.result))
         self.open_records.setEnabled(bool(self.attention and self.attention_rows) or bool(
-            self.result and self.result["records"] and "table" not in self.result))
+            self.result and self.result["records"] and "table" not in self.result) or bool(
+            self.project_result and self.table.isVisible() and self.table.rowCount()))
         if self.auto_report:
             self.auto_report = False
             self.report()

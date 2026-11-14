@@ -23,6 +23,7 @@ def project_request(text):
         return False
     return bool(
         re.search(r"\bчто\s+(?:у\s+нас\s+)?(?:сейчас\s+)?по\s+", normalized)
+        or re.match(r"^что\s+у\s+нас\s+сейчас\b", normalized)
         or re.search(r"\b(?:сводк\w*|состояни\w*|ситуаци\w*)\s+по\s+(?!всем\b|фирм\w*|компан\w*)", normalized)
         or re.search(r"\b(?:сводк\w*|состояни\w*|час\w*|расход\w*|заработал\w*)\b.*\b(?:объект|проект)\w*\b", normalized)
         or re.search(r"\bкто\b.*\b(?:объект|проект)\w*\b", normalized)
@@ -65,12 +66,27 @@ def project_marking(text):
 
 
 def _tokens_match(query, candidate, approximate=True):
-    return bool(query) and all(any(
+    if not query:
+        return False
+    if all(any(
         word == token or (approximate and min(len(word), len(token)) >= 4
                           and SequenceMatcher(None, word, token).ratio() >= 0.78)
         or (approximate and min(len(word), len(token)) >= 3
             and re.sub(r"[aeouy]", "a", word) == re.sub(r"[aeouy]", "a", token))
-        for token in candidate) for word in query)
+        for token in candidate) for word in query):
+        return True
+    if not approximate:
+        return False
+    joined = "".join(query)
+    # Speech can split names and attach the preposition "по" to their first syllable.
+    spoken = (joined, joined[2:]) if joined.startswith("po") else (joined,)
+    return any(
+        min(len(value), len(name)) >= 6 and SequenceMatcher(None, value, name).ratio() >= 0.82
+        for start in range(len(candidate))
+        for end in range(start + 1, len(candidate) + 1)
+        for name in ("".join(candidate[start:end]),)
+        for value in spoken
+    )
 
 
 def _project_query(text, objects):

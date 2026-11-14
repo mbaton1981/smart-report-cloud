@@ -2925,6 +2925,9 @@ class AssistantUiTests(unittest.TestCase):
                 reply()
                 self.assertEqual(dialog.table.item(0, 0).text(), "Test Employee")
                 self.assertEqual(dialog.table.item(0, 1).text(), "8")
+                dialog.show()
+                dialog.finished()
+                self.assertTrue(dialog.open_records.isEnabled())
                 dialog.table.selectRow(0)
                 dialog.input.setPlainText("Теперь по Badbacken")
                 dialog.command()
@@ -2957,6 +2960,13 @@ class AssistantUiTests(unittest.TestCase):
                 with patch.object(dialog, "project_action") as action:
                     reply()
                 action.assert_called_once_with("expenses")
+                api.assert_not_called()
+                dialog.received({"text": "Что у нас сейчас потом-то, Бода, Ренатур?"})
+                dialog.command()
+                self.assertEqual([obj["sync_id"] for obj in dialog.project_pending[0]], ["ata", "rivning"])
+                self.assertIsNone(dialog.project_selected)
+                self.assertIsNone(dialog.project_result)
+                self.assertEqual(dialog.object_name.text(), "")
                 api.assert_not_called()
 
     def test_approximate_single_object_requires_confirmation_and_employee_requests_still_route(self):
