@@ -714,6 +714,61 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertIsNone(incomplete["work_cost"])
         self.assertEqual(incomplete["expense_sums"]["gross_amount"], {"SEK": "50.00"})
         self.assertTrue(incomplete["expense_unknown"]["net_amount"])
+        from PyQt6.QtCore import QSignalBlocker
+        from PyQt6.QtTest import QTest
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._object_card_window = window
+        self._setup_catalog_window(window)
+        window._expense_read_cache = {(None, None): documents}
+        window.object_all_period.setChecked(False)
+        window.object_date_from.setText("2026-10-22")
+        window.object_date_to.setText("2026-10-22")
+        with QSignalBlocker(window.table_objects):
+            window.table_objects.setRowCount(1)
+            for column, text in enumerate(("Overview test", "Current site", "p3001", "900", "70", "Активен")):
+                item = self.desktop.QTableWidgetItem(text)
+                if column == 0:
+                    item.setData(self.desktop.Qt.ItemDataRole.UserRole, object_id)
+                    item.setData(self.desktop.Qt.ItemDataRole.UserRole + 2, sync_id)
+                    item.setData(self.desktop.Qt.ItemDataRole.UserRole + 3, 31001)
+                window.table_objects.setItem(0, column, item)
+            window.table_objects.setCurrentCell(0, 0)
+
+        def wait_for_overview():
+            deadline = time.monotonic() + 5
+            while getattr(window, "_object_overview_task", None) is not None and time.monotonic() < deadline:
+                self.qt_app.processEvents()
+                QTest.qWait(10)
+            self.assertIsNone(window._object_overview_task)
+
+        window.load_object_overview()
+        wait_for_overview()
+        self.assertEqual(
+            [label.text() for label in (
+                window.object_hours_value, window.object_employees_value, window.object_work_cost_value,
+                window.object_expense_gross_value, window.object_expense_net_value,
+            )],
+            ["10.00 ч", "1", "1 100.00 SEK", "140.00 SEK", "125.00 SEK"],
+        )
+        self.assertIn("22.10.2026", window.object_period_caption.text())
+        self.assertEqual(window.object_detail_mark.text(), "p3001")
+        self.assertIn("Overview test", window.object_detail_company.text())
+        self.assertTrue(all(button.isEnabled() for button in (
+            window.object_shifts_button, window.object_expenses_button, window.object_report_button,
+        )))
+        window.object_date_from.setText("2026-11-01")
+        window.object_date_to.setText("2026-11-30")
+        wait_for_overview()
+        self.assertEqual(window.object_work_cost_value.text(), "Нет рабочих записей")
+        self.assertIn("Нет рабочих записей", window.object_overview_status.text())
+        window.object_date_from.setText("2026-10-23")
+        window.object_date_to.setText("2026-10-23")
+        wait_for_overview()
+        self.assertEqual(window.object_work_cost_value.text(), "Неизвестно")
+        self.assertEqual(window.object_expense_net_value.text(), "Неизвестно")
+        self.assertIn("Расчёт неполный", window.object_overview_status.text())
         conn = self.desktop.get_db_connection()
         after = {
             table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
@@ -721,6 +776,113 @@ class CatalogSyncTests(unittest.TestCase):
         }
         conn.close()
         self.assertEqual(after, before)
+
+    def test_object_card_invalid_period_and_cleared_selection_invalidate_old_results(self):
+        from PyQt6.QtCore import QSignalBlocker
+
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._object_card_window = window
+        self._setup_catalog_window(window)
+        with QSignalBlocker(window.table_objects):
+            window.table_objects.setRowCount(1)
+            for column, text in enumerate(("Renatur", "Pending site", "p3100", "450", "35", "Активен")):
+                item = self.desktop.QTableWidgetItem(text)
+                if column == 0:
+                    item.setData(self.desktop.Qt.ItemDataRole.UserRole, 1)
+                    item.setData(self.desktop.Qt.ItemDataRole.UserRole + 2, "pending-site")
+                window.table_objects.setItem(0, column, item)
+            window.table_objects.setCurrentCell(0, 0)
+        with QSignalBlocker(window.object_all_period), QSignalBlocker(window.object_date_from), QSignalBlocker(window.object_date_to):
+            window.object_all_period.setChecked(False)
+            window.object_date_from.setText("2026-11-30")
+            window.object_date_to.setText("2026-11-01")
+        window._object_overview_request_id = 9
+        window.object_work_cost_value.setText("Old result")
+        window.load_object_overview()
+        self.assertGreater(window._object_overview_request_id, 9)
+        window._on_object_overview_ready(9, {}, "")
+        self.assertIn("Проверьте период", window.object_overview_status.text())
+        self.assertEqual(window.object_work_cost_value.text(), "—")
+        window.table_objects.clearSelection()
+        self.assertEqual(window.object_detail_title.text(), "Выберите объект слева")
+        self.assertTrue(window.object_detail_mark.isHidden())
+        self.assertFalse(window.object_shifts_button.isEnabled())
+        request_id = window._object_overview_request_id
+        window._on_object_overview_ready(request_id, {}, "test read failure")
+        self.assertIn("Не удалось загрузить", window.object_overview_status.text())
+        self.assertEqual(window.object_expense_status.text(), "Расходы не загружены.")
+
+    def test_object_card_layout_wraps_long_titles_and_separate_currencies_in_both_themes(self):
+        if os.environ.get("SMARTREPORT_CARD_LAYOUT_TEST_CHILD") != "1":
+            result = subprocess.run(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests",
+                 "-p", "test_catalog_sync.py", "-k",
+                 "test_object_card_layout_wraps_long_titles_and_separate_currencies_in_both_themes"],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                env=dict(os.environ, SMARTREPORT_CARD_LAYOUT_TEST_CHILD="1"),
+                capture_output=True, text=True, encoding="utf-8", timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return
+        from PyQt6.QtCore import QPoint
+        from PyQt6.QtWidgets import QFrame, QLabel
+        import desktop_theme
+
+        manager = desktop_theme.ensure_theme(self.desktop.DARK_THEME_QSS)
+        previous_theme = manager.name
+
+        def restore_theme():
+            manager.name = previous_theme
+            manager.apply()
+
+        self.addCleanup(restore_theme)
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self._object_card_window = window
+        self._setup_catalog_window(window)
+        detail = window.object_detail_title.parentWidget()
+        window.setCentralWidget(detail)
+        window._set_object_card_heading(
+            "Tillbyggnad Punschvägen 7 på Storholmen (1:184) — omfattande renovering och tilläggsarbeten",
+            "Testkund AB — lång företagsbeteckning", "p3100",
+        )
+        window.object_work_cost_value.setText("123 456 789.00 SEK")
+        window.object_expense_gross_value.setText(window._object_money_text(
+            {"SEK": "100000.00", "EUR": "1234567.89"}, False, 2, True,
+        ))
+        self.assertEqual(window.object_expense_gross_value.text(), "1 234 567.89 EUR · 100 000.00 SEK")
+        self.assertEqual(window._object_money_text({"SEK": "100"}, True, 1, True), "Неизвестно")
+        scroll = window.object_section_tabs.widget(0)
+        window.show()
+        for theme in ("light", "dark"):
+            manager.name = theme
+            manager.apply()
+            for width in (430, 760, 1060):
+                with self.subTest(theme=theme, width=width):
+                    window.resize(width, 760)
+                    for _ in range(3):
+                        self.qt_app.processEvents()
+                    content = scroll.widget()
+                    self.assertLessEqual(content.width(), scroll.viewport().width())
+                    for label in (
+                        window.object_detail_title, window.object_detail_company,
+                        window.object_work_cost_value, window.object_expense_gross_value,
+                    ):
+                        self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+                    for button in (
+                        window.object_shifts_button, window.object_expenses_button, window.object_report_button,
+                    ):
+                        point = button.mapTo(content, QPoint(0, 0))
+                        self.assertGreaterEqual(point.x(), 0)
+                        self.assertLessEqual(point.x() + button.width(), content.width())
+                    cards = content.findChildren(QFrame, "objectMetric")
+                    self.assertEqual(len(cards), 3)
+                    for card in cards:
+                        for label in card.findChildren(QLabel):
+                            point = label.mapTo(card, QPoint(0, 0))
+                            self.assertGreaterEqual(point.x(), 0)
+                            self.assertLessEqual(point.x() + label.width(), card.width())
 
     def test_stale_object_overview_response_is_ignored(self):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)

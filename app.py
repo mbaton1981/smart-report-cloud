@@ -12193,25 +12193,45 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         detail = QFrame()
         detail.setObjectName("card")
         detail_layout = QVBoxLayout(detail)
-        detail_layout.setContentsMargins(12, 12, 12, 12)
-        detail_layout.setSpacing(8)
-        self.object_detail_title = QLabel("Выберите объект")
-        self.object_detail_title.setStyleSheet("font-size: 18px; font-weight: 600")
+        detail_layout.setContentsMargins(16, 16, 16, 16)
+        detail_layout.setSpacing(10)
+        heading = QHBoxLayout()
+        heading.setSpacing(12)
+        self.object_detail_title = QLabel("Выберите объект слева")
+        self.object_detail_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.object_detail_title.setStyleSheet("font-size: 24px; font-weight: 700")
         self.object_detail_title.setWordWrap(True)
-        self.object_detail_meta = QLabel("Название и маркировка объекта появятся здесь.")
+        self.object_detail_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.object_detail_mark = QLabel()
+        self.object_detail_mark.setTextFormat(Qt.TextFormat.PlainText)
+        self.object_detail_mark.setWordWrap(True)
+        self.object_detail_mark.setMaximumWidth(140)
+        desktop_theme.apply_style(
+            self.object_detail_mark,
+            "background-color: #313c4e; color: #63b3ed; border: 1px solid #3f4c60; "
+            "border-radius: 6px; padding: 4px 8px; font-weight: 600;",
+        )
+        self.object_detail_mark.hide()
+        heading.addWidget(self.object_detail_title, 1)
+        heading.addWidget(self.object_detail_mark, 0, Qt.AlignmentFlag.AlignTop)
+        detail_layout.addLayout(heading)
+        self.object_detail_company = QLabel()
+        self.object_detail_company.setTextFormat(Qt.TextFormat.PlainText)
+        self.object_detail_company.setWordWrap(True)
+        self.object_detail_company.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        desktop_theme.apply_style(
+            self.object_detail_company, "color: #a0aec0; font-size: 13px; font-weight: 600;",
+        )
+        detail_layout.addWidget(self.object_detail_company)
+        self.object_detail_meta = QLabel()
         self.object_detail_meta.setWordWrap(True)
-        detail_layout.addWidget(self.object_detail_title)
-        detail_layout.addWidget(self.object_detail_meta)
         self.object_section_tabs = QTabWidget()
         self.object_section_tabs.setUsesScrollButtons(True)
         self.object_section_tabs.setElideMode(Qt.TextElideMode.ElideNone)
         overview_page = QWidget()
         overview_layout = QVBoxLayout(overview_page)
-        overview_layout.setContentsMargins(0, 0, 0, 0)
-        customer_terms_button = QPushButton("Прежние клиентские условия…")
-        customer_terms_button.setObjectName("customerTermsButton")
-        customer_terms_button.clicked.connect(self.customer_terms_dialog)
-        overview_layout.addWidget(customer_terms_button)
+        overview_layout.setContentsMargins(4, 12, 4, 4)
+        overview_layout.setSpacing(10)
 
         period_row = QHBoxLayout()
         self.object_all_period = QCheckBox("За весь объект")
@@ -12221,40 +12241,81 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_all_period.toggled.connect(self._object_period_changed)
         self.object_date_from.dateChanged.connect(self.load_object_overview)
         self.object_date_to.dateChanged.connect(self.load_object_overview)
+        self.object_date_from.setEnabled(False)
+        self.object_date_to.setEnabled(False)
         period_row.addWidget(self.object_all_period)
-        period_row.addWidget(QLabel("с"))
-        period_row.addWidget(self.object_date_from)
-        period_row.addWidget(QLabel("по"))
-        period_row.addWidget(self.object_date_to)
+        date_range = QWidget()
+        date_range_layout = QHBoxLayout(date_range)
+        date_range_layout.setContentsMargins(0, 0, 0, 0)
+        date_range_layout.addWidget(QLabel("с"))
+        date_range_layout.addWidget(self.object_date_from)
+        date_range_layout.addWidget(QLabel("по"))
+        date_range_layout.addWidget(self.object_date_to)
+        period_row.addWidget(date_range)
+        desktop_theme.adapt_box_layout(overview_page, period_row, compact_width=650)
         overview_layout.addLayout(period_row)
+        self.object_period_caption = QLabel("Период: за весь объект")
+        self.object_period_caption.setWordWrap(True)
+        self.object_period_caption.setStyleSheet("font-weight: 600")
+        overview_layout.addWidget(self.object_period_caption)
 
-        self.object_overview_status = QLabel("Выберите объект для загрузки сводки.")
+        self.object_overview_status = QLabel("Выберите объект слева")
         self.object_overview_status.setWordWrap(True)
         overview_layout.addWidget(self.object_overview_status)
-        metrics = QGridLayout()
+        metrics = QHBoxLayout()
+        metrics.setSpacing(10)
         self.object_hours_value = QLabel("—")
         self.object_employees_value = QLabel("—")
         self.object_work_cost_value = QLabel("—")
         self.object_expense_gross_value = QLabel("—")
         self.object_expense_net_value = QLabel("—")
-        for label, value, row, column in (
-            ("Рабочие часы, ч", self.object_hours_value, 0, 0),
-            ("Сотрудники за период", self.object_employees_value, 0, 1),
-            ("Работа и OB (расчёт), SEK без НДС", self.object_work_cost_value, 1, 0),
-            ("Подтверждённые расходы объекта, SEK с НДС", self.object_expense_gross_value, 1, 1),
-            ("Те же расходы, SEK без НДС", self.object_expense_net_value, 2, 0),
+        for label, value, note, detail_label, detail_value in (
+            ("Рабочие часы", self.object_hours_value, "Часы работы и OB, без повторного учёта.",
+             "Сотрудников за период", self.object_employees_value),
+            ("Расчёт клиенту", self.object_work_cost_value,
+             "SEK · без НДС\nРабота / фиксированная цена и OB. Транспорт в этот показатель не входит.",
+             "", None),
+            ("Подтверждённые расходы", self.object_expense_gross_value,
+             "С НДС · только подтверждённые доли объекта.\nВалюты показаны раздельно.",
+             "Те же расходы без НДС", self.object_expense_net_value),
         ):
+            metric = QFrame()
+            metric.setObjectName("objectMetric")
+            desktop_theme.apply_style(
+                metric, "QFrame#objectMetric { background-color: #252d38; "
+                "border: 1px solid #3f4c60; border-radius: 10px; }",
+            )
+            metric_layout = QVBoxLayout(metric)
+            metric_layout.setContentsMargins(14, 12, 14, 12)
+            metric_layout.setSpacing(6)
             caption = QLabel(label)
             caption.setWordWrap(True)
-            value.setStyleSheet("font-size: 16px; font-weight: 700")
-            metrics.addWidget(caption, row * 2, column)
-            metrics.addWidget(value, row * 2 + 1, column)
+            desktop_theme.apply_style(caption, "color: #a0aec0; font-weight: 600;")
+            value.setWordWrap(True)
+            value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            desktop_theme.apply_style(value, "color: #63b3ed; font-size: 23px; font-weight: 700;")
+            explanation = QLabel(note)
+            explanation.setWordWrap(True)
+            desktop_theme.apply_style(explanation, "color: #a0aec0;")
+            metric_layout.addWidget(caption)
+            metric_layout.addWidget(value)
+            metric_layout.addWidget(explanation)
+            if detail_value is not None:
+                subcaption = QLabel(detail_label)
+                subcaption.setWordWrap(True)
+                desktop_theme.apply_style(subcaption, "color: #a0aec0;")
+                detail_value.setWordWrap(True)
+                detail_value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                metric_layout.addWidget(subcaption)
+                metric_layout.addWidget(detail_value)
+            metric_layout.addStretch(1)
+            metrics.addWidget(metric, 1)
+        desktop_theme.adapt_box_layout(overview_page, metrics, compact_width=760)
         overview_layout.addLayout(metrics)
         self.object_expense_status = QLabel(
             "Расходы учитываются только по подтверждённым долям распределения."
         )
         self.object_expense_status.setWordWrap(True)
-        overview_layout.addWidget(self.object_expense_status)
 
         actions = QHBoxLayout()
         self.object_shifts_button = QPushButton("Смены")
@@ -12263,12 +12324,26 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_shifts_button.clicked.connect(self.open_selected_object_shifts)
         self.object_expenses_button.clicked.connect(self.open_selected_object_expenses)
         self.object_report_button.clicked.connect(self.open_selected_object_report)
-        actions.addWidget(self.object_shifts_button)
-        actions.addWidget(self.object_expenses_button)
-        actions.addWidget(self.object_report_button)
+        for button in (
+            self.object_shifts_button, self.object_expenses_button, self.object_report_button,
+        ):
+            button.setObjectName("secondaryAction")
+            actions.addWidget(button)
+        desktop_theme.adapt_box_layout(overview_page, actions, compact_width=380)
         overview_layout.addLayout(actions)
+        overview_layout.addWidget(self.object_expense_status)
+        overview_layout.addWidget(self.object_detail_meta)
+        customer_terms_button = QPushButton("Прежние клиентские условия…")
+        customer_terms_button.setObjectName("customerTermsButton")
+        customer_terms_button.clicked.connect(self.customer_terms_dialog)
+        overview_layout.addWidget(customer_terms_button)
         overview_layout.addStretch(1)
-        self.object_section_tabs.addTab(overview_page, "Обзор")
+        overview_scroll = QScrollArea()
+        overview_scroll.setWidgetResizable(True)
+        overview_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        overview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        overview_scroll.setWidget(overview_page)
+        self.object_section_tabs.addTab(overview_scroll, "Обзор")
         from object_card_ui import ObjectAgreementsPage, ObjectDocumentsPage
         from object_records import ObjectRecordStore
 
@@ -13566,15 +13641,24 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def load_object_overview(self, *_):
         if not hasattr(self, "object_overview_status"):
             return
-        selected_row = self.table_objects.currentRow()
+        self._object_overview_request_id = getattr(self, "_object_overview_request_id", 0) + 1
+        request_id = self._object_overview_request_id
+        self.object_period_caption.setText(
+            "Период: за весь объект" if self.object_all_period.isChecked() else
+            f"Период: {self.object_date_from.date().toString('dd.MM.yyyy')} — "
+            f"{self.object_date_to.date().toString('dd.MM.yyyy')}"
+        )
+        selected_row = (
+            self.table_objects.currentRow() if self.table_objects.selectionModel().hasSelection()
+            else -1
+        )
         identity = self.table_objects.item(selected_row, 0) if selected_row >= 0 else None
         if identity is None:
-            self._object_overview_request_id = getattr(self, "_object_overview_request_id", 0) + 1
-            self.object_detail_title.setText("Выберите объект")
-            self.object_detail_meta.setText("Название и маркировка объекта появятся здесь.")
+            self._set_object_card_heading()
+            self.object_detail_meta.clear()
             self.object_documents_page.set_object(None, "", "")
             self.object_agreements_page.set_object(None, "", "")
-            self.object_overview_status.setText("Выберите объект для загрузки сводки.")
+            self.object_overview_status.setText("Выберите объект слева")
             for value in (
                 self.object_hours_value, self.object_employees_value,
                 self.object_work_cost_value, self.object_expense_gross_value,
@@ -13597,15 +13681,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         expense_cache = getattr(self, "_expense_read_cache", {})
         if server_id is not None and (None, None) not in expense_cache:
             self._schedule_expense_read((None, None))
-        self.object_detail_title.setText(self.table_objects.item(selected_row, 1).text())
         company = self.table_objects.item(selected_row, 0).text()
         mark = self.table_objects.item(selected_row, 2).text()
         rate = self.table_objects.item(selected_row, 3).text()
         transport = self.table_objects.item(selected_row, 4).text()
         state = self.table_objects.item(selected_row, 5).text()
+        self._set_object_card_heading(self.table_objects.item(selected_row, 1).text(), company, mark)
         self.object_detail_meta.setText(
-            f"{company} · Markning: {mark or '—'} · {state}\n"
-            f"Действующие клиентские ставки: {rate} SEK/ч; транспорт {transport} SEK/выезд. "
+            f"{state} · Действующие клиентские ставки: {rate} SEK/ч; транспорт {transport} SEK/выезд. "
             "Исторические записи не переоцениваются по этим ставкам. "
             "Отдельного поля адреса в справочнике нет."
         )
@@ -13630,6 +13713,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             date_to = self.object_date_to.text().strip()
             if date_from > date_to:
                 self.object_overview_status.setText("Проверьте период: начало позже окончания.")
+                self.object_expense_status.setText("Расходы не рассчитаны: проверьте период.")
                 for value in (
                     self.object_hours_value, self.object_employees_value,
                     self.object_work_cost_value, self.object_expense_gross_value,
@@ -13638,9 +13722,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     value.setText("—")
                 return
 
-        self._object_overview_request_id = getattr(self, "_object_overview_request_id", 0) + 1
-        request_id = self._object_overview_request_id
         self.object_overview_status.setText("Загружаем данные объекта…")
+        self.object_expense_status.setText("Загружаем подтверждённые доли расходов…")
         for value in (
             self.object_hours_value, self.object_employees_value,
             self.object_work_cost_value, self.object_expense_gross_value,
@@ -13659,6 +13742,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         task.signals.completed.connect(self._on_object_overview_ready)
         self._object_overview_task = task
         QThreadPool.globalInstance().start(task)
+
+    def _set_object_card_heading(self, name="", company="", marking=""):
+        self.object_detail_title.setText(name or "Выберите объект слева")
+        self.object_detail_company.setText(f"Фирма-заказчик: {company or 'не указана'}" if name else "")
+        self.object_detail_mark.setText(marking or "Без маркировки")
+        self.object_detail_mark.setVisible(bool(name))
 
     def _read_object_overview(
         self, object_id, expected_sync_id, server_id, date_from, date_to,
@@ -13827,6 +13916,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self._object_overview_task = None
         if error:
             self.object_overview_status.setText(f"Не удалось загрузить сводку объекта: {error}")
+            self.object_expense_status.setText("Расходы не загружены.")
             for value in (
                 self.object_hours_value, self.object_employees_value,
                 self.object_work_cost_value, self.object_expense_gross_value,
@@ -13835,12 +13925,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 value.setText("—")
             return
         object_row = result["object"]
-        self.object_detail_title.setText(object_row["name"])
+        self._set_object_card_heading(
+            object_row["name"], object_row["company"], object_row.get("markning") or "",
+        )
+        rate = "неизвестно" if object_row["rate"] is None else f"{float(object_row['rate']):.2f}"
+        transport = (
+            "неизвестно" if object_row["transport_rate"] is None
+            else f"{float(object_row['transport_rate']):.2f}"
+        )
         self.object_detail_meta.setText(
-            f"{object_row['company']} · Markning: {object_row.get('markning') or '—'} · "
-            f"{'Активен' if object_row['is_active'] else 'В архиве'}\n"
-            f"Действующие клиентские ставки: {float(object_row['rate'] or 0):.2f} SEK/ч; "
-            f"транспорт {float(object_row['transport_rate'] or 0):.2f} SEK/выезд. "
+            f"{'Активен' if object_row['is_active'] else 'В архиве'} · "
+            f"Действующие клиентские ставки: {rate} SEK/ч; транспорт {transport} SEK/выезд. "
             "Ставки не применяются задним числом. Отдельного поля адреса в справочнике нет."
         )
         self.object_hours_value.setText(f"{result['hours']:,.2f} ч".replace(",", " "))
@@ -13867,7 +13962,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             else f"за {self.object_date_from.text()} — {self.object_date_to.text()}"
         )
         self.object_overview_status.setText(
-            f"Смены и расчётная стоимость — по сохранённой истории, {period_label}. "
+            (f"Нет рабочих записей {period_label}. " if not result["has_work_rows"] else
+             f"Расчёт неполный: стоимость неизвестна, {period_label}. "
+             if result["work_cost"] is None else
+             f"Смены и расчётная стоимость — по сохранённой истории, {period_label}. ") +
             "Часы записей OB включены один раз. Стоимость — без НДС, это не полученная оплата или прибыль."
         )
         if not result["expense_linked"]:
