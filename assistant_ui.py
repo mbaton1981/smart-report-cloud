@@ -3,6 +3,7 @@ import io
 import base64
 from html import escape
 import json
+import hashlib
 import logging
 import math
 import os
@@ -34,6 +35,7 @@ from assistant_actions import CAPABILITIES, REPORT_ACTIONS
 from assistant_desktop import DesktopActionError, local_result, native_action
 import assistant_attention
 import assistant_project
+from assistant_api import MAX_VOICE_TERMS, MAX_VOICE_TERMS_CHARS
 
 
 class AssistantClientError(ValueError):
@@ -680,6 +682,9 @@ class AssistantDialog(QDialog):
         self.buffer = None
         self.recording_started_at = None
         self.voice_warning = ""
+        self.voice_diagnostics = {}
+        self.last_voice_audio = None
+        self.voice_catalog_notice = ""
         self.context = None
         self.chat_messages = []
         self.choices = []
@@ -866,6 +871,11 @@ class AssistantDialog(QDialog):
         self.voice_cancel.setVisible(False)
         self.voice_cancel.clicked.connect(self.cancel_recording)
         row.addWidget(self.voice_cancel)
+        self.voice_append = QCheckBox("Добавить запись к тексту")
+        self.voice_append.setToolTip("Без этой отметки новая диктовка заменяет текст в поле; отмена сохраняет его.")
+        self.voice_details = QPushButton("Проверить голосовой запрос")
+        self.voice_details.setEnabled(False)
+        self.voice_details.clicked.connect(self.show_voice_details)
         tools = QHBoxLayout()
         self.pdf = QPushButton("Создать / открыть PDF")
         self.pdf.setEnabled(False)
@@ -890,6 +900,10 @@ class AssistantDialog(QDialog):
         self.recording_time.setAccessibleName("Длительность записи")
         voice_status.addWidget(self.recording_time)
         layout.addLayout(voice_status)
+        voice_options = QHBoxLayout()
+        voice_options.addWidget(self.voice_append)
+        voice_options.addWidget(self.voice_details)
+        layout.addLayout(voice_options)
         layout.addLayout(tools)
         self.native = QPushButton("Открыть штатную форму")
         self.native.setEnabled(False)
@@ -980,14 +994,15 @@ class AssistantDialog(QDialog):
     @staticmethod
     def _chat_message_html(role, text):
         label = {"Вы": "Вы", "SmartReport": "SmartReport"}.get(str(role), str(role))
-        background_color = "#313c4e" if label == "Вы" else "#2d3748"
+        background_color = "#313c4e" if label == "Вы" else "#2d3748" if label == "SmartReport" else "#252b35"
         background = desktop_theme.color(background_color).name()
+        foreground = desktop_theme.color("#e2e8f0").name()
         body = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
         return (
             f'<table width="100%" cellspacing="0" cellpadding="10" bgcolor="{background}">'
             '<tr><td>'
-            f'<p style="margin:0 0 5px 0"><span style="font-size:12pt; font-weight:700">{escape(label)}</span></p>'
-            f'<p style="margin:0; font-size:10pt; font-weight:400">{body}</p>'
+            f'<p style="margin:0 0 5px 0"><span style="color:{foreground}; font-size:12pt; font-weight:700">{escape(label)}</span></p>'
+            f'<p style="margin:0; font-size:10pt; font-weight:400"><span style="color:{foreground}">{body}</span></p>'
             '</td></tr></table>'
         )
 
@@ -1027,6 +1042,11 @@ class AssistantDialog(QDialog):
         self.clear_clarification()
         self.pending_draft = None
         self.input.clear()
+        self.voice_diagnostics = {}
+        self.last_voice_audio = None
+        self.voice_catalog_notice = ""
+        self.voice_append.setChecked(False)
+        self.voice_details.setEnabled(False)
         for field in (self.employee, self.company, self.object_name):
             field.clear()
         today = QDate.currentDate()
@@ -1100,6 +1120,7 @@ class AssistantDialog(QDialog):
             self.worker.audio_terms = None
         self.send.setEnabled(True)
         self.voice.setEnabled(True)
+        self.voice_append.setEnabled(True)
         self.workflow_choice.setEnabled(True)
         self.native.setEnabled(bool(self.result and "native_action" in self.result))
         self.open_records.setEnabled(bool(self.attention and self.attention_rows) or bool(
@@ -1191,13 +1212,27 @@ class AssistantDialog(QDialog):
             if not isinstance(transcript, str) or not transcript.strip():
                 self.failed("Распознавание вернуло пустой текст. Проверьте микрофон и попробуйте ещё раз.")
                 return
+            voice = data.get("voice")
+            if isinstance(voice, dict):
+                if self.voice_diagnostics.get("audio_sha256") and (
+                        voice.get("audio_sha256") != self.voice_diagnostics["audio_sha256"]):
+                    self.failed("Ответ распознавания относится к другой записи. Текст не добавлен.")
+                    return
+                self.voice_diagnostics["server"] = voice
+            self.voice_diagnostics["transcript"] = transcript
+            self.voice_diagnostics["sent_texts"] = []
+            self.voice_diagnostics.pop("resolved", None)
             transcript = transcript.strip()
             current = self.input.toPlainText()
-            self.input.setPlainText(current.rstrip() + ("\n" if current.strip() else "") + transcript)
+            append = self.voice_append.isChecked()
+            self.input.setPlainText(
+                current.rstrip() + ("\n" if current.strip() else "") + transcript if append else transcript)
+            self.voice_append.setChecked(False)
+            self.voice_details.setEnabled(True)
             warning = (self.voice_warning + " ") if self.voice_warning else ""
             self.state.setText(
-                warning + "Речь распознана и добавлена в поле. Проверьте ФИО, даты и числа, "
-                "исправьте при необходимости и нажмите «Отправить»."
+                warning + ("Речь распознана и добавлена к тексту. " if append else
+                           "Речь распознана как новая команда. ") + "Проверьте текст и нажмите «Отправить»."
             )
             self.voice_warning = ""
         elif "actions" in data:
@@ -1379,7 +1414,7 @@ class AssistantDialog(QDialog):
             button.setVisible(False)
         self.state.setText("Параметры изменены; отправьте новый запрос.")
 
-    def resolve_project(self, text, period):
+    def project_objects(self):
         if not self.database or not Path(self.database).is_file():
             raise ValueError("Локальный профиль недоступен; объект не определён.")
         conn = sqlite3.connect(Path(self.database).resolve().as_uri() + "?mode=ro", uri=True)
@@ -1390,6 +1425,10 @@ class AssistantDialog(QDialog):
                 "SELECT id,sync_id,server_id,name,company,markning,is_active FROM objects")]
         finally:
             conn.close()
+        return objects
+
+    def resolve_project(self, text, period):
+        objects = self.project_objects()
         named = assistant_project.project_candidates(text, objects)
         has_name = assistant_project.project_has_name(text, objects)
         if has_name:
@@ -1427,20 +1466,22 @@ class AssistantDialog(QDialog):
             raise ValueError("Объект или фирма не найдены. Выберите объект в поле или уточните название/маркировку; "
                              "поиск по всем объектам не выполнен.")
         if needs_choice:
-            self.project_pending = (matches, period)
-            self.clarification_choice.clear()
-            for obj in matches:
-                self.clarification_choice.addItem(
-                    f'{obj["name"]} · {obj["markning"] or "без маркировки"} · {obj["company"]}',
-                    obj["sync_id"])
-            self.clarification_choice.setVisible(True)
-            self.choose_clarification.setVisible(True)
-            self.append_message("SmartReport", "Выберите объект из справочника; можно указать номер варианта:\n" +
-                                "\n".join(f'{index + 1}. {self.clarification_choice.itemText(index)}'
-                                          for index in range(len(matches))))
-            self.state.setText("Выберите объект; автоматический выбор не выполнен.")
+            self.offer_project_choices(matches, period)
             return
         self.start_project(matches[0], period)
+
+    def offer_project_choices(self, matches, period):
+        self.project_pending = (matches, period)
+        self.clarification_choice.clear()
+        for obj in matches:
+            self.clarification_choice.addItem(
+                f'{obj["name"]} · {obj["markning"] or "без маркировки"} · {obj["company"]}', obj["sync_id"])
+        self.clarification_choice.setVisible(True)
+        self.choose_clarification.setVisible(True)
+        self.append_message("SmartReport", "Выберите объект из справочника; можно указать номер варианта:\n" +
+                            "\n".join(f'{index + 1}. {self.clarification_choice.itemText(index)}'
+                                      for index in range(len(matches))))
+        self.state.setText("Подтвердите объект; запрос и период сохранены.")
 
     def start_project(self, obj, period):
         from assistant_desktop import application
@@ -1450,6 +1491,11 @@ class AssistantDialog(QDialog):
         self.project_generation += 1
         generation = self.project_generation
         self.project_selected = obj
+        if self.voice_diagnostics.get("sent_texts"):
+            self.voice_diagnostics["resolved"] = {
+                "object": obj["name"], "company": obj["company"],
+                "id": obj["sync_id"], "period": period,
+            }
         self.project_mode = True
         self.project_active = False
         self.project_result = None
@@ -2226,6 +2272,8 @@ class AssistantDialog(QDialog):
         self.result = None
         self.pdf.setEnabled(False)
         self.append_message("Вы", text)
+        if self.voice_diagnostics.get("transcript"):
+            self.voice_diagnostics.setdefault("sent_texts", []).append(text)
         normalized = " ".join(text.casefold().strip(" .!?").split())
         period_only = bool(re.fullmatch(r"(?:а\s+)?(?:за\s+.+|с\s+.+\s+по\s+.+)", normalized))
         follow_action = ("expenses" if re.fullmatch(
@@ -2242,6 +2290,13 @@ class AssistantDialog(QDialog):
             self.state.setText("Выберите номер из предложенного списка объектов.")
             return
         project_request = assistant_project.project_request(text)
+        if (not project_request and re.match(r"^что\s+у\s+", normalized)
+                and not re.search(r"\bсотрудник\w*", normalized)):
+            try:
+                project_request = assistant_project.project_request(text, self.project_objects())
+            except (sqlite3.Error, ValueError) as error:
+                self.failed(str(error))
+                return
         if (self.project_pending is not None and not project_request and not period_only
                 and not follow_action and not re.search(r"\bсотрудник\w*|час\w*", normalized)):
             choices, period = self.project_pending
@@ -2250,6 +2305,8 @@ class AssistantDialog(QDialog):
                 self.project_pending = None
                 self.input.clear()
                 self.start_project(matches[0], period)
+            elif matches:
+                self.offer_project_choices(matches, period)
             else:
                 self.state.setText("Выберите объект кнопкой или номером из списка; запрос и период сохранены.")
             return
@@ -2514,6 +2571,7 @@ class AssistantDialog(QDialog):
             fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
             if device.isNull() or not device.isFormatSupported(fmt):
                 raise AssistantClientError("Микрофон PCM mono 16 kHz недоступен. Используйте текстовую команду.")
+            self.recording_terms = self.voice_context_terms()
             self.buffer = QBuffer(self)
             if not self.buffer.open(QIODevice.OpenModeFlag.ReadWrite):
                 raise AssistantClientError("Не удалось подготовить запись. Повторите попытку или используйте текст.")
@@ -2531,9 +2589,11 @@ class AssistantDialog(QDialog):
             self.voice_level.setValue(0)
             self.recording_time.setText("00:00 / 01:00")
             self.send.setEnabled(False)
-            self.state.setText("Идёт запись. Остановите её для распознавания или отмените без отправки.")
+            self.voice_append.setEnabled(False)
+            self.state.setText("Идёт запись. Остановите её для распознавания или отмените без отправки. "
+                               + self.voice_catalog_notice)
             self.timer.start()
-        except (ImportError, AssistantClientError, RuntimeError, OSError) as error:
+        except (ImportError, AssistantClientError, RuntimeError, OSError, sqlite3.Error) as error:
             logging.exception("Assistant microphone recording could not start")
             self._recording_failed(
                 str(error) if isinstance(error, AssistantClientError) else
@@ -2580,16 +2640,88 @@ class AssistantDialog(QDialog):
             self.company.text().strip(),
             self.object_name.text().strip(),
         ]
+        if self.project_selected:
+            terms.append(self.project_selected.get("markning") or "")
         if self.context and isinstance(self.context.get("plan"), dict):
             plan = self.context["plan"]
             terms.extend((plan.get("employee", ""), plan.get("company", ""), plan.get("object_name", "")))
-        return list(dict.fromkeys(value for value in terms if value))[:6]
+        if self.database and Path(self.database).is_file():
+            conn = sqlite3.connect(Path(self.database).resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                for name, company, marking in conn.execute(
+                        "SELECT name,company,markning FROM objects ORDER BY company,name"):
+                    terms.extend((company or "", name or "", marking or ""))
+            finally:
+                conn.close()
+            unavailable = ""
+        else:
+            unavailable = "Справочник недоступен; используются только выбранные названия. "
+        names = list(dict.fromkeys(" ".join(value.split()) for value in terms if value.strip()))
+        result = []
+        size = 0
+        for name in names:
+            if len(name) > 200 or len(result) >= MAX_VOICE_TERMS or size + len(name) > MAX_VOICE_TERMS_CHARS:
+                continue
+            result.append(name)
+            size += len(name)
+        self.voice_catalog_notice = unavailable + f"Подсказки распознавания: {len(result)} из {len(names)} названий."
+        return result
+
+    def show_voice_details(self):
+        data = self.voice_diagnostics
+        server = data.get("server")
+        engine = (f'{server.get("engine")} · {server.get("model")} · язык {server.get("language")}'
+                  if server else "Сервер не сообщил движок, модель и язык распознавания.")
+        text = (
+            f'{engine}\nМикрофон: {self.microphone_label.text()}\n'
+            f'WAV PCM mono, 16000 Hz, 16 bit; длительность: {data.get("duration_seconds", "неизвестна")} с\n'
+            f'RMS: {data.get("rms_dbfs", "неизвестен")} dBFS; пик: {data.get("peak", "неизвестен")}\n'
+            f'SHA-256 WAV: {data.get("audio_sha256", "неизвестен")}\n'
+            f'{self.voice_catalog_notice}\nНазвания: {"; ".join(data.get("terms", []))}\n\n'
+            f'Исходная расшифровка (без исправления названий):\n{data.get("transcript", "")}\n\n'
+            'Отправленные тексты после этой записи:\n' + "\n".join(data.get("sent_texts", []))
+        )
+        if server:
+            text += '\n\nПодсказки, принятые сервером ASR:\n' + "; ".join(server.get("terms", []))
+        if data.get("resolved"):
+            resolved = data["resolved"]
+            period = " — ".join(resolved["period"]) if resolved["period"] else "за весь объект"
+            text += (f'\n\nПоследняя сводка: {resolved["object"]} · {resolved["company"]}\n'
+                     f'ID: {resolved["id"]}; период: {period}')
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Запись → распознавание → запрос")
+        dialog.resize(720, 540)
+        layout = QVBoxLayout(dialog)
+        output = QTextEdit()
+        output.setReadOnly(True)
+        output.setPlainText(text)
+        layout.addWidget(output)
+        save = QPushButton("Сохранить эту запись WAV…")
+        save.setEnabled(self.last_voice_audio is not None)
+        save.clicked.connect(self.save_voice_audio)
+        layout.addWidget(save)
+        dialog.exec()
+
+    def save_voice_audio(self):
+        if self.last_voice_audio is None:
+            self.failed("Последняя запись уже удалена из памяти.")
+            return
+        filename, _ = QFileDialog.getSaveFileName(self, "Сохранить проверочную запись", "voice.wav", "WAV (*.wav)")
+        if not filename:
+            return
+        try:
+            Path(filename).write_bytes(self.last_voice_audio)
+        except OSError as error:
+            logging.exception("Assistant voice recording export failed")
+            QMessageBox.warning(self, "Запись не сохранена", str(error))
 
     def _finish_recording_controls(self):
         self.voice.setEnabled(True)
         self.voice_stop.setVisible(False)
         self.voice_cancel.setVisible(False)
         self.voice_level.setValue(0)
+        self.voice_append.setEnabled(True)
 
     def _discard_recording(self):
         self.timer.stop()
@@ -2630,6 +2762,10 @@ class AssistantDialog(QDialog):
             )
             return
         sample_count = len(raw) // 2
+        if len(raw) % 2:
+            self.failed("Запись содержит неполный аудиосэмпл. Запрос не отправлен; повторите запись.")
+            self.send.setEnabled(True)
+            return
         samples = [sample[0] for sample in struct.iter_unpack("<h", raw[:sample_count * 2])]
         peak = max((abs(sample) for sample in samples), default=0)
         rms = math.sqrt(sum(sample * sample for sample in samples) / max(1, len(samples)))
@@ -2646,7 +2782,18 @@ class AssistantDialog(QDialog):
             wav.setsampwidth(2)
             wav.setframerate(16000)
             wav.writeframes(raw)
-        self.call("transcribe", audio=stream.getvalue(), audio_terms=self.voice_context_terms())
+        terms = getattr(self, "recording_terms", None)
+        if terms is None:
+            terms = self.voice_context_terms()
+        self.last_voice_audio = stream.getvalue()
+        self.voice_diagnostics = {
+            "audio_sha256": hashlib.sha256(self.last_voice_audio).hexdigest(),
+            "duration_seconds": sample_count / 16000,
+            "rms_dbfs": round(20 * math.log10(max(rms, 1) / 32768), 1),
+            "peak": round(peak / 32768, 3), "terms": terms,
+        }
+        self.voice_details.setEnabled(False)
+        self.call("transcribe", audio=self.last_voice_audio, audio_terms=terms)
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
@@ -2655,6 +2802,7 @@ class AssistantDialog(QDialog):
             return
         if self.audio is not None:
             self._discard_recording()
+        self.last_voice_audio = None
         super().closeEvent(event)
 
 

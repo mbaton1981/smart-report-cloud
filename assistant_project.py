@@ -1,6 +1,5 @@
 """Read-only helpers for the assistant's object overview."""
 
-import calendar
 from datetime import datetime
 from decimal import Decimal
 from difflib import SequenceMatcher
@@ -9,21 +8,24 @@ from zoneinfo import ZoneInfo
 
 import assistant_attention
 from assistant_api import (
-    _RUSSIAN_MONTH_PATTERN, _RUSSIAN_MONTHS, _normalized_name_tokens,
-    _week_period, explicit_date_period,
+    _normalized_name_tokens, _week_period, explicit_date_period,
 )
 from customer_report import prepare_customer_costs
 from expense_documents import allocation_breakdown, parse_decimal
 from fixed_pricing import report_agreements
 
 
-def project_request(text):
+def project_request(text, objects=None):
     normalized = " ".join(text.casefold().split())
     if re.search(r"\bсотрудник\w*", normalized):
         return False
+    if objects is not None and re.match(r"^что\s+у\s+", normalized):
+        tokens, companies, _exact = _project_query(text, objects)
+        if tokens and (companies or project_candidates(text, objects)):
+            return True
     return bool(
         re.search(r"\bчто\s+(?:у\s+нас\s+)?(?:сейчас\s+)?по\s+", normalized)
-        or re.match(r"^что\s+у\s+нас\s+сейчас\b", normalized)
+        or re.match(r"^что\s+у\s+нас\b", normalized)
         or re.search(r"\b(?:сводк\w*|состояни\w*|ситуаци\w*)\s+по\s+(?!всем\b|фирм\w*|компан\w*)", normalized)
         or re.search(r"\b(?:сводк\w*|состояни\w*|час\w*|расход\w*|заработал\w*)\b.*\b(?:объект|проект)\w*\b", normalized)
         or re.search(r"\bкто\b.*\b(?:объект|проект)\w*\b", normalized)
@@ -34,34 +36,19 @@ def project_request(text):
 
 def project_period(text, today=None):
     today = today or datetime.now(ZoneInfo("Europe/Stockholm")).date()
-    explicit = explicit_date_period(text) or _week_period(text)
+    explicit = explicit_date_period(text, today=today) or _week_period(text)
     if explicit:
         return explicit
     normalized = text.casefold()
     if re.search(r"\bза\s+весь\s+(?:объект|проект)\b", normalized):
         return None
-    relative = re.search(r"\bза\s+(эт\w*|текущ\w*|прошл\w*|предыдущ\w*)\s+месяц\w*\b", normalized)
-    if relative:
-        year, number = today.year, today.month
-        if relative.group(1).startswith(("прошл", "предыдущ")):
-            year, number = (year - 1, 12) if number == 1 else (year, number - 1)
-        return f"{year:04d}-{number:02d}-01", f"{year:04d}-{number:02d}-{calendar.monthrange(year, number)[1]:02d}"
-    month = re.search(
-        rf"\bза\s+({_RUSSIAN_MONTH_PATTERN})(?:\s+(\d{{4}}))?\b",
-        normalized,
-    )
-    if month:
-        number = _RUSSIAN_MONTHS[month.group(1)]
-        year = int(month.group(2)) if month.group(2) else today.year
-        last_day = calendar.monthrange(year, number)[1]
-        return f"{year:04d}-{number:02d}-01", f"{year:04d}-{number:02d}-{last_day:02d}"
     if re.search(r"\b(?:за|с|недел\w*|месяц\w*|год\w*)\b", normalized):
         raise ValueError("Не удалось определить период. Укажите даты или месяц.")
     return None
 
 
 def project_marking(text):
-    match = re.search(r"(?<!\w)[pп]\s*(\d+(?:[-–]\d+)*)(?!\w)", text.casefold())
+    match = re.search(r"(?<!\w)(?:p|пэ|п)\s*[-–]?\s*(\d+(?:[-–]\d+)*)(?!\w)", text.casefold())
     return "p" + re.sub(r"[-–]", "", match.group(1)) if match else None
 
 
@@ -97,6 +84,7 @@ def _project_query(text, objects):
         r"час\w*|расход\w*|заработал\w*|кто|там|работал\w*|теперь|по|"
         r"объект\w*|проект\w*|этому|этот|этого|фирм\w*|компан\w*|а|и)\b",
         " ", normalized)
+    normalized = re.sub(r"^\s*у\s+", " ", normalized)
     company_phrase = re.search(r"\bу\s+(.+)$", normalized)
     company_query = _normalized_name_tokens(company_phrase.group(1)) if company_phrase else []
     name_tokens = _normalized_name_tokens(normalized[:company_phrase.start()]

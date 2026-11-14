@@ -7,6 +7,7 @@ from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import make_msgid
 import base64
+import calendar
 import hashlib
 import io
 import json
@@ -30,6 +31,8 @@ import swedish_translation
 
 MODEL = "gpt-5-mini"
 VOICE_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+MAX_VOICE_TERMS = 40
+MAX_VOICE_TERMS_CHARS = 2400
 MAX_OUTPUT = 1024
 INPUT_MICRO_USD = Decimal("0.25")
 OUTPUT_MICRO_USD = Decimal("2")
@@ -127,7 +130,26 @@ def _parse_russian_date(day, month, year=None):
         raise AssistantError("Укажите корректную дату или период.") from None
 
 
-def explicit_date_period(text):
+def month_date_period(text, today=None):
+    normalized = " ".join(strip_no_change_suffix(text).casefold().split())
+    today = today or datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    relative = re.search(r"\bза\s+(эт\w*|текущ\w*|прошл\w*|предыдущ\w*)\s+месяц\w*\b", normalized)
+    if relative:
+        year, number = today.year, today.month
+        if relative.group(1).startswith(("прошл", "предыдущ")):
+            year, number = (year - 1, 12) if number == 1 else (year, number - 1)
+    else:
+        month = re.search(rf"\bза\s+({_RUSSIAN_MONTH_PATTERN})(?:\s+(\d{{4}}))?\b", normalized)
+        if not month:
+            return None
+        number = _RUSSIAN_MONTHS[month.group(1)]
+        year = int(month.group(2)) if month.group(2) else today.year
+    if not 1 <= year <= 9999:
+        raise AssistantError("Укажите корректный год.")
+    return f"{year:04d}-{number:02d}-01", f"{year:04d}-{number:02d}-{calendar.monthrange(year, number)[1]:02d}"
+
+
+def explicit_date_period(text, *, today=None):
     normalized = " ".join(strip_no_change_suffix(text).casefold().split())
     date_range = re.search(rf"\bс\s+({DATE_TOKEN})\s+(?:по|до)\s+({DATE_TOKEN})\b", normalized)
     if date_range:
@@ -170,7 +192,7 @@ def explicit_date_period(text):
         match = russian_single.groupdict()
         selected = _parse_russian_date(match["day"], match["month"], match["year"]).isoformat()
         return selected, selected
-    return None
+    return month_date_period(text, today)
 
 
 def _week_period(text):
@@ -1926,10 +1948,18 @@ def select_plan(text, conn, actor, operation, post=None, context=None, summary_v
                     or clarification["field"] not in QUESTIONS):
                 raise AssistantError("Некорректный вопрос помощника. Используйте кнопки действий с явными датами.")
             selection = clarification.get("selection")
+            if clarification["field"] == "period" and date_period and selection is None:
+                raise AssistantError(
+                    f"Период уже распознан: {date_period[0]} — {date_period[1]}. "
+                    "Помощник не определил действие; уточните его или выберите кнопку."
+                )
             if selection is not None:
                 selection = validate_plan(selection)
                 if date_period:
                     selection["date_from"], selection["date_to"] = date_period
+                    if clarification["field"] == "period":
+                        finish(conn, actor, operation, "text", "routed")
+                        return selection
             choices = list(REPORT_TYPE_CHOICES if clarification["field"] == "report_type" else ())
             raise AssistantQuestion(clarification["field"], choices=choices, plan=selection)
         if len(calls) == 1 and calls[0].get("name") == "run_workflow":
@@ -2376,8 +2406,8 @@ def check_transport(conn, records):
 def _validate_transcription_terms(terms):
     if terms is None:
         return []
-    if not isinstance(terms, list) or len(terms) > 6:
-        raise AssistantError("Для подсказки распознавания передайте не более шести названий.")
+    if not isinstance(terms, list) or len(terms) > MAX_VOICE_TERMS:
+        raise AssistantError(f"Для подсказки распознавания передайте не более {MAX_VOICE_TERMS} названий.")
     result = []
     seen = set()
     for term in terms:
@@ -2388,7 +2418,7 @@ def _validate_transcription_terms(terms):
         if key not in seen:
             result.append(name)
             seen.add(key)
-    if sum(map(len, result)) > 600:
+    if sum(map(len, result)) > MAX_VOICE_TERMS_CHARS:
         raise AssistantError("Слишком длинная подсказка распознавания.")
     return result
 
@@ -2416,9 +2446,10 @@ def transcribe(audio, conn, actor, operation, post=None, terms=None):
             "Русская речь. Транскрибируй дословно, сохраняя отрицания, паузы и самокоррекции. "
             "Не переводи слова и не дополняй фразу."
         )
+        provider_form = {"model": VOICE_TRANSCRIPTION_MODEL, "language": "ru", "prompt": prompt}
         response = post("https://api.openai.com/v1/audio/transcriptions",
                         headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]},
-                        data={"model": VOICE_TRANSCRIPTION_MODEL, "language": "ru", "prompt": prompt},
+                        data=provider_form,
                         files={"file": ("command.wav", audio, "audio/wav")},
                         timeout=(10, 60), allow_redirects=False)
         if response.status_code != 200:
@@ -2427,7 +2458,12 @@ def transcribe(audio, conn, actor, operation, post=None, terms=None):
         if not isinstance(text, str) or len(text.encode()) > 8000:
             raise AssistantError("Ответ распознавания слишком длинный.")
         finish(conn, actor, operation, "voice", "transcribed")
-        return text
+        return {"text": text, "voice": {
+            "engine": "OpenAI Audio Transcriptions",
+            "model": provider_form["model"], "language": provider_form["language"],
+            "terms": terms, "audio_sha256": hashlib.sha256(audio).hexdigest(),
+            "duration_seconds": duration,
+        }}
     except (requests.RequestException, ValueError, KeyError, TypeError, AssistantError) as error:
         finish(conn, actor, operation, "voice", "failed")
         if isinstance(error, AssistantError):
@@ -2744,10 +2780,10 @@ def register_assistant(app, connect, authenticate):
             else:
                 audio = request.get_data()
                 terms = None
-            text = transcribe(
+            result = transcribe(
                 audio, conn, actor, request.headers.get("X-Operation-ID"), terms=terms,
             )
-            return jsonify(ok=True, text=text)
+            return jsonify(ok=True, **result)
         return handle(action)
 
     @app.route("/api/assistant/translate", methods=["POST"])

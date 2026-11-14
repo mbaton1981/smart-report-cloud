@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -303,6 +304,64 @@ class AssistantApiTests(unittest.TestCase):
         self.assertIn("Renatur", data["prompt"])
         self.assertNotIn("2026", data["prompt"])
         self.assertEqual(post.call_args.kwargs["files"]["file"][2], "audio/wav")
+
+    def test_voice_returns_verbatim_text_and_recording_identity_with_catalog_hints(self):
+        audio = BytesIO()
+        with wave.open(audio, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x10\x00" * 8000)
+        raw_text = "Что у нас потом Тбода Ренатур за ноябрь?"
+        terms = ["Renatur", "Privat"] + [f"Test project {index}" for index in range(12)]
+        provider = Mock(status_code=200, json=Mock(return_value={"text": raw_text}))
+        with patch("assistant_api.requests.post", return_value=provider) as post:
+            response = self.server_client.post(
+                self.base + "transcribe",
+                data={"terms": json.dumps(terms),
+                      "file": (BytesIO(audio.getvalue()), "command.wav", "audio/wav")},
+                headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())},
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        result = response.get_json()
+        self.assertEqual(result["text"], raw_text)
+        self.assertEqual(result["voice"]["audio_sha256"], hashlib.sha256(audio.getvalue()).hexdigest())
+        self.assertEqual(result["voice"]["duration_seconds"], 0.5)
+        self.assertEqual(result["voice"]["model"], post.call_args.kwargs["data"]["model"])
+        self.assertEqual(result["voice"]["language"], post.call_args.kwargs["data"]["language"])
+        self.assertEqual(result["voice"]["terms"], terms)
+        for term in terms:
+            self.assertIn(term, post.call_args.kwargs["data"]["prompt"])
+
+    def test_explicit_month_overrides_model_dates_and_redundant_period_question(self):
+        for text, period in (
+                ("Покажи записи сотрудника Synthetic Employee за ноябрь 2026",
+                 ("2026-11-01", "2026-11-30")),
+                ("Покажи записи сотрудника Synthetic Employee за февраль 2024",
+                 ("2024-02-01", "2024-02-29"))):
+            for question in (False, True):
+                with self.subTest(text=text, question=question):
+                    chosen = plan("search", employee="Synthetic Employee")
+                    provider = self.response(chosen)
+                    if question:
+                        provider = Mock(status_code=200, json=Mock(return_value={"output": [{
+                            "type": "function_call", "name": "request_clarification",
+                            "arguments": json.dumps({"field": "period", "selection": chosen}),
+                        }]}))
+                    with closing(self.server.get_db_connection()) as conn:
+                        result = assistant.select_plan(
+                            text, conn, dict(user_id=self.admin_id), str(uuid.uuid4()),
+                            post=Mock(return_value=provider),
+                        )
+                    self.assertEqual((result["date_from"], result["date_to"]), period)
+                    self.assertEqual(result["employee"], "Synthetic Employee")
+
+    def test_explicit_month_is_used_by_deterministic_read_and_summary_routes(self):
+        text = "Покажи часы Synthetic Employee за ноябрь 2026"
+        chosen = assistant.recognized_read_command(text)
+        self.assertEqual((chosen["date_from"], chosen["date_to"]), ("2026-11-01", "2026-11-30"))
+        self.assertEqual(assistant._summary_period("Сводка за ноябрь 2026", None, "overview"),
+                         ("2026-11-01", "2026-11-30"))
 
     def test_transcription_server_error_is_not_recorded_as_success(self):
         audio = BytesIO()
@@ -1901,6 +1960,13 @@ class AssistantApiTests(unittest.TestCase):
                 self.assertFalse(dialog.voice_stop.isVisible())
                 with wave.open(BytesIO(api.call_args.kwargs["audio"]), "rb") as wav:
                     self.assertEqual((wav.getnchannels(), wav.getframerate(), wav.getnframes()), (1, 16000, 16000))
+                    self.assertEqual(wav.readframes(16000), b"\x01\x01" * 16000)
+                dialog.voice.click()
+                dialog.buffer.write(b"\x02\x02" * 8000)
+                dialog.voice_stop.click()
+                with wave.open(BytesIO(api.call_args.kwargs["audio"]), "rb") as wav:
+                    self.assertEqual(wav.getnframes(), 8000)
+                    self.assertEqual(wav.readframes(8000), b"\x02\x02" * 8000)
                 api.reset_mock()
                 dialog.voice.click()
                 dialog.voice_cancel.click()
@@ -2013,7 +2079,7 @@ class AssistantApiTests(unittest.TestCase):
             self.assertTrue(dialog.voice.isEnabled())
             self.assertFalse(dialog.timer.isActive())
 
-    def test_voice_transcript_appends_and_cancel_preserves_typed_text(self):
+    def test_voice_transcripts_are_independent_unless_append_is_selected(self):
         from assistant_ui import AssistantDialog
         from PyQt6.QtWidgets import QWidget
         with patch("assistant_ui.RequestWorker.start"):
@@ -2022,9 +2088,16 @@ class AssistantApiTests(unittest.TestCase):
             dialog.finished()
             dialog.input.setPlainText("Покажи часы за прошлую неделю")
             dialog.received({"text": "А транспорт за тот же период?"})
+            self.assertEqual(dialog.input.toPlainText(), "А транспорт за тот же период?")
+            dialog.received({"text": "Что по Томтебоде у Ренатура за ноябрь?"})
+            self.assertEqual(dialog.input.toPlainText(), "Что по Томтебоде у Ренатура за ноябрь?")
+            self.assertEqual(dialog.voice_diagnostics["transcript"],
+                             "Что по Томтебоде у Ренатура за ноябрь?")
+            dialog.voice_append.setChecked(True)
+            dialog.received({"text": "Покажи также расходы"})
             self.assertEqual(
                 dialog.input.toPlainText(),
-                "Покажи часы за прошлую неделю\nА транспорт за тот же период?",
+                "Что по Томтебоде у Ренатура за ноябрь?\nПокажи также расходы",
             )
             self.assertIn("добавлен", dialog.state.text())
             dialog.audio = Mock()
@@ -2032,7 +2105,7 @@ class AssistantApiTests(unittest.TestCase):
             dialog.cancel_recording()
             self.assertEqual(
                 dialog.input.toPlainText(),
-                "Покажи часы за прошлую неделю\nА транспорт за тот же период?",
+                "Что по Томтебоде у Ренатура за ноябрь?\nПокажи также расходы",
             )
             self.assertIn("отменена", dialog.state.text())
             self.assertFalse(dialog.voice_cancel.isVisible())
@@ -2852,6 +2925,28 @@ class AssistantUiTests(unittest.TestCase):
             self._qt_widgets_before,
         )
 
+    def test_voice_catalog_hints_are_read_only_and_available_without_selected_object(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "voice-catalog.sqlite")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("CREATE TABLE objects(id, name, company, markning)")
+                conn.executemany("INSERT INTO objects VALUES(?,?,?,?)", [
+                    (1, "Tomteboda ÄTA Rivning", "Renatur", "p1038"),
+                    (2, "Badbacken 5 ext", "Privat", "p1022"),
+                ])
+                conn.commit()
+            before = Path(database).read_bytes()
+            with patch.object(RequestWorker, "start"):
+                dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.database = database
+            terms = dialog.voice_context_terms()
+            for name in ("Tomteboda ÄTA Rivning", "Renatur", "Badbacken 5 ext", "Privat", "p1038", "p1022"):
+                self.assertIn(name, terms)
+            self.assertEqual(Path(database).read_bytes(), before)
+
     def test_dictated_project_conversation_keeps_ids_period_and_original_action(self):
         from assistant_ui import AssistantDialog, ProjectWorker, RequestWorker
         from assistant_project import project_period
@@ -2893,14 +2988,18 @@ class AssistantUiTests(unittest.TestCase):
                     patch("desktop_auth.current_user", return_value={"role": "admin"}), \
                     patch("assistant_desktop.application", return_value=Mock()):
                 dialog.employee.setText("Old Employee")
-                dialog.received({"text": "Что по Томтебоде у Ренатура за ноябрь 2026?"})
+                dialog.received({"text": "Что у Томтабода Ренатур за ноябрь 2026?"})
                 dialog.command()
                 api.assert_not_called()
                 self.assertEqual([obj["sync_id"] for obj in dialog.project_pending[0]], ["ata", "rivning"])
                 self.assertEqual(dialog.project_pending[1], ("2026-11-01", "2026-11-30"))
                 self.assertEqual(dialog.employee.text(), "")
                 self.assertEqual(dialog.clarification_choice.itemData(1), "rivning")
-                dialog.clarification_choice.setCurrentIndex(1)
+                dialog.input.setPlainText("Tomteboda — это ривнинг.")
+                dialog.command()
+                self.assertEqual([obj["sync_id"] for obj in dialog.project_pending[0]], ["rivning"])
+                self.assertEqual(dialog.project_pending[1], ("2026-11-01", "2026-11-30"))
+                self.assertEqual(dialog.clarification_choice.itemData(0), "rivning")
                 dialog.choose_answer()
                 self.assertEqual(dialog.worker.obj["sync_id"], "rivning")
                 reply()
@@ -2954,7 +3053,7 @@ class AssistantUiTests(unittest.TestCase):
                 dialog.command()
                 self.assertEqual(dialog.project_intent, "expenses")
                 self.assertEqual(dialog.project_pending[1], week)
-                dialog.input.setPlainText("p10-38")
+                dialog.input.setPlainText("Пэ-1038")
                 dialog.command()
                 self.assertEqual(dialog.worker.obj["sync_id"], "rivning")
                 with patch.object(dialog, "project_action") as action:
@@ -3788,7 +3887,9 @@ class AssistantUiTests(unittest.TestCase):
             ("SmartReport", "Доступно 36 объектов:\n" + "\n".join(
                 f"{index}. Renatur / Объект {index}" for index in range(1, 37)
             )),
+            ("Служебное", "Новая запись не склеивается с предыдущей."),
         ]
+        dialog.output.setStyleSheet("QTextEdit {color:#000000;}")
         for role, text in messages:
             dialog.append_message(role, text)
 
@@ -3817,13 +3918,30 @@ class AssistantUiTests(unittest.TestCase):
         dialog.output.copy()
         self.assertIn("36. Renatur / Объект 36", application.clipboard().text())
 
+        def assert_readable():
+            for sample in ("Покажи часы", "Период:", "Новая запись"):
+                cursor = dialog.output.document().find(sample)
+                foreground = cursor.charFormat().foreground().color()
+                background = cursor.currentTable().format().background().color()
+                self.assertEqual(foreground.name(), desktop_theme.color("#e2e8f0").name())
+                def luminance(color):
+                    channels = (color.redF(), color.greenF(), color.blueF())
+                    linear = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
+                              for value in channels]
+                    return sum(a * b for a, b in zip(linear, (.2126, .7152, .0722)))
+                a, b = sorted((luminance(foreground), luminance(background)))
+                self.assertGreaterEqual((b + .05) / (a + .05), 4.5)
+
+        assert_readable()
         self.assertTrue(manager.toggle())
         dark_html = dialog.output.toHtml()
         self.assertIn('bgcolor="#313c4e"', dark_html)
         self.assertIn('bgcolor="#2d3748"', dark_html)
         self.assertIn("36. Renatur / Объект 36", dialog.output.toPlainText())
+        assert_readable()
         self.assertTrue(manager.toggle())
         light_html = dialog.output.toHtml()
         self.assertIn('bgcolor="#e2ebf2"', light_html)
         self.assertIn('bgcolor="#dce5ec"', light_html)
         self.assertIn("36. Renatur / Объект 36", dialog.output.toPlainText())
+        assert_readable()

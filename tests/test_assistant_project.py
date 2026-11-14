@@ -12,6 +12,7 @@ class ProjectRequestTests(unittest.TestCase):
         for text in ("Что у нас сейчас по Томтебуда Ренатур?",
                      "Что у нас сейчас потом-то, Бода, Ренатур?",
                      "Что у нас сейчас потом Тбода Ренатур?",
+                     "Что у нас потом Тбода Ренатур за ноябрь?",
                      "Хочу сводку по объекту, по проекту",
                      "Хочу сводку по проекту", "Дай сводку по Томтебоде",
                      "Теперь по Badbacken"):
@@ -30,15 +31,20 @@ class ProjectRequestTests(unittest.TestCase):
             {"id": 4, "name": "Badbacken 5 ext", "company": "Privat", "markning": "p1022"},
         ]
         for text in ("Что по Томтебоде у Ренатура за ноябрь?",
+                     "Что у Томтабода Ренатур за ноябрь?",
                      "Что у нас сейчас потом-то, Бода, Ренатур?",
                      "Что у нас сейчас потом Тбода Ренатур?",
                      "Что у нас сейчас по Томтебуда Ренатур?",
                      "Сводка по проекту Томтебода Renatur"):
             with self.subTest(text=text):
                 self.assertEqual(project_candidates(text, objects), objects[:2])
+        self.assertTrue(project_request("Что у Томтабода Ренатур за ноябрь?", objects))
+        self.assertTrue(project_request("Что у неизвестного объекта Ренатур за ноябрь?", objects))
+        self.assertFalse(project_request("Что у Иван Иванов за ноябрь?", objects))
+        self.assertFalse(project_request("Что у сотрудника Иван Иванов за ноябрь?", objects))
         self.assertEqual(project_candidates("Что по Tomteboda?", objects), objects[:3])
         self.assertEqual(project_candidates("Что по Томтебода Эта Ривнинг у Ренатюр?", objects), objects[1:2])
-        for marking in ("p1038", "P1038", "p10-38", "п 1038"):
+        for marking in ("p1038", "P1038", "p10-38", "п 1038", "Пэ-1038", "пэ 1038"):
             with self.subTest(marking=marking):
                 self.assertEqual(project_candidates("Что по " + marking, objects), objects[1:2])
         self.assertEqual(project_candidates("Что по Tomteboda у неизвестной фирмы?", objects), [])
@@ -60,6 +66,8 @@ class ProjectRequestTests(unittest.TestCase):
                          ("2024-02-01", "2024-02-29"))
         self.assertEqual(project_period("за прошлый месяц", date(2026, 1, 13)),
                          ("2025-12-01", "2025-12-31"))
+        self.assertEqual(project_period("с 01.10.2026 по 31.10.2026, а не за ноябрь", date(2025, 11, 13)),
+                         ("2026-10-01", "2026-10-31"))
         self.assertIsNone(project_period("за весь объект"))
         with self.assertRaises(ValueError):
             project_period("за непонятный период")
