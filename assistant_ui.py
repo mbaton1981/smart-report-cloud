@@ -2671,7 +2671,8 @@ class AssistantDialog(QDialog):
     def show_voice_details(self):
         data = self.voice_diagnostics
         server = data.get("server")
-        engine = (f'{server.get("engine")} · {server.get("model")} · язык {server.get("language")}'
+        engine = (f'{server.get("engine")} · {server.get("model")} · язык {server.get("language")} '
+                  f'({server.get("language_parameter", "language")})'
                   if server else "Сервер не сообщил движок, модель и язык распознавания.")
         text = (
             f'{engine}\nМикрофон: {self.microphone_label.text()}\n'

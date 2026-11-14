@@ -30,7 +30,7 @@ from assistant_actions import CAPABILITIES, NATIVE_ACTIONS, OBJECT_ACTIONS, capa
 import swedish_translation
 
 MODEL = "gpt-5-mini"
-VOICE_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+VOICE_TRANSCRIPTION_MODEL = "gpt-transcribe"
 MAX_VOICE_TERMS = 40
 MAX_VOICE_TERMS_CHARS = 2400
 MAX_OUTPUT = 1024
@@ -2411,7 +2411,7 @@ def _validate_transcription_terms(terms):
     result = []
     seen = set()
     for term in terms:
-        if not isinstance(term, str) or not term.strip() or len(term) > 200:
+        if not isinstance(term, str) or not term.strip() or len(term) > 200 or "<" in term or ">" in term:
             raise AssistantError("Подсказка распознавания содержит неверное название.")
         name = " ".join(term.split())
         key = name.casefold()
@@ -2439,14 +2439,13 @@ def transcribe(audio, conn, actor, operation, post=None, terms=None):
     reserve(conn, actor, operation, "voice", 100000)
     try:
         prompt = (
-            "Русская речь. Транскрибируй дословно, сохраняя отрицания, паузы и самокоррекции. "
-            "Не переводи слова и не дополняй фразу. Названия из текущего контекста: "
-            + "; ".join(terms)
-            if terms else
-            "Русская речь. Транскрибируй дословно, сохраняя отрицания, паузы и самокоррекции. "
-            "Не переводи слова и не дополняй фразу."
+            "Запрос к SmartReport на русском языке. Названия объектов и фирм могут быть шведскими. "
+            "Транскрибируй дословно, сохраняя отрицания и самокоррекции. "
+            "Сохраняй шведские названия, не переводи и не дополняй фразу."
         )
-        provider_form = {"model": VOICE_TRANSCRIPTION_MODEL, "language": "ru", "prompt": prompt}
+        provider_form = {"model": VOICE_TRANSCRIPTION_MODEL, "languages[]": ["ru"], "prompt": prompt}
+        if terms:
+            provider_form["keywords[]"] = terms
         response = post("https://api.openai.com/v1/audio/transcriptions",
                         headers={"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]},
                         data=provider_form,
@@ -2460,8 +2459,9 @@ def transcribe(audio, conn, actor, operation, post=None, terms=None):
         finish(conn, actor, operation, "voice", "transcribed")
         return {"text": text, "voice": {
             "engine": "OpenAI Audio Transcriptions",
-            "model": provider_form["model"], "language": provider_form["language"],
-            "terms": terms, "audio_sha256": hashlib.sha256(audio).hexdigest(),
+            "model": provider_form["model"], "language": provider_form["languages[]"][0],
+            "language_parameter": "languages[]", "terms": provider_form.get("keywords[]", []),
+            "audio_sha256": hashlib.sha256(audio).hexdigest(),
             "duration_seconds": duration,
         }}
     except (requests.RequestException, ValueError, KeyError, TypeError, AssistantError) as error:

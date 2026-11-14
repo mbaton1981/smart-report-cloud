@@ -270,12 +270,22 @@ class AssistantApiTests(unittest.TestCase):
                                           headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
             self.assertEqual(bad.status_code, 400)
             post.assert_not_called()
+            for keyword in ("<object", "object>"):
+                rejected = self.server_client.post(
+                    self.base + "transcribe",
+                    data={"terms": json.dumps([keyword]),
+                          "file": (BytesIO(audio.getvalue()), "command.wav", "audio/wav")},
+                    headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())},
+                )
+                self.assertEqual(rejected.status_code, 400)
+                post.assert_not_called()
             good = self.server_client.post(self.base + "transcribe", data=audio.getvalue(),
                                            headers=self.headers() | {"X-Operation-ID": str(uuid.uuid4())})
         self.assertEqual(good.get_json()["text"], "Покажи отчёт")
         self.assertEqual(post.call_count, 1)
         self.assertEqual(post.call_args.kwargs["data"]["model"], assistant.VOICE_TRANSCRIPTION_MODEL)
-        self.assertEqual(post.call_args.kwargs["data"]["language"], "ru")
+        self.assertEqual(post.call_args.kwargs["data"]["languages[]"], ["ru"])
+        self.assertNotIn("language", post.call_args.kwargs["data"])
         self.assertIn("самокоррекции", post.call_args.kwargs["data"]["prompt"])
         self.assertEqual(self.business()["incoming_submissions"], [])
 
@@ -299,9 +309,10 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["text"], "часы за прошлую неделю")
         data = post.call_args.kwargs["data"]
-        self.assertEqual(data["language"], "ru")
-        self.assertIn("Tomteboda ÄTA", data["prompt"])
-        self.assertIn("Renatur", data["prompt"])
+        self.assertEqual(data["languages[]"], ["ru"])
+        self.assertNotIn("language", data)
+        self.assertIn("Tomteboda ÄTA", data["keywords[]"])
+        self.assertIn("Renatur", data["keywords[]"])
         self.assertNotIn("2026", data["prompt"])
         self.assertEqual(post.call_args.kwargs["files"]["file"][2], "audio/wav")
 
@@ -312,7 +323,7 @@ class AssistantApiTests(unittest.TestCase):
             wav.setsampwidth(2)
             wav.setframerate(16000)
             wav.writeframes(b"\x10\x00" * 8000)
-        raw_text = "Что у нас потом Тбода Ренатур за ноябрь?"
+        raw_text = "Што ў Тамтабода Ренатур за лістапад?"
         terms = ["Renatur", "Privat"] + [f"Test project {index}" for index in range(12)]
         provider = Mock(status_code=200, json=Mock(return_value={"text": raw_text}))
         with patch("assistant_api.requests.post", return_value=provider) as post:
@@ -328,10 +339,17 @@ class AssistantApiTests(unittest.TestCase):
         self.assertEqual(result["voice"]["audio_sha256"], hashlib.sha256(audio.getvalue()).hexdigest())
         self.assertEqual(result["voice"]["duration_seconds"], 0.5)
         self.assertEqual(result["voice"]["model"], post.call_args.kwargs["data"]["model"])
-        self.assertEqual(result["voice"]["language"], post.call_args.kwargs["data"]["language"])
+        self.assertEqual(result["voice"]["language"], post.call_args.kwargs["data"]["languages[]"][0])
+        self.assertEqual(result["voice"]["language_parameter"], "languages[]")
         self.assertEqual(result["voice"]["terms"], terms)
-        for term in terms:
-            self.assertIn(term, post.call_args.kwargs["data"]["prompt"])
+        self.assertEqual(post.call_args.kwargs["data"]["keywords[]"], terms)
+        prepared = requests.Request(
+            "POST", "https://api.openai.com/v1/audio/transcriptions",
+            data=post.call_args.kwargs["data"], files=post.call_args.kwargs["files"],
+        ).prepare()
+        self.assertEqual(prepared.body.count(b'name="languages[]"'), 1)
+        self.assertEqual(prepared.body.count(b'name="keywords[]"'), len(terms))
+        self.assertNotIn(b'name="language"', prepared.body)
 
     def test_explicit_month_overrides_model_dates_and_redundant_period_question(self):
         for text, period in (
