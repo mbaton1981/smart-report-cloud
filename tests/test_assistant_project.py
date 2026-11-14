@@ -11,6 +11,7 @@ class ProjectRequestTests(unittest.TestCase):
     def test_natural_project_requests_do_not_escape_to_employee_or_global_hours(self):
         for text in ("Что у нас сейчас по Томтебуда Ренатур?",
                      "Что у нас сейчас потом-то, Бода, Ренатур?",
+                     "Что у нас сейчас потом Тбода Ренатур?",
                      "Хочу сводку по объекту, по проекту",
                      "Хочу сводку по проекту", "Дай сводку по Томтебоде",
                      "Теперь по Badbacken"):
@@ -30,6 +31,7 @@ class ProjectRequestTests(unittest.TestCase):
         ]
         for text in ("Что по Томтебоде у Ренатура за ноябрь?",
                      "Что у нас сейчас потом-то, Бода, Ренатур?",
+                     "Что у нас сейчас потом Тбода Ренатур?",
                      "Что у нас сейчас по Томтебуда Ренатур?",
                      "Сводка по проекту Томтебода Renatur"):
             with self.subTest(text=text):
