@@ -764,6 +764,18 @@ class CustomerReportTests(unittest.TestCase):
         dialog.accept()
         self.assertEqual(dialog.translations, {"1": "Montering"})
 
+    def test_draft_review_allows_untranslated_descriptions_without_changing_shifts(self):
+        self.shift(comment="Неоднозначное описание")
+        before = list(self.conn.iterdump())
+        row = self.window.generate_invoice()["journal_rows"][0]
+        dialog = self.desktop.JournalTranslationDialog(
+            [(row, "", "Требуется уточнение")], self.window, allow_draft=True,
+        )
+        dialog.accept()
+        self.assertEqual(dialog.result(), self.desktop.QDialog.DialogCode.Accepted)
+        self.assertEqual(dialog.translations, {})
+        self.assertEqual(list(self.conn.iterdump()), before)
+
     def test_cancelled_translation_review_does_not_write_or_overwrite_pdf(self):
         self.shift(comment="Неизвестноеслово")
         before = list(self.conn.iterdump())

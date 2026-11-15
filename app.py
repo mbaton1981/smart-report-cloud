@@ -2036,17 +2036,21 @@ class JournalTranslationDialog(QDialog):
     same shape for the given rows; it is offered for failed or doubtful records.
     """
 
-    def __init__(self, pending, parent=None, retry=None):
+    def __init__(self, pending, parent=None, retry=None, allow_draft=False):
         super().__init__(parent)
         self.setWindowTitle("Проверка перевода описаний для PDF")
         self.resize(1150, 600)
         self.translations = {}
         self._editors = []
         self._retry = retry
+        self._allow_draft = allow_draft
         self._machine = {}
         self._flagged = {}
         layout = QVBoxLayout(self)
         notice = QLabel(
+            "Введите или проверьте шведские описания. Пустые поля останутся отмечены как "
+            "требующие уточнения, а PDF будет черновиком. Исходные записи не изменяются."
+            if allow_draft else
             "Перевод выполнен ИИ через сервер SmartReport. Автоматически проверяются только пустой текст, "
             "кириллица, числа и обозначения — смысл проверьте сами и при необходимости исправьте текст справа.\n"
             "Исправления используются только в этом PDF. Исходные описания, смены и база не изменяются."
@@ -2074,7 +2078,9 @@ class JournalTranslationDialog(QDialog):
         self.error_label.setWordWrap(True)
         layout.addWidget(self.error_label)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Использовать перевод и создать PDF")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Создать PDF / черновик" if allow_draft else "Использовать перевод и создать PDF"
+        )
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         self.retry_button = buttons.addButton("Повторить перевод", QDialogButtonBox.ButtonRole.ActionRole)
         self.retry_button.setObjectName("journal_translation_retry")
@@ -2129,6 +2135,8 @@ class JournalTranslationDialog(QDialog):
         doubtful = []
         for row, editor in self._editors:
             text = editor.toPlainText().strip()
+            if not text and self._allow_draft:
+                continue
             if not text or swedish_translation.CYRILLIC.search(text):
                 self.error_label.setText(
                     f"Запись №{row['id']} · {row['date']} · {row['employee']}: "
@@ -14212,6 +14220,27 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout.addWidget(QLabel(
             f"{object_row['name']} · {object_row.get('markning') or 'без маркировки'}"
         ))
+        report_language = QComboBox()
+        report_language.addItem("Для заказчика — svenska", "sv")
+        report_language.addItem("Внутренний — русский", "ru")
+        customer_name = QLineEdit()
+        company = str(object_row.get("company") or "").strip()
+        if company.casefold() != "privat":
+            customer_name.setText(company)
+        customer_name.setPlaceholderText("Имя заказчика для этого отчёта")
+        review_note = QLineEdit()
+        review_note.setPlaceholderText("При необходимости — пояснение на шведском")
+        options_form = QFormLayout()
+        options_form.addRow("Вариант отчёта:", report_language)
+        options_form.addRow("Заказчик:", customer_name)
+        options_form.addRow("Отметка для проверки:", review_note)
+        report_language.currentIndexChanged.connect(
+            lambda: (
+                customer_name.setEnabled(report_language.currentData() == "sv"),
+                review_note.setEnabled(report_language.currentData() == "sv"),
+            )
+        )
+        layout.addLayout(options_form)
         period_layout = QFormLayout()
         all_period = QCheckBox("За весь объект")
         all_period.setChecked(True)
@@ -14269,6 +14298,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "date_to": selected_to,
             "include_copies": include_copies.isChecked(),
             "include_customer_cost": include_customer_cost.isChecked(),
+            "language": report_language.currentData(),
+            "customer_name": customer_name.text().strip(),
+            "review_note": review_note.text().strip(),
         }
         self._start_full_object_report(object_row, options)
 
@@ -14305,6 +14337,38 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 self, "Полный отчёт по объекту",
                 f"Не удалось сформировать PDF:\n{error}",
             )
+            return
+
+        if result.get("review_data") is not None:
+            data = result["review_data"]
+            pending = []
+            for row in data["customer_report"].get("journal_rows", []):
+                if row.get("entry_type") not in WORK_TYPES or not str(row.get("comment") or "").strip():
+                    continue
+                review_row = dict(row)
+                review_row.setdefault("id", row.get("sync_id"))
+                review_row.setdefault("object_name", data["object"].get("name") or "")
+                pending.append((review_row, "", "Требуется перевод и проверка", True))
+            translations = {}
+            if pending:
+                dialog = JournalTranslationDialog(pending, self, allow_draft=True)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    self.statusBar().showMessage("Формирование отчёта отменено.", 10000)
+                    return
+                translations = dialog.translations
+            data["journal_translations"] = translations
+            self.object_full_report_button.setEnabled(False)
+            task = ObjectPackageTask(
+                request_id,
+                lambda progress: self._finish_full_object_package(
+                    data, result["options"], result["selected_from"],
+                    result["selected_to"], progress,
+                ),
+            )
+            task.signals.progress.connect(self._on_full_object_report_progress)
+            task.signals.completed.connect(self._on_full_object_report_ready)
+            self._object_package_task = task
+            QThreadPool.globalInstance().start(task)
             return
 
         path = Path(result["path"])
@@ -14595,6 +14659,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             incomplete_reasons.append("Расчёт клиенту неполный: есть неизвестные цены или доплаты.")
         if any(document["share"].get("gross_amount") is None for document in confirmed_expenses):
             incomplete_reasons.append("У части подтверждённых распределений неизвестна сумма доли объекта.")
+        if options.get("language") == "sv" and options.get("review_note"):
+            incomplete_reasons.append(options["review_note"])
 
         data = {
             "object": dict(object_row),
@@ -14607,7 +14673,19 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "excluded_expenses": excluded_expenses,
             "expense_snapshot_available": snapshot_available,
             "incomplete_reasons": incomplete_reasons,
+            "language": options.get("language", "ru"),
+            "customer_name": options.get("customer_name", ""),
         }
+        if options.get("language") == "sv":
+            return {
+                "review_data": data, "options": options,
+                "selected_from": selected_from, "selected_to": selected_to,
+            }
+        return self._finish_full_object_package(data, options, selected_from, selected_to, progress)
+
+    def _finish_full_object_package(self, data, options, selected_from, selected_to, progress):
+        object_row = data["object"]
+        confirmed_expenses = data["expenses"]
         source_paths, source_errors = {}, {}
         with tempfile.TemporaryDirectory(prefix="smartreport-object-originals-") as directory:
             if options["include_copies"]:

@@ -6,6 +6,7 @@ from collections import defaultdict
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
+import re
 import tempfile
 
 from PIL import Image, ImageSequence
@@ -21,6 +22,7 @@ from reportlab.platypus import (
 
 from customer_report import CATEGORY_LABELS, REPORT_ISSUER_NAME, WORK_TYPES, format_quantity
 from expense_documents import parse_decimal
+from object_package_swedish import swedish_category, swedish_document_type, swedish_label
 
 
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
@@ -277,40 +279,63 @@ def _table(rows, widths, font, bold_font, *, repeat_rows=1, alignments=()):
 
 
 def _main_pdf_bytes(data, font, bold_font, appendix_pages):
+    swedish = data.get("language") == "sv"
+    raw_paragraph = _paragraph
+    raw_table = _table
+
+    def paragraph(value, style):
+        return raw_paragraph(swedish_label(value) if swedish else value, style)
+
+    class Literal(str):
+        pass
+
+    def table(rows, *args, **kwargs):
+        if swedish:
+            rows = [[cell if isinstance(cell, Literal) else swedish_label(cell)
+                     for cell in row] for row in rows]
+        return raw_table(rows, *args, **kwargs)
+
     width, height = landscape(A4)
     available = width - 72
     styles = {
         "title": ParagraphStyle("ObjectPackageTitle", fontName=bold_font, fontSize=18, leading=22),
         "issuer": ParagraphStyle("ObjectPackageIssuer", fontName=bold_font, fontSize=12, leading=15),
         "heading": ParagraphStyle("ObjectPackageSection", fontName=bold_font, fontSize=12, leading=15,
-                                  textColor=colors.HexColor("#152a38"), spaceBefore=8, spaceAfter=5),
+                                  textColor=colors.HexColor("#152a38"), spaceBefore=8, spaceAfter=5,
+                                  keepWithNext=True),
         "body": ParagraphStyle("ObjectPackageBodyText", fontName=font, fontSize=9, leading=12),
         "notice": ParagraphStyle("ObjectPackageNotice", fontName=font, fontSize=8.5, leading=11),
         "bold": ParagraphStyle("ObjectPackageBold", fontName=bold_font, fontSize=9, leading=12),
     }
     story = [
-        _paragraph(REPORT_ISSUER_NAME, styles["issuer"]),
-        _paragraph("Полный отчёт по объекту", styles["title"]),
+        paragraph(REPORT_ISSUER_NAME, styles["issuer"]),
+        paragraph("Полный отчёт по объекту", styles["title"]),
         Spacer(1, 7),
     ]
+    if swedish and data.get("draft"):
+        story.append(paragraph("UTKAST", styles["bold"]))
     object_row = data["object"]
     object_title = str(object_row.get("name") or "Объект")
     if object_row.get("markning"):
         object_title += f" · {object_row['markning']}"
     story.extend([
-        _paragraph(f"Заказчик: {object_row.get('company') or 'не указан'}", styles["body"]),
-        _paragraph(f"Объект: {object_title}", styles["bold"]),
-        _paragraph(
+        raw_paragraph(
+            f"Beställare: {data.get('customer_name') or 'Ej angiven'}" if swedish
+            else f"Заказчик: {object_row.get('company') or 'не указан'}",
+            styles["body"],
+        ),
+        raw_paragraph(f"{'Objekt' if swedish else 'Объект'}: {object_title}", styles["bold"]),
+        paragraph(
             f"Период: {data.get('period_label') or 'Нет данных'} · "
             f"Сформировано: {data['generated_at']}",
             styles["body"],
         ),
-        _paragraph(
+        paragraph(
             "Архивный объект" if not object_row.get("is_active", 1) else "Объект активен",
             styles["body"],
         ),
         Spacer(1, 6),
-        _paragraph(
+        paragraph(
             "Пакет предназначен для проверки выполненных работ и подготовки расчёта. "
             "Он не является финальной фактурой и не фиксирует оплату или прибыль; "
             "формирование не меняет записи учёта.",
@@ -318,10 +343,16 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         ),
     ])
     if data.get("incomplete_reasons"):
-        reasons = "; ".join(dict.fromkeys(data["incomplete_reasons"]))
+        reasons = "; ".join(
+            swedish_label(reason) if swedish else reason
+            for reason in dict.fromkeys(data["incomplete_reasons"])
+        )
         story.extend([
             Spacer(1, 5),
-            _paragraph(f"Пакет неполный: {reasons}", styles["bold"]),
+            raw_paragraph(
+                f"{'Underlaget är ofullständigt' if swedish else 'Пакет неполный'}: {reasons}",
+                styles["bold"],
+            ),
         ])
 
     report = data.get("customer_report") or {}
@@ -348,20 +379,21 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         ["Поездки", _format_trip_count(trips)],
     ]
     story.extend([
-        _paragraph("Сводка работ", styles["heading"]),
-        _table(summary, [available * .66, available * .34], font, bold_font),
+        paragraph("Сводка работ", styles["heading"]),
+        table(summary, [available * .66, available * .34], font, bold_font),
     ])
 
     employees_rows = [["Сотрудник", "Всего часов", "Обычные", "OB", "Поездки"]]
     for employee, hours, regular, ob, employee_trips in _employee_totals(report):
         employees_rows.append([
-            employee, _format_hours(hours), _format_hours(regular), _format_hours(ob),
+            Literal("Ej angiven" if swedish and employee == "Не указан" else employee),
+            _format_hours(hours), _format_hours(regular), _format_hours(ob),
             _format_trip_count(employee_trips),
         ])
     if len(employees_rows) > 1:
         story.extend([
-            _paragraph("Итоги по сотрудникам", styles["heading"]),
-            _table(
+            paragraph("Итоги по сотрудникам", styles["heading"]),
+            table(
                 employees_rows,
                 [available * .33, available * .17, available * .17, available * .17, available * .16],
                 font, bold_font,
@@ -369,7 +401,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         ])
 
     if data.get("include_customer_cost"):
-        story.append(_paragraph("Расчёт клиенту без НДС", styles["heading"]))
+        story.append(paragraph("Расчёт клиенту без НДС", styles["heading"]))
         cost_rows = [["Позиция из сохранённых клиентских условий", "Количество", "Ставка", "Сумма"]]
         for line in report.get("cost_lines", []):
             cost_rows.append([
@@ -380,7 +412,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             ])
         if len(cost_rows) == 1:
             cost_rows.append(["Нет записей для расчёта", "—", "—", "—"])
-        story.append(_table(
+        story.append(table(
             cost_rows, [available * .43, available * .17, available * .19, available * .21],
             font, bold_font, alignments=((1, "RIGHT"), (2, "RIGHT"), (3, "RIGHT")),
         ))
@@ -390,22 +422,25 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             label = "Расчётная сумма" if total_amount is not None else "Известная часть расчёта; итог неполон"
             value = _amount_text(total_amount if total_amount is not None else known_amount, "SEK")
             story.append(Spacer(1, 4))
-            story.append(_paragraph(f"{label}: {value}", styles["bold"]))
+            story.append(paragraph(f"{label}: {value}", styles["bold"]))
         else:
-            story.append(_paragraph(
+            story.append(paragraph(
                 "Нет рабочих записей для клиентского расчёта; сумма не определялась.",
                 styles["bold"],
             ))
-        story.append(_paragraph(
+        story.append(paragraph(
             "Это расчёт по сохранённым клиентским условиям, не выставленный счёт, оплата или прибыль.",
             styles["notice"],
         ))
         for warning in dict.fromkeys(report.get("warnings", [])):
-            story.append(_paragraph(f"Примечание: {warning}", styles["notice"]))
+            story.append(raw_paragraph(
+                f"Anmärkning: {swedish_label(warning)}" if swedish
+                else f"Примечание: {warning}", styles["notice"],
+            ))
 
     story.extend([
-        _paragraph("Подробные рабочие записи", styles["heading"]),
-        _paragraph(
+        paragraph("Подробные рабочие записи", styles["heading"]),
+        paragraph(
             "Включены записи типов work и OB вне зависимости от статуса; статус каждой записи показан "
             "в таблице. Часы отпусков, болезни и других нерабочих категорий исключены. "
             "Поездки указаны отдельно от часов.",
@@ -418,8 +453,13 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         segments = segments_by_id.get(row.get("sync_id"), [])
         journal.append([
             str(row.get("date") or "Неизвестно"),
-            str(row.get("employee") or "Не указан"),
-            str(row.get("comment") or "Описание не сохранено"),
+            Literal(str(row.get("employee") or ("Ej angiven" if swedish else "Не указан"))),
+            Literal(
+                str(data.get("journal_translations", {}).get(row.get("sync_id"))
+                    or ("Arbetsbeskrivning behöver förtydligas" if str(row.get("comment") or "").strip()
+                        else "Arbetsbeskrivning saknas"))
+                if swedish else str(row.get("comment") or "Описание не сохранено")
+            ),
             _format_hours(row.get("hours")),
             _row_ob_details(row, segments),
             _format_trip_count(row.get("transport")),
@@ -427,7 +467,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         ])
     if len(journal) == 1:
         journal.append(["Нет рабочих записей", "—", "—", "—", "—", "—", "—"])
-    story.append(_table(
+    story.append(table(
         journal,
         [available * .085, available * .13, available * .22, available * .075,
          available * .225, available * .08, available * .185],
@@ -435,7 +475,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     ))
 
     expenses = data.get("expenses", [])
-    story.append(_paragraph("Реестр подтверждённых расходов", styles["heading"]))
+    story.append(paragraph("Реестр подтверждённых расходов", styles["heading"]))
     if expenses:
         expense_rows = [[
             "Приложение", "Поставщик / эмитент", "Тип / № / дата",
@@ -459,29 +499,32 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                 else "Не сохранено"
             )
             category = document.get("expense_category") or document.get("document_comment") or ""
+            if swedish:
+                category = swedish_category(category)
             expense_description = " · ".join(filter(None, (
-                str(document.get("document_type") or ""),
+                swedish_document_type(document.get("document_type")) if swedish
+                else str(document.get("document_type") or ""),
                 str(document.get("invoice_number") or ""),
-                str(document.get("document_date") or "Дата неизвестна"),
+                str(document.get("document_date") or ("Datum saknas" if swedish else "Дата неизвестна")),
                 str(category),
             )))
             expense_rows.append([
                 str(document.get("application_number") or "—"),
-                str(document.get("supplier_name") or "Неизвестный поставщик"),
-                expense_description,
+                Literal(str(document.get("supplier_name") or ("Okänd leverantör" if swedish else "Неизвестный поставщик"))),
+                Literal(expense_description),
                 _share_amount_text(share, "net_amount"),
                 _share_amount_text(share, "vat_amount"),
                 amount_label,
                 rounding,
                 str(document.get("currency_code") or "UNKNOWN"),
             ])
-        story.append(_table(
+        story.append(table(
             expense_rows,
             [available * value for value in (.07, .16, .17, .11, .10, .13, .12, .14)],
             font, bold_font,
         ))
         for currency, totals_by_field in expense_totals_by_currency(expenses).items():
-            story.append(_paragraph(
+            story.append(paragraph(
                 f"Итого долей, {currency}: нетто "
                 f"{_total_amount_text(totals_by_field, 'net_amount', currency)}; "
                 f"НДС {_total_amount_text(totals_by_field, 'vat_amount', currency)}; "
@@ -490,7 +533,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                 styles["body"],
             ))
     else:
-        story.append(_paragraph(
+        story.append(paragraph(
             "Подтверждённых распределений на этот объект в выбранном диапазоне не найдено."
             if data.get("expense_snapshot_available") else
             "Расходы неизвестны: подтверждённый снимок реестра недоступен.",
@@ -500,8 +543,8 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     excluded = data.get("excluded_expenses", [])
     if excluded:
         story.extend([
-            _paragraph("Документы, не включённые в сумму расходов", styles["heading"]),
-            _paragraph(
+            paragraph("Документы, не включённые в сумму расходов", styles["heading"]),
+            paragraph(
                 "Связанные с объектом документы перечислены отдельно; их распределения не включены "
                 "в подтверждённый итог.",
                 styles["notice"],
@@ -510,56 +553,58 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         excluded_rows = [["Поставщик / эмитент", "Тип / № / дата", "Статус / причина"]]
         for document in excluded:
             excluded_rows.append([
-                str(document.get("supplier_name") or "Неизвестный поставщик"),
-                " · ".join(filter(None, (
-                    str(document.get("document_type") or ""),
+                Literal(str(document.get("supplier_name") or ("Okänd leverantör" if swedish else "Неизвестный поставщик"))),
+                Literal(" · ".join(filter(None, (
+                    swedish_document_type(document.get("document_type")) if swedish
+                    else str(document.get("document_type") or ""),
                     str(document.get("invoice_number") or ""),
-                    str(document.get("document_date") or "Дата неизвестна"),
-                ))),
+                    str(document.get("document_date") or ("Datum saknas" if swedish else "Дата неизвестна")),
+                )))),
                 str(document.get("excluded_reason") or "Не подтверждён"),
             ])
-        story.append(_table(
+        story.append(table(
             excluded_rows, [available * .27, available * .28, available * .45], font, bold_font,
         ))
 
     if data.get("include_copies"):
-        story.append(PageBreak())
-        story.append(_paragraph("Оглавление приложений", styles["heading"]))
+        if not swedish:
+            story.append(PageBreak())
+        story.append(paragraph("Оглавление приложений", styles["heading"]))
         index_rows = [["№", "Поставщик / документ", "Доля объекта", "Страница"]]
         for document in expenses:
             currency = str(document.get("currency_code") or "UNKNOWN")
             page_number = appendix_pages.get(expense_document_key(document), "—")
             index_rows.append([
                 str(document.get("application_number") or "—"),
-                " · ".join(filter(None, (
-                    str(document.get("supplier_name") or "Неизвестный поставщик"),
+                Literal(" · ".join(filter(None, (
+                    str(document.get("supplier_name") or ("Okänd leverantör" if swedish else "Неизвестный поставщик")),
                     str(document.get("invoice_number") or ""),
-                    str(document.get("document_date") or "Дата неизвестна"),
-                ))),
+                    str(document.get("document_date") or ("Datum saknas" if swedish else "Дата неизвестна")),
+                )))),
                 _share_amount_text(document["share"], "gross_amount", currency),
                 str(page_number),
             ])
         if len(index_rows) == 1:
             index_rows.append(["—", "Нет подтверждённых документов для приложения", "—", "—"])
-        story.append(_table(
+        story.append(table(
             index_rows, [available * .08, available * .52, available * .25, available * .15],
             font, bold_font,
         ))
         if expenses:
-            story.append(_paragraph(
+            story.append(paragraph(
                 "Каждое приложение начинается с отдельного листа; оригинальные страницы после него "
                 "сохранены без добавления отметок.",
                 styles["notice"],
             ))
     elif expenses:
-        story.append(_paragraph("Копии документов не включены по выбору пользователя.", styles["notice"]))
+        story.append(paragraph("Копии документов не включены по выбору пользователя.", styles["notice"]))
 
     output = BytesIO()
 
     def page_footer(pdf_canvas, doc):
         pdf_canvas.saveState()
         pdf_canvas.setFont(font, 8)
-        pdf_canvas.drawRightString(width - 36, 16, f"Страница {doc.page}")
+        pdf_canvas.drawRightString(width - 36, 16, f"{'Sida' if swedish else 'Страница'} {doc.page}")
         pdf_canvas.restoreState()
 
     def later_page(pdf_canvas, doc):
@@ -569,13 +614,15 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         pdf_canvas.setFillColor(colors.HexColor("#28475b"))
         pdf_canvas.drawString(
             36, height - 18,
-            f"{object_title} · {data.get('period_label') or 'Нет данных'}",
+            f"{object_title} · {swedish_label(data.get('period_label') or 'Нет данных')}"
+            if swedish else f"{object_title} · {data.get('period_label') or 'Нет данных'}",
         )
         pdf_canvas.restoreState()
 
     document = SimpleDocTemplate(
         output, pagesize=landscape(A4), leftMargin=36, rightMargin=36,
-        topMargin=36, bottomMargin=28, title="Полный отчёт по объекту",
+        topMargin=36, bottomMargin=28,
+        title="Fullständig objektrapport" if swedish else "Полный отчёт по объекту",
     )
     document.build(story, onFirstPage=page_footer, onLaterPages=later_page)
     return output.getvalue()
@@ -659,6 +706,7 @@ def _prepare_sources(expenses, source_paths, source_errors, work_dir):
 def _cover_pdf(prepared, page_number, data, font, bold_font):
     from xml.sax.saxutils import escape
     document = prepared["document"]
+    swedish = data.get("language") == "sv"
     page_width, page_height = A4
     output = BytesIO()
     pdf_canvas = canvas.Canvas(output, pagesize=A4)
@@ -670,8 +718,10 @@ def _cover_pdf(prepared, page_number, data, font, bold_font):
     body = ParagraphStyle("AppendixBody", fontName=font, fontSize=10, leading=14)
     body_bold = ParagraphStyle("AppendixBodyBold", fontName=bold_font, fontSize=10, leading=14)
 
-    def draw_paragraph(text, style, gap=9):
+    def draw_paragraph(text, style, gap=9, translate=True):
         nonlocal y
+        if swedish and translate:
+            text = swedish_label(text)
         paragraph = Paragraph(escape(str(text)).replace("\n", "<br/>"), style)
         _, paragraph_height = paragraph.wrap(available, page_height)
         if y - paragraph_height < 60:
@@ -681,17 +731,35 @@ def _cover_pdf(prepared, page_number, data, font, bold_font):
 
     draw_paragraph(f"Приложение {document.get('application_number')}", title, 18)
     draw_paragraph(REPORT_ISSUER_NAME, body_bold)
-    draw_paragraph(f"Объект: {data['object'].get('name')}", heading)
-    draw_paragraph(f"Заказчик: {data['object'].get('company') or 'не указан'}", body)
     draw_paragraph(
-        f"Поставщик / эмитент: {document.get('supplier_name') or 'неизвестен'}", body,
+        f"{'Objekt' if swedish else 'Объект'}: {data['object'].get('name')}",
+        heading, translate=False,
+    )
+    customer_name = data.get("customer_name") or "Ej angiven" if swedish else (
+        data["object"].get("company") or "не указан"
     )
     draw_paragraph(
-        f"Тип: {document.get('document_type') or 'не указан'} · "
-        f"Номер: {document.get('invoice_number') or 'неизвестен'} · "
-        f"Дата: {document.get('document_date') or 'неизвестна'}",
-        body,
+        f"{'Beställare' if swedish else 'Заказчик'}: {customer_name}", body, translate=False,
     )
+    draw_paragraph(
+        f"{'Leverantör / utfärdare' if swedish else 'Поставщик / эмитент'}: "
+        f"{document.get('supplier_name') or ('okänd' if swedish else 'неизвестен')}",
+        body, translate=False,
+    )
+    if swedish:
+        draw_paragraph(
+            f"Typ: {swedish_document_type(document.get('document_type'))} · "
+            f"Nummer: {document.get('invoice_number') or 'okänt'} · "
+            f"Datum: {document.get('document_date') or 'okänt'}",
+            body, translate=False,
+        )
+    else:
+        draw_paragraph(
+            f"Тип: {document.get('document_type') or 'не указан'} · "
+            f"Номер: {document.get('invoice_number') or 'неизвестен'} · "
+            f"Дата: {document.get('document_date') or 'неизвестна'}",
+            body,
+        )
     share = document["share"]
     currency = str(document.get("currency_code") or "UNKNOWN")
     draw_paragraph(
@@ -724,15 +792,29 @@ def _cover_pdf(prepared, page_number, data, font, bold_font):
             body,
         )
     if prepared.get("error"):
-        draw_paragraph(f"Копия отсутствует или неполна: {prepared['error']}", body_bold)
+        if swedish:
+            draw_paragraph(
+                "Kopian saknas eller är ofullständig; kontrollera originalfilen och dess kontrollsumma.",
+                body_bold,
+            )
+        else:
+            draw_paragraph(f"Копия отсутствует или неполна: {prepared['error']}", body_bold)
     else:
-        draw_paragraph(
-            f"Оригинал приложен целиком: {prepared['page_count']} стр. "
-            "Содержимое оригинала не изменено.",
-            body,
-        )
+        if swedish:
+            count = prepared["page_count"]
+            draw_paragraph(
+                f"Originalet är bifogat i sin helhet: {count} {'sida' if count == 1 else 'sidor'}. "
+                "Originalets innehåll har inte ändrats.",
+                body, translate=False,
+            )
+        else:
+            draw_paragraph(
+                f"Оригинал приложен целиком: {prepared['page_count']} стр. "
+                "Содержимое оригинала не изменено.",
+                body,
+            )
     pdf_canvas.setFont(font, 8)
-    pdf_canvas.drawRightString(page_width - left, 28, f"Страница {page_number}")
+    pdf_canvas.drawRightString(page_width - left, 28, f"{'Sida' if swedish else 'Страница'} {page_number}")
     pdf_canvas.save()
     return output.getvalue()
 
@@ -747,6 +829,43 @@ def write_object_report_package(
     source_paths = source_paths or {}
     source_errors = source_errors or {}
     expenses = data.get("expenses", [])
+    swedish = data.get("language") == "sv"
+    if swedish:
+        company = str(data["object"].get("company") or "").strip()
+        customer_name = str(data.get("customer_name") or "").strip()
+        if "customer_name" not in data and company.casefold() != "privat":
+            customer_name = company
+        data["customer_name"] = customer_name
+        translations = data.get("journal_translations", {})
+        missing_translations = any(
+            str(row.get("comment") or "").strip()
+            and not str(translations.get(row.get("sync_id")) or "").strip()
+            for row in (data.get("customer_report") or {}).get("journal_rows", [])
+            if row.get("entry_type") in WORK_TYPES
+        )
+        if not customer_name:
+            data.setdefault("incomplete_reasons", []).append("Beställarens namn saknas.")
+        if missing_translations:
+            data.setdefault("incomplete_reasons", []).append(
+                "Vissa arbetsbeskrivningar behöver översättas eller förtydligas."
+            )
+        untranslated = [
+            swedish_label(reason)
+            for reason in data.get("incomplete_reasons", [])
+        ] + [
+            swedish_label(warning)
+            for warning in (data.get("customer_report") or {}).get("warnings", [])
+        ] + [
+            swedish_category(document.get("expense_category") or document.get("document_comment"))
+            for document in expenses
+        ]
+        if any(re.search(r"[\u0400-\u04ff]", text) for text in untranslated):
+            data.setdefault("incomplete_reasons", []).append(
+                "Vissa anmärkningar eller kostnadsbeskrivningar behöver översättas; "
+                "originaltexten visas tills vidare."
+            )
+        if data.get("incomplete_reasons"):
+            data["draft"] = True
 
     for index, document in enumerate(expenses, 1):
         document["application_number"] = str(index) if data.get("include_copies") else "—"
@@ -760,8 +879,12 @@ def write_object_report_package(
         for entry in prepared:
             if entry.get("error"):
                 data.setdefault("incomplete_reasons", []).append(
-                    f"Приложение {entry['document']['application_number']}: оригинал отсутствует или неполон."
+                    (f"Bilaga {entry['document']['application_number']}: originalet saknas eller är ofullständigt."
+                     if swedish else
+                     f"Приложение {entry['document']['application_number']}: оригинал отсутствует или неполон.")
                 )
+                if swedish:
+                    data["draft"] = True
 
         appendix_pages = {}
         main_pdf = b""
@@ -791,14 +914,14 @@ def write_object_report_package(
             )
             writer.append(PdfReader(BytesIO(cover)))
             writer.add_outline_item(
-                f"Приложение {document['application_number']} · "
-                f"{document.get('supplier_name') or 'неизвестный поставщик'}",
+                f"{'Bilaga' if swedish else 'Приложение'} {document['application_number']} · "
+                f"{document.get('supplier_name') or ('okänd leverantör' if swedish else 'неизвестный поставщик')}",
                 first_page,
             )
             for source_path in entry["source_paths"]:
                 writer.append(str(source_path))
         writer.add_metadata({
-            "/Title": "Полный отчёт по объекту",
+            "/Title": "Fullständig objektrapport" if swedish else "Полный отчёт по объекту",
             "/Author": REPORT_ISSUER_NAME,
         })
         with target.open("wb") as output:

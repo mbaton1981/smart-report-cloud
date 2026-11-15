@@ -254,6 +254,81 @@ class ObjectPackageReportTests(unittest.TestCase):
         self.assertIn("Дата неизвестна", excluded[0]["excluded_reason"])
         self.assertEqual(collect_object_expenses([], 42, "2026-11-01", "2026-11-30"), ([], []))
 
+    def test_swedish_draft_uses_translations_and_preserves_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "invoice.pdf"
+            original = canvas.Canvas(str(source))
+            for label in ("Original page one", "Original page two"):
+                original.drawString(40, 740, label)
+                original.showPage()
+            original.save()
+            original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            document = _document(10, allocations=[{
+                "object_id": 42, "destination": "object", "net_amount": "10.00",
+                "vat_amount": "2.00", "gross_amount": "12.00", "rounding_amount": "0.00",
+            }])
+            document["document_type"] = "manual"
+            document["expense_category"] = "Прочие расходы"
+            expenses, excluded = collect_object_expenses([document], 42)
+            data = {
+                "language": "sv",
+                "object": {"name": "Badbacken", "markning": "p1022",
+                           "company": "Privat", "is_active": 1},
+                "period_label": "за весь объект; фактический диапазон данных 2026-11-02 — 2026-11-02",
+                "generated_at": "2026-11-03 12:00",
+                "customer_report": {
+                    "journal_rows": [
+                        {"date": "2026-11-02", "employee": "Worker", "comment": "Монтаж",
+                         "hours": 8, "transport": 0, "entry_type": "work", "sync_id": "one",
+                         "hours_confirmed": 0, "invoiced": 0},
+                        {"date": "2026-11-02", "employee": "Worker", "comment": "",
+                         "hours": 2, "transport": 0, "entry_type": "work", "sync_id": "two",
+                         "hours_confirmed": 1, "invoiced": 0},
+                        {"date": "2026-11-02", "employee": "Worker", "comment": "Неясное",
+                         "hours": 1, "transport": 0, "entry_type": "work", "sync_id": "three",
+                         "hours_confirmed": 0, "invoiced": 0},
+                    ],
+                    "journal_segments": {},
+                    "prepared_rows": [{"employee": "Worker", "without_ob_hours": 11}],
+                    "cost_lines": [],
+                    "totals": {"without_ob_hours": 11, "invoice_total": 0},
+                    "warnings": ["Число поездок неизвестно; расчёт клиенту неполный."],
+                },
+                "journal_translations": {"one": "Montering"},
+                "include_customer_cost": True, "include_copies": True,
+                "expenses": expenses, "excluded_expenses": excluded,
+                "expense_snapshot_available": True,
+                "incomplete_reasons": [
+                    "Не включено в расходы документов, требующих проверки или подтверждения: 2.",
+                    "Число поездок в части рабочих записей неизвестно.",
+                ],
+            }
+            target = root / "draft.pdf"
+            result = write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+                source_paths={"client-10": [source]},
+            )
+            reader = PdfReader(str(target))
+            generated_text = "\n".join(
+                page.extract_text() or "" for page in reader.pages[:-2]
+            )
+            self.assertIn("UTKAST", generated_text)
+            self.assertIn("Beställare: Ej angiven", generated_text)
+            self.assertNotIn("Beställare: Privat", generated_text)
+            self.assertIn("Montering", generated_text)
+            self.assertIn("Arbetsbeskrivning saknas", generated_text)
+            self.assertIn("Arbetsbeskrivning behöver förtydligas", generated_text)
+            self.assertIn("Ej bekräftad", generated_text)
+            self.assertIn("Manuellt registrerat dokument", generated_text)
+            self.assertIn("Dokument som behöver granskas", generated_text)
+            self.assertNotIn("manual", generated_text)
+            self.assertNotRegex(generated_text, r"[\u0400-\u04ff]")
+            self.assertEqual(result["page_count"], len(reader.pages))
+            self.assertIn("Original page one", reader.pages[-2].extract_text())
+            self.assertIn("Original page two", reader.pages[-1].extract_text())
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
+
     def test_object_card_report_task_builds_pdf_with_work_rows_and_unknown_trips(self):
         with patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
             app = importlib.import_module("app")
@@ -314,6 +389,9 @@ class ObjectPackageReportTests(unittest.TestCase):
                     controller._build_full_object_package = lambda *args: (
                         app.SmartReportApp._build_full_object_package(controller, *args)
                     )
+                    controller._finish_full_object_package = lambda *args: (
+                        app.SmartReportApp._finish_full_object_package(controller, *args)
+                    )
                     pool = SimpleNamespace(start=lambda task: task.run())
                     with patch.object(app, "fetch_all_expense_documents", return_value=[document]), \
                             patch.object(app, "REPORTS_DIR", str(root)), \
@@ -338,6 +416,42 @@ class ObjectPackageReportTests(unittest.TestCase):
                         any("поездок" in reason.lower() for reason in result["incomplete_reasons"]),
                         transport is None,
                     )
+                    if transport == 1:
+                        swedish_options = dict(
+                            options, language="sv", customer_name="Test",
+                            review_note="Kontrollera avrundningen.",
+                        )
+                        with patch.object(app, "fetch_all_expense_documents", return_value=[document]):
+                            review = controller._build_full_object_package(
+                                object_row, swedish_options, lambda _message: None,
+                            )
+                        self.assertNotIn("path", review)
+                        controller.table_objects = Mock()
+                        controller.table_objects.currentRow.return_value = 0
+                        controller.table_objects.item.return_value.data.return_value = 42
+                        controller._object_package_request_id = 7
+                        dialog = Mock()
+                        dialog.exec.return_value = app.QDialog.DialogCode.Accepted
+                        dialog.translations = {"shift-1": "Arbete"}
+                        completions.clear()
+                        with patch.object(app, "JournalTranslationDialog", return_value=dialog), \
+                                patch.object(app, "REPORTS_DIR", str(root)), \
+                                patch.object(app, "DEFAULT_FONT", self.font), \
+                                patch.object(app, "DEFAULT_FONT_BOLD", self.bold_font), \
+                                patch.object(app.QThreadPool, "globalInstance", return_value=pool):
+                            app.SmartReportApp._on_full_object_report_ready(controller, 7, review, "")
+                        self.assertEqual(len(completions), 1)
+                        _, swedish_result, error = completions[0]
+                        self.assertEqual(error, "")
+                        swedish_text = "\n".join(
+                            page.extract_text() or ""
+                            for page in PdfReader(swedish_result["path"]).pages
+                        )
+                        self.assertIn("Beställare: Test", swedish_text)
+                        self.assertIn("Arbete", swedish_text)
+                        self.assertIn("Kontrollera avrundningen.", swedish_text)
+                        self.assertIn("UTKAST", swedish_text)
+                        self.assertIn("Original invoice page", swedish_text)
 
 
 class ExpensePaginationTests(unittest.TestCase):
