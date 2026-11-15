@@ -3197,6 +3197,356 @@ class AssistantUiTests(unittest.TestCase):
         self.assertIn("не удалось проверить", received[0]["errors"][1])
         window._read_object_overview.assert_called_once()
 
+    def test_project_overview_scope_period_and_company_followups(self):
+        from assistant_project import project_overview_period, project_overview_scope
+        from datetime import date
+
+        objects = [
+            {"id": 1, "sync_id": "badbacken", "name": "Badbacken",
+             "company": "Renatur", "markning": "p1022"},
+            {"id": 2, "sync_id": "other", "name": "Other",
+             "company": "Elsewhere", "markning": "p1000"},
+        ]
+        self.assertEqual(
+            project_overview_scope("Что по всем объектам за ноябрь?", objects),
+            {"company": "", "all_objects": True},
+        )
+        self.assertEqual(
+            project_overview_scope("Покажи обзор объектов за прошлую неделю", objects),
+            {"company": "", "all_objects": True},
+        )
+        self.assertEqual(
+            project_overview_scope("Что по объектам Ренатура за ноябрь?", objects),
+            {"company": "Renatur", "all_objects": True},
+        )
+        self.assertEqual(
+            project_overview_scope("Только Ренатур", objects, allow_company_only=True),
+            {"company": "Renatur", "all_objects": True},
+        )
+        self.assertIsNone(project_overview_scope("Что по Badbacken за ноябрь?", objects))
+        today = date(2026, 11, 18)
+        self.assertEqual(
+            project_overview_period("Что по всем объектам за ноябрь?", today=today),
+            ("2026-11-01", "2026-11-30"),
+        )
+        self.assertEqual(
+            project_overview_period("за ноябрь 2026", today=today),
+            ("2026-11-01", "2026-11-30"),
+        )
+        self.assertEqual(
+            project_overview_period("за прошлую неделю", today=today),
+            ("2026-11-09", "2026-11-15"),
+        )
+        self.assertEqual(
+            project_overview_period("Покажи обзор объектов", today=today),
+            ("2026-11-01", "2026-11-30"),
+        )
+        self.assertEqual(
+            project_overview_period("А теперь за этот месяц?", today=today,
+                                    fallback=("2026-10-01", "2026-10-31")),
+            ("2026-11-01", "2026-11-30"),
+        )
+        self.assertEqual(
+            project_overview_period("Только Ренатур", today=today,
+                                    fallback=("2026-10-01", "2026-10-31")),
+            ("2026-10-01", "2026-10-31"),
+        )
+        with self.assertRaises(ValueError):
+            project_overview_period(
+                "Только Ренатур", today=today,
+                fallback=("2026-11-30", "2026-11-01"),
+            )
+
+    def test_project_overview_worker_fetches_shared_documents_once_and_keeps_currencies_separate(self):
+        from assistant_ui import ProjectOverviewWorker
+        from customer_report import prepare_customer_costs
+        from PyQt6.QtWidgets import QWidget
+
+        documents = [
+            {
+                "document_date": "2026-11-05", "currency_code": "SEK",
+                "verification_status": "confirmed", "allocation_basis": "net",
+                "allocations": [{"object_id": 11, "gross_amount": "30.00",
+                                 "net_amount": "25.00"}],
+            },
+            {
+                "document_date": "2026-11-06", "currency_code": "EUR",
+                "verification_status": "confirmed", "allocation_basis": "net",
+                "allocations": [{"object_id": 12, "gross_amount": "48.00",
+                                 "net_amount": "40.00"}],
+            },
+            {
+                "document_date": "2026-11-07", "currency_code": "SEK",
+                "verification_status": "confirmed", "allocation_basis": "net",
+                "allocations": [{"object_id": None, "destination": "company",
+                                 "gross_amount": "500.00", "net_amount": "400.00"}],
+            },
+        ]
+        window = QWidget()
+        window._expense_document_snapshot = Mock(return_value=(documents, True))
+        window._local_incoming_expense_documents = Mock(return_value=[])
+        window._merge_incoming_expense_documents = Mock(side_effect=lambda server, incoming: server + incoming)
+
+        def overview_for(object_id, sync_id, *_args):
+            report = {
+                "company": "Renatur", "sync_id": sync_id, "date_from": "2026-11-01",
+                "date_to": "2026-11-30", "journal_rows": [], "journal_segments": {},
+                "totals": {"without_ob_hours": 0}, "warnings": [],
+                "is_fast_pris": False, "fast_pris_amount": 0.0,
+            }
+            prepare_customer_costs(report)
+            return {
+                "journal_rows": [], "journal_segments": {}, "customer_report": report,
+                "hours": 0, "employees": 0, "has_work_rows": False,
+            }
+
+        window._read_object_overview = Mock(side_effect=overview_for)
+        app = Mock()
+        app.request_expense_api.return_value = {"documents": documents}
+        objects = [
+            {"id": 1, "sync_id": "one", "server_id": 11, "name": "One",
+             "company": "Renatur", "markning": "p1", "is_active": 1},
+            {"id": 2, "sync_id": "two", "server_id": 12, "name": "Two",
+             "company": "Renatur", "markning": "p2", "is_active": 0},
+        ]
+        worker = ProjectOverviewWorker(
+            window, app, objects, "Renatur", ("2026-11-01", "2026-11-30"),
+        )
+        received = []
+        worker.ready.connect(received.append)
+        worker.run()
+
+        app.request_expense_api.assert_called_once_with("GET", "/api/expense-documents")
+        self.assertEqual(window._read_object_overview.call_count, 2)
+        result = received[0]
+        self.assertEqual(result["all_server_ids"], {"11", "12"})
+        self.assertEqual(result["rows"][0]["expenses"]["totals"]["SEK"]["net_amount"], Decimal("25.00"))
+        self.assertEqual(result["rows"][1]["expenses"]["totals"]["EUR"]["net_amount"], Decimal("40.00"))
+        self.assertEqual(result["rows"][0]["shifts"]["total"], 0.0)
+        self.assertEqual(result["rows"][1]["shifts"]["total"], 0.0)
+
+    def test_project_overview_distinguishes_empty_period_from_limited_document_selection(self):
+        from assistant_ui import AssistantDialog, ProjectOverviewWorker, RequestWorker
+        from customer_report import prepare_customer_costs
+        from PyQt6.QtWidgets import QWidget
+
+        documents = [
+            {"document_date": "2026-11-05", "currency_code": "SEK",
+             "verification_status": "confirmed", "allocations": []}
+            for _ in range(1000)
+        ]
+        worker_window = QWidget()
+        worker_window._expense_document_snapshot = Mock(return_value=(documents, True))
+        worker_window._local_incoming_expense_documents = Mock(return_value=[])
+        worker_window._merge_incoming_expense_documents = Mock(
+            side_effect=lambda server, incoming: server + incoming,
+        )
+        report = {
+            "company": "A", "sync_id": "empty", "date_from": "2026-11-01",
+            "date_to": "2026-11-30", "journal_rows": [], "journal_segments": {},
+            "totals": {"without_ob_hours": 0}, "warnings": [],
+            "is_fast_pris": False, "fast_pris_amount": 0.0,
+        }
+        prepare_customer_costs(report)
+        worker_window._read_object_overview = Mock(return_value={
+            "journal_rows": [], "journal_segments": {}, "customer_report": report,
+            "hours": 0, "employees": 0, "has_work_rows": False,
+        })
+        app = Mock()
+        app.request_expense_api.return_value = {"documents": documents}
+        worker = ProjectOverviewWorker(
+            worker_window, app,
+            [{"id": 1, "sync_id": "empty", "server_id": 11, "name": "Empty",
+              "company": "A", "markning": "p1", "is_active": 1}],
+            "", ("2026-11-01", "2026-11-30"),
+        )
+        received = []
+        worker.ready.connect(received.append)
+        worker.run()
+        data = received[0]
+        self.assertIn("ограничен 1000 документами", data["errors"][0])
+        self.assertFalse(data["rows"][0]["overview"]["has_work_rows"])
+
+        with patch.object(RequestWorker, "start"):
+            dialog = AssistantDialog(QWidget())
+        self.addCleanup(dialog.close)
+        dialog.window._expense_register_status_key = Mock(return_value="confirmed")
+        dialog.window._expense_register_is_unallocated = Mock(return_value=False)
+        dialog.window._expense_register_unallocated_amount = Mock(return_value=0)
+        dialog.project_generation = 1
+        dialog.project_overview_received(data, 1)
+        self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertEqual(dialog.table.item(0, 4).text(), "не удалось проверить")
+        self.assertIn("источники данных неполны", dialog.output.toPlainText())
+
+    def test_project_overview_table_filters_inactive_and_navigates_by_stable_id(self):
+        from assistant_ui import AssistantDialog, RequestWorker
+        from PyQt6.QtWidgets import QWidget
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "projects.sqlite")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    "CREATE TABLE objects(id, sync_id, server_id, name, company, markning, is_active)"
+                )
+                conn.execute(
+                    "INSERT INTO objects VALUES(1,'stable-one',11,'Badbacken','Renatur','p1022',1)"
+                )
+                conn.commit()
+            with patch.object(RequestWorker, "start"):
+                dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.database = database
+            dialog.window._expense_register_status_key = Mock(return_value="confirmed")
+            dialog.window._expense_register_is_unallocated = Mock(return_value=False)
+            dialog.window._expense_register_unallocated_amount = Mock(return_value=0)
+            active = {
+                "object": {"id": 1, "sync_id": "stable-one", "server_id": 11,
+                           "name": "Badbacken", "company": "Renatur",
+                           "markning": "p1022", "is_active": 1},
+                "overview": {"has_work_rows": True},
+                "shifts": {"hours": 8, "total": None, "known_subtotal": 400,
+                           "unknown_records": 1, "incomplete_fixed": True,
+                           "issues": [{"kind": "shift", "id": "shift-1",
+                                       "reason": "неизвестна клиентская ставка"},
+                                      {"kind": "shift", "id": "shift-1",
+                                       "reason": "неизвестна клиентская ставка"}]},
+                "expenses": {"totals": {"SEK": {"net_amount": None}},
+                             "unknown": {("SEK", "net_amount")}, "linked": [], "undated": []},
+                "error": None,
+            }
+            inactive = {
+                "object": {"id": 2, "sync_id": "stable-two", "server_id": 12,
+                           "name": "Old site", "company": "Renatur",
+                           "markning": "p1023", "is_active": 0},
+                "overview": {"has_work_rows": True},
+                "shifts": {"hours": 2, "total": 120, "known_subtotal": 120,
+                           "unknown_records": 0, "incomplete_fixed": False, "issues": []},
+                "expenses": {"totals": {}, "unknown": set(), "linked": [], "undated": []},
+                "error": None,
+            }
+            no_activity = {
+                "object": {"id": 3, "sync_id": "stable-three", "server_id": 13,
+                           "name": "Unused site", "company": "Renatur",
+                           "markning": "p1024", "is_active": 1},
+                "overview": {"has_work_rows": False},
+                "shifts": {"hours": 0, "total": 0, "known_subtotal": 0,
+                           "unknown_records": 0, "incomplete_fixed": False, "issues": []},
+                "expenses": {"totals": {}, "unknown": set(), "linked": [], "undated": []},
+                "error": None,
+            }
+            state = {
+                "company": "Renatur", "period": ("2026-11-01", "2026-11-30"),
+                "rows": [active, inactive, no_activity], "documents": [], "online": True,
+                "errors": [], "all_server_ids": {"11", "12", "13"},
+            }
+            dialog.project_overview_state = state
+            dialog.project_overview_visible = True
+            dialog.project_generation = 5
+            dialog.project_overview_received({"company": "Old", "rows": []}, 4)
+            self.assertIs(dialog.project_overview_state, state)
+            dialog.project_show_inactive.setVisible(True)
+            dialog.project_open_summary.setVisible(True)
+            dialog.render_project_overview()
+            self.assertEqual(dialog.table.rowCount(), 2)
+            self.assertIn("Badbacken", dialog.table.item(0, 0).text())
+            self.assertIn("архив", dialog.table.item(1, 0).text())
+            self.assertIn("известная часть", dialog.table.item(0, 3).text())
+            self.assertIn("неизвестно", dialog.table.item(0, 4).text())
+            self.assertIn("неизвестна клиентская ставка", dialog.table.item(0, 5).text())
+            self.assertIn("фиксированные условия", dialog.table.item(0, 5).text())
+            self.assertEqual(dialog.table.item(0, 5).text().count("неизвестна клиентская ставка"), 1)
+            dialog.project_show_inactive.setChecked(True)
+            self.assertEqual(dialog.table.rowCount(), 3)
+            dialog.table.setCurrentCell(0, 0)
+            dialog.table.selectRow(0)
+            with patch.object(dialog, "start_project") as start:
+                dialog.open_project_summary()
+            start.assert_called_once_with(active["object"], state["period"])
+            self.assertIs(dialog.project_return_overview, state)
+            dialog.project_overview_visible = False
+            dialog.return_to_project_overview()
+            self.assertTrue(dialog.project_overview_visible)
+            self.assertEqual(dialog.company.text(), "Renatur")
+            self.assertEqual(dialog.date_from.date().toString("yyyy-MM-dd"), "2026-11-01")
+            self.assertEqual(dialog.table.currentRow(), -1)
+            self.assertTrue(dialog.project_show_inactive.isChecked())
+
+    def test_project_overview_command_clears_old_object_and_preserves_company_on_followup(self):
+        from assistant_ui import AssistantDialog, ProjectOverviewWorker, RequestWorker
+        from assistant_project import project_overview_period
+        from PyQt6.QtCore import QDate
+        from PyQt6.QtWidgets import QWidget
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "projects.sqlite")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    "CREATE TABLE objects(id, sync_id, server_id, name, company, markning, is_active)"
+                )
+                conn.executemany("INSERT INTO objects VALUES(?,?,?,?,?,?,?)", [
+                    (1, "one", 11, "Badbacken", "Renatur", "p1022", 1),
+                    (2, "two", 12, "Other", "Elsewhere", "p1000", 1),
+                ])
+                conn.commit()
+            with patch.object(RequestWorker, "start"):
+                dialog = AssistantDialog(QWidget())
+            self.addCleanup(dialog.close)
+            dialog.database = database
+            dialog.project_selected = {"id": 1, "sync_id": "one"}
+            with patch.object(ProjectOverviewWorker, "start"), \
+                    patch("desktop_auth.current_token", return_value="isolated-token"), \
+                    patch("desktop_auth.current_user", return_value={"role": "admin"}), \
+                    patch("assistant_desktop.application", return_value=Mock()):
+                dialog.input.setPlainText("Что по всем объектам за ноябрь 2026?")
+                dialog.command()
+                self.assertIsInstance(dialog.worker, ProjectOverviewWorker)
+                self.assertEqual(dialog.worker.company, "")
+                self.assertEqual(dialog.worker.period, ("2026-11-01", "2026-11-30"))
+                self.assertIsNone(dialog.project_selected)
+                self.assertEqual(dialog.object_name.text(), "")
+                dialog.project_overview_state = {
+                    "company": "Renatur", "period": ("2026-11-01", "2026-11-30"),
+                    "rows": [], "documents": [], "online": True, "errors": [],
+                }
+                dialog.company.setText("Renatur")
+                dialog.project_overview_visible = True
+                dialog.input.setPlainText("А теперь за этот месяц?")
+                dialog.command()
+                self.assertEqual(dialog.worker.company, "Renatur")
+                self.assertEqual(
+                    dialog.worker.period, project_overview_period("за этот месяц"),
+                )
+                dialog.project_overview_state = {
+                    "company": "Elsewhere", "period": ("2026-10-01", "2026-10-31"),
+                    "rows": [], "documents": [], "online": True, "errors": [],
+                }
+                dialog.date_from.setDate(QDate.fromString("2026-10-01", "yyyy-MM-dd"))
+                dialog.date_to.setDate(QDate.fromString("2026-10-31", "yyyy-MM-dd"))
+                dialog.company.setText("Elsewhere")
+                dialog.project_overview_visible = True
+                dialog.input.setPlainText("Только Ренатур")
+                dialog.command()
+                self.assertEqual(dialog.worker.company, "Renatur")
+                self.assertEqual(dialog.worker.period, ("2026-10-01", "2026-10-31"))
+                dialog.project_overview_state = {
+                    "company": "Renatur", "period": ("2026-10-01", "2026-10-31"),
+                    "rows": [], "documents": [], "online": True, "errors": [],
+                }
+                dialog.project_return_overview = dialog.project_overview_state
+                dialog.project_overview_visible = True
+                dialog.project_selected = {
+                    "id": 1, "sync_id": "one", "name": "Badbacken",
+                    "company": "Renatur", "markning": "p1022",
+                }
+                dialog.input.setPlainText("Покажи сотрудников по фирме")
+                with patch.object(dialog, "call") as call:
+                    dialog.command()
+                call.assert_called_once()
+                self.assertIsNone(dialog.project_overview_state)
+                self.assertIsNone(dialog.project_return_overview)
+                self.assertIsNone(dialog.project_selected)
+
     def test_project_object_choice_and_selected_context(self):
         from assistant_ui import AssistantDialog, RequestWorker
         from PyQt6.QtCore import Qt

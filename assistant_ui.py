@@ -282,32 +282,12 @@ class ProjectWorker(QThread):
         self.window, self.app, self.obj, self.period = window, app, obj, period
 
     def run(self):
-        errors = []
-        documents = None
-        try:
-            response = self.app.request_expense_api("GET", "/api/expense-documents")
-            if not isinstance(response, dict):
-                raise ValueError("Некорректный ответ реестра документов.")
-            documents = response.get("documents")
-            if not isinstance(documents, list) or any(not isinstance(item, dict) for item in documents):
-                raise ValueError("Некорректный список документов.")
-            if len(documents) >= 1000:
-                errors.append("Реестр ограничен 1000 документами; расходы могут быть неполными.")
-        except (requests.RequestException, RuntimeError, ValueError, KeyError) as error:
-            errors.append("Серверные документы: не удалось проверить: " + str(error))
-        try:
-            merged, _online = self.window._expense_document_snapshot(
-                server_snapshot=(documents or [], documents is not None))
-            incoming = self.window._local_incoming_expense_documents(readonly=True)
-            merged = self.window._merge_incoming_expense_documents(merged, incoming)
-        except (sqlite3.Error, OSError, ValueError, KeyError) as error:
-            merged = list(documents or [])
-            errors.append("Локальные документы: не удалось проверить: " + str(error))
+        merged, online, errors = project_documents_snapshot(self.window, self.app)
         try:
             start, end = self.period if self.period else (None, None)
             overview = self.window._read_object_overview(
                 self.obj["id"], self.obj["sync_id"], self.obj["server_id"],
-                start, end, merged, documents is not None, documents is not None,
+                start, end, merged, online, online,
             )
             summary = assistant_project.shift_summary(overview, self.period)
             expenses = assistant_project.expense_summary(merged, self.obj["server_id"], self.period)
@@ -317,7 +297,84 @@ class ProjectWorker(QThread):
             return
         self.ready.emit(dict(object=self.obj, period=self.period, overview=overview,
                              shifts=summary, expenses=expenses, documents=merged,
-                             errors=errors, online=documents is not None))
+                             errors=errors, online=online))
+
+
+def project_documents_snapshot(window, app):
+    errors = []
+    documents = None
+    try:
+        response = app.request_expense_api("GET", "/api/expense-documents")
+        if not isinstance(response, dict):
+            raise ValueError("Некорректный ответ реестра документов.")
+        documents = response.get("documents")
+        if not isinstance(documents, list) or any(not isinstance(item, dict) for item in documents):
+            raise ValueError("Некорректный список документов.")
+        if len(documents) >= 1000:
+            errors.append("Реестр ограничен 1000 документами; расходы могут быть неполными.")
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as error:
+        errors.append("Серверные документы: не удалось проверить: " + str(error))
+    try:
+        merged, _ = window._expense_document_snapshot(
+            server_snapshot=(documents or [], documents is not None))
+        incoming = window._local_incoming_expense_documents(readonly=True)
+        merged = window._merge_incoming_expense_documents(merged, incoming)
+    except (sqlite3.Error, OSError, ValueError, KeyError) as error:
+        merged = list(documents or [])
+        errors.append("Локальные документы: не удалось проверить: " + str(error))
+    valid_documents = []
+    invalid_count = 0
+    for document in merged:
+        allocations = document.get("allocations") or [] if isinstance(document, dict) else None
+        if not isinstance(document, dict) or not isinstance(allocations, list) or any(
+                not isinstance(part, dict) for part in allocations):
+            invalid_count += 1
+            continue
+        valid_documents.append(document)
+    if invalid_count:
+        errors.append(
+            f"Некорректных документов: {invalid_count}; они исключены, суммы расходов неполны."
+        )
+    merged = valid_documents
+    return merged, documents is not None, errors
+
+
+class ProjectOverviewWorker(QThread):
+    ready = pyqtSignal(dict)
+
+    def __init__(self, window, app, objects, company, period, parent=None):
+        super().__init__(parent)
+        self.window, self.app = window, app
+        self.objects, self.company, self.period = objects, company, period
+
+    def run(self):
+        documents, online, errors = project_documents_snapshot(self.window, self.app)
+        rows = []
+        start, end = self.period
+        for obj in self.objects:
+            if self.company and obj["company"] != self.company:
+                continue
+            try:
+                overview = self.window._read_object_overview(
+                    obj["id"], obj["sync_id"], obj["server_id"],
+                    start, end, documents, online, online,
+                )
+                shifts = assistant_project.shift_summary(overview, self.period)
+                expenses = assistant_project.expense_summary(
+                    documents, obj["server_id"], self.period,
+                )
+                rows.append(dict(object=obj, overview=overview, shifts=shifts,
+                                 expenses=expenses, errors=expenses["errors"], error=None))
+            except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                message = "Не удалось загрузить сводку: " + str(error)
+                rows.append(dict(object=obj, error=message))
+                errors.append(f'{obj["name"]}: {message}')
+        self.ready.emit(dict(
+            company=self.company, period=self.period, rows=rows, documents=documents,
+            online=online, errors=list(dict.fromkeys(errors)),
+            all_server_ids={str(obj["server_id"]) for obj in self.objects
+                            if obj.get("server_id") is not None},
+        ))
 
 
 def result_text(result):
@@ -700,6 +757,10 @@ class AssistantDialog(QDialog):
         self.project_mode = False
         self.project_selected = None
         self.project_intent = "summary"
+        self.project_overview_state = None
+        self.project_overview_visible = False
+        self.project_return_overview = None
+        self.project_period_selected = False
         app_module = sys.modules.get(window.__class__.__module__)
         self.assistant_candidate = bool(getattr(app_module, "ASSISTANT_CANDIDATE", False))
         self.database = getattr(app_module, "DB_FILE", None)
@@ -802,6 +863,10 @@ class AssistantDialog(QDialog):
         self.project_all.setVisible(False)
         self.project_all.toggled.connect(self.project_period_changed)
         layout.addWidget(self.project_all)
+        self.project_show_inactive = QCheckBox("Показать также объекты без активности")
+        self.project_show_inactive.setVisible(False)
+        self.project_show_inactive.toggled.connect(self.render_project_overview)
+        layout.addWidget(self.project_show_inactive)
         desktop_theme.adapt_box_layout(content, filters, compact_width=1080)
         shortcuts = QHBoxLayout()
         attention_button = QPushButton("Требует внимания")
@@ -926,6 +991,15 @@ class AssistantDialog(QDialog):
             button.clicked.connect(lambda checked=False, action=action: self.project_action(action))
             self.project_buttons.append(button)
             tools.addWidget(button)
+        self.project_open_summary = QPushButton("Открыть сводку объекта")
+        self.project_open_summary.setVisible(False)
+        self.project_open_summary.setEnabled(False)
+        self.project_open_summary.clicked.connect(self.open_project_summary)
+        tools.addWidget(self.project_open_summary)
+        self.project_back_button = QPushButton("Вернуться к обзору объектов")
+        self.project_back_button.setVisible(False)
+        self.project_back_button.clicked.connect(self.return_to_project_overview)
+        tools.addWidget(self.project_back_button)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setMinimumHeight(150)
@@ -949,7 +1023,8 @@ class AssistantDialog(QDialog):
         self.result_heading.setTextFormat(Qt.TextFormat.PlainText)
         self.result_heading.setWordWrap(True)
         layout.insertWidget(layout.indexOf(self.table), self.result_heading)
-        self.table.cellDoubleClicked.connect(lambda *_: self.record_details())
+        self.table.cellDoubleClicked.connect(self.table_double_clicked)
+        self.table.itemSelectionChanged.connect(self.project_overview_selection_changed)
         self.confirm_mail = QPushButton("Подтвердить отправку подготовленного письма…")
         self.confirm_mail.setEnabled(False)
         self.confirm_mail.clicked.connect(self.send_mail)
@@ -1034,6 +1109,9 @@ class AssistantDialog(QDialog):
         self.project_pending = None
         self.project_mode = False
         self.project_intent = "summary"
+        self.project_overview_state = None
+        self.project_overview_visible = False
+        self.project_return_overview = None
         self.show_all_attention.setVisible(False)
         self.auto_report = False
         self.choices = []
@@ -1053,6 +1131,7 @@ class AssistantDialog(QDialog):
         monday = today.addDays(1 - today.dayOfWeek())
         self.date_from.setDate(monday)
         self.date_to.setDate(monday.addDays(6))
+        self.project_period_selected = False
         self.chat_messages.clear()
         self.output.clear()
         self.table.setVisible(False)
@@ -1334,6 +1413,10 @@ class AssistantDialog(QDialog):
         if self.project_active:
             self.invalidate_project()
         self.project_mode = False
+        self.project_selected = None
+        self.project_overview_state = None
+        self.project_return_overview = None
+        self.project_overview_visible = False
         self.project_all.setVisible(False)
         with QSignalBlocker(self.project_all):
             self.project_all.setChecked(False)
@@ -1380,6 +1463,7 @@ class AssistantDialog(QDialog):
         self.worker.start()
 
     def hours_period_changed(self):
+        self.project_period_selected = True
         if self.project_active:
             self.invalidate_project()
         if self.attention and self.attention.get("overview") is not None:
@@ -1405,11 +1489,16 @@ class AssistantDialog(QDialog):
         self.project_generation += 1
         self.project_active = False
         self.project_result = None
+        self.project_overview_visible = False
         self.table.setVisible(False)
         self.table.clearSelection()
         self.table.setCurrentCell(-1, -1)
         self.result_heading.clear()
         self.open_records.setEnabled(False)
+        self.project_open_summary.setVisible(False)
+        self.project_open_summary.setEnabled(False)
+        self.project_show_inactive.setVisible(False)
+        self.project_back_button.setVisible(False)
         for button in self.project_buttons:
             button.setVisible(False)
         self.state.setText("Параметры изменены; отправьте новый запрос.")
@@ -1499,12 +1588,16 @@ class AssistantDialog(QDialog):
         self.project_mode = True
         self.project_active = False
         self.project_result = None
+        self.project_overview_visible = False
         self.context = None
         self.choices = []
         self.attention = None
         self.result = None
         self.table.setVisible(False)
         self.result_heading.clear()
+        self.project_open_summary.setVisible(False)
+        self.project_open_summary.setEnabled(False)
+        self.project_show_inactive.setVisible(False)
         self.show_all_attention.setVisible(False)
         self.clear_clarification()
         self.project_all.setVisible(True)
@@ -1519,6 +1612,8 @@ class AssistantDialog(QDialog):
             self.object_name.setText(obj["name"])
         self.employee.clear()
         self.project_active = True
+        self.project_period_selected = period is not None
+        self.project_back_button.setVisible(self.project_return_overview is not None)
         for button in self.project_buttons:
             button.setVisible(False)
         self.pdf.setEnabled(False)
@@ -1537,6 +1632,375 @@ class AssistantDialog(QDialog):
         self.worker.ready.connect(lambda data: self.project_received(data, generation))
         self.worker.finished.connect(self.finished)
         self.worker.start()
+
+    def start_projects(self, company, period):
+        from assistant_desktop import application
+        if not desktop_auth.current_token() or desktop_auth.current_user().get("role") != "admin":
+            self.failed("Для обзора нужен личный вход администратора.")
+            return
+        try:
+            objects = self.project_objects()
+            app = application(self.window)
+        except (DesktopActionError, OSError, sqlite3.Error, ValueError) as error:
+            self.failed(str(error))
+            return
+        self.project_generation += 1
+        generation = self.project_generation
+        self.project_selected = None
+        self.project_return_overview = None
+        self.project_overview_state = None
+        self.project_overview_visible = False
+        self.project_mode = True
+        self.project_active = True
+        self.project_result = None
+        self.project_pending = None
+        self.context = None
+        self.choices = []
+        self.attention = None
+        self.result = None
+        self.table.setVisible(False)
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.result_heading.clear()
+        self.project_all.setVisible(False)
+        self.project_back_button.setVisible(False)
+        self.project_open_summary.setVisible(False)
+        self.project_open_summary.setEnabled(False)
+        self.project_show_inactive.setVisible(False)
+        with QSignalBlocker(self.project_all), QSignalBlocker(self.project_show_inactive), \
+                QSignalBlocker(self.date_from), QSignalBlocker(self.date_to), \
+                QSignalBlocker(self.company), QSignalBlocker(self.object_name):
+            self.project_all.setChecked(False)
+            self.project_show_inactive.setChecked(False)
+            self.date_from.setDate(QDate.fromString(period[0], "yyyy-MM-dd"))
+            self.date_to.setDate(QDate.fromString(period[1], "yyyy-MM-dd"))
+            self.company.setText(company)
+            self.object_name.clear()
+        self.project_period_selected = True
+        for field in (self.date_from, self.date_to, self.date_from_label, self.date_to_label):
+            field.setVisible(True)
+        self.employee.clear()
+        self.clear_clarification()
+        for button in self.project_buttons:
+            button.setVisible(False)
+        self.pdf.setEnabled(False)
+        self.native.setEnabled(False)
+        self.open_records.setEnabled(False)
+        self.send.setEnabled(False)
+        self.voice.setEnabled(False)
+        self.state.setText("Загружаю общий обзор; данные не изменяются.")
+        self.project_active = True
+        self.worker = ProjectOverviewWorker(
+            self.window, app, objects, company, period, self,
+        )
+        self.worker.ready.connect(lambda data: self.project_overview_received(data, generation))
+        self.worker.finished.connect(self.finished)
+        self.worker.start()
+
+    def project_overview_received(self, data, generation):
+        if generation != self.project_generation:
+            return
+        if data.get("error"):
+            self.failed(data["error"])
+            return
+        self.project_overview_state = data
+        self.project_overview_visible = True
+        self.project_mode = True
+        self.project_active = True
+        self.project_selected = None
+        period = data["period"]
+        scope = data["company"] or "все объекты"
+        activity_count = sum(
+            not row.get("error") and (
+                row["overview"]["has_work_rows"] or bool(row["expenses"]["linked"])
+                or bool(row.get("errors"))
+            )
+            for row in data["rows"]
+        )
+        archived_count = sum(
+            not row["object"]["is_active"] and not row.get("error") and (
+                row["overview"]["has_work_rows"] or bool(row["expenses"]["linked"])
+                or bool(row.get("errors"))
+            )
+            for row in data["rows"]
+        )
+        unassigned_error = "источник недоступен"
+        try:
+            unassigned = self.project_unassigned_documents(data)
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
+            unassigned = None
+            unassigned_error = str(error)
+        lines = [
+            f'Обзор объектов · {scope} · {period[0]} — {period[1]}.',
+            f'Объектов с активностью за период: {activity_count}; '
+            f'архивных объектов с активностью: {archived_count}.',
+            "В таблице нет общего итога: валюты и отдельные неизвестные суммы не складываются.",
+            "Клиентская стоимость — расчёт, не выставленный счёт, оплата или прибыль.",
+            "Смены и клиентские условия — локальный профиль; расходы — " +
+            ("единый ответ серверного реестра и локальные входящие документы."
+             if data["online"] else
+             "доступный локальный снимок и входящие документы; полнота не подтверждена."),
+        ]
+        if not data["rows"]:
+            lines.append("В выбранной фирме нет объектов в локальном справочнике."
+                         if data["company"] else
+                         "В локальном справочнике нет объектов для обзора.")
+        elif not activity_count:
+            lines.append(
+                "За период не найдено активности в доступных данных."
+                if not data["errors"] else
+                "Активность не подтверждена: источники данных неполны; пустая таблица не означает нулевые показатели."
+            )
+        if data["errors"]:
+            lines.append("Ограничения источников: " + " ".join(dict.fromkeys(data["errors"])))
+        if unassigned:
+            lines.append(
+                f"Вне таблицы объектов: {unassigned} документ(а/ов) без подтверждённой привязки "
+                "к объекту; суммы не распределены автоматически."
+            )
+        elif unassigned is None:
+            lines.append("Не удалось проверить документы без привязки к объекту: " + unassigned_error)
+        self.append_message("SmartReport", "\n".join(lines))
+        self.result_heading.setText(f"Обзор объектов · {scope} · {period[0]} — {period[1]}")
+        self.project_show_inactive.setVisible(True)
+        self.project_open_summary.setVisible(True)
+        self.project_back_button.setVisible(False)
+        for button in self.project_buttons:
+            button.setVisible(False)
+        self.render_project_overview()
+        self.state.setText("Выберите строку и откройте сводку объекта. Данные не изменены.")
+
+    def project_unassigned_documents(self, data):
+        known_ids = data.get("all_server_ids", {
+            str(row["object"]["server_id"])
+            for row in data["rows"] if row["object"].get("server_id") is not None
+        })
+        count = 0
+        start, end = data["period"]
+        for document in data["documents"]:
+            if self.window._expense_register_status_key(document) == "ignored":
+                continue
+            day = str(document.get("document_date") or "")
+            if day and not start <= day <= end:
+                continue
+            allocations = document.get("allocations") or []
+            linked = any(
+                part.get("object_id") is not None
+                and str(part["object_id"]) in known_ids
+                and not part.get("company_expense")
+                and part.get("destination") != "company"
+                for part in allocations
+            )
+            if not linked:
+                count += 1
+        return count
+
+    def render_project_overview(self, _checked=False):
+        data = self.project_overview_state
+        if data is None or not self.project_overview_visible:
+            return
+        self.table.setSortingEnabled(False)
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Объект / маркировка", "Фирма-заказчик", "Рабочие часы",
+            "Клиенту без НДС", "Подтверждённые расходы без НДС", "Требует внимания",
+        ])
+        rows = []
+        show_inactive = self.project_show_inactive.isChecked()
+        source_incomplete = bool(data["errors"])
+        for result in data["rows"]:
+            obj = result["object"]
+            overview = result.get("overview")
+            expenses = result.get("expenses")
+            has_activity = bool(
+                result.get("error") or source_incomplete or
+                overview and (
+                    overview["has_work_rows"] or expenses["linked"] or result.get("errors")
+                )
+            )
+            if not show_inactive and not has_activity:
+                continue
+            if result.get("error"):
+                hours, customer_cost, expense_cost = (
+                    "не загружено", "неизвестно", "неизвестно",
+                )
+                reasons = [result["error"]]
+            else:
+                shifts = result["shifts"]
+                hours = f'{shifts["hours"]:g} ч'
+                customer_cost = self.project_customer_cost(result)
+                expense_cost = self.project_expense_cost(result, data)
+                reasons = self.project_attention_reasons(result, data)
+            object_name = f'{obj["name"]} · {obj.get("markning") or "без маркировки"}'
+            if not obj["is_active"]:
+                object_name += " · архив"
+            rows.append((obj, object_name, obj["company"], hours,
+                         customer_cost, expense_cost,
+                         "; ".join(reasons) if reasons else "—"))
+        self.table.setRowCount(len(rows))
+        for row_index, (obj, object_name, company, hours, customer, expenses, attention) in enumerate(rows):
+            values = (object_name, company, hours, customer, expenses, attention)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, obj)
+                    item.setData(Qt.ItemDataRole.UserRole + 1, obj.get("sync_id"))
+                self.table.setItem(row_index, column, item)
+        self.table.resizeColumnsToContents()
+        self.table.setVisible(True)
+        self.project_open_summary.setEnabled(False)
+        self.open_records.setEnabled(False)
+
+    @staticmethod
+    def project_customer_cost(result):
+        overview = result["overview"]
+        shifts = result["shifts"]
+        if not overview["has_work_rows"]:
+            return "нет рабочих смен"
+        if shifts["total"] is not None:
+            return f'{shifts["total"]:,.2f} SEK'
+        if shifts["known_subtotal"] is not None:
+            return f'известная часть: {shifts["known_subtotal"]:,.2f} SEK · неполно'
+        return "неизвестно · неполно"
+
+    @staticmethod
+    def project_expense_cost(result, data):
+        expenses = result["expenses"]
+        if result["object"].get("server_id") is None:
+            return "неизвестно: нет связи с реестром"
+        if not expenses["totals"]:
+            if not data["online"] or data["errors"] or result.get("errors"):
+                return "не удалось проверить"
+            return "нет подтверждённых долей"
+        values = []
+        for currency, amounts in sorted(expenses["totals"].items()):
+            amount = amounts["net_amount"]
+            incomplete = (
+                (currency, "net_amount") in expenses["unknown"]
+                or not data["online"] or bool(data["errors"]) or bool(result.get("errors"))
+            )
+            formatted = "неизвестно" if amount is None else f"{amount:,.2f} {currency}"
+            values.append(formatted + (" · неполно" if incomplete else ""))
+        return "; ".join(values)
+
+    def project_attention_reasons(self, result, data):
+        shifts, expenses = result["shifts"], result["expenses"]
+        issues = list(shifts["issues"])
+        issues.extend({"kind": "document", "id": None, "reason": str(error)}
+                      for error in result.get("errors", []))
+        try:
+            review, allocation = assistant_attention.document_issues(
+                expenses["linked"], self.window._expense_register_status_key,
+                self.window._expense_register_is_unallocated,
+                self.window._expense_register_unallocated_amount, data["period"],
+            )
+            issues.extend(review)
+            issues.extend(allocation)
+        except (sqlite3.Error, OSError, TypeError, ValueError, KeyError, AttributeError) as error:
+            issues.append({"kind": "document", "id": None,
+                           "reason": "проверка документов не выполнена: " + str(error)})
+        grouped = {}
+        for issue in issues:
+            kind = issue.get("kind") or "issue"
+            identity = (issue.get("id") or issue.get("client_id") or
+                        issue.get("incoming_document_id") or
+                        (issue.get("date"), issue.get("employee"), issue.get("supplier")))
+            key = (kind, str(identity))
+            reasons = grouped.setdefault(key, [])
+            reason = str(issue.get("reason") or "требует проверки").strip()
+            if reason not in reasons:
+                reasons.append(reason)
+        output = ["; ".join(reasons) for reasons in grouped.values()]
+        issue_shift_ids = {key[1] for key in grouped if key[0] == "shift"}
+        unexplained = max(0, shifts["unknown_records"] - len(issue_shift_ids))
+        if unexplained and not shifts["incomplete_fixed"]:
+            output.append(f"неполный клиентский расчёт: ещё {unexplained} смен(ы)")
+        if shifts["incomplete_fixed"]:
+            output.append("фиксированные условия применимы не ко всему периоду")
+        has_document_amount_issue = any(
+            key[0] == "document" and any(
+                re.search(r"неизвест|распредел", reason, re.IGNORECASE)
+                for reason in reasons
+            )
+            for key, reasons in grouped.items()
+        )
+        if not has_document_amount_issue:
+            for currency, field in sorted(expenses["unknown"]):
+                if field == "net_amount":
+                    output.append(f"неизвестна подтверждённая сумма доли без НДС ({currency})")
+        if result["object"].get("server_id") is not None and not data["online"]:
+            output.append("проверка расходов неполная")
+        return list(dict.fromkeys(output))
+
+    def project_overview_selection_changed(self):
+        if not self.project_overview_visible:
+            return
+        selected = self.table.currentRow()
+        item = self.table.item(selected, 0) if selected >= 0 else None
+        self.project_open_summary.setEnabled(
+            bool(item and isinstance(item.data(Qt.ItemDataRole.UserRole), dict))
+        )
+
+    def open_project_summary(self):
+        if not self.project_overview_visible:
+            return
+        selected = self.table.currentRow()
+        item = self.table.item(selected, 0) if selected >= 0 else None
+        obj = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(obj, dict):
+            self.state.setText("Сначала выберите объект в таблице.")
+            return
+        try:
+            matches = [
+                candidate for candidate in self.project_objects()
+                if candidate["id"] == obj["id"] and candidate.get("sync_id") == obj.get("sync_id")
+            ]
+        except (sqlite3.Error, OSError, ValueError) as error:
+            self.state.setText("Не удалось проверить устойчивый ID объекта: " + str(error))
+            return
+        if len(matches) != 1:
+            self.state.setText("Объект изменился или ID неоднозначен; сводка не открыта.")
+            return
+        self.project_return_overview = self.project_overview_state
+        self.project_intent = "summary"
+        self.start_project(matches[0], self.project_overview_state["period"])
+
+    def return_to_project_overview(self):
+        if self.project_return_overview is None:
+            return
+        self.project_generation += 1
+        self.project_overview_state = self.project_return_overview
+        self.project_return_overview = None
+        data = self.project_overview_state
+        self.project_result = None
+        self.project_selected = None
+        self.project_mode = True
+        self.project_active = True
+        self.project_overview_visible = True
+        self.project_all.setVisible(False)
+        self.project_back_button.setVisible(False)
+        with QSignalBlocker(self.date_from), QSignalBlocker(self.date_to), \
+                QSignalBlocker(self.company), \
+                QSignalBlocker(self.object_name):
+            self.date_from.setDate(QDate.fromString(data["period"][0], "yyyy-MM-dd"))
+            self.date_to.setDate(QDate.fromString(data["period"][1], "yyyy-MM-dd"))
+            self.company.setText(data["company"])
+            self.object_name.clear()
+        self.project_show_inactive.setVisible(True)
+        self.project_open_summary.setVisible(True)
+        for button in self.project_buttons:
+            button.setVisible(False)
+        self.render_project_overview()
+        self.state.setText("Обзор восстановлен с прежней фирмой и периодом.")
+
+    def table_double_clicked(self, *_):
+        if self.project_overview_visible:
+            self.open_project_summary()
+        else:
+            self.record_details()
 
     def project_received(self, data, generation):
         if generation != self.project_generation:
@@ -1606,6 +2070,7 @@ class AssistantDialog(QDialog):
         self.append_message("SmartReport", "\n".join(lines))
         self.result_heading.setText(f'{obj["name"]} · {period}')
         self.state.setText("Готово; для подробностей выберите действие. Данные не изменены.")
+        self.project_back_button.setVisible(self.project_return_overview is not None)
         for button in self.project_buttons:
             button.setVisible(True)
         if self.project_intent != "summary":
@@ -2244,6 +2709,10 @@ class AssistantDialog(QDialog):
         if self.project_active:
             self.invalidate_project()
         self.project_mode = False
+        self.project_selected = None
+        self.project_overview_state = None
+        self.project_return_overview = None
+        self.project_overview_visible = False
         self.project_all.setVisible(False)
         with QSignalBlocker(self.project_all):
             self.project_all.setChecked(False)
@@ -2276,6 +2745,9 @@ class AssistantDialog(QDialog):
             self.voice_diagnostics.setdefault("sent_texts", []).append(text)
         normalized = " ".join(text.casefold().strip(" .!?").split())
         period_only = bool(re.fullmatch(r"(?:а\s+)?(?:за\s+.+|с\s+.+\s+по\s+.+)", normalized))
+        overview_period_only = bool(re.fullmatch(
+            r"(?:а\s+)?(?:теперь\s+)?(?:за\s+.+|с\s+.+\s+по\s+.+)", normalized,
+        ))
         follow_action = ("expenses" if re.fullmatch(
             r"(?:покажи\s+)?расход\w*(?:\s+(?:за|с)\s+.+)?", normalized) else
             "employees" if re.fullmatch(r"кто\s+там\s+работал\w*(?:\s+(?:за|с)\s+.+)?", normalized) else None)
@@ -2288,6 +2760,52 @@ class AssistantDialog(QDialog):
                 self.start_project(choices[index], period)
                 return
             self.state.setText("Выберите номер из предложенного списка объектов.")
+            return
+        overview_context = self.project_overview_state or self.project_return_overview
+        overview_scope = None
+        needs_overview_parse = bool(
+            re.search(r"\b(?:все\w*|кажд\w*)\s+объект\w*|\b(?:обзор\w*|сводк\w*)\s+объект\w*|"
+                      r"\bчто\s+(?:у\s+нас\s+)?по\s+объект\w*", normalized)
+            or overview_context and (
+                overview_period_only or re.match(r"^только\s+", normalized)
+            )
+        )
+        if needs_overview_parse:
+            try:
+                overview_scope = assistant_project.project_overview_scope(
+                    text, self.project_objects(),
+                    allow_company_only=overview_context is not None,
+                )
+            except (sqlite3.Error, OSError, ValueError) as error:
+                self.failed(str(error))
+                return
+        if overview_scope is not None or overview_context and (
+                overview_period_only or re.match(r"^только\s+", normalized)):
+            try:
+                if self.project_period_selected:
+                    fallback = (
+                        self.date_from.date().toString("yyyy-MM-dd"),
+                        self.date_to.date().toString("yyyy-MM-dd"),
+                    )
+                else:
+                    fallback = overview_context["period"] if overview_context else None
+                period = assistant_project.project_overview_period(
+                    text, fallback=fallback,
+                )
+                company = (
+                    overview_scope["company"] if overview_scope is not None
+                    else self.company.text().strip() if overview_context else ""
+                )
+                self.input.clear()
+                self.invalidate_project()
+                self.context = None
+                self.choices = []
+                self.attention = None
+                self.show_all_attention.setVisible(False)
+                self.employee.clear()
+                self.start_projects(company, period)
+            except (ValueError, sqlite3.Error, OSError) as error:
+                self.failed(str(error))
             return
         project_request = assistant_project.project_request(text)
         if (not project_request and re.match(r"^что\s+у\s+", normalized)
@@ -2325,6 +2843,9 @@ class AssistantDialog(QDialog):
                                         "summary" if project_request and not re.match(r"^(?:теперь|а)\s+по", normalized)
                                         else self.project_intent))
                 self.input.clear()
+                self.project_overview_state = None
+                self.project_return_overview = None
+                self.project_overview_visible = False
                 self.invalidate_project()
                 self.context = None
                 self.choices = []
@@ -2361,6 +2882,10 @@ class AssistantDialog(QDialog):
         with QSignalBlocker(self.project_all):
             self.project_all.setChecked(False)
         self.project_period_changed()
+        self.project_selected = None
+        self.project_overview_state = None
+        self.project_return_overview = None
+        self.project_overview_visible = False
         if assistant_attention.is_attention_request(text):
             self.input.clear()
             self.start_attention(text, already_appended=True)

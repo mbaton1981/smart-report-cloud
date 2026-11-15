@@ -1,6 +1,6 @@
 """Read-only helpers for the assistant's object overview."""
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from difflib import SequenceMatcher
 import re
@@ -20,7 +20,7 @@ def project_request(text, objects=None):
     if re.search(r"\bсотрудник\w*", normalized):
         return False
     if objects is not None and re.match(r"^что\s+у\s+", normalized):
-        tokens, companies, _exact = _project_query(text, objects)
+        tokens, companies, _ = _project_query(text, objects)
         if tokens and (companies or project_candidates(text, objects)):
             return True
     return bool(
@@ -34,6 +34,34 @@ def project_request(text, objects=None):
     )
 
 
+def project_overview_scope(text, objects, *, allow_company_only=False):
+    normalized = " ".join(text.casefold().split())
+    if re.search(r"\b(?:сотрудник\w*|час(?:ы|ов|а))\b", normalized):
+        return None
+    explicit_all = bool(re.search(
+        r"\b(?:все\w*|кажд\w*)\s+объект\w*\b|"
+        r"\bобъект\w*\s+(?:все\w*|кажд\w*)\b",
+        normalized,
+    ))
+    overview_query = bool(
+        re.search(r"\b(?:обзор\w*|сводк\w*|ситуаци\w*)\s+(?:по\s+)?объект\w*", normalized)
+        or re.search(r"\bчто\s+(?:у\s+нас\s+)?по\s+объект\w*", normalized)
+        or re.search(r"\bпо\s+всем\s+объект\w*", normalized)
+    )
+    company_only = allow_company_only and bool(re.match(r"^только\s+", normalized))
+    if not explicit_all and not overview_query and not company_only:
+        return None
+
+    tokens, companies, _ = _project_query(text, objects)
+    if len(companies or ()) > 1:
+        raise ValueError("Укажите одну фирму для обзора объектов.")
+    if not explicit_all and tokens:
+        return None
+    if not explicit_all and not overview_query and not company_only:
+        return None
+    return {"company": companies[0] if companies else "", "all_objects": True}
+
+
 def project_period(text, today=None):
     today = today or datetime.now(ZoneInfo("Europe/Stockholm")).date()
     explicit = explicit_date_period(text, today=today) or _week_period(text)
@@ -45,6 +73,29 @@ def project_period(text, today=None):
     if re.search(r"\b(?:за|с|недел\w*|месяц\w*|год\w*)\b", normalized):
         raise ValueError("Не удалось определить период. Укажите даты или месяц.")
     return None
+
+
+def project_overview_period(text, today=None, fallback=None):
+    today = today or datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    explicit = explicit_date_period(text, today=today)
+    if explicit:
+        return explicit
+    week = re.search(r"\b(текущ\w*|эт\w*|прошл\w*|предыдущ\w*)\s+недел\w*\b", text.casefold())
+    if week:
+        start = today - timedelta(days=today.weekday())
+        if week.group(1).startswith(("прошл", "предыдущ")):
+            start -= timedelta(days=7)
+        return start.isoformat(), (start + timedelta(days=6)).isoformat()
+    if re.search(r"\b(?:за|с|недел\w*|месяц\w*|год\w*)\b", text.casefold()):
+        raise ValueError("Не удалось определить период. Укажите даты, месяц или неделю.")
+    if fallback:
+        start, end = (date.fromisoformat(value) for value in fallback)
+        if start > end:
+            raise ValueError("Начало периода должно быть не позже окончания.")
+        return start.isoformat(), end.isoformat()
+    start = today.replace(day=1)
+    next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return start.isoformat(), (next_month - timedelta(days=1)).isoformat()
 
 
 def project_marking(text):
@@ -82,7 +133,8 @@ def _project_query(text, objects):
     normalized = re.sub(
         r"\b(?:что|у\s+нас|сейчас|хочу|дай|мне|пожалуйста|покажи|сводк\w*|состояни\w*|ситуаци\w*|сколько|"
         r"час\w*|расход\w*|заработал\w*|кто|там|работал\w*|теперь|по|"
-        r"объект\w*|проект\w*|этому|этот|этого|фирм\w*|компан\w*|а|и)\b",
+        r"объект\w*|проект\w*|обзор\w*|этому|этот|этого|все\w*|кажд\w*|только|"
+        r"фирм\w*|компан\w*|а|и)\b",
         " ", normalized)
     normalized = re.sub(r"^\s*у\s+", " ", normalized)
     company_phrase = re.search(r"\bу\s+(.+)$", normalized)

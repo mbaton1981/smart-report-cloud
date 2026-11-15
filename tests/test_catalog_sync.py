@@ -700,6 +700,51 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(result["expense_sums"]["gross_amount"], {"SEK": "140.00"})
         self.assertEqual(result["expense_sums"]["net_amount"], {"SEK": "125.00"})
         self.assertEqual(result["expense_count"], 2)
+        from assistant_project import expense_summary, shift_summary
+        from assistant_ui import ProjectOverviewWorker
+
+        with self.desktop.get_db_connection() as conn:
+            object_rows = [dict(row) for row in conn.execute(
+                "SELECT id,sync_id,server_id,name,company,markning,is_active "
+                "FROM objects WHERE server_id IN (31001,31002) ORDER BY server_id",
+            )]
+        period = ("2026-10-22", "2026-10-22")
+        worker_window = SimpleNamespace(
+            _expense_document_snapshot=lambda server_snapshot: (documents, True),
+            _local_incoming_expense_documents=lambda readonly: [],
+            _merge_incoming_expense_documents=lambda server, incoming: server + incoming,
+            _read_object_overview=lambda selected_id, selected_sync, selected_server,
+            start, end, selected_documents, online, snapshot_available:
+                self.desktop.SmartReportApp._read_object_overview(
+                    None, selected_id, selected_sync, selected_server, start, end,
+                    selected_documents, online, snapshot_available,
+                ),
+        )
+        worker_app = SimpleNamespace(
+            request_expense_api=lambda method, path: {"documents": documents},
+        )
+        project_worker = ProjectOverviewWorker(
+            worker_window, worker_app, object_rows, "", period,
+        )
+        project_results = []
+        project_worker.ready.connect(project_results.append)
+        project_worker.run()
+        project_by_server_id = {
+            row["object"]["server_id"]: row for row in project_results[0]["rows"]
+        }
+        project_result = project_by_server_id[31001]
+        detailed_shifts = shift_summary(result, period)
+        self.assertEqual(project_result["overview"]["hours"], result["hours"])
+        self.assertEqual(project_result["shifts"]["total"], detailed_shifts["total"])
+        self.assertEqual(project_result["expenses"]["totals"]["SEK"]["net_amount"], Decimal("125.00"))
+        self.assertEqual(
+            project_by_server_id[31002]["expenses"]["totals"]["SEK"]["net_amount"],
+            Decimal("60.00"),
+        )
+        self.assertEqual(
+            expense_summary(documents, 31001, period)["totals"]["SEK"]["net_amount"],
+            Decimal("125.00"),
+        )
         next_month = self.desktop.SmartReportApp._read_object_overview(
             None, object_id, sync_id, 31001, "2026-11-01", "2026-11-30", documents, True, True,
         )
