@@ -318,12 +318,13 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     object_title = str(object_row.get("name") or "Объект")
     if object_row.get("markning"):
         object_title += f" · {object_row['markning']}"
-    story.extend([
-        raw_paragraph(
-            f"Beställare: {data.get('customer_name') or 'Ej angiven'}" if swedish
+    if not swedish or data.get("customer_name"):
+        story.append(raw_paragraph(
+            f"Beställare: {data['customer_name']}" if swedish
             else f"Заказчик: {object_row.get('company') or 'не указан'}",
             styles["body"],
-        ),
+        ))
+    story.extend([
         raw_paragraph(f"{'Objekt' if swedish else 'Объект'}: {object_title}", styles["bold"]),
         paragraph(
             f"Период: {data.get('period_label') or 'Нет данных'} · "
@@ -735,12 +736,13 @@ def _cover_pdf(prepared, page_number, data, font, bold_font):
         f"{'Objekt' if swedish else 'Объект'}: {data['object'].get('name')}",
         heading, translate=False,
     )
-    customer_name = data.get("customer_name") or "Ej angiven" if swedish else (
+    customer_name = data.get("customer_name") if swedish else (
         data["object"].get("company") or "не указан"
     )
-    draw_paragraph(
-        f"{'Beställare' if swedish else 'Заказчик'}: {customer_name}", body, translate=False,
-    )
+    if customer_name:
+        draw_paragraph(
+            f"{'Beställare' if swedish else 'Заказчик'}: {customer_name}", body, translate=False,
+        )
     draw_paragraph(
         f"{'Leverantör / utfärdare' if swedish else 'Поставщик / эмитент'}: "
         f"{document.get('supplier_name') or ('okänd' if swedish else 'неизвестен')}",
@@ -843,11 +845,18 @@ def write_object_report_package(
             for row in (data.get("customer_report") or {}).get("journal_rows", [])
             if row.get("entry_type") in WORK_TYPES
         )
-        if not customer_name:
-            data.setdefault("incomplete_reasons", []).append("Beställarens namn saknas.")
         if missing_translations:
             data.setdefault("incomplete_reasons", []).append(
                 "Vissa arbetsbeskrivningar behöver översättas eller förtydligas."
+            )
+        unconfirmed_hours = sum(
+            1 for row in (data.get("customer_report") or {}).get("journal_rows", [])
+            if row.get("entry_type") in WORK_TYPES
+            and not row.get("hours_confirmed") and not row.get("invoiced")
+        )
+        if unconfirmed_hours:
+            data.setdefault("incomplete_reasons", []).append(
+                f"Antal arbetsposter med obekräftade timmar: {unconfirmed_hours}."
             )
         untranslated = [
             swedish_label(reason)

@@ -314,12 +314,12 @@ class ObjectPackageReportTests(unittest.TestCase):
                 page.extract_text() or "" for page in reader.pages[:-2]
             )
             self.assertIn("UTKAST", generated_text)
-            self.assertIn("Beställare: Ej angiven", generated_text)
-            self.assertNotIn("Beställare: Privat", generated_text)
+            self.assertNotIn("Beställare:", generated_text)
             self.assertIn("Montering", generated_text)
             self.assertIn("Arbetsbeskrivning saknas", generated_text)
             self.assertIn("Arbetsbeskrivning behöver förtydligas", generated_text)
             self.assertIn("Ej bekräftad", generated_text)
+            self.assertIn("Antal arbetsposter med obekräftade timmar: 2", generated_text)
             self.assertIn("Manuellt registrerat dokument", generated_text)
             self.assertIn("Dokument som behöver granskas", generated_text)
             self.assertNotIn("manual", generated_text)
@@ -328,6 +328,35 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("Original page one", reader.pages[-2].extract_text())
             self.assertIn("Original page two", reader.pages[-1].extract_text())
             self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
+
+    def test_swedish_customer_name_is_optional_without_forcing_draft(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = {
+                "language": "sv", "object": {"name": "Objekt", "company": "Privat"},
+                "generated_at": "2026-11-03 12:00", "period_label": "2026-11-02",
+                "customer_report": {
+                    "journal_rows": [{
+                        "date": "2026-11-02", "employee": "Worker", "comment": "Монтаж",
+                        "hours": 8, "transport": 0, "entry_type": "work",
+                        "sync_id": "one", "hours_confirmed": 1, "invoiced": 0,
+                    }],
+                    "journal_segments": {},
+                    "prepared_rows": [{"employee": "Worker", "without_ob_hours": 8}],
+                    "totals": {"without_ob_hours": 8}, "warnings": [],
+                },
+                "journal_translations": {"one": "Montering"},
+                "include_customer_cost": False, "include_copies": False,
+                "expenses": [], "expense_snapshot_available": True, "incomplete_reasons": [],
+            }
+            target = Path(directory) / "report.pdf"
+            result = write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+            )
+            text = "\n".join(page.extract_text() or "" for page in PdfReader(target).pages)
+            self.assertNotIn("Beställare:", text)
+            self.assertNotIn("UTKAST", text)
+            self.assertEqual(result["incomplete_reasons"], [])
+            self.assertIn("Montering", text)
 
     def test_object_card_report_task_builds_pdf_with_work_rows_and_unknown_trips(self):
         with patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
