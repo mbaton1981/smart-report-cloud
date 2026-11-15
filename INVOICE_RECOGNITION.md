@@ -18,6 +18,12 @@ failure is reported and does not change the original PDF or mark a cost
 confirmed. Delivery to the ordinary expense registry preserves the reviewed
 document type; only the explicit review/transfer action confirms the expense.
 
+When a Swedish invoice has a `Momsspecifikation` table with `Momsbelopp` and
+`Bruttobelopp` columns, its `Totalt` row is the authoritative VAT and gross
+source. This prevents repeated product subtotals or VAT-rate cells on other
+pages from making those document totals ambiguous; no amount is derived from
+the printed tax rate.
+
 Order references that are not recognizable object markings, such as a
 textual project label, remain visible in allocation proposals but are never
 automatically assigned to an object or company costs.

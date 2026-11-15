@@ -665,6 +665,50 @@ def invoice_context(text):
     }
 
 
+def invoice_fiscal_summary_totals(rows):
+    results = []
+    for title_index, row in enumerate(rows):
+        if not any(re.fullmatch(r"Moms\s*specifikation", cell["text"].strip(), re.IGNORECASE)
+                   for cell in row):
+            continue
+        header_match = next(((index, candidate) for index, candidate in
+                             enumerate(rows[title_index + 1:title_index + 6], title_index + 1)
+                             if any(re.fullmatch(r"Moms\s*belopp(?:\s+(?:i\s+)?SEK)?",
+                                                 cell["text"].strip(), re.IGNORECASE)
+                                    for cell in candidate)
+                             and any(re.fullmatch(r"Brutto\s*belopp(?:\s+(?:i\s+)?SEK)?",
+                                                  cell["text"].strip(), re.IGNORECASE)
+                                     for cell in candidate)), None)
+        if header_match is None:
+            continue
+        header_index, header = header_match
+        vat_column = next(cell for cell in header
+                          if re.fullmatch(r"Moms\s*belopp(?:\s+(?:i\s+)?SEK)?",
+                                          cell["text"].strip(), re.IGNORECASE))
+        gross_column = next(cell for cell in header
+                            if re.fullmatch(r"Brutto\s*belopp(?:\s+(?:i\s+)?SEK)?",
+                                            cell["text"].strip(), re.IGNORECASE))
+        totals = [candidate for candidate in rows[header_index + 1:header_index + 9]
+                  if candidate and re.fullmatch(r"Totalt", candidate[0]["text"].strip(), re.IGNORECASE)]
+        if not totals:
+            continue
+        total = totals[-1]
+        for key, column in (("vat_amount", vat_column), ("gross_amount", gross_column)):
+            center = (column["x0"] + column["x1"]) / 2
+            tolerance = max(24, (column["x1"] - column["x0"]) * 0.75)
+            amounts = [(abs((cell["x0"] + cell["x1"]) / 2 - center), cell)
+                       for cell in total[1:] if parse_invoice_money(cell["text"]) is not None
+                       and abs((cell["x0"] + cell["x1"]) / 2 - center) <= tolerance]
+            if not amounts:
+                continue
+            amounts.sort(key=lambda item: item[0])
+            if len(amounts) > 1 and amounts[0][0] == amounts[1][0]:
+                continue
+            value_cell = amounts[0][1]
+            results.append((key, decimal_text(parse_invoice_money(value_cell["text"])), column, value_cell))
+    return results
+
+
 def required_document_fields(document_type):
     if document_type == "tax_decision":
         return ("supplier_name", "document_date", "gross_amount", "currency_code")
@@ -705,6 +749,7 @@ def parse_invoice_pages(pages):
         labels["amount_due"] += r"|Summa\s+er\s+tillgodo|Belopp\s+att\s+återfå"
     amount_caption_patterns = tuple(labels.values()) + (r"Bankkonto\s*(?:nr\.?|nummer)?",)
     candidates = {key: [] for key in labels}
+    fiscal_summary_matches = {"vat_amount": [], "gross_amount": []}
     companies = []
     supplier_identity = None
     field_sources = {}
@@ -744,6 +789,14 @@ def parse_invoice_pages(pages):
             rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
                     for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
         cells = [cell for row in rows for cell in row]
+        for key, value, caption, value_cell in invoice_fiscal_summary_totals(rows):
+            fiscal_summary_matches[key].append((value, {
+                "source": page.get("source"), "page": page.get("page", 1),
+                "attachment_index": page.get("attachment_index", 0),
+                "box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                "text": value_cell["text"], "caption": caption["text"],
+                "kind": "fiscal_summary_total", "priority": 5,
+            }))
         if page.get("page", 1) == 1:
             companies.extend(invoice_seller_blocks(cells, page))
         order_lines, order_sources = invoice_order_lines(rows)
@@ -933,6 +986,8 @@ def parse_invoice_pages(pages):
     }
     diagnostics = []
     for key, matches in candidates.items():
+        if key in fiscal_summary_matches and fiscal_summary_matches[key]:
+            matches = fiscal_summary_matches[key]
         if key == "vat_amount" and fiscal_summary_pages:
             matches = [(value, source) for value, source in matches
                        if (source.get("attachment_index", 0), source["page"]) in fiscal_summary_pages]
