@@ -367,13 +367,12 @@ class IncomingIntegrationTests(unittest.TestCase):
         try:
             window.inputs["vat_amount"].setText("24.00")
             changed_totals = window.payload()["allocations"][0]
-            self.assertNotIn("net_amount", changed_totals)
-            self.assertNotIn("vat_amount", changed_totals)
-            self.assertNotIn("rounding_amount", changed_totals)
+            self.assertEqual({key: changed_totals[key] for key in parts[0]}, parts[0])
             window.inputs["vat_amount"].setText("25.00")
 
             resaved = window.payload()
-            self.assertEqual(resaved["allocations"], parts)
+            self.assertEqual([{key: row[key] for key in expected}
+                              for row, expected in zip(resaved["allocations"], parts)], parts)
             self.assertEqual(resaved["rounding_amount"], "0.00")
             self.store.save(1, resaved, window.revision)
             self.assertEqual(self.sync()["synced"], 1, self.last_sync)
@@ -394,6 +393,197 @@ class IncomingIntegrationTests(unittest.TestCase):
                 [["40.00", "10.00", "0.00", "50.00"], ["60.00", "15.00", "0.00", "75.00"]],
             )
         finally:
+            window.close()
+
+    def test_existing_manual_document_preserves_fields_when_correcting_rounding(self):
+        from offline_review_ui import OfflineReviewWindow
+
+        revision, payload = self.store.latest(2)
+        payload.update(
+            confirmed_type="manual", supplier_name="Isolated Supplier AB",
+            invoice_number="TEST-ROUND", net_amount="100.00", vat_amount="25.00",
+            gross_amount="125.00", rounding_amount=None, original_checked=True,
+            allocations=[{"destination": "object", "object_id": self.object_id,
+                          "gross_amount": "125.00"}],
+        )
+        revision = self.store.save(2, payload, revision)
+        card = self.store.transfer(2, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        self.host.incoming_register_snapshot = lambda: self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+        before = self.host.incoming_register_snapshot()[0]
+        self.assertEqual(before["document_type"], "manual")
+        seed = {key: before[key] for key in (
+            "supplier_name", "invoice_number", "payment_reference", "document_date",
+            "currency_code", "net_amount", "vat_amount", "gross_amount", "rounding_amount",
+            "document_type", "verification_status", "allocations")}
+        seed.update(client_id=card["client_id"], usage="object_cost", allocation_basis="gross",
+                    expected_version=before["sync_version"], expense_category="Materials",
+                    document_comment="Keep this note")
+        seed["allocations"][0]["note"] = "Allocation note"
+        seed["allocations"][0]["expense_category"] = "Timber"
+        updated = self.server_client.put(
+            f"/api/expense-documents/{before['id']}", json=seed,
+            headers={"X-Sync-Key": "isolated-sync-test-key"})
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        before = self.host.incoming_register_snapshot()[0]
+        self.assertEqual(before["allocations"][0]["note"], "Allocation note")
+        self.assertEqual(before["allocations"][0]["expense_category"], "Timber")
+
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=2)
+        try:
+            window.inputs["gross_amount"].setText("124.75")
+            window.inputs["rounding_amount"].setText("-0.25")
+            window.allocations.item(0, 1).setText("124.75")
+            self.store.save(2, window.payload(), window.revision)
+            self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+            saved = self.host.incoming_register_snapshot()[0]
+            self.assertEqual(len(self.host.incoming_register_snapshot()), 1)
+            for key in ("document_type", "supplier_name", "invoice_number", "document_date",
+                        "currency_code", "net_amount", "vat_amount", "payment_reference",
+                        "expense_category", "document_comment", "verification_status"):
+                self.assertEqual(saved[key], before[key], key)
+            self.assertEqual(saved["rounding_amount"], "-0.25")
+            self.assertEqual(saved["gross_amount"], "124.75")
+            self.assertEqual(saved["allocations"][0]["object_id"], self.object_id)
+            self.assertEqual(saved["allocations"][0]["note"], "Allocation note")
+            self.assertEqual(saved["allocations"][0]["expense_category"], "Timber")
+            _revision, reopened = self.store.current_review(2)
+            self.assertEqual(reopened["confirmed_type"], "manual")
+            self.assertEqual(reopened["rounding_amount"], "-0.25")
+            changes = json.loads(self.store.history(2)[-1]["changes_json"])
+            self.assertEqual(changes["_server_before"]["sync_version"], before["sync_version"])
+            self.assertEqual(changes["_server_before"]["document_type"], "manual")
+        finally:
+            window.loaded_payload = window.payload()
+            window.close()
+
+    def test_existing_document_rejects_stale_version_without_queuing(self):
+        revision = self.approve()
+        card = self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        snapshot = self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+        self.host.incoming_register_snapshot = lambda: snapshot
+        revision, payload = self.store.current_review(1)
+        snapshot[0]["sync_version"] += 1
+        payload["supplier_name"] = "Stale edit"
+        with self.assertRaisesRegex(ReviewError, "изменилось"):
+            self.store.save(1, payload, revision)
+        self.assertEqual(self.store.latest(1)[0], revision)
+        self.assertFalse(self.host.incoming_delivery_pending(card["client_id"]))
+
+    def test_server_rejects_version_changed_after_editor_opened(self):
+        revision = self.approve()
+        card = self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        snapshot = self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+        self.host.incoming_register_snapshot = lambda: snapshot
+        revision, payload = self.store.current_review(1)
+        before = snapshot[0]
+        remote = {key: before[key] for key in (
+            "supplier_name", "invoice_number", "payment_reference", "document_date", "currency_code",
+            "net_amount", "vat_amount", "gross_amount", "rounding_amount", "document_type",
+            "verification_status", "allocations")}
+        remote.update(client_id=card["client_id"], usage="object_cost", allocation_basis="gross",
+                      expected_version=before["sync_version"], supplier_name="Newer server value")
+        response = self.server_client.put(
+            f"/api/expense-documents/{before['id']}", json=remote,
+            headers={"X-Sync-Key": "isolated-sync-test-key"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload["supplier_name"] = "Stale editor value"
+        self.store.save(1, payload, revision)
+        result = self.sync()
+        self.assertEqual(result["synced"], 0)
+        current = self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["supplier_name"], "Newer server value")
+        self.assertTrue(result["test_errors"])
+
+    def test_old_server_cannot_receive_preservation_sensitive_update(self):
+        revision = self.approve()
+        card = self.store.transfer(1, revision)
+
+        def old_server(method, url, headers=None, **kwargs):
+            response = self.request(method, url, headers=headers, **kwargs)
+            if urlsplit(url).path.endswith("capabilities"):
+                body = response.json()
+                body["features"].remove("incoming_review_preservation_v1")
+                return SimpleNamespace(status_code=response.status_code, json=lambda: body)
+            return response
+
+        with patch.object(socket.socket, "connect", side_effect=AssertionError("Network forbidden")), \
+                patch.object(self.desktop.requests, "request", side_effect=old_server):
+            result = self.desktop.SmartReportApp._sync_expense_document_outbox(self.host)
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["blocked"], 1)
+        self.assertFalse(any(method in ("POST", "PUT") for method, _path in self.calls))
+        conn = self.desktop.get_db_connection()
+        try:
+            pending = conn.execute("SELECT last_error FROM expense_document_outbox WHERE client_id=?",
+                                   (card["client_id"],)).fetchone()
+            self.assertIn("incoming_review_preservation_v1", pending["last_error"])
+        finally:
+            conn.close()
+
+    def test_empty_queue_and_explicit_open_of_accounted_document(self):
+        from offline_review_ui import OfflineReviewWindow
+        revision = self.approve()
+        self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        self.host.incoming_register_snapshot = lambda: self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+        for document_id in (2, 3):
+            self.store.set_action(document_id, "ignore", 0)
+        window = OfflineReviewWindow(self.store, integrated=True)
+        explicit = None
+        try:
+            self.assertEqual(window.selector.count(), 0)
+            self.assertIn("Нет необработанных документов", window.empty_state.text())
+            explicit = OfflineReviewWindow(self.store, integrated=True, document_id=1)
+            self.assertEqual(explicit.document_id, 1)
+            self.assertIsNotNone(explicit.gallery)
+            self.assertFalse(explicit.transfer_button.isEnabled())
+        finally:
+            window.close()
+            if explicit:
+                explicit.close()
+
+    def test_unknown_tax_remains_unknown_after_existing_card_edit(self):
+        from offline_review_ui import OfflineReviewWindow
+        revision, payload = self.store.latest(1)
+        payload.update(net_amount=None, vat_amount=None, rounding_amount=None,
+                       original_checked=True, allocations=[{
+                           "destination": "company", "object_id": None, "gross_amount": "125.00",
+                           "net_amount": None, "vat_amount": None,
+                       }])
+        revision = self.store.save(1, payload, revision)
+        card = self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        self.host.incoming_register_snapshot = lambda: self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
+        try:
+            window.inputs["invoice_number"].clear()
+            self.store.save(1, window.payload(), window.revision)
+            self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+            saved = self.host.incoming_register_snapshot()[0]
+            self.assertEqual(saved["client_id"], card["client_id"])
+            self.assertFalse(saved["invoice_number"])
+            for key in ("net_amount", "vat_amount", "rounding_amount"):
+                self.assertIsNone(saved[key], key)
+            for key in ("net_amount", "vat_amount"):
+                self.assertIsNone(saved["allocations"][0][key], key)
+        finally:
+            window.loaded_payload = window.payload()
             window.close()
 
     def test_unsupported_server_keeps_receipt_and_retries_safe(self):

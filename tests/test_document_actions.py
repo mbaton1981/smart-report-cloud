@@ -322,6 +322,8 @@ class DocumentActionTests(unittest.TestCase):
         self.assertEqual(saved_base["raw_text"], "Preserve existing extraction text")
         self.assertEqual(saved_base["field_sources"]["supplier_name"], [{"kind": "manual"}])
         self.assertEqual(saved_base["field_sources"]["net_amount"], [{"kind": "invoice_total"}])
+        self.assertEqual(saved_payload["supplier_name"], "Manually verified supplier")
+        self.assertEqual(saved_payload["invoice_number"], "MANUAL-123")
         self.assertEqual(saved_payload["net_amount"], "200.00")
         self.assertEqual(saved_payload["vat_amount"], "50.00")
         self.assertEqual(saved_payload["gross_amount"], "250.00")
@@ -377,12 +379,17 @@ class DocumentActionTests(unittest.TestCase):
             self.qt_app.processEvents()
             self.assertTrue(window.financial_panel.isVisible())
             window.inputs["vat_amount"].setText("invalid unsaved financial text")
-            with patch.object(self.store, "save", side_effect=AssertionError("Financial save forbidden")):
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Cancel), \
+                    patch.object(self.store, "save", side_effect=AssertionError("Financial save forbidden")):
                 window.ignore_button.click()
                 window.later_button.click()
-            self.assertEqual(self.store.action(1)[1], "later")
-            self.assertTrue(window.financial_panel.isVisible())
+            self.assertIsNone(self.store.action(1)[1])
+            self.assertEqual(window.inputs["vat_amount"].text(), "invalid unsaved financial text")
             window.inputs["vat_amount"].clear()
+            window.later_button.click()
+            self.assertEqual(self.store.action(1)[1], "later")
+            window.selector.setCurrentIndex(window.selector.findData(1))
+            self.assertTrue(window.financial_panel.isVisible())
             self.qt_app.processEvents()
             self.assertTrue(window.financial_panel.isVisible())
             self.assertTrue(window.gallery.isVisible())
@@ -412,6 +419,8 @@ class DocumentActionTests(unittest.TestCase):
             self.assertIsNone(documents[0]["amount_due"])
             self.assertTrue(documents[0]["has_original"])
             self.host.incoming_register_snapshot = self.documents
+            window.show_all_states.setChecked(True)
+            window.selector.setCurrentIndex(window.selector.findData(1))
             window.select_document()
             self.assertEqual(window.status.text(), "Учтён на объекте")
             self.assertFalse(window.ignore_button.isEnabled())

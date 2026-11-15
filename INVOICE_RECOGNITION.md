@@ -181,6 +181,24 @@ retain their existing partial-allocation rules. Multi-object desktop delivery
 requires `object_cost_allocations_v1` server capability; an older server leaves
 the operation queued with an explicit error.
 
+## Incoming review queue and preservation
+
+The incoming window lists documents needing attention once each, with the
+specific reasons and currency-separated document totals. Unknown amounts make
+the totals incomplete. The all-documents filter includes accounted and
+excluded documents, and explicit navigation opens the requested document.
+Review the original alongside its fields and allocations; saving a draft does
+not confirm an expense. Deferring a document keeps it available, protects
+unsaved edits and moves to another pending document. Only the explicit expense
+action confirms it.
+
+Existing expense edits retain the saved document type and untouched fields,
+including allocation details. The rounding field may be edited explicitly.
+Edits use the server version and retain the prior server snapshot in local
+history; a version conflict prevents overwriting newer changes. Delivery of
+these edits requires `incoming_review_preservation_v1`; an older server leaves
+the operation in the outbox with an error.
+
 ## Document actions and congestion-tax costs — 1.0.12-rc1
 
 The current incoming-document workflow supersedes the invoice-only candidate
@@ -189,8 +207,9 @@ restrictions described in the historical sections below:
 - Choose **Не учитывать**, **Разобрать позже**, or **Учесть как расход**.
   The first two save only an append-only document-action history; they do not
   validate financial fields, create outbox entries, or discard the original PDF.
-  Previously saved financial edits remain separate. Unsaved edits are not applied.
-- Only the expense action opens the financial editor. Invoice number and VAT
+  Previously saved financial edits remain separate. Unsaved edits require an
+  explicit save, discard or cancel choice before moving on.
+- The financial editor is available before the expense action. Invoice number and VAT
   are optional; object selection and manual review remain required. Recognition
   suggests a type but does not claim that the user confirmed that type.
 - `object_cost_fields` provides expense suggestions independently of invoice

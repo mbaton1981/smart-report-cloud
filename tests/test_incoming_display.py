@@ -57,7 +57,7 @@ class IncomingDisplayTests(unittest.TestCase):
         window = self.open_window(select_first=False)
 
         visible_ids = [window.selector.itemData(i) for i in range(window.selector.count())]
-        self.assertEqual(visible_ids, [3, 1])
+        self.assertEqual(visible_ids, [3, 2, 1])
         self.assertIsNone(window.selector.currentData())
         self.assertIsNone(window.document_id)
         self.assertIsNone(window.gallery)
@@ -68,6 +68,97 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertEqual(
             [window.selector.itemData(i) for i in range(window.selector.count())], [3, 2, 1])
         self.assertIsNone(window.selector.currentData())
+
+    def test_queue_reasons_are_combined_and_totals_keep_currencies_separate(self):
+        revision, fields = self.store.latest(1)
+        fields.update(gross_amount=None, currency_code="SEK", original_checked=False,
+                      allocations=[])
+        self.store.save(1, fields, revision)
+        revision, fields = self.store.latest(2)
+        fields.update(currency_code="EUR", gross_amount="100.00", original_checked=True,
+                      allocations=[{"destination": "company", "object_id": None,
+                                    "gross_amount": "25.00"}])
+        self.store.save(2, fields, revision)
+        window = self.open_window(select_first=False)
+        self.assertEqual(sum(window.selector.itemData(i) == 1
+                             for i in range(window.selector.count())), 1)
+        first = window.selector.itemText(window.selector.findData(1))
+        self.assertIn("Не определена сумма", first)
+        self.assertIn("Не выбрано назначение", first)
+        self.assertIn("сверить данные", first)
+        second = window.selector.itemText(window.selector.findData(2))
+        self.assertIn("Осталось распределить 75.00 EUR", second)
+        self.assertIn("EUR", window.queue_summary.text())
+        self.assertIn("SEK", window.queue_summary.text())
+        self.assertIn("итог неполный", window.queue_summary.text())
+
+    def test_later_preserves_edits_and_moves_to_another_document(self):
+        from PyQt6.QtWidgets import QMessageBox
+        window = self.open_window(document_id=1)
+        window.inputs["supplier_name"].setText("Saved for later")
+        with patch("offline_review_ui.QMessageBox.question",
+                   return_value=QMessageBox.StandardButton.Cancel):
+            window.set_action("later")
+        self.assertEqual(window.document_id, 1)
+        self.assertIsNone(self.store.action(1)[1])
+        with patch("offline_review_ui.QMessageBox.question",
+                   return_value=QMessageBox.StandardButton.Save):
+            window.set_action("later")
+        self.assertEqual(self.store.action(1)[1], "later")
+        self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Saved for later")
+        self.assertNotEqual(window.document_id, 1)
+        self.assertGreaterEqual(window.selector.findData(1), 0)
+        self.assertIsNone(self.store.card(1))
+
+    def test_failed_later_action_does_not_forget_discarded_form_edits(self):
+        from PyQt6.QtWidgets import QMessageBox
+        window = self.open_window(document_id=1)
+        window.inputs["supplier_name"].setText("Still visible")
+        with patch("offline_review_ui.QMessageBox.question",
+                   return_value=QMessageBox.StandardButton.Discard), \
+                patch.object(self.store, "set_action", side_effect=ReviewError("action failed")), \
+                patch("offline_review_ui.QMessageBox.warning"):
+            window.set_action("later")
+        self.assertEqual(window.document_id, 1)
+        self.assertNotEqual(window.payload(), window.loaded_payload)
+        self.assertEqual(window.inputs["supplier_name"].text(), "Still visible")
+        window.loaded_payload = window.payload()
+
+    def test_confirm_moves_on_success_but_not_on_error(self):
+        window = self.open_window(document_id=1)
+        window.checked.setChecked(True)
+        window.allocations.cellWidget(0, 0).setCurrentIndex(
+            window.allocations.cellWidget(0, 0).findData(self.object_id))
+        with patch.object(self.store, "transfer", side_effect=ReviewError("isolated failure")), \
+                patch("offline_review_ui.QMessageBox.warning"):
+            window.confirm_transfer()
+        self.assertEqual(window.document_id, 1)
+        self.assertIsNone(self.store.card(1))
+        window.confirm_transfer()
+        self.assertIsNotNone(self.store.card(1))
+        self.assertEqual(window.document_id, 1)
+        self.assertFalse(window.transfer_button.isEnabled())
+        self.assertTrue(window.next_button.isVisible())
+        window.next_button.click()
+        self.assertNotEqual(window.document_id, 1)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM register").fetchone()[0], 1)
+
+    def test_reload_error_is_not_an_empty_queue(self):
+        window = self.open_window(document_id=1)
+        with patch.object(self.store, "documents", side_effect=ReviewError("read failed")), \
+                patch("offline_review_ui.QMessageBox.warning") as warning:
+            window.reload_documents()
+        warning.assert_called_once()
+        self.assertEqual(window.document_id, 1)
+        self.assertIn("read failed", window.status.text())
+        self.assertGreater(window.selector.count(), 0)
+
+    def test_original_load_error_remains_visible_and_blocks_confirmation(self):
+        with patch.object(self.store, "original", side_effect=ReviewError("original unreadable")):
+            window = self.open_window(document_id=1)
+        self.assertIn("original unreadable", window.status.text())
+        self.assertFalse(window.transfer_button.isEnabled())
+        self.assertIsNone(self.store.card(1))
 
     def test_registered_document_opens_explicitly_even_when_accounted(self):
         revision = self.approve(2)
@@ -356,15 +447,18 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("Manually checked supplier", window.selector.currentText())
         self.assertIn("130.00", window.selector.currentText())
         window.later_button.click()
-        self.assertIn("Разобрать позже", window.selector.currentText())
+        self.assertNotEqual(window.document_id, 1)
+        self.assertIn("Разобрать позже", window.selector.itemText(window.selector.findData(1)))
         self.assertFalse(self.store.add_pdf(self.store.original(1).read_bytes(), "renamed.pdf",
                                            {"fields": self.fields}))
         window.reload_documents()
+        window.selector.setCurrentIndex(window.selector.findData(1))
         self.assertEqual(window.inputs["supplier_name"].text(), "Manually checked supplier")
         self.assertEqual(self.store.history(1), history)
         window.inputs["supplier_name"].setText("Unsaved correction")
         self.background_refresh(window)
         self.assertEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
+        window.loaded_payload = window.payload()
 
     def test_explicit_automatic_refresh_preserves_original_id_and_audit(self):
         original = self.store.original(1).read_bytes()
@@ -806,7 +900,7 @@ class IncomingDisplayTests(unittest.TestCase):
             self.assertEqual([call.args[0] for call in label.call_args_list], [other])
         window.reload_documents()
         self.assertEqual(window.inputs["supplier_name"].text(), "Unsaved correction")
-        self.assertIn("Разобрать позже", window.selector.itemText(1))
+        self.assertIn("Разобрать позже", window.selector.itemText(window.selector.findData(other)))
         window.loaded_payload = window.payload()
 
     def test_unchanged_server_snapshot_does_not_rebuild_selected_card(self):

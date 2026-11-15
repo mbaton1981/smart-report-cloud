@@ -1184,11 +1184,16 @@ def validate_expense_fields(payload):
         if amount_values["gross_amount"] is not None and amount_values["vat_amount"] is not None
         else None
         )
-        if object_cost and payload.get("net_amount") not in (None, "") and payload.get("rounding_amount") not in (None, ""):
-            net = parse_invoice_money(payload["net_amount"])
-            rounding = parse_invoice_money(payload["rounding_amount"])
-            if (net is None or rounding is None or amount_values["vat_amount"] is None
-                    or net + amount_values["vat_amount"] + rounding != amount_values["gross_amount"]):
+        if object_cost and "net_amount" in payload:
+            net = parse_invoice_money(payload.get("net_amount"))
+            rounding = parse_invoice_money(payload.get("rounding_amount"))
+            if payload.get("net_amount") not in (None, "") and net is None:
+                raise ValueError("Некорректная сумма: net_amount.")
+            if payload.get("rounding_amount") not in (None, "") and rounding is None:
+                raise ValueError("Некорректная сумма: rounding_amount.")
+            if (net is not None and amount_values["vat_amount"] is not None
+                    and amount_values["gross_amount"] is not None
+                    and net + amount_values["vat_amount"] + (rounding or 0) != amount_values["gross_amount"]):
                 raise ValueError("Нетто + НДС + указанное округление не равны сумме расхода.")
             amount_values.update(net_amount=net, rounding_amount=rounding)
     elif amount_values["net_amount"] is not None and amount_values["vat_amount"] is not None:
@@ -1320,7 +1325,8 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             if vat_amount is not None:
                 raise ValueError("НДС документа неизвестен; суммы НДС распределений тоже оставьте неизвестными.")
         elif vat_amount is None:
-            if len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"]):
+            if (len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"])
+                    and not (fields.get("usage") == "object_cost" and "vat_amount" in item)):
                 vat_amount = Decimal(fields["vat_amount"])
             else:
                 allocation_vat_unknown = True
@@ -1333,7 +1339,8 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             if (allocated_net is None or vat_amount is None or rounding is None
                     or allocated_net + vat_amount + rounding != allocated_gross):
                 raise ValueError("Net + НДС + отдельное округление части не совпадают с её итогом.")
-        elif vat_amount is not None:
+        elif vat_amount is not None and not (
+                fields.get("usage") == "object_cost" and "net_amount" in item):
             if not parse_invoice_money(fields.get("rounding_amount")):
                 allocated_net = allocated_gross - vat_amount
             elif len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"]):
@@ -1345,6 +1352,7 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             "vat_amount": decimal_text(vat_amount),
             "net_amount": decimal_text(allocated_net),
             "note": str(item.get("note") or "")[:500],
+            "expense_category": str(item.get("expense_category") or "")[:100],
         })
 
     total_gross = Decimal(fields["gross_amount"])
@@ -1719,6 +1727,8 @@ def expense_document_capabilities_api():
         net_features.append("object_cost_allocations_v1")
         if expense_document_type_schema_ready(connection):
             net_features.append("document_type_v1")
+            if invoice_net_schema_ready(connection):
+                net_features.append("incoming_review_preservation_v1")
     finally:
         connection.close()
     return jsonify({

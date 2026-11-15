@@ -3492,6 +3492,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 required_features.add("payment_reference_v1")
             if any(json.loads(row["payload_json"]).get("usage") == "object_cost" for row in rows):
                 required_features.add("object_costs_v1")
+            if any(json.loads(row["payload_json"]).get("requires_incoming_preservation_v1") for row in rows):
+                required_features.add("incoming_review_preservation_v1")
             if any(json.loads(row["payload_json"]).get("usage") == "object_cost"
                    and len(json.loads(row["payload_json"]).get("allocations") or []) > 1 for row in rows):
                 required_features.add("object_cost_allocations_v1")

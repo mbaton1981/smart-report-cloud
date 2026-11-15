@@ -121,6 +121,12 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Выберите объект для этой части.")
             cleaned["allocations"].append({"destination": destination, "object_id": object_id,
                                            "gross_amount": decimal_text(amount)})
+            for key, limit in (("note", 500), ("expense_category", 100)):
+                if key in part:
+                    value = part[key]
+                    if value is not None and (not isinstance(value, str) or len(value) > limit):
+                        raise ReviewError("Некорректное примечание или категория части.")
+                    cleaned["allocations"][-1][key] = value
             for key in ("net_amount", "vat_amount", "rounding_amount"):
                 if key in part:
                     value = parse_invoice_money(part[key])
@@ -157,11 +163,13 @@ class IncomingStore(OfflineReviewStore):
                 for key in EDITABLE:
                     if key in existing:
                         payload[key] = existing[key]
+                payload["confirmed_type"] = existing.get("document_type")
                 payload["allocations"] = [{"destination": row.get("destination") or
                                            ("object" if row.get("object_id") is not None else "company"),
                                            "object_id": row.get("object_id"),
                                            "gross_amount": row.get("gross_amount"),
-                                           **{key: row[key] for key in ("net_amount", "vat_amount", "rounding_amount")
+                                           **{key: row[key] for key in ("net_amount", "vat_amount", "rounding_amount",
+                                                                        "note", "expense_category")
                                               if key in row}}
                                           for row in existing.get("allocations", [])]
                 payload["object_id"] = (payload["allocations"][0]["object_id"]
@@ -188,10 +196,12 @@ class IncomingStore(OfflineReviewStore):
             revision, previous = self.latest(document_id)
             if revision != expected_revision:
                 raise ReviewError("Карточка изменена в другом окне. Обновите распределение.")
+            changes = {key: {"before": previous.get(key), "after": value}
+                       for key, value in cleaned.items() if previous.get(key) != value}
+            changes["_server_before"] = existing
             self.conn.execute("INSERT INTO revisions VALUES (?,?,?,?,?)", (
                 document_id, revision + 1, packed(cleaned),
-                packed({key: {"before": previous.get(key), "after": value}
-                        for key, value in cleaned.items() if previous.get(key) != value}),
+                packed(changes),
                 datetime.now(timezone.utc).isoformat()))
             self.conn.execute("UPDATE register SET payload_json=?,revision=? WHERE document_id=?",
                               (packed(cleaned), revision + 1, document_id))
@@ -288,18 +298,26 @@ class IncomingStore(OfflineReviewStore):
                             digest(self.original(document_id).read_bytes()), "0.00",
                             datetime.now(timezone.utc).isoformat()))
             card = self.card(document_id)
-        return self.deliver(card)
+        return self.deliver(card, confirming=True)
 
     def latest(self, document_id):
         revision, payload = super().latest(document_id)
         if revision == 0:
             base = self.base(document_id)
             costs = self.cost_fields(document_id)
+            reviewed = bool(self.allocations(payload) or payload.get("confirmed_type")
+                            or payload.get("original_checked"))
             for key in EDITABLE:
-                if key in costs:
+                manual = any(source.get("kind") == "manual"
+                             for source in base.get("field_sources", {}).get(key, []))
+                if key in costs and not (reviewed or manual):
                     payload[key] = costs[key]
             amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
-            if all(value is not None for value in amounts) and base.get("document_type") != "tax_decision":
+            gross_manual = any(source.get("kind") == "manual"
+                               for source in base.get("field_sources", {}).get("gross_amount", []))
+            if (not reviewed and not gross_manual
+                    and all(value is not None for value in amounts)
+                    and base.get("document_type") != "tax_decision"):
                 payload["gross_amount"] = decimal_text(sum(amounts))
         return revision, payload
 
@@ -595,6 +613,53 @@ class IncomingStore(OfflineReviewStore):
             return ("Учтён как общий расход фирмы" if has_company else "Учтён на объекте"), True
         return "Ожидает проверки в реестре", False
 
+    def attention_reasons(self, document_id):
+        if self.action(document_id)[1] == "ignore":
+            return []
+        card = self.card(document_id)
+        _, fields = self.current_review(document_id)
+        reasons = []
+        gross = parse_invoice_money(fields.get("gross_amount"))
+        if gross is not None and not gross.is_finite():
+            gross = None
+        currency = fields.get("currency_code")
+        if currency in (None, "", "UNKNOWN"):
+            currency = None
+        parts = self.allocations(fields)
+        if gross is None:
+            reasons.append("Не определена сумма")
+        if fields.get("supplier_name") in (None, "", "UNKNOWN"):
+            reasons.append("Не указан поставщик или эмитент")
+        if fields.get("document_date") in (None, "", "UNKNOWN"):
+            reasons.append("Не указана дата")
+        if currency is None:
+            reasons.append("Не указана валюта")
+        if any((part.get("destination") or
+                ("object" if part.get("object_id") is not None else "unselected")) == "unselected"
+               for part in parts) or not parts:
+            reasons.append("Не выбрано назначение")
+        amounts = [parse_invoice_money(part.get("gross_amount")) for part in parts]
+        if gross is not None and amounts and all(amount is not None and amount.is_finite()
+                                                  for amount in amounts):
+            remaining = gross - sum(amounts, Decimal(0))
+            if remaining > 0:
+                reasons.append(f"Осталось распределить {decimal_text(remaining)} {currency or 'валюта не указана'}")
+            elif remaining < 0:
+                reasons.append("Распределение превышает сумму документа")
+        if not fields.get("original_checked"):
+            reasons.append("Нужно сверить данные с оригиналом")
+        if self.base(document_id).get("suggested_document_type") == "payment_reminder":
+            reasons.append("Напоминание — не новая покупка")
+        if card:
+            status, accounted = self.accounting_status(document_id)
+            if not accounted:
+                reasons.append(status)
+        elif self.action(document_id)[1] == "later":
+            reasons.append("Разобрать позже")
+        if not card:
+            reasons.append("расход не создан")
+        return reasons
+
     @staticmethod
     def due_fields(base, reviewed):
         unchanged = reviewed.get("due_date") == base.get("due_date")
@@ -646,19 +711,23 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Возможный повтор покупки с другим PDF. Нужна ручная сверка.")
         return linked_client
 
-    def deliver(self, card):
+    def deliver(self, card, *, confirming=False):
         delivered = self.conn.execute(
             "SELECT * FROM deliveries WHERE document_id=?", (card["document_id"],)).fetchone()
         if delivered:
             return card
         payload = json.loads(card["payload_json"])
         base = self.base(card["document_id"])
-        document_type = payload.get("confirmed_type") or base.get("document_type") or "manual"
+        existing = self._existing(card["client_id"])
+        document_type = (payload.get("confirmed_type")
+                         or (existing.get("document_type") if existing else None)
+                         or base.get("document_type") or "manual")
         payload.update(
             client_id=card["client_id"], document_type=document_type, allocation_basis="gross", usage="object_cost",
             cost_operation_id=f"{card['client_id']}:{card['revision']}",
-            verification_status="confirmed",
-            recognized_text=base.get("raw_text") or "",
+            requires_incoming_preservation_v1=True,
+            verification_status=("confirmed" if confirming or not existing
+                                 else existing.get("verification_status")),
             required_attachment_sha256=[card["sha256"]],
             allocations=[{
                 **part,
@@ -668,11 +737,16 @@ class IncomingStore(OfflineReviewStore):
         )
         for key in ("amount_due", "settlement_status", "due_date"):
             payload.pop(key, None)
+        if existing:
+            for key in ("expense_category", "document_comment"):
+                if key in existing:
+                    payload[key] = existing[key]
+        else:
+            payload["recognized_text"] = base.get("raw_text") or ""
         # Retry the same client_id through the normal outbox. The queue is durable before
         # recording delivery; a lost response cannot change the document's identity.
         original = self.original(card["document_id"])
         staged = self.host._store_expense_originals([str(original)], card["client_id"])
-        existing = self._existing(card["client_id"])
         self.host.queue_expense_document_operation(
             card["client_id"], "upsert", payload,
             server_document_id=existing.get("id") if existing else None,
@@ -799,7 +873,7 @@ def open_incoming(host, root, document_id=None):
         if window.document_id is None:
             return
         text, green = store.accounting_status(window.document_id)
-        if store.card(window.document_id):
+        if store.card(window.document_id) and not window.original_error:
             window.status.setText(text)
             from desktop_theme import apply_style
             apply_style(window.status, "background:#1c4532;color:#68d391;padding:6px" if green else "")

@@ -5,6 +5,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from decimal import Decimal
 from html import escape
 from pathlib import Path
 
@@ -32,7 +33,7 @@ LABELS = {
 }
 TYPES = {"invoice": "Фактура", "receipt": "Чек", "unclassified": "Тип не установлен",
          "tax_decision": "Решение о транспортном налоге", "order_confirmation": "Подтверждение заказа",
-         "credit_note": "Кредитная фактура", "proforma": "Проформа"}
+         "credit_note": "Кредитная фактура", "proforma": "Проформа", "manual": "Вручную"}
 
 
 class IncomingDocumentDelegate(QStyledItemDelegate):
@@ -74,6 +75,7 @@ class OfflineReviewWindow(QDialog):
         self.explicit_document_id = document_id
         self.gallery = None
         self.preview_document_id = None
+        self.original_error = None
         self.inputs, self.origins = {}, {}
         self._validation_styles = {}
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
@@ -108,6 +110,10 @@ class OfflineReviewWindow(QDialog):
         if integrated or document_id is not None:
             self.selector.setCurrentIndex(self.selector.findData(document_id))
         layout.addWidget(self.selector)
+        if integrated:
+            self.queue_summary = QLabel()
+            self.queue_summary.setWordWrap(True)
+            layout.addWidget(self.queue_summary)
         self.classification = QLabel()
         self.classification.setWordWrap(True)
         layout.addWidget(self.classification)
@@ -161,10 +167,10 @@ class OfflineReviewWindow(QDialog):
 
         self.field_labels = {}
         for key, label in LABELS.items():
-            if integrated and key in ("due_date", "amount_due", "rounding_amount"):
+            if integrated and key in ("due_date", "amount_due"):
                 continue
             if integrated and key == "gross_amount":
-                label = "Сумма расхода по документу"
+                label = "Сумма к оплате по документу"
             if integrated and key == "supplier_name":
                 label = "Поставщик / организация / получатель сбора"
             if integrated and key in ("invoice_number", "vat_amount", "net_amount"):
@@ -212,7 +218,7 @@ class OfflineReviewWindow(QDialog):
             self.object.hide()
             self.allocations = QTableWidget(0, 3)
             self.allocations.setObjectName("review_allocations")
-            self.allocations.setHorizontalHeaderLabels(["Назначение", "Сумма с НДС", ""])
+            self.allocations.setHorizontalHeaderLabels(["Назначение", "Сумма части", ""])
             header = self.allocations.horizontalHeader()
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -247,6 +253,7 @@ class OfflineReviewWindow(QDialog):
             form.addRow(self.allocation_total)
             self.allocations.itemChanged.connect(self.update_allocation_total)
             self.inputs["gross_amount"].textChanged.connect(self.update_allocation_total)
+            self.inputs["currency_code"].textChanged.connect(self.update_allocation_total)
         else:
             form.addRow("Объект:", self.object)
         self.checked = QCheckBox("Сверил оригинал")
@@ -300,11 +307,15 @@ class OfflineReviewWindow(QDialog):
             self.ignore_button = QPushButton("Не учитывать — не фактура")
             self.restore_button = QPushButton("Восстановить документ")
             self.later_button = QPushButton("Разобрать позже")
+            self.next_button = QPushButton("Следующий документ")
+            self.next_button.hide()
+            self.next_button.clicked.connect(self.advance_document)
             self.expense_button = self.transfer_button
             self.ignore_button.clicked.connect(lambda: self.set_action("ignore"))
             self.restore_button.clicked.connect(lambda: self.set_action("expense"))
             self.later_button.clicked.connect(lambda: self.set_action("later"))
-            for button in (self.ignore_button, self.restore_button, self.later_button, self.expense_button):
+            for button in (self.ignore_button, self.restore_button, self.later_button, self.expense_button,
+                           self.next_button):
                 actions.addWidget(button)
             layout.addLayout(actions)
             draft_actions = QHBoxLayout()
@@ -331,41 +342,33 @@ class OfflineReviewWindow(QDialog):
         documents = self.store.documents()
         if not self.integrated:
             return documents
-        documents = sorted(documents, key=lambda item: item["id"], reverse=True)
         if self.show_all_states.isChecked():
-            return documents
+            return sorted(documents, key=lambda item: item["id"], reverse=True)
+        documents = sorted(documents, key=lambda item: (
+            self.store.action(item["id"])[1] == "later", -item["id"]))
         return [
             document for document in documents
             if document["id"] == self.explicit_document_id
-            or (self.store.action(document["id"])[1] != "ignore"
-                and self.store.card(document["id"]) is None)
+            or (document["id"] == getattr(self, "document_id", None)
+                and hasattr(self, "next_button") and not self.next_button.isHidden())
+            or self.store.attention_reasons(document["id"])
         ]
 
     def payload(self):
-        result = {**{key: widget.text().strip() or None for key, widget in self.inputs.items()},
-                "confirmed_type": None if self.integrated else self.kind.currentData(),
+        result = {**(getattr(self, "loaded_review", {}) if self.integrated else {}),
+                **{key: widget.text().strip() or None for key, widget in self.inputs.items()},
+                "confirmed_type": (getattr(self, "loaded_review", {}).get("confirmed_type")
+                                   if self.integrated else self.kind.currentData()),
                 "object_id": self.object.currentData(),
                 "original_checked": self.checked.isChecked(),
-                "settlement_status": None if self.integrated else
+                "settlement_status": getattr(self, "loaded_review", {}).get("settlement_status") if self.integrated else
                     "prepaid" if self.receipt_paid.isChecked() else None}
         if self.integrated:
             from expense_documents import parse_invoice_money, decimal_text
-            base = self.store.base(self.document_id)
-            rounding = parse_invoice_money(base.get("rounding_amount"))
             net = parse_invoice_money(result.get("net_amount"))
             vat = parse_invoice_money(result.get("vat_amount"))
             gross = parse_invoice_money(result.get("gross_amount"))
-            if (rounding is not None and net is not None and vat is not None
-                    and net + vat + rounding == gross):
-                result["rounding_amount"] = decimal_text(rounding)
             loaded_review = getattr(self, "loaded_review", {}) or {}
-            same_document_totals = all(
-                parse_invoice_money(result.get(key)) == parse_invoice_money(loaded_review.get(key))
-                for key in ("net_amount", "vat_amount", "gross_amount")
-            )
-            if same_document_totals and result.get("rounding_amount") in (None, ""):
-                if loaded_review.get("rounding_amount") not in (None, ""):
-                    result["rounding_amount"] = loaded_review["rounding_amount"]
             original_parts = self.store.allocations(loaded_review)
             parts = []
             for row in range(self.allocations.rowCount()):
@@ -373,19 +376,18 @@ class OfflineReviewWindow(QDialog):
                 gross_amount = self.allocations.item(row, 1).text().strip() or None
                 part = {"destination": destination, "object_id": object_id,
                         "gross_amount": gross_amount}
-                if same_document_totals:
-                    matches = [
-                        original for original in original_parts
-                        if (original.get("destination") or
-                            ("object" if original.get("object_id") is not None else "company")) == destination
-                        and original.get("object_id") == object_id
-                        and parse_invoice_money(original.get("gross_amount"))
-                        == parse_invoice_money(gross_amount)
-                    ]
-                    if len(matches) == 1:
-                        for key in ("net_amount", "vat_amount", "rounding_amount"):
-                            if matches[0].get(key) not in (None, ""):
-                                part[key] = matches[0][key]
+                original = self.allocations.cellWidget(row, 0).property("reviewOriginalPart")
+                if original in original_parts:
+                    for key in ("net_amount", "vat_amount", "rounding_amount", "note", "expense_category"):
+                        if key in original:
+                            part[key] = original[key]
+                if (original in original_parts and len(original_parts) == 1 and self.allocations.rowCount() == 1
+                      and parse_invoice_money(original_parts[0].get("gross_amount"))
+                          != parse_invoice_money(gross_amount)
+                      and parse_invoice_money(gross_amount) == gross
+                      and net is not None and vat is not None):
+                    part.update(net_amount=decimal_text(net), vat_amount=decimal_text(vat),
+                                rounding_amount=result.get("rounding_amount"))
                 parts.append(part)
             if parts:
                 result["allocations"] = parts
@@ -408,6 +410,7 @@ class OfflineReviewWindow(QDialog):
         row = self.allocations.rowCount()
         self.allocations.insertRow(row)
         combo = ObjectPickerComboBox()
+        combo.setProperty("reviewOriginalPart", part or None)
         combo.setMinimumWidth(110)
         combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         selected = part.get("object_id")
@@ -554,8 +557,11 @@ class OfflineReviewWindow(QDialog):
             self.allocation_total.setText("Выберите объект или общие расходы для каждой незаполненной части.")
             return
         allocated = sum(amounts, Decimal(0))
+        currency = self.inputs["currency_code"].text().strip() or "валюта не указана"
+        remaining = decimal_text(total - allocated) if total is not None else "не определён"
         self.allocation_total.setText(
-            f"Распределено: {decimal_text(allocated)}; общая сумма: {decimal_text(total) or 'не указана'}. "
+            f"Сумма документа: {decimal_text(total) or 'не указана'} {currency}; "
+            f"распределено: {decimal_text(allocated)}; осталось: {remaining}. "
             + ("Суммы совпадают." if total == allocated and amounts else
                "Для учёта распределите всю сумму. Можно сохранить черновик."))
 
@@ -580,10 +586,16 @@ class OfflineReviewWindow(QDialog):
                 self.allocations.item(0, 1).setText(value)
 
     def set_action(self, action):
+        previous_revision = getattr(self, "revision", None)
+        previous_loaded = getattr(self, "loaded_payload", None)
+        if action in ("ignore", "later") and not self.keep_unsaved():
+            return
         previous_action = self.store.action(self.document_id)[1] if self.integrated else None
         try:
             self.action_revision = self.store.set_action(self.document_id, action, self.action_revision)
         except (ReviewError, OSError, sqlite3.Error) as error:
+            if self.revision == previous_revision and previous_loaded is not None:
+                self.loaded_payload = previous_loaded
             QMessageBox.warning(self, "Статус не изменён", str(error))
             return
         # Status changes do not parse, save, or discard visible financial edits.
@@ -601,14 +613,13 @@ class OfflineReviewWindow(QDialog):
                  "Проверьте данные и распределите сумму по объектам. Номер и НДС необязательны."
                  if action == "expense" else labels[action])
         self.status.setText(label)
-        unsaved = self.payload() != self.loaded_payload
-        if action in ("ignore", "later") and unsaved:
-            self.status.setText(label + ". Несохранённые правки полей не применены.")
         desktop_theme.apply_style(self.status, "")
         refresh = getattr(self.store.host, "incoming_review_changed", None)
         if refresh:
             refresh()
-        if not unsaved:
+        if action in ("ignore", "later"):
+            self.advance_document()
+        else:
             self.reload_documents()
 
     def update_action_controls(self):
@@ -645,7 +656,7 @@ class OfflineReviewWindow(QDialog):
         for key, label_widget in self.field_labels.items():
             label = LABELS[key]
             if self.integrated and key == "gross_amount":
-                label = "Сумма расхода по документу"
+                label = "Сумма к оплате по документу"
             if self.integrated and key == "supplier_name":
                 label = "Поставщик / организация / получатель сбора"
             if self.integrated and key in ("invoice_number", "vat_amount", "net_amount"):
@@ -656,7 +667,7 @@ class OfflineReviewWindow(QDialog):
                 label = "Эмитент / поставщик"
             label_widget.setText(label + ":")
         if self.integrated and hasattr(self, "allocations"):
-            amount_label = "Сумма к оплате" if infrastructure_fee else "Сумма с НДС"
+            amount_label = "Сумма к оплате" if infrastructure_fee else "Сумма части"
             self.allocations.setHorizontalHeaderLabels(["Назначение", amount_label, ""])
 
     def document_label(self, document_id):
@@ -669,22 +680,53 @@ class OfflineReviewWindow(QDialog):
         sources = source_data.get("sources") or []
         filename = sources[0].get("filename") if sources and isinstance(sources[0], dict) else None
         reason = self.store.exclusion_reason(document_id) if self.integrated else None
-        supplier = (fields.get("supplier_name")
+        supplier = (fields.get("supplier_name") if fields.get("supplier_name") not in (None, "", "UNKNOWN") else None)
+        supplier = (supplier
                     or (filename if reason else None)
                     or "Поставщик не распознан")
-        date = fields.get("document_date") or "Дата не распознана"
+        date = (fields.get("document_date") if fields.get("document_date") not in (None, "", "UNKNOWN")
+                else "Дата не распознана")
+        number = fields.get("invoice_number") or "номер не указан"
         amount = fields.get("gross_amount")
         total = (f"{amount} {fields.get('currency_code') or ''}".strip()
                  if amount not in (None, "") else "Сумма не определена — нужна проверка")
         document_type = fields.get("confirmed_type") or base.get("document_type") or "Тип не установлен"
         document_type = self.type_label(document_type, base)
-        status = (self.store.accounting_status(document_id)[0] if self.integrated
+        status = ("; ".join(self.store.attention_reasons(document_id))
+                  or self.store.accounting_status(document_id)[0] if self.integrated
                   else "Требует проверки")
+        if self.integrated:
+            accounting_status, accounted = self.store.accounting_status(document_id)
+            if accounted and accounting_status not in status:
+                status += "; " + accounting_status
         if reason:
             status = (f"Исключён — {document_type}, не учитывать"
                       if base.get("document_type") == "order_confirmation"
                       else f"Исключён — {reason}")
-        return f"№{document_id} — {supplier} — {document_type} — {date} — {total} — {status}"
+        return f"№{document_id} — {supplier} — {document_type} — {date} — {number} — {total} — {status}"
+
+    def update_queue_summary(self):
+        from expense_documents import decimal_text, parse_invoice_money
+        totals = {}
+        incomplete = False
+        count = 0
+        for doc in self.store.documents():
+            document_id = doc["id"]
+            if not self.store.attention_reasons(document_id):
+                continue
+            count += 1
+            _, fields = self.store.current_review(document_id)
+            amount = parse_invoice_money(fields.get("gross_amount"))
+            currency = fields.get("currency_code")
+            if amount is None or not amount.is_finite() or currency in (None, "", "UNKNOWN"):
+                incomplete = True
+            else:
+                totals[currency] = totals.get(currency, Decimal(0)) + amount
+        amounts = "; ".join(f"{decimal_text(value)} {currency}"
+                            for currency, value in sorted(totals.items()))
+        self.queue_summary.setText(
+            f"Требуют внимания: {count}. Суммы документов: {amounts or 'нет известных сумм'}"
+            + ("; итог неполный" if incomplete else "") + ".")
 
     def refresh_document_labels(self, *, server_changed=False):
         token = (self.store.conn.total_changes, self.store.conn.execute("PRAGMA data_version").fetchone()[0])
@@ -729,6 +771,8 @@ class OfflineReviewWindow(QDialog):
             self._label_token = token
         finally:
             self.selector.blockSignals(False)
+        if self.integrated:
+            self.update_queue_summary()
 
     def reload_documents(self, document_id=None):
         if document_id is not None:
@@ -737,7 +781,15 @@ class OfflineReviewWindow(QDialog):
                  and self.payload() != self.loaded_payload)
         self.selector.blockSignals(True)
         selected = self.selector.currentData()
-        documents = self._visible_documents()
+        try:
+            documents = self._visible_documents()
+        except (ReviewError, OSError, sqlite3.Error, ValueError) as error:
+            self.selector.blockSignals(False)
+            QMessageBox.warning(self, "Не удалось загрузить входящие", str(error))
+            self.status.setText(f"Ошибка загрузки входящих: {error}")
+            return False
+        if dirty and selected is not None and all(doc["id"] != selected for doc in documents):
+            documents.append({"id": selected})
         visible = {doc["id"] for doc in documents}
         self.selector.clear()
         for doc in documents:
@@ -750,13 +802,24 @@ class OfflineReviewWindow(QDialog):
         if not dirty:
             self.select_document()
         self.refresh_document_labels()
+        return True
 
     def refresh_server_review(self):
         self.refresh_objects()
         if self.document_id is not None and self.payload() == self.loaded_payload:
             revision, payload = self.store.current_review(self.document_id)
             if revision != self.revision or payload != self.loaded_review:
+                offer_next = not self.next_button.isHidden()
                 self.select_document()
+                if offer_next:
+                    self.next_button.show()
+        visible = [doc["id"] for doc in self._visible_documents()]
+        selected = self.document_id
+        dirty = selected is not None and self.payload() != self.loaded_payload
+        if dirty and selected not in visible:
+            visible.append(selected)
+        if visible != [self.selector.itemData(i) for i in range(self.selector.count())]:
+            self.reload_documents()
         self.refresh_document_labels(server_changed=True)
 
     def refresh_objects(self):
@@ -825,6 +888,8 @@ class OfflineReviewWindow(QDialog):
             label.setText(provenance[key])
 
     def select_document(self):
+        if self.integrated:
+            self.next_button.hide()
         self.document_id = self.selector.currentData()
         if self.document_id is None:
             self.update_field_labels()
@@ -971,6 +1036,7 @@ class OfflineReviewWindow(QDialog):
             self.gallery.deleteLater()
             self.gallery = None
         self.original_available = self.gallery is not None
+        self.original_error = None
         if self.gallery is None:
             try:
                 path = self.store.original(self.document_id)
@@ -981,7 +1047,8 @@ class OfflineReviewWindow(QDialog):
                 self.gallery.show()
                 self.original_available = True
             except (ReviewError, OSError, ValueError) as error:
-                self.status.setText(f"Оригинал недоступен; перенос запрещён: {error}")
+                self.original_error = f"Оригинал недоступен; перенос запрещён: {error}"
+                self.status.setText(self.original_error)
         card = self.store.card(self.document_id)
         editable = card is None or self.integrated and self.server_version is not None
         for field in self.inputs.values():
@@ -1019,15 +1086,16 @@ class OfflineReviewWindow(QDialog):
             self.status.setText(text)
             desktop_theme.apply_style(self.status, "background:#1c4532;color:#68d391;padding:6px" if green else "")
             self.update_action_controls()
+            if self.original_error:
+                self.status.setText(self.original_error)
         self.refresh_document_labels()
 
     def keep_unsaved(self):
         if getattr(self, "document_id", None) is None:
             return True
-        if self.integrated and getattr(self, "document_id", None) is not None and self.store.action(self.document_id)[1] in ("ignore", "later"):
-            return True
         if not hasattr(self, "loaded_payload") or self.payload() == self.loaded_payload:
             return True
+
         answer = QMessageBox.question(
             self, "Несохранённые исправления", "Сохранить изменения черновика перед выходом из него?",
             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard |
@@ -1041,7 +1109,28 @@ class OfflineReviewWindow(QDialog):
             except (ReviewError, OSError, sqlite3.Error) as error:
                 QMessageBox.warning(self, "Исправления не сохранены", str(error))
                 return False
+        else:
+            self.loaded_payload = self.payload()
         return True
+
+    def advance_document(self):
+        previous = self.document_id
+        self.explicit_document_id = None
+        if not self.reload_documents():
+            return
+        for index in range(self.selector.count()):
+            document_id = self.selector.itemData(index)
+            if document_id != previous and self.store.action(document_id)[1] != "later":
+                self.selector.setCurrentIndex(index)
+                return
+        self.selector.setCurrentIndex(-1)
+        if any(self.store.action(self.selector.itemData(index))[1] == "later"
+               for index in range(self.selector.count())):
+            self.status.setText("Новых документов больше нет. Отложенные доступны в списке.")
+        elif self.selector.count():
+            self.status.setText("Других документов для обработки нет. Проверяйте статус передачи в списке.")
+        else:
+            self.status.setText("Очередь завершена. Учтённые документы доступны через фильтр.")
 
     def change_document(self):
         if not self.keep_unsaved():
@@ -1138,6 +1227,8 @@ class OfflineReviewWindow(QDialog):
             refresh = getattr(self.store.host, "incoming_after_queue", None)
             if refresh:
                 refresh()
+            self.next_button.show()
+            self.status.setText("Расход поставлен в очередь. Можно перейти к следующему документу.")
 
     def show_registry(self):
         dialog = QDialog(self)
