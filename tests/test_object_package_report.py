@@ -210,15 +210,16 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertGreaterEqual(result["page_count"], 6)
             self.assertIn("Bygger och renoverar i Sthlm AB", text)
             self.assertIn("Архивный объект", text)
-            self.assertIn("OB-часы (часть общего количества)", text)
+            self.assertIn("Работа и поездки вместе", text)
             self.assertIn("18,0 ч", text)
-            self.assertIn("16,0 ч", text)
-            self.assertIn("10,0 ч", text)
+            self.assertIn("8,0 ч", text)
+            self.assertIn("6,0 ч", text)
             self.assertIn("2,0 ч", text)
             self.assertIn("Second Worker", text)
-            self.assertIn("Поездки\nНеизвестно", text)
-            self.assertIn("10,00 (известная часть; неполно)", text)
+            self.assertIn("Сумма поездок: Неизвестно", text)
+            self.assertIn("12,00 SEK (известная часть; неполно)", text)
             self.assertIn("20,00 SEK (известная часть; итог неполон)", text)
+            self.assertIn("EUR: 5,00 EUR", text)
             self.assertIn("Поездки", text)
             self.assertIn("Часы подтверждены", text)
             self.assertIn("Приложение 1", text)
@@ -232,6 +233,256 @@ class ObjectPackageReportTests(unittest.TestCase):
             for path, digest in original_hashes.items():
                 self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
             self.assertTrue(result["incomplete_reasons"])
+
+    def test_swedish_cover_shows_object_shares_travel_rates_and_source_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            originals = {}
+            source_paths = {}
+            originals_by_invoice = {
+                "client-30": [
+                    ("order 8782530-01", "Sälj.ordnr: 8782530-01", "Proj. nr: P1040"),
+                ],
+                "client-31": [
+                    ("order 8781867-01", "Sälj.ordnr: 8781867-01", "Proj. nr: P1040"),
+                    ("order detail", "Sälj.ordnr: 8781867-01", "Proj. nr: P1040"),
+                    ("terms", "Terms and conditions", ""),
+                ],
+                "client-32": [
+                    ("order 8779738-01", "Sälj.ordnr: 8779738-01", "Proj. nr: P1040"),
+                    ("order detail", "Sälj.ordnr: 8779738-01", "Proj. nr: P1040"),
+                ],
+            }
+            for key, pages in originals_by_invoice.items():
+                source = root / f"{key}.pdf"
+                output = canvas.Canvas(str(source))
+                for label, order, project in pages:
+                    output.drawString(40, 740, label)
+                    output.drawString(40, 720, order)
+                    if project:
+                        output.drawString(40, 700, project)
+                    output.showPage()
+                output.save()
+                originals[source] = hashlib.sha256(source.read_bytes()).hexdigest()
+                source_paths[key] = [source]
+
+            first = _document(30, allocations=[
+                {"object_id": 42, "destination": "object", "net_amount": "641.92",
+                 "vat_amount": "160.48", "gross_amount": "802.45",
+                 "rounding_amount": "0.05"},
+                {"object_id": 84, "destination": "object", "net_amount": "2992.00",
+                 "vat_amount": "748.00", "gross_amount": "3740.55",
+                 "rounding_amount": "0.00"},
+            ], gross="4543.00")
+            second = _document(31, allocations=[
+                {"object_id": 42, "destination": "object", "net_amount": None,
+                 "vat_amount": None, "gross_amount": "3489.34",
+                 "rounding_amount": None},
+                {"object_id": 84, "destination": "object", "net_amount": "939.73",
+                 "vat_amount": "234.93", "gross_amount": "1174.66",
+                 "rounding_amount": "0.00"},
+            ], net=None, vat=None, gross="4664.00")
+            third = _document(32, allocations=[
+                {"object_id": 42, "destination": "object", "net_amount": "9167.88",
+                 "vat_amount": "2291.99", "gross_amount": "11459.87",
+                 "rounding_amount": "0.00"},
+                {"object_id": 84, "destination": "object", "net_amount": "100000.00",
+                 "vat_amount": "25000.00", "gross_amount": "128169.90",
+                 "rounding_amount": "0.23"},
+            ], net="109167.88", vat="27291.99", gross="139629.77")
+            third["allocation_basis"] = "net"
+            third["amount_due"] = "139630.00"
+            third["rounding_amount"] = "0.23"
+            for document in (first, second, third):
+                document["expense_category"] = "Материалы"
+            expenses, excluded = collect_object_expenses([first, second, third], 42)
+
+            report = {
+                "journal_rows": [
+                    {"date": "2026-11-02", "employee": "Worker", "comment": "",
+                     "hours": 1, "transport": 2, "entry_type": "work", "sync_id": "w1",
+                     "hours_confirmed": 1, "invoiced": 0},
+                    {"date": "2026-11-03", "employee": "Worker", "comment": "",
+                     "hours": 1, "transport": 1, "entry_type": "work", "sync_id": "w2",
+                     "hours_confirmed": 1, "invoiced": 0},
+                ],
+                "journal_segments": {},
+                "prepared_rows": [],
+                "cost_lines": [
+                    {"label": "Arbete", "quantity": 2, "unit": "h",
+                     "rate": 480, "amount": 960},
+                    {"label": "Resa", "quantity": 2, "unit": "st",
+                     "rate": 450, "amount": 900},
+                    {"label": "Resa", "quantity": 1, "unit": "st",
+                     "rate": 500, "amount": 500},
+                ],
+                "totals": {
+                    "work_amount": 960, "ob_amount": 0, "transport_amount": 1400,
+                    "known_subtotal": 2360, "invoice_total": 2360,
+                },
+                "warnings": [],
+            }
+            data = {
+                "language": "sv",
+                "object": {"name": "Storholmenvagen 42 Staffan Bathroom",
+                           "markning": "p1040", "company": "Staffan", "is_active": 1},
+                "customer_name": "Staffan",
+                "period_label": "2026-11-02 — 2026-11-03",
+                "generated_at": "2026-11-15 12:00",
+                "customer_report": report,
+                "journal_translations": {},
+                "include_customer_cost": True,
+                "include_copies": True,
+                "expenses": expenses,
+                "excluded_expenses": excluded,
+                "expense_snapshot_available": True,
+                "incomplete_reasons": [],
+            }
+            target = root / "p1040-report.pdf"
+            write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+                source_paths=source_paths,
+            )
+            reader = PdfReader(str(target))
+            first_page = reader.pages[0].extract_text()
+            journal_page = reader.pages[1].extract_text()
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+            self.assertIn("Bygger och renoverar i Sthlm AB", first_page)
+            self.assertIn("Arbete", first_page)
+            self.assertIn("960,00 SEK", first_page)
+            self.assertIn("Totalt resor: 3 st", first_page)
+            self.assertIn("Summa resor: 1 400,00 SEK exkl. moms", first_page)
+            normalized_first_page = " ".join(first_page.split())
+            self.assertIn("2 st × 450,00 SEK", normalized_first_page)
+            self.assertIn("1 st × 500,00 SEK", normalized_first_page)
+            self.assertIn("Arbetsjournal", journal_page)
+            self.assertNotIn("Arbetsjournal", first_page)
+            self.assertIn("15 751,66 SEK", text)
+            self.assertIn("Känd nettodel: 9 809,80 SEK", text)
+            self.assertIn("inte en fullständig nettosumma", text)
+            self.assertIn("På detta objekt: 3 489,34 SEK", text)
+            self.assertIn("På detta objekt: 11 459,87 SEK", text)
+            self.assertIn("Leverantörens fullständiga fakturabelopp: 4 664,00 SEK", text)
+            self.assertIn("Leverantörens fullständiga fakturabelopp: 139 630,00 SEK", text)
+            self.assertIn("Fakturan omfattar inköp för flera objekt", text)
+            self.assertIn("original 1 s. 1, 2", text)
+            self.assertNotRegex(text, r"[\u0400-\u04ff]")
+            for path, digest in originals.items():
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+            for pages in originals_by_invoice.values():
+                for label, *_ in pages:
+                    self.assertIn(label, text)
+
+    def test_net_basis_supplier_total_stays_unknown_without_due_or_rounding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "invoice.pdf"
+            output = canvas.Canvas(str(source))
+            output.drawString(40, 740, "Invoice")
+            output.save()
+
+            document = _document(33, allocations=[{
+                "object_id": 42, "destination": "object", "net_amount": "80.00",
+                "vat_amount": "20.00", "gross_amount": "100.00",
+            }], net="80.00", vat="20.00", gross="100.00")
+            document.update(
+                allocation_basis="net", amount_due=None, rounding_amount=None,
+                expense_category="Материалы",
+            )
+            expenses, excluded = collect_object_expenses([document], 42)
+            data = {
+                "language": "sv",
+                "object": {"name": "Testobjekt", "markning": "p1040",
+                           "company": "Staffan", "is_active": 1},
+                "customer_name": "Staffan",
+                "period_label": "2026-11-02 — 2026-11-02",
+                "generated_at": "2026-11-15 12:00",
+                "customer_report": {
+                    "journal_rows": [], "journal_segments": {}, "cost_lines": [],
+                    "totals": {
+                        "work_amount": 0, "ob_amount": 0, "transport_amount": 0,
+                        "known_subtotal": 0, "invoice_total": 0,
+                    },
+                    "warnings": [],
+                },
+                "journal_translations": {},
+                "include_customer_cost": False,
+                "include_copies": True,
+                "expenses": expenses,
+                "excluded_expenses": excluded,
+                "expense_snapshot_available": True,
+                "incomplete_reasons": [],
+            }
+            target = root / "unknown-invoice-total.pdf"
+            write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+                source_paths={"client-33": [source]},
+            )
+            text = "\n".join(
+                page.extract_text() or "" for page in PdfReader(str(target)).pages
+            )
+
+        self.assertIn("På detta objekt: 100,00 SEK", text)
+        self.assertIn("Leverantörens fullständiga fakturabelopp: Okänt", text)
+
+    def test_long_object_names_and_journal_rows_flow_across_pages(self):
+        long_name = (
+            "Storholmenvagen 42 Staffan Bathroom renovation and plumbing replacement "
+            "for the north-facing apartment and shared utility room"
+        )
+        rows = [
+            {
+                "date": "2026-11-02", "employee": f"Worker {index:02d}", "comment": "",
+                "hours": 1, "transport": 0, "entry_type": "work",
+                "sync_id": f"shift-{index:02d}", "hours_confirmed": 1, "invoiced": 0,
+            }
+            for index in range(45)
+        ]
+        data = {
+            "language": "sv",
+            "object": {"name": long_name, "markning": "p1040",
+                       "company": "Staffan", "is_active": 1},
+            "customer_name": "Staffan",
+            "period_label": "2026-11-02 — 2026-11-02",
+            "generated_at": "2026-11-15 12:00",
+            "customer_report": {
+                "journal_rows": rows,
+                "journal_segments": {},
+                "cost_lines": [],
+                "totals": {
+                    "work_amount": 21600, "ob_amount": 0, "transport_amount": 0,
+                    "known_subtotal": 21600, "invoice_total": 21600,
+                },
+                "warnings": [],
+            },
+            "journal_translations": {
+                f"shift-{index:02d}": (
+                    f"Renovering av badrum och installation av rördel "
+                    f"för arbetsmoment {index:02d}"
+                )
+                for index in range(45)
+            },
+            "include_customer_cost": False,
+            "include_copies": False,
+            "expenses": [],
+            "expense_snapshot_available": True,
+            "incomplete_reasons": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "long-report.pdf"
+            result = write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+            )
+            reader = PdfReader(str(target))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text = "\n".join(pages)
+
+        self.assertGreaterEqual(result["page_count"], 4)
+        self.assertIn(long_name, " ".join(pages[0].split()))
+        self.assertIn("Arbetsjournal", pages[1])
+        self.assertIn("Worker 44", text)
+        self.assertGreaterEqual(text.count("Arbetsbeskrivning"), 2)
 
     def test_unknown_date_is_excluded_from_period_without_assuming_zero(self):
         document = _document(
@@ -317,7 +568,10 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertNotIn("Beställare:", generated_text)
             self.assertIn("Montering", generated_text)
             self.assertIn("Arbetsbeskrivning saknas", generated_text)
-            self.assertIn("Arbetsbeskrivning behöver förtydligas", generated_text)
+            self.assertIn(
+                "Arbetsbeskrivning behöver förtydligas",
+                " ".join(generated_text.split()),
+            )
             self.assertIn("Ej bekräftad", generated_text)
             self.assertIn("Antal arbetsposter med obekräftade timmar: 2", generated_text)
             self.assertIn("Manuellt registrerat dokument", generated_text)
@@ -355,6 +609,8 @@ class ObjectPackageReportTests(unittest.TestCase):
             text = "\n".join(page.extract_text() or "" for page in PdfReader(target).pages)
             self.assertNotIn("Beställare:", text)
             self.assertNotIn("UTKAST", text)
+            self.assertIn("0,00 SEK", text)
+            self.assertIn("Inga bekräftade andelar", text)
             self.assertEqual(result["incomplete_reasons"], [])
             self.assertIn("Montering", text)
 
@@ -480,6 +736,7 @@ class ObjectPackageReportTests(unittest.TestCase):
                         self.assertIn("Arbete", swedish_text)
                         self.assertIn("Kontrollera avrundningen.", swedish_text)
                         self.assertIn("UTKAST", swedish_text)
+                        self.assertIn("Summa resor: Okänt", swedish_text)
                         self.assertIn("Original invoice page", swedish_text)
 
 
