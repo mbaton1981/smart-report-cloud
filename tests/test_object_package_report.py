@@ -16,7 +16,8 @@ from reportlab.pdfgen import canvas
 from PIL import Image
 
 from object_package_report import (
-    collect_object_expenses, expense_totals_by_currency, write_object_report_package,
+    _expense_description, collect_object_expenses, expense_totals_by_currency,
+    write_object_report_package,
 )
 
 
@@ -219,7 +220,9 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("Сумма поездок: Неизвестно", text)
             self.assertIn("12,00 SEK (известная часть; неполно)", text)
             self.assertIn("20,00 SEK (известная часть; итог неполон)", text)
-            self.assertIn("EUR: 5,00 EUR", text)
+            self.assertIn("5,00 EUR", text)
+            self.assertNotIn("EUR: 5,00 EUR", text)
+            self.assertIn("2026-11-02", text)
             self.assertIn("Поездки", text)
             self.assertIn("Часы подтверждены", text)
             self.assertIn("Приложение 1", text)
@@ -351,6 +354,7 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("Bygger och renoverar i Sthlm AB", first_page)
             self.assertIn("Arbete", first_page)
             self.assertIn("960,00 SEK", first_page)
+            self.assertNotIn("SEK: 15 751,66 SEK", first_page)
             self.assertIn("Totalt resor: 3 st", first_page)
             self.assertIn("Summa resor: 1 400,00 SEK exkl. moms", first_page)
             normalized_first_page = " ".join(first_page.split())
@@ -358,6 +362,7 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("1 st × 500,00 SEK", normalized_first_page)
             self.assertIn("Arbetsjournal", journal_page)
             self.assertNotIn("Arbetsjournal", first_page)
+            self.assertIn("2026-11-02", journal_page)
             self.assertIn("15 751,66 SEK", text)
             self.assertIn("Känd nettodel: 9 809,80 SEK", text)
             self.assertIn("inte en fullständig nettosumma", text)
@@ -373,6 +378,12 @@ class ObjectPackageReportTests(unittest.TestCase):
             for pages in originals_by_invoice.values():
                 for label, *_ in pages:
                     self.assertIn(label, text)
+
+    def test_materials_without_reliable_item_description_use_neutral_fallback(self):
+        self.assertEqual(
+            _expense_description({"expense_category": "Материалы"}, "p1040"),
+            "Objektets fördelade kostnad; artikelspecifikation saknas.",
+        )
 
     def test_net_basis_supplier_total_stays_unknown_without_due_or_rounding(self):
         with tempfile.TemporaryDirectory() as directory:

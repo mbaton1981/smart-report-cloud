@@ -200,6 +200,10 @@ class OfflineReviewWindow(QDialog):
             field.textChanged.connect(self.update_origins)
             field.textChanged.connect(clear_input_error(key))
         self.amount_choices = QComboBox()
+        self.amount_choices.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.amount_choices.setMinimumContentsLength(28)
         if integrated:
             self.amount_label = QLabel("Найденные суммы — выберите по оригиналу:")
             form.addRow(self.amount_label, self.amount_choices)
@@ -973,6 +977,9 @@ class OfflineReviewWindow(QDialog):
                 context = "; ".join(f"стр. {item['page']}: {item['text']}"
                                     for item in candidate["evidence"])
                 self.amount_choices.addItem(f"{candidate['amount']} — {context}", candidate["amount"])
+                self.amount_choices.setItemData(
+                    self.amount_choices.count() - 1, context, Qt.ItemDataRole.ToolTipRole,
+                )
             self.amount_choices.setCurrentIndex(max(0, self.amount_choices.findData(payload.get("gross_amount"))))
             self.amount_choices.setEnabled(self.store.card(self.document_id) is None)
         self.amount_choices.blockSignals(False)

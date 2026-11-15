@@ -318,7 +318,14 @@ class IncomingStore(OfflineReviewStore):
             if (not reviewed and not gross_manual
                     and all(value is not None for value in amounts)
                     and base.get("document_type") != "tax_decision"):
-                payload["gross_amount"] = decimal_text(sum(amounts))
+                net_plus_vat = sum(amounts)
+                rounding = parse_invoice_money(base.get("rounding_amount"))
+                amount_due = parse_invoice_money(base.get("amount_due"))
+                if (not base.get("prepaid") and rounding is not None and amount_due is not None
+                        and net_plus_vat + rounding == amount_due):
+                    payload["gross_amount"] = decimal_text(amount_due)
+                else:
+                    payload["gross_amount"] = decimal_text(net_plus_vat)
         return revision, payload
 
     def provenance(self, document_id, payload=None):
@@ -344,7 +351,17 @@ class IncomingStore(OfflineReviewStore):
         amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
         if all(value is not None for value in amounts):
             total = decimal_text(sum(amounts))
-            if current.get("gross_amount") == total and total != base.get("gross_amount"):
+            rounding = parse_invoice_money(base.get("rounding_amount"))
+            amount_due = parse_invoice_money(base.get("amount_due"))
+            if (not base.get("prepaid") and rounding is not None and amount_due is not None
+                    and sum(amounts) + rounding == amount_due
+                    and current.get("gross_amount") == decimal_text(amount_due)
+                    and decimal_text(amount_due) != base.get("gross_amount")):
+                result["gross_amount"] = (
+                    "Вычислено: нетто + НДС + подтверждённое округление; "
+                    "совпадает с суммой к оплате"
+                )
+            elif current.get("gross_amount") == total and total != base.get("gross_amount"):
                 result["gross_amount"] = "Вычислено: нетто + НДС; округление хранится отдельно"
         return result
 

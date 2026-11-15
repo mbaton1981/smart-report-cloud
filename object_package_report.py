@@ -406,6 +406,8 @@ def _expense_description(document, marking):
         return description
     if category:
         category = swedish_category(category)
+        if category.casefold() in {"материалы", "material", "materials"} and not order_description:
+            return "Objektets fördelade kostnad; artikelspecifikation saknas."
         return f"{category} {order_description}." if order_description else category
     if order_description:
         return f"Inköp {order_description}."
@@ -732,10 +734,12 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         trip_label = "Resor · ofullständiga uppgifter" if swedish else "Поездки · данные неполны"
 
     if expense_totals:
-        expense_values = [
-            f"{currency}: {display_total(amounts, 'gross_amount', currency)}"
-            for currency, amounts in expense_totals.items()
-        ]
+        expense_values = []
+        for currency, amounts in expense_totals.items():
+            value = display_total(amounts, "gross_amount", currency)
+            expense_values.append(
+                value if f" {currency}" in value else f"{currency}: {value}"
+            )
         expense_value = "\n".join(expense_values)
         tax_notes = _expense_tax_notes(expenses, "sv" if swedish else "ru")
         if tax_notes:
@@ -838,8 +842,8 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         journal.append(["Нет рабочих записей", "—", "—", "—", "—", "—", "—"])
     story.append(table(
         journal,
-        [available * .085, available * .13, available * .22, available * .075,
-         available * .225, available * .08, available * .185],
+        [available * .13, available * .125, available * .18, available * .075,
+         available * .21, available * .08, available * .20],
         font, bold_font, alignments=((3, "RIGHT"), (5, "RIGHT")),
     ))
 

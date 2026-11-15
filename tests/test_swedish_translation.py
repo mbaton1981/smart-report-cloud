@@ -6,8 +6,11 @@ wiring only, not real translation quality.
 from contextlib import closing
 import json
 import os
+import sqlite3
+import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
@@ -172,6 +175,33 @@ class ClientRequestTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in post.call_args.kwargs["json"]["items"]],
                          ["Монтаж 12 радиаторов DN20", "Демонтаж труб отопления 2 этаж"])
         self.assertEqual(second["Демонтаж труб отопления 2 этаж"], ("Demontering av värmerör på plan 2", False))
+
+    def test_confirmed_translations_persist_by_shift_id_and_source_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "isolated.sqlite3"
+            rows = [{"sync_id": "shift-1", "comment": "Монтаж труб"}]
+            with closing(sqlite3.connect(database)) as conn:
+                self.assertEqual(translation.load_confirmed_translations(conn, rows), {})
+                translation.save_confirmed_translations(
+                    conn, rows, {"shift-1": "Montering av rör"},
+                )
+            with closing(sqlite3.connect(database)) as conn:
+                self.assertEqual(
+                    translation.load_confirmed_translations(conn, rows),
+                    {"shift-1": "Montering av rör"},
+                )
+                self.assertEqual(
+                    translation.load_confirmed_translations(
+                        conn, [{"sync_id": "shift-2", "comment": "Монтаж труб"}],
+                    ),
+                    {},
+                )
+                self.assertEqual(
+                    translation.load_confirmed_translations(
+                        conn, [{"sync_id": "shift-1", "comment": "Монтаж стояка"}],
+                    ),
+                    {},
+                )
 
 
 class TranslationChecksTests(unittest.TestCase):

@@ -3,6 +3,7 @@ import json
 from io import BytesIO
 import os
 import sqlite3
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -50,7 +51,6 @@ class CustomerReportTests(unittest.TestCase):
             cloned = sqlite3.connect(":memory:")
             self.conn.backup(cloned)
             cloned.row_factory = sqlite3.Row
-            cloned.execute("PRAGMA query_only=ON")
             return cloned
 
         self.patcher = patch.object(self.desktop, "get_db_connection", connection)
@@ -331,6 +331,26 @@ class CustomerReportTests(unittest.TestCase):
         text = self.pdf(report).pages[0].extract_text()
         self.assertIn("Varav OB lördag", text)
         self.assertIn("OB lördag – tillägg", text)
+
+    def test_confirmed_translation_is_reused_for_the_same_shift_and_source(self):
+        self.shift(comment="Неизвестный перевод")
+        report = self.window.generate_invoice()
+        row = report["journal_rows"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "translations.sqlite3")
+            connection = sqlite3.connect(database)
+            self.translation.save_confirmed_translations(
+                connection, [row], {row["sync_id"]: "Arbete på badrum"},
+            )
+            connection.close()
+            with patch.object(
+                    self.desktop, "get_db_connection",
+                    side_effect=lambda: sqlite3.connect(database)), \
+                    patch.object(
+                        self.desktop.JournalTranslationDialog, "exec",
+                        side_effect=AssertionError("A confirmed translation should be reused")):
+                translations = self.window._collect_journal_translations(report)
+        self.assertEqual(translations, {row["sync_id"]: "Arbete på badrum"})
 
     def test_fractional_hours_are_not_truncated_in_views_or_pdf(self):
         self.shift(hours=1.25)
@@ -739,8 +759,23 @@ class CustomerReportTests(unittest.TestCase):
             dialog.accept()
             return dialog.result()
 
-        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
-            translated = self.window._collect_journal_translations(report)
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "translations.sqlite3")
+            with patch.object(
+                    self.desktop, "get_db_connection",
+                    side_effect=lambda: sqlite3.connect(database)), \
+                    patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+                translated = self.window._collect_journal_translations(report)
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    self.translation.load_confirmed_translations(
+                        connection, report["journal_rows"],
+                    ),
+                    translated,
+                )
+            finally:
+                connection.close()
         self.assertEqual(translated, {"1": "Granskat arbete <A>", "2": "Annat granskat arbete"})
         journal = self.pdf({**report, "journal_translations": translated}).pages[-1].extract_text()
         self.assertIn("Granskat arbete <A>", journal)

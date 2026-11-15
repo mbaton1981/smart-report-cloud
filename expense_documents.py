@@ -455,7 +455,60 @@ def invoice_order_lines(rows):
                 sources.append({"box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
                                 "kind": "order_total" if re.match(r"Summa\s+order", label, re.IGNORECASE) else "order_header"})
                 break
-    return lines, sources
+    header_patterns = (
+        ("order", re.compile(r"Sälj\s*\.\s*ordnr\s*\.?", re.IGNORECASE)),
+        ("project", re.compile(
+            r"Proj\s*\.\s*nr\s*\.?|Märke\s*/\s*Ordnr\s*\.?|Märkning|Ert\s+ordernr",
+            re.IGNORECASE,
+        )),
+    )
+    for row_index, row in enumerate(rows[:-1]):
+        headers = []
+        for cell in row:
+            text = cell["text"].strip()
+            for kind, pattern in header_patterns:
+                if re.fullmatch(rf"{pattern.pattern}\s*:?", text, re.IGNORECASE):
+                    headers.append((kind, cell))
+                    break
+        if not headers:
+            continue
+        values_row = rows[row_index + 1]
+        row_height = max(cell["y1"] - cell["y0"] for cell in row)
+        gap = min(cell["y0"] for cell in values_row) - max(cell["y1"] for cell in row)
+        if gap < 0 or gap > max(24, row_height * 3):
+            continue
+        headers.sort(key=lambda item: (item[1]["x0"] + item[1]["x1"]) / 2)
+        centers = [(cell["x0"] + cell["x1"]) / 2 for _, cell in headers]
+        for index, (kind, header) in enumerate(headers):
+            lower = float("-inf") if index == 0 else (centers[index - 1] + centers[index]) / 2
+            upper = float("inf") if index == len(headers) - 1 else (centers[index] + centers[index + 1]) / 2
+            candidates = [
+                cell for cell in values_row
+                if lower <= (cell["x0"] + cell["x1"]) / 2 < upper
+                and cell["text"].strip()
+            ]
+            if len(candidates) != 1:
+                continue
+            value_cell = candidates[0]
+            value = value_cell["text"].strip()
+            if kind == "order":
+                if not re.fullmatch(r"[\w./-]+", value):
+                    continue
+                label = "Sälj.ordnr."
+            else:
+                if not re.fullmatch(r"[\w./-]+", value):
+                    continue
+                label = "Proj.nr."
+            lines.append(f"{label}: {value}")
+            sources.append({
+                "box": [value_cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                "kind": "order_header",
+            })
+    ordered = sorted(
+        zip(lines, sources),
+        key=lambda item: (item[1]["box"][1], item[1]["box"][0]),
+    )
+    return [line for line, _source in ordered], [source for _line, source in ordered]
 
 
 def invoice_seller_blocks(cells, page):
@@ -1146,7 +1199,8 @@ def parse_invoice_pages(pages):
         for page in order_pages:
             for index, line in enumerate(page["text"].splitlines()):
                 marker = re.fullmatch(r"Proj\.nr\.:\s*(.+)", line, re.IGNORECASE)
-                order = re.fullmatch(r"Order nr:\s*(\S+)", line, re.IGNORECASE)
+                order = re.fullmatch(
+                    r"(?:Order nr|Sälj\.ordnr\.)\s*:\s*(\S+)", line, re.IGNORECASE)
                 if marker:
                     markers.append((marker.group(1), page, page["line_sources"][index]))
                 if order:

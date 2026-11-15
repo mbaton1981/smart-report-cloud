@@ -6,6 +6,7 @@ never claimed as verified: the desktop shows every machine translation for revie
 """
 import hashlib
 import re
+import sqlite3
 import uuid
 from collections import Counter
 from urllib.parse import urlsplit
@@ -66,6 +67,69 @@ def translation_problems(source, translated):
 
 def _key(text):
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def load_confirmed_translations(connection, rows):
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='journal_translation_confirmations'"
+    ).fetchone()
+    if table is None:
+        return {}
+    translations = {}
+    for row in rows:
+        row_id = row.get("sync_id")
+        sync_id = str(row_id or "")
+        source = str(row.get("comment") or "").strip()
+        if not sync_id or not source:
+            continue
+        saved = connection.execute(
+            "SELECT translation FROM journal_translation_confirmations "
+            "WHERE sync_id=? AND source_sha256=?",
+            (sync_id, _key(source)),
+        ).fetchone()
+        if saved is not None:
+            translations[row_id] = saved[0]
+    return translations
+
+
+def save_confirmed_translations(connection, rows, translations):
+    sources = {
+        str(row.get("sync_id") or ""): str(row.get("comment") or "").strip()
+        for row in rows
+        if row.get("sync_id") and str(row.get("comment") or "").strip()
+    }
+    unknown_ids = {str(sync_id) for sync_id in translations} - set(sources)
+    if unknown_ids:
+        raise ValueError("Нельзя сохранить перевод без связанной записи и исходного текста.")
+    records = []
+    for row_id, translated in translations.items():
+        sync_id = str(row_id)
+        source = sources[sync_id]
+        translated = str(translated or "").strip()
+        if not translated or CYRILLIC.search(translated):
+            raise ValueError("Подтверждённый перевод должен быть непустым и на шведском.")
+        records.append((sync_id, _key(source), translated))
+    if not records:
+        return
+    with connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS journal_translation_confirmations (
+                sync_id TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                translation TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (sync_id, source_sha256)
+            )
+        """)
+        connection.executemany("""
+            INSERT INTO journal_translation_confirmations
+                (sync_id, source_sha256, translation)
+            VALUES (?, ?, ?)
+            ON CONFLICT(sync_id, source_sha256) DO UPDATE SET
+                translation=excluded.translation,
+                updated_at=CURRENT_TIMESTAMP
+        """, records)
 
 
 _cache = {}

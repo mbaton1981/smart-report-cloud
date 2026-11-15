@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 import test_incoming_integration as integration
 from document_costs import propose_object_allocations
-from expense_documents import match_objects, object_marking_matches, parse_project_order_allocations
+from expense_documents import (
+    match_objects, object_marking_matches, parse_invoice_pages, parse_project_order_allocations,
+)
 
 
 def fixture():
@@ -63,6 +65,68 @@ def beijer_fixture():
 
 
 class ProposalTests(unittest.TestCase):
+    def test_order_and_project_headers_link_to_values_in_the_same_columns_below(self):
+        def cell(text, left, top, right, bottom):
+            return {"text": text, "x0": left, "y0": top, "x1": right, "y1": bottom}
+
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "source": "beijer-layout.pdf",
+            "text": "Sälj.ordnr. Märke/Ordnr. Proj.nr.\n"
+                    "8923880-01 P1041\nSumma order 150,20",
+            "elements": [
+                cell("Sälj.ordnr.", 50, 100, 105, 110),
+                cell("Märke/Ordnr.", 170, 100, 250, 110),
+                cell("Proj.nr.", 320, 100, 370, 110),
+                cell("8923880-01", 50, 120, 115, 130),
+                cell("P1041", 170, 120, 210, 130),
+                cell("Summa order", 50, 145, 110, 155),
+                cell("150,20", 500, 145, 550, 155),
+            ],
+        }])
+
+        self.assertEqual(len(fields["order_proposals"]), 1)
+        order = fields["order_proposals"][0]
+        self.assertEqual(order["order_id"], "8923880-01")
+        self.assertEqual(order["project_code"], "P1041")
+        self.assertEqual(order["net_amount"], "150.20")
+
+    def test_seller_order_marker_supports_single_order_fallback_without_order_total(self):
+        def cell(text, left, top, right, bottom):
+            return {"text": text, "x0": left, "y0": top, "x1": right, "y1": bottom}
+
+        page = {
+            "page": 1,
+            "source": "beijer-layout.pdf",
+            "text": "Sälj.ordnr. Märke/Ordnr. Proj.nr.\n8923880-01 P1041\nExkl. moms 150,20",
+            "elements": [
+                cell("Sälj.ordnr.", 50, 100, 105, 110),
+                cell("Märke/Ordnr.", 170, 100, 250, 110),
+                cell("Proj.nr.", 320, 100, 370, 110),
+                cell("8923880-01", 50, 120, 115, 130),
+                cell("P1041", 320, 120, 360, 130),
+                cell("Exkl. moms", 50, 145, 110, 155),
+                cell("150,20", 200, 145, 240, 155),
+            ],
+        }
+
+        fields = parse_invoice_pages([page])
+
+        self.assertEqual(len(fields["order_proposals"]), 1)
+        order = fields["order_proposals"][0]
+        self.assertEqual(order["order_id"], "8923880-01")
+        self.assertEqual(order["project_code"], "P1041")
+        self.assertEqual(order["net_amount"], "150.20")
+
+    def test_requisition_number_is_not_a_project_marker(self):
+        self.assertEqual(
+            match_objects(
+                "Projekt ID: ej projekt\nRekvisitionsnr.: 1037",
+                [{"id": 14, "name": "Object", "markning": "p1037", "is_active": 1}],
+            ),
+            [],
+        )
+
     def test_groups_orders_preserves_net_vat_and_reconciles_stated_rounding(self):
         fields = fixture()
         before = copy.deepcopy(fields)
@@ -292,7 +356,7 @@ class ProposalIntegrationTests(unittest.TestCase):
         window, document_id, objects = self.prepare_beijer()
         before = self.store.latest(document_id)
         self.assertFalse(window.proposal["errors"], window.proposal["errors"])
-        self.assertEqual(window.inputs["gross_amount"].text(), "5679.10")
+        self.assertEqual(window.inputs["gross_amount"].text(), "5679.00")
         with patch.object(QMessageBox, "warning") as warning, \
                 patch.object(QMessageBox, "question",
                              return_value=QMessageBox.StandardButton.No) as question:

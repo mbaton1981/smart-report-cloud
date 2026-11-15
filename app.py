@@ -2053,7 +2053,8 @@ class JournalTranslationDialog(QDialog):
             if allow_draft else
             "Перевод выполнен ИИ через сервер SmartReport. Автоматически проверяются только пустой текст, "
             "кириллица, числа и обозначения — смысл проверьте сами и при необходимости исправьте текст справа.\n"
-            "Исправления используются только в этом PDF. Исходные описания, смены и база не изменяются."
+            "Подтверждённые переводы сохраняются локально для той же записи и исходного текста. "
+            "Исходные описания и смены не изменяются."
         )
         notice.setWordWrap(True)
         layout.addWidget(notice)
@@ -11406,9 +11407,32 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         return translated
 
     def _collect_journal_translations(self, report):
+        import swedish_translation
+        journal_rows = [
+            row for row in report["journal_rows"]
+            if row.get("entry_type") in WORK_TYPES
+        ]
         translations = {}
+        if journal_rows:
+            connection = None
+            try:
+                connection = get_db_connection()
+                translations = swedish_translation.load_confirmed_translations(
+                    connection, journal_rows,
+                )
+            except sqlite3.Error as error:
+                QMessageBox.warning(
+                    self, "Сохранённые переводы недоступны",
+                    f"Не удалось прочитать подтверждённые переводы. "
+                    f"Проверьте описания в этом отчёте.\n\n{error}",
+                )
+            finally:
+                if connection is not None:
+                    connection.close()
         pending = []
-        for row in report["journal_rows"]:
+        for row in journal_rows:
+            if row.get("sync_id") in translations:
+                continue
             text = row["comment"] or ""
             try:
                 translations[row["sync_id"]] = SmartReportApp._journal_description_swedish(text)
@@ -11422,6 +11446,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
             translations.update(dialog.translations)
+            connection = None
+            try:
+                connection = get_db_connection()
+                swedish_translation.save_confirmed_translations(
+                    connection, pending, dialog.translations,
+                )
+            except (sqlite3.Error, ValueError) as error:
+                QMessageBox.warning(
+                    self, "Переводы не сохранены",
+                    "Подтверждённые переводы используются в этом PDF, но не были "
+                    f"сохранены для следующих отчётов.\n\n{error}",
+                )
+            finally:
+                if connection is not None:
+                    connection.close()
         return translations
 
     def _machine_translate_rows(self, rows):

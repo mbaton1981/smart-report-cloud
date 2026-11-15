@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QBoxLayout, QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QBoxLayout, QScrollArea, QWidget
 
 import test_incoming_integration as integration
 import desktop_theme
@@ -68,6 +69,27 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertEqual(
             [window.selector.itemData(i) for i in range(window.selector.count())], [3, 2, 1])
         self.assertIsNone(window.selector.currentData())
+
+    def test_long_amount_evidence_does_not_force_horizontal_form_scrolling(self):
+        window = self.open_window(document_id=1)
+        costs = dict(self.store.cost_fields(1))
+        evidence = " ".join(["recognized source detail"] * 30)
+        costs["amount_candidates"] = [{
+            "amount": "1072.00",
+            "evidence": [{"page": 1, "text": evidence}],
+        }]
+        with patch.object(self.store, "cost_fields", return_value=costs):
+            window.select_document()
+        window.resize(1450, 940)
+        self.qt_app.processEvents()
+
+        scroll = window.findChild(QScrollArea)
+        self.assertIsNotNone(scroll)
+        self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+        self.assertEqual(
+            window.amount_choices.itemData(1, Qt.ItemDataRole.ToolTipRole),
+            f"стр. 1: {evidence}",
+        )
 
     def test_queue_reasons_are_combined_and_totals_keep_currencies_separate(self):
         revision, fields = self.store.latest(1)

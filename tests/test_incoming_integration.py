@@ -459,6 +459,41 @@ class IncomingIntegrationTests(unittest.TestCase):
             window.loaded_payload = window.payload()
             window.close()
 
+    def test_explicit_rounding_uses_amount_due_as_allocated_gross_once(self):
+        base = dict(self.store.base(1))
+        base.update(
+            net_amount="150.20", vat_amount="37.55", gross_amount="187.75",
+            rounding_amount="0.25", amount_due="188.00",
+        )
+        with patch.object(self.store, "base", return_value=base):
+            revision, payload = self.store.latest(1)
+            self.assertEqual(payload["gross_amount"], "188.00")
+            payload.update(
+                confirmed_type="invoice", original_checked=True,
+                supplier_name="Isolated Supplier AB", document_date="2026-10-21",
+                currency_code="SEK", net_amount="150.20", vat_amount="37.55",
+                rounding_amount="0.25", amount_due="188.00",
+                allocations=[{
+                    "destination": "object", "object_id": self.object_id,
+                    "gross_amount": "188.00", "net_amount": "150.20",
+                    "vat_amount": "37.55", "rounding_amount": "0.25",
+                }],
+            )
+            self.assertEqual(self.store.issues(1, payload), [])
+            revision = self.store.save(1, payload, revision)
+            self.store.transfer(1, revision)
+
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        remote = self.server_client.get(
+            "/api/expense-documents",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"][0]
+        self.assertEqual(remote["gross_amount"], "188.00")
+        self.assertEqual(remote["rounding_amount"], "0.25")
+        self.assertEqual(remote["allocations"][0]["gross_amount"], "188.00")
+        self.assertEqual(remote["allocations"][0]["net_amount"], "150.20")
+        self.assertEqual(remote["allocations"][0]["vat_amount"], "37.55")
+
     def test_existing_document_rejects_stale_version_without_queuing(self):
         revision = self.approve()
         card = self.store.transfer(1, revision)
