@@ -42,7 +42,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
+from customer_report import WORK_TYPES, format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
 from object_package_report import (
     collect_object_expenses, expense_document_key, write_object_report_package,
 )

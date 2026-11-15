@@ -7,7 +7,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pypdf import PdfReader
 from reportlab.pdfbase import pdfmetrics
@@ -253,6 +253,91 @@ class ObjectPackageReportTests(unittest.TestCase):
         self.assertEqual(len(excluded), 1)
         self.assertIn("Дата неизвестна", excluded[0]["excluded_reason"])
         self.assertEqual(collect_object_expenses([], 42, "2026-11-01", "2026-11-30"), ([], []))
+
+    def test_object_card_report_task_builds_pdf_with_work_rows_and_unknown_trips(self):
+        with patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
+            app = importlib.import_module("app")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pdf = root / "original.pdf"
+            original = canvas.Canvas(str(source_pdf))
+            original.drawString(40, 740, "Original invoice page")
+            original.save()
+            document = _document(10, allocations=[
+                {"object_id": 42, "destination": "object", "net_amount": "10.00",
+                 "vat_amount": "2.00", "gross_amount": "12.00"},
+                {"object_id": 84, "destination": "object", "net_amount": "20.00",
+                 "vat_amount": "4.00", "gross_amount": "24.00"},
+            ])
+            object_row = {
+                "id": 42, "server_id": 42, "sync_id": "object-42",
+                "name": "Badbacken", "markning": "p1022", "company": "Test",
+            }
+            options = {
+                "all_period": True, "date_from": None, "date_to": None,
+                "include_copies": True, "include_customer_cost": True,
+            }
+            for transport in (None, 1):
+                with self.subTest(transport=transport):
+                    work_report = {
+                        "journal_rows": [
+                            {"date": "2026-11-02", "employee": "Worker", "comment": "Work",
+                             "hours": 8, "transport": transport, "entry_type": "work",
+                             "sync_id": "shift-1", "hours_confirmed": 1, "invoiced": 0},
+                            {"date": "2026-11-02", "employee": "Worker", "comment": "Sick",
+                             "hours": 2, "transport": None, "entry_type": "sick"},
+                        ],
+                        "journal_segments": {}, "prepared_rows": [], "cost_lines": [],
+                        "totals": {"hours": 8, "without_ob_hours": 8, "ob_categories": {},
+                                   "known_subtotal": 4000, "invoice_total": 4000},
+                        "warnings": [],
+                    }
+                    completions = []
+                    controller = SimpleNamespace(
+                        object_full_report_button=Mock(),
+                        statusBar=lambda: SimpleNamespace(showMessage=Mock()),
+                        _on_full_object_report_progress=lambda *_args: None,
+                        _on_full_object_report_ready=lambda *args: completions.append(args),
+                        _object_work_history_range=lambda *_args: (
+                            ("2026-11-02", "2026-11-02"), 0, ""
+                        ),
+                        _expense_document_snapshot=lambda *_args, **_kwargs: ([document], True),
+                        collect_invoice_report=lambda **_kwargs: work_report,
+                        _prepare_invoice_view=lambda report: report,
+                        _download_object_report_originals=lambda *_args: (
+                            {"client-10": [source_pdf]}, {}
+                        ),
+                    )
+                    controller._reserve_object_report_path = lambda *args: (
+                        app.SmartReportApp._reserve_object_report_path(controller, *args)
+                    )
+                    controller._build_full_object_package = lambda *args: (
+                        app.SmartReportApp._build_full_object_package(controller, *args)
+                    )
+                    pool = SimpleNamespace(start=lambda task: task.run())
+                    with patch.object(app, "fetch_all_expense_documents", return_value=[document]), \
+                            patch.object(app, "REPORTS_DIR", str(root)), \
+                            patch.object(app, "DEFAULT_FONT", self.font), \
+                            patch.object(app, "DEFAULT_FONT_BOLD", self.bold_font), \
+                            patch.object(app.QThreadPool, "globalInstance", return_value=pool):
+                        app.SmartReportApp._start_full_object_report(controller, object_row, options)
+
+                    self.assertEqual(len(completions), 1)
+                    _, result, error = completions[0]
+                    self.assertEqual(error, "")
+                    text = "\n".join(
+                        page.extract_text() or "" for page in PdfReader(result["path"]).pages
+                    )
+                    self.assertIn("Badbacken", text)
+                    self.assertIn("8,0 ч", text)
+                    self.assertIn("12,00", text)
+                    self.assertIn("Original invoice page", text)
+                    self.assertNotIn("Sick", text)
+                    self.assertEqual(work_report["totals"]["invoice_total"] is None, transport is None)
+                    self.assertEqual(
+                        any("поездок" in reason.lower() for reason in result["incomplete_reasons"]),
+                        transport is None,
+                    )
 
 
 class ExpensePaginationTests(unittest.TestCase):
