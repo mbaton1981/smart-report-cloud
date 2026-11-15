@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QBoxLayout, QScrollArea, QWidget
 
 import test_incoming_integration as integration
 import desktop_theme
+from expense_documents import ExtractionResult
 from offline_review import ReviewError
 
 
@@ -51,6 +52,134 @@ class IncomingDisplayTests(unittest.TestCase):
                 window.selector.setCurrentIndex(default_index)
         self.qt_app.processEvents()
         return window
+
+    def test_project_marker_suggestion_shows_source_without_allocating_it(self):
+        window = self.open_window(document_id=1)
+        window.allocations.setRowCount(0)
+        window.add_allocation({"gross_amount": "10970.27"})
+        window.loaded_payload = window.payload()
+        self.addCleanup(setattr, window, "loaded_payload", window.payload())
+        before = (
+            window.allocations.cellWidget(0, 0).currentData(),
+            window.allocations.item(0, 1).text(),
+        )
+        evidence = [
+            {"label": "Projektnamn", "value": "P1037", "normalized": "1037", "page": 1},
+            {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
+        ]
+        suggestions = [{
+            "name": "Object p1037", "markning": "p1037",
+            "reason": "Найдена маркировка p1037 в поле Projektnamn: P1037, стр. 1",
+        }]
+        proposal = {"parts": [], "warnings": [], "errors": [], "rounding": "0.00", "total": None}
+
+        with patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                patch.object(window, "_object_marker_suggestions", return_value=(evidence, suggestions, None)):
+            window.show_proposal()
+
+        self.assertIn("Projektnamn", window.proposal_label.text())
+        self.assertIn("Rekvisitionsnr.", window.proposal_label.text())
+        self.assertIn("стр. 1", window.proposal_label.text())
+        self.assertIn("Object p1037", window.proposal_label.text())
+        self.assertEqual(
+            (window.allocations.cellWidget(0, 0).currentData(), window.allocations.item(0, 1).text()),
+            before,
+        )
+
+    def test_conflicting_project_markers_are_visible_for_reconciliation(self):
+        window = self.open_window(document_id=1)
+        evidence = [
+            {"label": "Projektnamn", "value": "P1037", "normalized": "1037", "page": 1},
+            {"label": "Rekvisitionsnr.", "value": "1022", "normalized": "1022", "page": 2},
+        ]
+        suggestions = [
+            {"name": "Object p1037", "markning": "p1037", "reason": "стр. 1"},
+            {"name": "Object p1022", "markning": "p1022", "reason": "стр. 2"},
+        ]
+        proposal = {"parts": [], "warnings": [], "errors": [], "rounding": "0.00", "total": None}
+
+        with patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                patch.object(window, "_object_marker_suggestions", return_value=(evidence, suggestions, None)):
+            window.show_proposal()
+
+        self.assertIn("Найдены разные маркировки", window.proposal_label.text())
+        self.assertIn("P1037", window.proposal_label.text())
+        self.assertIn("1022", window.proposal_label.text())
+        self.assertIn("стр. 1", window.proposal_label.text())
+        self.assertIn("стр. 2", window.proposal_label.text())
+        self.assertIn("автоматически не распределены", window.proposal_label.text())
+
+    def test_marker_suggestion_is_blocked_when_any_original_page_is_unreadable(self):
+        window = self.open_window(document_id=1)
+        reader = SimpleNamespace(
+            is_encrypted=False,
+            pages=[
+                SimpleNamespace(extract_text=lambda: "P1037Projektnamn:\nInvoice header and details"),
+                SimpleNamespace(extract_text=lambda: ""),
+            ],
+        )
+
+        with patch("offline_review_ui.PdfReader", return_value=reader):
+            evidence, suggestions, warning = window._object_marker_suggestions()
+
+        self.assertEqual([(item["value"], item["page"]) for item in evidence], [("P1037", 1)])
+        self.assertEqual(suggestions, [])
+        self.assertIn("страницах 2", warning)
+
+    def test_partial_page_text_keeps_known_markings_visible_without_candidate(self):
+        window = self.open_window(document_id=1)
+        evidence = [
+            {"label": "Projektnamn", "value": "P1037", "normalized": "1037", "page": 1},
+            {"label": "Rekvisitionsnr.", "value": "1022", "normalized": "1022", "page": 2},
+        ]
+        proposal = {"parts": [], "warnings": [], "errors": [], "rounding": "0.00", "total": None}
+
+        with patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                patch.object(
+                    window, "_object_marker_suggestions",
+                    return_value=(evidence, [], "На странице 3 не удалось проверить полный текст."),
+                ):
+            window.show_proposal()
+
+        label = window.proposal_label.text()
+        self.assertIn("Не удалось проверить все страницы", label)
+        self.assertIn("P1037", label)
+        self.assertIn("1022", label)
+        self.assertIn("стр. 1", label)
+        self.assertIn("стр. 2", label)
+        self.assertNotIn("Кандидаты (не назначены)", label)
+
+    def test_api_upload_does_not_offer_object_when_any_page_text_is_incomplete(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        captured = []
+        window._expense_object_candidates = lambda: [{
+            "id": 14, "name": "Object p1037", "markning": "p1037", "is_active": 1,
+        }]
+        window._api_expense_document_review_dialog = (
+            lambda *args, **kwargs: captured.append((args, kwargs))
+        )
+        extraction = ExtractionResult(
+            "P1037Projektnamn:\nInvoice header and details", "test", 1.0,
+            ("P1037Projektnamn:\nInvoice header and details", ""),
+        )
+        source = Path(self._case.name) / "incomplete-pages.pdf"
+
+        with patch.object(self.desktop.QFileDialog, "getOpenFileName", return_value=(str(source), "")), \
+                patch.object(self.desktop, "extract_local_document", return_value=extraction), \
+                patch.object(self.desktop, "parse_document_text", return_value={"review_reasons": []}), \
+                patch.object(self.desktop, "parse_project_order_allocations", return_value={
+                    "orders": [], "warnings": [], "requires_review": False,
+                }), \
+                patch.object(self.desktop, "match_objects") as match_objects:
+            self.desktop.SmartReportApp._api_upload_expense_document(window)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0][3], [])
+        self.assertIn("страницах 2", captured[0][1]["marker_warning"])
+        self.assertEqual(captured[0][1]["marker_evidence"][0]["value"], "P1037")
+        match_objects.assert_not_called()
 
     def test_incoming_defaults_to_new_unprocessed_documents_without_preview(self):
         revision = self.approve(2)
@@ -239,7 +368,7 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertEqual(window.selector.currentData(), 1)
 
     def test_expense_mail_reminder_uses_both_themes_and_does_not_mark_failed_check(self):
-        from datetime import date
+        from datetime import date, datetime, timezone
         import folder_mail
         from desktop_theme import ThemeManager
 
@@ -303,25 +432,26 @@ class IncomingDisplayTests(unittest.TestCase):
             host.mail_reminder_check.click()
             self.assertEqual(mail_check_calls, [True])
 
-            stamp = "2026-11-12T12:30:00+00:00"
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             with patch.object(folder_mail, "load_reminder_state", return_value={
-                    "last_successful_check": stamp, "last_suggestion_date": None}) as load, \
+                    "last_successful_check": stamp,
+                    "last_suggestion_date": date.today().isoformat()}) as load, \
                     patch.object(folder_mail, "save_reminder_state") as save:
                 self.desktop.SmartReportApp._maybe_show_mail_reminder(host)
                 load.assert_called_once_with()
-                save.assert_called_once_with(last_suggestion_date=date.today().isoformat())
-            self.assertIn("12.11.2026", host.mail_reminder_last_check.text())
+                save.assert_not_called()
+            self.assertIn(date.today().strftime("%d.%m.%Y"), host.mail_reminder_last_check.text())
+            self.assertFalse(host.mail_reminder_banner.isHidden())
 
             host.mail_reminder_later.click()
             self.assertTrue(host.mail_reminder_banner.isHidden())
-            host._mail_reminder_shown_today = None
             with patch.object(folder_mail, "load_reminder_state", return_value={
                     "last_suggestion_date": date.today().isoformat()}) as load, \
                     patch.object(folder_mail, "save_reminder_state") as save:
                 self.desktop.SmartReportApp._maybe_show_mail_reminder(host)
                 load.assert_called_once_with()
                 save.assert_not_called()
-            self.assertTrue(host.mail_reminder_banner.isHidden())
+            self.assertFalse(host.mail_reminder_banner.isHidden())
 
             with patch.object(folder_mail, "save_reminder_state") as save:
                 self.desktop.SmartReportApp.mail_import_completed(host, False, None)

@@ -17,7 +17,10 @@ def propose_object_allocations(fields, objects):
     result = {"parts": [], "warnings": [], "errors": [], "rounding": "0.00", "total": None}
     result["errors"].extend(fields.get("order_proposal_warnings") or [])
     if not orders:
-        result["errors"].append("Маркировки и суммы заказов не распознаны. Доступно ручное распределение.")
+        result["errors"].append(
+            "Подтверждённые суммы заказов не распознаны; автоматическое распределение недоступно. "
+            "Доступно ручное распределение."
+        )
         return result
     grouped, seen = {}, set()
     for order in orders:

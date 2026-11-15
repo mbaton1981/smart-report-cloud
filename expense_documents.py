@@ -5,6 +5,7 @@ import re
 import shutil
 import sqlite3
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -1935,21 +1936,95 @@ def object_marking_matches(value: str | None, marking: str | None) -> bool:
     return False
 
 
-def match_objects(document_text: str, objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    context_pattern = re.compile(
-        r"^\s*(?P<label>Märkn(?:ing)?|Markning|Märke/Ordnr\.?|Projekt(?:namn|\s*(?:nr\.?|nummer|kod|code))?|"
-        r"Proj\s*\.?\s*nr\.?|Project(?:\s*(?:reference|nr\.?|number|code))?|"
-        r"Er\s+referens|Your\s+reference|Kundreferens|"
-        r"Referens|Reference(?:\s*(?:nr\.?|no\.?))?|"
-        r"Order(?:\s*(?:nr\.?|no\.?|number|id|#))?|Ordernummer|Beställningsnr|Purchase\s+order)"
-        r"(?:\s*[:#]\s*|\s+)(?P<value>.*?)\s*$",
-        re.IGNORECASE,
+_OBJECT_CONTEXT_PATTERN = re.compile(
+    r"^\s*(?P<label>Märkn(?:ing)?|Markning|Märke/Ordnr\.?|Rekvisitionsnr\.?|"
+    r"Projekt(?:namn|\s*(?:nr\.?|nummer|kod|code))?|Proj\s*\.?\s*nr\.?|"
+    r"Project(?:\s*(?:reference|nr\.?|number|code))?|Er\s+referens|Your\s+reference|Kundreferens|"
+    r"Referens|Reference(?:\s*(?:nr\.?|no\.?))?|"
+    r"Order(?:\s*(?:nr\.?|no\.?|number|id|#))?|Ordernummer|Beställningsnr|Purchase\s+order)"
+    r"(?:\s*[:#]\s*|\s+)(?P<value>.*?)\s*$",
+    re.IGNORECASE,
+)
+_REVERSED_PROJECT_CONTEXT_PATTERN = re.compile(
+    r"^\s*(?P<value>.+?)\s*(?P<label>Märkn(?:ing)?|Markning|Märke/Ordnr\.?|Projektnamn|"
+    r"Rekvisitionsnr\.?|Projekt\s*(?:nr\.?|nummer|kod|code)|Proj\s*\.?\s*nr\.?|"
+    r"Project\s*(?:reference|nr\.?|number|code))\s*[:#]?\s*$",
+    re.IGNORECASE,
+)
+_OBJECT_MARKER_CONTEXT_LABELS = {
+    "markn", "markning", "markeordnr", "projektnamn", "rekvisitionsnr",
+    "projektnr", "projektnummer", "projektkod", "projektcode", "projnr",
+    "projectreference", "projectnr", "projectnumber", "projectcode",
+}
+_OBJECT_MARKER_VALUE_PATTERN = re.compile(
+    r"\s*[A-Za-z]*\s*\d(?:[A-Za-z0-9 -]*[A-Za-z0-9])?\s*"
+)
+
+
+def _document_contexts(document_text: str | Sequence[str]) -> list[dict[str, Any]]:
+    pages = (
+        [(None, document_text)]
+        if isinstance(document_text, str)
+        else list(enumerate(document_text, start=1))
     )
     contexts = []
-    for line in (document_text or "").splitlines():
-        match = context_pattern.match(line)
-        if match:
-            contexts.append((match.group("label"), match.group("value")))
+    for page, page_text in pages:
+        for line in page_text.splitlines():
+            match = _OBJECT_CONTEXT_PATTERN.match(line)
+            if not match:
+                match = _REVERSED_PROJECT_CONTEXT_PATTERN.match(line)
+                if match:
+                    contexts.append({
+                        "label": match.group("label"),
+                        "value": match.group("value").strip(),
+                        "page": page,
+                    })
+                continue
+            contexts.append({
+                "label": match.group("label"),
+                "value": match.group("value").strip(),
+                "page": page,
+            })
+    return contexts
+
+
+def pages_with_insufficient_text(page_texts: Sequence[str]) -> list[int]:
+    return [
+        page_number for page_number, text in enumerate(page_texts, 1)
+        if sum(character.isalnum() for character in text) < 12 or len(text.split()) < 3
+    ]
+
+
+def object_marker_evidence(document_text: str | Sequence[str]) -> list[dict[str, Any]]:
+    evidence = []
+    seen = set()
+    for context in _document_contexts(document_text):
+        if _normalize_match(context["label"]) not in _OBJECT_MARKER_CONTEXT_LABELS:
+            continue
+        value = context["value"]
+        if not _OBJECT_MARKER_VALUE_PATTERN.fullmatch(value):
+            continue
+        normalized = normalize_object_marking(value)
+        if not normalized:
+            continue
+        key = normalized, _normalize_match(context["label"]), context["page"]
+        if key in seen:
+            continue
+        seen.add(key)
+        evidence.append({
+            "label": context["label"],
+            "value": value,
+            "normalized": normalized,
+            "page": context["page"],
+        })
+    return evidence
+
+
+def match_objects(
+    document_text: str | Sequence[str],
+    objects: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    contexts = _document_contexts(document_text)
     matches = []
     for item in objects:
         if is_service_category(item):
@@ -1957,30 +2032,59 @@ def match_objects(document_text: str, objects: list[dict[str, Any]]) -> list[dic
         candidates = []
         marking = str(item.get("markning") or "").strip()
         if marking and marking not in {"*", "**", "***", "****"}:
-            for label, value in contexts:
-                if object_marking_matches(value, marking):
-                    candidates.append((100, f"Найдена маркировка {marking} в поле {label}"))
-                    break
+            evidence = [
+                context for context in contexts
+                if object_marking_matches(context["value"], marking)
+            ]
+            if evidence:
+                reasons = []
+                for context in evidence:
+                    page = f", стр. {context['page']}" if context["page"] is not None else ""
+                    reason = (
+                        f"Найдена маркировка {marking} в поле {context['label']}: "
+                        f"{context['value']}{page}"
+                    )
+                    if reason not in reasons:
+                        reasons.append(reason)
+                candidates.append((100, "; ".join(reasons), evidence))
         for alias in item.get("aliases", []):
             alias_text = str(alias.get("alias") if isinstance(alias, dict) else alias)
             normalized_alias = _normalize_match(alias_text)
-            if len(normalized_alias) >= 4 and any(
-                normalized_alias in _normalize_match(value) for _, value in contexts
-            ):
-                candidates.append((90, f"Найдена ссылка на объект: {alias_text}"))
+            if len(normalized_alias) >= 4:
+                evidence = [
+                    context for context in contexts
+                    if normalized_alias in _normalize_match(context["value"])
+                ]
+                if evidence:
+                    reasons = []
+                    for context in evidence:
+                        page = f", поле {context['label']}, стр. {context['page']}" if context["page"] is not None else ""
+                        reason = f"Найдена ссылка на объект: {alias_text}{page}"
+                        if reason not in reasons:
+                            reasons.append(reason)
+                    candidates.append((90, "; ".join(reasons), evidence))
         name = str(item.get("name") or "").strip()
         normalized_name = _normalize_match(name)
-        if len(normalized_name) >= 6 and any(
-            normalized_name in _normalize_match(value) for _, value in contexts
-        ):
-            candidates.append((80, f"Название объекта указано в ссылке: {name}"))
+        if len(normalized_name) >= 6:
+            evidence = [
+                context for context in contexts
+                if normalized_name in _normalize_match(context["value"])
+            ]
+            if evidence:
+                reasons = []
+                for context in evidence:
+                    page = f", поле {context['label']}, стр. {context['page']}" if context["page"] is not None else ""
+                    reason = f"Название объекта указано в ссылке: {name}{page}"
+                    if reason not in reasons:
+                        reasons.append(reason)
+                candidates.append((80, "; ".join(reasons), evidence))
         if candidates:
             best = max(candidates, key=lambda result: result[0])
             matches.append({
                 "object_id": item["id"], "name": name, "markning": marking,
                 "company": str(item.get("company") or ""),
                 "is_active": item.get("is_active", 1),
-                "reason": best[1], "score": best[0],
+                "reason": best[1], "score": best[0], "evidence": best[2],
             })
     return sorted(matches, key=lambda item: (-item["score"], item["name"].casefold()))
 

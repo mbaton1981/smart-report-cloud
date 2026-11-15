@@ -181,10 +181,15 @@ class FolderMailUITests(unittest.TestCase):
             folder_mail.open_import_dialog(self.window, archive=True)
 
     def test_import_dialog_is_nonmodal_and_duplicate_launch_reuses_it(self):
-        folder_mail.open_import_dialog(self.window)
-        dialog = self.window._mail_import_dialog
+        with patch.object(folder_mail, "import_folder") as import_folder, \
+                patch.object(folder_mail.imaplib, "IMAP4_SSL") as connect:
+            folder_mail.open_import_dialog(self.window)
+            dialog = self.window._mail_import_dialog
+            self.app.processEvents()
+            self.assertIsNone(dialog.worker)
+            import_folder.assert_not_called()
+            connect.assert_not_called()
         self.addCleanup(dialog.close)
-        self.app.processEvents()
         self.assertFalse(dialog.isModal())
         self.assertTrue(self.window.isEnabled())
         with patch.object(folder_mail, "create_import_dialog", side_effect=AssertionError("No duplicate")):

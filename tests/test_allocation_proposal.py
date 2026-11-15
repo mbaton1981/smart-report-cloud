@@ -7,7 +7,8 @@ from unittest.mock import patch
 import test_incoming_integration as integration
 from document_costs import propose_object_allocations
 from expense_documents import (
-    match_objects, object_marking_matches, parse_invoice_pages, parse_project_order_allocations,
+    match_objects, object_marker_evidence, object_marking_matches, parse_invoice_pages,
+    parse_project_order_allocations,
 )
 
 
@@ -118,14 +119,74 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual(order["project_code"], "P1041")
         self.assertEqual(order["net_amount"], "150.20")
 
-    def test_requisition_number_is_not_a_project_marker(self):
+    def test_bauhaus_project_name_and_requisition_match_with_page_evidence(self):
+        pages = (
+            "2Projekt ID:\nP1037Projektnamn:\n1037Rekvisitionsnr.:\n970-4638-10-6Ordernr.",
+            "Artikelrad utan projektreferens",
+            "Fortsatt artikelrad utan projektreferens",
+        )
+        objects = [{"id": 14, "name": "Object", "markning": "p1037", "is_active": 1}]
+
+        suggestions = match_objects(pages, objects)
+
+        self.assertEqual([item["object_id"] for item in suggestions], [14])
+        self.assertIn("Projektnamn: P1037, стр. 1", suggestions[0]["reason"])
+        self.assertIn("Rekvisitionsnr.: 1037, стр. 1", suggestions[0]["reason"])
+        self.assertNotIn("Projekt ID", suggestions[0]["reason"])
         self.assertEqual(
-            match_objects(
-                "Projekt ID: ej projekt\nRekvisitionsnr.: 1037",
-                [{"id": 14, "name": "Object", "markning": "p1037", "is_active": 1}],
-            ),
+            [(item["value"], item["page"]) for item in object_marker_evidence(pages)],
+            [("P1037", 1), ("1037", 1)],
+        )
+
+    def test_bauhaus_requisition_number_matches_when_project_name_is_ej_projekt(self):
+        pages = (
+            "1Projekt ID:\nej projektProjektnamn:\n1037Rekvisitionsnr.:\n970-4638-1-51Ordernr.",
+            "Artikelrad utan projektreferens",
+        )
+        objects = [{"id": 14, "name": "Object", "markning": "p1037", "is_active": 1}]
+
+        suggestions = match_objects(pages, objects)
+
+        self.assertEqual([item["object_id"] for item in suggestions], [14])
+        self.assertIn("Rekvisitionsnr.: 1037, стр. 1", suggestions[0]["reason"])
+        self.assertNotIn("Projektnamn", suggestions[0]["reason"])
+        self.assertEqual(
+            [(item["value"], item["page"]) for item in object_marker_evidence(pages)],
+            [("1037", 1)],
+        )
+        self.assertEqual(
+            match_objects("Projekt ID: 1037", objects),
             [],
         )
+        self.assertEqual(
+            match_objects("Rekvisitionsnr.: 1037", objects)[0]["object_id"],
+            14,
+        )
+
+    def test_conflicting_object_markings_are_retained_with_page_evidence(self):
+        pages = (
+            "P1037Projektnamn:",
+            "1022Rekvisitionsnr.:",
+            "Artikelrad utan projektreferens",
+        )
+        objects = [
+            {"id": 14, "name": "Object 1037", "markning": "p1037", "is_active": 1},
+            {"id": 5, "name": "Object 1022", "markning": "p1022", "is_active": 1},
+        ]
+
+        suggestions = match_objects(pages, objects)
+        evidence = object_marker_evidence(pages)
+
+        self.assertEqual({item["object_id"] for item in suggestions}, {5, 14})
+        self.assertTrue(any("стр. 1" in item["reason"] for item in suggestions))
+        self.assertTrue(any("стр. 2" in item["reason"] for item in suggestions))
+        self.assertEqual([(item["normalized"], item["page"]) for item in evidence], [("1037", 1), ("1022", 2)])
+
+    def test_missing_order_totals_does_not_claim_project_markers_are_unknown(self):
+        result = propose_object_allocations({"order_proposals": []}, [])
+
+        self.assertIn("Подтверждённые суммы заказов не распознаны", result["errors"][0])
+        self.assertNotIn("Маркировки", result["errors"][0])
 
     def test_groups_orders_preserves_net_vat_and_reconciles_stated_rounding(self):
         fields = fixture()

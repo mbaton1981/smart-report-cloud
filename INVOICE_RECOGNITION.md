@@ -217,6 +217,12 @@ restrictions described in the historical sections below:
   decision date, issuing authority and OCR reference. They do not invent VAT,
   an invoice number, net amount, payment or debt. Possible late-payment fees,
   passage-by-passage amounts and bare years are not tax totals.
+- Explicit `Projektnamn` and `Rekvisitionsnr.` values can suggest an object even
+  when the PDF text layer places the value before the field label. Show the
+  matching field and page; do not select the object or allocate the invoice
+  total automatically. Different project markings across pages remain visible
+  for manual reconciliation. If any page has insufficient readable text, do
+  not offer a whole-document object candidate until the original is checked.
 - Equal totals on multiple pages are supporting evidence for one amount.
   Conflicting totals remain blank and appear as candidates with source text and
   page numbers. Selecting a candidate fills the expense amount; manual entry

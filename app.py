@@ -65,7 +65,8 @@ from ob_calculator import (
 from expense_documents import (
     apply_expense_documents_migration, build_project_order_allocations, decimal_text, document_storage_root,
     extract_local_document, find_document_duplicates, get_object_expense_summary, is_service_category,
-    match_objects, normalize_object_marking, object_marking_matches,
+    match_objects, normalize_object_marking, object_marker_evidence, object_marking_matches,
+    pages_with_insufficient_text,
     parse_decimal, parse_document_text, parse_project_order_allocations,
     safe_folder_name, sha256_file,
     store_original_file,
@@ -5200,8 +5201,26 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         fields["client_id"] = str(uuid.uuid4())
         if extraction.confidence is not None and extraction.confidence < 0.65:
             fields["review_reasons"].append("низкая уверенность OCR; проверьте все поля")
-        suggestions = match_objects(extraction.text, self._expense_object_candidates())
-        self._api_expense_document_review_dialog(None, path, fields, suggestions, None)
+        suggestion_source = extraction.pages
+        marker_evidence = object_marker_evidence(suggestion_source)
+        incomplete_pages = pages_with_insufficient_text(suggestion_source)
+        marker_warning = None
+        if not suggestion_source:
+            marker_warning = "Страницы оригинала не получены; сверьте документ вручную."
+        elif incomplete_pages:
+            pages = ", ".join(map(str, incomplete_pages))
+            marker_warning = (
+                f"На страницах {pages} не удалось проверить полный текст; "
+                "сверьте документ вручную."
+            )
+        suggestions = (
+            match_objects(suggestion_source, self._expense_object_candidates())
+            if marker_warning is None else []
+        )
+        self._api_expense_document_review_dialog(
+            None, path, fields, suggestions, None, marker_evidence=marker_evidence,
+            marker_warning=marker_warning,
+        )
 
     def _download_expense_original(self, document):
         if not has_sync_credentials():
@@ -5222,7 +5241,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def _api_expense_document_review_dialog(
         self, document_id, source_path, fields, suggestions, existing_allocations,
-        source_paths=None, preview_paths=None,
+        source_paths=None, preview_paths=None, marker_evidence=None, marker_warning=None,
     ):
         non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(
             str(fields.get("raw_text") or fields.get("recognized_text") or "")
@@ -5341,6 +5360,48 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
             note.setWordWrap(True)
             form.addRow("Тип документа:", note)
+
+        marker_evidence = marker_evidence or []
+        evidence_groups = {}
+        evidence_labels = []
+        for evidence in marker_evidence:
+            evidence_groups.setdefault(evidence["normalized"], []).append(evidence)
+            page = f", стр. {evidence['page']}" if evidence.get("page") else ""
+            evidence_labels.append(f"{evidence['value']} — {evidence['label']}{page}")
+        evidence_text = "; ".join(dict.fromkeys(evidence_labels))
+        suggestion_details = "; ".join(
+            f"{item['name']} ({item.get('markning') or 'без маркировки'}): {item['reason']}"
+            for item in suggestions
+        )
+        if marker_warning:
+            conflict = " Найдены разные маркировки:" if len(evidence_groups) > 1 else " Маркировки:"
+            details = f"{conflict} {evidence_text}." if evidence_text else ""
+            suggestion_text = (
+                marker_warning + details
+                + " Объект не выбран, распределение не выполнено автоматически."
+            )
+        elif len(evidence_groups) > 1:
+            suggestion_text = (
+                f"В оригинале найдены разные маркировки: {evidence_text}. "
+                "Сверьте их по страницам; объект и сумма автоматически не распределены."
+            )
+        elif evidence_text:
+            suggestion_text = (
+                f"Маркировка в оригинале: {evidence_text}. "
+                "Объект не выбран, распределение не выполнено автоматически."
+            )
+        elif suggestions:
+            suggestion_text = (
+                "Есть текстовое совпадение. Объект не выбран, распределение не выполнено автоматически."
+            )
+        else:
+            suggestion_text = "Совпадение не найдено; объект выберите вручную."
+        if suggestion_details:
+            suggestion_text += "\nКандидаты: " + suggestion_details
+        suggestion_label = QLabel(suggestion_text)
+        suggestion_label.setTextFormat(Qt.TextFormat.PlainText)
+        suggestion_label.setWordWrap(True)
+        form.addRow("Предложение объекта:", suggestion_label)
 
         recognized_text = QTextEdit(str(fields.get("raw_text") or fields.get("recognized_text") or ""))
         recognized_text.setReadOnly(True)
@@ -8074,11 +8135,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         return "Последняя успешная проверка: " + checked_at.astimezone().strftime("%d.%m.%Y %H:%M")
 
     def _maybe_show_mail_reminder(self):
-        from folder_mail import FolderError, load_reminder_state, save_reminder_state
-        today = date.today().isoformat()
-        if getattr(self, "_mail_reminder_shown_today", None) == today:
-            return
-        self._mail_reminder_shown_today = today
+        from folder_mail import FolderError, load_reminder_state
         try:
             state = load_reminder_state()
         except (FolderError, OSError, ValueError):
@@ -8091,15 +8148,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             return
         self.mail_reminder_last_check.setText(
             self._format_mail_check_time(state.get("last_successful_check")))
-        if state.get("last_suggestion_date") == today:
-            return
         self.mail_reminder_banner.show()
-        try:
-            save_reminder_state(last_suggestion_date=today)
-        except (FolderError, OSError, ValueError):
-            logging.exception("Не удалось сохранить дату напоминания о почте")
-            self.mail_reminder_result.setText(
-                "Не удалось сохранить дату напоминания; проверку можно запустить вручную.")
 
     def mail_import_completed(self, successful, report):
         from folder_mail import FolderError, save_reminder_state

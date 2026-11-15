@@ -17,8 +17,13 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
     QStyledItemDelegate, QStyle,
 )
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
 
 from document_preview import DocumentGalleryDialog
+from expense_documents import (
+    DocumentExtractionError, match_objects, object_marker_evidence, pages_with_insufficient_text,
+)
 from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
 from object_picker import ObjectPickerComboBox
 import desktop_theme
@@ -454,6 +459,24 @@ class OfflineReviewWindow(QDialog):
                                                self.allocations.fontMetrics().height() + 18) + 8)
         self.update_allocation_total()
 
+    def _object_marker_suggestions(self):
+        reader = PdfReader(str(self.store.original(self.document_id)))
+        if reader.is_encrypted:
+            raise DocumentExtractionError("Зашифрованный PDF нельзя прочитать без пароля.")
+        page_texts = tuple((page.extract_text() or "").strip() for page in reader.pages)
+        if not page_texts:
+            raise DocumentExtractionError("В оригинале не найдены страницы для проверки маркировок.")
+        marker_evidence = object_marker_evidence(page_texts)
+        unreadable_pages = pages_with_insufficient_text(page_texts)
+        if unreadable_pages:
+            pages = ", ".join(map(str, unreadable_pages))
+            return (
+                marker_evidence,
+                [],
+                f"На страницах {pages} не удалось проверить полный текст.",
+            )
+        return marker_evidence, match_objects(page_texts, self.store.objects()), None
+
     def show_proposal(self):
         self.proposal = self.store.allocation_proposal(self.document_id)
         proposal = self.proposal
@@ -461,6 +484,54 @@ class OfflineReviewWindow(QDialog):
             self.store.base(self.document_id).get("document_subtype") == "infrastructure_fee_decision")
         lines = ["<b>Предложение по маркировкам и позициям на страницах PDF. "
                  "Это не подтверждённое распределение.</b>"]
+        try:
+            marker_evidence, object_suggestions, marker_warning = self._object_marker_suggestions()
+        except (
+            DocumentExtractionError, ImportError, OSError, PyPdfError, ReviewError, ValueError,
+        ) as error:
+            lines.append(
+                "<b>Маркировки объекта:</b> не удалось проверить оригинал: "
+                + escape(str(error))
+            )
+        else:
+            evidence_text = "; ".join(dict.fromkeys(
+                f"{escape(item['value'])} — {escape(item['label'])}"
+                + (f", стр. {item['page']}" if item.get("page") else "")
+                for item in marker_evidence
+            ))
+            if marker_warning:
+                lines.append(
+                    "<b>Не удалось проверить все страницы:</b> "
+                    + escape(marker_warning)
+                    + " Кандидат не предлагается; сверьте оригинал."
+                )
+                if evidence_text:
+                    lines.append(
+                        "<b>Маркировки на читаемых страницах:</b> "
+                        + evidence_text
+                        + ". Сверьте их с остальными страницами."
+                    )
+            elif len({item["normalized"] for item in marker_evidence}) > 1:
+                lines.append(
+                    "<b>Найдены разные маркировки — сверьте по страницам:</b> "
+                    + evidence_text
+                    + ". Объект и сумма автоматически не распределены."
+                )
+            elif evidence_text:
+                lines.append(
+                    "<b>Основание маркировки:</b> " + evidence_text
+                    + ". Объект и сумма автоматически не распределены."
+                )
+            if object_suggestions:
+                lines.append("<b>Кандидаты (не назначены):</b>")
+                for item in object_suggestions:
+                    candidate = f"{item['name']} ({item.get('markning') or 'без маркировки'})"
+                    lines.append(
+                        f"{escape(candidate)} — {escape(item['reason'])}. "
+                        "Объект не выбран."
+                    )
+            elif marker_evidence and not marker_warning:
+                lines.append("Совпадение с объектами не найдено; выберите вручную.")
         for part in proposal["parts"]:
             options = ", ".join(
                 f"{item['name']} ({item['markning'] or 'без маркировки'})"
