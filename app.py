@@ -43,6 +43,9 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
+from object_package_report import (
+    collect_object_expenses, expense_document_key, write_object_report_package,
+)
 import customer_intervals
 from customer_intervals_desktop import CustomerIntervalsMixin, cache_terms
 from customer_supplements_ui import calculate_supplements
@@ -168,6 +171,68 @@ def request_expense_api(method, path, **kwargs):
     if not response.ok:
         raise RuntimeError(payload.get("error") or f"Сервер вернул HTTP {response.status_code}.")
     return payload
+
+
+EXPENSE_DOCUMENT_PAGE_SIZE = 1000
+
+
+def fetch_all_expense_documents(date_from=None, date_to=None):
+    """Fetch every expense page or fail rather than treating a truncated page as complete."""
+    params = {"limit": EXPENSE_DOCUMENT_PAGE_SIZE, "offset": 0}
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    documents = []
+    document_ids = set()
+    expected_total = None
+    offset = 0
+    while True:
+        params["offset"] = offset
+        result = request_expense_api("GET", "/api/expense-documents", params=params)
+        page = result.get("documents")
+        if not isinstance(page, list) or len(page) > EXPENSE_DOCUMENT_PAGE_SIZE:
+            raise RuntimeError("Сервер вернул некорректную страницу реестра расходов.")
+
+        if "total" not in result or "has_more" not in result or "offset" not in result:
+            if offset or len(page) >= EXPENSE_DOCUMENT_PAGE_SIZE:
+                raise RuntimeError(
+                    "Сервер не подтвердил полноту выборки расходов; пакет не сформирован."
+                )
+            documents.extend(page)
+            break
+
+        try:
+            total = int(result["total"])
+            response_offset = int(result["offset"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("Сервер вернул некорректные сведения о страницах реестра.") from error
+        if total < 0 or response_offset != offset:
+            raise RuntimeError("Сервер вернул несогласованные сведения о страницах реестра.")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise RuntimeError(
+                "Реестр расходов изменился во время чтения; повторите формирование отчёта."
+            )
+        for document in page:
+            identity = str(document.get("client_id") or document.get("id") or "")
+            if not identity or identity in document_ids:
+                raise RuntimeError("В страницах реестра есть запись без устойчивого ID или дубликат.")
+            document_ids.add(identity)
+        documents.extend(page)
+        has_more = bool(result["has_more"])
+        if has_more != (offset + len(page) < total):
+            raise RuntimeError("Сервер вернул неполную или несогласованную страницу расходов.")
+        if not has_more:
+            if len(documents) != total:
+                raise RuntimeError("Получена неполная выборка реестра расходов.")
+            break
+        if not page:
+            raise RuntimeError("Сервер сообщил о следующей странице без записей.")
+        offset += len(page)
+    return documents
+
 
 RECORD_TYPE_WORK = "work"
 RECORD_TYPE_ATF = "atf"
@@ -1851,6 +1916,30 @@ class ObjectOverviewTask(QRunnable):
             result = self.fetch()
         except Exception as error:
             logging.exception("Object overview read failed")
+            self.signals.completed.emit(self.request_id, None, str(error))
+        else:
+            self.signals.completed.emit(self.request_id, result, "")
+
+
+class ObjectPackageSignals(QObject):
+    progress = pyqtSignal(int, str)
+    completed = pyqtSignal(int, object, str)
+
+
+class ObjectPackageTask(QRunnable):
+    def __init__(self, request_id, build):
+        super().__init__()
+        self.request_id = request_id
+        self.build = build
+        self.signals = ObjectPackageSignals()
+
+    def run(self):
+        try:
+            result = self.build(
+                lambda message: self.signals.progress.emit(self.request_id, message)
+            )
+        except Exception as error:
+            logging.exception("Full object report creation failed")
             self.signals.completed.emit(self.request_id, None, str(error))
         else:
             self.signals.completed.emit(self.request_id, result, "")
@@ -10578,11 +10667,25 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.report_pages.addTab(self.tab_dagbok, "Журнал работ")
         layout.addWidget(self.report_pages)
 
-    def collect_invoice_report(self):
-        d_from = self.inv_date_from.text().strip()
-        d_to = self.inv_date_to.text().strip()
-        comp = self.inv_comp_cb.currentText()
-        object_id = self.inv_obj_cb.currentData()
+    def collect_invoice_report(self, *, selection=None):
+        if selection is None:
+            d_from = self.inv_date_from.text().strip()
+            d_to = self.inv_date_to.text().strip()
+            comp = self.inv_comp_cb.currentText()
+            object_id = self.inv_obj_cb.currentData()
+            expected_sync_id = self.inv_obj_cb.currentData(Qt.ItemDataRole.UserRole + 1)
+            is_fast_pris = self.fast_pris_check.isChecked()
+            fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
+            allow_fast_pris_draft = True
+        else:
+            d_from = str(selection["date_from"]).strip()
+            d_to = str(selection["date_to"]).strip()
+            comp = str(selection["company"])
+            object_id = int(selection["object_id"])
+            expected_sync_id = selection["sync_id"]
+            is_fast_pris = bool(selection.get("is_fast_pris", False))
+            fast_pris_amount = float(selection.get("fast_pris_amount", 0.0)) if is_fast_pris else 0.0
+            allow_fast_pris_draft = bool(selection.get("allow_fast_pris_draft", False))
         if not comp or object_id is None:
             raise ValueError("Выберите фирму и объект. Если объект исчез из справочника, выберите его заново.")
         datetime.strptime(d_from, "%Y-%m-%d")
@@ -10597,7 +10700,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             obj_row = cursor.execute(
                 "SELECT * FROM objects WHERE id = ? AND company = ?", (object_id, comp)
             ).fetchone()
-            if obj_row is None or obj_row['sync_id'] != self.inv_obj_cb.currentData(Qt.ItemDataRole.UserRole + 1):
+            if obj_row is None or obj_row['sync_id'] != expected_sync_id:
                 raise ValueError("Выбранный объект изменился или больше не существует. Обновите справочник.")
             obj = obj_row['name']
             object_names = invoice_object_names(cursor, obj_row)
@@ -10668,8 +10771,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         "sparade segment saknas eller är inkonsekventa."
                     )
             rows = [tuple(row[:3]) + (2 if row[3] and not row[6] else row[3],) + tuple(row[4:6]) for row in rows]
-            is_fast_pris = self.fast_pris_check.isChecked()
-            fast_pris_amount = parse_float(self.fast_pris_input.text(), 0.0) if is_fast_pris else 0.0
             if is_fast_pris and (not math.isfinite(fast_pris_amount) or fast_pris_amount <= 0):
                 raise ValueError("Укажите положительную фиксированную цену; стоимость не рассчитана.")
             report = {
@@ -10689,7 +10790,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             }
             scope = self._fixed_scope(report)
             draft = getattr(self, "_fast_pris_draft", {})
-            report["fast_pris_extras"] = draft.get("extras", {}) if draft.get("scope") == scope else {}
+            report["fast_pris_extras"] = (
+                draft.get("extras", {})
+                if allow_fast_pris_draft and draft.get("scope") == scope else {}
+            )
             return report
         finally:
             conn.close()
@@ -12321,15 +12425,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_shifts_button = QPushButton("Смены")
         self.object_expenses_button = QPushButton("Расходы")
         self.object_report_button = QPushButton("Отчёт")
+        self.object_full_report_button = QPushButton("Полный отчёт по объекту")
         self.object_shifts_button.clicked.connect(self.open_selected_object_shifts)
         self.object_expenses_button.clicked.connect(self.open_selected_object_expenses)
         self.object_report_button.clicked.connect(self.open_selected_object_report)
+        self.object_full_report_button.clicked.connect(self.open_full_object_report_dialog)
+        self.object_full_report_button.setObjectName("primaryAction")
         for button in (
             self.object_shifts_button, self.object_expenses_button, self.object_report_button,
+            self.object_full_report_button,
         ):
-            button.setObjectName("secondaryAction")
+            if button is not self.object_full_report_button:
+                button.setObjectName("secondaryAction")
             actions.addWidget(button)
-        desktop_theme.adapt_box_layout(overview_page, actions, compact_width=380)
+        desktop_theme.adapt_box_layout(overview_page, actions, compact_width=520)
         overview_layout.addLayout(actions)
         overview_layout.addWidget(self.object_expense_status)
         overview_layout.addWidget(self.object_detail_meta)
@@ -13670,7 +13779,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
             for button in (
                 self.object_shifts_button, self.object_expenses_button,
-                self.object_report_button,
+                self.object_report_button, self.object_full_report_button,
             ):
                 button.setEnabled(False)
             return
@@ -13705,6 +13814,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "" if server_id is not None else "Нет устойчивой связи с реестром расходов."
         )
         self.object_report_button.setEnabled(bool(sync_id))
+        self.object_full_report_button.setEnabled(bool(sync_id))
 
         date_from = None
         date_to = None
@@ -14084,6 +14194,467 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.generate_invoice()
         except (ValueError, sqlite3.Error) as error:
             QMessageBox.warning(self, "Переход к отчёту", str(error))
+
+    def open_full_object_report_dialog(self):
+        try:
+            object_row = self._selected_object_for_navigation()
+            if object_row is None:
+                return
+            if not object_row["sync_id"]:
+                raise ValueError("Для объекта нет устойчивого ID отчётного фильтра.")
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Полный отчёт по объекту", str(error))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Полный отчёт по объекту")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"{object_row['name']} · {object_row.get('markning') or 'без маркировки'}"
+        ))
+        period_layout = QFormLayout()
+        all_period = QCheckBox("За весь объект")
+        all_period.setChecked(True)
+        date_from = create_date_field(self.object_date_from.text().strip())
+        date_to = create_date_field(self.object_date_to.text().strip())
+        date_from.setEnabled(False)
+        date_to.setEnabled(False)
+        all_period.toggled.connect(lambda checked: (
+            date_from.setEnabled(not checked), date_to.setEnabled(not checked)
+        ))
+        date_range = QHBoxLayout()
+        date_range.addWidget(QLabel("с"))
+        date_range.addWidget(date_from)
+        date_range.addWidget(QLabel("по"))
+        date_range.addWidget(date_to)
+        period_layout.addRow(all_period)
+        period_layout.addRow("Период:", date_range)
+        layout.addLayout(period_layout)
+
+        include_copies = QCheckBox("Включить копии фактур и расходных документов")
+        include_copies.setChecked(True)
+        include_customer_cost = QCheckBox("Включить расчёт клиенту по сохранённым условиям")
+        include_customer_cost.setChecked(True)
+        layout.addWidget(include_copies)
+        layout.addWidget(include_customer_cost)
+        note = QLabel(
+            "По умолчанию включается весь объект. Отчёт не создаёт фактуру и не меняет учётные данные."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сформировать PDF")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if all_period.isChecked():
+            selected_from = selected_to = None
+        else:
+            selected_from = date_from.date().toString("yyyy-MM-dd")
+            selected_to = date_to.date().toString("yyyy-MM-dd")
+            if selected_from > selected_to:
+                QMessageBox.warning(
+                    self, "Полный отчёт по объекту",
+                    "Начало периода должно быть не позже окончания.",
+                )
+                return
+        options = {
+            "all_period": all_period.isChecked(),
+            "date_from": selected_from,
+            "date_to": selected_to,
+            "include_copies": include_copies.isChecked(),
+            "include_customer_cost": include_customer_cost.isChecked(),
+        }
+        self._start_full_object_report(object_row, options)
+
+    def _start_full_object_report(self, object_row, options):
+        self._object_package_request_id = getattr(self, "_object_package_request_id", 0) + 1
+        request_id = self._object_package_request_id
+        self.object_full_report_button.setEnabled(False)
+        self.statusBar().showMessage("Подготавливаем полный отчёт по объекту…")
+        task = ObjectPackageTask(
+            request_id,
+            lambda progress: self._build_full_object_package(object_row, options, progress),
+        )
+        task.signals.progress.connect(self._on_full_object_report_progress)
+        task.signals.completed.connect(self._on_full_object_report_ready)
+        self._object_package_task = task
+        QThreadPool.globalInstance().start(task)
+
+    def _on_full_object_report_progress(self, request_id, message):
+        if request_id == getattr(self, "_object_package_request_id", None):
+            self.statusBar().showMessage(message)
+
+    def _on_full_object_report_ready(self, request_id, result, error):
+        if request_id != getattr(self, "_object_package_request_id", None):
+            return
+        self._object_package_task = None
+        selected = self.table_objects.currentRow()
+        item = self.table_objects.item(selected, 0) if selected >= 0 else None
+        self.object_full_report_button.setEnabled(
+            bool(item and item.data(Qt.ItemDataRole.UserRole + 2))
+        )
+        if error:
+            self.statusBar().showMessage("Формирование полного отчёта не выполнено.", 10000)
+            QMessageBox.critical(
+                self, "Полный отчёт по объекту",
+                f"Не удалось сформировать PDF:\n{error}",
+            )
+            return
+
+        path = Path(result["path"])
+        self.statusBar().showMessage(f"PDF сохранён: {path}", 12000)
+        details = f"PDF сохранён:\n{path}"
+        if result.get("incomplete_reasons"):
+            details += "\n\nПакет неполный: " + "; ".join(result["incomplete_reasons"])
+        else:
+            details += "\n\nПакет сформирован без обнаруженных ограничений."
+        message = QMessageBox(self)
+        message.setWindowTitle("Полный отчёт по объекту")
+        message.setText(details)
+        open_pdf = message.addButton("Открыть PDF", QMessageBox.ButtonRole.ActionRole)
+        open_folder = message.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
+        message.addButton(QMessageBox.StandardButton.Close)
+        message.exec()
+        if message.clickedButton() is open_pdf:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+        elif message.clickedButton() is open_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent.resolve())))
+
+    def _object_work_history_range(self, object_row, date_from=None, date_to=None):
+        conn = get_db_connection()
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            cursor = conn.cursor()
+            current = cursor.execute(
+                "SELECT * FROM objects WHERE id=? AND sync_id=?",
+                (object_row["id"], object_row["sync_id"]),
+            ).fetchone()
+            if current is None:
+                raise ValueError("Объект изменился или больше не существует.")
+            names = invoice_object_names(cursor, dict(current))
+            placeholders = ",".join("?" for _ in names)
+            row = cursor.execute(
+                f"SELECT MIN(date), MAX(date) FROM shifts WHERE company=? "
+                f"AND object_name IN ({placeholders}) AND entry_type IN ('work','ob')",
+                (current["company"], *names),
+            ).fetchone()
+            pending_filters = [
+                "s.company = ?", f"s.object_name IN ({placeholders})",
+                "s.entry_type IN ('work','ob')",
+                "o.state IN ('pending','conflict','blocked')",
+            ]
+            pending_params = [current["company"], *names]
+            if date_from:
+                pending_filters.append("s.date >= ?")
+                pending_params.append(date_from)
+            if date_to:
+                pending_filters.append("s.date <= ?")
+                pending_params.append(date_to)
+            pending = cursor.execute(
+                "SELECT COUNT(DISTINCT s.sync_id), GROUP_CONCAT(DISTINCT o.state) "
+                "FROM shifts s JOIN shift_sync_outbox o ON o.sync_id=s.sync_id "
+                f"WHERE {' AND '.join(pending_filters)}",
+                pending_params,
+            ).fetchone()
+            return (
+                (row[0], row[1]) if row and row[0] and row[1] else (None, None),
+                int(pending[0] or 0) if pending else 0,
+                str(pending[1] or "") if pending else "",
+            )
+        finally:
+            conn.close()
+
+    def _download_object_report_originals(self, documents, directory, progress):
+        sources, errors = {}, {}
+        for document_index, document in enumerate(documents, 1):
+            key = expense_document_key(document)
+            progress(f"Загружаем оригиналы: {document_index}/{len(documents)}…")
+            local_paths = [Path(path) for path in document.get("local_attachment_paths") or []]
+            if local_paths:
+                attachments = list(document.get("attachments") or [])
+                if not attachments and document.get("file_sha256"):
+                    attachments = [{"sha256": document["file_sha256"]}]
+                if attachments and len(attachments) != len(local_paths):
+                    errors[key] = "Не удалось связать локальные файлы с хешами оригиналов."
+                    continue
+                verified_paths = []
+                failures = []
+                for index, path in enumerate(local_paths):
+                    try:
+                        if not path.is_file():
+                            failures.append(f"{path.name}: файл не найден в профиле.")
+                            continue
+                        expected_hash = (
+                            str(attachments[index].get("sha256") or "")
+                            if attachments else ""
+                        )
+                        if expected_hash:
+                            actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                            if actual_hash != expected_hash:
+                                failures.append(f"{path.name}: SHA-256 не совпадает с реестром.")
+                                continue
+                    except OSError as error:
+                        failures.append(f"{path.name}: не удалось проверить оригинал: {error}")
+                        continue
+                    verified_paths.append(path)
+                sources[key] = verified_paths
+                if failures:
+                    errors[key] = "; ".join(failures)
+                continue
+            attachments = list(document.get("attachments") or [])
+            if not attachments and document.get("has_original"):
+                attachments = [{
+                    "id": None, "original_name": document.get("original_name"),
+                    "sha256": document.get("file_sha256"),
+                }]
+            if not attachments:
+                errors[key] = "В реестре нет доступного оригинала."
+                continue
+            server_id = document.get("server_document_id") or document.get("id")
+            if not isinstance(server_id, int):
+                errors[key] = "Для оригинала нет серверного ID."
+                continue
+            sources[key] = []
+            failures = []
+            for attachment_index, attachment in enumerate(attachments, 1):
+                attachment_id = attachment.get("id")
+                endpoint = (
+                    f"/api/expense-documents/{server_id}/attachments/{int(attachment_id)}/original"
+                    if attachment_id is not None else
+                    f"/api/expense-documents/{server_id}/original"
+                )
+                try:
+                    response = requests.get(
+                        f"{CLOUD_URL.rstrip('/')}{endpoint}",
+                        headers=sync_headers(), timeout=30,
+                    )
+                    response.raise_for_status()
+                    content = response.content
+                    expected_hash = str(attachment.get("sha256") or "")
+                    actual_hash = hashlib.sha256(content).hexdigest()
+                    if expected_hash and actual_hash != expected_hash:
+                        raise ValueError("SHA-256 оригинала не совпадает с реестром.")
+                    original_name = str(
+                        attachment.get("original_name") or f"document-{attachment_index}"
+                    )
+                    stem = safe_folder_name(Path(original_name).stem) or "document"
+                    suffix = Path(original_name).suffix or ".pdf"
+                    target = Path(directory) / f"{key}_{attachment_index}_{stem}{suffix}"
+                    target.write_bytes(content)
+                    sources[key].append(target)
+                except Exception as error:
+                    failures.append(f"{attachment.get('original_name') or attachment_index}: {error}")
+            if failures:
+                errors[key] = "; ".join(failures)
+        return sources, errors
+
+    def _build_full_object_package(self, object_row, options, progress):
+        date_from = options.get("date_from")
+        date_to = options.get("date_to")
+        server_id = object_row.get("server_id")
+        snapshot_available = False
+        expense_online = False
+        snapshot_error = None
+        documents = []
+
+        if server_id is not None:
+            progress("Загружаем полный снимок реестра расходов…")
+            try:
+                server_documents = fetch_all_expense_documents(date_from, date_to)
+                expense_online = True
+                snapshot_available = True
+            except Exception as error:
+                cache = getattr(self, "_expense_read_cache", {})
+                if (None, None) not in cache:
+                    raise RuntimeError(
+                        f"Не удалось получить полный снимок расходов: {error}"
+                    ) from error
+                server_documents = list(cache[(None, None)])
+                snapshot_available = True
+                snapshot_error = str(error)
+            documents, expense_online = self._expense_document_snapshot(
+                date_from, date_to, server_snapshot=(server_documents, expense_online),
+            )
+        else:
+            snapshot_error = "Объект не связан с реестром расходов; суммы расходов неизвестны."
+
+        if server_id is not None and snapshot_available:
+            confirmed_expenses, excluded_expenses = collect_object_expenses(
+                documents, int(server_id), date_from, date_to,
+            )
+        else:
+            confirmed_expenses, excluded_expenses = [], []
+
+        work_range, unsynced_shift_count, unsynced_shift_states = (
+            self._object_work_history_range(
+                object_row,
+                date_from if not options["all_period"] else None,
+                date_to if not options["all_period"] else None,
+            )
+        )
+        work_start, work_end = work_range
+        if options["all_period"]:
+            related_dates = [
+                str(document.get("document_date") or "")
+                for document in (*confirmed_expenses, *excluded_expenses)
+                if document.get("document_date")
+            ]
+            all_dates = [value for value in (work_start, work_end, *related_dates) if value]
+            selected_from = min(all_dates) if all_dates else None
+            selected_to = max(all_dates) if all_dates else None
+        else:
+            selected_from, selected_to = date_from, date_to
+
+        customer_report = None
+        if selected_from and selected_to:
+            progress("Сверяем смены и расчёт клиентских условий…")
+            customer_report = self.collect_invoice_report(selection={
+                "company": object_row["company"],
+                "object_id": object_row["id"],
+                "sync_id": object_row["sync_id"],
+                "date_from": selected_from,
+                "date_to": selected_to,
+                "is_fast_pris": False,
+                "allow_fast_pris_draft": False,
+            })
+            customer_report = self._prepare_invoice_view(customer_report)
+        else:
+            customer_report = {
+                "object_id": object_row["id"],
+                "sync_id": object_row["sync_id"],
+                "company": object_row["company"],
+                "object": object_row["name"],
+                "date_from": "",
+                "date_to": "",
+                "journal_rows": [],
+                "journal_segments": {},
+                "prepared_rows": [],
+                "cost_lines": [],
+                "warnings": [],
+                "totals": {
+                    "hours": 0.0, "without_ob_hours": 0.0, "ob_categories": {},
+                    "known_subtotal": 0.0, "invoice_total": 0.0,
+                },
+            }
+
+        unknown_trip_rows = [
+            row for row in customer_report.get("journal_rows", [])
+            if row.get("entry_type") in WORK_TYPES and row.get("transport") is None
+        ]
+        if unknown_trip_rows:
+            customer_report["totals"]["invoice_total"] = None
+            customer_report.setdefault("warnings", []).append(
+                "Число поездок неизвестно; расчёт клиенту неполный."
+            )
+            customer_report.setdefault("cost_lines", []).append({
+                "label": "Поездки - количество неизвестно",
+                "quantity": None, "unit": "st", "rate": None, "amount": None,
+            })
+
+        if options["all_period"]:
+            period_label = (
+                f"за весь объект; фактический диапазон данных {selected_from} — {selected_to}"
+                if selected_from and selected_to else
+                "за весь объект; датированные записи отсутствуют"
+            )
+        else:
+            period_label = f"{selected_from} — {selected_to}"
+
+        incomplete_reasons = []
+        if snapshot_error:
+            incomplete_reasons.append(snapshot_error)
+        if server_id is not None and snapshot_available and not expense_online:
+            incomplete_reasons.append("Использован последний локальный снимок расходов; он может быть устаревшим.")
+            if len(documents) >= EXPENSE_DOCUMENT_PAGE_SIZE:
+                incomplete_reasons.append(
+                    "Локальный снимок достиг лимита 1000 документов; полнота не подтверждена."
+                )
+        if excluded_expenses:
+            incomplete_reasons.append(
+                f"Не включено в расходы документов, требующих проверки или подтверждения: "
+                f"{len(excluded_expenses)}."
+            )
+        if unsynced_shift_count:
+            states = ", ".join(sorted(unsynced_shift_states.split(",")))
+            incomplete_reasons.append(
+                f"В выборке есть несинхронизированные или конфликтующие смены: "
+                f"{unsynced_shift_count}; состояния: {states}."
+            )
+        if customer_report.get("totals", {}).get("without_ob_hours") is None:
+            incomplete_reasons.append("Распределение обычных и OB-часов не полностью подтверждено.")
+        if unknown_trip_rows:
+            incomplete_reasons.append("Число поездок в части рабочих записей неизвестно.")
+        if options["include_customer_cost"] and customer_report.get("totals", {}).get("invoice_total") is None:
+            incomplete_reasons.append("Расчёт клиенту неполный: есть неизвестные цены или доплаты.")
+        if any(document["share"].get("gross_amount") is None for document in confirmed_expenses):
+            incomplete_reasons.append("У части подтверждённых распределений неизвестна сумма доли объекта.")
+
+        data = {
+            "object": dict(object_row),
+            "period_label": period_label,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "customer_report": customer_report,
+            "include_customer_cost": options["include_customer_cost"],
+            "include_copies": options["include_copies"],
+            "expenses": confirmed_expenses,
+            "excluded_expenses": excluded_expenses,
+            "expense_snapshot_available": snapshot_available,
+            "incomplete_reasons": incomplete_reasons,
+        }
+        source_paths, source_errors = {}, {}
+        with tempfile.TemporaryDirectory(prefix="smartreport-object-originals-") as directory:
+            if options["include_copies"]:
+                source_paths, source_errors = self._download_object_report_originals(
+                    confirmed_expenses, directory, progress,
+                )
+            output_path = self._reserve_object_report_path(
+                object_row, selected_from, selected_to, options["all_period"],
+            )
+            try:
+                progress("Формируем PDF и проверяем приложения…")
+                result = write_object_report_package(
+                    output_path, data, font=DEFAULT_FONT, bold_font=DEFAULT_FONT_BOLD,
+                    source_paths=source_paths, source_errors=source_errors,
+                )
+            except Exception:
+                if output_path.exists():
+                    output_path.unlink()
+                raise
+        return result
+
+    def _reserve_object_report_path(self, object_row, date_from, date_to, all_period):
+        reports_dir = Path(REPORTS_DIR)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        period = (
+            f"{date_from or 'no-date'}_{date_to or 'no-date'}"
+            if date_from or date_to else "all-period"
+        )
+        if all_period:
+            period = f"all_{period}"
+        parts = [
+            "Full-object-report",
+            safe_folder_name(str(object_row.get("name") or "object")),
+            safe_folder_name(str(object_row.get("markning") or "no-mark")),
+            safe_folder_name(period),
+        ]
+        stem = "_".join(part[:70].rstrip(" .") or "object" for part in parts)
+        for suffix in range(1, 10000):
+            filename = f"{stem}.pdf" if suffix == 1 else f"{stem}_{suffix}.pdf"
+            path = reports_dir / filename
+            try:
+                with path.open("xb"):
+                    pass
+                return path
+            except FileExistsError:
+                continue
+        raise OSError("Не удалось подобрать свободное имя для PDF в папке отчётов.")
 
     def update_object_archive_action(self):
         selected = self.table_objects.currentRow()

@@ -1791,7 +1791,15 @@ def expense_documents_list_api():
     date_from = request.args.get("date_from", "").strip()
     date_to = request.args.get("date_to", "").strip()
     object_id = request.args.get("object_id", "").strip()
-    query = "SELECT * FROM expense_documents"
+    try:
+        limit = int(request.args.get("limit", "1000"))
+        offset = int(request.args.get("offset", "0"))
+        selected_object = int(object_id) if object_id else None
+    except ValueError:
+        return jsonify({"ok": False, "error": "Некорректный параметр выборки."}), 400
+    if limit < 1 or limit > 1000 or offset < 0:
+        return jsonify({"ok": False, "error": "Недопустимый размер или смещение выборки."}), 400
+
     conditions = ["is_deleted = 0", """NOT EXISTS (
         SELECT 1 FROM expense_processing p
         WHERE p.document_id=expense_documents.id AND p.state='split')"""]
@@ -1802,29 +1810,43 @@ def expense_documents_list_api():
     if date_to:
         conditions.append("(document_date IS NULL OR document_date = '' OR document_date <= ?)")
         params.append(date_to)
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY document_date DESC, id DESC LIMIT 1000"
+    if selected_object is not None:
+        conditions.append("""EXISTS (
+            SELECT 1 FROM expense_allocations a
+            WHERE a.document_id=expense_documents.id AND a.object_id=?)""")
+        params.append(selected_object)
+    where_clause = " WHERE " + " AND ".join(conditions)
 
     conn = get_db_connection()
     try:
+        conn.execute("BEGIN")
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        total = int(cursor.execute(
+            "SELECT COUNT(*) FROM expense_documents" + where_clause, params,
+        ).fetchone()[0])
+        supplier_names = sorted({
+            str(row[0]) for row in cursor.execute(
+                "SELECT DISTINCT supplier_name FROM expense_documents" + where_clause
+                + " AND supplier_name IS NOT NULL AND TRIM(supplier_name) <> ''",
+                params,
+            ).fetchall()
+        }, key=str.casefold)
+        cursor.execute(
+            "SELECT * FROM expense_documents" + where_clause
+            + " ORDER BY document_date DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
         rows = cursor.fetchall()
         documents = [serialize_expense_document(cursor, row) for row in rows]
-        if object_id:
-            try:
-                selected_object = int(object_id)
-            except ValueError:
-                return jsonify({"ok": False, "error": "Некорректный ID объекта."}), 400
-            documents = [
-                document for document in documents
-                if any(item["object_id"] == selected_object for item in document["allocations"])
-            ]
-        supplier_names = sorted({
-            document["supplier_name"] for document in documents if document["supplier_name"]
-        }, key=str.casefold)
-        return jsonify({"ok": True, "documents": documents, "suppliers": supplier_names})
+        return jsonify({
+            "ok": True,
+            "documents": documents,
+            "suppliers": supplier_names,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + len(documents) < total,
+        })
     finally:
         conn.close()
 

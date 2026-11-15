@@ -335,3 +335,50 @@ class ExpenseSharingTests(unittest.TestCase):
         document = response.get_json()["document"]
         self.assertEqual(document["unallocated_gross"], "2400.00")
         self.assertEqual(document["verification_status"], "draft")
+
+    def test_expense_document_list_paginates_without_losing_total_supplier_list(self):
+        conn = self.server.get_db_connection()
+        try:
+            now = "2026-11-01T00:00:00+00:00"
+            conn.executemany(
+                "INSERT INTO expense_documents(client_id,supplier_name,created_at,updated_at) "
+                "VALUES(?,?,?,?)",
+                [
+                    (f"page-{index}", f"Page supplier {index}", now, now)
+                    for index in range(3)
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        first = self.server_client.get(
+            "/api/expense-documents?limit=2&offset=0", headers=headers,
+        )
+        self.assertEqual(first.status_code, 200, first.get_json())
+        first_page = first.get_json()
+        self.assertEqual(first_page["total"], 3)
+        self.assertTrue(first_page["has_more"])
+        self.assertEqual(len(first_page["documents"]), 2)
+        self.assertEqual(first_page["suppliers"], [
+            "Page supplier 0", "Page supplier 1", "Page supplier 2",
+        ])
+
+        second = self.server_client.get(
+            "/api/expense-documents?limit=2&offset=2", headers=headers,
+        )
+        self.assertEqual(second.status_code, 200, second.get_json())
+        second_page = second.get_json()
+        self.assertEqual(second_page["total"], 3)
+        self.assertFalse(second_page["has_more"])
+        self.assertEqual(len(second_page["documents"]), 1)
+        self.assertFalse({
+            row["id"] for row in first_page["documents"]
+        } & {
+            row["id"] for row in second_page["documents"]
+        })
+
+        invalid = self.server_client.get(
+            "/api/expense-documents?limit=1001", headers=headers,
+        )
+        self.assertEqual(invalid.status_code, 400)
