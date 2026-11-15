@@ -123,7 +123,8 @@ def non_invoice_document_type(text: str) -> str | None:
     headings = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.startswith("---")]
     header = "\n".join(headings[:60])
     if re.search(
-            r"^\s*Beslut\s+om\s+(?:trängselskatt|fordonsskatt)(?:\s+och\s+avgifter)?\s*$",
+            r"^\s*Beslut\s+om\s+(?:trängselskatt|fordonsskatt(?:\s+och\s+avgifter)?|"
+            r"infrastrukturavgift)\s*$",
             header, re.IGNORECASE | re.MULTILINE):
         return "tax_decision"
     if re.search(r"^\s*ORDERBEKRÄFTELSE\s*$", header, re.IGNORECASE | re.MULTILINE):
@@ -721,6 +722,10 @@ def parse_invoice_pages(pages):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     fields = parse_document_text(text)
     non_invoice_type = fields.get("non_invoice_document_type")
+    if (non_invoice_type == "tax_decision"
+            and re.search(r"^\s*Beslut\s+om\s+infrastrukturavgift\s*$",
+                          text, re.IGNORECASE | re.MULTILINE)):
+        fields["document_subtype"] = "infrastructure_fee_decision"
     labels = {
         "supplier_name": r"Leverantör|Supplier|Seller|Returadress|Return\s+address",
         "invoice_number": r"Fakturanummer|Fakturanr\s*/\s*OCR(?:\s*[- ]?\s*nr\.?)?|"
@@ -1092,24 +1097,29 @@ def parse_invoice_pages(pages):
             supplier_name=None, supplier_org_number=None, supplier_vat_number=None,
             invoice_number=None, document_date=None, due_date=None, payment_reference=None,
         )
-        diagnostics.append(
-            "Распознано уведомление о заказе; суммы из него не являются подтверждёнными суммами фактуры."
-            if non_invoice_type == "order_confirmation"
-            else "Распознано решение о транспортном налоге, а не фактура; данные получателя не являются данными поставщика."
-        )
+        if non_invoice_type == "order_confirmation":
+            diagnostics.append(
+                "Распознано уведомление о заказе; суммы из него не являются подтверждёнными суммами фактуры.")
+        elif fields.get("document_subtype") == "infrastructure_fee_decision":
+            diagnostics.append(
+                "Распознано решение об инфраструктурном сборе, а не фактура; эмитент и получатель разделены.")
+        else:
+            diagnostics.append(
+                "Распознано решение о транспортном налоге, а не фактура; данные получателя не являются данными поставщика.")
     fields["review_reasons"] = diagnostics
     from document_costs import extract_cost_fields
     fields["object_cost_fields"] = extract_cost_fields(pages, fields)
     if fields.get("document_type") == "tax_decision":
         object_fields = fields["object_cost_fields"]
         object_sources = object_fields.get("field_sources") or {}
-        for key in ("supplier_name", "document_date", "due_date", "payment_reference",
+        for key in ("supplier_name", "recipient_name", "document_date", "due_date", "payment_reference",
                     "currency_code", "gross_amount"):
             fields[key] = object_fields.get(key)
             if key in object_sources:
                 field_sources[key] = object_sources[key]
             else:
                 field_sources.pop(key, None)
+        fields["recipient_name"] = object_fields.get("recipient_name")
         fields["due_date_kind"] = "explicit" if fields.get("due_date") else "absent"
         fields["due_date_review_required"] = False
         fields["due_date_reviewed"] = False

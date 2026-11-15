@@ -159,6 +159,7 @@ class OfflineReviewWindow(QDialog):
         def clear_input_error(field_key):
             return lambda: self._clear_validation_field(field_key)
 
+        self.field_labels = {}
         for key, label in LABELS.items():
             if integrated and key in ("due_date", "amount_due", "rounding_amount"):
                 continue
@@ -186,7 +187,9 @@ class OfflineReviewWindow(QDialog):
             box.addWidget(origin)
             if integrated:
                 origin.hide()
-            form.addRow(label + ":", row)
+            label_widget = QLabel(label + ":")
+            form.addRow(label_widget, row)
+            self.field_labels[key] = label_widget
             self.inputs[key], self.origins[key] = field, origin
             field.textChanged.connect(self.update_origins)
             field.textChanged.connect(clear_input_error(key))
@@ -447,6 +450,8 @@ class OfflineReviewWindow(QDialog):
     def show_proposal(self):
         self.proposal = self.store.allocation_proposal(self.document_id)
         proposal = self.proposal
+        infrastructure_fee = (
+            self.store.base(self.document_id).get("document_subtype") == "infrastructure_fee_decision")
         lines = ["<b>Предложение по маркировкам и позициям на страницах PDF. "
                  "Это не подтверждённое распределение.</b>"]
         for part in proposal["parts"]:
@@ -470,9 +475,13 @@ class OfflineReviewWindow(QDialog):
                 f"доля округления {part['rounding']}; стр. {', '.join(map(str, part['pages']))}"
                 + (f" — <b>{escape(part['warning'])}</b>" if part["warning"] else ""))
         if proposal["total"]:
-            lines.append(f"Округление документа: {proposal['rounding']} SEK. Распределено пропорционально "
-                         "суммам с НДС, остаточные эре — по наибольшим дробным долям. "
-                         f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
+            if infrastructure_fee:
+                lines.append(
+                    f"Сумма к оплате распределена без изменения исходного итога: {proposal['total']} SEK.")
+            else:
+                lines.append(f"Округление документа: {proposal['rounding']} SEK. Распределено пропорционально "
+                             "суммам с НДС, остаточные эре — по наибольшим дробным долям. "
+                             f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
         lines.extend(escape(text) for text in proposal["errors"])
         self.proposal_label.setText("<br>".join(lines))
         self.apply_proposal_button.setEnabled(bool(proposal["parts"]) and not proposal["errors"]
@@ -623,6 +632,33 @@ class OfflineReviewWindow(QDialog):
                         and allocations[0].get("object_id") is not None)
         self.reassign_button.setEnabled(can_reassign)
 
+    @staticmethod
+    def type_label(document_type, base):
+        if (document_type == "tax_decision"
+                and base.get("document_subtype") == "infrastructure_fee_decision"):
+            return "Решение об инфраструктурном сборе"
+        return TYPES.get(document_type, document_type)
+
+    def update_field_labels(self, base=None):
+        base = base or {}
+        infrastructure_fee = base.get("document_subtype") == "infrastructure_fee_decision"
+        for key, label_widget in self.field_labels.items():
+            label = LABELS[key]
+            if self.integrated and key == "gross_amount":
+                label = "Сумма расхода по документу"
+            if self.integrated and key == "supplier_name":
+                label = "Поставщик / организация / получатель сбора"
+            if self.integrated and key in ("invoice_number", "vat_amount", "net_amount"):
+                label += " (если указан)"
+            if infrastructure_fee and key == "gross_amount":
+                label = "Сумма к оплате"
+            elif infrastructure_fee and key == "supplier_name":
+                label = "Эмитент / поставщик"
+            label_widget.setText(label + ":")
+        if self.integrated and hasattr(self, "allocations"):
+            amount_label = "Сумма к оплате" if infrastructure_fee else "Сумма с НДС"
+            self.allocations.setHorizontalHeaderLabels(["Назначение", amount_label, ""])
+
     def document_label(self, document_id):
         _, fields = (self.store.current_review(document_id) if self.integrated
                      else self.store.latest(document_id))
@@ -641,7 +677,7 @@ class OfflineReviewWindow(QDialog):
         total = (f"{amount} {fields.get('currency_code') or ''}".strip()
                  if amount not in (None, "") else "Сумма не определена — нужна проверка")
         document_type = fields.get("confirmed_type") or base.get("document_type") or "Тип не установлен"
-        document_type = TYPES.get(document_type, document_type)
+        document_type = self.type_label(document_type, base)
         status = (self.store.accounting_status(document_id)[0] if self.integrated
                   else "Требует проверки")
         if reason:
@@ -791,6 +827,7 @@ class OfflineReviewWindow(QDialog):
     def select_document(self):
         self.document_id = self.selector.currentData()
         if self.document_id is None:
+            self.update_field_labels()
             if self.gallery is not None:
                 self.preview_layout.removeWidget(self.gallery)
                 self.gallery.hide()
@@ -829,6 +866,7 @@ class OfflineReviewWindow(QDialog):
         self.loaded_review = payload
         self.server_version = payload.get("server_version")
         base = current_classification(self.store.base(self.document_id))
+        self.update_field_labels(base)
         order_number = base.get("order_number")
         self.order_number_label.setText(
             f"Номер заказа (не номер фактуры/чека): {order_number}" if order_number else "")
@@ -877,7 +915,7 @@ class OfflineReviewWindow(QDialog):
         kind = base.get("document_type")
         self.receipt_paid.setVisible(kind == "receipt" and not self.integrated)
         self.classification.setText(
-            f"Предполагаемый тип: {TYPES.get(kind, kind)}. "
+            f"Предполагаемый тип: {self.type_label(kind, base)}. "
             "Он не считается подтверждённым до вашего выбора.\n" +
             ("НАПОМИНАНИЕ: это не новая покупка. Нужна исходная фактура и сверка уже учтённого расхода."
              if base.get("suggested_document_type") == "payment_reminder"
@@ -886,7 +924,7 @@ class OfflineReviewWindow(QDialog):
              "Объект всегда выбирается вручную; коды проектов в PDF не означают выбор объекта."))
         if self.integrated:
             self.classification.setText(
-                f"Предполагаемый тип: {TYPES.get(kind, kind)}. Это подсказка распознавания, не подтверждение типа.\n"
+                f"Предполагаемый тип: {self.type_label(kind, base)}. Это подсказка распознавания, не подтверждение типа.\n"
                 + ("Напоминание не является новым расходом — выберите статус без финансовых полей."
                    if base.get("suggested_document_type") == "payment_reminder"
                    else "Сверьте оригинал, дату, поставщика и суммы. Назначьте каждую часть общим расходам фирмы или объекту."))
@@ -904,8 +942,8 @@ class OfflineReviewWindow(QDialog):
                 current = conflict.get("current")
                 recognized = conflict.get("recognized")
                 if field == "document_type":
-                    current = TYPES.get(current, current)
-                    recognized = TYPES.get(recognized, recognized)
+                    current = self.type_label(current, base)
+                    recognized = self.type_label(recognized, base)
                 conflict_lines.append(
                     f"{label}: сохранено «{current}», распознано «{recognized}»."
                 )
@@ -922,6 +960,10 @@ class OfflineReviewWindow(QDialog):
                     self.classification.text() + "\nПроверка распознавания: "
                     + " ".join(recognition_reasons)
                 )
+        recipient = base.get("recipient_name")
+        if recipient:
+            self.classification.setText(
+                self.classification.text() + f"\nПолучатель: {recipient}")
         if self.gallery and self.preview_document_id != self.document_id:
             self.gallery.hide()
             self.preview_layout.removeWidget(self.gallery)

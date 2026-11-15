@@ -53,17 +53,24 @@ TYPE_LABELS = {
 }
 
 
+def document_type_label(fields: dict) -> str:
+    if fields.get("document_subtype") == "infrastructure_fee_decision":
+        return "Решение об инфраструктурном сборе — не фактура"
+    return TYPE_LABELS.get(fields.get("document_type"), "Тип не установлен")
+
+
 def recognition_status(result: dict, state: str) -> dict:
     fields = result.get("fields") or {}
     kind = fields.get("document_type")
+    type_label = document_type_label(fields)
     missing = [key for key in required_document_fields(kind)
                if fields.get(key) in (None, "", "UNKNOWN")]
     if state in ("failed", "pending") or result.get("state") == "failed":
         outcome, label = "failed", "Распознавание не завершено — требуется явный повтор"
     elif kind == "order_confirmation":
-        outcome, label = "not_invoice", TYPE_LABELS[kind]
+        outcome, label = "not_invoice", type_label
     elif kind in ("tax_decision", "proforma", "non_document", "transfer_receipt"):
-        outcome, label = "not_invoice", TYPE_LABELS[kind]
+        outcome, label = "not_invoice", type_label
     elif kind not in ("invoice", "receipt", "credit_note"):
         outcome, label = "unclassified", "Тип не установлен — требуется ручная проверка"
     elif missing:
@@ -71,7 +78,7 @@ def recognition_status(result: dict, state: str) -> dict:
     else:
         outcome, label = "requires_review", "Поля извлечены — требуется ручная проверка"
     return {"outcome": outcome, "label": label,
-            "document_type": TYPE_LABELS.get(kind, "Тип не установлен"),
+            "document_type": type_label,
             "missing_fields": missing if outcome in ("incomplete", "failed", "unclassified") else []}
 
 
@@ -112,6 +119,7 @@ def classify_mail_document(fields: dict) -> None:
         object_sources = object_fields.get("field_sources") or {}
         fields.update(
             supplier_name=object_fields.get("supplier_name"),
+            recipient_name=object_fields.get("recipient_name"),
             supplier_org_number=None, supplier_vat_number=None,
             invoice_number=None,
             document_date=object_fields.get("document_date"),
@@ -127,7 +135,12 @@ def classify_mail_document(fields: dict) -> None:
         field_sources.pop("supplier_org_number", None)
         field_sources.pop("supplier_vat_number", None)
         field_sources.pop("invoice_number", None)
-        reason = "Решение о транспортном налоге, не фактура. Получатель не является поставщиком; НДС не подставляется."
+        reason = (
+            "Решение об инфраструктурном сборе, не фактура. Эмитент и получатель разделены; "
+            "НДС не подставляется."
+            if fields.get("document_subtype") == "infrastructure_fee_decision"
+            else "Решение о транспортном налоге, не фактура. Получатель не является поставщиком; НДС не подставляется."
+        )
     elif detected_type == "order_confirmation":
         fields["document_type"] = "order_confirmation"
         fields.update(
@@ -149,14 +162,9 @@ def classify_mail_document(fields: dict) -> None:
 
 def mail_review_warnings(fields: dict) -> list[str]:
     """Safe, deterministic notices; never expose arbitrary OCR/mail error text."""
-    labels = {
-        "invoice": "Фактура", "receipt": "Чек", "credit_note": "Кредитная фактура",
-        "transfer_receipt": "Подтверждение перевода", "proforma": "Проформа",
-        "tax_decision": "Решение о транспортном налоге",
-        "order_confirmation": "Подтверждение заказа", "unclassified": "Тип не установлен",
-    }
     kind = fields.get("document_type")
-    notices = [f"Тип документа: {labels.get(kind, 'Тип не установлен')}.",
+    type_label = document_type_label(fields)
+    notices = [f"Тип документа: {type_label}.",
                "Только тестовый черновик: расходы и долг не создаются, перенос в учёт отключён."]
     specific = {
         "receipt": "Чек: требуется проверить оплату, возмещение сотруднику и отсутствие повторного расхода. Итог чека не означает долг.",
@@ -166,13 +174,16 @@ def mail_review_warnings(fields: dict) -> list[str]:
         "credit_note": "Кредитная фактура: проверьте знак сумм и связь с исходной фактурой.",
         "transfer_receipt": "Подтверждение перевода не заменяет фактуру; требуется сверка платежа.",
     }
-    if kind in specific:
+    if fields.get("document_subtype") == "infrastructure_fee_decision":
+        notices.append("Решение об инфраструктурном сборе: сумма к оплате указана отдельно; НДС не подставляется.")
+    elif kind in specific:
         notices.append(specific[kind])
     elif kind != "invoice":
         notices.append("Финансовый тип не подтверждён; требуется ручная проверка.")
     if fields.get("vat_amount") in (None, "", "UNKNOWN"):
         notices.append("НДС неизвестен. Ноль или расчётная ставка автоматически не подставляются.")
-    if fields.get("amount_due") in (None, "", "UNKNOWN"):
+    if (fields.get("amount_due") in (None, "", "UNKNOWN")
+            and not (kind == "tax_decision" and fields.get("gross_amount") not in (None, "", "UNKNOWN"))):
         notices.append("Долг / остаток к оплате не подтверждён; из итога документа не вычисляется.")
     return notices
 

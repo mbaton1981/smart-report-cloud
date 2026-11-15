@@ -5,6 +5,7 @@ from unittest.mock import patch
 import test_incoming_integration as integration
 from document_costs import extract_cost_fields
 from expense_documents import parse_invoice_pages, required_document_fields
+from mail_import import mail_review_warnings, recognition_status
 from offline_review import ReviewError, packed
 
 
@@ -15,6 +16,31 @@ Transportstyrelsen
 Trängselskatt för september 2026 1208
 För att undvika en tilläggsavgift på 500 kronor ska betalningen finnas bokförd i tid.
 Totalt att betala (kronor) 1208"""
+
+INFRASTRUCTURE_FEE_PAGES = [
+    {"page": 1, "text": """Bygger Och Renoverar I Sthlm AB
+Ingrid Horns Väg 8
+136 36 Handen
+Registreringsnummer
+Person-/Orgnummer
+OCR-nummer
+BCM 12S
+559540-4392
+19115002438537076
+Beslut om infrastrukturavgift
+Datum
+2026-11-11
+Transportstyrelsen
+Summaattbetala
+Beloppet ska vara bokfört på Transportstyrelsens konto för infrastrukturavgift senast 2027-01-04 8
+Infrastrukturavgift för oktober 2026 8"""},
+    {"page": 2, "text": """Infrastrukturavgift för registrerade passagetillfällen
+Specifikation
+Datum Passagetillfällen Plats/Typ Summa, kronor
+2026-10-09 1 SKURUBROAVGIFT 4
+2026-10-20 1 SKURUBROAVGIFT 4
+Totalt att betala i kronor 8"""},
+]
 
 
 class CostExtractionTests(unittest.TestCase):
@@ -142,6 +168,32 @@ Vägtrafikregisteravgift 74"""
             required_document_fields(fields["document_type"]),
             ("supplier_name", "document_date", "gross_amount", "currency_code"),
         )
+
+    def test_infrastructure_fee_decision_extracts_issuer_recipient_and_unique_total(self):
+        fields = parse_invoice_pages(INFRASTRUCTURE_FEE_PAGES)
+        costs = fields["object_cost_fields"]
+
+        self.assertEqual(fields["document_type"], "tax_decision")
+        self.assertEqual(fields["document_subtype"], "infrastructure_fee_decision")
+        self.assertEqual(fields["supplier_name"], "Transportstyrelsen")
+        self.assertEqual(fields["recipient_name"], "Bygger Och Renoverar I Sthlm AB")
+        self.assertEqual(fields["document_date"], "2026-11-11")
+        self.assertEqual(fields["due_date"], "2027-01-04")
+        self.assertEqual(fields["payment_reference"], "19115002438537076")
+        self.assertEqual(fields["gross_amount"], "8.00")
+        self.assertEqual(fields["currency_code"], "SEK")
+        self.assertIsNone(fields["invoice_number"])
+        self.assertIsNone(fields["net_amount"])
+        self.assertIsNone(fields["vat_amount"])
+        self.assertEqual([item["amount"] for item in costs["amount_candidates"]], ["8.00"])
+        self.assertEqual(
+            {item["page"] for item in costs["amount_candidates"][0]["evidence"]}, {1, 2})
+        self.assertEqual(
+            recognition_status({"fields": fields}, "requires_review")["document_type"],
+            "Решение об инфраструктурном сборе — не фактура",
+        )
+        self.assertFalse(any("остаток к оплате не подтверждён" in warning
+                             for warning in mail_review_warnings(fields)))
 
     def test_conflicting_totals_are_candidates_not_an_invented_choice(self):
         fields = extract_cost_fields([{"page": 1, "text": TAX_TEXT.replace(
@@ -363,6 +415,38 @@ class DocumentActionTests(unittest.TestCase):
             window.select_document()
             self.assertEqual(window.status.text(), "Учтён на объекте")
             self.assertFalse(window.ignore_button.isEnabled())
+        finally:
+            window.loaded_payload = window.payload()
+            window.close()
+
+    def test_infrastructure_fee_ui_labels_amount_as_payable_and_shows_recipient(self):
+        fields = parse_invoice_pages(INFRASTRUCTURE_FEE_PAGES)
+        revision, payload = self.store.latest(1)
+        for key in ("supplier_name", "invoice_number", "payment_reference", "document_date",
+                    "due_date", "currency_code", "net_amount", "vat_amount", "gross_amount",
+                    "amount_due"):
+            payload[key] = fields.get(key)
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1", (packed(fields),))
+            self.store.conn.execute(
+                "UPDATE revisions SET payload_json=? WHERE document_id=1 AND revision=?",
+                (packed(payload), revision),
+            )
+
+        from offline_review_ui import OfflineReviewWindow
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
+        try:
+            self.assertEqual(window.field_labels["gross_amount"].text(), "Сумма к оплате:")
+            self.assertEqual(window.field_labels["supplier_name"].text(), "Эмитент / поставщик:")
+            self.assertEqual(window.allocations.horizontalHeaderItem(1).text(), "Сумма к оплате")
+            self.assertEqual(window.inputs["gross_amount"].text(), "8.00")
+            self.assertEqual(window.inputs["supplier_name"].text(), "Transportstyrelsen")
+            self.assertEqual(window.inputs["invoice_number"].text(), "")
+            self.assertEqual(window.inputs["vat_amount"].text(), "")
+            self.assertIn("Решение об инфраструктурном сборе", window.document_label(1))
+            self.assertIn("Получатель: Bygger Och Renoverar I Sthlm AB",
+                          window.classification.text())
+            self.assertIn("Решение об инфраструктурном сборе", window.classification.text())
         finally:
             window.loaded_payload = window.payload()
             window.close()

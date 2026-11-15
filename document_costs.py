@@ -153,17 +153,38 @@ def verified_saved_allocation_vat(pages, document, allocations, objects):
 def extract_cost_fields(pages, fields):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     tax = non_invoice_document_type(text) == "tax_decision"
+    infrastructure_fee = (
+        fields.get("document_subtype") == "infrastructure_fee_decision"
+        or bool(re.search(r"^\s*Beslut\s+om\s+infrastrukturavgift\s*$",
+                          text, re.IGNORECASE | re.MULTILINE))
+    )
     result = {key: fields.get(key) for key in (
         "supplier_name", "document_date", "due_date", "invoice_number", "payment_reference",
         "currency_code", "gross_amount", "net_amount", "vat_amount")}
     result["field_sources"] = dict(fields.get("field_sources") or {})
     result["amount_candidates"] = []
+    result["recipient_name"] = None
     if not tax:
         return result
 
+    supplier_sources = (fields.get("field_sources") or {}).get("supplier_name", [])
     result.update(supplier_name=None, document_date=None, due_date=None, invoice_number=None,
                   payment_reference=None, gross_amount=None, net_amount=None, vat_amount=None)
     result["field_sources"] = {}
+    if infrastructure_fee:
+        result["document_subtype"] = "infrastructure_fee_decision"
+        recipient_candidates = {}
+        for source in supplier_sources:
+            name = source.get("text")
+            if (source.get("kind") in {"seller_address_block", "seller_registration_block"}
+                    and isinstance(name, str) and name.strip()
+                    and name.strip().casefold() != "transportstyrelsen"):
+                recipient_candidates[name.strip()] = source
+        if len({name.casefold() for name in recipient_candidates}) == 1:
+            recipient_name, source = next(iter(recipient_candidates.items()))
+            result["recipient_name"] = recipient_name
+            result["field_sources"]["recipient_name"] = [
+                {**source, "kind": "recipient_address_block"}]
     references = [item for item in (fields.get("field_sources") or {}).get("payment_reference", [])
                   if re.fullmatch(r"\d{5,30}", item.get("text", ""))
                   and re.search(r"OCR", item.get("caption", ""), re.IGNORECASE)]
@@ -217,9 +238,14 @@ def extract_cost_fields(pages, fields):
                     result["document_date"] = value
                     result["field_sources"]["document_date"] = [source]
             if not result["payment_reference"] and re.fullmatch(r"OCR[- ]nummer\s*:?", line, re.IGNORECASE):
-                if index + 1 < len(lines) and re.fullmatch(r"\d{5,30}", lines[index + 1]):
-                    result["payment_reference"] = lines[index + 1]
-                    result["field_sources"]["payment_reference"] = [source]
+                reference_values = {
+                    value for value in lines[index + 1:index + 5]
+                    if re.fullmatch(r"\d{5,30}", value)
+                }
+                if len(reference_values) == 1:
+                    result["payment_reference"] = next(iter(reference_values))
+                    result["field_sources"]["payment_reference"] = [{
+                        **source, "text": line + "\n" + result["payment_reference"]}]
 
     if re.search(r"\bTransportstyrelsen(?:s)?\b", text, re.IGNORECASE):
         result["supplier_name"] = "Transportstyrelsen"
