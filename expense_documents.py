@@ -840,6 +840,9 @@ def parse_invoice_pages(pages):
             return value
         return None
 
+    fallback_invoice_candidates = []
+    fallback_vat_candidates = []
+    fallback_due_candidates = []
     for page in pages:
         elements = page.get("elements") or []
         if elements:
@@ -848,6 +851,44 @@ def parse_invoice_pages(pages):
             rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
                     for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
         cells = [cell for row in rows for cell in row]
+        page_lines = [line.strip() for line in str(page.get("text") or "").splitlines() if line.strip()]
+        for index, line in enumerate(page_lines):
+            if (line.casefold() == "faktura" and index + 2 < len(page_lines)
+                    and re.fullmatch(r"nr\.?", page_lines[index + 1], re.IGNORECASE)
+                    and re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{1,120}", page_lines[index + 2])):
+                fallback_invoice_candidates.append((page_lines[index + 2], {
+                    "source": page.get("source"), "page": page.get("page", 1),
+                    "attachment_index": page.get("attachment_index", 0),
+                    "text": page_lines[index + 2], "caption": "Faktura Nr", "kind": "header",
+                }))
+            if re.fullmatch(r"ATT\s+BETALA\s*:?", line, re.IGNORECASE) and index:
+                amount_line = re.sub(r"^SEK\s*", "", page_lines[index - 1], flags=re.IGNORECASE)
+                amount_line = re.sub(r"\s*(?:SEK|kr)\s*$", "", amount_line, flags=re.IGNORECASE).strip()
+                if re.fullmatch(r"-?[\d\s.,]+", amount_line):
+                    amount = checked_value("amount_due", amount_line)
+                    if amount is not None:
+                        fallback_due_candidates.append((amount, {
+                            "source": page.get("source"), "page": page.get("page", 1),
+                            "attachment_index": page.get("attachment_index", 0),
+                            "text": page_lines[index - 1], "caption": line,
+                            "kind": "invoice_total",
+                        }))
+            vat_match = re.fullmatch(
+                r"Moms\s+(\d+(?:[,.]\d+)?)\s*%\s+p[åa]\s+(-?[\d.,]+)\s+(-?[\d.,]+)",
+                line, re.IGNORECASE,
+            )
+            if vat_match:
+                rate, taxable_raw, vat_raw = vat_match.groups()
+                rate_value = parse_decimal(rate)
+                taxable = parse_invoice_money(taxable_raw)
+                vat = parse_invoice_money(vat_raw)
+                if (rate_value is not None and taxable is not None and vat is not None
+                        and (taxable * rate_value / 100).quantize(CENT, rounding=ROUND_HALF_UP) == vat):
+                    fallback_vat_candidates.append((decimal_text(vat), {
+                        "source": page.get("source"), "page": page.get("page", 1),
+                        "attachment_index": page.get("attachment_index", 0),
+                        "text": vat_raw, "caption": line, "kind": "invoice_total", "priority": 3,
+                    }))
         for key, value, caption, value_cell in invoice_fiscal_summary_totals(rows):
             fiscal_summary_matches[key].append((value, {
                 "source": page.get("source"), "page": page.get("page", 1),
@@ -1028,6 +1069,13 @@ def parse_invoice_pages(pages):
                                               else 3 if row_with_total or ledger_row or re.search(r"\d.*%", cell_text)
                                               else 2 if re.search(r"belopp", cell_text, re.IGNORECASE) else 1)
                     candidates[key].append((value, source))
+    for key, fallbacks in (
+        ("invoice_number", fallback_invoice_candidates),
+        ("vat_amount", fallback_vat_candidates),
+        ("amount_due", fallback_due_candidates),
+    ):
+        if not candidates[key]:
+            candidates[key].extend(fallbacks)
     if not candidates["supplier_name"] and companies:
         priority = max(item[0] for item in companies)
         best = [item for item in companies if item[0] == priority]
@@ -1939,6 +1987,7 @@ def object_marking_matches(value: str | None, marking: str | None) -> bool:
 _OBJECT_CONTEXT_PATTERN = re.compile(
     r"^\s*(?P<label>Märkn(?:ing)?|Markning|Märke/Ordnr\.?|Rekvisitionsnr\.?|"
     r"Projekt(?:namn|\s*(?:nr\.?|nummer|kod|code))?|Proj\s*\.?\s*nr\.?|"
+    r"Arbetsplats|"
     r"Project(?:\s*(?:reference|nr\.?|number|code))?|Er\s+referens|Your\s+reference|Kundreferens|"
     r"Referens|Reference(?:\s*(?:nr\.?|no\.?))?|"
     r"Order(?:\s*(?:nr\.?|no\.?|number|id|#))?|Ordernummer|Beställningsnr|Purchase\s+order)"
@@ -1952,7 +2001,7 @@ _REVERSED_PROJECT_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _OBJECT_MARKER_CONTEXT_LABELS = {
-    "markn", "markning", "markeordnr", "projektnamn", "rekvisitionsnr",
+    "markn", "markning", "markeordnr", "projektnamn", "rekvisitionsnr", "arbetsplats",
     "projektnr", "projektnummer", "projektkod", "projektcode", "projnr",
     "projectreference", "projectnr", "projectnumber", "projectcode",
 }

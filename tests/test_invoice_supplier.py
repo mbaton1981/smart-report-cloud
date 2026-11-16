@@ -1,6 +1,6 @@
 import unittest
 
-from expense_documents import parse_invoice_pages
+from expense_documents import match_objects, object_marker_evidence, parse_invoice_pages
 
 
 class InvoiceSupplierTests(unittest.TestCase):
@@ -237,6 +237,39 @@ class InvoiceSupplierTests(unittest.TestCase):
         self.assertIsNone(fields["net_amount"])
         self.assertIsNone(fields["vat_amount"])
         self.assertTrue(any("НДС не указана" in warning for warning in fields["review_reasons"]))
+
+    def test_cramo_header_workplace_and_rounding_reconcile_from_original_text(self):
+        text = "\n".join((
+            "FAKTURA", "Nr", "12785007",
+            "Datum Fakturakundnr Sida", "2026-11-15 73165892 1/1",
+            "Arb.plats ID", "73294985",
+            "Arbetsplats: P1041", "PUNSCHVÄGEN 7",
+            "SUMMA EXKL. MOMS 2.283,48",
+            "Moms 25,00 % på 2.283,48 570,87",
+            "Öresutjämning -0,35",
+            "BETALNING OSS TILLHANDA SENAST 2026-11-30",
+            "SEK 2.854,00", "ATT BETALA",
+        ))
+
+        fields = parse_invoice_pages([{"text": text, "page": 1, "source": "Cramo-12785007.pdf"}])
+
+        self.assertEqual(fields["invoice_number"], "12785007")
+        self.assertEqual(fields["net_amount"], "2283.48")
+        self.assertEqual(fields["vat_amount"], "570.87")
+        self.assertEqual(fields["gross_amount"], "2854.35")
+        self.assertEqual(fields["rounding_amount"], "-0.35")
+        self.assertEqual(fields["amount_due"], "2854.00")
+        self.assertEqual(fields["field_sources"]["invoice_number"][0]["text"], "12785007")
+        markers = object_marker_evidence(text)
+        self.assertEqual(
+            [(item["label"], item["value"]) for item in markers],
+            [("Arbetsplats", "P1041")],
+        )
+        matches = match_objects(text, [
+            {"id": 41, "name": "P1041 test object", "markning": "p1041", "is_active": 1},
+        ])
+        self.assertEqual([item["object_id"] for item in matches], [41])
+        self.assertEqual(object_marker_evidence("Arb.plats ID\n73294985"), [])
 
 
 if __name__ == "__main__":

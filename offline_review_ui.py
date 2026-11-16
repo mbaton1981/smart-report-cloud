@@ -22,7 +22,8 @@ from pypdf.errors import PyPdfError
 
 from document_preview import DocumentGalleryDialog
 from expense_documents import (
-    DocumentExtractionError, match_objects, object_marker_evidence, pages_with_insufficient_text,
+    DocumentExtractionError, match_objects, object_marker_evidence, object_marking_matches,
+    pages_with_insufficient_text, parse_invoice_pages, parse_invoice_money, decimal_text,
 )
 from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
 from object_picker import ObjectPickerComboBox
@@ -81,6 +82,7 @@ class OfflineReviewWindow(QDialog):
         self.gallery = None
         self.preview_document_id = None
         self.original_error = None
+        self.partial_proposal_candidate = None
         self.inputs, self.origins = {}, {}
         self._validation_styles = {}
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
@@ -464,6 +466,7 @@ class OfflineReviewWindow(QDialog):
         if reader.is_encrypted:
             raise DocumentExtractionError("Зашифрованный PDF нельзя прочитать без пароля.")
         page_texts = tuple((page.extract_text() or "").strip() for page in reader.pages)
+        self.original_page_texts = page_texts
         if not page_texts:
             raise DocumentExtractionError("В оригинале не найдены страницы для проверки маркировок.")
         marker_evidence = object_marker_evidence(page_texts)
@@ -476,6 +479,107 @@ class OfflineReviewWindow(QDialog):
                 f"На страницах {pages} не удалось проверить полный текст.",
             )
         return marker_evidence, match_objects(page_texts, self.store.objects()), None
+
+    def _single_project_total_proposal(self, proposal, marker_evidence, object_suggestions, marker_warning):
+        base = self.store.base(self.document_id)
+        if (marker_warning or proposal["parts"] or base.get("order_proposals")
+                or base.get("document_type") not in {"invoice", "receipt"}):
+            return None
+        markers = {item.get("normalized") for item in marker_evidence if item.get("normalized")}
+        labels = {str(item.get("label") or "").casefold().rstrip(".") for item in marker_evidence}
+        if len(markers) != 1 or not {"projektnamn", "rekvisitionsnr"}.issubset(labels):
+            return None
+        marker = next(item["value"] for item in marker_evidence if item.get("normalized") in markers)
+        candidates = {
+            item["object_id"]: item for item in object_suggestions
+            if item.get("score") == 100
+            and isinstance(item.get("object_id"), int)
+            and object_marking_matches(marker, str(item.get("markning") or ""))
+        }
+        if len(candidates) != 1:
+            return None
+        candidate = next(iter(candidates.values()))
+        if str(candidate.get("is_active", 1)).strip().casefold() in {"0", "false", "no"}:
+            return None
+        page_texts = getattr(self, "original_page_texts", ())
+        if not page_texts or pages_with_insufficient_text(page_texts):
+            return None
+        fields = parse_invoice_pages([
+            {"page": number, "text": text} for number, text in enumerate(page_texts, 1)
+        ])
+        money = {
+            key: parse_invoice_money(fields.get(key))
+            for key in ("net_amount", "vat_amount", "gross_amount", "rounding_amount", "amount_due")
+        }
+        if (any(value is None or not value.is_finite() for value in money.values())
+                or money["net_amount"] < 0 or money["vat_amount"] < 0
+                or money["gross_amount"] != money["net_amount"] + money["vat_amount"]
+                or money["net_amount"] + money["vat_amount"] + money["rounding_amount"]
+                != money["amount_due"]):
+            return None
+        sources = fields.get("field_sources") or {}
+        for key in ("net_amount", "vat_amount", "rounding_amount"):
+            if not sources.get(key) or not any(
+                source.get("kind") in {"invoice_total", "fiscal_summary_total"}
+                for source in sources[key]
+            ):
+                return None
+        if not sources.get("amount_due") or not any(
+            source.get("kind") == "invoice_total" for source in sources["amount_due"]
+        ):
+            return None
+        part = {
+            "marker": marker, "object_id": candidate["object_id"],
+            "object_name": candidate["name"], "object_options": [{
+                "id": candidate["object_id"], "name": candidate["name"],
+                "markning": candidate.get("markning") or "",
+                "company": candidate.get("company") or "", "is_active": True,
+            }],
+            "warning": "", "net_amount": decimal_text(money["net_amount"]),
+            "vat_amount": decimal_text(money["vat_amount"]),
+            "before_rounding": decimal_text(money["gross_amount"]),
+            "rounding": decimal_text(money["rounding_amount"]),
+            "gross_amount": decimal_text(money["amount_due"]),
+            "pages": sorted({
+                int(item["page"]) for item in marker_evidence if item.get("page")
+            } | {
+                int(source["page"])
+                for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due")
+                for source in sources.get(key, []) if source.get("page")
+            }),
+            "orders": [],
+        }
+        return {
+            **proposal, "parts": [part], "warnings": [], "errors": [],
+            "rounding": decimal_text(money["rounding_amount"]),
+            "total": decimal_text(money["amount_due"]),
+        }
+
+    def _partial_marker_candidate(self, proposal, marker_evidence, object_suggestions, marker_warning):
+        if (marker_warning or proposal["parts"] or self.store.card(self.document_id)
+                or self.store.base(self.document_id).get("document_type") not in {"invoice", "receipt"}
+                or self.store.base(self.document_id).get("order_proposals")):
+            return None
+        markers = {item.get("normalized") for item in marker_evidence if item.get("normalized")}
+        if len(markers) != 1:
+            return None
+        marker = next(item["value"] for item in marker_evidence if item.get("normalized") in markers)
+        candidates = {
+            item["object_id"]: item for item in object_suggestions
+            if item.get("score") == 100
+            and isinstance(item.get("object_id"), int)
+            and object_marking_matches(marker, str(item.get("markning") or ""))
+        }
+        if len(candidates) != 1:
+            return None
+        candidate = next(iter(candidates.values()))
+        if str(candidate.get("is_active", 1)).strip().casefold() in {"0", "false", "no"}:
+            return None
+        return {
+            "marker": marker,
+            "object_id": candidate["object_id"],
+            "name": candidate["name"],
+        }
 
     def show_proposal(self):
         self.proposal = self.store.allocation_proposal(self.document_id)
@@ -493,6 +597,8 @@ class OfflineReviewWindow(QDialog):
                 "<b>Маркировки объекта:</b> не удалось проверить оригинал: "
                 + escape(str(error))
             )
+            self.original_page_texts = ()
+            marker_evidence, object_suggestions, marker_warning = [], [], str(error)
         else:
             evidence_text = "; ".join(dict.fromkeys(
                 f"{escape(item['value'])} — {escape(item['label'])}"
@@ -532,6 +638,14 @@ class OfflineReviewWindow(QDialog):
                     )
             elif marker_evidence and not marker_warning:
                 lines.append("Совпадение с объектами не найдено; выберите вручную.")
+        complete_proposal = self._single_project_total_proposal(
+            proposal, marker_evidence, object_suggestions, marker_warning)
+        if complete_proposal is not None:
+            proposal = complete_proposal
+            self.proposal = proposal
+        partial_candidate = self._partial_marker_candidate(
+            proposal, marker_evidence, object_suggestions, marker_warning)
+        self.partial_proposal_candidate = partial_candidate
         for part in proposal["parts"]:
             options = ", ".join(
                 f"{item['name']} ({item['markning'] or 'без маркировки'})"
@@ -560,17 +674,86 @@ class OfflineReviewWindow(QDialog):
                 lines.append(f"Округление документа: {proposal['rounding']} SEK. Распределено пропорционально "
                              "суммам с НДС, остаточные эре — по наибольшим дробным долям. "
                              f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
+        if partial_candidate:
+            lines.append(
+                f"<b>Частичное предложение:</b> маркировка «{escape(partial_candidate['marker'])}» "
+                f"однозначно указывает на «{escape(partial_candidate['name'])}», но подтверждённая сумма "
+                "по заказу или доле отсутствует. Кнопка заполнит только объект; укажите сумму части вручную "
+                "по оригиналу. Общий итог фактуры не считается суммой этой доли.")
         lines.extend(escape(text) for text in proposal["errors"])
         self.proposal_label.setText("<br>".join(lines))
-        self.apply_proposal_button.setEnabled(bool(proposal["parts"]) and not proposal["errors"]
-                                              and not self.store.card(self.document_id))
+        full_proposal = bool(proposal["parts"]) and not proposal["errors"]
+        self.apply_proposal_button.setText(
+            "Подставить объект — сумму указать вручную" if partial_candidate
+            else "Заполнить форму предложением")
+        self.apply_proposal_button.setToolTip(
+            "Подставит только предложенный объект; сумма части останется пустой. "
+            "Проверьте оригинал и укажите сумму вручную. Ничего не сохраняется."
+            if partial_candidate else
+            "Только заполнит форму данными из маркеров и позиций PDF. "
+            "Проверьте результат и нажмите «Учесть как расход»; до этого ничего не сохранено.")
+        self.apply_proposal_button.setEnabled(
+            not self.store.card(self.document_id) and (full_proposal or partial_candidate is not None))
 
     def apply_proposal(self):
         from expense_documents import parse_invoice_money
         proposal = self.store.allocation_proposal(self.document_id)
-        if proposal["errors"] or not proposal["parts"] or self.store.card(self.document_id):
-            QMessageBox.warning(self, "Предложение недоступно", "\n".join(proposal["errors"]) or
+        if self.store.card(self.document_id):
+            QMessageBox.warning(self, "Предложение недоступно",
                                 "Расход уже создан. Откройте актуальное распределение.")
+            return
+        if not proposal["parts"]:
+            try:
+                marker_evidence, object_suggestions, marker_warning = self._object_marker_suggestions()
+            except (
+                DocumentExtractionError, ImportError, OSError, PyPdfError, ReviewError, ValueError,
+            ) as error:
+                self.original_page_texts = ()
+                marker_evidence, object_suggestions, marker_warning = [], [], str(error)
+            complete_proposal = self._single_project_total_proposal(
+                proposal, marker_evidence, object_suggestions, marker_warning)
+            if complete_proposal is not None:
+                proposal = complete_proposal
+                self.proposal = proposal
+            else:
+                partial_candidate = self._partial_marker_candidate(
+                    proposal, marker_evidence, object_suggestions, marker_warning)
+                if partial_candidate is not None:
+                    if self.partial_proposal_matches_form(partial_candidate):
+                        self.status.setText(
+                            "Объект подставлен в форму; сумма части не заполнена. "
+                            "Укажите её вручную по оригиналу. Ничего не сохранено."
+                        )
+                        return
+                    if self.allocations.rowCount() and QMessageBox.question(
+                        self, "Подставить объект?",
+                        "Заменить текущие строки одной строкой с предложенным объектом? "
+                        "Сумма части останется пустой: укажите её вручную по оригиналу. "
+                        "Общий итог фактуры не переносится в сумму части. Сохранение — отдельной кнопкой.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    ) != QMessageBox.StandardButton.Yes:
+                        return
+                    self.allocations.setRowCount(0)
+                    self.add_allocation({
+                        "object_id": partial_candidate["object_id"],
+                        "gross_amount": None,
+                    })
+                    self.partial_proposal_candidate = partial_candidate
+                    self.status.setText(
+                        "Только объект подставлен в форму. Укажите сумму части вручную по оригиналу; "
+                        "фактура не сохранена и не учтена."
+                    )
+                    return
+                QMessageBox.warning(
+                    self, "Предложение недоступно",
+                    "\n".join(proposal["errors"]) or
+                    "Нет однозначной активной маркировки без конфликта страниц. "
+                    "Распределите сумму вручную по оригиналу.",
+                )
+                return
+        if proposal["errors"]:
+            QMessageBox.warning(self, "Предложение недоступно", "\n".join(proposal["errors"]))
             return
         base = self.store.base(self.document_id)
         for key in ("net_amount", "vat_amount"):
@@ -592,6 +775,7 @@ class OfflineReviewWindow(QDialog):
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
+        self.partial_proposal_candidate = None
         self.allocations.setRowCount(0)
         for part in proposal["parts"]:
             self.add_allocation(part)
@@ -599,6 +783,16 @@ class OfflineReviewWindow(QDialog):
         self.status.setText(
             "Предложение заполнено только в форме. Проверьте объекты и суммы; ничего не сохранено. "
             "Расход появится в итогах только после «Учесть как расход».")
+
+    def partial_proposal_matches_form(self, candidate):
+        if candidate is None or self.allocations.rowCount() != 1:
+            return False
+        destination, object_id = self.allocation_target(0)
+        amount = self.allocations.item(0, 1)
+        return (
+            destination == "object" and object_id == candidate["object_id"]
+            and (amount is None or not amount.text().strip())
+        )
 
     def proposal_matches_form(self, proposal):
         from expense_documents import parse_invoice_money
@@ -656,8 +850,15 @@ class OfflineReviewWindow(QDialog):
         value = self.amount_choices.currentData()
         if value is not None:
             self.inputs["gross_amount"].setText(value)
+            partial_object_selected = (
+                self.partial_proposal_candidate is not None
+                and self.allocations.rowCount() == 1
+                and self.allocation_target(0) == (
+                    "object", self.partial_proposal_candidate["object_id"])
+            )
             if (self.integrated and self.allocations.rowCount() == 1
-                    and not self.allocations.item(0, 1).text().strip()):
+                    and not self.allocations.item(0, 1).text().strip()
+                    and not partial_object_selected):
                 self.allocations.item(0, 1).setText(value)
 
     def set_action(self, action):
@@ -965,6 +1166,7 @@ class OfflineReviewWindow(QDialog):
     def select_document(self):
         if self.integrated:
             self.next_button.hide()
+        self.partial_proposal_candidate = None
         self.document_id = self.selector.currentData()
         if self.document_id is None:
             self.update_field_labels()

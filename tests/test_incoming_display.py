@@ -108,6 +108,100 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("стр. 1", window.proposal_label.text())
         self.assertIn("стр. 2", window.proposal_label.text())
         self.assertIn("автоматически не распределены", window.proposal_label.text())
+        self.assertFalse(window.apply_proposal_button.isEnabled())
+
+    def test_marker_only_proposal_selects_object_but_leaves_amount_manual_and_unsaved(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        self.host._expense_objects = [{
+            "id": self.object_id, "name": "Isolated p1037 object",
+            "markning": "p1037", "is_active": 1,
+        }]
+        window = self.open_window(document_id=1)
+        self.addCleanup(lambda: setattr(window, "loaded_payload", window.payload()))
+        evidence = [
+            {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
+        ]
+        suggestions = [{
+            "object_id": self.object_id, "name": "Isolated p1037 object",
+            "markning": "p1037", "is_active": 1, "score": 100,
+            "reason": "Найдена маркировка p1037 в поле Projektnamn: P1037, стр. 1",
+        }]
+        proposal = {
+            "parts": [], "warnings": [],
+            "errors": ["Подтверждённые суммы заказов не распознаны."],
+            "rounding": "0.00", "total": None,
+        }
+
+        with patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                patch.object(window, "_object_marker_suggestions",
+                             return_value=(evidence, suggestions, None)):
+            window.show_proposal()
+            self.assertTrue(window.apply_proposal_button.isEnabled())
+            self.assertIn("сумму части вручную", window.proposal_label.text())
+            self.assertIn("не считается суммой этой доли", window.proposal_label.text())
+            with patch.object(QMessageBox, "question",
+                              return_value=QMessageBox.StandardButton.Yes):
+                window.apply_proposal_button.click()
+            window.amount_choices.addItem("Сумма документа", "125.00")
+            window.amount_choices.setCurrentIndex(window.amount_choices.count() - 1)
+
+        self.assertEqual(window.allocations.rowCount(), 1)
+        self.assertEqual(window.allocations.cellWidget(0, 0).currentData(), self.object_id)
+        self.assertEqual(window.allocations.item(0, 1).text(), "")
+        self.assertEqual(window.inputs["gross_amount"].text(), "125.00")
+        self.assertIsNone(self.store.card(1))
+        self.assertEqual(self.store.latest(1)[0], 0)
+        self.assertIn("не сохранена и не учтена", window.status.text())
+
+    def test_confirmed_single_project_total_fills_form_without_saving_expense(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        self.host._expense_objects = [{
+            "id": self.object_id, "name": "Isolated p1037 object",
+            "markning": "p1037", "is_active": 1,
+        }]
+        window = self.open_window(document_id=1)
+        self.addCleanup(lambda: setattr(window, "loaded_payload", window.payload()))
+        window.original_page_texts = ("\n".join((
+            "Faktura", "Fakturanummer TEST-123", "Fakturadatum 2026-10-21",
+            "Projektnamn: P1037", "Rekvisitionsnr.: 1037",
+            "Netto 100.00 SEK", "Moms 25 % 25.00 SEK",
+            "Öresavrundning 0.00 SEK", "Att betala 125.00 SEK",
+        )),)
+        evidence = [
+            {"label": "Projektnamn", "value": "P1037", "normalized": "1037", "page": 1},
+            {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
+        ]
+        suggestions = [{
+            "object_id": self.object_id, "name": "Isolated p1037 object",
+            "markning": "p1037", "is_active": 1, "score": 100,
+            "reason": "Найдена маркировка p1037",
+        }]
+        proposal = {
+            "parts": [], "warnings": [],
+            "errors": ["Подтверждённые суммы заказов не распознаны."],
+            "rounding": "0.00", "total": None,
+        }
+
+        with patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                patch.object(window, "_object_marker_suggestions",
+                             return_value=(evidence, suggestions, None)):
+            window.show_proposal()
+            self.assertTrue(window.apply_proposal_button.isEnabled())
+            self.assertEqual(window.apply_proposal_button.text(), "Заполнить форму предложением")
+            self.assertIn("125.00", window.proposal_label.text())
+            with patch.object(QMessageBox, "question",
+                              return_value=QMessageBox.StandardButton.Yes):
+                window.apply_proposal_button.click()
+
+        self.assertEqual(window.allocations.rowCount(), 1)
+        self.assertEqual(window.allocations.cellWidget(0, 0).currentData(), self.object_id)
+        self.assertEqual(window.allocations.item(0, 1).text(), "125.00")
+        self.assertEqual(window.inputs["gross_amount"].text(), "125.00")
+        self.assertIsNone(self.store.card(1))
+        self.assertEqual(self.store.latest(1)[0], 0)
+        self.assertIn("ничего не сохранено", window.status.text())
 
     def test_marker_suggestion_is_blocked_when_any_original_page_is_unreadable(self):
         window = self.open_window(document_id=1)
