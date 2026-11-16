@@ -1365,12 +1365,14 @@ class CatalogSyncTests(unittest.TestCase):
             }
             with patch.object(
                 window, "_schedule_object_expense_original_recovery",
-            ), patch.object(
+            ) as schedule_recovery, patch.object(
                 window, "_expense_document_snapshot",
                 return_value=([document], True),
             ):
                 window.load_object_expense_overview()
 
+            self.assertEqual(schedule_recovery.call_args.args[4]["markning"], "p1041")
+            self.assertEqual(schedule_recovery.call_args.args[4]["id"], object_id)
             self.assertIn("SEK 4,213.12", window.object_expenses_net_lbl.text())
             self.assertIn(
                 "проверено по оригиналу, сохранённая запись не изменена",

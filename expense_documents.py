@@ -95,6 +95,75 @@ def _label_value(lines: list[str], labels: str) -> str | None:
     return None
 
 
+def _clean_extracted_text(value: Any) -> str:
+    return str(value or "").translate({ord("\x00"): None, ord("\ufffe"): None, ord("\uffff"): None})
+
+
+def _identity_key(value: str | None) -> str:
+    normalized = unicodedata.normalize("NFKD", _clean_extracted_text(value).casefold())
+    return "".join(character for character in normalized
+                   if character.isalnum() and unicodedata.category(character) != "Mn")
+
+
+def _is_invoice_recipient_caption(value: str) -> bool:
+    return _identity_key(value) in {
+        "mottagare", "moagare", "fakturamottagare", "fakturamoagare",
+        "fakturaadress", "faktureringsadress", "fakturerattill",
+        "betalningsavsandare", "kopare", "koparensadress", "buyer", "leveransadress",
+    }
+
+
+def _invoice_recipient_details(text: str) -> tuple[str, str] | None:
+    lines = [line.strip() for line in _clean_extracted_text(text).replace("\r", "\n").split("\n")
+             if line.strip()]
+    for index, line in enumerate(lines):
+        caption, separator, inline_value = line.partition(":")
+        if not _is_invoice_recipient_caption(caption.strip()):
+            continue
+        if separator and inline_value.strip():
+            return inline_value.strip(), caption.strip()
+        for candidate in lines[index + 1:index + 5]:
+            if _is_invoice_recipient_caption(candidate):
+                break
+            if (not re.search(r"[A-Za-zÅÄÖåäö]", candidate)
+                    or re.search(r"\d|[:/@]", candidate)
+                    or len(re.findall(r"[A-Za-zÅÄÖåäö]+", candidate)) < 2):
+                continue
+            return candidate, caption.strip()
+    return None
+
+
+def _invoice_footer_registration_blocks(page, recipient_name: str | None = None):
+    lines = [line.strip() for line in _clean_extracted_text(page.get("text") or "").splitlines()
+             if line.strip()]
+    recipient_key = _identity_key(recipient_name)
+    for number_index, line in enumerate(lines):
+        match = re.fullmatch(r"(\d{6})[- ]?(\d{4})", line)
+        if not match:
+            continue
+        registration_number = f"{match.group(1)}-{match.group(2)}"
+        for name_index in range(number_index - 1, max(-1, number_index - 6), -1):
+            name = lines[name_index]
+            name_key = _identity_key(name)
+            if (not name_key or name_key == recipient_key or re.search(r"\d|[:/@]", name)
+                    or len(re.findall(r"[A-Za-zÅÄÖåäö]+", name)) < 2
+                    or not re.fullmatch(r"[A-Za-zÅÄÖåäö&.'’()\- ]{3,120}", name)):
+                continue
+            if not any(_identity_key(previous) == name_key for previous in lines[:name_index]):
+                continue
+            yield {
+                "name": name,
+                "registration_number": registration_number,
+                "source": {
+                    "page": page.get("page", 1),
+                    "text": line,
+                    "caption": "unlabelled organisation number",
+                    "kind": "seller_registration_block",
+                },
+            }
+            break
+
+
 def _date_value(value: str | None) -> str | None:
     if not value:
         return None
@@ -136,7 +205,8 @@ def non_invoice_document_type(text: str) -> str | None:
 
 
 def parse_document_text(text: str) -> dict[str, Any]:
-    lines = [line.strip() for line in (text or "").replace("\r", "\n").split("\n") if line.strip()]
+    lines = [line.strip() for line in _clean_extracted_text(text).replace("\r", "\n").split("\n")
+             if line.strip()]
     full_text = "\n".join(lines)
     lower_text = full_text.casefold()
     receipt_heading = any(re.fullmatch(
@@ -173,7 +243,8 @@ def parse_document_text(text: str) -> dict[str, Any]:
     due_date = _date_value(_label_value(lines, r"Förfallodatum|Forfallodatum|Due\s*date|Payment\s*due"))
 
     net_raw = _label_value(lines, r"Netto|Belopp\s+ex(?:kl)?\.?\s*moms|Summa\s+exkl\.?\s*moms|Amount\s+excl\.?\s*VAT")
-    due_raw = _label_value(lines, r"Att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due")
+    due_raw = _label_value(
+        lines, r"A(?:tt)?\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due")
     gross_labels = (
         r"Summa\s+totalt|Total\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|"
         r"Totalbelopp|Total\s+amount|Dokumentets\s+total|Totalt")
@@ -518,6 +589,8 @@ def invoice_seller_blocks(cells, page):
     candidates = []
     width = max((cell["x1"] for cell in cells), default=1)
     height = max((cell["y1"] for cell in cells), default=1)
+    recipient = _invoice_recipient_details(page.get("text") or "")
+    recipient_key = _identity_key(recipient[0]) if recipient else ""
     registered_company = re.compile(
         r"(?:^|[,|])\s*(?P<name>[A-ZÅÄÖ0-9][A-ZÅÄÖa-zåäö0-9&.'’()\- ]{1,100}?"
         r"\b(?:AB|HB|KB|Aktiebolag|Ltd\.?|GmbH|AS|Inc\.?))"
@@ -526,9 +599,15 @@ def invoice_seller_blocks(cells, page):
     )
     for cell in cells:
         value = cell["text"].strip()
-        if any(re.match(r"^(?:Faktura(?:mottagare|adress)|Mottagare|Fakturerat\s+till|Faktureringsadress|Betalningsavsändare|Köparens\s+adress|Köpare|Buyer|Leveransadress)\b", other["text"], re.IGNORECASE)
-               and abs(other["x0"] - cell["x0"]) < 24 and 0 <= cell["y0"] - other["y0"] < 100
-               for other in cells):
+        if recipient_key and _identity_key(value) == recipient_key:
+            continue
+        if any(
+                (_is_invoice_recipient_caption(other["text"])
+                 or re.match(r"^(?:Faktura(?:mottagare|adress)|Mottagare|Fakturerat\s+till|Faktureringsadress|Betalningsavsändare|Köparens\s+adress|Köpare|Buyer|Leveransadress)\b",
+                             other["text"], re.IGNORECASE))
+                and abs(other["x0"] - cell["x0"]) < 24
+                and 0 <= cell["y0"] - other["y0"] < 100
+                for other in cells):
             continue
         for registered in registered_company.finditer(value):
             name = re.sub(r"\s*,\s*", ", ",
@@ -580,6 +659,15 @@ def invoice_seller_blocks(cells, page):
                                name, page, cell, "seller_address_block"))
         elif cell["y0"] > height * 0.65:
             candidates.append((95 if own_registration else 85, name, page, cell, "seller_address_block"))
+    for registration in _invoice_footer_registration_blocks(page, recipient[0] if recipient else None):
+        name = registration["name"]
+        name_key = _identity_key(name)
+        if any(_identity_key(existing[1]) == name_key for existing in candidates):
+            continue
+        name_cell = next((cell for cell in cells if _identity_key(cell["text"]) == name_key), None)
+        if name_cell is None:
+            name_cell = {"text": name, "x0": 0, "x1": 0, "y0": 0, "y1": 0}
+        candidates.append((97, name, page, name_cell, "seller_registration_block"))
     receipt_text = str(page.get("text") or "")
     if re.search(r"\b(?:kvitto|receipt|kassakvitto|kontantnota)\b", receipt_text, re.IGNORECASE):
         lines = [line.strip() for line in receipt_text.splitlines() if line.strip()]
@@ -712,6 +800,13 @@ def invoice_supplier_identifiers(page, supplier_name):
                     "kind": "seller_identity_block",
                     "box": [cell[axis] for axis in ("x0", "y0", "x1", "y1")],
                 }
+    if "supplier_org_number" not in identifiers:
+        supplier_key = _identity_key(supplier_name)
+        for registration in _invoice_footer_registration_blocks(page):
+            if _identity_key(registration["name"]) == supplier_key:
+                identifiers["supplier_org_number"] = registration["registration_number"]
+                sources["supplier_org_number"] = registration["source"]
+                break
     return {"values": identifiers, "sources": sources}
 
 
@@ -775,7 +870,8 @@ def required_document_fields(document_type):
 
 
 def parse_invoice_pages(pages):
-    text = "\n\n".join(str(page.get("text") or "") for page in pages)
+    raw_text = "\n\n".join(str(page.get("text") or "") for page in pages)
+    text = _clean_extracted_text(raw_text)
     fields = parse_document_text(text)
     text_supplier_name = fields.get("supplier_name")
     non_invoice_type = fields.get("non_invoice_document_type")
@@ -796,7 +892,7 @@ def parse_invoice_pages(pages):
         "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+ex(?:kl)?\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms\s+totalt|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
-        "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalt\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
+        "amount_due": r"A(?:tt)?\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalt\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
         "gross_amount": r"Summa\s+totalt|Totalt?(?:\s+belopp)?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Totalt",
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
@@ -817,6 +913,24 @@ def parse_invoice_pages(pages):
     field_sources = {}
     order_pages = []
     due_caption_seen = False
+    recipient_matches = []
+    for page in pages:
+        recipient = _invoice_recipient_details(str(page.get("text") or ""))
+        if recipient:
+            recipient_matches.append((recipient[0], recipient[1], page))
+    recipient_names = {_identity_key(name) for name, _caption, _page in recipient_matches}
+    recipient_diagnostics = []
+    if len(recipient_names) == 1:
+        recipient_name, recipient_caption, recipient_page = recipient_matches[0]
+        fields["recipient_name"] = recipient_name
+        field_sources["recipient_name"] = [{
+            "page": recipient_page.get("page", 1),
+            "text": recipient_name,
+            "caption": recipient_caption,
+            "kind": "recipient_label_block",
+        }]
+    elif len(recipient_names) > 1:
+        recipient_diagnostics.append("В документе найдены разные получатели; проверьте оригинал.")
 
     def checked_value(key, raw):
         value = str(raw).strip().strip(":")
@@ -846,8 +960,16 @@ def parse_invoice_pages(pages):
     fallback_invoice_candidates = []
     fallback_vat_candidates = []
     fallback_due_candidates = []
-    for page in pages:
-        elements = page.get("elements") or []
+    for source_page in pages:
+        page = {
+            **source_page,
+            "text": _clean_extracted_text(source_page.get("text") or ""),
+            "elements": [
+                {**element, "text": _clean_extracted_text(element.get("text") or "")}
+                for element in source_page.get("elements") or []
+            ],
+        }
+        elements = page["elements"]
         if elements:
             rows = invoice_layout_rows(elements, labels.values())
         else:
@@ -864,7 +986,7 @@ def parse_invoice_pages(pages):
                     "attachment_index": page.get("attachment_index", 0),
                     "text": page_lines[index + 2], "caption": "Faktura Nr", "kind": "header",
                 }))
-            if re.fullmatch(r"ATT\s+BETALA\s*:?", line, re.IGNORECASE) and index:
+            if re.fullmatch(r"A(?:TT)?\s+BETALA\s*:?", line, re.IGNORECASE) and index:
                 amount_line = re.sub(r"^SEK\s*", "", page_lines[index - 1], flags=re.IGNORECASE)
                 amount_line = re.sub(r"\s*(?:SEK|kr)\s*$", "", amount_line, flags=re.IGNORECASE).strip()
                 if re.fullmatch(r"-?[\d\s.,]+", amount_line):
@@ -1112,7 +1234,7 @@ def parse_invoice_pages(pages):
                (source.get("attachment_index", 0), source["page"])
                for _, other in candidates["exempt_net_amount"])
     }
-    diagnostics = []
+    diagnostics = list(recipient_diagnostics)
     for key, matches in candidates.items():
         if key in fiscal_summary_matches and fiscal_summary_matches[key]:
             matches = fiscal_summary_matches[key]
@@ -1212,7 +1334,7 @@ def parse_invoice_pages(pages):
     if fields["due_date_review_required"]:
         diagnostics.append("Срок оплаты рассчитан по условиям или неоднозначен; требуется явная сверка, это не распознанная дата документа.")
     fields["allocation_basis"] = "net"
-    fields["raw_text"] = text
+    fields["raw_text"] = raw_text
     fields.update(invoice_context(text))
     fields["document_total"] = fields.get("gross_amount")
     if non_invoice_type:

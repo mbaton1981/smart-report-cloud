@@ -330,6 +330,11 @@ class OfflineReviewWindow(QDialog):
                 actions.addWidget(button)
             layout.addLayout(actions)
             draft_actions = QHBoxLayout()
+            self.rerecognition_button = QPushButton("Повторно распознать и сравнить")
+            self.rerecognition_button.setToolTip(
+                "Сравнит новый разбор с черновиком. Обновление полей и подтверждение расхода — отдельные действия.")
+            self.rerecognition_button.clicked.connect(self.preview_rerecognition)
+            draft_actions.addWidget(self.rerecognition_button)
             draft_actions.addWidget(self.save_button)
             layout.addLayout(draft_actions)
             self.diagnostics_layout.addWidget(self.registry_button)
@@ -1194,6 +1199,7 @@ class OfflineReviewWindow(QDialog):
             self.transfer_button.setEnabled(False)
             self.financial_panel.hide()
             if self.integrated:
+                self.rerecognition_button.setEnabled(False)
                 for button in (self.ignore_button, self.later_button, self.expense_button):
                     button.setEnabled(False)
             self.status.setText(self.empty_state.text())
@@ -1330,6 +1336,8 @@ class OfflineReviewWindow(QDialog):
                 self.original_error = f"Оригинал недоступен; перенос запрещён: {error}"
                 self.status.setText(self.original_error)
         card = self.store.card(self.document_id)
+        if self.integrated:
+            self.rerecognition_button.setEnabled(self.original_available)
         editable = card is None or self.integrated and self.server_version is not None
         for field in self.inputs.values():
             field.setReadOnly(not editable)
@@ -1369,6 +1377,120 @@ class OfflineReviewWindow(QDialog):
             if self.original_error:
                 self.status.setText(self.original_error)
         self.refresh_document_labels()
+
+    def preview_rerecognition(self):
+        if not self.integrated or self.document_id is None:
+            return
+        if self.payload() != self.loaded_payload:
+            QMessageBox.warning(
+                self, "Сначала сохраните исправления",
+                "В форме есть несохранённые изменения. Сохраните или отмените их перед повторным разбором.",
+            )
+            return
+
+        from invoice_processing import recognize_invoice
+
+        preview_revision, preview_payload = self.store.latest(self.document_id)
+        preview_base = self.store.base(self.document_id)
+        try:
+            result = recognize_invoice([self.store.original(self.document_id)])
+        except (ReviewError, OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(self, "Повторный разбор не выполнен", str(error))
+            return
+        if result.get("errors") or result.get("state") == "failed":
+            details = "\n".join(str(error) for error in result.get("errors") or [])
+            QMessageBox.warning(
+                self, "Повторный разбор не выполнен",
+                details or "Старые данные черновика сохранены.",
+            )
+            return
+
+        recognized = result.get("fields") or {}
+        labels = {
+            **LABELS,
+            "document_type": "Тип документа",
+            "recipient_name": "Получатель",
+            "supplier_org_number": "Регистрационный номер поставщика",
+            "supplier_vat_number": "Номер НДС поставщика",
+        }
+        comparison_keys = tuple(dict.fromkeys((
+            *LABELS, "document_type", "recipient_name",
+            "supplier_org_number", "supplier_vat_number",
+        )))
+        base = current_classification(preview_base)
+        changes = []
+        for key in comparison_keys:
+            old_value = (preview_payload.get(key) if key in EDITABLE else base.get(key))
+            new_value = recognized.get(key)
+            if old_value == new_value:
+                continue
+            old_text = "не распознано" if old_value in (None, "", "UNKNOWN") else str(old_value)
+            new_text = ("не распознано при повторном разборе"
+                        if new_value in (None, "", "UNKNOWN") else str(new_value))
+            evidence = (recognized.get("field_sources") or {}).get(key) or []
+            evidence_text = "; ".join(
+                f"стр. {source.get('page')}: {source.get('text') or source.get('operation') or source.get('kind')}"
+                for source in evidence[:2]
+            )
+            line = f"{labels.get(key, key)}: «{old_text}» → «{new_text}»"
+            if evidence_text:
+                line += f" ({evidence_text})"
+            changes.append(line)
+        if not changes:
+            QMessageBox.information(
+                self, "Повторный разбор",
+                "Отличий не найдено. Черновик и расход не изменены.",
+            )
+            return
+
+        payload = preview_payload
+        manual_sources = any(
+            source.get("kind") == "manual"
+            for sources in (preview_base.get("field_sources") or {}).values()
+            for source in sources
+        )
+        can_update = (
+            preview_revision == 0
+            and self.store.card(self.document_id) is None
+            and not self.store.allocations(payload)
+            and payload.get("confirmed_type") in (None, "")
+            and payload.get("original_checked") is not True
+            and not manual_sources
+        )
+        message = "\n".join(changes)
+        if not can_update:
+            QMessageBox.information(
+                self, "Результат повторного разбора",
+                message + "\n\nПоказаны только отличия. Черновик содержит ручную проверку, "
+                "распределение или подтверждение; автоматическое обновление не выполнено.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self, "Обновить поля черновика?",
+            message + "\n\nОбновить найденные автоматически распознанные поля? "
+            "Ненайденные значения останутся без изменений. Расход не создаётся и не подтверждается.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.store.record_recognition(
+                self.document_id, result, replace_automatic=True,
+                expected_revision=preview_revision,
+                expected_payload=preview_payload,
+                expected_base=preview_base,
+            )
+        except (ReviewError, OSError, sqlite3.Error, ValueError) as error:
+            QMessageBox.warning(self, "Черновик не обновлён", str(error))
+            return
+        self.select_document()
+        QMessageBox.information(
+            self, "Черновик обновлён",
+            "Автоматически распознанные поля обновлены. Расход не создан и не подтверждён; "
+            "сверьте оригинал перед дальнейшими действиями.",
+        )
 
     def keep_unsaved(self):
         if getattr(self, "document_id", None) is None:

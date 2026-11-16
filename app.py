@@ -8845,6 +8845,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
         finally:
             conn.close()
+        self._object_expense_object_rows = {
+            int(item["id"]): dict(item) for item in object_expense_objects
+        }
         for combo, include_all in (
             (getattr(self, "exp_filter_object", None), True),
             (getattr(self, "object_expenses_object", None), False),
@@ -9709,7 +9712,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         return expense_document_key(document), str(version), int(object_id)
 
     def _schedule_object_expense_original_recovery(
-        self, object_id, date_from, date_to, documents,
+        self, object_id, date_from, date_to, documents, target_object,
     ):
         confirmed, _excluded = collect_object_expenses(
             documents, object_id, date_from, date_to,
@@ -9725,6 +9728,23 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 continue
             needed.append((key, document))
         if not needed:
+            return
+        target_object = dict(target_object or {})
+        try:
+            target_object_id = int(target_object.get("id"))
+        except (TypeError, ValueError):
+            target_object_id = None
+        if (target_object_id != int(object_id)
+                or not str(target_object.get("markning") or "").strip()):
+            error = (
+                "В справочнике отсутствует маркировка выбранного объекта; "
+                "сопоставить заказ оригинала с долей нельзя."
+            )
+            for key, _document in needed:
+                self._object_expense_recovery_cache[key] = {
+                    "allocations": {}, "status": "object_metadata_unavailable",
+                    "error": error, "verified_count": 0,
+                }
             return
 
         request_id = self._object_expense_recovery_request_id + 1
@@ -9750,7 +9770,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 source_paths, source_errors = self._download_object_report_originals(
                     source_documents, directory, lambda _message: None,
                 )
-                data = {"object": {"id": int(object_id)}, "expenses": expenses}
+                data = {"object": target_object, "expenses": expenses}
                 _recover_report_share_tax(data, source_paths, source_errors)
 
             results = {}
@@ -9853,14 +9873,27 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         is_company = object_id == "company"
         selected_id = None if is_company else int(object_id)
         if selected_id is not None:
+            target_object = getattr(self, "_object_expense_object_rows", {}).get(
+                selected_id,
+            )
+            if target_object is None:
+                target_object = next(
+                    (
+                        item for item in getattr(self, "_expense_objects", [])
+                        if int(item.get("id", -1)) == selected_id
+                    ),
+                    None,
+                )
             self._schedule_object_expense_original_recovery(
-                selected_id, date_from, date_to, documents,
+                selected_id, date_from, date_to, documents, target_object,
             )
         rows = []
         totals = {"gross": {}, "vat": {}, "net": {}, "unallocated": {}, "categories": {}}
         unknown = {"gross": False, "vat": False, "net": False}
         recovered_share_count = 0
         pending_recovery_count = 0
+        recovery_checked_count = 0
+        recovery_error_count = 0
         for document in documents:
             if document.get("supporting_to_document_id"):
                 continue
@@ -9889,6 +9922,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if recovery_entry:
                 display_document["net_recovery_status"] = recovery_entry.get("status")
                 display_document["net_recovery_error"] = recovery_entry.get("error")
+                if recovery_entry.get("status"):
+                    recovery_checked_count += 1
+                    if recovery_entry.get("status") not in {"recovered", "verified"}:
+                        recovery_error_count += 1
             currency = str(document.get("currency_code") or "SEK")
             if document.get("verification_status") == "confirmed":
                 for allocation_index, allocation in enumerate(allocations):
@@ -9945,6 +9982,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
         if pending_recovery_count:
             net_summary += f"; проверка оригиналов выполняется для {pending_recovery_count} долей"
+        if recovery_checked_count:
+            net_summary += (
+                f"; проверка оригиналов завершена для {recovery_checked_count} документов"
+            )
+            if recovery_error_count:
+                net_summary += (
+                    f", без восстановления: {recovery_error_count} "
+                    "(причина указана в строке документа)"
+                )
         self.object_expenses_net_lbl.setText(net_summary)
         for category, label in self.object_expenses_category_labels.items():
             category_total = totals["categories"].get(
@@ -10008,6 +10054,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     f"Подтверждение: #{supporting.get('id')} · "
                     f"{supporting.get('supplier_name') or 'поставщик не указан'} · "
                     f"{supporting.get('invoice_number') or 'номер не указан'}"
+                )
+            if display_document.get("net_recovery_error"):
+                allocation_descriptions.append(
+                    "Проверка оригинала: "
+                    + str(display_document["net_recovery_error"])
                 )
             values = (
                 str(document.get("id") or document.get("client_id")),

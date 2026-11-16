@@ -444,13 +444,24 @@ class IncomingStore(OfflineReviewStore):
                                datetime.now(timezone.utc).isoformat()))
         return True
 
-    def record_recognition(self, document_id, result, *, replace_automatic=False):
+    def record_recognition(
+        self, document_id, result, *, replace_automatic=False,
+        expected_revision=None, expected_payload=None, expected_base=None,
+    ):
         fields = current_classification(result.get("fields") or {})
         fields["_recognition_state"] = result.get("state")
         revision, current_payload = self.latest(document_id)
         if revision or self.card(document_id):
             raise ReviewError("Распознавание не заменяет сохранённые ручные исправления.")
         base = self.base(document_id)
+        if (expected_revision is not None
+                and (revision != expected_revision or current_payload != expected_payload
+                     or base != expected_base)):
+            raise ReviewError("Документ изменился во время повторного распознавания; обновите список.")
+
+        def missing(value):
+            return value in (None, "", "UNKNOWN")
+
         if replace_automatic:
             if result.get("errors") or result.get("state") == "failed":
                 raise ReviewError("Повторное распознавание завершилось ошибкой; прежние данные сохранены.")
@@ -469,8 +480,23 @@ class IncomingStore(OfflineReviewStore):
                 "reason": "explicit_automatic_recognition_refresh",
             })
             payload = dict(current_payload)
-            payload.update({key: fields.get(key) for key in EDITABLE
-                            if key not in {"confirmed_type", "object_id", "original_checked", "settlement_status"}})
+            payload.update({
+                key: fields[key] for key in EDITABLE
+                if key in fields and key not in {
+                    "confirmed_type", "object_id", "original_checked", "settlement_status",
+                } and not missing(fields[key])
+            })
+            refreshed_base = dict(base)
+            for key, value in fields.items():
+                if key == "field_sources":
+                    sources = dict(refreshed_base.get(key) or {})
+                    sources.update({field: evidence for field, evidence in value.items() if evidence})
+                    refreshed_base[key] = sources
+                elif key == "review_reasons":
+                    refreshed_base[key] = list(value or [])
+                elif key != "recognition_conflicts" and not missing(value):
+                    refreshed_base[key] = value
+            refreshed_base["recognition_conflicts"] = []
             with self.conn:
                 self.conn.execute("BEGIN IMMEDIATE")
                 row = self.conn.execute(
@@ -482,7 +508,7 @@ class IncomingStore(OfflineReviewStore):
                     raise ReviewError("Документ изменился во время распознавания; обновите список.")
                 self.conn.execute(
                     "UPDATE documents SET base_json=?,source_json=? WHERE id=?",
-                    (packed(fields), packed(source), document_id),
+                    (packed(refreshed_base), packed(source), document_id),
                 )
                 self.conn.execute(
                     "UPDATE revisions SET payload_json=? WHERE document_id=? AND revision=0",
@@ -493,9 +519,6 @@ class IncomingStore(OfflineReviewStore):
         merged_payload = dict(current_payload)
         conflicts = []
         filled = set()
-
-        def missing(value):
-            return value in (None, "", "UNKNOWN")
 
         for key in EDITABLE:
             existing = current_payload.get(key)

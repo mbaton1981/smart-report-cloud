@@ -221,6 +221,48 @@ class InvoiceSupplierTests(unittest.TestCase):
         self.assertEqual(fields["gross_amount"], "30000.00")
         self.assertEqual(fields["amount_due"], "30000.00")
 
+    def test_misdecoded_recipient_and_repeated_footer_registration_identify_supplier(self):
+        broken_character = "\ufffe"
+        text = "\n".join((
+            "Sickla IF",
+            f"Mo{broken_character}agare",
+            "Bygger och renoverar i Sthlm AB",
+            "Fakturanummer: F202416",
+            "Fakturadatum: 2026-11-16",
+            "Belopp ex moms: 30 000,00 kr",
+            "Moms 0% på 30 000,00 0,00",
+            "Total moms: 0,00 kr",
+            "Totalbelopp inkl moms: 30 000,00 kr",
+            "Öresavrundning: 0,00 kr",
+            f"A{broken_character} betala: 30 000,00 kr",
+            "Sickla IF",
+            "Gillevägen 5",
+            "131 33 Nacka",
+            "814000-5797",
+        ))
+        elements = [
+            self.cell(line, 40, index * 12 + 50, 565, index * 12 + 58)
+            for index, line in enumerate(text.splitlines())
+        ]
+
+        fields = parse_invoice_pages([{"text": text, "page": 1, "elements": elements}])
+
+        self.assertEqual(fields["supplier_name"], "Sickla IF")
+        self.assertEqual(fields["supplier_org_number"], "814000-5797")
+        self.assertEqual(fields["recipient_name"], "Bygger och renoverar i Sthlm AB")
+        self.assertEqual(fields["invoice_number"], "F202416")
+        self.assertEqual(fields["document_date"], "2026-11-16")
+        self.assertEqual(fields["net_amount"], "30000.00")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["gross_amount"], "30000.00")
+        self.assertEqual(fields["rounding_amount"], "0.00")
+        self.assertEqual(fields["amount_due"], "30000.00")
+        self.assertIn(broken_character, fields["raw_text"])
+        self.assertEqual(fields["field_sources"]["recipient_name"][0]["kind"],
+                         "recipient_label_block")
+        self.assertEqual(fields["field_sources"]["supplier_org_number"][0]["kind"],
+                         "seller_registration_block")
+
     def test_receipt_totals_date_order_reference_and_stated_vat(self):
         fields = parse_invoice_pages([{
             "page": 1,

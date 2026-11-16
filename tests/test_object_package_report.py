@@ -377,6 +377,34 @@ class ObjectPackageReportTests(unittest.TestCase):
 
         self.assertIsNone(expenses[0]["share"]["net_amount"])
         self.assertEqual(expenses[0]["net_recovery_status"], "no_unique_match")
+        self.assertIn("найдено 2 одинаковых заказов", expenses[0]["net_recovery_error"])
+
+    def test_report_only_net_recovery_explains_unmapped_original_marker(self):
+        saved = _document(75, net=None, vat=None, gross="12.00", allocations=[{
+            "object_id": 42, "destination": "object", "net_amount": None,
+            "vat_amount": None, "gross_amount": "12.00",
+        }])
+        expenses, _ = collect_object_expenses([saved], 42)
+        data = {"object": {"id": 42, "markning": "p1041"}, "expenses": expenses}
+        unmapped_part = {
+            "marker": "P1041", "object_options": [], "gross_amount": "12.00",
+            "net_amount": "10.00", "vat_amount": "2.00", "rounding": "0.00",
+        }
+        with patch(
+            "object_package_report.extract_local_document",
+            return_value=SimpleNamespace(pages=("original",), page_elements=((),), text="original"),
+        ), patch(
+            "object_package_report.verified_original_order_allocation_proposal",
+            return_value=[unmapped_part],
+        ):
+            _recover_report_share_tax(data, {"client-75": ["original.pdf"]}, {})
+
+        self.assertEqual(expenses[0]["net_recovery_status"], "no_unique_match")
+        self.assertIn(
+            "Маркировка «p1041» найдена в оригинале, но не сопоставлена",
+            expenses[0]["net_recovery_error"],
+        )
+        self.assertIsNone(saved["allocations"][0]["net_amount"])
 
     def test_package_keeps_original_pages_and_separates_work_ob_and_trip_totals(self):
         with tempfile.TemporaryDirectory() as directory:

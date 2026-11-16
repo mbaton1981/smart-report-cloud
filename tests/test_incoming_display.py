@@ -711,17 +711,67 @@ class IncomingDisplayTests(unittest.TestCase):
         before = self.store.base(1)
         source_before = json.loads(self.store.conn.execute(
             "SELECT source_json FROM documents WHERE id=1").fetchone()[0])
-        result = {"fields": dict(self.fields, supplier_name="Correct issuer AB"),
+        recognized = dict(self.fields, supplier_name="Correct issuer AB")
+        recognized.pop("gross_amount")
+        result = {"fields": recognized,
                   "state": "requires_review", "errors": []}
         self.store.record_recognition(1, result, replace_automatic=True)
         self.assertEqual(self.store.latest(1)[0], 0)
         self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Correct issuer AB")
+        self.assertEqual(self.store.latest(1)[1]["gross_amount"], self.fields["gross_amount"])
         self.assertEqual(self.store.original(1).read_bytes(), original)
         source_after = json.loads(self.store.conn.execute(
             "SELECT source_json FROM documents WHERE id=1").fetchone()[0])
         self.assertEqual(source_after["result"], source_before["result"])
         self.assertEqual(source_after["recognition_history"][0]["base"], before)
         self.assertIsNone(self.store.card(1))
+
+    def test_rerecognition_preview_shows_changes_before_updating_unconfirmed_draft(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        window = self.open_window(document_id=1)
+        original = self.store.original(1).read_bytes()
+        recognized = dict(
+            self.fields,
+            supplier_name="Sickla IF",
+            recipient_name="Bygger och renoverar i Sthlm AB",
+            supplier_org_number="814000-5797",
+            field_sources={
+                "supplier_name": [{"page": 1, "text": "Sickla IF"}],
+                "recipient_name": [{"page": 1, "text": "Bygger och renoverar i Sthlm AB"}],
+            },
+        )
+        result = {"fields": recognized, "state": "requires_review", "errors": []}
+
+        with patch("invoice_processing.recognize_invoice", return_value=result) as recognize, \
+                patch.object(QMessageBox, "question",
+                             return_value=QMessageBox.StandardButton.Yes) as confirm, \
+                patch.object(QMessageBox, "information"):
+            window.rerecognition_button.click()
+
+        recognize.assert_called_once()
+        self.assertIn("Isolated Supplier AB", confirm.call_args.args[2])
+        self.assertIn("Sickla IF", confirm.call_args.args[2])
+        self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Sickla IF")
+        self.assertIsNone(self.store.latest(1)[1]["confirmed_type"])
+        self.assertFalse(self.store.latest(1)[1]["original_checked"])
+        self.assertIsNone(self.store.card(1))
+        self.assertEqual(self.store.original(1).read_bytes(), original)
+
+    def test_rerecognition_apply_rejects_changes_since_preview(self):
+        revision, payload = self.store.latest(1)
+        base = self.store.base(1)
+        changed_base = dict(base, raw_text="changed after preview")
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1",
+                                    (json.dumps(changed_base, ensure_ascii=False),))
+
+        with self.assertRaisesRegex(ReviewError, "изменился во время повторного распознавания"):
+            self.store.record_recognition(
+                1, {"fields": self.fields, "state": "requires_review"},
+                replace_automatic=True, expected_revision=revision,
+                expected_payload=payload, expected_base=base,
+            )
 
     def test_explicit_automatic_refresh_rejects_manual_or_allocated_draft(self):
         revision, payload = self.store.latest(1)
@@ -813,6 +863,8 @@ class IncomingDisplayTests(unittest.TestCase):
             _expense_totals_label=self.desktop.SmartReportApp._expense_totals_label,
             _expense_selected_allocations=self.desktop.SmartReportApp._expense_selected_allocations,
             _expense_allocation_total=self.desktop.SmartReportApp._expense_allocation_total,
+            _expense_document_identity=self.desktop.SmartReportApp._expense_document_identity,
+            _update_expense_detail=lambda: None,
         )
         host.exp_filter_object.addItem("Все объекты", None)
         host.exp_filter_status.addItem("Все состояния", "all")
@@ -939,6 +991,8 @@ class IncomingDisplayTests(unittest.TestCase):
             _expense_totals_label=self.desktop.SmartReportApp._expense_totals_label,
             _expense_selected_allocations=self.desktop.SmartReportApp._expense_selected_allocations,
             _expense_allocation_total=self.desktop.SmartReportApp._expense_allocation_total,
+            _expense_document_identity=self.desktop.SmartReportApp._expense_document_identity,
+            _update_expense_detail=lambda: None,
         )
         host.exp_filter_object.addItem("Все объекты", None)
         host.exp_filter_status.addItem("Активные", "active")

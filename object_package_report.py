@@ -26,7 +26,9 @@ from reportlab.platypus import (
 
 from customer_report import CATEGORY_LABELS, REPORT_ISSUER_NAME, WORK_TYPES, format_quantity
 from document_costs import verified_original_order_allocation_proposal
-from expense_documents import DocumentExtractionError, extract_local_document, parse_decimal
+from expense_documents import (
+    DocumentExtractionError, extract_local_document, object_marking_matches, parse_decimal,
+)
 from expense_categories import (
     CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
     CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, confirmed_expense_category,
@@ -1641,28 +1643,108 @@ def _recover_report_share_tax(data, source_paths, source_errors):
 
         remaining = list(parts)
         recovered_indexes = []
+        recovery_errors = []
         for allocation_index in missing_indexes:
             allocation = allocations[allocation_index]
             saved_gross = parse_decimal(allocation.get("gross_amount"))
             if saved_gross is None:
+                recovery_errors.append(
+                    f"Доля {allocation_index + 1}: сохранённая сумма с НДС неизвестна."
+                )
                 continue
-            candidates = [
+            object_parts = [
                 part for part in remaining
                 if len(part.get("object_options") or []) == 1
                 and part["object_options"][0].get("id") == int(target_id)
-                and parse_decimal(part.get("gross_amount")) == saved_gross
-                and (
-                    parse_decimal(allocation.get("vat_amount")) is None
-                    or parse_decimal(allocation.get("vat_amount"))
-                    == parse_decimal(part.get("vat_amount"))
+            ]
+            if not object_parts:
+                marker = str(target_object.get("markning") or "").strip()
+                matching_marker_parts = [
+                    part for part in remaining
+                    if marker and object_marking_matches(
+                        str(part.get("marker") or ""), marker,
+                    )
+                ]
+                original_markers = ", ".join(
+                    sorted({
+                        str(part.get("marker") or "без маркировки")
+                        for part in remaining
+                    })
+                ) or "не распознаны"
+                if matching_marker_parts:
+                    reason = (
+                        f"Маркировка «{marker}» найдена в оригинале, но не "
+                        "сопоставлена с выбранным объектом по справочнику."
+                    )
+                elif marker:
+                    reason = (
+                        f"В оригинале нет однозначного заказа для маркировки "
+                        f"«{marker}»; распознаны: {original_markers}."
+                    )
+                else:
+                    reason = (
+                        "В справочнике выбранного объекта не указана маркировка; "
+                        f"в оригинале распознаны: {original_markers}."
+                    )
+                recovery_errors.append(f"Доля {allocation_index + 1}: {reason}")
+                continue
+            gross_matches = [
+                part for part in object_parts
+                if parse_decimal(part.get("gross_amount")) == saved_gross
+            ]
+            if not gross_matches:
+                original_amounts = ", ".join(sorted({
+                    str(parse_decimal(part.get("gross_amount")))
+                    for part in object_parts
+                    if parse_decimal(part.get("gross_amount")) is not None
+                })) or "не определены"
+                recovery_errors.append(
+                    f"Доля {allocation_index + 1}: сумма с НДС {saved_gross} "
+                    f"не совпала с суммами оригинала для маркировки "
+                    f"«{target_object.get('markning') or 'не задана'}» "
+                    f"({original_amounts})."
                 )
-                and (
-                    parse_decimal(allocation.get("rounding_amount")) is None
-                    or parse_decimal(allocation.get("rounding_amount"))
-                    == parse_decimal(part.get("rounding"))
+                continue
+            saved_vat = parse_decimal(allocation.get("vat_amount"))
+            vat_matches = [
+                part for part in gross_matches
+                if saved_vat is None
+                or saved_vat == parse_decimal(part.get("vat_amount"))
+            ]
+            if not vat_matches:
+                original_vat = ", ".join(sorted({
+                    str(parse_decimal(part.get("vat_amount")))
+                    for part in gross_matches
+                    if parse_decimal(part.get("vat_amount")) is not None
+                })) or "не определён"
+                recovery_errors.append(
+                    f"Доля {allocation_index + 1}: сохранённый НДС {saved_vat} "
+                    f"не совпал с НДС оригинала ({original_vat})."
                 )
+                continue
+            saved_rounding = parse_decimal(allocation.get("rounding_amount"))
+            candidates = [
+                part for part in vat_matches
+                if saved_rounding is None
+                or saved_rounding == parse_decimal(part.get("rounding"))
             ]
             if len(candidates) != 1:
+                if not candidates:
+                    original_rounding = ", ".join(sorted({
+                        str(parse_decimal(part.get("rounding")))
+                        for part in vat_matches
+                        if parse_decimal(part.get("rounding")) is not None
+                    })) or "не определено"
+                    reason = (
+                        f"сохранённое округление {saved_rounding} не совпало "
+                        f"с оригиналом ({original_rounding})"
+                    )
+                else:
+                    reason = (
+                        f"найдено {len(candidates)} одинаковых заказов; "
+                        "однозначная сверка невозможна"
+                    )
+                recovery_errors.append(f"Доля {allocation_index + 1}: {reason}.")
                 continue
             part = candidates[0]
             remaining.remove(part)
@@ -1694,8 +1776,15 @@ def _recover_report_share_tax(data, source_paths, source_errors):
             fully_recovered = len(recovered_indexes) == len(missing_indexes)
             document["share"]["net_recovered_from_original"] = fully_recovered
             document["share"]["net_partially_recovered_from_original"] = not fully_recovered
+            if recovery_errors:
+                document["net_recovery_error"] = "; ".join(recovery_errors)
+            else:
+                document.pop("net_recovery_error", None)
         elif missing_indexes:
             document["net_recovery_status"] = "no_unique_match"
+            document["net_recovery_error"] = "; ".join(recovery_errors) or (
+                "Оригинал не содержит однозначного совпадения с долей объекта."
+            )
 
 
 def _cover_pdf(prepared, page_number, data, font, bold_font):
