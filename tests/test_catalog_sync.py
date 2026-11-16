@@ -72,9 +72,8 @@ class CatalogSyncTests(unittest.TestCase):
 
     def setUp(self):
         self._qt_widgets_before = snapshot_top_level_widgets(self.qt_app)
-        self.addCleanup(
-            cleanup_new_top_level_widgets, self.qt_app, self._qt_widgets_before)
         self._case = tempfile.TemporaryDirectory(prefix="smartreport-catalog-test-")
+        self.addCleanup(self._case.cleanup)
         root = Path(self._case.name)
         previous_data_dir = os.environ.get("SMARTREPORT_DATA_DIR")
         os.environ["SMARTREPORT_DATA_DIR"] = str(root / "profile")
@@ -82,6 +81,9 @@ class CatalogSyncTests(unittest.TestCase):
             lambda value=previous_data_dir: os.environ.pop("SMARTREPORT_DATA_DIR", None)
             if value is None else os.environ.__setitem__("SMARTREPORT_DATA_DIR", value)
         )
+        self.addCleanup(gc.collect)
+        self.addCleanup(
+            cleanup_new_top_level_widgets, self.qt_app, self._qt_widgets_before)
         self.server.DB_FILE = str(root / "server.db")
         self.desktop.DB_FILE = str(root / "desktop.db")
         self.server.init_cloud_db()
@@ -99,8 +101,6 @@ class CatalogSyncTests(unittest.TestCase):
 
         self.assertTrue(QThreadPool.globalInstance().waitForDone(10000),
                         "Background catalog reads must finish before deleting their database")
-        gc.collect()  # отпускает соединения SQLite, оставшиеся в циклах ссылок тестового окна
-        self._case.cleanup()
 
     def _wait_for_employee_status(self, window, timeout=3):
         from PyQt6.QtTest import QTest
@@ -3804,6 +3804,11 @@ class CatalogSyncTests(unittest.TestCase):
         self.desktop.QMainWindow.__init__(window)
         window.tab_expenses = self.desktop.QWidget()
         window.tab_object_expenses = self.desktop.QWidget()
+        window._object_expense_recovery_cache = {}
+        window._object_expense_recovery_inflight = set()
+        window._object_expense_recovery_requests = {}
+        window._object_expense_recovery_tasks = {}
+        window._object_expense_recovery_request_id = 0
         document = {"id": 12, "client_id": "vat-report", "document_date": "2026-10-19", "supplier_name": "Beijer",
                     "invoice_number": "260993714021", "currency_code": "SEK", "verification_status": "confirmed",
                     "allocation_basis": "net", "net_amount": "73181.14", "vat_amount": "18295.31", "gross_amount": "91476.45",
@@ -3851,6 +3856,11 @@ class CatalogSyncTests(unittest.TestCase):
         self.desktop.QMainWindow.__init__(window)
         window.tab_expenses = self.desktop.QWidget()
         window.tab_object_expenses = self.desktop.QWidget()
+        window._object_expense_recovery_cache = {}
+        window._object_expense_recovery_inflight = set()
+        window._object_expense_recovery_requests = {}
+        window._object_expense_recovery_tasks = {}
+        window._object_expense_recovery_request_id = 0
         object_rows = [
             {"id": 5, "name": "Object 5", "markning": "p1037", "company": "Privat"},
             {"id": 6, "name": "Object 6", "markning": "p1035", "company": "Privat"},

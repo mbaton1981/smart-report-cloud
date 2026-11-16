@@ -395,8 +395,9 @@ class IncomingIntegrationTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_existing_manual_document_preserves_fields_when_correcting_rounding(self):
+    def test_existing_manual_document_conflicts_on_stale_allocations_without_losing_category(self):
         from offline_review_ui import OfflineReviewWindow
+        from expense_categories import CATEGORY_MATERIALS
 
         revision, payload = self.store.latest(2)
         payload.update(
@@ -419,17 +420,19 @@ class IncomingIntegrationTests(unittest.TestCase):
             "currency_code", "net_amount", "vat_amount", "gross_amount", "rounding_amount",
             "document_type", "verification_status", "allocations")}
         seed.update(client_id=card["client_id"], usage="object_cost", allocation_basis="gross",
-                    expected_version=before["sync_version"], expense_category="Materials",
+                    expected_version=before["sync_version"], expense_category=CATEGORY_MATERIALS,
+                    expense_category_source="user",
                     document_comment="Keep this note")
         seed["allocations"][0]["note"] = "Allocation note"
-        seed["allocations"][0]["expense_category"] = "Timber"
+        seed["allocations"][0]["expense_category"] = CATEGORY_MATERIALS
+        seed["allocations"][0]["expense_category_source"] = "user"
         updated = self.server_client.put(
             f"/api/expense-documents/{before['id']}", json=seed,
             headers={"X-Sync-Key": "isolated-sync-test-key"})
         self.assertEqual(updated.status_code, 200, updated.get_json())
         before = self.host.incoming_register_snapshot()[0]
         self.assertEqual(before["allocations"][0]["note"], "Allocation note")
-        self.assertEqual(before["allocations"][0]["expense_category"], "Timber")
+        self.assertEqual(before["allocations"][0]["expense_category"], CATEGORY_MATERIALS)
 
         window = OfflineReviewWindow(self.store, integrated=True, document_id=2)
         try:
@@ -437,21 +440,30 @@ class IncomingIntegrationTests(unittest.TestCase):
             window.inputs["rounding_amount"].setText("-0.25")
             window.allocations.item(0, 1).setText("124.75")
             self.store.save(2, window.payload(), window.revision)
-            self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+            sync_result = self.sync()
+            self.assertEqual(sync_result["synced"], 0, sync_result)
+            self.assertEqual(sync_result["conflicts"], 1, sync_result)
+            self.assertTrue(
+                any("категориями" in error for error in sync_result["test_errors"]),
+                sync_result,
+            )
             saved = self.host.incoming_register_snapshot()[0]
             self.assertEqual(len(self.host.incoming_register_snapshot()), 1)
             for key in ("document_type", "supplier_name", "invoice_number", "document_date",
-                        "currency_code", "net_amount", "vat_amount", "payment_reference",
-                        "expense_category", "document_comment", "verification_status"):
+                        "currency_code", "net_amount", "vat_amount", "gross_amount",
+                        "rounding_amount", "payment_reference", "expense_category",
+                        "document_comment", "verification_status"):
                 self.assertEqual(saved[key], before[key], key)
-            self.assertEqual(saved["rounding_amount"], "-0.25")
-            self.assertEqual(saved["gross_amount"], "124.75")
+            self.assertEqual(saved["allocations"][0]["gross_amount"], "125.00")
             self.assertEqual(saved["allocations"][0]["object_id"], self.object_id)
             self.assertEqual(saved["allocations"][0]["note"], "Allocation note")
-            self.assertEqual(saved["allocations"][0]["expense_category"], "Timber")
-            _revision, reopened = self.store.current_review(2)
+            self.assertEqual(saved["allocations"][0]["expense_category"], CATEGORY_MATERIALS)
+            self.assertEqual(saved["allocations"][0]["expense_category_source"], "user")
+            local_revision, reopened = self.store.latest(2)
+            self.assertGreater(local_revision, revision)
             self.assertEqual(reopened["confirmed_type"], "manual")
             self.assertEqual(reopened["rounding_amount"], "-0.25")
+            self.assertEqual(reopened["gross_amount"], "124.75")
             changes = json.loads(self.store.history(2)[-1]["changes_json"])
             self.assertEqual(changes["_server_before"]["sync_version"], before["sync_version"])
             self.assertEqual(changes["_server_before"]["document_type"], "manual")
