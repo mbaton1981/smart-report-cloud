@@ -12,6 +12,8 @@ import tempfile
 
 from PIL import Image, ImageSequence
 from pypdf import PdfReader, PdfWriter
+from pypdf.errors import PdfReadError
+from pypdfium2 import PdfiumError
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
@@ -23,7 +25,8 @@ from reportlab.platypus import (
 )
 
 from customer_report import CATEGORY_LABELS, REPORT_ISSUER_NAME, WORK_TYPES, format_quantity
-from expense_documents import parse_decimal
+from document_costs import verified_original_order_allocation_proposal
+from expense_documents import DocumentExtractionError, extract_local_document, parse_decimal
 from object_package_swedish import swedish_category, swedish_document_type, swedish_label
 
 
@@ -62,13 +65,17 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
             continue
         if key:
             seen.add(key)
-        allocations = [
-            allocation for allocation in document.get("allocations", [])
+        source_allocations = [
+            dict(allocation) for allocation in document.get("allocations") or []
+        ]
+        object_allocation_indexes = [
+            index for index, allocation in enumerate(source_allocations)
             if allocation.get("object_id") is not None
             and int(allocation["object_id"]) == int(object_id)
             and not allocation.get("company_expense")
             and allocation.get("destination") != "company"
         ]
+        allocations = [source_allocations[index] for index in object_allocation_indexes]
         if not allocations:
             continue
 
@@ -99,7 +106,12 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
             reason = "Распределение не подтверждено."
 
         if reason:
-            excluded.append({**document, "object_allocations": allocations, "excluded_reason": reason})
+            excluded.append({
+                **document,
+                "object_allocations": allocations,
+                "object_allocation_indexes": object_allocation_indexes,
+                "excluded_reason": reason,
+            })
             continue
 
         parts = {
@@ -113,7 +125,8 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
         confirmed.append({
             **document,
             "object_allocations": allocations,
-            "source_allocations": list(document.get("allocations", [])),
+            "source_allocations": source_allocations,
+            "object_allocation_indexes": object_allocation_indexes,
             "share": amounts,
             "date_unknown": not bool(document_date),
         })
@@ -272,27 +285,52 @@ def _money_parts(values):
 def _customer_summary(report):
     totals = report.get("totals", {})
     lines = report.get("cost_lines", [])
-    work_amounts = [
-        line.get("amount") for line in lines
-        if not str(line.get("label") or "").startswith("Resa")
+    work_lines = [
+        line for line in lines
+        if str(line.get("label") or "").startswith(
+            ("Arbete", "Fast pris", "OB", "Kundtillägg")
+        )
     ]
     travel_lines = [
         line for line in lines if str(line.get("label") or "").startswith("Resa")
     ]
-    work = _money_parts(work_amounts)
-    travel = _money_parts(line.get("amount") for line in travel_lines)
-    work_total = parse_decimal(totals.get("work_amount"))
-    ob_total = parse_decimal(totals.get("ob_amount"))
-    if work_total is not None or ob_total is not None:
-        work_amount = (
-            work_total + ob_total
-            if work_total is not None and ob_total is not None else None
+    work = _money_parts(line.get("amount") for line in work_lines)
+    if work_lines:
+        work_amount = work["known"] if work["complete"] else None
+        known_work_amount = work["known"]
+        work_unknown_rows = sum(
+            parse_decimal(line.get("amount")) is None for line in work_lines
         )
     else:
-        work_amount = work["known"] if work["complete"] else None
-    travel_amount = parse_decimal(totals.get("transport_amount"))
-    if travel_amount is None and travel["complete"]:
-        travel_amount = travel["known"] or Decimal(0)
+        work_values = [
+            parse_decimal(totals.get(key))
+            for key in ("work_amount", "ob_amount")
+        ]
+        known_work_values = [value for value in work_values if value is not None]
+        known_work_amount = (
+            sum(known_work_values, Decimal(0)) if known_work_values else None
+        )
+        work_unknown_rows = sum(value is None for value in work_values)
+        work_complete = (
+            "work_amount" in totals and "ob_amount" in totals
+            and all(value is not None for value in work_values)
+        )
+        work_amount = known_work_amount if work_complete else None
+        work["complete"] = work_complete
+        work["known"] = known_work_amount
+
+    travel = _money_parts(line.get("amount") for line in travel_lines)
+    if travel_lines:
+        travel_amount = travel["known"] if travel["complete"] else None
+        travel_unknown_rows = sum(
+            parse_decimal(line.get("amount")) is None for line in travel_lines
+        )
+    else:
+        travel_amount = parse_decimal(totals.get("transport_amount"))
+        travel_unknown_rows = 0 if travel_amount is not None else 1
+        if travel_amount is not None:
+            travel["known"] = travel_amount
+            travel["complete"] = True
     combined = parse_decimal(totals.get("invoice_total"))
     known_combined = parse_decimal(totals.get("known_subtotal"))
     trips = []
@@ -304,10 +342,12 @@ def _customer_summary(report):
     known_trips = sum((value for value in trips if value is not None), Decimal(0))
     if (
         travel_amount is None and not travel_lines
-        and all(value is not None for value in trips) and known_trips == 0
+        and trips and all(value is not None for value in trips) and known_trips == 0
     ):
         travel_amount = Decimal(0)
         travel["known"] = Decimal(0)
+        travel["complete"] = True
+        travel_unknown_rows = 0
     rates = defaultdict(lambda: {
         "quantity": Decimal(0), "amounts": [], "quantity_complete": True,
     })
@@ -341,14 +381,165 @@ def _customer_summary(report):
         "known_trips": known_trips,
         "unknown_trip_rows": sum(value is None for value in trips),
         "work_amount": work_amount,
-        "known_work_amount": work["known"],
+        "known_work_amount": known_work_amount,
         "work_complete": work["complete"] and work_amount is not None,
+        "unknown_work_rows": work_unknown_rows,
         "travel_amount": travel_amount,
         "known_travel_amount": travel["known"],
         "travel_complete": travel["complete"] and travel_amount is not None,
+        "unknown_travel_rows": travel_unknown_rows,
         "combined_amount": combined,
         "known_combined_amount": known_combined,
         "trip_breakdown": trip_breakdown,
+    }
+
+
+def _object_total_summary(data, figures):
+    expenses = data.get("expenses", [])
+    excluded = data.get("excluded_expenses", [])
+    snapshot_available = bool(data.get("expense_snapshot_available"))
+    expense_net = defaultdict(Decimal)
+    unknown_net_by_currency = defaultdict(int)
+    foreign_share_count = 0
+    unknown_currency_share_count = 0
+    unknown_net_share_count = 0
+
+    for document in expenses:
+        currency = str(document.get("currency_code") or "UNKNOWN").strip().upper()
+        allocations = document.get("object_allocations") or []
+        if not allocations:
+            allocations = [document.get("share") or {}]
+        for allocation in allocations:
+            net = parse_decimal(allocation.get("net_amount"))
+            if net is None:
+                unknown_net_share_count += 1
+                unknown_net_by_currency[currency] += 1
+            else:
+                expense_net[currency] += net
+            if currency == "UNKNOWN":
+                unknown_currency_share_count += 1
+            elif currency != "SEK":
+                foreign_share_count += 1
+
+    unconfirmed_share_count = sum(
+        max(1, len(document.get("object_allocations") or []))
+        for document in excluded
+    )
+    if "SEK" in expense_net or any(
+        str(document.get("currency_code") or "UNKNOWN").strip().upper() == "SEK"
+        for document in expenses
+    ):
+        known_sek_expense = expense_net["SEK"]
+    elif snapshot_available:
+        known_sek_expense = Decimal(0)
+    else:
+        known_sek_expense = None
+
+    known_components = [
+        value for value in (
+            figures.get("known_work_amount"),
+            figures.get("known_travel_amount"),
+            known_sek_expense,
+        ) if value is not None
+    ]
+    known_total = (
+        sum(known_components, Decimal(0)) if known_components else None
+    )
+    complete = (
+        figures.get("work_complete")
+        and figures.get("travel_complete")
+        and snapshot_available
+        and not unknown_net_share_count
+        and not foreign_share_count
+        and not unknown_currency_share_count
+        and not unconfirmed_share_count
+    )
+
+    swedish = data.get("language") == "sv"
+    reasons = []
+    recovery_statuses = {
+        document.get("net_recovery_status") for document in expenses
+    }
+    if not figures.get("work_complete"):
+        count = figures.get("unknown_work_rows") or 0
+        reasons.append(
+            f"Okänd summa arbete/OB för {count} rader"
+            if swedish and count else
+            "Arbetssumman är ofullständig"
+            if swedish else
+            f"Неизвестна сумма работы/OB в строках: {count}"
+            if count else "Сумма работы/OB неизвестна"
+        )
+    if not figures.get("travel_complete"):
+        count = figures.get("unknown_travel_rows") or 0
+        reasons.append(
+            f"Okänd resesumma för {count} rader"
+            if swedish and count else
+            "Resesumman är ofullständig"
+            if swedish else
+            f"Неизвестна сумма поездок в строках: {count}"
+            if count else "Сумма поездок неизвестна"
+        )
+    if not snapshot_available:
+        reasons.append(
+            "Kostnadsregistret är inte tillgängligt"
+            if swedish else "Реестр расходов недоступен"
+        )
+    if unknown_net_share_count:
+        reasons.append(
+            f"netto saknas; antal andelar: {unknown_net_share_count}"
+            if swedish else
+            f"нетто неизвестно; количество долей: {unknown_net_share_count}"
+        )
+    recovery_reason = None
+    if "original_not_verified" in recovery_statuses:
+        recovery_reason = (
+            "originalet kunde inte verifieras"
+            if swedish else "оригинал не прошёл сверку"
+        )
+    elif recovery_statuses.intersection({"no_unique_match", "partially_recovered"}):
+        recovery_reason = (
+            "ingen entydig matchning mot originalordern"
+            if swedish else "нет однозначного сопоставления с заказом оригинала"
+        )
+    elif "original_unavailable" in recovery_statuses:
+        recovery_reason = (
+            "originalet saknas eller är inte tillgängligt"
+            if swedish else "оригинал отсутствует или недоступен"
+        )
+    if unknown_net_share_count and recovery_reason:
+        reasons.append(recovery_reason)
+    if unconfirmed_share_count:
+        reasons.append(
+            f"obekräftade andelar: {unconfirmed_share_count}"
+            if swedish else
+            f"неподтверждённые доли: {unconfirmed_share_count}"
+        )
+    if foreign_share_count:
+        reasons.append(
+            f"andelar i annan valuta, ej konverterade: {foreign_share_count}"
+            if swedish else
+            f"доли в другой валюте не конвертированы: {foreign_share_count}"
+        )
+    if unknown_currency_share_count:
+        reasons.append(
+            f"valuta saknas för andelar: {unknown_currency_share_count}"
+            if swedish else
+            f"для долей не указана валюта: {unknown_currency_share_count}"
+        )
+
+    return {
+        "known_total": known_total,
+        "complete": complete,
+        "expense_net_by_currency": dict(expense_net),
+        "unknown_net_by_currency": dict(unknown_net_by_currency),
+        "known_sek_expense": known_sek_expense,
+        "unknown_net_share_count": unknown_net_share_count,
+        "unknown_net_reason": recovery_reason,
+        "foreign_share_count": foreign_share_count,
+        "unknown_currency_share_count": unknown_currency_share_count,
+        "unconfirmed_share_count": unconfirmed_share_count,
+        "reasons": reasons,
     }
 
 
@@ -512,7 +703,6 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     marking = str(object_row.get("markning") or "")
     object_display = object_title + (f" · {marking}" if marking else "")
     expenses = data.get("expenses", [])
-    expense_totals = expense_totals_by_currency(expenses)
 
     styles.update({
         "cover_object": ParagraphStyle(
@@ -553,8 +743,6 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         if known is not None:
             suffix = " · delbelopp, total ofullständig" if swedish else " · известная часть, итог неполон"
             return _amount_text(known, currency) + suffix
-        if not work_rows:
-            return "Ej beräknat" if swedish else "Не рассчитывалось"
         return "Okänt" if swedish else "Неизвестно"
 
     def display_amount(value, currency="SEK"):
@@ -577,13 +765,17 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             return "Okänt" if swedish else "Неизвестно"
         return _format_trip_count(value)
 
-    def card(label, value, note, background):
+    def card(label, value, note, background, cell_width=None):
         body = [
             [raw_paragraph(label, styles["card_label"])],
             [raw_paragraph(value, styles["card_value"])],
             [raw_paragraph(note, styles["card_note"])],
         ]
-        result = Table(body, colWidths=[available * .47 - 26], hAlign="LEFT")
+        result = Table(
+            body,
+            colWidths=[cell_width or available * .47 - 26],
+            hAlign="LEFT",
+        )
         result.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), background),
             ("BOX", (0, 0), (-1, -1), .8, colors.HexColor("#c5d3dc")),
@@ -668,9 +860,6 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     trip_value = amount_or_partial(
         figures["travel_amount"], figures["known_travel_amount"],
     )
-    combined_value = amount_or_partial(
-        figures["combined_amount"], figures["known_combined_amount"],
-    )
     if figures["hours"] is not None:
         work_hours = format_quantity(figures["hours"])
         if swedish and work_hours.endswith(",0"):
@@ -728,81 +917,138 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                 count = "Okänt antal" if swedish else "Неизвестное число поездок"
             breakdown.append(f"{count} × {rate}")
         trip_note += (" · Priser: " if swedish else " · Ставки: ") + "; ".join(breakdown)
-    if figures["unknown_trip_rows"] == 0:
-        trip_label = "Resor" if swedish else "Поездки"
-    else:
-        trip_label = "Resor · ofullständiga uppgifter" if swedish else "Поездки · данные неполны"
-
-    if expense_totals:
-        expense_values = []
-        for currency, amounts in expense_totals.items():
-            value = display_total(amounts, "gross_amount", currency)
-            expense_values.append(
-                value if f" {currency}" in value else f"{currency}: {value}"
-            )
-        expense_value = "\n".join(expense_values)
-        tax_notes = _expense_tax_notes(expenses, "sv" if swedish else "ru")
-        if tax_notes:
-            expense_note = (
-                "Beloppen är inklusive moms enligt bekräftade objektandelar. "
-                if swedish else
-                "Суммы с НДС по подтверждённым долям объекта. "
-            ) + " ".join(tax_notes)
-        else:
-            expense_note = (
-                "Beloppen är inklusive moms; netto och moms är kända för samtliga bekräftade andelar."
-                if swedish else
-                "Суммы с НДС; нетто и НДС известны для всех подтверждённых долей."
-            )
-        if any(amounts.get("gross_amount") is None for amounts in expense_totals.values()):
-            expense_note += (
-                " En del av bruttoandelarna saknas; visat belopp är endast den kända delen."
-                if swedish else
-                " Часть сумм долей неизвестна; указана только известная часть."
-            )
-    else:
-        expense_value = "Inga bekräftade andelar" if swedish else "Нет подтверждённых долей"
-        expense_note = (
-            "Inga bekräftade inköps- eller kostnadsfördelningar i perioden."
-            if swedish else "Нет подтверждённых закупок/расходов в периоде."
-        )
-    labor_trip_note = (
-        "Arbete och resor enligt sparade kundvillkor, exkl. moms. Inköp ingår inte; "
-        "detta är inte en faktura eller ett belopp att betala."
+    trip_label = (
+        "Resor · ofullständiga uppgifter · exkl. moms"
+        if swedish and figures["unknown_trip_rows"] else
+        "Resor · exkl. moms"
         if swedish else
-        "Работа и поездки по сохранённым условиям, без НДС. Закупки не включены; "
-        "это не счёт и не сумма к оплате."
+        "Поездки · данные неполны · без НДС"
+        if figures["unknown_trip_rows"] else
+        "Поездки · без НДС"
     )
-    cards = Table([
-        [
-            card("Arbete" if swedish else "Работа", work_value, work_note,
-                 colors.HexColor("#f0f5f8")),
-            card(trip_label, trip_value, trip_note, colors.HexColor("#f0f5f8")),
-        ],
-        [
-            card("Arbete och resor tillsammans" if swedish else "Работа и поездки вместе",
-                 combined_value, labor_trip_note, colors.HexColor("#e5f0ea")),
-            card("Bekräftade inköp och kostnader" if swedish else "Подтверждённые закупки и расходы",
-                 expense_value, expense_note, colors.HexColor("#f7f2e7")),
-        ],
-    ], colWidths=[available * .50, available * .50], hAlign="LEFT")
+
+    total_summary = _object_total_summary(data, figures)
+    if total_summary["known_sek_expense"] is None:
+        expense_value = "Okänt" if swedish else "Неизвестно"
+    else:
+        expense_value = display_amount(total_summary["known_sek_expense"], "SEK")
+        if total_summary["unknown_net_share_count"] or total_summary["foreign_share_count"] \
+                or total_summary["unknown_currency_share_count"]:
+            expense_value += (
+                " · känd SEK-del" if swedish else " · известная часть в SEK"
+            )
+    expense_notes = []
+    if total_summary["unknown_net_share_count"]:
+        count = total_summary["unknown_net_share_count"]
+        expense_notes.append(
+            f"netto saknas; antal andelar: {count}"
+            if swedish else f"нетто неизвестно; долей: {count}"
+        )
+        if total_summary["unknown_net_reason"]:
+            expense_notes.append(total_summary["unknown_net_reason"])
+    if total_summary["unconfirmed_share_count"]:
+        count = total_summary["unconfirmed_share_count"]
+        expense_notes.append(
+            f"obekräftade andelar: {count}"
+            if swedish else f"неподтверждённые доли: {count}"
+        )
+    other_currency_parts = [
+        f"{currency}: {display_amount(value, currency)}"
+        for currency, value in total_summary["expense_net_by_currency"].items()
+        if currency != "SEK"
+    ]
+    if other_currency_parts:
+        expense_notes.append(
+            ("Ingår inte i SEK-totalen: " if swedish else "Не включено в итог SEK: ")
+            + ", ".join(other_currency_parts)
+        )
+    if "UNKNOWN" in total_summary["expense_net_by_currency"]:
+        expense_notes.append(
+            f"Okänd valuta: {display_amount(total_summary['expense_net_by_currency']['UNKNOWN'])}"
+            if swedish else
+            f"Неизвестная валюта: {display_amount(total_summary['expense_net_by_currency']['UNKNOWN'])}"
+        )
+    if not expense_notes:
+        expense_notes.append(
+            "Andelarnas belopp visas exkl. moms"
+            if swedish else "Показаны суммы долей без НДС"
+        )
+    expense_note = ". ".join(expense_notes) + "."
+
+    total_title = (
+        "Totalt för objektet exkl. moms"
+        if swedish and total_summary["complete"] else
+        "Delsumma exkl. moms"
+        if swedish else
+        "Итого по объекту без НДС"
+        if total_summary["complete"] else
+        "Промежуточный итог без НДС"
+    )
+    total_value = (
+        display_amount(total_summary["known_total"])
+        if total_summary["known_total"] is not None else
+        "Okänt" if swedish else "Неизвестно"
+    )
+    total_note = (
+        "Arbete enligt sparade kundvillkor + resor + objektets kostnadsandelar, exkl. moms."
+        if swedish else
+        "Работа по сохранённым условиям + поездки + расходы долями объекта, без НДС."
+    )
+    if not total_summary["complete"]:
+        total_note = " · ".join(total_summary["reasons"]) or (
+            "Ofullständiga uppgifter" if swedish else "Данные неполны"
+        )
+
+    card_width = available / 3 - 10
+    cards = Table([[
+        card(
+            "Arbete · exkl. moms" if swedish else "Работа · без НДС",
+            work_value, work_note, colors.HexColor("#f0f5f8"), card_width,
+        ),
+        card(
+            trip_label,
+            trip_value, trip_note, colors.HexColor("#f0f5f8"), card_width,
+        ),
+        card(
+            "Inköp och kostnader · exkl. moms"
+            if swedish else "Закупки и расходы · без НДС",
+            expense_value, expense_note, colors.HexColor("#f7f2e7"), card_width,
+        ),
+    ]], colWidths=[available / 3] * 3, hAlign="LEFT")
     cards.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    total_band = Table([[
+        raw_paragraph(total_title, styles["card_label"]),
+        raw_paragraph(total_value, ParagraphStyle(
+            "ObjectPackageTotalValue", fontName=bold_font, fontSize=25, leading=29,
+            textColor=colors.HexColor("#123424"),
+        )),
+        raw_paragraph(total_note, styles["card_note"]),
+    ]], colWidths=[available * .30, available * .30, available * .40])
+    total_band.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#dcefe1")),
+        ("BOX", (0, 0), (-1, -1), 1.2, colors.HexColor("#5b8c67")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
     ]))
     story.extend([
-        Spacer(1, 8),
+        Spacer(1, 10),
         cards,
         Spacer(1, 8),
+        total_band,
+        Spacer(1, 10),
         raw_paragraph(
-            "Underlaget visar registrerade uppgifter och beräkningar enligt sparade kundvillkor. "
-            "Det är inte en slutlig faktura och anger inte betalning eller vinst."
+            "Sammanställning enligt rapportens uppgifter. Inget materialpåslag har lagts till."
             if swedish else
-            "Отчёт показывает учётные данные и расчёты по сохранённым условиям. "
-            "Это не окончательный счёт, не подтверждение оплаты и не прибыль.",
+            "Итог рассчитан по данным отчёта; наценка на материалы не добавлялась.",
             styles["detail_note"],
         ),
         PageBreak(),
@@ -968,6 +1214,18 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                 amount_label += (
                     "\nNetto och moms är inte fullständigt kända."
                     if swedish else "\nНетто и НДС известны не полностью."
+                )
+            if share.get("net_recovered_from_original"):
+                amount_label += (
+                    "\nNetto verifierat mot original; registerposten är oförändrad."
+                    if swedish else
+                    "\nНетто сверено с оригиналом; запись реестра не менялась."
+                )
+            elif share.get("net_partially_recovered_from_original"):
+                amount_label += (
+                    "\nVissa andelar har verifierats mot original; registerposten är oförändrad."
+                    if swedish else
+                    "\nЧасть долей сверена с оригиналом; запись реестра не менялась."
                 )
             expense_rows.append([
                 Literal(str(document.get("document_date") or ("Datum saknas" if swedish else "Дата неизвестна"))),
@@ -1197,6 +1455,118 @@ def _prepare_sources(expenses, source_paths, source_errors, work_dir):
     return prepared
 
 
+def _recover_report_share_tax(data, source_paths, source_errors):
+    expenses = data.get("expenses", [])
+    target_object = data["object"]
+    target_id = target_object.get("id")
+    if target_id is None:
+        return
+
+    for document in expenses:
+        allocations = document.get("object_allocations") or []
+        missing_indexes = [
+            index for index, allocation in enumerate(allocations)
+            if parse_decimal(allocation.get("net_amount")) is None
+        ]
+        if not missing_indexes:
+            continue
+
+        key = expense_document_key(document)
+        paths = list(source_paths.get(key, []))
+        if source_errors.get(key) or not paths:
+            document["net_recovery_status"] = "original_unavailable"
+            continue
+
+        try:
+            pages = []
+            for attachment_index, raw_path in enumerate(paths):
+                path = Path(raw_path)
+                extraction = extract_local_document(path)
+                page_texts = extraction.pages or (extraction.text,)
+                for page_index, page_text in enumerate(page_texts):
+                    page_elements = (
+                        extraction.page_elements[page_index]
+                        if page_index < len(extraction.page_elements) else ()
+                    )
+                    pages.append({
+                        "source": path.name,
+                        "page": page_index + 1,
+                        "attachment_index": attachment_index,
+                        "text": page_text,
+                        "elements": page_elements,
+                    })
+            if not pages:
+                raise ValueError("В оригинале нет страниц для проверки.")
+
+            parts = verified_original_order_allocation_proposal(
+                pages, document, [target_object],
+            )
+        except (
+            DocumentExtractionError, OSError, PdfReadError, PdfiumError,
+            RuntimeError, ValueError, KeyError,
+        ):
+            document["net_recovery_status"] = "original_not_verified"
+            continue
+
+        remaining = list(parts)
+        recovered_indexes = []
+        for allocation_index in missing_indexes:
+            allocation = allocations[allocation_index]
+            saved_gross = parse_decimal(allocation.get("gross_amount"))
+            if saved_gross is None:
+                continue
+            candidates = [
+                part for part in remaining
+                if len(part.get("object_options") or []) == 1
+                and part["object_options"][0].get("id") == int(target_id)
+                and parse_decimal(part.get("gross_amount")) == saved_gross
+                and (
+                    parse_decimal(allocation.get("vat_amount")) is None
+                    or parse_decimal(allocation.get("vat_amount"))
+                    == parse_decimal(part.get("vat_amount"))
+                )
+                and (
+                    parse_decimal(allocation.get("rounding_amount")) is None
+                    or parse_decimal(allocation.get("rounding_amount"))
+                    == parse_decimal(part.get("rounding"))
+                )
+            ]
+            if len(candidates) != 1:
+                continue
+            part = candidates[0]
+            remaining.remove(part)
+            allocation.update(
+                net_amount=part["net_amount"],
+                vat_amount=part["vat_amount"],
+                rounding_amount=part["rounding"],
+                net_recovered_from_original=True,
+            )
+            recovered_indexes.append(allocation_index)
+
+        if recovered_indexes:
+            document["net_recovered_allocation_indexes"] = recovered_indexes
+            document["net_recovery_status"] = (
+                "recovered" if len(recovered_indexes) == len(missing_indexes)
+                else "partially_recovered"
+            )
+            allocations = document.get("object_allocations") or []
+            parts_by_field = {
+                field: _sum_partial(allocation.get(field) for allocation in allocations)
+                for field in ("net_amount", "vat_amount", "gross_amount", "rounding_amount")
+            }
+            document["share"] = {
+                field: part["value"] for field, part in parts_by_field.items()
+            }
+            document["share"]["known_amounts"] = {
+                field: part["known"] for field, part in parts_by_field.items()
+            }
+            fully_recovered = len(recovered_indexes) == len(missing_indexes)
+            document["share"]["net_recovered_from_original"] = fully_recovered
+            document["share"]["net_partially_recovered_from_original"] = not fully_recovered
+        elif missing_indexes:
+            document["net_recovery_status"] = "no_unique_match"
+
+
 def _cover_pdf(prepared, page_number, data, font, bold_font):
     from xml.sax.saxutils import escape
     document = prepared["document"]
@@ -1307,6 +1677,24 @@ def _cover_pdf(prepared, page_number, data, font, bold_font):
         body,
         translate=not swedish,
     )
+    if share.get("net_recovered_from_original"):
+        draw_paragraph(
+            "Netto, moms och avrundning har verifierats mot originalet för rapporten; "
+            "den sparade fördelningen har inte ändrats."
+            if swedish else
+            "Нетто, НДС и округление сверены с оригиналом только для отчёта; "
+            "сохранённое распределение не изменялось.",
+            body,
+        )
+    elif share.get("net_partially_recovered_from_original"):
+        draw_paragraph(
+            "Vissa andelar har verifierats mot originalet för rapporten; "
+            "den sparade fördelningen har inte ändrats."
+            if swedish else
+            "Часть долей сверена с оригиналом только для отчёта; "
+            "сохранённое распределение не изменялось.",
+            body,
+        )
     if (
         share.get("rounding_amount") is not None
         or share.get("known_amounts", {}).get("rounding_amount") is not None
@@ -1390,6 +1778,47 @@ def write_object_report_package(
     source_errors = source_errors or {}
     expenses = data.get("expenses", [])
     swedish = data.get("language") == "sv"
+    _recover_report_share_tax(data, source_paths, source_errors)
+    for document in expenses:
+        status = document.get("net_recovery_status")
+        if status in {"original_unavailable", "original_not_verified", "no_unique_match",
+                      "partially_recovered"}:
+            reason = (
+                "Originalets nettoposter kunde inte verifieras för alla andelar."
+                if swedish else
+                "Нетто удалось подтвердить по оригиналу не для всех долей."
+            )
+            data.setdefault("incomplete_reasons", []).append(
+                f"{reason} Фактура: {document.get('invoice_number') or 'неизвестна'}."
+                if not swedish else
+                f"{reason} Faktura: {document.get('invoice_number') or 'okänd'}."
+            )
+            detail = {
+                "original_unavailable": (
+                    "Original saknas eller kan inte läsas."
+                    if swedish else "Оригинал отсутствует или не читается."
+                ),
+                "original_not_verified": (
+                    "Originalet kunde inte verifieras mot dokumentnummer, belopp och orderrader."
+                    if swedish else
+                    "Оригинал не прошёл сверку номера, суммы и строк заказа."
+                ),
+                "no_unique_match": (
+                    "Ingen entydig matchning mellan objektandel och originalorder."
+                    if swedish else
+                    "Нет однозначного сопоставления доли объекта и заказа оригинала."
+                ),
+                "partially_recovered": (
+                    "Vissa andelar saknar entydig matchning mot originalordern."
+                    if swedish else
+                    "Для части долей нет однозначного сопоставления с заказами оригинала."
+                ),
+            }[status]
+            data["incomplete_reasons"].append(
+                f"{detail} Faktura: {document.get('invoice_number') or 'okänd'}."
+                if swedish else
+                f"{detail} Фактура: {document.get('invoice_number') or 'неизвестна'}."
+            )
     if swedish:
         company = str(data["object"].get("company") or "").strip()
         customer_name = str(data.get("customer_name") or "").strip()

@@ -16,8 +16,9 @@ from reportlab.pdfgen import canvas
 from PIL import Image
 
 from object_package_report import (
-    _expense_description, collect_object_expenses, expense_totals_by_currency,
-    write_object_report_package,
+    _customer_summary, _expense_description, _object_total_summary,
+    _recover_report_share_tax, collect_object_expenses,
+    expense_totals_by_currency, write_object_report_package,
 )
 
 
@@ -106,6 +107,191 @@ class ObjectPackageReportTests(unittest.TestCase):
         self.assertEqual(totals["SEK"]["known_amounts"]["net_amount"], Decimal("15.00"))
         self.assertIsNone(totals["SEK"]["net_amount"])
         self.assertEqual(set(totals), {"SEK"})
+
+    def test_object_net_total_uses_only_selected_share_and_keeps_currencies_separate(self):
+        shared = _document(70, net="150.00", vat="30.00", gross="180.00", allocations=[
+            {"object_id": 42, "destination": "object", "net_amount": "50.00",
+             "vat_amount": "10.00", "gross_amount": "60.00", "rounding_amount": "0.00"},
+            {"object_id": 84, "destination": "object", "net_amount": "100.00",
+             "vat_amount": "20.00", "gross_amount": "120.00", "rounding_amount": "0.00"},
+        ])
+        expenses, excluded = collect_object_expenses([shared], 42)
+        report = {
+            "journal_rows": [{
+                "entry_type": "work", "hours": 2, "transport": 1,
+            }],
+            "cost_lines": [
+                {"label": "Arbete", "amount": "100.00", "quantity": 2},
+                {"label": "Resa", "amount": "25.00", "quantity": 1, "rate": 25},
+            ],
+            "totals": {
+                "work_amount": "100.00", "ob_amount": "0.00",
+                "transport_amount": "25.00",
+            },
+        }
+        data = {
+            "customer_report": report, "expenses": expenses,
+            "excluded_expenses": excluded, "expense_snapshot_available": True,
+        }
+        summary = _object_total_summary(data, _customer_summary(report))
+
+        self.assertEqual(expenses[0]["share"]["net_amount"], Decimal("50.00"))
+        self.assertEqual(summary["known_sek_expense"], Decimal("50.00"))
+        self.assertEqual(summary["known_total"], Decimal("175.00"))
+        self.assertTrue(summary["complete"])
+
+    def test_pdf_cover_shows_net_components_and_not_gross_expense(self):
+        shared = _document(75, net="150.00", vat="30.00", gross="180.00", allocations=[
+            {"object_id": 42, "destination": "object", "net_amount": "50.00",
+             "vat_amount": "10.00", "gross_amount": "60.00", "rounding_amount": "0.00"},
+            {"object_id": 84, "destination": "object", "net_amount": "100.00",
+             "vat_amount": "20.00", "gross_amount": "120.00", "rounding_amount": "0.00"},
+        ])
+        expenses, excluded = collect_object_expenses([shared], 42)
+        report = {
+            "journal_rows": [{
+                "date": "2026-11-02", "employee": "Worker", "comment": "Repair",
+                "hours": 2, "transport": 1, "entry_type": "work", "sync_id": "work-1",
+                "hours_confirmed": 1, "invoiced": 0,
+            }],
+            "journal_segments": {}, "prepared_rows": [],
+            "cost_lines": [
+                {"label": "Arbete", "quantity": 2, "unit": "h",
+                 "rate": 50, "amount": "100.00"},
+                {"label": "Resa", "quantity": 1, "unit": "st",
+                 "rate": 25, "amount": "25.00"},
+            ],
+            "totals": {
+                "work_amount": "100.00", "ob_amount": "0.00",
+                "transport_amount": "25.00", "invoice_total": "125.00",
+            },
+            "warnings": [],
+        }
+        data = {
+            "object": {"id": 42, "name": "Object", "markning": "p1041",
+                       "company": "Customer", "is_active": 1},
+            "period_label": "2026-11-02", "generated_at": "2026-11-03 12:00",
+            "customer_report": report, "include_customer_cost": True,
+            "include_copies": False, "expenses": expenses,
+            "excluded_expenses": excluded, "expense_snapshot_available": True,
+            "incomplete_reasons": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cover-report.pdf"
+            write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+            )
+            cover_text = PdfReader(str(target)).pages[0].extract_text()
+
+        self.assertIn("Работа · без НДС", cover_text)
+        self.assertIn("Поездки · без НДС", cover_text)
+        self.assertIn("Закупки и расходы · без НДС", cover_text)
+        self.assertIn("50,00 SEK", cover_text)
+        self.assertIn("Итого по объекту без НДС", cover_text)
+        self.assertIn("175,00 SEK", cover_text)
+        self.assertNotIn("60,00 SEK", cover_text)
+
+    def test_partial_net_and_unknown_work_or_travel_do_not_become_zero(self):
+        missing_net = _document(71, net=None, vat=None, gross="20.00", allocations=[{
+            "object_id": 42, "destination": "object", "net_amount": None,
+            "vat_amount": None, "gross_amount": "20.00",
+        }])
+        foreign = _document(72, currency="EUR", allocations=[{
+            "object_id": 42, "destination": "object", "net_amount": "10.00",
+            "vat_amount": "2.00", "gross_amount": "12.00",
+        }])
+        expenses, excluded = collect_object_expenses([missing_net, foreign], 42)
+        report = {
+            "journal_rows": [{"entry_type": "work", "hours": 1, "transport": 1}],
+            "cost_lines": [{"label": "Arbete", "amount": "100.00"}],
+            "totals": {},
+        }
+        summary = _object_total_summary({
+            "customer_report": report, "expenses": expenses,
+            "excluded_expenses": excluded, "expense_snapshot_available": True,
+        }, _customer_summary(report))
+
+        self.assertEqual(summary["known_total"], Decimal("100.00"))
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["unknown_net_share_count"], 1)
+        self.assertEqual(summary["foreign_share_count"], 1)
+        self.assertIsNone(_customer_summary(report)["travel_amount"])
+        self.assertIn("долей: 1", " ".join(summary["reasons"]))
+        self.assertIn("не конвертированы", " ".join(summary["reasons"]))
+
+    def test_work_total_sums_fast_price_and_addons_once_from_detail_lines(self):
+        figures = _customer_summary({
+            "journal_rows": [],
+            "cost_lines": [
+                {"label": "Fast pris 2026-01-01 – 2026-01-31", "amount": "1000.00"},
+                {"label": "Arbete – extra utöver fast pris", "amount": "200.00"},
+                {"label": "Kundtillägg – OB", "amount": "50.00"},
+            ],
+            "totals": {
+                "work_amount": "1200.00", "ob_amount": "50.00",
+                "invoice_total": "1250.00",
+            },
+        })
+
+        self.assertEqual(figures["work_amount"], Decimal("1250.00"))
+        self.assertTrue(figures["work_complete"])
+
+    def test_report_only_net_recovery_requires_unique_object_and_gross_match(self):
+        saved = _document(73, net=None, vat=None, gross="12.00", allocations=[
+            {"object_id": 42, "destination": "object", "net_amount": None,
+             "vat_amount": None, "gross_amount": "12.00"},
+            {"object_id": 84, "destination": "object", "net_amount": None,
+             "vat_amount": None, "gross_amount": "24.00"},
+        ])
+        expenses, _ = collect_object_expenses([saved], 42)
+        data = {
+            "object": {"id": 42, "markning": "p1041"},
+            "expenses": expenses,
+        }
+        parts = [
+            {"object_options": [{"id": 42}], "gross_amount": "12.00",
+             "net_amount": "10.00", "vat_amount": "2.00", "rounding": "0.00"},
+            {"object_options": [{"id": 84}], "gross_amount": "24.00",
+             "net_amount": "20.00", "vat_amount": "4.00", "rounding": "0.00"},
+        ]
+        with patch(
+            "object_package_report.extract_local_document",
+            return_value=SimpleNamespace(pages=("original",), page_elements=((),), text="original"),
+        ), patch(
+            "object_package_report.verified_original_order_allocation_proposal",
+            return_value=parts,
+        ):
+            _recover_report_share_tax(data, {"client-73": ["original.pdf"]}, {})
+
+        self.assertEqual(expenses[0]["share"]["net_amount"], Decimal("10.00"))
+        self.assertEqual(expenses[0]["share"]["vat_amount"], Decimal("2.00"))
+        self.assertTrue(expenses[0]["share"]["net_recovered_from_original"])
+        self.assertIsNone(saved["allocations"][0]["net_amount"])
+
+    def test_report_only_net_recovery_rejects_duplicate_gross_match(self):
+        saved = _document(74, net=None, vat=None, gross="12.00", allocations=[{
+            "object_id": 42, "destination": "object", "net_amount": None,
+            "vat_amount": None, "gross_amount": "12.00",
+        }])
+        expenses, _ = collect_object_expenses([saved], 42)
+        data = {"object": {"id": 42, "markning": "p1041"}, "expenses": expenses}
+        duplicate_parts = [
+            {"object_options": [{"id": 42}], "gross_amount": "12.00",
+             "net_amount": "10.00", "vat_amount": "2.00", "rounding": "0.00"},
+            {"object_options": [{"id": 42}], "gross_amount": "12.00",
+             "net_amount": "10.00", "vat_amount": "2.00", "rounding": "0.00"},
+        ]
+        with patch(
+            "object_package_report.extract_local_document",
+            return_value=SimpleNamespace(pages=("original",), page_elements=((),), text="original"),
+        ), patch(
+            "object_package_report.verified_original_order_allocation_proposal",
+            return_value=duplicate_parts,
+        ):
+            _recover_report_share_tax(data, {"client-74": ["original.pdf"]}, {})
+
+        self.assertIsNone(expenses[0]["share"]["net_amount"])
+        self.assertEqual(expenses[0]["net_recovery_status"], "no_unique_match")
 
     def test_package_keeps_original_pages_and_separates_work_ob_and_trip_totals(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -211,13 +397,14 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertGreaterEqual(result["page_count"], 6)
             self.assertIn("Bygger och renoverar i Sthlm AB", text)
             self.assertIn("Архивный объект", text)
-            self.assertIn("Работа и поездки вместе", text)
+            self.assertIn("Промежуточный итог без НДС", text)
+            self.assertNotIn("Работа и поездки вместе", text)
             self.assertIn("18,0 ч", text)
             self.assertIn("8,0 ч", text)
             self.assertIn("6,0 ч", text)
             self.assertIn("2,0 ч", text)
             self.assertIn("Second Worker", text)
-            self.assertIn("Сумма поездок: Неизвестно", text)
+            self.assertIn("Сумма поездок: Неизвестно", " ".join(text.split()))
             self.assertIn("12,00 SEK (известная часть; неполно)", text)
             self.assertIn("20,00 SEK (известная часть; итог неполон)", text)
             self.assertIn("5,00 EUR", text)
@@ -356,7 +543,10 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("960,00 SEK", first_page)
             self.assertNotIn("SEK: 15 751,66 SEK", first_page)
             self.assertIn("Totalt resor: 3 st", first_page)
-            self.assertIn("Summa resor: 1 400,00 SEK exkl. moms", first_page)
+            self.assertIn(
+                "Summa resor: 1 400,00 SEK exkl. moms",
+                " ".join(first_page.split()),
+            )
             normalized_first_page = " ".join(first_page.split())
             self.assertIn("2 st × 450,00 SEK", normalized_first_page)
             self.assertIn("1 st × 500,00 SEK", normalized_first_page)
@@ -365,7 +555,7 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("2026-11-02", journal_page)
             self.assertIn("15 751,66 SEK", text)
             self.assertIn("Känd nettodel: 9 809,80 SEK", text)
-            self.assertIn("inte en fullständig nettosumma", text)
+            self.assertIn("inte en fullständig nettosumma", " ".join(text.split()))
             self.assertIn("På detta objekt: 3 489,34 SEK", text)
             self.assertIn("På detta objekt: 11 459,87 SEK", text)
             self.assertIn("Leverantörens fullständiga fakturabelopp: 4 664,00 SEK", text)
@@ -621,7 +811,7 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertNotIn("Beställare:", text)
             self.assertNotIn("UTKAST", text)
             self.assertIn("0,00 SEK", text)
-            self.assertIn("Inga bekräftade andelar", text)
+            self.assertIn("Inga bekräftade kostnadsfördelningar hittades", text)
             self.assertEqual(result["incomplete_reasons"], [])
             self.assertIn("Montering", text)
 

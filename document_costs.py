@@ -115,14 +115,18 @@ def propose_object_allocations(fields, objects):
     return result
 
 
-def verified_saved_allocation_vat(pages, document, allocations, objects):
-    """Enrich an existing gross split only when original items reproduce it exactly."""
+def _verified_original_order_proposal(
+    pages, document, objects, *, allow_missing_saved_tax_fields,
+):
     from expense_documents import allocation_vat_from_items, parse_invoice_pages, parse_project_order_allocations
+
     fields = parse_invoice_pages(pages)
     if fields.get("non_invoice_document_type") or fields.get("invoice_number") != document["invoice_number"]:
         raise ValueError("Оригинал не подтверждает номер или тип фактуры.")
     for key in ("net_amount", "vat_amount", "rounding_amount"):
-        if parse_invoice_money(fields.get(key)) != parse_invoice_money(document.get(key)):
+        saved = parse_invoice_money(document.get(key))
+        original = parse_invoice_money(fields.get(key))
+        if saved != original and not (allow_missing_saved_tax_fields and saved is None):
             raise ValueError("Оригинал не подтверждает " + key + "; автоматическое дополнение НДС отклонено.")
     original_orders = parse_project_order_allocations(pages)
     fields["order_proposals"] = allocation_vat_from_items(
@@ -133,6 +137,35 @@ def verified_saved_allocation_vat(pages, document, allocations, objects):
         warning for warning in fields["order_proposal_warnings"]
         if not (warning.startswith("НДС для заказа ") and "не распознан" in warning)]
     proposal = propose_object_allocations(fields, objects)
+    return fields, proposal
+
+
+def verified_original_order_allocation_proposal(pages, document, objects):
+    """Return original-backed parts without changing a saved confirmed allocation."""
+    fields, proposal = _verified_original_order_proposal(
+        pages, document, objects, allow_missing_saved_tax_fields=True,
+    )
+    saved_gross = parse_invoice_money(document.get("gross_amount"))
+    original_gross = parse_invoice_money(fields.get("gross_amount"))
+    amount_due = parse_invoice_money(fields.get("amount_due"))
+    if saved_gross is None or saved_gross not in {
+        value for value in (original_gross, amount_due) if value is not None
+    }:
+        raise ValueError("Сумма оригинала не совпадает с сохранённой суммой фактуры.")
+    saved_currency = str(document.get("currency_code") or "").strip().upper()
+    original_currency = str(fields.get("currency_code") or "").strip().upper()
+    if not saved_currency or saved_currency == "UNKNOWN" or saved_currency != original_currency:
+        raise ValueError("Валюта оригинала не совпадает с сохранённой валютой фактуры.")
+    if proposal["errors"]:
+        raise ValueError("Заказы оригинала не прошли полную сверку: " + "; ".join(proposal["errors"]))
+    return proposal["parts"]
+
+
+def verified_saved_allocation_vat(pages, document, allocations, objects):
+    """Enrich an existing gross split only when original items reproduce it exactly."""
+    fields, proposal = _verified_original_order_proposal(
+        pages, document, objects, allow_missing_saved_tax_fields=False,
+    )
     if proposal["errors"] or len(proposal["parts"]) != len(allocations):
         raise ValueError("Позиции не воспроизводят сохранённые части: " + "; ".join(proposal["errors"]))
     remaining = list(proposal["parts"])

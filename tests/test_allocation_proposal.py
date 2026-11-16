@@ -5,7 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import test_incoming_integration as integration
-from document_costs import propose_object_allocations
+from document_costs import (
+    propose_object_allocations, verified_original_order_allocation_proposal,
+    verified_saved_allocation_vat,
+)
 from expense_documents import (
     match_objects, object_marker_evidence, object_marking_matches, parse_invoice_pages,
     parse_project_order_allocations,
@@ -199,6 +202,99 @@ class ProposalTests(unittest.TestCase):
         self.assertEqual([part["object_id"] for part in result["parts"]], [5, 13, None])
         self.assertTrue(result["parts"][2]["warning"].startswith("Объект неактивен"))
         self.assertEqual(fields, before)
+
+    def test_original_order_proposal_allows_report_only_missing_tax_but_checks_identity(self):
+        fields = fixture()
+        orders = fields["order_proposals"]
+        saved = {
+            "invoice_number": fields["invoice_number"],
+            "gross_amount": fields["amount_due"],
+            "amount_due": fields["amount_due"],
+            "currency_code": "SEK",
+            "net_amount": None, "vat_amount": None, "rounding_amount": None,
+        }
+        before = copy.deepcopy(saved)
+        with patch("expense_documents.parse_invoice_pages", return_value=fields), patch(
+            "expense_documents.parse_project_order_allocations",
+            return_value={"orders": orders, "warnings": []},
+        ), patch(
+            "expense_documents.allocation_vat_from_items",
+            side_effect=lambda _pages, parsed_orders, _net, _vat: parsed_orders,
+        ):
+            parts = verified_original_order_allocation_proposal(
+                [{"text": "isolated original"}], saved, OBJECTS,
+            )
+
+        p1022 = next(part for part in parts if part["marker"] == "P1022")
+        self.assertEqual(p1022["net_amount"], "473.86")
+        self.assertEqual(p1022["rounding"], "-0.01")
+        self.assertEqual(saved, before)
+        mismatch_fields = fixture()
+        with patch(
+            "expense_documents.parse_invoice_pages", return_value=mismatch_fields,
+        ), patch(
+            "expense_documents.parse_project_order_allocations",
+            return_value={"orders": mismatch_fields["order_proposals"], "warnings": []},
+        ), patch(
+            "expense_documents.allocation_vat_from_items",
+            side_effect=lambda _pages, parsed_orders, _net, _vat: parsed_orders,
+        ), self.assertRaisesRegex(ValueError, "Валюта"):
+            verified_original_order_allocation_proposal(
+                [{"text": "isolated original"}],
+                {**saved, "currency_code": "EUR"}, OBJECTS,
+            )
+
+    def test_existing_saved_allocation_verification_stays_strict(self):
+        fields = fixture()
+        proposed = propose_object_allocations(fields, OBJECTS)["parts"]
+        allocations = [
+            {
+                "id": index,
+                "object_id": part["object_options"][0]["id"],
+                "destination": "object",
+                "allocated_gross": part["gross_amount"],
+            }
+            for index, part in enumerate(proposed, 1)
+        ]
+        document = {
+            key: fields[key] for key in (
+                "invoice_number", "net_amount", "vat_amount", "rounding_amount",
+                "gross_amount", "amount_due", "currency_code",
+            )
+        }
+        source_fields = fixture()
+        orders = source_fields["order_proposals"]
+        with patch(
+            "expense_documents.parse_invoice_pages", return_value=source_fields,
+        ), patch(
+            "expense_documents.parse_project_order_allocations",
+            return_value={"orders": orders, "warnings": []},
+        ), patch(
+            "expense_documents.allocation_vat_from_items",
+            side_effect=lambda _pages, parsed_orders, _net, _vat: parsed_orders,
+        ):
+            matched, _ = verified_saved_allocation_vat(
+                [{"text": "isolated original"}], document, allocations, OBJECTS,
+            )
+
+        self.assertEqual(len(matched), 3)
+        self.assertEqual(
+            sum(Decimal(part["gross_amount"]) for part in matched),
+            Decimal(fields["amount_due"]),
+        )
+        with patch(
+            "expense_documents.parse_invoice_pages", return_value=source_fields,
+        ), patch(
+            "expense_documents.parse_project_order_allocations",
+            return_value={"orders": orders, "warnings": []},
+        ), patch(
+            "expense_documents.allocation_vat_from_items",
+            side_effect=lambda _pages, parsed_orders, _net, _vat: parsed_orders,
+        ), self.assertRaisesRegex(ValueError, "не подтверждает net"):
+            verified_saved_allocation_vat(
+                [{"text": "isolated original"}],
+                {**document, "net_amount": "4000.00"}, allocations, OBJECTS,
+            )
 
     def test_beijer_9_autoselects_only_unique_active_objects_and_reconciles_rounding(self):
         result = propose_object_allocations(beijer_fixture(), BEIJER_OBJECTS)
