@@ -13,6 +13,9 @@ from PyQt6.QtWidgets import (
 
 from desktop_ui import ReportTable as QTableWidget
 from document_preview import DocumentGalleryDialog
+from expense_categories import (
+    CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES, confirmed_expense_category,
+)
 from expense_documents import (
     decimal_text, due_date_edit, due_date_issues, invoice_context, is_service_category,
     net_invoice_issues, non_invoice_document_type, object_marking_matches, parse_invoice_money,
@@ -223,10 +226,19 @@ class InvoiceReviewMixin:
                 object_id = table.cellWidget(index, 3).currentData() if destination == "object" else None
                 amount = table.item(index, 1).text().strip()
                 unchanged = parse_invoice_money(amount) == parse_invoice_money(original.get("net_amount"))
+                selected_category = table.cellWidget(index, 4).currentText()
+                category, category_source = confirmed_expense_category(
+                    selected_category,
+                    "user" if selected_category != CATEGORY_UNCLASSIFIED else "unclassified",
+                )
                 rows.append({
                     **original, "original_marker": table.item(index, 0).text().strip(),
                     "net_amount": amount or None, "destination": destination,
-                    "object_id": object_id, "expense_category": table.cellWidget(index, 4).text().strip(),
+                    "object_id": object_id, "expense_category": category,
+                    "expense_category_source": category_source,
+                    "expense_category_evidence": (
+                        "Явный выбор пользователя" if category_source == "user" else ""
+                    ),
                     "vat_amount": original.get("vat_amount") if unchanged else None,
                     "gross_amount": None,
                     "ambiguous": bool(original.get("ambiguous")) and not ambiguity_reviewed.isChecked(),
@@ -316,8 +328,44 @@ class InvoiceReviewMixin:
                 )
             selected_destination = original.get("destination") or ("object" if selected is not None else "unselected")
             destination.setCurrentIndex(max(0, destination.findData(selected_destination)))
-            category = QLineEdit(str(original.get("expense_category") or ""))
-            category.setPlaceholderText("Необязательно")
+            category_value, _category_source = confirmed_expense_category(
+                original.get("expense_category"),
+                original.get("expense_category_source"),
+            )
+            category = QComboBox()
+            category.addItems(EXPENSE_CATEGORIES)
+            category.setCurrentText(category_value)
+            def update_category_tooltip(*_):
+                selected_category = category.currentText()
+                if selected_category != CATEGORY_UNCLASSIFIED:
+                    old_category, old_source = confirmed_expense_category(
+                        original.get("expense_category"),
+                        original.get("expense_category_source"),
+                    )
+                    if old_source == "user" and selected_category == old_category:
+                        category.setToolTip(
+                            "Категория подтверждена пользователем; основание: "
+                            + str(original.get("expense_category_evidence") or "явный выбор пользователя")
+                        )
+                    else:
+                        category.setToolTip(
+                            "После сохранения категория будет подтверждена вашим явным выбором."
+                        )
+                elif (original.get("expense_category_source") in {"suggested", "recognized"}
+                        and str(original.get("expense_category") or "").strip() in EXPENSE_CATEGORIES[:-1]):
+                    category.setToolTip(
+                        "Предложение: " + str(original.get("expense_category"))
+                        + "; основание: "
+                        + str(original.get("expense_category_evidence") or "не указано")
+                        + ". Выберите вручную для подтверждения."
+                    )
+                else:
+                    category.setToolTip(
+                        "Категория относится только к этой части расхода и требует явного выбора."
+                    )
+
+            category.currentTextChanged.connect(update_category_tooltip)
+            update_category_tooltip()
             table.setCellWidget(row, 2, destination)
             table.setCellWidget(row, 3, object_combo)
             table.setCellWidget(row, 4, category)
@@ -333,12 +381,11 @@ class InvoiceReviewMixin:
 
             def destination_changed(*_):
                 object_combo.setEnabled(destination.currentData() == "object")
-                category.setEnabled(destination.currentData() == "company")
                 refresh()
 
             destination.currentIndexChanged.connect(destination_changed)
             object_combo.currentIndexChanged.connect(refresh)
-            category.textChanged.connect(refresh)
+            category.currentTextChanged.connect(refresh)
             destination_changed()
 
         def remove_row():

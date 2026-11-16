@@ -26,13 +26,14 @@ from PyQt6.QtWidgets import (
     QFrame, QFormLayout, QCheckBox, QFileDialog, QInputDialog,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QScrollArea, QSizePolicy,
     QTextEdit, QSplitter, QGraphicsView, QGraphicsScene, QAbstractItemView,
+    QListWidget, QListWidgetItem,
     QGridLayout, QMenu, QToolButton
 )
 from PyQt6.QtCore import (
     Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool,
     QItemSelectionModel, QSignalBlocker,
 )
-from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QImage, QPixmap
+from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QFont, QImage, QPixmap
 from PyQt6.QtCore import QUrl
 
 # Импорты для генерации PDF
@@ -75,6 +76,9 @@ from expense_documents import (
 from expense_documents import (
     non_invoice_document_type, parse_invoice_pages, parse_invoice_money, net_invoice_issues,
     invoice_context, due_date_issues, due_date_edit,
+)
+from expense_categories import (
+    CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES, confirmed_expense_category,
 )
 from desktop_ui import ReportTable as QTableWidget
 import desktop_ui
@@ -3499,6 +3503,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             if any(json.loads(row["payload_json"]).get("usage") == "object_cost"
                    and len(json.loads(row["payload_json"]).get("allocations") or []) > 1 for row in rows):
                 required_features.add("object_cost_allocations_v1")
+            if any(
+                any("expense_category_source" in allocation
+                    for allocation in json.loads(row["payload_json"]).get("allocations") or [])
+                for row in rows
+            ):
+                required_features.add("allocation_categories_v1")
+            if any(
+                "supporting_document_ids" in json.loads(row["payload_json"])
+                for row in rows
+            ):
+                required_features.add("expense_support_links_v1")
             try:
                 capability_response = requests.request(
                     "GET",
@@ -4374,6 +4389,28 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         payroll_actions.addWidget(history_btn)
         card_layout.addLayout(payroll_actions)
         desktop_theme.adapt_box_layout(card, payroll_actions, compact_width=1080)
+        reference_actions = QHBoxLayout()
+        self.sal_ob_reference_btn = QPushButton("Сверхурочные · Övertid")
+        self.sal_ob_reference_btn.setObjectName("secondaryAction")
+        self.sal_ob_reference_btn.setToolTip(
+            "Справочная памятка по предоставленному изображению; актуальность соглашения не проверена."
+        )
+        self.sal_ob_reference_btn.clicked.connect(
+            lambda: self.open_salary_reference_window("overtime")
+        )
+        self.sal_ob_supplement_btn = QPushButton("Вечер, ночь, выходные · OB")
+        self.sal_ob_supplement_btn.setObjectName("secondaryAction")
+        self.sal_ob_supplement_btn.setToolTip(
+            "Справочная памятка по предоставленному изображению; актуальность соглашения не проверена."
+        )
+        self.sal_ob_supplement_btn.clicked.connect(
+            lambda: self.open_salary_reference_window("ob")
+        )
+        reference_actions.addWidget(self.sal_ob_reference_btn)
+        reference_actions.addWidget(self.sal_ob_supplement_btn)
+        reference_actions.addStretch(1)
+        card_layout.addLayout(reference_actions)
+        desktop_theme.adapt_box_layout(card, reference_actions, compact_width=850)
         self.payroll_history_note = QLabel("Закрытие зарплаты не означает выплату. «Баланс» не меняется.")
         self.payroll_history_note.setWordWrap(True)
         card_layout.addWidget(self.payroll_history_note)
@@ -4468,6 +4505,206 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         QTimer.singleShot(0, self.resize_salary_table_columns)
         self.sal_report_mode.currentIndexChanged.connect(self.on_salary_report_mode_changed)
         self.sal_employee_filter.currentIndexChanged.connect(lambda: self.load_salary_table_template())
+
+    def open_salary_reference_window(self, reference_kind):
+        windows = getattr(self, "_salary_reference_windows", {})
+        existing = windows.get(reference_kind)
+        if existing is not None and not sip.isdeleted(existing):
+            existing.showNormal()
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        references = {
+            "ob": {
+                "title": "OB — работа в неудобное время",
+                "asset": "ob_source.png",
+                "explanation": (
+                    "Доплата за работу в указанные часы. В источнике указано: "
+                    "OB не выплачивается при сверхурочной работе."
+                ),
+                "rows": [
+                    ("Пн–Пт", "05:00–06:00", "OB 1", "+20%", "morning"),
+                    ("Пн–Пт", "06:00–18:00", "Обычная оплата", "без OB", "ordinary"),
+                    ("Пн–Пт", "18:00–22:00", "OB 2", "+40%", "evening"),
+                    ("Пн–Пт", "22:00–05:00", "OB 3", "+70%", "night"),
+                    ("Сб, Вс и праздничные", "00:00–24:00", "OB 3", "+70%", "weekend"),
+                ],
+                "notes": [
+                    "Проценты указаны к базе utgående lön. Источник ссылается на определение в §3, пункте 6.2; самого определения на фрагменте нет.",
+                    "Для месячной зарплаты часовая база: (месячная зарплата × 12) / (52 × средняя недельная продолжительность работы).",
+                ],
+            },
+            "overtime": {
+                "title": "Övertid — сверхурочная работа",
+                "asset": "overtime_source.png",
+                "explanation": (
+                    "Сверхурочная работа — работа сверх установленного обычного рабочего времени. "
+                    "Само по себе наступление вечера не делает смену сверхурочной."
+                ),
+                "rows": [
+                    ("Пн–Пт", "05:00–06:00", "Övertid B", "+50%", "morning"),
+                    ("Пн–Пт", "06:00–17:00", "Övertid A", "+30%", "ordinary"),
+                    ("Пн–Пт", "17:00–19:00", "Övertid B", "+50%", "evening"),
+                    ("Пн–Пт", "19:00–22:00", "Övertid C", "+70%", "late"),
+                    ("Пн–Пт", "22:00–05:00", "Övertid D", "+100%", "night"),
+                    ("Сб, Вс и праздничные", "00:00–24:00", "Övertid D", "+100%", "weekend"),
+                ],
+                "notes": [
+                    "Проценты обозначают доплату к базе utgående lön, а не полную оплату часа.",
+                    "OB и сверхурочную доплату не складывать: в предоставленном источнике OB исключён при сверхурочной работе.",
+                    "В источнике указаны особые причины и предварительное соглашение руководства с сотрудником. Кратковременная работа от случая к случаю может выполняться без соглашения по требованию работодателя.",
+                ],
+            },
+        }
+        reference = references.get(reference_kind)
+        if reference is None:
+            raise ValueError(f"Неизвестный вид памятки по зарплате: {reference_kind}")
+
+        asset_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        image_path = asset_root / "assets" / "payroll_reference" / reference["asset"]
+        if not image_path.is_file():
+            image_path = Path(__file__).resolve().parent / "assets" / "payroll_reference" / reference["asset"]
+        source_pixmap = QPixmap(str(image_path))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(reference["title"])
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        dialog.setWindowFlags(
+            dialog.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        dialog.setMinimumSize(720, 500)
+        dialog.resize(920, 660)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        explanation = QLabel(reference["explanation"])
+        explanation.setWordWrap(True)
+        desktop_theme.apply_style(
+            explanation, "QLabel { color: #e2e8f0; font-size: 15px; font-weight: 600; }"
+        )
+        layout.addWidget(explanation)
+
+        table = QTableWidget(len(reference["rows"]), 4, dialog)
+        table.setHorizontalHeaderLabels(["Дни", "Время", "Вид оплаты", "Доплата"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setWordWrap(True)
+        table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setMinimumHeight(40)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(54)
+        table.setObjectName("salaryReferenceTable")
+        for row_index, row in enumerate(reference["rows"]):
+            for column, value in enumerate(row[:4]):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                font = QFont()
+                font.setPointSize(15 if column in (1, 3) else 12)
+                font.setBold(column in (1, 3))
+                item.setFont(font)
+                table.setItem(row_index, column, item)
+        layout.addWidget(table, 1)
+
+        note_labels = []
+        for text in reference["notes"]:
+            note = QLabel(text)
+            note.setWordWrap(True)
+            note_labels.append(note)
+            layout.addWidget(note)
+        source_note = QLabel(
+            "По предоставленной памятке. Название и срок действия соглашения на фрагменте не видны; "
+            "актуальность не проверена."
+        )
+        source_note.setWordWrap(True)
+        layout.addWidget(source_note)
+
+        controls = QHBoxLayout()
+        original_button = QPushButton("Посмотреть оригинал")
+        original_button.setEnabled(not source_pixmap.isNull())
+        original_button.setObjectName("secondaryAction")
+        close_button = QPushButton("Закрыть")
+        close_button.setObjectName("secondaryAction")
+        controls.addWidget(original_button)
+        controls.addStretch(1)
+        controls.addWidget(close_button)
+        layout.addLayout(controls)
+        desktop_theme.adapt_box_layout(dialog, controls, compact_width=850)
+
+        def apply_reference_theme(theme_name=None):
+            palettes = {
+                "dark": {
+                    "morning": ("#59452e", "#fff1d6"),
+                    "ordinary": ("#38424f", "#edf2f6"),
+                    "evening": ("#5a4938", "#fff1d6"),
+                    "late": ("#55443a", "#fff1d6"),
+                    "night": ("#344657", "#e7f2ff"),
+                    "weekend": ("#345144", "#e5f5e8"),
+                },
+                "light": {
+                    "morning": ("#f4e3cd", "#3b2c1b"),
+                    "ordinary": ("#e6eaed", "#263238"),
+                    "evening": ("#efe1d2", "#3b2c1b"),
+                    "late": ("#eee0d5", "#3b2c1b"),
+                    "night": ("#dce8f1", "#1f3447"),
+                    "weekend": ("#deece2", "#21402c"),
+                },
+            }
+            palette = palettes[theme_name or desktop_theme.current_theme()]
+            for row_index, row in enumerate(reference["rows"]):
+                background, foreground = palette[row[4]]
+                for column in range(table.columnCount()):
+                    item = table.item(row_index, column)
+                    item.setBackground(QColor(background))
+                    item.setForeground(QColor(foreground))
+            for label in (source_note, *note_labels):
+                desktop_theme.apply_style(
+                    label, "QLabel { color: #a0aec0; font-size: 13px; }"
+                )
+            desktop_theme.apply_style(
+                dialog,
+                "QDialog { background-color: #1e2229; color: #e2e8f0; } "
+                "QHeaderView::section { background-color: #323a48; color: #e2e8f0; "
+                "padding: 8px; border: 0; font-size: 13px; font-weight: 700; } "
+                "QTableWidget { gridline-color: #4a5568; border: 1px solid #4a5568; }",
+            )
+
+        apply_reference_theme()
+        manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+        if manager is not None:
+            manager.changed.connect(apply_reference_theme)
+            dialog.destroyed.connect(
+                lambda *_: manager.changed.disconnect(apply_reference_theme)
+            )
+
+        def open_original():
+            if source_pixmap.isNull():
+                QMessageBox.warning(dialog, "Оригинал", f"Не удалось открыть фрагмент: {image_path}")
+                return
+            preview = getattr(dialog, "_source_preview_window", None)
+            if preview is None or sip.isdeleted(preview):
+                preview = DocumentPreviewDialog(
+                    source_pixmap, f"Оригинал · {reference['title']}", dialog,
+                )
+                dialog._source_preview_window = preview
+            preview.showNormal()
+            preview.raise_()
+            preview.activateWindow()
+
+        original_button.clicked.connect(open_original)
+        close_button.clicked.connect(dialog.close)
+        windows[reference_kind] = dialog
+        self._salary_reference_windows = windows
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def on_salary_report_mode_changed(self):
         self.sal_history_parameters.setVisible(not payroll_ui.management_mode(self))
@@ -5330,10 +5567,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         net_amount = QLineEdit(str(fields.get("net_amount") or ""))
         vat_amount = QLineEdit(str(fields.get("vat_amount") or ""))
         gross_amount = QLineEdit(str(fields.get("gross_amount") or ""))
-        category = QComboBox()
-        category.setEditable(True)
-        category.addItems(["Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты", "Прочие расходы", "Квитанция перевода"])
-        category.setCurrentText(str(fields.get("expense_category") or "Прочие расходы"))
         document_comment = QTextEdit(str(fields.get("document_comment") or ""))
         document_comment.setMaximumHeight(80)
         form.addRow("Поставщик:", supplier)
@@ -5343,7 +5576,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         form.addRow("Сумма без НДС:", net_amount)
         form.addRow("НДС:", vat_amount)
         form.addRow("Сумма с НДС:", gross_amount)
-        form.addRow("Категория:", category)
         form.addRow("Комментарий:", document_comment)
         if is_transfer_receipt:
             transfer_note = QLabel(
@@ -5432,13 +5664,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         order_proposals = [dict(item) for item in fields.get("order_proposals") or []]
         order_table = QTableWidget()
         order_table.setObjectName("expenseOrderProposals")
-        order_table.setColumnCount(7)
+        order_table.setColumnCount(9)
         order_table.setHorizontalHeaderLabels([
-            "Proj.nr.", "Order ID", "Объект", "Net", "VAT заказа", "Gross", "Источник",
+            "Proj.nr.", "Order ID", "Объект", "Net", "VAT заказа", "Gross",
+            "Категория", "Пояснение", "Источник",
         ])
         order_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         order_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         order_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for column in (3, 4, 5, 6, 8):
+            order_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         try:
             supplier_links = request_expense_api(
                 "GET", "/api/expense-project-code-links",
@@ -5489,6 +5724,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             gross_item = QTableWidgetItem("")
             gross_item.setFlags(gross_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             order_table.setItem(row, 5, gross_item)
+            category_value = proposal.get("expense_category")
+            if (proposal.get("expense_category_source") != "user"
+                    or category_value not in EXPENSE_CATEGORIES[:-1]):
+                category_value = CATEGORY_UNCLASSIFIED
+            category_combo = QComboBox()
+            category_combo.addItems(EXPENSE_CATEGORIES)
+            category_combo.setCurrentText(category_value)
+            order_table.setCellWidget(row, 6, category_combo)
+            category_note = QLineEdit(str(proposal.get("note") or ""))
+            category_note.setPlaceholderText("Содержание или ссылка на спецификацию")
+            order_table.setCellWidget(row, 7, category_note)
             sources = proposal.get("sources") or []
             page = int(sources[0].get("page") or 1) if sources else 1
             source_pages = ", ".join(dict.fromkeys(str(source.get("page")) for source in sources))
@@ -5507,7 +5753,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         initial_page=page_number - 1, initial_attachment=file_index,
                     ).exec()
                 )
-            order_table.setCellWidget(row, 6, source_button)
+            order_table.setCellWidget(row, 8, source_button)
             order_table.blockSignals(signals_blocked)
 
         for proposal in order_proposals:
@@ -5571,7 +5817,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             form.addRow(orders_reviewed)
 
         def add_empty_order():
-            proposal = {"project_code": "", "order_id": "", "sources": [], "ambiguous": False}
+            proposal = {
+                "project_code": "", "order_id": "", "sources": [], "ambiguous": False,
+                "expense_category": CATEGORY_UNCLASSIFIED,
+                "expense_category_source": "unclassified",
+            }
             order_proposals.append(proposal)
             add_order_proposal(proposal)
             update_order_proposal_totals()
@@ -5587,9 +5837,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         remove_order_button.clicked.connect(remove_order)
 
         allocation_table = QTableWidget()
-        allocation_table.setColumnCount(2)
-        allocation_table.setHorizontalHeaderLabels(["Объект", "Сумма с НДС"])
+        allocation_table.setColumnCount(4)
+        allocation_table.setHorizontalHeaderLabels([
+            "Объект", "Сумма с НДС", "Категория", "Пояснение / источник",
+        ])
         allocation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        allocation_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
 
         def add_allocation(allocation=None):
             allocation = allocation or {}
@@ -5605,6 +5858,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             object_combos.append(object_combo)
             allocation_table.setCellWidget(row, 0, object_combo)
             allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
+            category_value = allocation.get("expense_category")
+            if (allocation.get("expense_category_source") != "user"
+                    or category_value not in EXPENSE_CATEGORIES[:-1]):
+                category_value = CATEGORY_UNCLASSIFIED
+            category_combo = QComboBox()
+            category_combo.addItems(EXPENSE_CATEGORIES)
+            category_combo.setCurrentText(category_value)
+            allocation_table.setCellWidget(row, 2, category_combo)
+            allocation_note = QLineEdit(str(allocation.get("note") or ""))
+            allocation_note.setPlaceholderText("Строка, страница или спецификация")
+            allocation_table.setCellWidget(row, 3, allocation_note)
 
         for allocation in existing_allocations or []:
             add_allocation(allocation)
@@ -5735,6 +5999,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "net_amount": decimal_text(parse_decimal(order_table.item(row, 3).text())),
                     "vat_amount": decimal_text(parse_decimal(order_table.item(row, 4).text())),
                     "gross_amount": decimal_text(parse_decimal(order_table.item(row, 5).text())),
+                    "expense_category": order_table.cellWidget(row, 6).currentText(),
+                    "expense_category_source": (
+                        "user" if order_table.cellWidget(row, 6).currentText() != CATEGORY_UNCLASSIFIED
+                        else "unclassified"
+                    ),
+                    "expense_category_evidence": (
+                        "Явный выбор пользователя"
+                        if order_table.cellWidget(row, 6).currentText() != CATEGORY_UNCLASSIFIED else ""
+                    ),
+                    "note": order_table.cellWidget(row, 7).text().strip(),
                     "ambiguous": bool(proposal.get("ambiguous")) and not orders_reviewed.isChecked(),
                 })
                 proposal_rows.append(proposal)
@@ -5755,7 +6029,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 if object_id is None:
                     QMessageBox.warning(dialog, "Объект", f"Выберите объект в строке {row + 1}.")
                     return
-                allocation_rows.append({"object_id": int(object_id), "gross_amount": amount})
+                category = allocation_table.cellWidget(row, 2).currentText()
+                allocation_rows.append({
+                    "object_id": int(object_id), "gross_amount": amount,
+                    "expense_category": category,
+                    "expense_category_source": "user" if category != CATEGORY_UNCLASSIFIED else "unclassified",
+                    "expense_category_evidence": (
+                        "Явный выбор пользователя" if category != CATEGORY_UNCLASSIFIED else ""
+                    ),
+                    "note": allocation_table.cellWidget(row, 3).text().strip(),
+                })
             if status == "confirmed" and fields.get("order_proposals"):
                 if not orders_reviewed.isChecked():
                     QMessageBox.warning(dialog, "Заказы", "Сверьте строки заказов и VAT с оригиналом.")
@@ -5782,7 +6065,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 "net_amount": decimal_text(net_value),
                 "vat_amount": decimal_text(vat_value),
                 "gross_amount": decimal_text(gross_value),
-                "expense_category": category.currentText().strip() or "Прочие расходы",
+                "expense_category": CATEGORY_UNCLASSIFIED,
                 "document_comment": document_comment.toPlainText().strip(),
                 "verification_status": status,
                 "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
@@ -5901,13 +6184,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         vat_amount = QLineEdit(str(fields.get("vat_amount") or ""))
         gross_amount = QLineEdit(str(fields.get("gross_amount") or ""))
         amount_due = QLineEdit(str(fields.get("amount_due") or ""))
-        category = QComboBox()
-        category.setEditable(True)
-        category.addItems([
-            "Материалы", "Услуги", "Аренда", "Транспорт", "Инструменты",
-            "Связь", "Прочие накладные расходы",
-        ])
-        category.setCurrentText(str(fields.get("expense_category") or "Прочие накладные расходы"))
         document_comment = QTextEdit(str(fields.get("document_comment") or ""))
         document_comment.setMaximumHeight(90)
         document_comment.setPlaceholderText("Необязательный комментарий пользователя")
@@ -5934,7 +6210,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ("Fakturanummer:", invoice_number), ("Платёжная ссылка OCR:", payment_reference),
             ("Валюта:", currency), ("Netto / Belopp exkl. moms:", net_amount),
             ("Moms (в документе):", vat_amount), ("Общая сумма документа:", gross_amount),
-            ("Сумма к оплате, если отличается:", amount_due), ("Категория расхода:", category),
+            ("Сумма к оплате, если отличается:", amount_due),
             ("Комментарий:", document_comment),
         ):
             form.addRow(label, widget)
@@ -5985,8 +6261,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         form.addRow(suggestion_label)
 
         allocation_table = QTableWidget()
-        allocation_table.setColumnCount(2)
-        allocation_table.setHorizontalHeaderLabels(["Объект", "Распределённая сумма документа"])
+        allocation_table.setColumnCount(4)
+        allocation_table.setHorizontalHeaderLabels([
+            "Объект / общие расходы", "Сумма с НДС", "Категория", "Пояснение",
+        ])
         allocations = existing_allocations if existing_allocations is not None else []
         if not allocations and fields.get("gross_amount"):
             allocations = [{"object_id": None, "gross_amount": fields.get("gross_amount"), "note": ""}]
@@ -6008,6 +6286,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             object_combos.append(object_combo)
             allocation_table.setCellWidget(row, 0, object_combo)
             allocation_table.setItem(row, 1, QTableWidgetItem(str(allocation.get("gross_amount") or "")))
+            category_value = allocation.get("expense_category")
+            if (allocation.get("expense_category_source") != "user"
+                    or category_value not in EXPENSE_CATEGORIES[:-1]):
+                category_value = CATEGORY_UNCLASSIFIED
+            category_combo = QComboBox()
+            category_combo.addItems(EXPENSE_CATEGORIES)
+            category_combo.setCurrentText(category_value)
+            allocation_table.setCellWidget(row, 2, category_combo)
+            allocation_table.setItem(row, 3, QTableWidgetItem(str(allocation.get("note") or "")))
         for allocation in allocations:
             add_allocation(allocation)
         allocation_buttons = QHBoxLayout()
@@ -6140,10 +6427,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         QMessageBox.warning(dialog, "Распределение", f"Укажите сумму распределения в строке {row + 1}.")
                         return
                     continue
+                allocation_category = allocation_table.cellWidget(row, 2).currentText()
                 allocation_rows.append({
                     "object_id": combo.currentData() if combo else None,
                     "gross_amount": value,
-                    "note": suggestion_text if combo and combo.currentData() is not None else "",
+                    "expense_category": allocation_category,
+                    "expense_category_source": (
+                        "user" if allocation_category != CATEGORY_UNCLASSIFIED else "unclassified"
+                    ),
+                    "expense_category_evidence": (
+                        "Явный выбор пользователя"
+                        if allocation_category != CATEGORY_UNCLASSIFIED else ""
+                    ),
+                    "note": allocation_table.item(row, 3).text().strip()
+                    if allocation_table.item(row, 3) else "",
                 })
             if status == "confirmed" and (not allocation_rows or any(item["object_id"] is None for item in allocation_rows)):
                 QMessageBox.warning(dialog, "Объект", "Для подтверждения выберите объект в каждой строке распределения. Черновик можно сохранить без объекта.")
@@ -6189,7 +6486,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 "vat_amount": vat_value,
                 "gross_amount": gross_value,
                 "amount_due": due_value,
-                "expense_category": category.currentText().strip() or "Прочее",
+                "expense_category": CATEGORY_UNCLASSIFIED,
                 "document_comment": document_comment.toPlainText().strip(),
                 "reverse_charge": reverse_charge.isChecked(),
                 "vat_lines": vat_lines,
@@ -8326,29 +8623,36 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_expenses_selected_label = QLabel("Выберите объект или общие расходы фирмы.")
         self.object_expenses_selected_label.setWordWrap(True)
         layout.addWidget(self.object_expenses_selected_label)
-        summary = QHBoxLayout()
+        summary = QGridLayout()
         self.object_expenses_total_lbl = QLabel("Доля с НДС: —")
         self.object_expenses_vat_lbl = QLabel("НДС доли: —")
         self.object_expenses_net_lbl = QLabel("Доля без НДС: —")
         self.object_expenses_unallocated_lbl = QLabel("Не распределено в документах: —")
-        for label in (
+        for column, label in enumerate((
             self.object_expenses_total_lbl, self.object_expenses_vat_lbl,
             self.object_expenses_net_lbl, self.object_expenses_unallocated_lbl,
-        ):
+        )):
             label.setWordWrap(True)
-            summary.addWidget(label)
+            summary.addWidget(label, 0, column)
+        self.object_expenses_category_labels = {}
+        for index, category in enumerate(EXPENSE_CATEGORIES):
+            label = QLabel(f"{category} · без НДС: —")
+            label.setWordWrap(True)
+            self.object_expenses_category_labels[category] = label
+            summary.addWidget(label, 1 + index // 3, index % 3)
         layout.addLayout(summary)
 
-        self.object_expenses_table = QTableWidget(0, 8)
+        self.object_expenses_table = QTableWidget(0, 9)
         self.object_expenses_table.setHorizontalHeaderLabels([
             "ID", "Дата", "Поставщик", "Документ", "Доля с НДС",
-            "Без НДС", "НДС доли", "Статус распределения",
+            "Без НДС", "НДС доли", "Категория · пояснение", "Статус распределения",
         ])
         self.object_expenses_table.setColumnHidden(0, True)
         object_header = self.object_expenses_table.horizontalHeader()
-        for column, width in {1: 95, 3: 165, 4: 125, 5: 115, 6: 105, 7: 185}.items():
+        for column, width in {1: 95, 3: 165, 4: 125, 5: 115, 6: 105, 8: 185}.items():
             object_header.resizeSection(column, width)
         object_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        object_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.object_expenses_table.setAlternatingRowColors(True)
         self.object_expenses_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.object_expenses_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -9303,9 +9607,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         is_company = object_id == "company"
         selected_id = None if is_company else int(object_id)
         rows = []
-        totals = {"gross": {}, "vat": {}, "net": {}, "unallocated": {}}
+        totals = {"gross": {}, "vat": {}, "net": {}, "unallocated": {}, "categories": {}}
         unknown = {"gross": False, "vat": False, "net": False}
         for document in documents:
+            if document.get("supporting_to_document_id"):
+                continue
             allocations = [
                 item for item in (document.get("allocations") or [])
                 if (item.get("object_id") is None and item.get("destination", "company") == "company" if is_company else item.get("object_id") == selected_id)
@@ -9321,6 +9627,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             totals[key][currency] = totals[key].get(currency, Decimal(0)) + amount
                         else:
                             unknown[key] = True
+                    category, _source = confirmed_expense_category(
+                        allocation.get("expense_category"),
+                        allocation.get("expense_category_source"),
+                    )
+                    category_totals = totals["categories"].setdefault(
+                        category, {"amounts": {}, "unknown_count": 0}
+                    )
+                    net_amount = parse_decimal(allocation.get("net_amount"))
+                    if net_amount is None:
+                        category_totals["unknown_count"] += 1
+                    else:
+                        category_totals["amounts"][currency] = (
+                            category_totals["amounts"].get(currency, Decimal(0)) + net_amount
+                        )
             remaining = parse_decimal(document.get("unallocated_gross"))
             if remaining is not None and remaining:
                 totals["unallocated"][currency] = totals["unallocated"].get(currency, Decimal(0)) + remaining
@@ -9334,6 +9654,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_expenses_net_lbl.setText(
             "Доля без НДС: " + self._expense_totals_label(totals["net"], unknown["net"])
         )
+        for category, label in self.object_expenses_category_labels.items():
+            category_total = totals["categories"].get(
+                category, {"amounts": {}, "unknown_count": 0}
+            )
+            value = self._expense_money_label(category_total["amounts"])
+            if category_total["unknown_count"]:
+                value += f"; нетто неизвестно у {category_total['unknown_count']} долей"
+            label.setText(f"{category} · без НДС: {value}")
         self.object_expenses_unallocated_lbl.setText(
             "Не распределено в полных документах (отдельно от доли): "
             + self._expense_money_label(totals["unallocated"])
@@ -9349,6 +9677,24 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             amount_label = f"{allocated_gross:,.2f} {currency}" if allocated_gross is not None else "Неизвестно"
             net_label = f"{allocated_net:,.2f} {currency}" if allocated_net is not None else "Неизвестно"
             allocated_vat = self._expense_allocation_total(allocations, "vat_amount")
+            allocation_descriptions = []
+            for allocation in allocations:
+                category, _source = confirmed_expense_category(
+                    allocation.get("expense_category"),
+                    allocation.get("expense_category_source"),
+                )
+                net = parse_decimal(allocation.get("net_amount"))
+                net_text = f"{net:,.2f} {currency}" if net is not None else "нетто неизвестно"
+                note = str(allocation.get("note") or "").strip()
+                allocation_descriptions.append(
+                    f"{category}: {net_text}" + (f" — {note}" if note else "")
+                )
+            for supporting in document.get("supporting_documents") or []:
+                allocation_descriptions.append(
+                    f"Подтверждение: #{supporting.get('id')} · "
+                    f"{supporting.get('supplier_name') or 'поставщик не указан'} · "
+                    f"{supporting.get('invoice_number') or 'номер не указан'}"
+                )
             values = (
                 str(document.get("id") or document.get("client_id")),
                 document.get("document_date") or "—", document.get("supplier_name") or "Не указан",
@@ -9356,10 +9702,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 amount_label,
                 net_label,
                 f"{allocated_vat:,.2f} {currency}" if allocated_vat is not None else "Неизвестно",
+                "\n".join(allocation_descriptions),
                 self._expense_distribution_label(document),
             )
             for column, value in enumerate(values):
                 self.object_expenses_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+            self.object_expenses_table.item(row_index, 7).setToolTip(
+                "Категория применяется к каждой части отдельно; неизвестное нетто в итог не включается."
+            )
             rounding = (allocated_gross - allocated_net - allocated_vat
                         if all(value is not None for value in (allocated_gross, allocated_net, allocated_vat)) else None)
             self.object_expenses_table.item(row_index, 4).setToolTip("\n".join(
@@ -9445,6 +9795,51 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         preview_paths = list(source_paths or fields.get("local_attachment_paths") or [])
         if not preview_paths and fields.get("has_original"):
             preview_paths = self._expense_document_original_paths(server_document)
+        expense_documents = self._expense_document_snapshot()[0]
+        current_document_id = server_document.get("server_document_id")
+        if current_document_id is None and isinstance(server_document.get("id"), int):
+            current_document_id = server_document["id"]
+        current_support_ids = {
+            int(value) for value in server_document.get("supporting_document_ids", [])
+            if str(value).isdigit()
+        }
+        source_fields = {**fields, **document}
+        source_currency = str(source_fields.get("currency_code") or "UNKNOWN").upper()
+        source_supplier = " ".join(str(source_fields.get("supplier_name") or "").casefold().split())
+        source_invoice = "".join(str(source_fields.get("invoice_number") or "").casefold().split())
+        source_gross = parse_invoice_money(source_fields.get("gross_amount"))
+        if source_gross is None:
+            source_net = parse_invoice_money(source_fields.get("net_amount"))
+            source_vat = parse_invoice_money(source_fields.get("vat_amount"))
+            if source_net is not None and source_vat is not None:
+                source_gross = source_net + source_vat
+        support_candidates = []
+        for candidate in expense_documents:
+            candidate_id = candidate.get("id")
+            if (not isinstance(candidate_id, int) or candidate_id == current_document_id
+                    or candidate.get("client_id") == client_id
+                    or candidate.get("supporting_to_document_id")
+                    or candidate.get("supporting_documents")):
+                continue
+            reasons = []
+            candidate_invoice = "".join(
+                str(candidate.get("invoice_number") or "").casefold().split()
+            )
+            if source_invoice and candidate_invoice == source_invoice:
+                reasons.append("совпадает номер фактуры")
+            candidate_supplier = " ".join(
+                str(candidate.get("supplier_name") or "").casefold().split()
+            )
+            candidate_gross = parse_invoice_money(candidate.get("gross_amount"))
+            if (source_supplier and source_supplier == candidate_supplier
+                    and source_currency == str(candidate.get("currency_code") or "UNKNOWN").upper()
+                    and source_gross is not None and source_gross == candidate_gross):
+                reasons.append("совпадают поставщик, валюта и итог")
+            if reasons:
+                support_candidates.append((candidate, ", ".join(reasons)))
+        for linked in server_document.get("supporting_documents") or []:
+            if not any(item[0].get("id") == linked.get("id") for item in support_candidates):
+                support_candidates.append((linked, "уже связано"))
         dialog = QDialog(self)
         dialog.setWindowTitle("Проверка фактуры и распределение расходов")
         dialog.resize(1040, 760)
@@ -9520,13 +9915,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         top.addWidget(details)
         top.setSizes([500, 500])
         layout.addWidget(top, 3)
-        table = QTableWidget(0, 6)
+        table = QTableWidget(0, 7)
         table.setObjectName("invoiceAllocations")
-        table.setHorizontalHeaderLabels(["Заказ / пометка", "Без НДС", "Назначение", "Объект", "Категория", "Источник"])
+        table.setHorizontalHeaderLabels([
+            "Заказ / пометка", "Без НДС", "Назначение", "Объект",
+            "Категория", "Пояснение", "Источник",
+        ])
         table.setMinimumHeight(155)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(table, 2)
         source_rows = []
         objects = list(self.incoming_allocation_objects())
@@ -9572,6 +9970,70 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         ambiguity_reviewed.setObjectName("invoiceAmbiguityReviewed")
         ambiguity_reviewed.setVisible(any(item.get("ambiguous") for item in fields.get("order_proposals") or []))
         layout.addWidget(ambiguity_reviewed)
+        support_note = QLabel(
+            "Похожие документы — только предупреждение. Без выбора документ остаётся самостоятельным расходом. "
+            "Отметьте оригинал как подтверждение только если его сумма уже включена в эту фактуру; "
+            "тогда он не будет повторно включён в расходы объекта."
+        )
+        support_note.setWordWrap(True)
+        support_note.setObjectName("expenseEvidenceNote")
+        layout.addWidget(support_note)
+        supporting_list = QListWidget()
+        supporting_list.setObjectName("expenseSupportingDocuments")
+        supporting_list.setMaximumHeight(105)
+        for candidate, reason in support_candidates:
+            item = QListWidgetItem(
+                f"#{candidate['id']} · {candidate.get('supplier_name') or 'Поставщик не указан'} · "
+                f"№ {candidate.get('invoice_number') or 'не указан'} · "
+                f"{candidate.get('currency_code') or 'UNKNOWN'} "
+                f"{candidate.get('gross_amount') or 'сумма неизвестна'} · {reason}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, int(candidate["id"]))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if int(candidate["id"]) in current_support_ids
+                else Qt.CheckState.Unchecked
+            )
+            if candidate.get("has_original"):
+                item.setToolTip("Оригинал сохранён; его можно открыть в реестре расходов.")
+            supporting_list.addItem(item)
+        if server_document.get("supporting_to_document_id"):
+            support_note.setText(
+                f"Этот документ уже связан как подтверждение к фактуре "
+                f"#{server_document['supporting_to_document_id']}; редактируйте связь из карточки основной фактуры."
+            )
+            supporting_list.setEnabled(False)
+        elif not support_candidates:
+            supporting_list.addItem("Совпадения по поставщику, номеру и сумме не найдены.")
+            supporting_list.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+        layout.addWidget(supporting_list)
+        open_support_original = QPushButton("Открыть оригинал выбранного документа")
+        open_support_original.setEnabled(not bool(server_document.get("supporting_to_document_id")))
+        layout.addWidget(open_support_original)
+        support_documents_by_id = {
+            int(candidate.get("id")): candidate
+            for candidate, _reason in support_candidates
+            if str(candidate.get("id", "")).isdigit()
+        }
+
+        def open_selected_support_original():
+            item = supporting_list.currentItem()
+            if item is None or item.data(Qt.ItemDataRole.UserRole) is None:
+                QMessageBox.information(dialog, "Подтверждающий документ", "Выберите документ из списка.")
+                return
+            linked_document = support_documents_by_id.get(int(item.data(Qt.ItemDataRole.UserRole)))
+            if linked_document is None:
+                QMessageBox.information(dialog, "Оригинал", "Запись документа больше не доступна.")
+                return
+            paths = self._expense_document_original_paths(linked_document)
+            if paths:
+                DocumentGalleryDialog(
+                    paths, linked_document.get("supplier_name") or "Подтверждающий документ", dialog
+                ).exec()
+            else:
+                QMessageBox.information(dialog, "Оригинал", "У документа пока нет оригиналов.")
+
+        open_support_original.clicked.connect(open_selected_support_original)
         extra_toggle = QPushButton("Дополнительно")
         extra_toggle.setCheckable(True)
         extra = QTextEdit()
@@ -9605,10 +10067,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 object_id = table.cellWidget(index, 3).currentData() if destination == "object" else None
                 amount = table.item(index, 1).text().strip()
                 unchanged = parse_invoice_money(amount) == parse_invoice_money(original.get("net_amount"))
+                selected_category = table.cellWidget(index, 4).currentText()
                 rows.append({
                     **original, "original_marker": table.item(index, 0).text().strip(),
                     "net_amount": amount or None, "destination": destination,
-                    "object_id": object_id, "expense_category": table.cellWidget(index, 4).text().strip(),
+                    "object_id": object_id, "expense_category": selected_category,
+                    "expense_category_source": (
+                        "user" if selected_category != CATEGORY_UNCLASSIFIED else "unclassified"
+                    ),
+                    "expense_category_evidence": (
+                        "Явный выбор пользователя" if selected_category != CATEGORY_UNCLASSIFIED else ""
+                    ),
+                    "note": table.cellWidget(index, 5).text().strip(),
                     "vat_amount": original.get("vat_amount") if unchanged else None,
                     "gross_amount": None,
                     "ambiguous": bool(original.get("ambiguous")) and not ambiguity_reviewed.isChecked(),
@@ -9677,29 +10147,67 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 )
             selected_destination = original.get("destination") or ("object" if selected is not None else "unselected")
             destination.setCurrentIndex(max(0, destination.findData(selected_destination)))
-            category = QLineEdit(str(original.get("expense_category") or ""))
-            category.setPlaceholderText("Необязательно")
+            category_value = original.get("expense_category")
+            if (original.get("expense_category_source") != "user"
+                    or category_value not in EXPENSE_CATEGORIES[:-1]):
+                category_value = CATEGORY_UNCLASSIFIED
+            category = QComboBox()
+            category.addItems(EXPENSE_CATEGORIES)
+            category.setCurrentText(category_value)
+            def update_category_tooltip(*_):
+                selected_category = category.currentText()
+                if selected_category != CATEGORY_UNCLASSIFIED:
+                    old_category, old_source = confirmed_expense_category(
+                        original.get("expense_category"),
+                        original.get("expense_category_source"),
+                    )
+                    if old_source == "user" and selected_category == old_category:
+                        category.setToolTip(
+                            "Категория подтверждена пользователем; основание: "
+                            + str(original.get("expense_category_evidence") or "явный выбор пользователя")
+                        )
+                    else:
+                        category.setToolTip(
+                            "После сохранения категория будет подтверждена вашим явным выбором."
+                        )
+                elif (original.get("expense_category_source") in {"suggested", "recognized"}
+                        and str(original.get("expense_category") or "").strip() in EXPENSE_CATEGORIES[:-1]):
+                    category.setToolTip(
+                        "Предложение: " + str(original.get("expense_category"))
+                        + "; основание: "
+                        + str(original.get("expense_category_evidence") or "не указано")
+                        + ". Выберите вручную для подтверждения."
+                    )
+                else:
+                    category.setToolTip(
+                        "Категория не подтверждена. Выберите значение по содержанию этой части."
+                    )
+
+            category.currentTextChanged.connect(update_category_tooltip)
+            update_category_tooltip()
+            note = QLineEdit(str(original.get("note") or ""))
+            note.setPlaceholderText("Содержание или источник ручной разбивки")
             table.setCellWidget(row, 2, destination)
             table.setCellWidget(row, 3, object_combo)
             table.setCellWidget(row, 4, category)
+            table.setCellWidget(row, 5, note)
             sources = original.get("sources") or []
             source_button = QPushButton("Стр. " + str(sources[0]["page"]) if sources else "Нет страницы")
             source_button.setEnabled(bool(gallery and sources))
             if gallery and sources:
                 source_button.clicked.connect(lambda _checked=False, source=sources[0]: gallery.show_source(
                     int(source.get("attachment_index") or 0), int(source["page"])))
-            table.setCellWidget(row, 5, source_button)
+            table.setCellWidget(row, 6, source_button)
             source_rows.append(original)
             table.blockSignals(False)
 
             def destination_changed(*_):
                 object_combo.setEnabled(destination.currentData() == "object")
-                category.setEnabled(destination.currentData() == "company")
                 refresh()
 
             destination.currentIndexChanged.connect(destination_changed)
             object_combo.currentIndexChanged.connect(refresh)
-            category.textChanged.connect(refresh)
+            category.currentIndexChanged.connect(refresh)
             destination_changed()
 
         def remove_row():
@@ -9787,6 +10295,22 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 return
             if status == "confirmed" and (net_invoice_issues(current, rows) or not confirm.isEnabled()):
                 return
+            selected_support_ids = {
+                int(supporting_list.item(index).data(Qt.ItemDataRole.UserRole))
+                for index in range(supporting_list.count())
+                if supporting_list.item(index).checkState() == Qt.CheckState.Checked
+                and supporting_list.item(index).data(Qt.ItemDataRole.UserRole) is not None
+            }
+            if selected_support_ids != current_support_ids:
+                answer = QMessageBox.question(
+                    dialog, "Подтверждающие документы",
+                    "Выбранные подтверждающие документы будут связаны с этой фактурой и исключены "
+                    "из самостоятельных расходов объекта. Продолжить?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
             net = parse_invoice_money(current["net_amount"])
             vat = parse_invoice_money(current["vat_amount"])
             payload = {**current, "client_id": client_id, "allocation_basis": "net",
@@ -9797,6 +10321,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                        "recognized_text": fields.get("raw_text") or fields.get("recognized_text") or "",
                        "document_comment": fields.get("document_comment") or "",
                        "expense_category": fields.get("expense_category") or "Прочие расходы"}
+            if not server_document.get("supporting_to_document_id"):
+                payload["supporting_document_ids"] = sorted(selected_support_ids)
             known_hashes = [item["sha256"] for item in fields.get("attachments") or [] if item.get("sha256")]
             if known_hashes:
                 payload["required_attachment_sha256"] = known_hashes
@@ -9870,7 +10396,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         existing_allocations = list(document.get("allocations") or [])
         dialog = QDialog(self)
         dialog.setWindowTitle("Документ расходов" if document.get("client_id") else "Новый расход")
-        dialog.setMinimumWidth(620)
+        dialog.resize(900, 720)
+        dialog.setMinimumWidth(820)
         form = QFormLayout(dialog)
         if non_invoice_type and not object_cost:
             note = QLabel(
@@ -9956,6 +10483,60 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         form.addRow("НДС (moms):", vat_amount)
         form.addRow("Сумма без НДС:", net_preview)
         form.addRow("Объект:", single_object)
+        single_category = QComboBox()
+        single_category.setObjectName("expenseSingleCategory")
+        single_category.addItems(EXPENSE_CATEGORIES)
+        single_category.setCurrentText(CATEGORY_UNCLASSIFIED)
+        single_note = QLineEdit()
+        single_note.setObjectName("expenseSingleAllocationNote")
+        category_context = existing_allocations[0] if len(existing_allocations) == 1 else parsed_fields
+        suggested_category = str(category_context.get("expense_category") or "").strip()
+        suggested_source = category_context.get("expense_category_source")
+        category_evidence = str(category_context.get("expense_category_evidence") or "").strip()
+        if len(existing_allocations) == 1:
+            category_value, _category_source = confirmed_expense_category(
+                existing_allocations[0].get("expense_category"),
+                existing_allocations[0].get("expense_category_source"),
+            )
+            single_category.setCurrentText(category_value)
+            single_note.setText(str(existing_allocations[0].get("note") or ""))
+        single_category_evidence = QLabel()
+        single_category_evidence.setObjectName("expenseCategoryEvidence")
+        single_category_evidence.setWordWrap(True)
+
+        def update_single_category_evidence(*_):
+            current_category = single_category.currentText()
+            if current_category != CATEGORY_UNCLASSIFIED:
+                original_category, original_source = confirmed_expense_category(
+                    category_context.get("expense_category"),
+                    category_context.get("expense_category_source"),
+                )
+                if original_source == "user" and current_category == original_category:
+                    single_category_evidence.setText(
+                        "Категория подтверждена пользователем; основание: "
+                        + (category_evidence or "явный выбор пользователя")
+                    )
+                else:
+                    single_category_evidence.setText(
+                        "После сохранения категория будет подтверждена вашим явным выбором."
+                    )
+                return
+            if (suggested_category in EXPENSE_CATEGORIES[:-1]
+                    and suggested_source in {"suggested", "recognized"}):
+                single_category_evidence.setText(
+                    f"Предложение: {suggested_category}; основание: "
+                    f"{category_evidence or 'не указано'}. Выберите вручную для подтверждения."
+                )
+            else:
+                single_category_evidence.setText(
+                    "Не классифицировано. Выберите категорию по содержанию этой части."
+                )
+
+        single_category.currentTextChanged.connect(update_single_category_evidence)
+        update_single_category_evidence()
+        form.addRow("Категория части:", single_category)
+        form.addRow("", single_category_evidence)
+        form.addRow("Пояснение части:", single_note)
         form.addRow(archive_toggle)
         form.addRow("Комментарий:", comment)
         form.addRow("Статус:", status)
@@ -9965,13 +10546,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         split_check = QCheckBox("Разделить по объектам")
         split_check.setObjectName("expenseSplitByObjects")
-        split_table = QTableWidget(0, 3)
+        split_table = QTableWidget(0, 5)
         split_table.setObjectName("expenseAllocations")
-        split_table.setHorizontalHeaderLabels(["Объект / фирма", "Сумма с НДС", "НДС"])
+        split_table.setHorizontalHeaderLabels([
+            "Объект / фирма", "Сумма с НДС", "НДС", "Категория", "Пояснение",
+        ])
         split_table.setVisible(False)
         split_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         split_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         split_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        split_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        split_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         distribution_total = QLabel("Распределено: 0.00; осталось: —")
         distribution_note = QLabel(
             "НДС в частях указывается вручную. Неизвестный НДС не распределяется пропорционально."
@@ -9995,9 +10580,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         additional_fields.setVisible(False)
         additional_layout = QFormLayout(additional_fields)
         invoice_number = QLineEdit(str(document.get("invoice_number") or parsed_fields.get("invoice_number") or ""))
-        category = QLineEdit(str(document.get("expense_category") or parsed_fields.get("expense_category") or "Прочие расходы"))
         additional_layout.addRow("Номер документа:", invoice_number)
-        additional_layout.addRow("Категория:", category)
         additional_toggle.toggled.connect(additional_fields.setVisible)
         form.addRow(additional_toggle)
         form.addRow(additional_fields)
@@ -10005,11 +10588,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             for widget in (
                 supplier, document_date, due_date_input, due_date_reviewed,
                 gross_amount, vat_amount, currency, comment, invoice_number,
-                category, status, additional_toggle,
+                single_category, single_category_evidence, single_note, status, additional_toggle,
             ):
                 widget.setEnabled(False)
 
         def append_allocation(object_id, allocated_gross, allocated_vat, original=None):
+            original = dict(original or {})
             row = split_table.rowCount()
             split_table.insertRow(row)
             object_combo = ObjectPickerComboBox()
@@ -10021,6 +10605,37 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             split_table.setItem(row, 1, QTableWidgetItem(str(allocated_gross or "")))
             split_table.item(row, 1).setData(Qt.ItemDataRole.UserRole, original)
             split_table.setItem(row, 2, QTableWidgetItem(str(allocated_vat) if allocated_vat is not None else ""))
+            category_value, category_source = confirmed_expense_category(
+                original.get("expense_category"), original.get("expense_category_source"),
+            )
+            category_combo = QComboBox()
+            category_combo.setObjectName("expenseAllocationCategory")
+            category_combo.addItems(EXPENSE_CATEGORIES)
+            category_combo.setCurrentText(CATEGORY_UNCLASSIFIED)
+            category_combo.setCurrentText(category_value)
+            category_combo.setEnabled(not assignment_only)
+            if category_source == "user":
+                category_combo.setToolTip(
+                    "Категория подтверждена пользователем; основание: "
+                    + (str(original.get("expense_category_evidence") or "явный выбор пользователя"))
+                )
+            else:
+                suggested = str(original.get("expense_category") or "").strip()
+                evidence = str(original.get("expense_category_evidence") or "").strip()
+                if suggested and original.get("expense_category_source") in {"suggested", "recognized"}:
+                    category_combo.setToolTip(
+                        f"Предложение: {suggested}; основание: {evidence or 'не указано'}. "
+                        "Выберите категорию вручную для подтверждения."
+                    )
+                else:
+                    category_combo.setToolTip(
+                        "Категория не подтверждена. Выберите значение по содержанию этой части."
+                    )
+            split_table.setCellWidget(row, 3, category_combo)
+            note_input = QLineEdit(str(original.get("note") or ""))
+            note_input.setObjectName("expenseAllocationNote")
+            note_input.setEnabled(not assignment_only)
+            split_table.setCellWidget(row, 4, note_input)
 
         def update_net_preview(*_):
             gross = parse_decimal(gross_amount.text())
@@ -10048,6 +10663,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
 
         def set_split(enabled):
+            if not enabled and split_table.rowCount() > 1:
+                split_check.blockSignals(True)
+                split_check.setChecked(True)
+                split_check.blockSignals(False)
+                QMessageBox.warning(
+                    dialog, "Распределение",
+                    "Нельзя свернуть несколько частей в одну без потери распределения. "
+                    "Удалите лишние строки вручную.",
+                )
+                return
             if enabled and split_table.rowCount() == 0:
                 if existing_allocations:
                     for allocation in existing_allocations:
@@ -10057,9 +10682,28 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         append_allocation(selected, allocation.get("gross_amount"), allocation.get("vat_amount"), allocation)
                 else:
                     selected = single_object.currentData()
-                    append_allocation(selected, gross_amount.text(), vat_amount.text())
+                    category_value = single_category.currentText()
+                    append_allocation(selected, gross_amount.text(), vat_amount.text(), {
+                        "expense_category": category_value,
+                        "expense_category_source": (
+                            "user" if category_value != CATEGORY_UNCLASSIFIED else "unclassified"
+                        ),
+                        "expense_category_evidence": (
+                            "Явный выбор пользователя"
+                            if category_value != CATEGORY_UNCLASSIFIED else ""
+                        ),
+                        "note": single_note.text().strip(),
+                    })
+            if not enabled and split_table.rowCount() == 1:
+                category_combo = split_table.cellWidget(0, 3)
+                note_input = split_table.cellWidget(0, 4)
+                single_category.setCurrentText(category_combo.currentText())
+                single_note.setText(note_input.text())
             split_table.setVisible(enabled)
             single_object.setVisible(not enabled)
+            single_category.setVisible(not enabled)
+            single_category_evidence.setVisible(not enabled)
+            single_note.setVisible(not enabled)
             add_allocation.setVisible(enabled)
             remove_allocation.setVisible(enabled)
             update_net_preview()
@@ -10125,6 +10769,30 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             QMessageBox.warning(self, "Расход", "Проверьте сумму НДС.")
             return False
         allocations = []
+        def category_fields(category_combo, note_input, original=None):
+            selected_category = category_combo.currentText()
+            category_value, category_source = confirmed_expense_category(
+                selected_category,
+                "user" if selected_category != CATEGORY_UNCLASSIFIED else "unclassified",
+            )
+            original = original or {}
+            old_category, old_source = confirmed_expense_category(
+                original.get("expense_category"), original.get("expense_category_source"),
+            )
+            evidence = ""
+            if category_source == "user":
+                evidence = (
+                    str(original.get("expense_category_evidence") or "").strip()
+                    if category_value == old_category and old_source == category_source
+                    else "Явный выбор пользователя"
+                )
+            return {
+                "expense_category": category_value,
+                "expense_category_source": category_source,
+                "expense_category_evidence": evidence,
+                "note": note_input.text().strip(),
+            }
+
         if split_check.isChecked():
             for row in range(split_table.rowCount()):
                 object_combo = split_table.cellWidget(row, 0)
@@ -10144,6 +10812,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "object_id": None if selected == "company" else selected,
                     "gross_amount": decimal_text(row_gross),
                     "vat_amount": decimal_text(row_vat),
+                    **category_fields(
+                        split_table.cellWidget(row, 3),
+                        split_table.cellWidget(row, 4),
+                        split_table.item(row, 1).data(Qt.ItemDataRole.UserRole),
+                    ),
                 })
                 old_part = split_table.item(row, 1).data(Qt.ItemDataRole.UserRole)
                 if (old_part and row_gross == parse_decimal(old_part.get("gross_amount"))
@@ -10158,8 +10831,22 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "object_id": None if selected == "company" else selected,
                     "gross_amount": decimal_text(gross),
                     "vat_amount": decimal_text(vat),
+                    **category_fields(
+                        single_category,
+                        single_note,
+                        existing_allocations[0] if len(existing_allocations) == 1 else None,
+                    ),
                 })
 
+        legacy_category = str(
+            document.get("expense_category") or parsed_fields.get("expense_category") or ""
+        ).strip()
+        if legacy_category.casefold() == "квитанция перевода":
+            document_category = legacy_category
+        elif len(allocations) == 1:
+            document_category = allocations[0]["expense_category"]
+        else:
+            document_category = CATEGORY_UNCLASSIFIED
         payload = {
             "client_id": client_id,
             **due_values,
@@ -10169,7 +10856,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "net_amount": decimal_text(gross - vat) if gross is not None and vat is not None else None,
             "vat_amount": decimal_text(vat),
             "gross_amount": decimal_text(gross),
-            "expense_category": category.text().strip() or "Прочие расходы",
+            "expense_category": document_category,
             "document_comment": comment.text().strip(),
             "invoice_number": invoice_number.text().strip(),
             "document_type": document.get("document_type") or parsed_fields.get("document_type") or "manual",
@@ -14779,9 +15466,34 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         source_paths, source_errors = {}, {}
         with tempfile.TemporaryDirectory(prefix="smartreport-object-originals-") as directory:
             if options["include_copies"]:
+                supporting_documents = []
+                seen_supports = set()
+                for document in confirmed_expenses:
+                    for supporting in document.get("supporting_documents") or []:
+                        key = expense_document_key(supporting)
+                        if key and key not in seen_supports:
+                            seen_supports.add(key)
+                            supporting_documents.append(supporting)
                 source_paths, source_errors = self._download_object_report_originals(
-                    confirmed_expenses, directory, progress,
+                    confirmed_expenses + supporting_documents, directory, progress,
                 )
+                for document in confirmed_expenses:
+                    key = expense_document_key(document)
+                    combined_paths = list(source_paths.get(key, []))
+                    combined_errors = []
+                    if source_errors.get(key):
+                        combined_errors.append(source_errors[key])
+                    for supporting in document.get("supporting_documents") or []:
+                        supporting_key = expense_document_key(supporting)
+                        combined_paths.extend(source_paths.pop(supporting_key, []))
+                        support_error = source_errors.pop(supporting_key, None)
+                        if support_error:
+                            combined_errors.append(
+                                f"Подтверждающий документ #{supporting.get('id')}: {support_error}"
+                            )
+                    source_paths[key] = combined_paths
+                    if combined_errors:
+                        source_errors[key] = "; ".join(combined_errors)
             output_path = self._reserve_object_report_path(
                 object_row, selected_from, selected_to, options["all_period"],
             )

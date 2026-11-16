@@ -29,7 +29,7 @@
         select { text-overflow: ellipsis; }
         input[type="file"] { max-width: 100%; }
         textarea { width: 100%; resize: vertical; }
-        .stats { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 8px; margin: 12px 0; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 12px 0; }
         .stat { background: var(--paper); border: 1px solid var(--line); padding: 10px 12px; }
         .stat span { display: block; color: var(--muted); font-size: 13px; }
         .stat strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
@@ -37,12 +37,17 @@
         .editor h2 { font-size: 17px; margin: 0 0 10px; }
         .fields { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 10px; }
         .fields .wide { grid-column: span 2; }
-        .allocation-head, .allocation-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(180px, .9fr) auto; gap: 10px; align-items: center; margin: 8px 0; }
+        .allocation-head, .allocation-row { display: grid; grid-template-columns: minmax(170px, 1.2fr) minmax(190px, 1.3fr) minmax(125px, .8fr) minmax(170px, 1fr) auto; gap: 8px; align-items: center; margin: 8px 0; }
         .allocation-head { color: var(--muted); font-size: 12px; }
         .allocation-row button { background: #a83e36; }
         .allocation-total { display: flex; flex-wrap: wrap; gap: 16px; border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
         .allocation-total strong { color: var(--ink); }
         .allocation-help { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+        .evidence-box { border: 1px solid var(--line); padding: 10px; margin-top: 12px; }
+        .evidence-list { display: grid; gap: 6px; margin-top: 8px; }
+        .evidence-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+        .evidence-item label { display: flex; align-items: center; gap: 7px; color: var(--ink); }
+        .evidence-item input { width: auto; min-height: 0; }
         .unallocated-status { display: inline-block; max-width: 100%; padding: 3px 7px; border-radius: 4px; background: #fff1d6; color: #754700; font-weight: 600; white-space: nowrap; }
         .unallocated-status.is-zero { background: #e5f3ee; color: #176448; }
         .actions { margin-top: 12px; }
@@ -67,9 +72,11 @@
             .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .fields .wide { grid-column: span 2; }
             .allocation-head { display: none; }
-            .allocation-row { grid-template-columns: minmax(0, 1fr) minmax(120px, .85fr) auto; gap: 6px; }
+            .allocation-head { display: none; }
+            .allocation-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
+            .allocation-row button { grid-column: 2; justify-self: end; }
         }
-        @media (max-width: 420px) { .allocation-row { grid-template-columns: minmax(0, 1fr) 112px; } .allocation-row button { grid-column: 1 / -1; justify-self: end; } }
+        @media (max-width: 420px) { .allocation-row { grid-template-columns: minmax(0, 1fr); } .allocation-row button { grid-column: 1; justify-self: end; } }
     </style>
 </head>
 <body>
@@ -116,14 +123,19 @@
                 <label>Сумма с НДС<input id="gross-amount" inputmode="decimal"></label>
                 <label>Округление<input id="rounding-amount" inputmode="decimal"></label>
                 <label>К оплате<input id="amount-due" inputmode="decimal"></label>
-                <label>Категория<select id="category"><option>Материалы</option><option>Услуги</option><option>Аренда</option><option>Транспорт</option><option>Инструменты</option><option>Прочие расходы</option></select></label>
                 <label class="wide">Комментарий<textarea id="comment" rows="2" maxlength="4000"></textarea></label>
                 <label class="wide">Оригиналы<input id="original" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp"></label>
             </div>
             <h3>Распределение</h3>
-            <div class="allocation-head"><span>Объект</span><span>Сумма с НДС</span><span></span></div>
+            <div class="allocation-head"><span>Объект или общие расходы фирмы</span><span>Категория</span><span>Сумма с НДС</span><span>Пояснение</span><span></span></div>
             <div id="allocation-rows"></div>
-            <button id="add-allocation" class="secondary" type="button">Добавить объект</button>
+            <button id="add-allocation" class="secondary" type="button">Добавить часть</button>
+            <p class="allocation-help">Категория и объект относятся к каждой части отдельно. Выбор категории не меняет сумму фактуры, НДС, округление или назначение.</p>
+            <div class="evidence-box">
+                <strong>Подтверждающие документы</strong>
+                <p class="allocation-help">Совпадение поставщика, номера или суммы только предупреждает о возможной связи. Ничего не исключается автоматически. Отметьте документ только если он подтверждает расход, уже включённый в эту фактуру.</p>
+                <div id="supporting-documents" class="evidence-list"></div>
+            </div>
             <p class="allocation-help">Нераспределённый остаток — часть суммы фактуры, которой пока не назначен объект. Это не отдельный объект и не действие; остаток не включается в расходы объектов.</p>
             <div class="allocation-total">
                 <span>Итого: <strong id="allocation-document-total">0.00</strong></span>
@@ -155,18 +167,23 @@
             <div class="stat"><span>Расход с НДС</span><strong id="object-gross">0.00</strong></div>
             <div class="stat"><span>Расход без НДС</span><strong id="object-net">0.00</strong></div>
             <div class="stat"><span>НДС по документам</span><strong id="object-vat">0.00</strong></div>
-            <div class="stat"><span>Материалы</span><strong id="object-materials">0.00</strong></div>
-            <div class="stat"><span>Прочие расходы</span><strong id="object-other">0.00</strong></div>
+            <div class="stat"><span>Материалы и закупки · без НДС</span><strong id="object-materials">0.00</strong></div>
+            <div class="stat"><span>Работы подрядчиков · без НДС</span><strong id="object-subcontractor-work">0.00</strong></div>
+            <div class="stat"><span>Смешанные расходы подрядчика · без НДС</span><strong id="object-mixed">0.00</strong></div>
+            <div class="stat"><span>Прочие расходы · без НДС</span><strong id="object-other">0.00</strong></div>
+            <div class="stat"><span>Не классифицировано · без НДС</span><strong id="object-unclassified">0.00</strong></div>
         </div>
         <div id="object-status" class="status"></div>
         <div class="table-wrap"><table>
-            <thead><tr><th>Дата</th><th>Поставщик</th><th>Номер</th><th>Категория</th><th>Доля без НДС</th><th>Доля НДС</th><th>Доля с НДС</th><th>Вся фактура</th><th title="Остаток общей суммы, не отнесённый к объектам.">Остаток фактуры</th><th>Статус</th></tr></thead>
+            <thead><tr><th>Дата</th><th>Поставщик</th><th>Номер</th><th>Категория · содержание · доля без НДС</th><th>Доля без НДС</th><th>Доля НДС</th><th>Доля с НДС</th><th>Вся фактура</th><th title="Остаток общей суммы, не отнесённый к объектам.">Остаток фактуры</th><th>Статус</th></tr></thead>
             <tbody id="object-rows"></tbody>
         </table></div>
     </section>
 </main>
 <script>
     const csrfToken = "{{ csrf_token }}";
+    const expenseCategories = {{ expense_categories|tojson }};
+    const categoryUnclassified = "Не классифицировано";
     const objects = [];
     let documents = [];
     let archiveSuppliers = [];
@@ -204,32 +221,113 @@
         select.value = allocation.object_id || (allocation.destination === "company" ? "company" : "");
         select.title = select.selectedOptions[0]?.textContent || "Выберите объект";
         select.addEventListener("change", () => { select.title = select.selectedOptions[0]?.textContent || "Выберите объект"; });
+        const category = document.createElement("select");
+        for (const value of expenseCategories) category.add(new Option(value, value));
+        category.value = allocation.expense_category_source === "user"
+            && expenseCategories.includes(allocation.expense_category)
+            ? allocation.expense_category : categoryUnclassified;
+        category.title = "Категория относится только к этой части расхода";
         const amount = document.createElement("input");
         amount.inputMode = "decimal";
         amount.placeholder = "0.00";
+        amount.dataset.allocationAmount = "true";
         amount.value = (editingSnapshot?.allocation_basis === "net"
             ? allocation.net_amount : allocation.gross_amount) ?? "";
         amount.addEventListener("input", updateAllocationTotals);
+        const note = document.createElement("input");
+        note.maxLength = 1000;
+        note.placeholder = "Пояснение, строка или страница";
+        note.value = allocation.note || "";
         const remove = document.createElement("button");
         remove.type = "button";
         remove.textContent = "Удалить";
         remove.addEventListener("click", () => { row.remove(); updateAllocationTotals(); });
-        row.append(select, amount, remove);
+        row.append(select, category, amount, note, remove);
         $("allocation-rows").appendChild(row);
         updateAllocationTotals();
     }
     function updateAllocationTotals() {
         const netBasis = editingSnapshot?.allocation_basis === "net";
         const total = Number($(netBasis ? "net-amount" : "gross-amount").value.replace(",", ".") || 0);
-        document.querySelector(".allocation-head span:nth-child(2)").textContent = netBasis ? "Сумма без НДС" : "Сумма с НДС";
+        document.querySelector(".allocation-head span:nth-child(3)").textContent = netBasis ? "Сумма без НДС" : "Сумма с НДС";
         const allocated = [...$("allocation-rows").querySelectorAll(".allocation-row")]
             .filter(row => row.querySelector("select").value)
-            .reduce((sum, row) => sum + Number(row.querySelector("input").value.replace(",", ".") || 0), 0);
+            .reduce((sum, row) => sum + Number(row.querySelector("[data-allocation-amount]").value.replace(",", ".") || 0), 0);
         $("allocation-document-total").textContent = money(total);
         $("allocation-allocated").textContent = money(allocated);
         $("allocation-unallocated").textContent = money(total - allocated);
     }
     function formatCurrency(amount, currency) { return amount == null ? "—" : `${currency} ${money(amount)}`; }
+    function renderSupportingCandidates(current = {}) {
+        const container = $("supporting-documents");
+        container.replaceChildren();
+        if (current.supporting_to_document_id) {
+            const note = document.createElement("p");
+            note.className = "allocation-help";
+            note.textContent = `Этот документ подтверждает расход в документе #${current.supporting_to_document_id}. Самостоятельный расход по нему не учитывается.`;
+            container.appendChild(note);
+            return;
+        }
+        const selected = new Set((current.supporting_document_ids || [])
+            .map(Number).filter(Number.isInteger));
+        for (const item of current.supporting_documents || []) selected.add(Number(item.id));
+        const supplier = String(current.supplier_name || $("supplier").value || "").trim().toLocaleLowerCase();
+        const invoice = String(current.invoice_number || $("invoice-number").value || "").replace(/\s+/g, "").toLocaleLowerCase();
+        const currency = String(current.currency_code || $("currency").value || "UNKNOWN").toUpperCase();
+        const grossValue = current.gross_amount ?? $("gross-amount").value;
+        const gross = Number(String(grossValue ?? "").replace(",", "."));
+        const currentId = Number(current.id || editingDocument || 0);
+        const candidates = new Map();
+        for (const doc of documents) {
+            if (!Number.isInteger(Number(doc.id)) || Number(doc.id) === currentId
+                    || doc.supporting_to_document_id || (doc.supporting_documents || []).length) continue;
+            const reasons = [];
+            const candidateInvoice = String(doc.invoice_number || "").replace(/\s+/g, "").toLocaleLowerCase();
+            if (invoice && candidateInvoice === invoice) reasons.push("номер документа совпадает");
+            const candidateGross = Number(String(doc.gross_amount ?? "").replace(",", "."));
+            if (supplier && supplier === String(doc.supplier_name || "").trim().toLocaleLowerCase()
+                    && currency === String(doc.currency_code || "UNKNOWN").toUpperCase()
+                    && Number.isFinite(gross) && gross === candidateGross) {
+                reasons.push("поставщик, валюта и итог совпадают");
+            }
+            if (selected.has(Number(doc.id))) reasons.push("уже связано");
+            if (reasons.length) candidates.set(Number(doc.id), { doc, reason: reasons.join("; ") });
+        }
+        for (const doc of current.supporting_documents || []) {
+            candidates.set(Number(doc.id), { doc, reason: "уже связано" });
+        }
+        if (!candidates.size) {
+            const empty = document.createElement("span");
+            empty.className = "allocation-help";
+            empty.textContent = "Похожие подтверждённые записи не найдены.";
+            container.appendChild(empty);
+            return;
+        }
+        for (const [id, { doc, reason }] of candidates) {
+            const row = document.createElement("div");
+            row.className = "evidence-item";
+            const label = document.createElement("label");
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.value = String(id);
+            checkbox.checked = selected.has(id);
+            checkbox.disabled = Boolean(current.supporting_to_document_id);
+            const text = document.createElement("span");
+            text.textContent = `#${id} · ${doc.supplier_name || "Поставщик не указан"} · № ${doc.invoice_number || "не указан"} · ${doc.currency_code || "UNKNOWN"} ${doc.gross_amount ?? "сумма неизвестна"} — ${reason}`;
+            label.append(checkbox, text);
+            const open = document.createElement("button");
+            open.type = "button";
+            open.className = "secondary";
+            open.textContent = "Открыть оригинал";
+            open.addEventListener("click", (event) => {
+                event.stopPropagation();
+                if (doc.has_original) window.open(`/api/expense-documents/${id}/original`, "_blank", "noopener");
+                else setStatus("У выбранного документа нет сохранённого оригинала.", "editor-status");
+            });
+            row.append(label, open);
+            container.appendChild(row);
+        }
+    }
     function renderArchive() {
         const body = $("archive-rows");
         body.replaceChildren();
@@ -238,16 +336,18 @@
         for (const doc of documents) {
             const currency = doc.currency_code || "UNKNOWN";
             const bucket = totals.get(currency) || { net: 0, vat: 0, gross: 0, unallocated: 0 };
-            if (doc.verification_status === "confirmed") {
+            if (doc.verification_status === "confirmed" && !doc.supporting_to_document_id) {
                 bucket.net += Number(doc.net_amount || 0);
                 bucket.vat += Number(doc.vat_amount || 0);
                 bucket.gross += Number(doc.gross_amount || 0);
-            } else reviewCount++;
-            bucket.unallocated += Number(doc.unallocated_gross || 0);
+            } else if (!doc.supporting_to_document_id) reviewCount++;
+            if (!doc.supporting_to_document_id) bucket.unallocated += Number(doc.unallocated_gross || 0);
             totals.set(currency, bucket);
             const row = document.createElement("tr");
             row.dataset.id = doc.id;
-            const names = [...new Set(doc.allocations.map((item) => item.object_name))].join(", ") || "Объекты не назначены";
+            const names = doc.supporting_to_document_id
+                ? `Подтверждение к документу #${doc.supporting_to_document_id}`
+                : [...new Set(doc.allocations.map((item) => item.object_name))].join(", ") || "Объекты не назначены";
             const unallocated = Number(doc.unallocated_gross || 0);
             const values = [doc.document_date || "—", doc.supplier_name || "Не указан", doc.invoice_number || "—", names,
                 formatCurrency(doc.gross_amount, currency), formatCurrency(doc.allocated_gross, currency),
@@ -308,9 +408,9 @@
         $("document-form").reset();
         $("editor-title").textContent = "Новая фактура";
         $("currency").value = "SEK";
-        $("category").value = "Материалы";
         $("allocation-rows").replaceChildren();
         $("document-form").hidden = false;
+        renderSupportingCandidates({});
         setStatus("", "editor-status");
         updateAllocationTotals();
     }
@@ -335,12 +435,10 @@
             $("net-amount").value = doc.net_amount || "";
             $("vat-amount").value = doc.vat_amount || "";
             $("gross-amount").value = doc.gross_amount || "";
-            const category = $("category");
-            if (![...category.options].some((option) => option.value === doc.expense_category)) category.add(new Option(doc.expense_category, doc.expense_category));
-            category.value = doc.expense_category || "Материалы";
             $("comment").value = doc.document_comment || "";
             $("allocation-rows").replaceChildren();
             for (const allocation of doc.allocations) addAllocationRow(allocation);
+            renderSupportingCandidates(doc);
             $("document-form").hidden = false;
             const processing = doc.processing;
             setStatus(processing ? `Обработка: ${processing.state}. ${(processing.errors || []).join("; ")} Не определено: ${(processing.missing_fields || []).join(", ")}` : "", "editor-status");
@@ -352,15 +450,28 @@
         const allocations = [];
         for (const row of $("allocation-rows").querySelectorAll(".allocation-row")) {
             const objectId = row.querySelector("select").value;
-            const amount = row.querySelector("input").value.trim();
+            const category = row.querySelectorAll("select")[1].value;
+            const amount = row.querySelector("[data-allocation-amount]").value.trim();
+            const note = row.querySelectorAll("input")[1].value.trim();
             if (!amount && !objectId) continue;
             if (!amount) { setStatus("Укажите сумму для выбранного объекта. Чтобы оставить её нераспределённой, удалите эту строку.", "editor-status"); return; }
             if (!objectId) { setStatus("Выберите объект для каждой распределённой суммы.", "editor-status"); return; }
             allocations.push({ object_id: objectId === "company" ? null : Number(objectId),
                 destination: objectId === "company" ? "company" : "object",
-                expense_category: $("category").value,
+                expense_category: category,
+                expense_category_source: category === categoryUnclassified ? "unclassified" : "user",
+                expense_category_evidence: category === categoryUnclassified ? "" : "Явный выбор пользователя в редакторе расходов",
+                note,
                 [editingSnapshot?.allocation_basis === "net" ? "net_amount" : "gross_amount"]: amount });
         }
+        const supportingIds = [...$("supporting-documents").querySelectorAll('input[type="checkbox"]:checked')]
+            .map((checkbox) => Number(checkbox.value)).filter(Number.isInteger).sort((a, b) => a - b);
+        const previousSupportingIds = (editingSnapshot?.supporting_document_ids || [])
+            .map(Number).filter(Number.isInteger).sort((a, b) => a - b);
+        const sameSupportingIds = supportingIds.length === previousSupportingIds.length
+            && supportingIds.every((value, index) => value === previousSupportingIds[index]);
+        if (!sameSupportingIds && editingSnapshot?.id
+                && !window.confirm("Выбранные подтверждающие документы будут связаны с этой фактурой и исключены из самостоятельных расходов объекта. Продолжить?")) return;
         const payload = {
             client_id: clientId,
             supplier_name: $("supplier").value.trim(),
@@ -370,11 +481,12 @@
             net_amount: $("net-amount").value.trim() || null,
             vat_amount: $("vat-amount").value.trim() || null,
             gross_amount: $("gross-amount").value.trim() || null,
-            expense_category: $("category").value,
+            expense_category: editingSnapshot?.expense_category || categoryUnclassified,
             document_comment: $("comment").value.trim(),
             verification_status: status,
             allocations,
         };
+        if (!editingSnapshot?.supporting_to_document_id) payload.supporting_document_ids = supportingIds;
         if (editingSnapshot) {
             payload.usage = editingSnapshot.usage;
             if (editingSnapshot.usage === "object_cost") {
@@ -456,22 +568,43 @@
             const result = await api(`/api/expense-objects/${id}/expenses?${params}`);
             const currencies = Object.entries(result.summary).map(([currency, amounts]) => ({ currency, amounts }));
             const display = (key) => currencies.map(({ currency, amounts }) => `${currency} ${money(amounts[key])}`).join(" · ") || "0.00";
+            const categoryDisplay = (category) => currencies.map(({ currency, amounts }) => {
+                const part = amounts.categories?.[category];
+                const known = part?.known_net ?? "0";
+                return `${currency} ${money(known)}${part?.unknown_net_count ? ` · нетто неизвестно у ${part.unknown_net_count} долей` : ""}`;
+            }).join(" · ") || "0.00";
             $("object-gross").textContent = display("gross");
-            $("object-net").textContent = display("net");
+            $("object-net").textContent = display("known_net");
             $("object-vat").textContent = display("vat");
-            $("object-materials").textContent = display("materials");
-            $("object-other").textContent = display("other");
+            $("object-materials").textContent = categoryDisplay(expenseCategories[0]);
+            $("object-subcontractor-work").textContent = categoryDisplay(expenseCategories[1]);
+            $("object-mixed").textContent = categoryDisplay(expenseCategories[2]);
+            $("object-other").textContent = categoryDisplay(expenseCategories[3]);
+            $("object-unclassified").textContent = categoryDisplay(categoryUnclassified);
+            const unknownCount = currencies.reduce((sum, item) => sum + Number(item.amounts.unknown_net_count || 0), 0);
             const body = $("object-rows");
             body.replaceChildren();
             for (const doc of result.documents) {
                 const row = document.createElement("tr");
-                const values = [doc.document_date || "—", doc.supplier_name || "Не указан", doc.invoice_number || "—", doc.expense_category,
-                    formatCurrency(doc.object_net, doc.currency_code), formatCurrency(doc.object_vat, doc.currency_code),
+                const allocationLines = (doc.object_allocations || []).map((allocation) => {
+                    const category = allocation.expense_category || categoryUnclassified;
+                    const note = allocation.note ? ` — ${allocation.note}` : "";
+                    return `${category}: ${formatCurrency(allocation.net_amount, doc.currency_code)}${note}`;
+                });
+                if ((doc.supporting_documents || []).length) {
+                    allocationLines.push(`Подтверждения: ${(doc.supporting_documents || []).map((item) => `#${item.id}`).join(", ")}`);
+                }
+                const allocationDetails = allocationLines.join("\n") || "Доля отсутствует";
+                const knownNet = formatCurrency(doc.object_known_net, doc.currency_code)
+                    + (doc.object_unknown_net_count ? ` · нетто неизвестно у ${doc.object_unknown_net_count} долей` : "");
+                const values = [doc.document_date || "—", doc.supplier_name || "Не указан", doc.invoice_number || "—", allocationDetails,
+                    knownNet, formatCurrency(doc.object_vat, doc.currency_code),
                     formatCurrency(doc.object_gross, doc.currency_code), formatCurrency(doc.gross_amount, doc.currency_code),
                     formatCurrency(doc.unallocated_gross, doc.currency_code), doc.verification_status];
                 for (const [index, value] of values.entries()) {
                     const cell = document.createElement("td");
                     cell.textContent = value;
+                    if (index === 3) cell.style.whiteSpace = "pre-line";
                     if (index === 8) {
                         cell.title = "Часть суммы документа, ещё не распределённая между объектами.";
                         const state = document.createElement("span");
@@ -485,7 +618,8 @@
                 body.appendChild(row);
             }
             if (!result.documents.length) body.innerHTML = '<tr><td class="empty" colspan="10">Нет документов по объекту за выбранный период.</td></tr>';
-            $("object-status").textContent = `Черновики: ${result.draft_count}; требуют проверки: ${result.review_count}.`;
+            $("object-status").textContent = `Черновики: ${result.draft_count}; требуют проверки: ${result.review_count}.`
+                + (unknownCount ? ` Известное нетто показано отдельно; неизвестно у ${unknownCount} долей.` : "");
         } catch (error) { $("object-status").textContent = error.message; }
     }
     async function logout() { await api("/logout", { method: "POST" }); location.href = "/"; }

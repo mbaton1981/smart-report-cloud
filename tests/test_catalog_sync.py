@@ -389,9 +389,13 @@ class CatalogSyncTests(unittest.TestCase):
             .button(object_card_ui.QDialogButtonBox.StandardButton.Close).text(),
             "Закрыть",
         )
+        from PyQt6.QtCore import QEvent
+
         for dialog in opened_dialogs:
             dialog.deleteLater()
         window.close()
+        self.qt_app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        opened_dialogs.clear()
         self.qt_app.processEvents()
 
         reopened = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
@@ -1898,7 +1902,10 @@ class CatalogSyncTests(unittest.TestCase):
                              "net_amount": "100.00", "vat_amount": None, "gross_amount": None}],
             "order_proposals": [
                 {"project_code": "P1035", "original_marker": "P1035", "order_id": "A-1",
-                 "net_amount": "60.00", "ambiguous": False, "sources": []},
+                 "net_amount": "60.00", "ambiguous": False, "sources": [],
+                 "expense_category": "Материалы и закупки",
+                 "expense_category_source": "recognized",
+                 "expense_category_evidence": "Страница 1, строка «Material»"},
                 {"project_code": "P9999", "original_marker": "P9999", "order_id": "A-2",
                  "net_amount": "40.00", "ambiguous": False, "sources": []},
             ],
@@ -1916,6 +1923,10 @@ class CatalogSyncTests(unittest.TestCase):
                 table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
                 # Детализация по заказам, а не единственная свёрнутая строка без назначения.
                 self.assertEqual(table.rowCount(), 2)
+                suggested_category = table.cellWidget(0, 4)
+                self.assertEqual(suggested_category.currentText(), "Не классифицировано")
+                self.assertIn("Предложение: Материалы и закупки", suggested_category.toolTip())
+                self.assertIn("Страница 1", suggested_category.toolTip())
                 dialog.findChild(
                     self.desktop.QPushButton, "invoiceApplyObjectProposal").click()
                 self.assertEqual(table.cellWidget(0, 2).currentData(), "object")
@@ -2335,7 +2346,7 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual(main_titles.count("Расходы"), 1)
             self.assertNotIn("Материалы и расходы по объектам", main_titles)
             self.assertEqual(window.table_supplier_documents.columnCount(), 9)
-            self.assertEqual(window.object_expenses_table.columnCount(), 8)
+            self.assertEqual(window.object_expenses_table.columnCount(), 9)
             self.assertEqual(window.object_expenses_object.currentIndex(), 0)
             server_conn = self.server.get_db_connection()
             stable_object = server_conn.execute(
@@ -3421,7 +3432,7 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM expense_document_outbox").fetchone()[0], 0)
                 connection.close()
                 table.cellWidget(2, 2).setCurrentIndex(table.cellWidget(2, 2).findData("company"))
-                table.cellWidget(2, 4).setText("Инструмент")
+                table.cellWidget(2, 4).setCurrentText("Материалы и закупки")
                 self.assertTrue(confirm.isEnabled())
                 confirm.click()
                 return dialog.result()
@@ -4054,6 +4065,16 @@ class CatalogSyncTests(unittest.TestCase):
                 dialog.findChild(self.desktop.QLineEdit, "expenseVatInput").setText("25.00")
                 object_combo = dialog.findChild(self.desktop.QComboBox, "expenseObject")
                 object_combo.setCurrentIndex(object_combo.findData("company"))
+                category = dialog.findChild(self.desktop.QComboBox, "expenseSingleCategory")
+                self.assertEqual(category.currentText(), "Не классифицировано")
+                evidence = dialog.findChild(self.desktop.QLabel, "expenseCategoryEvidence")
+                self.assertIn("Предложение: Работы подрядчиков", evidence.text())
+                self.assertIn("страница 2", evidence.text())
+                category.setCurrentText("Материалы и закупки")
+                self.assertIn("явным выбором", evidence.text())
+                dialog.findChild(self.desktop.QLineEdit, "expenseSingleAllocationNote").setText(
+                    "Покупка для фирмы"
+                )
                 window.load_expense_document_filters()
                 self.assertEqual(
                     dialog.findChild(self.desktop.QLineEdit, "expenseGrossInput").text(),
@@ -4071,7 +4092,13 @@ class CatalogSyncTests(unittest.TestCase):
                  patch.object(self.desktop.QMessageBox, "information"), \
                  patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 self.assertTrue(window._expense_document_review_dialog(
-                    parsed_fields={"currency_code": "SEK", "document_type": "manual"},
+                    parsed_fields={
+                        "currency_code": "SEK",
+                        "document_type": "manual",
+                        "expense_category": "Работы подрядчиков",
+                        "expense_category_source": "recognized",
+                        "expense_category_evidence": "страница 2, строка 4",
+                    },
                     recognition_message="Распознавание не запускалось; заполните поля вручную.",
                 ))
 
@@ -4087,6 +4114,10 @@ class CatalogSyncTests(unittest.TestCase):
             self.assertEqual(payload["net_amount"], "100.00")
             self.assertEqual(payload["allocations"], [{
                 "object_id": None, "gross_amount": "125.00", "vat_amount": "25.00",
+                "expense_category": "Материалы и закупки",
+                "expense_category_source": "user",
+                "expense_category_evidence": "Явный выбор пользователя",
+                "note": "Покупка для фирмы",
             }])
             desktop_conn.close()
             self.assertEqual(window.table_supplier_documents.rowCount(), 1)
@@ -4339,22 +4370,28 @@ class CatalogSyncTests(unittest.TestCase):
                 table = dialog.findChild(self.desktop.QTableWidget, "expenseAllocations")
                 table.item(0, 1).setText("60.00")
                 table.item(0, 2).setText("12.00")
+                table.cellWidget(0, 3).setCurrentText("Материалы и закупки")
+                table.cellWidget(0, 4).setText("Материал")
                 dialog.findChild(self.desktop.QPushButton, "expenseAddAllocation").click()
                 second_object = table.cellWidget(1, 0)
                 second_object.setCurrentIndex(second_object.findData(object_ids[1]))
                 table.item(1, 1).setText("65.00")
                 table.item(1, 2).setText("13.00")
+                table.cellWidget(1, 3).setCurrentText("Работы подрядчиков")
+                table.cellWidget(1, 4).setText("Работа подрядчика")
                 dialog.accept()
                 return self.desktop.QDialog.DialogCode.Accepted
 
             with patch.object(self.desktop.QDialog, "exec", new=fill_split_and_accept), \
                  patch.object(window, "background_sync_with_cloud"), \
                  patch.object(self.desktop.QMessageBox, "information"), \
+                 patch.object(self.desktop.QMessageBox, "warning") as warning, \
                  patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 self.assertTrue(window._expense_document_review_dialog(
                     parsed_fields={"currency_code": "SEK", "document_type": "invoice"},
                     recognition_message="Распознавание выполнено; поля проверены вручную.",
                 ))
+                warning.assert_not_called()
 
             desktop_conn = self.desktop.get_db_connection()
             payload = self.desktop.json.loads(desktop_conn.execute(
@@ -4362,8 +4399,16 @@ class CatalogSyncTests(unittest.TestCase):
             ).fetchone()[0])
             desktop_conn.close()
             self.assertEqual(payload["allocations"], [
-                {"object_id": object_ids[0], "gross_amount": "60.00", "vat_amount": "12.00"},
-                {"object_id": object_ids[1], "gross_amount": "65.00", "vat_amount": "13.00"},
+                {
+                    "object_id": object_ids[0], "gross_amount": "60.00", "vat_amount": "12.00",
+                    "expense_category": "Материалы и закупки", "expense_category_source": "user",
+                    "expense_category_evidence": "Явный выбор пользователя", "note": "Материал",
+                },
+                {
+                    "object_id": object_ids[1], "gross_amount": "65.00", "vat_amount": "13.00",
+                    "expense_category": "Работы подрядчиков", "expense_category_source": "user",
+                    "expense_category_evidence": "Явный выбор пользователя", "note": "Работа подрядчика",
+                },
             ])
             self.assertEqual(
                 sum(Decimal(item["gross_amount"]) for item in payload["allocations"]),
@@ -4385,14 +4430,15 @@ class CatalogSyncTests(unittest.TestCase):
             {"original_marker": "P1035", "destination": "object", "object_id": 1, "net_amount": "2000.00"},
             {"original_marker": "P1035", "destination": "object", "object_id": 1, "net_amount": "340.99"},
             {"original_marker": "ROMAN BASHCHUK", "destination": "company", "object_id": None,
-             "net_amount": "708.96", "expense_category": "Инструмент"},
+             "net_amount": "708.96", "expense_category": "Материалы и закупки",
+             "expense_category_source": "user"},
         ]
         self.assertEqual(net_invoice_issues(fields, rows), [])
         allocations = normalize_net_allocations(rows)
         self.assertEqual([item["net_amount"] for item in allocations], ["2340.99", "708.96"])
         self.assertTrue(all(item["vat_amount"] is None and item["gross_amount"] is None for item in allocations))
         self.assertIsNone(allocations[1]["object_id"])
-        self.assertEqual(allocations[1]["expense_category"], "Инструмент")
+        self.assertEqual(allocations[1]["expense_category"], "Материалы и закупки")
         self.assertTrue(net_invoice_issues({**fields, "rounding_amount": "0.00"}, rows))
         self.assertTrue(net_invoice_issues({**fields, "vat_amount": None}, rows))
         self.assertTrue(net_invoice_issues(fields, [{**rows[0], "destination": "unselected"}]))
@@ -4528,6 +4574,7 @@ class CatalogSyncTests(unittest.TestCase):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
         window._expense_objects = [{"id": object_id, "name": "Invoice P1035", "markning": "P1035"}]
+        window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
         fields = {"allocation_basis": "net", "supplier_name": "BEIJER BYGGMATERIAL AB",
                   "invoice_number": "260406399329", "document_date": "2026-10-15", "currency_code": "SEK",
                   "net_amount": "3049.95", "vat_amount": "762.49", "rounding_amount": "-0.44", "amount_due": "3812.00",
@@ -4550,10 +4597,10 @@ class CatalogSyncTests(unittest.TestCase):
             table.cellWidget(0, 2).setCurrentIndex(table.cellWidget(0, 2).findData("object"))
             table.cellWidget(0, 3).setCurrentIndex(table.cellWidget(0, 3).findData(object_id))
             table.cellWidget(1, 2).setCurrentIndex(table.cellWidget(1, 2).findData("company"))
-            table.cellWidget(1, 4).setText("Инструмент")
+            table.cellWidget(1, 4).setCurrentText("Материалы и закупки")
             supplier = dialog.findChild(self.desktop.QLineEdit, "invoice_supplier_name")
             supplier.setText("BEIJER BYGGMATERIAL AB / проверено")
-            table.cellWidget(1, 5).click()
+            table.cellWidget(1, 6).click()
             gallery = dialog.findChild(self.desktop.DocumentGalleryDialog)
             self.assertEqual(gallery._page_index, 1)
             self.assertTrue(supplier.text().endswith("проверено"))
@@ -4577,7 +4624,7 @@ class CatalogSyncTests(unittest.TestCase):
             connection = self.desktop.get_db_connection()
             payload = json.loads(connection.execute("SELECT payload_json FROM expense_document_outbox").fetchone()[0])
             connection.close()
-            self.assertEqual(payload["allocations"][1]["expense_category"], "Инструмент")
+            self.assertEqual(payload["allocations"][1]["expense_category"], "Материалы и закупки")
             self.assertIsNone(payload["allocations"][1]["object_id"])
             self.assertEqual(payload["rounding_amount"], "-0.44")
             self.assertIsNone(payload["allocations"][1]["vat_amount"])
@@ -4597,7 +4644,7 @@ class CatalogSyncTests(unittest.TestCase):
              "destination": "object", "object_id": object_id, "net_amount": "2340.99", "sources": []},
             {"original_marker": "ROMAN BASHCHUK", "project_code": None, "order_id": "B",
              "destination": "company", "object_id": None, "net_amount": "708.96",
-             "expense_category": "Инструмент", "sources": []},
+             "expense_category": "Материалы и закупки", "expense_category_source": "user", "sources": []},
         ]
         payload = {
             "client_id": str(uuid.uuid4()), "supplier_name": "BEIJER BYGGMATERIAL AB",
@@ -4621,7 +4668,7 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertTrue(document["fully_allocated"])
         self.assertTrue(all(row["vat_amount"] is None for row in document["allocations"]))
         self.assertIsNone(document["allocations"][1]["object_id"])
-        self.assertEqual(document["allocations"][1]["expense_category"], "Инструмент")
+        self.assertEqual(document["allocations"][1]["expense_category"], "Материалы и закупки")
         self.assertEqual(document["order_proposals"][1]["original_marker"], "ROMAN BASHCHUK")
         summary = self.server_client.get(f"/api/expense-objects/{object_id}/expenses", headers=headers).get_json()["summary"]["SEK"]
         self.assertEqual(summary["net"], "2340.99")
@@ -4654,6 +4701,7 @@ class CatalogSyncTests(unittest.TestCase):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
         window._expense_objects = []
+        window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
         base_fields = {
             "allocation_basis": "net",
             "supplier_name": "Receiver AB",
@@ -4831,6 +4879,7 @@ class CatalogSyncTests(unittest.TestCase):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
         window._expense_objects = []
+        window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
 
         def save_draft(dialog):
             currency = dialog.findChild(self.desktop.QLineEdit, "invoice_currency_code")
@@ -4915,6 +4964,7 @@ class CatalogSyncTests(unittest.TestCase):
                 window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
                 self.desktop.QMainWindow.__init__(window)
                 window._expense_objects = [{"id": object_id, "name": "Isolated catalog object", "markning": "TEST-1"}]
+                window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
                 fields = {"client_id": identifier, "allocation_basis": "net", "supplier_name": "Isolated supplier",
                           "invoice_number": "UI-" + destination, "document_date": "2026-10-17", "currency_code": "SEK",
                           "net_amount": "100.00", "vat_amount": "25.00", "rounding_amount": "0.00", "amount_due": "125.00"}
@@ -4940,7 +4990,7 @@ class CatalogSyncTests(unittest.TestCase):
                         objects.setCurrentIndex(objects.findData(object_id))
                     else:
                         self.assertFalse(table.cellWidget(0, 3).isEnabled())
-                        table.cellWidget(0, 4).setText("Isolated company category")
+                        table.cellWidget(0, 4).setCurrentText("Материалы и закупки")
                     self.assertEqual(counter.text(), "Без НДС: распределено 100.00 / осталось 0.00")
                     self.assertTrue(confirm.isEnabled())
                     dialog.findChild(self.desktop.QPushButton, "invoiceSaveDraft").click()
@@ -4953,7 +5003,7 @@ class CatalogSyncTests(unittest.TestCase):
                     self.assertEqual(table.item(0, 1).text(), "100.00")
                     self.assertEqual(table.cellWidget(0, 3).currentData(), object_id if destination == "object" else None)
                     if destination == "company":
-                        self.assertEqual(table.cellWidget(0, 4).text(), "Isolated company category")
+                        self.assertEqual(table.cellWidget(0, 4).currentText(), "Материалы и закупки")
                     for key, expected in (("net_amount", "100.00"), ("vat_amount", "25.00"),
                                           ("rounding_amount", "0.00"), ("amount_due", "125.00")):
                         self.assertEqual(dialog.findChild(self.desktop.QLineEdit, "invoice_" + key).text(), expected)
@@ -4992,6 +5042,7 @@ class CatalogSyncTests(unittest.TestCase):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
         window._expense_objects = []
+        window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
         fields = {"allocation_basis": "net", "supplier_name": "Date test", "invoice_number": "D54", "document_date": "2026-10-15",
                   "currency_code": "SEK", "net_amount": "100.00", "vat_amount": "25.00", "amount_due": "125.00",
                   "due_date": "2026-11-14", "due_date_kind": "calculated", "due_date_review_required": True,

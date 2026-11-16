@@ -14,6 +14,7 @@ class ExpenseSharingTests(unittest.TestCase):
     tearDownClass = classmethod(integration.IncomingIntegrationTests.tearDownClass.__func__)
     _add_company = integration.IncomingIntegrationTests._add_company
     setUp = integration.IncomingIntegrationTests.setUp
+    approve = integration.IncomingIntegrationTests.approve
     stage = integration.IncomingIntegrationTests.stage
     request = integration.IncomingIntegrationTests.request
     sync = integration.IncomingIntegrationTests.sync
@@ -128,6 +129,157 @@ class ExpenseSharingTests(unittest.TestCase):
         self.assertIsNotNone(pending["last_error"])
         self.assertEqual(len(self.documents()), 1)
 
+    def test_category_edit_and_support_link_are_explicit_net_neutral_and_versioned(self):
+        from expense_categories import CATEGORY_SUBCONTRACTOR_WORK
+        from object_package_report import collect_object_expenses
+
+        projects = self.configure_incoming()
+        capabilities = self.server_client.get(
+            "/api/expense-documents/capabilities",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()
+        self.assertIn("allocation_categories_v1", capabilities["features"])
+        self.assertIn("expense_support_links_v1", capabilities["features"])
+        revision, supporting_payload = self.store.latest(2)
+        supporting_payload["document_date"] = "2026-10-22"
+        self.store.save(2, supporting_payload, revision)
+        for document_id in (1, 2):
+            revision, payload = self.store.latest(document_id)
+            payload.update(
+                confirmed_type="receipt" if document_id == 2 else "invoice",
+                object_id=projects[0],
+                original_checked=True,
+                allocations=[{
+                    "destination": "object",
+                    "object_id": projects[0],
+                    "gross_amount": payload["gross_amount"],
+                }],
+            )
+            revision = self.store.save(document_id, payload, revision)
+            self.store.transfer(document_id, revision)
+        self.assertEqual(self.sync()["synced"], 2, self.last_sync)
+
+        documents = self.documents()
+        parent = next(document for document in documents
+                      if document["client_id"] == self.store.card(1)["client_id"])
+        supporting = next(document for document in documents
+                          if document["client_id"] == self.store.card(2)["client_id"])
+        original_version = parent["sync_version"]
+        payload = {
+            "client_id": parent["client_id"],
+            "supplier_name": parent["supplier_name"],
+            "invoice_number": parent["invoice_number"],
+            "document_date": parent["document_date"],
+            "currency_code": parent["currency_code"],
+            "gross_amount": parent["gross_amount"],
+            "vat_amount": parent["vat_amount"],
+            "verification_status": "confirmed",
+            "allocation_basis": "gross",
+            "expected_version": original_version,
+            "allocations": [{
+                "object_id": projects[0],
+                "gross_amount": "125.00",
+                "net_amount": "100.00",
+                "vat_amount": "25.00",
+                "expense_category": CATEGORY_SUBCONTRACTOR_WORK,
+                "expense_category_source": "user",
+                "expense_category_evidence": "Selected from invoice line 1",
+            }],
+            "supporting_document_ids": [supporting["id"]],
+        }
+        with self.server_client.session_transaction() as session:
+            session.update(role="admin", expense_csrf_token="isolated-csrf")
+        response = self.server_client.put(
+            f"/api/expense-documents/{parent['id']}", json=payload,
+            headers={"X-CSRF-Token": "isolated-csrf"},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        stale = self.server_client.put(
+            f"/api/expense-documents/{parent['id']}", json=payload,
+            headers={"X-CSRF-Token": "isolated-csrf"},
+        )
+        self.assertEqual(stale.status_code, 409, stale.get_json())
+        with self.server_client.session_transaction() as session:
+            session.clear()
+
+        updated = next(document for document in self.documents()
+                       if document["id"] == parent["id"])
+        legacy_payload = {
+            "client_id": updated["client_id"],
+            "supplier_name": updated["supplier_name"],
+            "invoice_number": updated["invoice_number"],
+            "document_date": updated["document_date"],
+            "currency_code": updated["currency_code"],
+            "gross_amount": updated["gross_amount"],
+            "vat_amount": updated["vat_amount"],
+            "verification_status": updated["verification_status"],
+            "expected_version": updated["sync_version"],
+            "allocations": [{
+                "object_id": allocation["object_id"],
+                "gross_amount": allocation["gross_amount"],
+                "net_amount": allocation["net_amount"],
+                "vat_amount": allocation["vat_amount"],
+            } for allocation in updated["allocations"]],
+        }
+        with self.server_client.session_transaction() as session:
+            session.update(role="admin", expense_csrf_token="isolated-csrf")
+        legacy_response = self.server_client.put(
+            f"/api/expense-documents/{parent['id']}", json=legacy_payload,
+            headers={"X-CSRF-Token": "isolated-csrf"},
+        )
+        self.assertEqual(legacy_response.status_code, 200, legacy_response.get_json())
+        with self.server_client.session_transaction() as session:
+            session.clear()
+
+        updated_documents = self.documents()
+        updated = next(document for document in updated_documents
+                       if document["id"] == parent["id"])
+        child = next(document for document in updated_documents
+                     if document["id"] == supporting["id"])
+        allocation = updated["allocations"][0]
+        self.assertEqual(updated["supplier_name"], parent["supplier_name"])
+        self.assertEqual(updated["invoice_number"], parent["invoice_number"])
+        self.assertEqual(updated["document_type"], parent["document_type"])
+        self.assertEqual(updated["verification_status"], parent["verification_status"])
+        self.assertEqual(updated["rounding_amount"], parent["rounding_amount"])
+        self.assertEqual(updated["amount_due"], parent["amount_due"])
+        self.assertEqual(updated["attachments"], parent["attachments"])
+        self.assertEqual(allocation["object_id"], projects[0])
+        self.assertEqual(allocation["gross_amount"], "125.00")
+        self.assertEqual(allocation["net_amount"], "100.00")
+        self.assertEqual(allocation["vat_amount"], "25.00")
+        self.assertEqual(allocation["expense_category"], CATEGORY_SUBCONTRACTOR_WORK)
+        self.assertEqual(allocation["expense_category_source"], "user")
+        self.assertEqual(updated["supporting_document_ids"], [supporting["id"]])
+        self.assertEqual(child["supporting_to_document_id"], parent["id"])
+
+        summary = self.server_client.get(
+            f"/api/expense-objects/{projects[0]}/expenses",
+            headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()
+        self.assertEqual(len(summary["documents"]), 1)
+        self.assertEqual(summary["summary"]["SEK"]["net"], "100.00")
+        self.assertEqual(
+            summary["summary"]["SEK"]["categories"][CATEGORY_SUBCONTRACTOR_WORK]["known_net"],
+            "100.00",
+        )
+        included, excluded = collect_object_expenses(updated_documents, projects[0])
+        self.assertEqual(len(included), 1)
+        self.assertEqual(included[0]["share"]["net_amount"], Decimal("100.00"))
+        self.assertEqual(excluded, [])
+
+        connection = self.server.get_db_connection()
+        try:
+            history = connection.execute(
+                "SELECT new_allocations_json FROM expense_allocation_history "
+                "WHERE document_id=? ORDER BY id DESC LIMIT 1", (parent["id"],),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(history)
+        self.assertIn(CATEGORY_SUBCONTRACTOR_WORK, history[0])
+
     def test_company_and_mixed_allocations_sync_once_and_analytics_keep_company_share_general(self):
         projects = self.configure_incoming()
         revision, company_payload = self.store.latest(1)
@@ -229,6 +381,27 @@ class ExpenseSharingTests(unittest.TestCase):
     def documents(self):
         return self.server_client.get("/api/expense-documents", headers={
             "X-Sync-Key": "isolated-sync-test-key"}).get_json()["documents"]
+
+    def test_web_editor_renders_allocation_categories_and_explicit_evidence_controls(self):
+        import json
+        import re
+        from expense_categories import EXPENSE_CATEGORIES
+
+        with self.server_client.session_transaction() as session:
+            session.update(role="admin")
+        response = self.server_client.get("/expenses")
+        with self.server_client.session_transaction() as session:
+            session.clear()
+
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        category_match = re.search(r"const expenseCategories = (.*?);", html)
+        self.assertIsNotNone(category_match)
+        self.assertEqual(json.loads(category_match.group(1)), list(EXPENSE_CATEGORIES))
+        self.assertIn("Категория относится только к этой части расхода", html)
+        self.assertIn("Пояснение, строка или страница", html)
+        self.assertIn("supporting-documents", html)
+        self.assertIn("Открыть оригинал", html)
 
     def desktop_snapshot(self):
         # The desktop reads the same server API; the browser edit itself uses its session.

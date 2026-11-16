@@ -65,6 +65,7 @@ _LABELS = {
     "Тип / № / дата": "Typ / nr / datum",
     "Нетто": "Exklusive moms",
     "НДС": "Moms",
+    "без НДС": "exkl. moms",
     "Сумма доли": "Objektets andel",
     "Округление": "Avrundning",
     "Валюта": "Valuta",
@@ -140,6 +141,12 @@ _LABELS = {
     "Нет данных": "Uppgifter saknas",
     "Прочие расходы": "Övriga kostnader",
     "Материалы": "Material",
+    "Материалы и закупки": "Material och inköp",
+    "Работы подрядчиков": "Underentreprenörers arbete",
+    "Работа и материалы подрядчика, без разбивки": (
+        "Underentreprenör – arbete och material, ej specificerat"
+    ),
+    "Не классифицировано": "Ej kategoriserat",
     "Услуги": "Tjänster",
     "Аренда": "Hyra",
     "Транспорт": "Transport",

@@ -136,6 +136,7 @@ class MailTrialTests(unittest.TestCase):
 
         window = ReviewHost()
         window._expense_objects = []
+        window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
         parsed = {
             "supplier_name": "Verified Supplier AB",
             "invoice_number": "INV-1",
@@ -238,7 +239,7 @@ class MailTrialTests(unittest.TestCase):
             # Use the existing company destination and category editor.
             dest = table.cellWidget(4, 2)
             dest.setCurrentIndex(dest.findData("company"))
-            table.cellWidget(4, 4).setText("Тестовые административные расходы")
+            table.cellWidget(4, 4).setCurrentText("Прочие расходы")
             from PyQt6.QtWidgets import QCheckBox
             dialog.findChild(QCheckBox, "invoiceAmbiguityReviewed").setChecked(True)
             # Editing an amount invalidates its VAT/item evidence, not a guessed recomputation.
@@ -263,7 +264,7 @@ class MailTrialTests(unittest.TestCase):
             self.assertEqual([table.cellWidget(i, 3).currentData() for i in range(4)],
                              [101, 103, 104, 102])
             self.assertEqual(table.cellWidget(4, 2).currentData(), "company")
-            self.assertEqual(table.cellWidget(4, 4).text(), "Тестовые административные расходы")
+            self.assertEqual(table.cellWidget(4, 4).currentText(), "Прочие расходы")
             self.assertEqual(dialog.findChild(QLineEdit, "invoice_rounding_amount").text(), "0.50")
             self.assertEqual(dialog.findChild(QLineEdit, "invoice_amount_due").text(), "125.50")
             self.assertFalse(dialog.findChild(QPushButton, "invoiceConfirm").isEnabled())

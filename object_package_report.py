@@ -27,6 +27,10 @@ from reportlab.platypus import (
 from customer_report import CATEGORY_LABELS, REPORT_ISSUER_NAME, WORK_TYPES, format_quantity
 from document_costs import verified_original_order_allocation_proposal
 from expense_documents import DocumentExtractionError, extract_local_document, parse_decimal
+from expense_categories import (
+    CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
+    CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, confirmed_expense_category,
+)
 from object_package_swedish import swedish_category, swedish_document_type, swedish_label
 
 
@@ -59,7 +63,13 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
     """Return one confirmed row per document and separate related, excluded records."""
     confirmed, excluded = [], []
     seen = set()
+    documents_by_id = {
+        str(document.get("id")): document for document in documents
+        if document.get("id") is not None
+    }
     for document in documents:
+        if document.get("supporting_to_document_id"):
+            continue
         key = expense_document_key(document)
         if key and key in seen:
             continue
@@ -68,6 +78,13 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
         source_allocations = [
             dict(allocation) for allocation in document.get("allocations") or []
         ]
+        supporting_documents = list(document.get("supporting_documents") or [])
+        if not supporting_documents:
+            supporting_documents = [
+                documents_by_id[str(value)]
+                for value in document.get("supporting_document_ids") or []
+                if str(value) in documents_by_id
+            ]
         object_allocation_indexes = [
             index for index, allocation in enumerate(source_allocations)
             if allocation.get("object_id") is not None
@@ -76,6 +93,13 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
             and allocation.get("destination") != "company"
         ]
         allocations = [source_allocations[index] for index in object_allocation_indexes]
+        for allocation in allocations:
+            category, source = confirmed_expense_category(
+                allocation.get("expense_category"),
+                allocation.get("expense_category_source"),
+            )
+            allocation["expense_category"] = category
+            allocation["expense_category_source"] = source
         if not allocations:
             continue
 
@@ -108,6 +132,7 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
         if reason:
             excluded.append({
                 **document,
+                "supporting_documents": supporting_documents,
                 "object_allocations": allocations,
                 "object_allocation_indexes": object_allocation_indexes,
                 "excluded_reason": reason,
@@ -124,6 +149,7 @@ def collect_object_expenses(documents, object_id, date_from=None, date_to=None):
         }
         confirmed.append({
             **document,
+            "supporting_documents": supporting_documents,
             "object_allocations": allocations,
             "source_allocations": source_allocations,
             "object_allocation_indexes": object_allocation_indexes,
@@ -399,6 +425,7 @@ def _object_total_summary(data, figures):
     excluded = data.get("excluded_expenses", [])
     snapshot_available = bool(data.get("expense_snapshot_available"))
     expense_net = defaultdict(Decimal)
+    category_net = defaultdict(lambda: {"known": Decimal(0), "unknown_count": 0})
     unknown_net_by_currency = defaultdict(int)
     foreign_share_count = 0
     unknown_currency_share_count = 0
@@ -410,12 +437,19 @@ def _object_total_summary(data, figures):
         if not allocations:
             allocations = [document.get("share") or {}]
         for allocation in allocations:
+            category, _source = confirmed_expense_category(
+                allocation.get("expense_category"),
+                allocation.get("expense_category_source"),
+            )
+            category_total = category_net[(currency, category)]
             net = parse_decimal(allocation.get("net_amount"))
             if net is None:
                 unknown_net_share_count += 1
                 unknown_net_by_currency[currency] += 1
+                category_total["unknown_count"] += 1
             else:
                 expense_net[currency] += net
+                category_total["known"] += net
             if currency == "UNKNOWN":
                 unknown_currency_share_count += 1
             elif currency != "SEK":
@@ -532,6 +566,17 @@ def _object_total_summary(data, figures):
         "known_total": known_total,
         "complete": complete,
         "expense_net_by_currency": dict(expense_net),
+        "category_net_by_currency": {
+            currency: {
+                category: {
+                    "known": values["known"],
+                    "unknown_count": values["unknown_count"],
+                }
+                for (entry_currency, category), values in category_net.items()
+                if entry_currency == currency
+            }
+            for currency in {key[0] for key in category_net}
+        },
         "unknown_net_by_currency": dict(unknown_net_by_currency),
         "known_sek_expense": known_sek_expense,
         "unknown_net_share_count": unknown_net_share_count,
@@ -928,52 +973,58 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     )
 
     total_summary = _object_total_summary(data, figures)
-    if total_summary["known_sek_expense"] is None:
-        expense_value = "Okänt" if swedish else "Неизвестно"
-    else:
-        expense_value = display_amount(total_summary["known_sek_expense"], "SEK")
-        if total_summary["unknown_net_share_count"] or total_summary["foreign_share_count"] \
-                or total_summary["unknown_currency_share_count"]:
-            expense_value += (
-                " · känd SEK-del" if swedish else " · известная часть в SEK"
+    category_specs = (
+        (CATEGORY_MATERIALS, "Материалы и закупки · без НДС", "Material och inköp · exkl. moms", "#f7f2e7"),
+        (CATEGORY_SUBCONTRACTOR_WORK, "Работы подрядчиков · без НДС", "Underentreprenörers arbete · exkl. moms", "#edf3f8"),
+        (CATEGORY_SUBCONTRACTOR_MIXED, "Работа и материалы подрядчика, без разбивки · без НДС",
+         "Underentreprenör – arbete och material, ej specificerat · exkl. moms", "#f0eff7"),
+        (CATEGORY_OTHER, "Прочие расходы · без НДС", "Övriga kostnader · exkl. moms", "#f3f5f4"),
+        (CATEGORY_UNCLASSIFIED, "Не классифицировано · без НДС", "Ej kategoriserat · exkl. moms", "#fff3e7"),
+    )
+    category_cards = []
+    category_values = total_summary["category_net_by_currency"]
+    for category, russian_label, swedish_category_label, background in category_specs:
+        category_sek = category_values.get("SEK", {}).get(category)
+        if category_sek is None:
+            category_value = (
+                "Okänt" if swedish else "Неизвестно"
+            ) if not data.get("expense_snapshot_available") else display_amount(Decimal(0))
+            unknown_count = 0
+        else:
+            category_value = display_amount(category_sek["known"], "SEK")
+            unknown_count = category_sek["unknown_count"]
+        category_notes = [
+            "Belopp exkl. moms" if swedish else "Суммы без НДС",
+        ]
+        if unknown_count:
+            category_notes.append(
+                f"netto saknas för {unknown_count} andelar" if swedish
+                else f"нетто неизвестно у {unknown_count} долей"
             )
-    expense_notes = []
-    if total_summary["unknown_net_share_count"]:
-        count = total_summary["unknown_net_share_count"]
-        expense_notes.append(
-            f"netto saknas; antal andelar: {count}"
-            if swedish else f"нетто неизвестно; долей: {count}"
-        )
-        if total_summary["unknown_net_reason"]:
-            expense_notes.append(total_summary["unknown_net_reason"])
+        foreign_categories = [
+            f"{currency} {display_amount(values[category]['known'], currency)}"
+            for currency, values in category_values.items()
+            if currency != "SEK" and category in values
+            and values[category]["known"] != 0
+        ]
+        if foreign_categories:
+            category_notes.append(
+                ("Ingår inte i SEK-totalen: " if swedish else "Не включено в итог SEK: ")
+                + ", ".join(foreign_categories)
+            )
+        category_cards.append(card(
+            swedish_category_label if swedish else russian_label,
+            category_value, ". ".join(category_notes) + ".",
+            colors.HexColor(background), available / 4 - 18,
+        ))
     if total_summary["unconfirmed_share_count"]:
-        count = total_summary["unconfirmed_share_count"]
-        expense_notes.append(
-            f"obekräftade andelar: {count}"
-            if swedish else f"неподтверждённые доли: {count}"
-        )
-    other_currency_parts = [
-        f"{currency}: {display_amount(value, currency)}"
-        for currency, value in total_summary["expense_net_by_currency"].items()
-        if currency != "SEK"
-    ]
-    if other_currency_parts:
-        expense_notes.append(
-            ("Ingår inte i SEK-totalen: " if swedish else "Не включено в итог SEK: ")
-            + ", ".join(other_currency_parts)
-        )
-    if "UNKNOWN" in total_summary["expense_net_by_currency"]:
-        expense_notes.append(
-            f"Okänd valuta: {display_amount(total_summary['expense_net_by_currency']['UNKNOWN'])}"
+        unconfirmed_note = (
+            f"Obekräftade andelar ingår inte: {total_summary['unconfirmed_share_count']}."
             if swedish else
-            f"Неизвестная валюта: {display_amount(total_summary['expense_net_by_currency']['UNKNOWN'])}"
+            f"Неподтверждённые доли не включены: {total_summary['unconfirmed_share_count']}."
         )
-    if not expense_notes:
-        expense_notes.append(
-            "Andelarnas belopp visas exkl. moms"
-            if swedish else "Показаны суммы долей без НДС"
-        )
-    expense_note = ". ".join(expense_notes) + "."
+    else:
+        unconfirmed_note = ""
 
     total_title = (
         "Totalt för objektet exkl. moms"
@@ -995,12 +1046,17 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         "Работа по сохранённым условиям + поездки + расходы долями объекта, без НДС."
     )
     if not total_summary["complete"]:
-        total_note = " · ".join(total_summary["reasons"]) or (
+        total_note = " · ".join(
+            swedish_label(reason) if swedish else reason
+            for reason in total_summary["reasons"]
+        ) or (
             "Ofullständiga uppgifter" if swedish else "Данные неполны"
         )
+    if unconfirmed_note:
+        total_note += " " + unconfirmed_note
 
-    card_width = available / 3 - 10
-    cards = Table([[
+    card_width = available / 4 - 18
+    category_cards = [
         card(
             "Arbete · exkl. moms" if swedish else "Работа · без НДС",
             work_value, work_note, colors.HexColor("#f0f5f8"), card_width,
@@ -1009,12 +1065,11 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             trip_label,
             trip_value, trip_note, colors.HexColor("#f0f5f8"), card_width,
         ),
-        card(
-            "Inköp och kostnader · exkl. moms"
-            if swedish else "Закупки и расходы · без НДС",
-            expense_value, expense_note, colors.HexColor("#f7f2e7"), card_width,
-        ),
-    ]], colWidths=[available / 3] * 3, hAlign="LEFT")
+    ] + category_cards
+    cards = Table([
+        category_cards[:4],
+        [*category_cards[4:7], Spacer(1, 1)],
+    ], colWidths=[available / 4] * 4, hAlign="LEFT")
     cards.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
@@ -1204,9 +1259,44 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                     ) if data.get("include_copies") else
                     "Original ej bifogat" if swedish else "Оригинал не приложен"
                 )
-            amount_label = swedish_label(
-                _share_amount_text(share, "gross_amount", currency),
-            )
+            category_lines = []
+            for allocation in document.get("object_allocations") or []:
+                category = allocation.get("expense_category") or CATEGORY_UNCLASSIFIED
+                category_label = swedish_label(category) if swedish else category
+                net_value = _amount_text(allocation.get("net_amount"), currency)
+                if swedish:
+                    net_value = swedish_label(net_value)
+                detail = f"{category_label} · {'netto' if swedish else 'нетто'} {net_value}"
+                note = str(
+                    allocation.get("note") or document.get("document_comment")
+                    or document.get("expense_description") or ""
+                ).strip()
+                if note:
+                    detail += f" · {note}"
+                category_lines.append(detail)
+            for supporting in document.get("supporting_documents") or []:
+                reference = " · ".join(filter(None, (
+                    f"#{supporting.get('id')}" if supporting.get("id") is not None else "",
+                    str(supporting.get("supplier_name") or ""),
+                    str(supporting.get("invoice_number") or ""),
+                )))
+                if reference:
+                    category_lines.append(
+                        ("Bekräftande dokument: " if swedish else "Подтверждающий документ: ")
+                        + reference
+                    )
+            if not category_lines:
+                category_lines.append("Нет распределённых частей" if not swedish else "Inga fördelade delar")
+            def localized_share_amount(field):
+                amount = _share_amount_text(share, field, currency)
+                return swedish_label(amount) if swedish else amount
+
+            amount_label = "\n".join((
+                f"{'Netto' if swedish else 'Нетто'}: {localized_share_amount('net_amount')}",
+                f"{'Moms' if swedish else 'НДС'}: {localized_share_amount('vat_amount')}",
+                f"{'Brutto' if swedish else 'Сумма с НДС'}: {localized_share_amount('gross_amount')}",
+                f"{'Avrundning' if swedish else 'Округление'}: {localized_share_amount('rounding_amount')}",
+            ))
             tax_unknown = (
                 share.get("net_amount") is None or share.get("vat_amount") is None
             )
@@ -1234,8 +1324,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                     str(document.get("invoice_number") or ""),
                 )))),
                 Literal(
-                    document.get("expense_description")
-                    or _expense_description(document, marking)
+                    "\n".join(category_lines)
                 ),
                 Literal(amount_label),
                 Literal("\n".join(references)),
@@ -1645,6 +1734,17 @@ def _cover_pdf(prepared, page_number, data, font, bold_font):
             f"Номер: {document.get('invoice_number') or 'неизвестен'} · "
             f"Дата: {document.get('document_date') or 'неизвестна'}",
             body,
+        )
+    for supporting in document.get("supporting_documents") or []:
+        draw_paragraph(
+            f"Bekräftande dokument till denna kostnad: "
+            f"{supporting.get('supplier_name') or 'okänd leverantör'} · "
+            f"{supporting.get('invoice_number') or 'nummer saknas'}"
+            if swedish else
+            f"Подтверждающий документ к этому расходу: "
+            f"{supporting.get('supplier_name') or 'поставщик не указан'} · "
+            f"{supporting.get('invoice_number') or 'номер не указан'}",
+            body, translate=False,
         )
     share = document["share"]
     currency = str(document.get("currency_code") or "UNKNOWN").upper()

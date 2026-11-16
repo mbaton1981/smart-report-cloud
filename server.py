@@ -21,8 +21,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 from expense_documents import build_project_order_allocations, decimal_text, parse_decimal
-from expense_documents import migrate_invoice_net_schema, invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations, parse_invoice_money, invoice_context
+from expense_documents import (
+    ensure_expense_allocation_category_schema, migrate_invoice_net_schema,
+    invoice_net_schema_ready, net_invoice_issues, normalize_net_allocations,
+    parse_invoice_money, invoice_context,
+)
 from expense_documents import due_date_issues
+from expense_categories import (
+    CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES, confirmed_expense_category,
+)
 from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
 from web_login_throttle import SQLiteLoginThrottle
@@ -867,18 +874,33 @@ def init_cloud_db():
         document_id INTEGER PRIMARY KEY REFERENCES expense_documents(id),
         state TEXT NOT NULL, details_json TEXT NOT NULL, updated_at TEXT NOT NULL
     )""")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS expense_document_evidence (
+            parent_document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+            supporting_document_id INTEGER NOT NULL UNIQUE REFERENCES expense_documents(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(parent_document_id, supporting_document_id),
+            CHECK(parent_document_id <> supporting_document_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_expense_document_evidence_parent
+        ON expense_document_evidence(parent_document_id)
+    """)
 
     conn.commit()
     conn.close()
 
-    # Перестройка таблицы распределений выполняется только по явному флагу; резервная копия создана выше.
-    if os.environ.get('SMARTREPORT_UPGRADE_NET_SCHEMA') == '1':
-        upgrade_connection = sqlite3.connect(DB_FILE, timeout=30.0, isolation_level=None)
-        try:
-            upgrade_connection.execute("PRAGMA foreign_keys=ON")
+    # Перестройка денежной схемы требует отдельного флага; новые поля категорий добавляются только аддитивно.
+    upgrade_connection = sqlite3.connect(DB_FILE, timeout=30.0, isolation_level=None)
+    try:
+        upgrade_connection.execute("PRAGMA foreign_keys=ON")
+        if os.environ.get('SMARTREPORT_UPGRADE_NET_SCHEMA') == '1':
             migrate_invoice_net_schema(upgrade_connection)
-        finally:
-            upgrade_connection.close()
+        if invoice_net_schema_ready(upgrade_connection):
+            ensure_expense_allocation_category_schema(upgrade_connection)
+    finally:
+        upgrade_connection.close()
 
 init_cloud_db()
 
@@ -1266,6 +1288,8 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         for item in raw_allocations:
             if not isinstance(item, dict):
                 raise ValueError("Некорректная строка распределения.")
+            if item.get("expense_category_source") == "user" and item.get("expense_category") not in EXPENSE_CATEGORIES:
+                raise ValueError("Выберите категорию из списка.")
             destination = item.get("destination") or (
                 "object" if item.get("object_id") is not None else "company")
             if destination not in {"object", "company", "unselected"}:
@@ -1345,6 +1369,11 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
                 allocated_net = allocated_gross - vat_amount
             elif len(raw_allocations) == 1 and allocated_gross == Decimal(fields["gross_amount"]):
                 allocated_net = parse_invoice_money(fields.get("net_amount"))
+        if item.get("expense_category_source") == "user" and item.get("expense_category") not in EXPENSE_CATEGORIES:
+            raise ValueError("Выберите категорию из списка.")
+        category, category_source = confirmed_expense_category(
+            item.get("expense_category"), item.get("expense_category_source"),
+        )
         normalized.append({
             "destination": destination,
             "object_id": object_id,
@@ -1352,7 +1381,12 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
             "vat_amount": decimal_text(vat_amount),
             "net_amount": decimal_text(allocated_net),
             "note": str(item.get("note") or "")[:500],
-            "expense_category": str(item.get("expense_category") or "")[:100],
+            "expense_category": category,
+            "expense_category_source": category_source,
+            "expense_category_evidence": (
+                str(item.get("expense_category_evidence") or "").strip()[:500]
+                if category_source == "user" else ""
+            ),
         })
 
     total_gross = Decimal(fields["gross_amount"])
@@ -1496,6 +1530,174 @@ def expense_document_type_schema_ready(cursor_or_connection):
     }
 
 
+class AllocationCategoryConflict(ValueError):
+    pass
+
+
+def _allocation_destination(item):
+    return item.get("destination") or (
+        "object" if item.get("object_id") is not None else "company"
+    )
+
+
+def preserve_legacy_allocation_categories(cursor, document_id, allocations):
+    saved_rows = [dict(row) for row in cursor.execute(
+        "SELECT * FROM expense_allocations WHERE document_id=? ORDER BY id",
+        (document_id,),
+    ).fetchall()]
+    saved_by_id = {int(row["id"]): row for row in saved_rows}
+    has_confirmed_categories = any(
+        confirmed_expense_category(
+            row.get("expense_category"), row.get("expense_category_source"),
+        )[0] != CATEGORY_UNCLASSIFIED
+        for row in saved_rows
+    )
+    if not isinstance(allocations, list):
+        return allocations
+
+    used_ids = set()
+    for item in allocations:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("expense_category_source") or "")
+        category = str(item.get("expense_category") or "").strip()
+        if source == "user":
+            if category not in EXPENSE_CATEGORIES:
+                raise ValueError("Выберите категорию из списка.")
+            continue
+        if source == "unclassified" and category == CATEGORY_UNCLASSIFIED:
+            continue
+
+        allocation_id = item.get("allocation_id", item.get("id"))
+        matched = None
+        if allocation_id is not None:
+            try:
+                allocation_id = int(allocation_id)
+            except (TypeError, ValueError):
+                allocation_id = None
+            if allocation_id in saved_by_id and allocation_id not in used_ids:
+                matched = saved_by_id[allocation_id]
+
+        if matched is None:
+            destination = _allocation_destination(item)
+            object_id = item.get("object_id") if destination == "object" else None
+            candidates = []
+            for saved in saved_rows:
+                if int(saved["id"]) in used_ids:
+                    continue
+                saved_destination = saved.get("destination") or (
+                    "object" if saved.get("object_id") is not None else "company"
+                )
+                if saved_destination != destination or saved.get("object_id") != object_id:
+                    continue
+                equal = True
+                for payload_key, saved_key in (
+                    ("net_amount", "allocated_net"),
+                    ("gross_amount", "allocated_gross"),
+                    ("vat_amount", "allocated_vat"),
+                ):
+                    if item.get(payload_key) not in (None, ""):
+                        if parse_invoice_money(item[payload_key]) != parse_invoice_money(saved.get(saved_key)):
+                            equal = False
+                            break
+                if equal:
+                    candidates.append(saved)
+            if len(candidates) == 1:
+                matched = candidates[0]
+
+        if matched is None:
+            if has_confirmed_categories:
+                raise AllocationCategoryConflict(
+                    "Распределение не удалось однозначно сопоставить с сохранёнными категориями. "
+                    "Обновите клиент; категории и суммы не изменены."
+                )
+            item["expense_category"] = CATEGORY_UNCLASSIFIED
+            item["expense_category_source"] = "unclassified"
+            item["expense_category_evidence"] = ""
+            continue
+
+        used_ids.add(int(matched["id"]))
+        item["expense_category"] = matched.get("expense_category") or CATEGORY_UNCLASSIFIED
+        item["expense_category_source"] = matched.get("expense_category_source") or "unclassified"
+        item["expense_category_evidence"] = matched.get("expense_category_evidence") or ""
+    return allocations
+
+
+def validate_supporting_document_ids(cursor, parent_document_id, raw_ids):
+    if not isinstance(raw_ids, list) or len(raw_ids) > 50:
+        raise ValueError("Выберите не более 50 подтверждающих документов.")
+    normalized = []
+    for value in raw_ids:
+        try:
+            document_id = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Некорректный ID подтверждающего документа.") from error
+        if document_id == int(parent_document_id) or document_id in normalized:
+            raise ValueError("Документ нельзя связать с собой или указать повторно.")
+        child = cursor.execute(
+            "SELECT id, is_deleted FROM expense_documents WHERE id=?",
+            (document_id,),
+        ).fetchone()
+        if child is None or child["is_deleted"]:
+            raise ValueError("Подтверждающий документ не найден или удалён.")
+        if cursor.execute(
+            "SELECT 1 FROM expense_document_evidence WHERE supporting_document_id=? "
+            "AND parent_document_id<>?",
+            (document_id, parent_document_id),
+        ).fetchone():
+            raise ValueError("Документ уже связан как подтверждение другой фактуры.")
+        if cursor.execute(
+            "SELECT 1 FROM expense_document_evidence WHERE parent_document_id=?",
+            (document_id,),
+        ).fetchone():
+            raise ValueError("Документ с собственными подтверждениями нельзя вложить повторно.")
+        normalized.append(document_id)
+    if cursor.execute(
+        "SELECT 1 FROM expense_document_evidence WHERE supporting_document_id=?",
+        (parent_document_id,),
+    ).fetchone():
+        raise ValueError("Подтверждающий документ сам связан с другой фактурой.")
+    return normalized
+
+
+def store_supporting_document_ids(cursor, parent_document_id, document_ids, timestamp):
+    cursor.execute(
+        "DELETE FROM expense_document_evidence WHERE parent_document_id=?",
+        (parent_document_id,),
+    )
+    cursor.executemany("""
+        INSERT INTO expense_document_evidence (
+            parent_document_id, supporting_document_id, created_at
+        ) VALUES (?, ?, ?)
+    """, [
+        (parent_document_id, document_id, timestamp)
+        for document_id in document_ids
+    ])
+
+
+def _allocation_history_snapshot(allocations, *, database_rows=False):
+    result = []
+    for source in allocations:
+        item = dict(source)
+        category, category_source = confirmed_expense_category(
+            item.get("expense_category"),
+            item.get("expense_category_source"),
+        )
+        destination = _allocation_destination(item)
+        result.append({
+            "destination": destination,
+            "object_id": item.get("object_id") if destination == "object" else None,
+            "net_amount": item.get("allocated_net") if database_rows else item.get("net_amount"),
+            "vat_amount": item.get("allocated_vat") if database_rows else item.get("vat_amount"),
+            "gross_amount": item.get("allocated_gross") if database_rows else item.get("gross_amount"),
+            "expense_category": category,
+            "expense_category_source": category_source,
+            "expense_category_evidence": item.get("expense_category_evidence") or "",
+            "note": item.get("allocation_note") if database_rows else item.get("note"),
+        })
+    return sorted(result, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
+
+
 def store_expense_allocation_rows(cursor, document_id, allocations, fields):
     if fields.get("payment_reference_provided"):
         cursor.execute("UPDATE expense_documents SET payment_reference=? WHERE id=?",
@@ -1512,7 +1714,10 @@ def store_expense_allocation_rows(cursor, document_id, allocations, fields):
     net_basis = fields.get("allocation_basis") == "net"
     net_schema = invoice_net_schema_ready(cursor)
     if net_schema:
-        columns.extend(["destination", "expense_category"])
+        columns.extend([
+            "destination", "expense_category", "expense_category_source",
+            "expense_category_evidence",
+        ])
     if net_basis:
         cursor.execute("UPDATE expense_documents SET allocation_basis='net', rounding_amount=?, amount_due=? WHERE id=?",
                        (fields.get("rounding_amount"), fields.get("amount_due"), document_id))
@@ -1523,14 +1728,26 @@ def store_expense_allocation_rows(cursor, document_id, allocations, fields):
     for item in allocations:
         row = [document_id, item["object_id"], item["gross_amount"], item["net_amount"], item["vat_amount"], item["note"]]
         if net_schema:
-            row.extend([item.get("destination") or ("company" if item["object_id"] is None else "object"), item.get("expense_category") or ""])
+            category, category_source = confirmed_expense_category(
+                item.get("expense_category"), item.get("expense_category_source"),
+            )
+            row.extend([
+                item.get("destination") or ("company" if item["object_id"] is None else "object"),
+                category, category_source,
+                str(item.get("expense_category_evidence") or "")[:500]
+                if category_source == "user" else "",
+            ])
         rows.append(row)
     cursor.executemany(f"INSERT INTO expense_allocations ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})", rows)
 
 
 def serialize_expense_document(cursor, document, include_text=False):
     net_schema = invoice_net_schema_ready(cursor)
-    allocation_extras = ", a.destination, a.expense_category" if net_schema else ""
+    allocation_extras = (
+        ", a.id AS allocation_id, a.destination, a.expense_category, "
+        "a.expense_category_source, a.expense_category_evidence"
+        if net_schema else ", a.id AS allocation_id"
+    )
     cursor.execute(f"""
         SELECT a.object_id, o.name AS object_name, o.company, o.markning,
                a.allocated_gross AS gross_amount, a.allocated_net AS net_amount,
@@ -1542,6 +1759,15 @@ def serialize_expense_document(cursor, document, include_text=False):
     serialized_allocations = []
     for row in cursor.fetchall():
         item = dict(row)
+        category, category_source = confirmed_expense_category(
+            item.get("expense_category"), item.get("expense_category_source"),
+        )
+        item["expense_category"] = category
+        item["expense_category_source"] = category_source
+        item["expense_category_evidence"] = (
+            str(item.get("expense_category_evidence") or "")[:500]
+            if category_source == "user" else ""
+        )
         item["object_id"] = int(item["object_id"]) if item["object_id"] is not None else None
         item["object_name"] = item["object_name"] or ("Общие расходы фирмы" if item.get("destination", "company") == "company" else "Не выбрано")
         item["company_expense"] = item.get("destination", "company" if item["object_id"] is None else "object") == "company"
@@ -1584,6 +1810,41 @@ def serialize_expense_document(cursor, document, include_text=False):
             "id": None, "original_name": document["original_name"], "has_original": True,
             "sha256": document["file_sha256"],
         }]
+    cursor.execute("""
+        SELECT d.id, d.supplier_name, d.invoice_number, d.document_date, d.currency_code,
+               a.id AS attachment_id, a.original_name
+        FROM expense_document_evidence e
+        JOIN expense_documents d ON d.id=e.supporting_document_id
+        LEFT JOIN expense_document_attachments a ON a.document_id=d.id
+        WHERE e.parent_document_id=? AND d.is_deleted=0
+        ORDER BY d.id, a.ordinal, a.id
+    """, (document["id"],))
+    supporting_documents = []
+    for row in cursor.fetchall():
+        item = {
+            "id": int(row["id"]),
+            "supplier_name": row["supplier_name"],
+            "invoice_number": row["invoice_number"],
+            "document_date": row["document_date"],
+            "currency_code": row["currency_code"],
+            "attachments": [],
+        }
+        if row["attachment_id"] is not None:
+            item["attachments"].append({
+                "id": int(row["attachment_id"]),
+                "original_name": row["original_name"],
+                "document_id": int(row["id"]),
+            })
+        if supporting_documents and supporting_documents[-1]["id"] == item["id"]:
+            supporting_documents[-1]["attachments"].extend(item["attachments"])
+        else:
+            supporting_documents.append(item)
+    parent = cursor.execute("""
+        SELECT d.id, d.supplier_name, d.invoice_number, d.document_date
+        FROM expense_document_evidence e
+        JOIN expense_documents d ON d.id=e.parent_document_id
+        WHERE e.supporting_document_id=? AND d.is_deleted=0
+    """, (document["id"],)).fetchone()
     serialized = {
         "id": int(document["id"]),
         "client_id": document["client_id"],
@@ -1610,6 +1871,10 @@ def serialize_expense_document(cursor, document, include_text=False):
         "has_original": bool(attachments),
         "attachments": attachments,
         "allocations": serialized_allocations,
+        "supporting_document_ids": [item["id"] for item in supporting_documents],
+        "supporting_documents": supporting_documents,
+        "supporting_to_document_id": int(parent["id"]) if parent else None,
+        "supporting_to": dict(parent) if parent else None,
         "allocated_gross": decimal_text(allocated_gross),
         "unallocated_gross": decimal_text(unallocated_gross),
         "allocated_net": decimal_text(allocated_net),
@@ -1632,6 +1897,18 @@ def serialize_expense_document(cursor, document, include_text=False):
         serialized["usage"] = "object_cost"
     if include_text:
         serialized["recognized_text"] = document["recognized_text"]
+        if net_schema:
+            history = cursor.execute("""
+                SELECT id, changed_at, old_allocations_json, new_allocations_json
+                FROM expense_allocation_history
+                WHERE document_id=? ORDER BY id DESC LIMIT 20
+            """, (document["id"],)).fetchall()
+            serialized["allocation_history"] = [{
+                "id": int(item["id"]),
+                "changed_at": item["changed_at"],
+                "old_allocations": json.loads(item["old_allocations_json"]),
+                "new_allocations": json.loads(item["new_allocations_json"]),
+            } for item in history]
     return serialized
 
 
@@ -1670,8 +1947,11 @@ def expenses_page():
     if session.get("role") != "admin":
         return redirect("/")
     csrf_token = session.setdefault("expense_csrf_token", uuid.uuid4().hex)
-    return render_template("expenses.html", csrf_token=csrf_token,
-                           mail_intake_enabled=mail_intake_store is not None)
+    return render_template(
+        "expenses.html", csrf_token=csrf_token,
+        mail_intake_enabled=mail_intake_store is not None,
+        expense_categories=EXPENSE_CATEGORIES,
+    )
 
 
 @app.route("/api/expense-objects", methods=["GET"])
@@ -1719,6 +1999,17 @@ def expense_document_capabilities_api():
     connection = get_db_connection()
     try:
         net_features = ["net_allocations_v1"] if invoice_net_schema_ready(connection) else []
+        allocation_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(expense_allocations)")
+        }
+        if {"expense_category_source", "expense_category_evidence"}.issubset(allocation_columns):
+            net_features.append("allocation_categories_v1")
+        evidence_table = connection.execute("""
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='expense_document_evidence'
+        """).fetchone()
+        if evidence_table:
+            net_features.append("expense_support_links_v1")
         if expense_due_date_schema_ready(connection):
             net_features.append("due_date_v1")
         if "payment_reference" in {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}:
@@ -2077,6 +2368,11 @@ def expense_document_create_api():
         ))
         document_id = int(cursor.lastrowid)
         store_expense_allocation_rows(cursor, document_id, allocations, fields)
+        if "supporting_document_ids" in payload:
+            supporting_ids = validate_supporting_document_ids(
+                cursor, document_id, payload.get("supporting_document_ids"),
+            )
+            store_supporting_document_ids(cursor, document_id, supporting_ids, now)
         if payload.get("usage") == "object_cost":
             cursor.execute("INSERT INTO expense_processing VALUES (?,?,?,?)",
                            (document_id, "reviewed", json.dumps({"usage": "object_cost"}), now))
@@ -2246,12 +2542,43 @@ def expense_document_update_api(document_id):
                     "ok": False, "error": "Такая фактура уже есть в архиве.",
                     "existing_document_id": int(matching_document["id"]),
                 }), 409
+        if ("allocations" not in payload and not payload.get("order_proposals")
+                and invoice_net_schema_ready(cursor)):
+            saved_categories = cursor.execute("""
+                SELECT expense_category, expense_category_source
+                FROM expense_allocations WHERE document_id=?
+            """, (document_id,)).fetchall()
+            if any(
+                confirmed_expense_category(row["expense_category"], row["expense_category_source"])[0]
+                != CATEGORY_UNCLASSIFIED
+                for row in saved_categories
+            ):
+                raise AllocationCategoryConflict(
+                    "Клиент не передал распределения категорий; обновите клиент. "
+                    "Сохранённые категории и суммы не изменены."
+                )
         raw_allocations = payload.get("allocations", [])
         if order_proposals and fields["verification_status"] == "confirmed" and fields["allocation_basis"] != "net":
             raw_allocations = build_project_order_allocations(
                 order_proposals, fields["net_amount"], fields["vat_amount"], fields["gross_amount"],
             )
+        raw_allocations = preserve_legacy_allocation_categories(
+            cursor, document_id, raw_allocations,
+        )
         allocations = resolve_expense_allocations(cursor, raw_allocations, fields)
+        supporting_ids = None
+        if "supporting_document_ids" in payload:
+            supporting_ids = validate_supporting_document_ids(
+                cursor, document_id, payload.get("supporting_document_ids"),
+            )
+        old_allocation_rows = cursor.execute(
+            "SELECT * FROM expense_allocations WHERE document_id=? ORDER BY id",
+            (document_id,),
+        ).fetchall()
+        old_allocation_snapshot = _allocation_history_snapshot(
+            old_allocation_rows, database_rows=True,
+        )
+        new_allocation_snapshot = _allocation_history_snapshot(allocations)
         now = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
             UPDATE expense_documents SET supplier_name=?, invoice_number=?, document_date=?,
@@ -2270,8 +2597,20 @@ def expense_document_update_api(document_id):
         if cursor.rowcount != 1:
             conn.rollback()
             return jsonify({"ok": False, "conflict": True, "error": "Документ изменился на сервере."}), 409
+        if old_allocation_snapshot != new_allocation_snapshot and invoice_net_schema_ready(cursor):
+            cursor.execute("""
+                INSERT INTO expense_allocation_history (
+                    document_id, changed_at, old_allocations_json, new_allocations_json
+                ) VALUES (?, ?, ?, ?)
+            """, (
+                document_id, now,
+                json.dumps(old_allocation_snapshot, ensure_ascii=False, sort_keys=True),
+                json.dumps(new_allocation_snapshot, ensure_ascii=False, sort_keys=True),
+            ))
         cursor.execute("DELETE FROM expense_allocations WHERE document_id = ?", (document_id,))
         store_expense_allocation_rows(cursor, document_id, allocations, fields)
+        if supporting_ids is not None:
+            store_supporting_document_ids(cursor, document_id, supporting_ids, now)
         if order_proposals and fields["verification_status"] == "confirmed":
             save_expense_project_code_links(cursor, fields["supplier_name"], order_proposals, now)
         if restore:
@@ -2295,6 +2634,12 @@ def expense_document_update_api(document_id):
             "SELECT * FROM expense_documents WHERE id = ?", (document_id,)
         ).fetchone()
         return jsonify({"ok": True, "document": serialize_expense_document(cursor, document)})
+    except AllocationCategoryConflict as error:
+        conn.rollback()
+        return jsonify({
+            "ok": False, "conflict": True, "error": str(error),
+            "current_version": int(existing["sync_version"]) if existing is not None else None,
+        }), 409
     except (ValueError, json.JSONDecodeError) as error:
         conn.rollback()
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -2677,7 +3022,11 @@ def expense_object_summary_api(object_id):
         ).fetchone()
         if object_row is None:
             return jsonify({"ok": False, "error": "Объект не найден."}), 404
-        conditions = ["a.object_id = ?", "d.is_deleted = 0"]
+        conditions = [
+            "a.object_id = ?", "d.is_deleted = 0",
+            "NOT EXISTS (SELECT 1 FROM expense_document_evidence e "
+            "WHERE e.supporting_document_id=d.id)",
+        ]
         params = [object_id]
         if date_from:
             conditions.append("d.document_date >= ?")
@@ -2715,15 +3064,24 @@ def expense_object_summary_api(object_id):
                 if document["vat_amount"] is not None and all(value is not None for value in object_vat_values)
                 else None
             )
+            object_known_net = sum(
+                (value for value in object_net_values if value is not None), Decimal(0)
+            )
+            object_unknown_net_count = sum(value is None for value in object_net_values)
+            document["object_allocations"] = object_allocations
             document["object_gross"] = decimal_text(object_gross)
             document["object_net"] = decimal_text(object_net)
+            document["object_known_net"] = decimal_text(object_known_net)
+            document["object_unknown_net_count"] = object_unknown_net_count
             document["object_vat"] = decimal_text(object_vat)
             if document["verification_status"] == "confirmed":
                 currency = document["currency_code"]
                 bucket = totals.setdefault(currency, {
                     "gross": Decimal(0), "net": Decimal(0), "vat": Decimal(0),
+                    "known_net": Decimal(0), "unknown_net_count": 0,
                     "materials": Decimal(0), "other": Decimal(0),
-                    "gross_known": True, "vat_known": True,
+                    "gross_known": True, "vat_known": True, "net_complete": True,
+                    "categories": {},
                 })
                 if object_gross is not None:
                     bucket["gross"] += object_gross
@@ -2731,25 +3089,56 @@ def expense_object_summary_api(object_id):
                     bucket["gross_known"] = False
                 if object_net is not None:
                     bucket["net"] += object_net
+                bucket["known_net"] += object_known_net
+                bucket["unknown_net_count"] += object_unknown_net_count
+                if object_unknown_net_count:
+                    bucket["net_complete"] = False
                 if object_vat is not None:
                     bucket["vat"] += object_vat
                 else:
                     bucket["vat_known"] = False
-                category = document["expense_category"].casefold()
-                bucket["materials" if "материал" in category or "material" in category else "other"] += object_gross or Decimal(0)
+                for allocation in object_allocations:
+                    category, _category_source = confirmed_expense_category(
+                        allocation.get("expense_category"),
+                        allocation.get("expense_category_source"),
+                    )
+                    category_total = bucket["categories"].setdefault(category, {
+                        "known_net": Decimal(0), "unknown_net_count": 0,
+                    })
+                    part_net = parse_decimal(allocation.get("net_amount"))
+                    if part_net is None:
+                        category_total["unknown_net_count"] += 1
+                    else:
+                        category_total["known_net"] += part_net
+                    if category == EXPENSE_CATEGORIES[0]:
+                        bucket["materials"] += parse_decimal(allocation.get("gross_amount")) or Decimal(0)
+                    else:
+                        bucket["other"] += parse_decimal(allocation.get("gross_amount")) or Decimal(0)
             elif document["verification_status"] == "draft":
                 draft_count += 1
             else:
                 review_count += 1
             documents.append(document)
 
-        summary = {
-              currency: {key: (decimal_text(value) if
-                           (key not in {"gross", "materials", "other"} or amounts["gross_known"])
-                           and (key != "vat" or amounts["vat_known"]) else None)
-                       for key, value in amounts.items() if key not in {"gross_known", "vat_known"}}
-            for currency, amounts in totals.items()
-        }
+        summary = {}
+        for currency, amounts in totals.items():
+            summary[currency] = {
+                key: (
+                    decimal_text(value) if
+                    (key not in {"gross", "materials", "other"} or amounts["gross_known"])
+                    and (key != "vat" or amounts["vat_known"])
+                    and (key != "net" or amounts["net_complete"]) else None
+                )
+                for key, value in amounts.items()
+                if key not in {"gross_known", "vat_known", "net_complete", "categories"}
+            }
+            summary[currency]["categories"] = {
+                category: {
+                    "known_net": decimal_text(value["known_net"]),
+                    "unknown_net_count": value["unknown_net_count"],
+                }
+                for category, value in amounts["categories"].items()
+            }
         return jsonify({
             "ok": True, "object": dict(object_row), "summary": summary,
             "draft_count": draft_count, "review_count": review_count,

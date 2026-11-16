@@ -15,6 +15,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from PIL import Image
 
+from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
 from object_package_report import (
     _customer_summary, _expense_description, _object_total_summary,
     _recover_report_share_tax, collect_object_expenses,
@@ -140,6 +141,47 @@ class ObjectPackageReportTests(unittest.TestCase):
         self.assertEqual(summary["known_total"], Decimal("175.00"))
         self.assertTrue(summary["complete"])
 
+    def test_categorizing_parts_does_not_change_one_invoice_net_total(self):
+        allocations = [
+            {"object_id": 42, "destination": "object", "net_amount": "20.00",
+             "vat_amount": "5.00", "gross_amount": "25.00", "rounding_amount": "0.00"},
+            {"object_id": 42, "destination": "object", "net_amount": "10.00",
+             "vat_amount": "2.50", "gross_amount": "12.50", "rounding_amount": "0.00"},
+        ]
+        document = _document(74, net="30.00", vat="7.50", gross="37.50",
+                             allocations=allocations)
+        report = {"journal_rows": [], "cost_lines": [],
+                  "totals": {"work_amount": "0.00", "transport_amount": "0.00"}}
+        unclassified, excluded = collect_object_expenses([document], 42)
+        before = _object_total_summary({
+            "customer_report": report, "expenses": unclassified,
+            "excluded_expenses": excluded, "expense_snapshot_available": True,
+        }, _customer_summary(report))
+
+        allocations[0].update(
+            expense_category=CATEGORY_SUBCONTRACTOR_WORK,
+            expense_category_source="user",
+            expense_category_evidence="Invoice line 1",
+        )
+        allocations[1].update(
+            expense_category=CATEGORY_MATERIALS,
+            expense_category_source="user",
+            expense_category_evidence="Invoice line 2",
+        )
+        categorized, excluded = collect_object_expenses([document], 42)
+        after = _object_total_summary({
+            "customer_report": report, "expenses": categorized,
+            "excluded_expenses": excluded, "expense_snapshot_available": True,
+        }, _customer_summary(report))
+
+        self.assertEqual(len(categorized), 1)
+        self.assertEqual(before["known_sek_expense"], Decimal("30.00"))
+        self.assertEqual(after["known_sek_expense"], Decimal("30.00"))
+        self.assertEqual(before["known_total"], after["known_total"])
+        categories = after["category_net_by_currency"]["SEK"]
+        self.assertEqual(categories[CATEGORY_SUBCONTRACTOR_WORK]["known"], Decimal("20.00"))
+        self.assertEqual(categories[CATEGORY_MATERIALS]["known"], Decimal("10.00"))
+
     def test_pdf_cover_shows_net_components_and_not_gross_expense(self):
         shared = _document(75, net="150.00", vat="30.00", gross="180.00", allocations=[
             {"object_id": 42, "destination": "object", "net_amount": "50.00",
@@ -183,9 +225,11 @@ class ObjectPackageReportTests(unittest.TestCase):
             )
             cover_text = PdfReader(str(target)).pages[0].extract_text()
 
-        self.assertIn("Работа · без НДС", cover_text)
-        self.assertIn("Поездки · без НДС", cover_text)
-        self.assertIn("Закупки и расходы · без НДС", cover_text)
+        normalized_cover = " ".join(cover_text.split())
+        self.assertIn("Работа · без НДС", normalized_cover)
+        self.assertIn("Поездки · без НДС", normalized_cover)
+        self.assertIn("Материалы и закупки · без НДС", normalized_cover)
+        self.assertIn("Не классифицировано · без НДС", normalized_cover)
         self.assertIn("50,00 SEK", cover_text)
         self.assertIn("Итого по объекту без НДС", cover_text)
         self.assertIn("175,00 SEK", cover_text)
@@ -937,7 +981,10 @@ class ObjectPackageReportTests(unittest.TestCase):
                         self.assertIn("Arbete", swedish_text)
                         self.assertIn("Kontrollera avrundningen.", swedish_text)
                         self.assertIn("UTKAST", swedish_text)
-                        self.assertIn("Summa resor: Okänt", swedish_text)
+                        self.assertIn(
+                            "Summa resor: Okänt",
+                            " ".join(swedish_text.split()),
+                        )
                         self.assertIn("Original invoice page", swedish_text)
 
 

@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from expense_categories import CATEGORY_UNCLASSIFIED, confirmed_expense_category
+
 
 MIGRATION_ID = "supplier_documents_v1"
 CENT = Decimal("0.01")
@@ -1491,25 +1493,38 @@ def build_project_order_allocations(orders, net_amount, vat_amount, gross_amount
         if project_key in project_objects and project_objects[project_key] != object_id:
             raise ValueError("Один код проекта не может обозначать разные объекты одного поставщика.")
         project_objects[project_key] = object_id
-        if object_id not in grouped:
-            grouped[object_id] = {
-                "object_id": object_id, "net_amount": Decimal(0),
-                "vat_amount": Decimal(0), "gross_amount": Decimal(0), "notes": [],
+        category, category_source = confirmed_expense_category(
+            order.get("expense_category"), order.get("expense_category_source"),
+        )
+        group_key = (object_id, category)
+        if group_key not in grouped:
+            grouped[group_key] = {
+                "object_id": object_id, "expense_category": category,
+                "expense_category_source": category_source,
+                "expense_category_evidence": order.get("expense_category_evidence") or "",
+                "net_amount": Decimal(0), "vat_amount": Decimal(0),
+                "gross_amount": Decimal(0), "notes": [],
             }
-        allocation = grouped[object_id]
+        allocation = grouped[group_key]
         for index, (key, value) in enumerate((
             ("net_amount", net_value), ("vat_amount", vat_value), ("gross_amount", gross_value),
         )):
             allocation[key] += value
             actual[index] += value
         pages = ",".join(str(source.get("page")) for source in order.get("sources") or [])
-        allocation["notes"].append(
+        source_note = (
             f"Proj.nr. {order['project_code']}; Order {order.get('order_id') or '—'}; стр. {pages}"
+        )
+        allocation["notes"].append(
+            "; ".join(filter(None, (str(order.get("note") or "").strip(), source_note)))
         )
     if actual != expected:
         raise ValueError("Суммы заказов должны точно совпасть с net, VAT и gross фактуры.")
     return [{
         "object_id": item["object_id"],
+        "expense_category": item["expense_category"],
+        "expense_category_source": item["expense_category_source"],
+        "expense_category_evidence": item["expense_category_evidence"],
         "net_amount": decimal_text(item["net_amount"]),
         "vat_amount": decimal_text(item["vat_amount"]),
         "gross_amount": decimal_text(item["gross_amount"]),
@@ -1529,7 +1544,7 @@ def invoice_net_schema_ready(connection):
 
 def migrate_invoice_net_schema(connection):
     if invoice_net_schema_ready(connection):
-        return
+        return ensure_expense_allocation_category_schema(connection)
     if connection.in_transaction:
         raise ValueError("Миграция требует отдельной транзакции и предварительной резервной копии.")
     try:
@@ -1550,7 +1565,9 @@ def migrate_invoice_net_schema(connection):
                 allocated_vat TEXT,
                 allocation_note TEXT NOT NULL DEFAULT '',
                 destination TEXT NOT NULL DEFAULT 'object',
-                expense_category TEXT NOT NULL DEFAULT ''
+                expense_category TEXT NOT NULL DEFAULT '',
+                expense_category_source TEXT NOT NULL DEFAULT 'unclassified',
+                expense_category_evidence TEXT NOT NULL DEFAULT ''
             )
         """)
         connection.execute("""
@@ -1566,6 +1583,45 @@ def migrate_invoice_net_schema(connection):
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise sqlite3.IntegrityError("Нарушены внешние ключи после миграции распределений.")
         connection.commit()
+        return ensure_expense_allocation_category_schema(connection)
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def ensure_expense_allocation_category_schema(connection):
+    if not invoice_net_schema_ready(connection):
+        return False
+    if connection.in_transaction:
+        raise ValueError("Добавление категорий требует отдельной транзакции.")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(expense_allocations)")
+        }
+        for name, definition in (
+            ("expense_category_source", "TEXT NOT NULL DEFAULT 'unclassified'"),
+            ("expense_category_evidence", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE expense_allocations ADD COLUMN {name} {definition}"
+                )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS expense_allocation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL REFERENCES expense_documents(id) ON DELETE CASCADE,
+                changed_at TEXT NOT NULL,
+                old_allocations_json TEXT NOT NULL,
+                new_allocations_json TEXT NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expense_allocation_history_document
+            ON expense_allocation_history(document_id, id)
+        """)
+        connection.commit()
+        return True
     except Exception:
         connection.rollback()
         raise
@@ -1699,12 +1755,16 @@ def normalize_net_allocations(allocations):
         destination = row.get("destination") or (
             "object" if row.get("object_id") is not None else "company")
         object_id = row.get("object_id") if destination == "object" else None
-        category = str(row.get("expense_category") or "").strip()[:100]
+        category, category_source = confirmed_expense_category(
+            row.get("expense_category"), row.get("expense_category_source"),
+        )
         key = (destination, object_id, category)
         net = parse_invoice_money(row.get("net_amount"))
         vat = parse_invoice_money(row.get("vat_amount"))
         if key not in grouped:
             grouped[key] = {"object_id": object_id, "destination": destination, "expense_category": category,
+                            "expense_category_source": category_source,
+                            "expense_category_evidence": "",
                             "net_amount": Decimal(0), "vat_amount": Decimal(0), "note": "",
                             "net_known": True, "vat_known": True}
         item = grouped[key]
@@ -1712,8 +1772,17 @@ def normalize_net_allocations(allocations):
         item["vat_known"] &= vat is not None
         item["net_amount"] += net or Decimal(0)
         item["vat_amount"] += vat or Decimal(0)
+        evidence = str(row.get("expense_category_evidence") or "").strip()[:500]
+        if evidence and evidence not in item["expense_category_evidence"]:
+            item["expense_category_evidence"] = (
+                item["expense_category_evidence"] + ("; " if item["expense_category_evidence"] else "")
+                + evidence
+            )[:500]
+        note = str(row.get("note") or "").strip()
         marker = str(row.get("original_marker") or row.get("project_code") or row.get("order_id") or "")
-        item["note"] = (item["note"] + "; " + marker).strip("; ")[:500]
+        details = "; ".join(value for value in (note, marker) if value)
+        if details and details not in item["note"]:
+            item["note"] = (item["note"] + "; " + details).strip("; ")[:500]
     result = []
     for item in grouped.values():
         net = item.pop("net_amount") if item.pop("net_known") else None

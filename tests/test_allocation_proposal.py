@@ -10,8 +10,9 @@ from document_costs import (
     verified_saved_allocation_vat,
 )
 from expense_documents import (
-    match_objects, object_marker_evidence, object_marking_matches, parse_invoice_pages,
-    parse_project_order_allocations,
+    build_project_order_allocations, match_objects, object_marker_evidence,
+    object_marking_matches, parse_invoice_pages, parse_project_order_allocations,
+    normalize_net_allocations,
 )
 
 
@@ -69,6 +70,55 @@ def beijer_fixture():
 
 
 class ProposalTests(unittest.TestCase):
+    def test_project_order_parts_split_by_object_and_category_without_changing_totals(self):
+        from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
+
+        parts = build_project_order_allocations([
+            {"project_code": "P1041", "object_id": 42, "net_amount": "20.00",
+             "vat_amount": "5.00", "expense_category": CATEGORY_SUBCONTRACTOR_WORK,
+             "expense_category_source": "user", "expense_category_evidence": "Invoice line 1"},
+            {"project_code": "P1041", "object_id": 42, "net_amount": "10.00",
+             "vat_amount": "2.50", "expense_category": CATEGORY_MATERIALS,
+             "expense_category_source": "user", "expense_category_evidence": "Invoice line 2"},
+            {"project_code": "P1042", "object_id": 84, "net_amount": "15.00",
+             "vat_amount": "3.75", "expense_category": CATEGORY_MATERIALS,
+             "expense_category_source": "user", "expense_category_evidence": "Invoice line 3"},
+        ], "45.00", "11.25", "56.25")
+
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(
+            {(part["object_id"], part["expense_category"], part["net_amount"])
+             for part in parts},
+            {
+                (42, CATEGORY_SUBCONTRACTOR_WORK, "20.00"),
+                (42, CATEGORY_MATERIALS, "10.00"),
+                (84, CATEGORY_MATERIALS, "15.00"),
+            },
+        )
+        self.assertEqual(sum(Decimal(part["gross_amount"]) for part in parts),
+                         Decimal("56.25"))
+
+    def test_net_allocations_keep_unknown_tax_and_group_by_category(self):
+        from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
+
+        parts = normalize_net_allocations([
+            {"object_id": 42, "destination": "object", "net_amount": "20.00",
+             "vat_amount": "5.00", "expense_category": CATEGORY_SUBCONTRACTOR_WORK,
+             "expense_category_source": "user", "expense_category_evidence": "Invoice line 1"},
+            {"object_id": 42, "destination": "object", "net_amount": "10.00",
+             "vat_amount": "2.50", "expense_category": CATEGORY_MATERIALS,
+             "expense_category_source": "user", "expense_category_evidence": "Invoice line 2"},
+            {"object_id": 84, "destination": "object", "net_amount": None,
+             "vat_amount": None, "gross_amount": "12.00"},
+        ])
+
+        by_category = {part["expense_category"]: part for part in parts}
+        self.assertEqual(by_category[CATEGORY_SUBCONTRACTOR_WORK]["net_amount"], "20.00")
+        self.assertEqual(by_category[CATEGORY_SUBCONTRACTOR_WORK]["gross_amount"], "25.00")
+        self.assertEqual(by_category[CATEGORY_MATERIALS]["gross_amount"], "12.50")
+        self.assertIsNone(by_category["Не классифицировано"]["net_amount"])
+        self.assertIsNone(by_category["Не классифицировано"]["gross_amount"])
+
     def test_order_and_project_headers_link_to_values_in_the_same_columns_below(self):
         def cell(text, left, top, right, bottom):
             return {"text": text, "x0": left, "y0": top, "x1": right, "y1": bottom}
