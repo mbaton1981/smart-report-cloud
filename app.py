@@ -45,7 +45,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from customer_report import WORK_TYPES, format_quantity, money, positive_rate, prepare_customer_costs, write_customer_pdf
 from object_package_report import (
-    collect_object_expenses, expense_document_key, write_object_report_package,
+    _recover_report_share_tax, collect_object_expenses, expense_document_key,
+    write_object_report_package,
 )
 import customer_intervals
 from customer_intervals_desktop import CustomerIntervalsMixin, cache_terms
@@ -78,7 +79,9 @@ from expense_documents import (
     invoice_context, due_date_issues, due_date_edit,
 )
 from expense_categories import (
-    CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES, confirmed_expense_category,
+    CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
+    CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES,
+    confirmed_expense_category, suggest_expense_category,
 )
 from desktop_ui import ReportTable as QTableWidget
 import desktop_ui
@@ -2728,6 +2731,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self._expense_read_busy = False
         self._expense_read_task = None
         self._expense_online = False
+        self._object_expense_recovery_cache = {}
+        self._object_expense_recovery_inflight = set()
+        self._object_expense_recovery_requests = {}
+        self._object_expense_recovery_tasks = {}
+        self._object_expense_recovery_request_id = 0
 
         init_db_once()
         self.init_ui()
@@ -3625,8 +3633,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             and type(result.get("current_version")) is int):
                         restored_row = requeue_expense_document_restore(queued, payload, result)
                         if restored_row is not None:
-                            if getattr(self, "_selected_expense_identity", None) == queued["client_id"]:
-                                self._selected_expense_identity = restored_row["client_id"]
+                            if getattr(self, "_selected_expense_identity", None) == (
+                                    "expense-client", queued["client_id"]):
+                                self._selected_expense_identity = self._expense_document_identity(
+                                    restored_row
+                                )
+                                self._selected_expense_document_snapshot = dict(restored_row)
                             rows.append(restored_row)
                             continue
                     error = str(result.get("error") or f"Сервер вернул HTTP {status_code}.")
@@ -7999,6 +8011,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         document = item.data(Qt.ItemDataRole.UserRole) if item else None
         if isinstance(document, dict):
             self._selected_expense_identity = self._expense_document_identity(document)
+            self._selected_expense_document_snapshot = dict(document)
+            self._expense_selection_message = ""
 
     def _expense_document_hidden_reasons(self, document):
         """Причины, по которым текущие фильтры реестра скрывают документ."""
@@ -8096,11 +8110,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self._expense_document_review_dialog(document=document)
     @staticmethod
     def _expense_document_identity(document):
-        return (
-            document.get("incoming_document_id")
-            or document.get("client_id")
-            or document.get("id")
-        )
+        client_id = str(document.get("client_id") or "").strip()
+        if client_id:
+            return ("expense-client", client_id)
+        incoming_id = document.get("incoming_document_id")
+        if incoming_id is not None:
+            return ("incoming-review", str(incoming_id))
+        document_id = document.get("id")
+        if document_id is not None:
+            return ("expense-server", str(document_id))
+        return None
 
     @staticmethod
     def _expense_selected_allocations(document, selected_filter):
@@ -8228,14 +8247,28 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             return
         document = self._selected_expense_document(self.table_supplier_documents, notify=False)
         if document is None:
-            self.exp_detail_supplier.setText("Выберите документ")
-            self.exp_detail_status.clear()
+            selection_message = str(getattr(self, "_expense_selection_message", "") or "")
+            self.exp_detail_supplier.setText(
+                "Ранее выбранный документ скрыт"
+                if selection_message and "скрыт" in selection_message.casefold()
+                else "Выбранный документ недоступен"
+                if selection_message else "Выберите документ"
+            )
+            self.exp_detail_status.setText("Выбор не изменён" if selection_message else "")
             self.exp_detail_preview.setPixmap(QPixmap())
-            self.exp_detail_preview.setText("Выберите фактуру, чтобы проверить оригинал и реквизиты.")
+            self.exp_detail_preview.setText(
+                selection_message
+                or "Выберите фактуру, чтобы проверить оригинал и реквизиты."
+            )
             for value in self.exp_detail_values.values():
                 value.setText("—")
-            self.exp_detail_progress.clear()
-            self.exp_detail_hint.clear()
+            self.exp_detail_progress.setText("")
+            self.exp_detail_hint.setText(
+                "Снимите фильтр, чтобы вернуться к документу."
+                if selection_message and "скрыт" in selection_message.casefold()
+                else "Обновите реестр: документ больше не найден в текущем снимке."
+                if selection_message else ""
+            )
             self.exp_assign_button.setEnabled(False)
             self.exp_primary_action.setEnabled(False)
             self.exp_detail_original_button.setEnabled(False)
@@ -8638,6 +8671,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         for index, category in enumerate(EXPENSE_CATEGORIES):
             label = QLabel(f"{category} · без НДС: —")
             label.setWordWrap(True)
+            label.setVisible(False)
             self.object_expenses_category_labels[category] = label
             summary.addWidget(label, 1 + index // 3, index % 3)
         layout.addLayout(summary)
@@ -8669,7 +8703,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         delete_button.clicked.connect(self.delete_selected_object_expense)
         open_button = QPushButton("Открыть оригинал")
         open_button.clicked.connect(self.open_selected_object_expense_original)
-        for button in (edit_button, vat_button, delete_button, open_button):
+        classify_button = QPushButton("Разобрать расходы по категориям")
+        classify_button.clicked.connect(self.open_expense_category_review)
+        retry_originals_button = QPushButton("Повторить проверку оригиналов")
+        retry_originals_button.clicked.connect(self.retry_object_expense_original_recovery)
+        for button in (
+            edit_button, vat_button, delete_button, open_button,
+            classify_button, retry_originals_button,
+        ):
             actions.addWidget(button)
         layout.addLayout(actions)
         self.object_expenses_object.currentIndexChanged.connect(self.load_object_expense_overview)
@@ -9327,16 +9368,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if hasattr(self, "exp_metrics"):
             self._update_expense_summary_cards(base_filtered)
 
-        # Выбор хранится по постоянному ID и переживает перерисовку, даже если документ
-        # временно не попал в отфильтрованный список.
+        # Выбор хранится по типизированному устойчивому ключу: числовой ID черновика
+        # не может совпасть с серверным ID зарегистрированного расхода.
         selected_identity = getattr(self, "_selected_expense_identity", None)
         pinned_identity = selected_identity is not None
         current_row = self.table_supplier_documents.currentRow()
         if selected_identity is None and current_row >= 0 and self.table_supplier_documents.item(current_row, 0):
             old_doc = self.table_supplier_documents.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
             if isinstance(old_doc, dict):
-                selected_identity = (old_doc.get("incoming_document_id") or
-                                     old_doc.get("client_id") or old_doc.get("id"))
+                selected_identity = self._expense_document_identity(old_doc)
+                self._selected_expense_identity = selected_identity
+                self._selected_expense_document_snapshot = dict(old_doc)
         vertical_scroll = self.table_supplier_documents.verticalScrollBar().value()
         horizontal_scroll = self.table_supplier_documents.horizontalScrollBar().value()
         gross_totals, vat_totals, net_totals, unallocated_totals = {}, {}, {}, {}
@@ -9393,12 +9435,64 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_docs_state_counts_lbl.setText(state_summary)
 
         table = self.table_supplier_documents
+        render_signature = (
+            date_from, date_to, selected_filter, only_unallocated, status_filter, search_text,
+            tuple(
+                repr(self._expense_document_identity(document)) for document in documents
+            ),
+            json.dumps(filtered, ensure_ascii=False, sort_keys=True, default=str),
+        )
+        if render_signature == getattr(self, "_expense_register_render_signature", None):
+            self._update_expense_detail()
+            if getattr(self, "_expense_selection_message", ""):
+                self.exp_api_status_lbl.setText(self._expense_selection_message)
+            elif online:
+                self.exp_api_status_lbl.setText(
+                    "Реестр обновлён. Учтённые суммы включают только подтверждённые сервером документы.")
+            return
+
+        selected_document = None
+        if selected_identity is not None:
+            selected_document = next(
+                (document for document in documents
+                 if self._expense_document_identity(document) == selected_identity),
+                None,
+            )
+            if selected_document is not None:
+                self._selected_expense_document_snapshot = dict(selected_document)
+        self._expense_selection_message = ""
+        if selected_identity is not None and not any(
+                self._expense_document_identity(document) == selected_identity
+                for document in filtered):
+            previous_document = selected_document or getattr(
+                self, "_selected_expense_document_snapshot", None
+            )
+            hidden_reasons = (
+                self._expense_document_hidden_reasons(previous_document)
+                if isinstance(previous_document, dict) else []
+            )
+            if hidden_reasons:
+                self._expense_selection_message = (
+                    "Ранее выбранный документ скрыт текущими фильтрами: "
+                    + "; ".join(hidden_reasons) + "."
+                )
+            else:
+                self._selected_expense_document_snapshot = None
+                self._expense_selection_message = (
+                    "Ранее выбранный документ больше не найден в актуальном реестре. "
+                    "Карточка очищена; другой документ не выбран."
+                )
+
+        sorting_enabled = table.isSortingEnabled()
+        sort_column = table.horizontalHeader().sortIndicatorSection()
+        sort_order = table.horizontalHeader().sortIndicatorOrder()
         table.setHorizontalHeaderLabels([
             "ID", "Дата", "Поставщик / документ", "№ документа", "Назначение",
             "Доля с НДС" if allocation_scope else "Сумма фактуры с НДС",
             "Без НДС", "НДС доли" if allocation_scope else "НДС", "Состояние",
         ])
         blocker = QSignalBlocker(table)
+        table.setSortingEnabled(False)
         table.setCurrentCell(-1, -1)
         table.setRowCount(len(filtered))
         restored_row = -1
@@ -9548,18 +9642,35 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     )
                 table.setItem(row_index, column, item)
             table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
-            if selected_identity is not None and selected_identity in (
-                    document.get("incoming_document_id"), document.get("client_id"), document.get("id")):
+            if (selected_identity is not None
+                    and self._expense_document_identity(document) == selected_identity):
                 restored_row = row_index
         desktop_theme.refresh_table_item_colors(table)
+        if sorting_enabled:
+            table.setSortingEnabled(True)
+            if sort_column >= 0:
+                table.sortItems(sort_column, sort_order)
+            if restored_row >= 0 and sort_column >= 0:
+                selected_identity = self._expense_document_identity(filtered[restored_row])
+                restored_row = next(
+                    (row for row in range(table.rowCount())
+                     if self._expense_document_identity(
+                         table.item(row, 0).data(Qt.ItemDataRole.UserRole) or {}
+                     ) == selected_identity),
+                    -1,
+                )
         if restored_row >= 0:
             table.setCurrentCell(restored_row, 1)
-            table.scrollToItem(table.item(restored_row, 1))
         elif filtered and not pinned_identity:
             table.setCurrentCell(0, 1)
+            selected = table.item(0, 0).data(Qt.ItemDataRole.UserRole)
+            if isinstance(selected, dict):
+                self._selected_expense_identity = self._expense_document_identity(selected)
+                self._selected_expense_document_snapshot = dict(selected)
         table.verticalScrollBar().setValue(vertical_scroll)
         table.horizontalScrollBar().setValue(horizontal_scroll)
         del blocker
+        self._expense_register_render_signature = render_signature
         if hasattr(self, "exp_docs_result_count"):
             self.exp_docs_result_count.setText(f"{len(filtered)} из {len(documents)}")
         if hasattr(self, "exp_detail_scroll"):
@@ -9586,9 +9697,144 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         elif restored_row < 0 and selected_identity is not None:
             self.exp_api_status_lbl.setText(
                 f"Показано {len(filtered)} документов. Ранее выбранная запись скрыта текущим фильтром.")
+        elif getattr(self, "_expense_selection_message", ""):
+            self.exp_api_status_lbl.setText(self._expense_selection_message)
         elif online:
             self.exp_api_status_lbl.setText(
                 f"Реестр обновлён. Учтённые суммы включают только подтверждённые сервером документы.")
+
+    @staticmethod
+    def _object_expense_recovery_key(document, object_id):
+        version = document.get("sync_version") or document.get("server_version") or 0
+        return expense_document_key(document), str(version), int(object_id)
+
+    def _schedule_object_expense_original_recovery(
+        self, object_id, date_from, date_to, documents,
+    ):
+        confirmed, _excluded = collect_object_expenses(
+            documents, object_id, date_from, date_to,
+        )
+        needed = []
+        for document in confirmed:
+            if not any(parse_decimal(part.get("net_amount")) is None
+                       for part in document.get("object_allocations") or []):
+                continue
+            key = self._object_expense_recovery_key(document, object_id)
+            if (key in self._object_expense_recovery_cache
+                    or key in self._object_expense_recovery_inflight):
+                continue
+            needed.append((key, document))
+        if not needed:
+            return
+
+        request_id = self._object_expense_recovery_request_id + 1
+        self._object_expense_recovery_request_id = request_id
+        keys = [key for key, _document in needed]
+        self._object_expense_recovery_inflight.update(keys)
+        self._object_expense_recovery_requests[request_id] = {
+            "keys": keys, "object_id": int(object_id),
+            "date_from": date_from, "date_to": date_to,
+        }
+        source_documents = [dict(document) for _key, document in needed]
+
+        def recover():
+            expenses, _excluded = collect_object_expenses(
+                documents, object_id, date_from, date_to,
+            )
+            target_keys = {key for key, _document in needed}
+            expenses = [
+                document for document in expenses
+                if self._object_expense_recovery_key(document, object_id) in target_keys
+            ]
+            with tempfile.TemporaryDirectory(prefix="smartreport-overview-tax-") as directory:
+                source_paths, source_errors = self._download_object_report_originals(
+                    source_documents, directory, lambda _message: None,
+                )
+                data = {"object": {"id": int(object_id)}, "expenses": expenses}
+                _recover_report_share_tax(data, source_paths, source_errors)
+
+            results = {}
+            for document in expenses:
+                key = self._object_expense_recovery_key(document, object_id)
+                recovered = {}
+                for allocation, source_index in zip(
+                    document.get("object_allocations") or [],
+                    document.get("object_allocation_indexes") or [],
+                ):
+                    if allocation.get("net_recovered_from_original"):
+                        recovered[int(source_index)] = {
+                            field: allocation.get(field)
+                            for field in (
+                                "net_amount", "vat_amount", "rounding_amount",
+                                "net_recovered_from_original",
+                            )
+                        }
+                results[key] = {
+                    "allocations": recovered,
+                    "status": document.get("net_recovery_status"),
+                    "error": document.get("net_recovery_error"),
+                    "verified_count": len(recovered),
+                }
+            return {
+                "object_id": int(object_id), "date_from": date_from,
+                "date_to": date_to, "results": results,
+            }
+
+        task = ObjectOverviewTask(request_id, recover)
+        task.signals.completed.connect(self._on_object_expense_original_recovery_completed)
+        self._object_expense_recovery_tasks[request_id] = task
+        QThreadPool.globalInstance().start(task)
+
+    def _on_object_expense_original_recovery_completed(self, request_id, result, error):
+        request = self._object_expense_recovery_requests.pop(request_id, None)
+        self._object_expense_recovery_tasks.pop(request_id, None)
+        if request is None:
+            return
+        self._object_expense_recovery_inflight.difference_update(request["keys"])
+        if error:
+            logging.error("Could not verify object expense originals: %s", error)
+            for key in request["keys"]:
+                self._object_expense_recovery_cache[key] = {
+                    "allocations": {}, "status": "original_unavailable",
+                    "error": error, "verified_count": 0,
+                }
+        else:
+            self._object_expense_recovery_cache.update(result.get("results") or {})
+
+        current_object = self.object_expenses_object.currentData()
+        current_object_id = (
+            None if current_object in (None, "company") else int(current_object)
+        )
+        current_from = (
+            self.object_expenses_date_from.text().strip()
+            if self.object_expenses_period_enabled.isChecked() else None
+        )
+        current_to = (
+            self.object_expenses_date_to.text().strip()
+            if self.object_expenses_period_enabled.isChecked() else None
+        )
+        if (current_object_id == request["object_id"]
+                and current_from == request["date_from"]
+                and current_to == request["date_to"]):
+            self.load_object_expense_overview()
+            if error:
+                self.object_expenses_selected_label.setText(
+                    self.object_expenses_selected_label.text()
+                    + f" Проверка оригинала завершилась ошибкой: {error}"
+                )
+
+    def retry_object_expense_original_recovery(self, *_):
+        selected = self.object_expenses_object.currentData()
+        if selected in (None, "company"):
+            return
+        object_id = int(selected)
+        stale = [
+            key for key in self._object_expense_recovery_cache
+            if key[2] == object_id
+        ]
+        for key in stale:
+            self._object_expense_recovery_cache.pop(key, None)
+        self.load_object_expense_overview()
 
     def load_object_expense_overview(self, *_):
         if not hasattr(self, "object_expenses_table"):
@@ -9606,21 +9852,46 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         documents, _online = self._expense_document_snapshot(date_from, date_to)
         is_company = object_id == "company"
         selected_id = None if is_company else int(object_id)
+        if selected_id is not None:
+            self._schedule_object_expense_original_recovery(
+                selected_id, date_from, date_to, documents,
+            )
         rows = []
         totals = {"gross": {}, "vat": {}, "net": {}, "unallocated": {}, "categories": {}}
         unknown = {"gross": False, "vat": False, "net": False}
+        recovered_share_count = 0
+        pending_recovery_count = 0
         for document in documents:
             if document.get("supporting_to_document_id"):
                 continue
-            allocations = [
-                item for item in (document.get("allocations") or [])
-                if (item.get("object_id") is None and item.get("destination", "company") == "company" if is_company else item.get("object_id") == selected_id)
-            ]
+            allocations = []
+            recovery_entry = None
+            if selected_id is not None:
+                recovery_key = self._object_expense_recovery_key(document, selected_id)
+                recovery_entry = self._object_expense_recovery_cache.get(recovery_key)
+            for allocation_index, source_allocation in enumerate(document.get("allocations") or []):
+                matches = (
+                    source_allocation.get("object_id") is None
+                    and source_allocation.get("destination", "company") == "company"
+                    if is_company else source_allocation.get("object_id") == selected_id
+                )
+                if not matches:
+                    continue
+                allocation = dict(source_allocation)
+                if recovery_entry:
+                    allocation.update(
+                        recovery_entry.get("allocations", {}).get(allocation_index, {})
+                    )
+                allocations.append(allocation)
             if not allocations:
                 continue
+            display_document = dict(document)
+            if recovery_entry:
+                display_document["net_recovery_status"] = recovery_entry.get("status")
+                display_document["net_recovery_error"] = recovery_entry.get("error")
             currency = str(document.get("currency_code") or "SEK")
             if document.get("verification_status") == "confirmed":
-                for allocation in allocations:
+                for allocation_index, allocation in enumerate(allocations):
                     for field, key in (("gross_amount", "gross"), ("vat_amount", "vat"), ("net_amount", "net")):
                         amount = parse_decimal(allocation.get(field))
                         if amount is not None:
@@ -9632,7 +9903,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         allocation.get("expense_category_source"),
                     )
                     category_totals = totals["categories"].setdefault(
-                        category, {"amounts": {}, "unknown_count": 0}
+                        category, {
+                            "amounts": {}, "unknown_count": 0, "allocation_count": 0,
+                            "document_ids": set(),
+                        }
+                    )
+                    category_totals["allocation_count"] += 1
+                    category_totals["document_ids"].add(
+                        expense_document_key(document) or str(document.get("id"))
                     )
                     net_amount = parse_decimal(allocation.get("net_amount"))
                     if net_amount is None:
@@ -9641,27 +9919,59 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         category_totals["amounts"][currency] = (
                             category_totals["amounts"].get(currency, Decimal(0)) + net_amount
                         )
+                    if allocation.get("net_recovered_from_original"):
+                        recovered_share_count += 1
+                    elif net_amount is None and selected_id is not None:
+                        recovery_key = self._object_expense_recovery_key(document, selected_id)
+                        if recovery_key in self._object_expense_recovery_inflight:
+                            pending_recovery_count += 1
             remaining = parse_decimal(document.get("unallocated_gross"))
             if remaining is not None and remaining:
                 totals["unallocated"][currency] = totals["unallocated"].get(currency, Decimal(0)) + remaining
-            rows.append((document, allocations))
+            rows.append((display_document, allocations))
         self.object_expenses_total_lbl.setText(
             "Доля с НДС: " + self._expense_totals_label(totals["gross"], unknown["gross"])
         )
         self.object_expenses_vat_lbl.setText(
             "НДС доли: " + self._expense_totals_label(totals["vat"], unknown["vat"])
         )
-        self.object_expenses_net_lbl.setText(
-            "Доля без НДС: " + self._expense_totals_label(totals["net"], unknown["net"])
+        net_summary = "Доля без НДС: " + self._expense_totals_label(
+            totals["net"], unknown["net"],
         )
+        if recovered_share_count:
+            net_summary += (
+                f"; {recovered_share_count} долей проверено по оригиналу, "
+                "сохранённая запись не изменена"
+            )
+        if pending_recovery_count:
+            net_summary += f"; проверка оригиналов выполняется для {pending_recovery_count} долей"
+        self.object_expenses_net_lbl.setText(net_summary)
         for category, label in self.object_expenses_category_labels.items():
             category_total = totals["categories"].get(
-                category, {"amounts": {}, "unknown_count": 0}
+                category, {
+                    "amounts": {}, "unknown_count": 0, "allocation_count": 0,
+                    "document_ids": set(),
+                }
             )
             value = self._expense_money_label(category_total["amounts"])
             if category_total["unknown_count"]:
                 value += f"; нетто неизвестно у {category_total['unknown_count']} долей"
-            label.setText(f"{category} · без НДС: {value}")
+            has_parts = category_total["allocation_count"] > 0
+            label.setVisible(has_parts)
+            if has_parts and category == CATEGORY_UNCLASSIFIED and len(totals["categories"]) == 1:
+                title = "Расходы без разбивки / Ej kategoriserade kostnader"
+            else:
+                title = category
+            if has_parts:
+                document_count = len(category_total["document_ids"])
+                count_label = (
+                    "документ" if document_count % 10 == 1 and document_count % 100 != 11
+                    else "документа" if 2 <= document_count % 10 <= 4
+                    and not 12 <= document_count % 100 <= 14
+                    else "документов"
+                )
+                value += f"; {document_count} {count_label}"
+            label.setText(f"{title} · без НДС: {value}")
         self.object_expenses_unallocated_lbl.setText(
             "Не распределено в полных документах (отдельно от доли): "
             + self._expense_money_label(totals["unallocated"])
@@ -9686,6 +9996,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 net = parse_decimal(allocation.get("net_amount"))
                 net_text = f"{net:,.2f} {currency}" if net is not None else "нетто неизвестно"
                 note = str(allocation.get("note") or "").strip()
+                if allocation.get("net_recovered_from_original"):
+                    note = (note + " · " if note else "") + (
+                        "Проверено по оригиналу; сохранённая запись не изменена"
+                    )
                 allocation_descriptions.append(
                     f"{category}: {net_text}" + (f" — {note}" if note else "")
                 )
@@ -9724,11 +10038,317 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     ("Округление фактуры отдельно", "rounding_amount"),
                 )
             ))
-            self.object_expenses_table.item(row_index, 5).setToolTip(
+            net_tooltip = (
                 "Сохранённая доля без НДС." if allocated_net is not None
                 else "Доля без НДС не сохранена или не распознана."
             )
+            if any(part.get("net_recovered_from_original") for part in allocations):
+                net_tooltip += (
+                    "\nПроверено по оригиналу; сохранённая запись не изменена."
+                )
+            elif document.get("net_recovery_status") == "original_unavailable":
+                net_tooltip += "\nОригинал недоступен для проверки."
+            elif document.get("net_recovery_status") == "original_not_verified":
+                net_tooltip += "\nДанные оригинала не прошли сверку."
+            elif document.get("net_recovery_status") == "no_unique_match":
+                net_tooltip += "\nНет однозначного совпадения с заказом оригинала."
+            elif document.get("net_recovery_status") == "partially_recovered":
+                net_tooltip += "\nЧасть долей не подтверждена оригиналом."
+            if document.get("net_recovery_error"):
+                net_tooltip += "\n" + str(document["net_recovery_error"])
+            self.object_expenses_table.item(row_index, 5).setToolTip(net_tooltip)
             self.object_expenses_table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
+
+    def open_expense_category_review(self, *_):
+        selected_object = self.object_expenses_object.currentData()
+        if selected_object in (None, "company"):
+            QMessageBox.information(
+                self, "Категории расходов",
+                "Выберите объект, чтобы разобрать категории его долей расходов.",
+            )
+            return
+        object_id = int(selected_object)
+        date_from = (
+            self.object_expenses_date_from.text().strip()
+            if self.object_expenses_period_enabled.isChecked() else None
+        )
+        date_to = (
+            self.object_expenses_date_to.text().strip()
+            if self.object_expenses_period_enabled.isChecked() else None
+        )
+        documents, _online = self._expense_document_snapshot(date_from, date_to)
+        confirmed, _excluded = collect_object_expenses(
+            documents, object_id, date_from, date_to,
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Разбор расходов по категориям")
+        dialog.resize(1160, 650)
+        dialog.setMinimumSize(980, 500)
+        layout = QVBoxLayout(dialog)
+        instruction = QLabel(
+            "Категория назначается каждой доле отдельно. Предложения основаны на содержании, "
+            "не сохраняются автоматически и не меняют суммы или назначение."
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels([
+            "Подтвердить", "Поставщик / фактура", "Доля без НДС",
+            "Содержание", "Предложенная категория", "Основание",
+            "Оригинал", "Результат",
+        ])
+        table.setColumnWidth(0, 88)
+        table.setColumnWidth(1, 180)
+        table.setColumnWidth(2, 130)
+        table.setColumnWidth(3, 210)
+        table.setColumnWidth(4, 245)
+        table.setColumnWidth(5, 245)
+        table.setColumnWidth(6, 90)
+        table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch,
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.ResizeMode.Stretch,
+        )
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(table, 1)
+
+        review_rows = []
+        for document in confirmed:
+            server_id = document.get("server_document_id") or document.get("id")
+            version = document.get("sync_version")
+            if not isinstance(server_id, int) or version is None:
+                continue
+            allocations = document.get("object_allocations") or []
+            allocation_indexes = document.get("object_allocation_indexes") or []
+            recovery_key = self._object_expense_recovery_key(document, object_id)
+            recovery_entry = self._object_expense_recovery_cache.get(recovery_key) or {}
+            for allocation, allocation_index in zip(allocations, allocation_indexes):
+                share = dict(allocation)
+                share.update(
+                    recovery_entry.get("allocations", {}).get(int(allocation_index), {})
+                )
+                current_category, current_source = confirmed_expense_category(
+                    share.get("expense_category"),
+                    share.get("expense_category_source"),
+                )
+                if current_source == "user":
+                    suggested = current_category
+                    evidence = str(
+                        share.get("expense_category_evidence")
+                        or "Категория ранее подтверждена пользователем."
+                    )
+                else:
+                    suggested, evidence = suggest_expense_category(
+                        document, share, len(document.get("allocations") or []),
+                    )
+                currency = str(document.get("currency_code") or "SEK")
+                net = parse_decimal(share.get("net_amount"))
+                net_label = f"{net:,.2f} {currency}" if net is not None else "Неизвестно"
+                content = str(
+                    share.get("note") or document.get("document_comment")
+                    or "Описание в документе не извлечено."
+                ).strip()
+                row = table.rowCount()
+                table.insertRow(row)
+                include = QTableWidgetItem()
+                include.setFlags(
+                    include.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsEnabled
+                )
+                include.setCheckState(Qt.CheckState.Unchecked)
+                table.setItem(row, 0, include)
+                table.setItem(row, 1, QTableWidgetItem(
+                    f"{document.get('supplier_name') or 'Поставщик не указан'}\n"
+                    f"№ {document.get('invoice_number') or 'не указан'}"
+                ))
+                table.setItem(row, 2, QTableWidgetItem(net_label))
+                table.setItem(row, 3, QTableWidgetItem(content[:240]))
+                category_combo = QComboBox()
+                for category in EXPENSE_CATEGORIES:
+                    category_combo.addItem(category, category)
+                category_index = category_combo.findData(suggested)
+                category_combo.setCurrentIndex(
+                    category_index if category_index >= 0
+                    else category_combo.findData(CATEGORY_UNCLASSIFIED)
+                )
+                table.setCellWidget(row, 4, category_combo)
+                table.setItem(row, 5, QTableWidgetItem(evidence))
+                original_button = QPushButton("Открыть")
+                original_button.clicked.connect(
+                    lambda _checked=False, source=dict(document):
+                    self._open_expense_document_original(source)
+                )
+                table.setCellWidget(row, 6, original_button)
+                table.setItem(row, 7, QTableWidgetItem(
+                    "Текущее подтверждение" if current_source == "user"
+                    else "Предложено · не сохранено"
+                ))
+                table.item(row, 5).setToolTip(evidence)
+                review_rows.append({
+                    "document": dict(document),
+                    "allocation_index": int(allocation_index),
+                    "share": share,
+                    "checkbox": include,
+                    "category_combo": category_combo,
+                    "evidence": evidence,
+                    "status_item": table.item(row, 7),
+                })
+
+        if not review_rows:
+            message = QLabel(
+                "В выбранном объекте нет подтверждённых долей, доступных для категоризации."
+            )
+            message.setWordWrap(True)
+            layout.addWidget(message)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        save_button = QPushButton("Сохранить выбранные категории")
+        save_button.setObjectName("saveCategoryReview")
+        close_button = QPushButton("Закрыть")
+        buttons.addWidget(save_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        close_button.clicked.connect(dialog.reject)
+
+        def save_selected_categories():
+            selected_rows = [
+                row for row in review_rows
+                if row["checkbox"].checkState() == Qt.CheckState.Checked
+            ]
+            if not selected_rows:
+                QMessageBox.information(
+                    dialog, "Категории расходов", "Отметьте доли, которые нужно сохранить.",
+                )
+                return
+            selected_documents = {
+                row["document"].get("id") for row in selected_rows
+            }
+            confirmation = QMessageBox.question(
+                dialog,
+                "Подтверждение категорий",
+                f"Сохранить категории для {len(selected_rows)} долей "
+                f"в {len(selected_documents)} документах?\n\n"
+                "Изменятся только категории и основание выбора. Суммы, НДС, "
+                "округление, распределения, поставщик и статус документа сохраняются.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirmation != QMessageBox.StandardButton.Yes:
+                return
+
+            grouped = {}
+            for row in selected_rows:
+                document_id = row["document"].get("server_document_id") or row["document"].get("id")
+                grouped.setdefault(int(document_id), []).append(row)
+            try:
+                capabilities = request_expense_api(
+                    "GET", "/api/expense-documents/capabilities",
+                )
+                if "allocation_categories_v1" not in capabilities.get("features", []):
+                    raise RuntimeError(
+                        "Сервер не поддерживает категории долей. Записи не изменены."
+                    )
+            except Exception as error:
+                logging.exception("Could not verify allocation category capability")
+                for row in selected_rows:
+                    row["status_item"].setText(f"Не сохранено: {error}")
+                QMessageBox.warning(dialog, "Категории расходов", str(error))
+                return
+
+            saved_count = 0
+            failed_count = 0
+            for document_id, document_rows in grouped.items():
+                try:
+                    response = request_expense_api(
+                        "GET", f"/api/expense-documents/{document_id}",
+                    )
+                    current = dict(response["document"])
+                    expected_version = document_rows[0]["document"].get("sync_version")
+                    if int(current.get("sync_version") or 0) != int(expected_version or 0):
+                        raise RuntimeError(
+                            "Конфликт версии: документ изменился после открытия списка. "
+                            "Обновите данные и повторите выбор."
+                        )
+                    allocations = [
+                        dict(part) for part in current.get("allocations") or []
+                    ]
+                    updates = {}
+                    for row in document_rows:
+                        index = row["allocation_index"]
+                        if index >= len(allocations):
+                            raise RuntimeError(
+                                "Состав долей изменился; документ не обновлён."
+                            )
+                        current_part = allocations[index]
+                        original_part = row["share"]
+                        if (
+                            current_part.get("object_id") != original_part.get("object_id")
+                            or parse_decimal(current_part.get("gross_amount"))
+                            != parse_decimal(original_part.get("gross_amount"))
+                            or parse_decimal(current_part.get("vat_amount"))
+                            != parse_decimal(original_part.get("vat_amount"))
+                        ):
+                            raise RuntimeError(
+                                "Назначение или суммы доли изменились; документ не обновлён."
+                            )
+                        category = row["category_combo"].currentData()
+                        if category == CATEGORY_UNCLASSIFIED:
+                            source = "unclassified"
+                            evidence = "Пользователь оставил долю без разбивки."
+                        else:
+                            source = "user"
+                            evidence = (
+                                f"Пользователь подтвердил категорию. {row['evidence']}"
+                            )
+                        current_part["expense_category"] = category
+                        current_part["expense_category_source"] = source
+                        current_part["expense_category_evidence"] = evidence
+                        updates[index] = row
+
+                    payload = dict(current)
+                    payload["allocations"] = allocations
+                    payload["expected_version"] = int(current["sync_version"])
+                    request_expense_api(
+                        "PUT",
+                        f"/api/expense-documents/{document_id}",
+                        json=payload,
+                    )
+                    saved_count += len(document_rows)
+                    for index, row in updates.items():
+                        row["checkbox"].setCheckState(Qt.CheckState.Unchecked)
+                        row["status_item"].setText(
+                            f"Сохранено, новая версия {int(current['sync_version']) + 1}"
+                        )
+                except Exception as error:
+                    logging.exception(
+                        "Could not save allocation categories for expense %s",
+                        document_id,
+                    )
+                    failed_count += len(document_rows)
+                    for row in document_rows:
+                        row["status_item"].setText(f"Не сохранено: {error}")
+
+            if saved_count:
+                self._invalidate_expense_reads()
+                if getattr(self, "_async_expense_reads", False):
+                    self._expense_read_cache.clear()
+                    self._schedule_expense_read((date_from, date_to))
+                else:
+                    self.load_object_expense_overview()
+            QMessageBox.information(
+                dialog,
+                "Результат категоризации",
+                f"Сохранено долей: {saved_count}. Не сохранено: {failed_count}. "
+                "Для несохранённых строк указан результат.",
+            )
+
+        save_button.clicked.connect(save_selected_categories)
+        dialog.exec()
 
     def _store_expense_originals(self, paths, client_id):
         from expense_documents import document_storage_root
@@ -10344,7 +10964,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 QMessageBox.warning(dialog, "Не сохранено", str(error))
                 return
             dialog.accept()
-            self._selected_expense_identity = client_id
+            self._selected_expense_identity = ("expense-client", str(client_id))
+            self._selected_expense_document_snapshot = {
+                **payload, "client_id": str(client_id),
+            }
             self.load_expense_documents()
             self.background_sync_with_cloud()
             self._offer_hidden_expense_document(payload, "Документ сохранён и поставлен в очередь синхронизации.")
@@ -10908,7 +11531,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 Path(path).unlink(missing_ok=True)
             QMessageBox.warning(self, "Расход", f"Документ не поставлен в очередь: {error}")
             return False
-        self._selected_expense_identity = client_id
+        self._selected_expense_identity = ("expense-client", str(client_id))
+        self._selected_expense_document_snapshot = {
+            **payload, "client_id": str(client_id),
+        }
         self.load_expense_documents()
         self.background_sync_with_cloud()
         if self._offer_hidden_expense_document(

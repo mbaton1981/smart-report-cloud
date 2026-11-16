@@ -425,7 +425,10 @@ def _object_total_summary(data, figures):
     excluded = data.get("excluded_expenses", [])
     snapshot_available = bool(data.get("expense_snapshot_available"))
     expense_net = defaultdict(Decimal)
-    category_net = defaultdict(lambda: {"known": Decimal(0), "unknown_count": 0})
+    category_net = defaultdict(lambda: {
+        "known": Decimal(0), "unknown_count": 0, "allocation_count": 0,
+        "document_ids": set(),
+    })
     unknown_net_by_currency = defaultdict(int)
     foreign_share_count = 0
     unknown_currency_share_count = 0
@@ -442,6 +445,10 @@ def _object_total_summary(data, figures):
                 allocation.get("expense_category_source"),
             )
             category_total = category_net[(currency, category)]
+            category_total["allocation_count"] += 1
+            category_total["document_ids"].add(
+                expense_document_key(document) or str(document.get("id"))
+            )
             net = parse_decimal(allocation.get("net_amount"))
             if net is None:
                 unknown_net_share_count += 1
@@ -571,6 +578,8 @@ def _object_total_summary(data, figures):
                 category: {
                     "known": values["known"],
                     "unknown_count": values["unknown_count"],
+                    "allocation_count": values["allocation_count"],
+                    "document_count": len(values["document_ids"]),
                 }
                 for (entry_currency, category), values in category_net.items()
                 if entry_currency == currency
@@ -983,18 +992,44 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     )
     category_cards = []
     category_values = total_summary["category_net_by_currency"]
+    active_categories = {
+        category
+        for currency_values in category_values.values()
+        for category, values in currency_values.items()
+        if values["allocation_count"]
+    }
     for category, russian_label, swedish_category_label, background in category_specs:
         category_sek = category_values.get("SEK", {}).get(category)
+        if category not in active_categories:
+            continue
         if category_sek is None:
             category_value = (
-                "Okänt" if swedish else "Неизвестно"
-            ) if not data.get("expense_snapshot_available") else display_amount(Decimal(0))
+                "Ingår inte i SEK-totalen" if swedish
+                else "Не включено в итог SEK"
+            )
             unknown_count = 0
+            document_count = sum(
+                values[category]["document_count"]
+                for values in category_values.values()
+                if category in values
+            )
         else:
             category_value = display_amount(category_sek["known"], "SEK")
             unknown_count = category_sek["unknown_count"]
+            document_count = category_sek["document_count"]
+        if category == CATEGORY_UNCLASSIFIED and len(active_categories) == 1:
+            russian_label = "Расходы без разбивки / Ej kategoriserade kostnader"
+            swedish_category_label = "Ej kategoriserade kostnader"
         category_notes = [
             "Belopp exkl. moms" if swedish else "Суммы без НДС",
+            (
+                f"{document_count} dokument" if swedish
+                else f"{document_count} документ"
+                if document_count % 10 == 1 and document_count % 100 != 11
+                else f"{document_count} документа"
+                if 2 <= document_count % 10 <= 4 and not 12 <= document_count % 100 <= 14
+                else f"{document_count} документов"
+            ),
         ]
         if unknown_count:
             category_notes.append(
@@ -1066,10 +1101,13 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             trip_value, trip_note, colors.HexColor("#f0f5f8"), card_width,
         ),
     ] + category_cards
-    cards = Table([
-        category_cards[:4],
-        [*category_cards[4:7], Spacer(1, 1)],
-    ], colWidths=[available / 4] * 4, hAlign="LEFT")
+    card_rows = [
+        category_cards[index:index + 4]
+        for index in range(0, len(category_cards), 4)
+    ]
+    for row in card_rows:
+        row.extend([Spacer(1, 1)] * (4 - len(row)))
+    cards = Table(card_rows, colWidths=[available / 4] * 4, hAlign="LEFT")
     cards.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
@@ -1564,6 +1602,9 @@ def _recover_report_share_tax(data, source_paths, source_errors):
         paths = list(source_paths.get(key, []))
         if source_errors.get(key) or not paths:
             document["net_recovery_status"] = "original_unavailable"
+            document["net_recovery_error"] = (
+                source_errors.get(key) or "В реестре нет доступного оригинала."
+            )
             continue
 
         try:
@@ -1593,8 +1634,9 @@ def _recover_report_share_tax(data, source_paths, source_errors):
         except (
             DocumentExtractionError, OSError, PdfReadError, PdfiumError,
             RuntimeError, ValueError, KeyError,
-        ):
+        ) as error:
             document["net_recovery_status"] = "original_not_verified"
+            document["net_recovery_error"] = str(error)
             continue
 
         remaining = list(parts)

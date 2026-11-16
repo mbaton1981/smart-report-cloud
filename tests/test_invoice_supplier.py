@@ -178,6 +178,49 @@ class InvoiceSupplierTests(unittest.TestCase):
         self.assertEqual(fields["field_sources"]["supplier_name"][0]["kind"],
                          "seller_registration_block")
 
+    def test_recipient_company_is_not_supplier_and_explicit_zero_vat_wins_over_item_price(self):
+        elements = [
+            self.cell("Leverantör", 40, 50, 105, 58),
+            self.cell("Sickla IF", 120, 50, 180, 58),
+            self.cell("Mottagare", 400, 80, 460, 88),
+            self.cell("Bygger och renoverar i Sthlm AB", 400, 95, 565, 103),
+            self.cell("Fakturanummer", 40, 120, 120, 128),
+            self.cell("F202416", 150, 120, 205, 128),
+            self.cell("Fakturadatum", 40, 140, 115, 148),
+            self.cell("2026-11-16", 150, 140, 210, 148),
+            self.cell("Belopp ex moms", 40, 200, 125, 208),
+            self.cell("30 000,00 kr", 200, 200, 270, 208),
+            self.cell("Moms", 400, 200, 430, 208),
+            self.cell("30 000,00 kr", 500, 200, 570, 208),
+            self.cell("Total moms", 40, 230, 105, 238),
+            self.cell("0,00 kr", 200, 230, 240, 238),
+            self.cell("Att betala", 40, 250, 100, 258),
+            self.cell("30 000,00 kr", 200, 250, 270, 258),
+        ]
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "\n".join((
+                "Leverantör: Sickla IF",
+                "Mottagare: Bygger och renoverar i Sthlm AB",
+                "Fakturanummer: F202416",
+                "Fakturadatum: 2026-11-16",
+                "Belopp ex moms: 30 000,00 kr",
+                "Moms: 30 000,00 kr",
+                "Total moms: 0,00 kr",
+                "Att betala: 30 000,00 kr",
+            )),
+            "elements": elements,
+        }])
+
+        self.assertEqual(fields["supplier_name"], "Sickla IF")
+        self.assertNotEqual(fields["supplier_name"], "Bygger och renoverar i Sthlm AB")
+        self.assertEqual(fields["invoice_number"], "F202416")
+        self.assertEqual(fields["document_date"], "2026-11-16")
+        self.assertEqual(fields["net_amount"], "30000.00")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["gross_amount"], "30000.00")
+        self.assertEqual(fields["amount_due"], "30000.00")
+
     def test_receipt_totals_date_order_reference_and_stated_vat(self):
         fields = parse_invoice_pages([{
             "page": 1,

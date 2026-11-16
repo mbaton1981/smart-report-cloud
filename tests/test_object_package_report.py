@@ -228,12 +228,53 @@ class ObjectPackageReportTests(unittest.TestCase):
         normalized_cover = " ".join(cover_text.split())
         self.assertIn("Работа · без НДС", normalized_cover)
         self.assertIn("Поездки · без НДС", normalized_cover)
-        self.assertIn("Материалы и закупки · без НДС", normalized_cover)
-        self.assertIn("Не классифицировано · без НДС", normalized_cover)
+        self.assertIn("Расходы без разбивки / Ej kategoriserade kostnader", normalized_cover)
+        self.assertNotIn("Материалы и закупки · без НДС", normalized_cover)
+        self.assertNotIn("Работы подрядчиков · без НДС", normalized_cover)
+        self.assertIn("1 документ", normalized_cover)
         self.assertIn("50,00 SEK", cover_text)
         self.assertIn("Итого по объекту без НДС", cover_text)
         self.assertIn("175,00 SEK", cover_text)
         self.assertNotIn("60,00 SEK", cover_text)
+
+    def test_pdf_cover_keeps_zero_total_refund_category_visible(self):
+        refund = _document(76, net="0.00", vat="0.00", gross="0.00", allocations=[{
+            "object_id": 42, "destination": "object", "net_amount": "0.00",
+            "vat_amount": "0.00", "gross_amount": "0.00", "rounding_amount": "0.00",
+            "expense_category": CATEGORY_MATERIALS,
+            "expense_category_source": "user",
+            "expense_category_evidence": "Проверено пользователем",
+        }])
+        expenses, excluded = collect_object_expenses([refund], 42)
+        report = {
+            "journal_rows": [], "journal_segments": {}, "prepared_rows": [],
+            "cost_lines": [],
+            "totals": {
+                "work_amount": "0.00", "ob_amount": "0.00",
+                "transport_amount": "0.00", "invoice_total": "0.00",
+            },
+            "warnings": [],
+        }
+        data = {
+            "object": {"id": 42, "name": "Object", "markning": "p1041",
+                       "company": "Customer", "is_active": 1},
+            "period_label": "2026-11-02", "generated_at": "2026-11-03 12:00",
+            "customer_report": report, "include_customer_cost": True,
+            "include_copies": False, "expenses": expenses,
+            "excluded_expenses": excluded, "expense_snapshot_available": True,
+            "incomplete_reasons": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "zero-refund-cover.pdf"
+            write_object_report_package(
+                target, data, font=self.font, bold_font=self.bold_font,
+            )
+            cover_text = " ".join(PdfReader(str(target)).pages[0].extract_text().split())
+
+        self.assertIn("Материалы и закупки · без НДС", cover_text)
+        self.assertIn("0,00 SEK", cover_text)
+        self.assertNotIn("Работы подрядчиков · без НДС", cover_text)
+        self.assertNotIn("Прочие расходы · без НДС", cover_text)
 
     def test_partial_net_and_unknown_work_or_travel_do_not_become_zero(self):
         missing_net = _document(71, net=None, vat=None, gross="20.00", allocations=[{

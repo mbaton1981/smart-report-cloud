@@ -1158,6 +1158,233 @@ class CatalogSyncTests(unittest.TestCase):
         ).fetchone()[0], 1)
         server_conn.close()
 
+    def test_category_review_saves_only_explicit_category_and_rejects_replay(self):
+        from expense_documents import (
+            ensure_expense_allocation_category_schema,
+            migrate_invoice_net_schema,
+        )
+
+        server_conn = self.server.get_db_connection()
+        migrate_invoice_net_schema(server_conn)
+        ensure_expense_allocation_category_schema(server_conn)
+        object_id = int(server_conn.execute(
+            "SELECT id FROM meta_objects WHERE is_active=1 ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        server_conn.close()
+        client_id = str(uuid.uuid4())
+        headers = {"X-Sync-Key": "isolated-sync-test-key"}
+        created = self.server_client.post(
+            "/api/expense-documents",
+            headers=headers,
+            json={
+                "client_id": client_id,
+                "supplier_name": "Dmytro contractor",
+                "invoice_number": "63",
+                "document_date": "2026-11-16",
+                "currency_code": "SEK",
+                "net_amount": "67240.00",
+                "vat_amount": "0.00",
+                "gross_amount": "67240.00",
+                "rounding_amount": "0.00",
+                "amount_due": "67240.00",
+                "verification_status": "confirmed",
+                "recognized_text": "Arbete utförd på objektet",
+                "allocations": [{
+                    "object_id": object_id,
+                    "destination": "object",
+                    "net_amount": "67240.00",
+                    "vat_amount": "0.00",
+                    "gross_amount": "67240.00",
+                    "rounding_amount": "0.00",
+                    "expense_category": "Не классифицировано",
+                    "expense_category_source": "unclassified",
+                    "note": "Arbete utförd på objektet",
+                }],
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        original = created.get_json()["document"]
+        object_row = {"id": object_id, "name": "p1037", "markning": "p1037"}
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        window._expense_objects = [object_row]
+        window._async_expense_reads = False
+        window._object_expense_recovery_cache = {}
+        window._object_expense_recovery_inflight = set()
+        window._object_expense_recovery_requests = {}
+        window._object_expense_recovery_tasks = {}
+        window._object_expense_recovery_request_id = 0
+
+        def fake_api(method, path, **kwargs):
+            response = self.server_client.open(
+                path, method=method, headers=headers,
+                json=kwargs.get("json"), query_string=kwargs.get("params"),
+            )
+            result = response.get_json()
+            if response.status_code >= 400:
+                raise RuntimeError(result.get("error") or f"HTTP {response.status_code}")
+            return result
+
+        def accept_category_review(dialog):
+            table = dialog.findChild(self.desktop.QTableWidget)
+            self.assertEqual(table.rowCount(), 1)
+            table.item(0, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
+            combo = table.cellWidget(0, 4)
+            combo.setCurrentIndex(combo.findData(
+                self.desktop.CATEGORY_SUBCONTRACTOR_WORK,
+            ))
+            with patch.object(
+                self.desktop.QMessageBox, "question",
+                return_value=self.desktop.QMessageBox.StandardButton.Yes,
+            ), patch.object(self.desktop.QMessageBox, "information"):
+                dialog.findChild(
+                    self.desktop.QPushButton, "saveCategoryReview",
+                ).click()
+            self.assertEqual(
+                table.item(0, 7).text(),
+                "Сохранено, новая версия 2",
+            )
+            self.assertEqual(
+                table.item(0, 0).checkState(),
+                self.desktop.Qt.CheckState.Unchecked,
+            )
+            with patch.object(
+                self.desktop.QMessageBox, "information",
+            ) as no_selection:
+                dialog.findChild(
+                    self.desktop.QPushButton, "saveCategoryReview",
+                ).click()
+                no_selection.assert_called_once()
+            dialog.reject()
+            return dialog.result()
+
+        try:
+            with patch.object(window, "_expense_server_objects", return_value=([object_row], True)), \
+                 patch.object(window, "_expense_document_snapshot", return_value=([original], True)), \
+                 patch.object(self.desktop, "request_expense_api", side_effect=fake_api):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+            window.object_expenses_object.setCurrentIndex(
+                window.object_expenses_object.findData(object_id)
+            )
+            with patch.object(
+                window, "_expense_document_snapshot",
+                return_value=([original], True),
+            ), patch.object(
+                self.desktop, "request_expense_api", side_effect=fake_api,
+            ), patch.object(
+                self.desktop.QDialog, "exec", new=accept_category_review,
+            ):
+                window.open_expense_category_review()
+
+            current = self.server_client.get(
+                f"/api/expense-documents/{original['id']}", headers=headers,
+            ).get_json()["document"]
+            self.assertEqual(current["sync_version"], 2)
+            self.assertEqual(current["supplier_name"], original["supplier_name"])
+            self.assertEqual(current["verification_status"], "confirmed")
+            for field in ("net_amount", "vat_amount", "gross_amount", "rounding_amount", "amount_due"):
+                self.assertEqual(current[field], original[field])
+            self.assertEqual(current["allocations"][0]["object_id"], object_id)
+            self.assertEqual(current["allocations"][0]["net_amount"], "67240.00")
+            self.assertEqual(
+                current["allocations"][0]["expense_category"],
+                self.desktop.CATEGORY_SUBCONTRACTOR_WORK,
+            )
+            self.assertEqual(
+                current["allocations"][0]["expense_category_source"], "user",
+            )
+            self.assertIn("пользователь", current["allocations"][0]["expense_category_evidence"].casefold())
+            server_conn = self.server.get_db_connection()
+            self.assertEqual(server_conn.execute(
+                "SELECT COUNT(*) FROM expense_documents WHERE client_id=?", (client_id,)
+            ).fetchone()[0], 1)
+            server_conn.close()
+        finally:
+            window.close()
+            window.deleteLater()
+
+    def test_object_expense_overview_displays_verified_net_without_mutating_share(self):
+        server_conn = self.server.get_db_connection()
+        object_id = int(server_conn.execute(
+            "SELECT id FROM meta_objects WHERE is_active=1 ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        server_conn.close()
+        document = {
+            "id": 7001, "client_id": "verified-original-share",
+            "sync_version": 3, "supplier_name": "Beijer",
+            "invoice_number": "260418715827", "document_date": "2026-10-28",
+            "currency_code": "SEK", "verification_status": "confirmed",
+            "net_amount": None, "vat_amount": None, "gross_amount": "5266.03",
+            "rounding_amount": None, "amount_due": None,
+            "allocations": [{
+                "object_id": object_id, "destination": "object",
+                "net_amount": None, "vat_amount": None, "gross_amount": "5266.03",
+                "rounding_amount": None, "expense_category": "Не классифицировано",
+                "expense_category_source": "unclassified",
+            }],
+        }
+        object_row = {"id": object_id, "name": "p1041", "markning": "p1041"}
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        window._expense_objects = [object_row]
+        window._async_expense_reads = False
+        window._object_expense_recovery_cache = {}
+        window._object_expense_recovery_inflight = set()
+        window._object_expense_recovery_requests = {}
+        window._object_expense_recovery_tasks = {}
+        window._object_expense_recovery_request_id = 0
+        try:
+            with patch.object(
+                window, "_expense_server_objects",
+                return_value=([object_row], True),
+            ), patch.object(
+                window, "_expense_document_snapshot",
+                return_value=([document], True),
+            ), patch.object(self.desktop, "request_expense_api", return_value={"objects": []}):
+                window.setup_expenses_tab()
+                window.setup_object_expenses_tab()
+            combo = window.object_expenses_object
+            combo.blockSignals(True)
+            combo.setCurrentIndex(combo.findData(object_id))
+            combo.blockSignals(False)
+            cache_key = window._object_expense_recovery_key(document, object_id)
+            window._object_expense_recovery_cache[cache_key] = {
+                "allocations": {
+                    0: {
+                        "net_amount": "4213.12", "vat_amount": None,
+                        "rounding_amount": None,
+                        "net_recovered_from_original": True,
+                    },
+                },
+                "status": "verified", "error": None, "verified_count": 1,
+            }
+            with patch.object(
+                window, "_schedule_object_expense_original_recovery",
+            ), patch.object(
+                window, "_expense_document_snapshot",
+                return_value=([document], True),
+            ):
+                window.load_object_expense_overview()
+
+            self.assertIn("SEK 4,213.12", window.object_expenses_net_lbl.text())
+            self.assertIn(
+                "проверено по оригиналу, сохранённая запись не изменена",
+                window.object_expenses_net_lbl.text(),
+            )
+            self.assertEqual(
+                window.object_expenses_table.item(0, 5).text(),
+                "4,213.12 SEK",
+            )
+            self.assertIsNone(document["allocations"][0]["net_amount"])
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_expense_update_rejects_stale_server_version(self):
         client_id = str(uuid.uuid4())
         headers = {"X-Sync-Key": "isolated-sync-test-key"}
@@ -1698,6 +1925,9 @@ class CatalogSyncTests(unittest.TestCase):
             "verification_status": "draft", "allocations": [],
         }
         harness = SimpleNamespace()
+        harness._expense_document_identity = (
+            self.desktop.SmartReportApp._expense_document_identity
+        )
         queue = self.desktop.SmartReportApp.queue_expense_document_operation
 
         def fake_request(method, url, headers=None, timeout=None, **kwargs):
@@ -1735,12 +1965,15 @@ class CatalogSyncTests(unittest.TestCase):
             queue(harness, second_client, "upsert",
                   {**fields, "client_id": second_client, "document_comment": "re-imported draft"},
                   attachment_paths=[path])
-            harness._selected_expense_identity = second_client
+            harness._selected_expense_identity = ("expense-client", second_client)
             result = self.desktop.SmartReportApp._sync_expense_document_outbox(harness)
             # Восстановление выполняется в том же проходе: карточка доступна сразу после сохранения.
             self.assertEqual(result["synced"], 1, result)
             self.assertEqual(result["conflicts"], 0)
-            self.assertEqual(harness._selected_expense_identity, first_client)
+            self.assertEqual(
+                harness._selected_expense_identity,
+                ("expense-client", first_client),
+            )
 
         self.assertEqual(outbox_rows(), [])
         server_conn = self.server.get_db_connection()
@@ -3998,6 +4231,70 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_expense_selection_uses_namespaced_identity_and_unchanged_refresh_is_noop(self):
+        review_draft = {
+            "id": "incoming:6", "incoming_document_id": 6, "client_id": "incoming:6",
+            "supplier_name": "St1", "invoice_number": "ST1-6", "document_date": "2026-11-16",
+            "currency_code": "SEK", "gross_amount": "125.00", "net_amount": "100.00",
+            "vat_amount": "25.00", "verification_status": "requires_review",
+            "allocations": [], "attachments": [],
+        }
+        registered_expense = {
+            "id": 6, "client_id": "registered-id-6", "supplier_name": "Other AB",
+            "invoice_number": "ID06", "document_date": "2026-11-16", "currency_code": "SEK",
+            "gross_amount": "250.00", "net_amount": "200.00", "vat_amount": "50.00",
+            "verification_status": "confirmed", "allocations": [], "attachments": [],
+        }
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        try:
+            with patch.object(window, "_expense_server_objects", return_value=([], True)):
+                window.setup_expenses_tab()
+            with patch.object(
+                window, "_expense_register_snapshot",
+                return_value=([review_draft, registered_expense], True),
+            ):
+                window.exp_date_from.setText("2026-01-01")
+                window.exp_date_to.setText("2027-01-01")
+                window.load_expense_documents()
+                table = window.table_supplier_documents
+                review_row = next(
+                    row for row in range(table.rowCount())
+                    if table.item(row, 0).data(self.desktop.Qt.ItemDataRole.UserRole)["invoice_number"] == "ST1-6"
+                )
+                table.setCurrentCell(review_row, 1)
+                selected_item = table.item(review_row, 0)
+                window.load_expense_documents()
+
+            selected = table.item(table.currentRow(), 0).data(self.desktop.Qt.ItemDataRole.UserRole)
+            self.assertEqual(selected["invoice_number"], "ST1-6")
+            self.assertIs(table.item(review_row, 0), selected_item)
+            self.assertEqual(
+                window._expense_document_identity(review_draft),
+                ("expense-client", "incoming:6"),
+            )
+            self.assertNotEqual(
+                window._expense_document_identity(review_draft),
+                window._expense_document_identity(registered_expense),
+            )
+            with patch.object(
+                window, "_expense_register_snapshot",
+                return_value=([registered_expense], True),
+            ):
+                window.load_expense_documents()
+                self.assertEqual(table.currentRow(), -1)
+                self.assertIn("больше не найден", window._expense_selection_message)
+                missing_identity = window._selected_expense_identity
+                window.load_expense_documents()
+                self.assertEqual(table.currentRow(), -1)
+                self.assertEqual(window._selected_expense_identity, missing_identity)
+                self.assertIn("больше не найден", window._expense_selection_message)
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_queue_and_synced_documents_share_period_filter(self):
         client_id = str(uuid.uuid4())
         undated_id = str(uuid.uuid4())
@@ -4257,10 +4554,13 @@ class CatalogSyncTests(unittest.TestCase):
                  patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 window.upload_expense_document()
             hidden_prompt.assert_called_once()
+            desktop_conn = self.desktop.get_db_connection()
+            queued_document = json.loads(desktop_conn.execute(
+                "SELECT payload_json FROM expense_document_outbox").fetchone()[0])
+            desktop_conn.close()
             self.assertEqual(
                 window._selected_expense_identity,
-                json.loads(self.desktop.get_db_connection().execute(
-                    "SELECT payload_json FROM expense_document_outbox").fetchone()[0])["client_id"],
+                window._expense_document_identity(queued_document),
             )
             desktop_conn = self.desktop.get_db_connection()
             outbox = desktop_conn.execute(

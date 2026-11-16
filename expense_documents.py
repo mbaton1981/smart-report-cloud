@@ -172,7 +172,7 @@ def parse_document_text(text: str) -> dict[str, Any]:
         document_date = transfer_date or document_date
     due_date = _date_value(_label_value(lines, r"Förfallodatum|Forfallodatum|Due\s*date|Payment\s*due"))
 
-    net_raw = _label_value(lines, r"Netto|Belopp\s+exkl\.?\s*moms|Summa\s+exkl\.?\s*moms|Amount\s+excl\.?\s*VAT")
+    net_raw = _label_value(lines, r"Netto|Belopp\s+ex(?:kl)?\.?\s*moms|Summa\s+exkl\.?\s*moms|Amount\s+excl\.?\s*VAT")
     due_raw = _label_value(lines, r"Att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Amount\s+due")
     gross_labels = (
         r"Summa\s+totalt|Total\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|"
@@ -526,7 +526,7 @@ def invoice_seller_blocks(cells, page):
     )
     for cell in cells:
         value = cell["text"].strip()
-        if any(re.match(r"^(?:Faktura(?:mottagare|adress)|Fakturerat\s+till|Faktureringsadress|Betalningsavsändare|Köparens\s+adress|Köpare|Buyer|Leveransadress)\b", other["text"], re.IGNORECASE)
+        if any(re.match(r"^(?:Faktura(?:mottagare|adress)|Mottagare|Fakturerat\s+till|Faktureringsadress|Betalningsavsändare|Köparens\s+adress|Köpare|Buyer|Leveransadress)\b", other["text"], re.IGNORECASE)
                and abs(other["x0"] - cell["x0"]) < 24 and 0 <= cell["y0"] - other["y0"] < 100
                for other in cells):
             continue
@@ -777,6 +777,7 @@ def required_document_fields(document_type):
 def parse_invoice_pages(pages):
     text = "\n\n".join(str(page.get("text") or "") for page in pages)
     fields = parse_document_text(text)
+    text_supplier_name = fields.get("supplier_name")
     non_invoice_type = fields.get("non_invoice_document_type")
     if (non_invoice_type == "tax_decision"
             and re.search(r"^\s*Beslut\s+om\s+infrastrukturavgift\s*$",
@@ -792,7 +793,7 @@ def parse_invoice_pages(pages):
         "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date|Date",
         "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda(?:\s+senast)?|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
-        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+exkl\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
+        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+ex(?:kl)?\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms\s+totalt|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
         "amount_due": r"Att\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalt\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
@@ -992,6 +993,12 @@ def parse_invoice_pages(pages):
                             other["text"].strip(), re.IGNORECASE) for other in row if other is not cell)
                                for row in rows):
                         continue
+                if (key == "vat_amount" and re.fullmatch(r"Moms", cell_text, re.IGNORECASE)
+                        and re.search(
+                            r"\b(?:Total\s+moms|Moms\s+totalt|Moms\s*belopp)\b",
+                            "\n".join(page_lines), re.IGNORECASE,
+                        )):
+                    continue
                 if key == "gross_amount" and any(
                     cell in row and any(
                         other["x1"] <= cell["x0"]
@@ -1078,6 +1085,18 @@ def parse_invoice_pages(pages):
     ):
         if not candidates[key]:
             candidates[key].extend(fallbacks)
+    if not candidates["supplier_name"] and text_supplier_name:
+        supplier_page = next((
+            page for page in pages
+            if re.search(r"^\s*(?:Leverantör|Leverantor|Supplier|Seller)\s*[:\s]",
+                         str(page.get("text") or ""), re.IGNORECASE | re.MULTILINE)
+        ), pages[0] if pages else {})
+        candidates["supplier_name"].append((text_supplier_name, {
+            "page": supplier_page.get("page", 1),
+            "text": text_supplier_name,
+            "caption": "explicit supplier label",
+            "kind": "explicit_supplier_label",
+        }))
     if not candidates["supplier_name"] and companies:
         priority = max(item[0] for item in companies)
         best = [item for item in companies if item[0] == priority]
