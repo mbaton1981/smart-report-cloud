@@ -889,7 +889,7 @@ def parse_invoice_pages(pages):
         "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date|Date",
         "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda(?:\s+senast)?|Tillhanda\s+senast|Due\s*date|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
-        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Summa\s+netto|Varuvärde|Belopp\s+ex(?:kl)?\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
+        "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Artiklar\s+ex\.?\s*moms|Summa\s+netto|Varuvärde|Belopp\s+ex(?:kl)?\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms\s+totalt|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
         "amount_due": r"A(?:tt)?\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalt\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
@@ -905,7 +905,10 @@ def parse_invoice_pages(pages):
         labels["vat_amount"] += r"|Varav\s+moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?"
     if fields.get("document_type") == "credit_note":
         labels["amount_due"] += r"|Summa\s+er\s+tillgodo|Belopp\s+att\s+återfå"
-    amount_caption_patterns = tuple(labels.values()) + (r"Bankkonto\s*(?:nr\.?|nummer)?",)
+    amount_caption_patterns = tuple(labels.values()) + (
+        r"Frakt\s+ex(?:kl)?\.?\s*moms",
+        r"Bankkonto\s*(?:nr\.?|nummer)?",
+    )
     candidates = {key: [] for key in labels}
     fiscal_summary_matches = {"vat_amount": [], "gross_amount": []}
     companies = []
@@ -971,7 +974,7 @@ def parse_invoice_pages(pages):
         }
         elements = page["elements"]
         if elements:
-            rows = invoice_layout_rows(elements, labels.values())
+            rows = invoice_layout_rows(elements, amount_caption_patterns)
         else:
             rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
                     for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
@@ -1166,7 +1169,7 @@ def parse_invoice_pages(pages):
                                                 and checked_value(key, item["text"]) is not None]
                     neighbors = [other for other in cells if other is not cell and (
                         4 < other["y0"] - cell["y0"] < 42
-                            and (cell["x0"] - 5 <= other["x0"] < right_edge - 5
+                            and (cell["x0"] - 5 <= (other["x0"] + other["x1"]) / 2 < right_edge - 5
                                 or abs(other["x1"] - cell["x1"]) < 6)
                         and not any(is_caption(between) and cell["y0"] + 4 < between["y0"] <= other["y0"] + 2
                                     and abs(between["x0"] - cell["x0"]) < 25 for between in cells)
@@ -1305,6 +1308,29 @@ def parse_invoice_pages(pages):
             }]
         elif abs(expected_gross - gross_value) > Decimal("0.02"):
             diagnostics.append("Сумма без НДС + НДС не совпадает с итогом до округления.")
+        due_value = parse_decimal(fields.get("amount_due"))
+        explicit_invoice_total = any(
+            source.get("kind") in {"invoice_total", "fiscal_summary_total"}
+            and re.search(r"\bFakturabelopp\b", str(source.get("caption") or ""), re.IGNORECASE)
+            for source in field_sources.get("amount_due", [])
+        )
+        if (
+            fields.get("rounding_amount") is None
+            and not fields.get("prepaid")
+            and explicit_invoice_total
+            and due_value is not None
+            and gross_value == expected_gross == due_value
+        ):
+            fields["rounding_amount"] = "0.00"
+            field_sources["rounding_amount"] = [{
+                "kind": "derived_from_stated_totals",
+                "operation": "invoice_total_minus_net_and_vat",
+                "sources": (
+                    field_sources.get("amount_due", [])
+                    + field_sources.get("net_amount", [])
+                    + field_sources.get("vat_amount", [])
+                ),
+            }]
     if (fields.get("document_type") == "receipt" and gross_value is not None
             and fields.get("currency_code") == "USD"):
         line_total = _receipt_line_amount_total(text, fields.get("currency_code"))

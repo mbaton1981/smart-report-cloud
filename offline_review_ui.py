@@ -17,12 +17,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
     QStyledItemDelegate, QStyle,
 )
-from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
 from document_preview import DocumentGalleryDialog
 from expense_documents import (
-    DocumentExtractionError, match_objects, object_marker_evidence, object_marking_matches,
+    DocumentExtractionError, extract_local_document, match_objects, object_marker_evidence, object_marking_matches,
     pages_with_insufficient_text, parse_invoice_pages, parse_invoice_money, decimal_text,
 )
 from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
@@ -488,13 +487,20 @@ class OfflineReviewWindow(QDialog):
         self.update_allocation_total()
 
     def _object_marker_suggestions(self):
-        reader = PdfReader(str(self.store.original(self.document_id)))
-        if reader.is_encrypted:
-            raise DocumentExtractionError("Зашифрованный PDF нельзя прочитать без пароля.")
-        page_texts = tuple((page.extract_text() or "").strip() for page in reader.pages)
+        extraction = extract_local_document(self.store.original(self.document_id))
+        page_texts = tuple((text or "").strip() for text in extraction.pages)
         self.original_page_texts = page_texts
         if not page_texts:
             raise DocumentExtractionError("В оригинале не найдены страницы для проверки маркировок.")
+        page_elements = extraction.page_elements or tuple(() for _ in page_texts)
+        self.original_pages = tuple(
+            {
+                "page": number,
+                "text": text,
+                "elements": page_elements[number - 1] if number <= len(page_elements) else (),
+            }
+            for number, text in enumerate(page_texts, 1)
+        )
         marker_evidence = object_marker_evidence(page_texts)
         unreadable_pages = pages_with_insufficient_text(page_texts)
         if unreadable_pages:
@@ -532,9 +538,7 @@ class OfflineReviewWindow(QDialog):
         page_texts = getattr(self, "original_page_texts", ())
         if not page_texts or pages_with_insufficient_text(page_texts):
             return None
-        fields = parse_invoice_pages([
-            {"page": number, "text": text} for number, text in enumerate(page_texts, 1)
-        ])
+        fields = parse_invoice_pages(getattr(self, "original_pages", ()))
         money = {
             key: parse_invoice_money(fields.get(key))
             for key in ("net_amount", "vat_amount", "gross_amount", "rounding_amount", "amount_due")
@@ -549,6 +553,10 @@ class OfflineReviewWindow(QDialog):
         for key in ("net_amount", "vat_amount", "rounding_amount"):
             if not sources.get(key) or not any(
                 source.get("kind") in {"invoice_total", "fiscal_summary_total"}
+                or key == "rounding_amount"
+                and source.get("kind") == "derived_from_stated_totals"
+                and source.get("operation") == "invoice_total_minus_net_and_vat"
+                and money["rounding_amount"] == 0
                 for source in sources[key]
             ):
                 return None
@@ -627,6 +635,7 @@ class OfflineReviewWindow(QDialog):
                 + escape(str(error))
             )
             self.original_page_texts = ()
+            self.original_pages = ()
             marker_evidence, object_suggestions, marker_warning = [], [], str(error)
         else:
             evidence_text = "; ".join(dict.fromkeys(
@@ -1629,10 +1638,20 @@ class OfflineReviewWindow(QDialog):
             new_text = ("не распознано при повторном разборе"
                         if new_value in (None, "", "UNKNOWN") else str(new_value))
             evidence = (recognized.get("field_sources") or {}).get(key) or []
-            evidence_text = "; ".join(
-                f"стр. {source.get('page')}: {source.get('text') or source.get('operation') or source.get('kind')}"
-                for source in evidence[:2]
-            )
+
+            def format_source(source):
+                pages = list(dict.fromkeys(
+                    str(item["page"])
+                    for item in (source, *(source.get("sources") or []))
+                    if item.get("page") not in (None, "")
+                ))
+                detail = source.get("text") or {
+                    "net_plus_vat": "нетто + НДС",
+                    "invoice_total_minus_net_and_vat": "итог фактуры минус нетто и НДС",
+                }.get(source.get("operation"), source.get("operation") or source.get("kind"))
+                return f"{'стр. ' + ', '.join(pages) + ': ' if pages else ''}{detail}"
+
+            evidence_text = "; ".join(format_source(source) for source in evidence[:2])
             line = f"{labels.get(key, key)}: «{old_text}» → «{new_text}»"
             if evidence_text:
                 line += f" ({evidence_text})"

@@ -63,6 +63,44 @@ def st1_product_summary_page():
     }
 
 
+def bauhaus_compact_summary_page():
+    def cell(text, x, y, width=60):
+        return {"text": text, "x0": x, "y0": y, "x1": x + width, "y1": y + 10}
+
+    return {
+        "page": 1,
+        "source": "synthetic-bauhaus-compact-invoice.pdf",
+        "text": (
+            "Faktura 405685006\nFakturadatum 17.11.2026\nArtiklar ex. moms\n"
+            "Moms % Frakt ex. Moms Artiklar ex. moms Moms\n"
+            "25,0% 724,74 SEK 181,19 SEK\n"
+            "Avrundning Fakturabelopp\n"
+            "Totalsumma 724,74 SEK 181,19 SEK 905,93 SEK\n"
+            "Betalt belopp: 0,00 SEK\nTotalt belopp: 905,93 SEK"
+        ),
+        "elements": [
+            cell("Faktura", 20, 20),
+            cell("Faktura 405685006", 20, 40),
+            cell("Fakturadatum 17.11.2026", 20, 60),
+            cell("Moms %", 127, 518, 36),
+            cell("Frakt ex. Moms", 192, 518, 64),
+            cell("Artiklar ex. moms", 266, 518, 75),
+            cell("Moms", 402, 518, 25),
+            cell("Avrundning", 463, 518, 50),
+            cell("Fakturabelopp", 518, 518, 61),
+            cell("25,0%", 140, 533, 25),
+            cell("724,74SEK", 294, 533, 47),
+            cell("181,19SEK", 378, 533, 46),
+            cell("Totalsumma", 32, 549, 58),
+            cell("724,74SEK", 294, 549, 47),
+            cell("181,19SEK", 378, 549, 46),
+            cell("905,93 SEK", 534, 549, 62),
+            cell("Betalt belopp: 0,00 SEK", 484, 565, 98),
+            cell("Totalt belopp: 905,93 SEK", 474, 581, 108),
+        ],
+    }
+
+
 class InvoiceSummaryTotalTests(unittest.TestCase):
     def test_four_page_reverse_charge_summary_total_does_not_require_vat(self):
         pages = [{"page": page, "text": "Faktura\nBenämning\nService item 100,00"} for page in (1, 2, 3)]
@@ -97,6 +135,20 @@ class InvoiceSummaryTotalTests(unittest.TestCase):
         self.assertIsNone(fields["rounding_amount"])
         self.assertEqual(fields["field_sources"]["vat_amount"][0]["kind"], "fiscal_summary_total")
         self.assertEqual(fields["field_sources"]["vat_amount"][0]["page"], 2)
+
+    def test_bauhaus_compact_summary_reads_net_vat_and_exact_zero_rounding(self):
+        fields = parse_invoice_pages([bauhaus_compact_summary_page()])
+
+        self.assertEqual(fields["net_amount"], "724.74")
+        self.assertEqual(fields["vat_amount"], "181.19")
+        self.assertEqual(fields["gross_amount"], "905.93")
+        self.assertEqual(fields["amount_due"], "905.93")
+        self.assertEqual(fields["rounding_amount"], "0.00")
+        self.assertFalse(fields["prepaid"])
+        self.assertEqual(
+            fields["field_sources"]["rounding_amount"][0]["operation"],
+            "invoice_total_minus_net_and_vat",
+        )
 
     def test_current_classification_does_not_mutate_saved_reasons(self):
         original = {"raw_text": "Påminnelse", "document_type": "invoice", "review_reasons": ["Original"]}

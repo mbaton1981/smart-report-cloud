@@ -1,5 +1,20 @@
 # Invoice Recognition and Net Allocations
 
+## Bauhaus 405685006 compact one-page summary
+
+The retained 17.11.2026 original has one readable page and a native text layer;
+OCR was not required. Its adjacent `Frakt ex. Moms` and `Artiklar ex. moms`
+captions were grouped into one layout cell, while the nearby VAT amount fell
+inside the net-column boundary. The parser now separates the captions and
+rejects boundary-overlap candidates, reading net 724.74 SEK, VAT 181.19 SEK,
+and the stated invoice total 905.93 SEK from page 1.
+
+Gross is derived only from the stated net and VAT. Rounding is derived as
+invoice total minus net and VAT only when those explicit totals agree exactly
+and no prepayment indication exists; it is 0.00 SEK for this document. No VAT
+rate, order sum, or amount due is invented. Re-recognition previews show
+derived-field evidence with its source page rather than an invalid `None` page.
+
 ## Receipt identity, totals and currency-aware review
 
 Receipt parsing keeps the receipt/check number, order number and payment

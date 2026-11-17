@@ -1121,8 +1121,9 @@ def merge_server_object_catalog(cursor, remote_objects):
                         merge_service_aliases(sync_id, company, service_aliases)
                     if local_revision == server_revision:
                         cursor.execute(
-                            "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ?",
-                            (server_id, int(local["id"]), sync_id),
+                            "UPDATE objects SET server_id = ? WHERE id = ? AND sync_id = ? "
+                            "AND (server_id IS NULL OR server_id <> ?)",
+                            (server_id, int(local["id"]), sync_id, server_id),
                         )
                         continue
                 if local['name'] != name:
@@ -2010,7 +2011,7 @@ class EmployeeStatusTask(QRunnable):
 
 
 class SyncWorker(QThread):
-    completed = pyqtSignal(bool, int, int, int, int, int, str, str, str)
+    completed = pyqtSignal(bool, int, int, int, int, int, str, str, str, bool, bool, bool)
 
     def __init__(self, window):
         super().__init__(window)
@@ -2024,9 +2025,11 @@ class SyncWorker(QThread):
                 result["unresolved_legacy"], result["imported_employees"],
                 result["unresolved_employees"], result["conflict_details"],
                 result["unresolved_legacy_details"], "",
+                result["shift_data_changed"], result["catalog_data_changed"],
+                result["expense_data_changed"],
             )
         except Exception as error:
-            self.completed.emit(False, 0, 0, 0, 0, 0, "", "", str(error))
+            self.completed.emit(False, 0, 0, 0, 0, 0, "", "", str(error), False, False, False)
 
 def parse_float(val_str, default=0.0):
     if not val_str:
@@ -2731,6 +2734,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self._expense_read_busy = False
         self._expense_read_task = None
         self._expense_online = False
+        self._expense_read_force_refresh = False
         self._object_expense_recovery_cache = {}
         self._object_expense_recovery_inflight = set()
         self._object_expense_recovery_requests = {}
@@ -3759,6 +3763,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def perform_sync_logic(self):
         if ISOLATED_CANDIDATE or ASSISTANT_CANDIDATE:
             raise RuntimeError("Синхронизация отключена в изолированном кандидате.")
+        shift_data_changed = False
+        catalog_data_changed = False
+        expense_data_changed = False
         ensure_sync_dataset()
         headers = sync_headers()
         downloaded_ids = []
@@ -3804,12 +3811,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            changes_before = conn.total_changes
             for shift in downloaded:
                 remote_type = shift.get('record_type', shift.get('submission_type', RECORD_TYPE_WORK))
                 if remote_type == RECORD_TYPE_OB and not local_ob_enabled:
                     continue
                 self.apply_remote_shift(cursor, shift)
                 downloaded_ids.append(shift['id'])
+            shift_data_changed = conn.total_changes > changes_before
             conn.commit()
         except Exception:
             conn.rollback()
@@ -3827,12 +3836,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM shift_sync_state WHERE name = 'cursor'")
         current_cursor = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM shifts WHERE (entry_type = 'ob' AND (start_time IS NULL OR end_time IS NULL)) OR (entry_type = 'work' AND (rate = 0 OR rate IS NULL) AND (transport = 0 OR transport IS NULL))")
-        has_suspicious_or_incomplete = cursor.fetchone()[0] > 0
         conn.close()
 
         manual_requested = bool(getattr(self, '__dict__', {}).get('_manual_sync_requested', False))
-        pull_since = 0 if (manual_requested or has_suspicious_or_incomplete) else current_cursor
+        pull_since = 0 if manual_requested else current_cursor
         response = requests.get(
             f"{CLOUD_URL}/sync/pull", headers=headers, params={"since": pull_since}, timeout=4
         )
@@ -3842,6 +3849,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            changes_before = conn.total_changes
             cache_terms(cursor, pulled.get("customer_terms", []))
             blocked_ob_sequences = []
             for shift in pulled.get('changes', []):
@@ -3850,6 +3858,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     blocked_ob_sequences.append(int(shift.get('change_seq', current_cursor + 1)))
                     continue
                 self.apply_remote_shift(cursor, shift)
+            shift_data_changed = (
+                shift_data_changed or conn.total_changes > changes_before
+            )
             next_cursor = pulled.get('cursor', current_cursor)
             if blocked_ob_sequences:
                 next_cursor = max(current_cursor, min(blocked_ob_sequences) - 1)
@@ -3929,6 +3940,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             cursor = conn.cursor()
             try:
                 cursor.execute("BEGIN IMMEDIATE")
+                changes_before = conn.total_changes
                 for change in changes:
                     result = results.get(change['operation_id'], {})
                     if result.get('ok'):
@@ -3961,6 +3973,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         cursor.execute("UPDATE shift_sync_outbox SET state = 'conflict' WHERE operation_id = ?", (change['operation_id'],))
                         if change["operation"] == "delete" and result.get("current"):
                             self.apply_remote_shift(cursor, result["current"])
+                shift_data_changed = (
+                    shift_data_changed or conn.total_changes > changes_before
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -3981,7 +3996,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            changes_before = conn.total_changes
             catalog_stats = merge_server_object_catalog(cursor, catalog_result.get("objects"))
+            catalog_data_changed = conn.total_changes > changes_before
             conn.commit()
         except Exception:
             conn.rollback()
@@ -4077,6 +4094,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             cursor = conn.cursor()
             try:
                 cursor.execute("BEGIN IMMEDIATE")
+                changes_before = conn.total_changes
                 for event in employee_events:
                     result = employee_results_by_id[event["operation_id"]]
                     if result.get("stale") and not result.get("equivalent"):
@@ -4094,6 +4112,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             "DELETE FROM employee_sync_outbox WHERE operation_id = ? AND employee_name = ?",
                             (event["operation_id"], event["name"]),
                         )
+                catalog_data_changed = (
+                    catalog_data_changed or conn.total_changes > changes_before
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -4114,6 +4135,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             cursor = conn.cursor()
             try:
                 cursor.execute("BEGIN IMMEDIATE")
+                changes_before = conn.total_changes
                 for event in object_events:
                     result = object_results_by_id[event["operation_id"]]
                     if result.get("stale"):
@@ -4168,6 +4190,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             (result.get("server_object_id"), int(event["object_id"]), event["sync_id"]),
                         )
                     cursor.execute("DELETE FROM object_sync_outbox WHERE operation_id = ?", (event["operation_id"],))
+                catalog_data_changed = (
+                    catalog_data_changed or conn.total_changes > changes_before
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -4187,8 +4212,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         cursor = conn.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
+            changes_before = conn.total_changes
             employee_catalog_stats = merge_server_employee_catalog(
                 cursor, employee_catalog_result.get("employees")
+            )
+            catalog_data_changed = (
+                catalog_data_changed or conn.total_changes > changes_before
             )
             conn.commit()
         except Exception:
@@ -4201,7 +4230,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             payroll_response = requests.get(f"{CLOUD_URL}/sync/payroll", headers=headers, timeout=20)
             raise_for_sync_response(payroll_response)
             payroll_ui.cache(sys.modules[__name__], payroll_response.json()["events"])
-        self._expense_read_dirty = getattr(self, "_expense_read_dirty", False) or bool(expense_sync_result.get("synced") or expense_sync_result.get("conflicts"))
+        expense_data_changed = bool(
+            expense_sync_result.get("synced") or expense_sync_result.get("conflicts")
+        )
+        self._expense_read_dirty = (
+            getattr(self, "_expense_read_dirty", False) or expense_data_changed
+        )
         conflicts += expense_sync_result["conflicts"]
         if expense_sync_result["conflicts"]:
             sync_conflict_reasons["конфликт расходных документов"] = expense_sync_result["conflicts"]
@@ -4220,25 +4254,42 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "unresolved_employees": employee_catalog_stats["unresolved"],
             "conflict_details": conflict_details,
             "unresolved_legacy_details": unresolved_legacy_details,
+            "shift_data_changed": shift_data_changed,
+            "catalog_data_changed": catalog_data_changed,
+            "expense_data_changed": expense_data_changed,
         }
 
     def _on_sync_completed(
         self, success, conflicts, linked_legacy, unresolved_legacy,
         imported_employees, unresolved_employees, conflict_details,
-        unresolved_legacy_details, error,
+        unresolved_legacy_details, error, shift_data_changed=False,
+        catalog_data_changed=False, expense_data_changed=False,
     ):
         self._sync_worker = None
+        manual_requested = self._manual_sync_requested
         if success:
-            self.load_shifts_history()
-            if getattr(self, "tabs", None) and self.tabs.currentIndex() == 6:
+            if shift_data_changed or catalog_data_changed or manual_requested:
+                self.load_shifts_history()
+            if (
+                (catalog_data_changed or manual_requested)
+                and getattr(self, "tabs", None)
+                and self.tabs.currentIndex() == 6
+            ):
                 self.load_service_categories_table()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3 and hasattr(self, "table_supplier_documents"):
-            if getattr(self, "_async_expense_reads", False) and (getattr(self, "_expense_read_dirty", False) or self._manual_sync_requested):
+            if getattr(self, "_async_expense_reads", False) and (
+                getattr(self, "_expense_read_dirty", False)
+                or self._manual_sync_requested
+                or expense_data_changed
+            ):
                 self._expense_read_dirty = False
+                self._expense_read_force_refresh = True
                 self._invalidate_expense_reads()
                 self._schedule_expense_read((self.exp_date_from.text().strip(), self.exp_date_to.text().strip()))
                 self.exp_api_status_lbl.setText("Изменения синхронизированы; обновление реестра в фоне.")
-            else:
+            elif getattr(self, "_async_expense_reads", False):
+                self._schedule_expense_read((self.exp_date_from.text().strip(), self.exp_date_to.text().strip()))
+            elif expense_data_changed or manual_requested or getattr(self, "_expense_read_dirty", False):
                 self.load_expense_documents()
                 if self.exp_document_tabs.currentIndex() == 1:
                     self.load_object_expense_overview()
@@ -8740,25 +8791,40 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self._expense_refresh_again = False
         self._expense_read_busy = False
         self._expense_read_task = None
+        was_online = self._expense_online
         self._expense_online = not error
         self._expense_read_error = error
         self._expense_read_attempts[key] = time.monotonic()
+        objects_changed = False
+        documents_changed = False
         if not error:
-            incoming_changed = (self._expense_read_cache.get(key) != list(documents)
-                                or self._expense_objects != list(objects))
+            documents_changed = self._expense_read_cache.get(key) != list(documents)
+            objects_changed = self._expense_objects != list(objects)
             self._expense_read_cache[key] = list(documents)
             self._expense_objects = list(objects)
-            incoming = getattr(self, "_incoming_viewer", None)
-            if incoming is not None and incoming_changed:
-                incoming.refresh_server_review()
+        incoming_changed = (
+            documents_changed or objects_changed or was_online != self._expense_online
+        )
+        force_refresh = getattr(self, "_expense_read_force_refresh", False)
+        self._expense_read_force_refresh = False
+        should_refresh = incoming_changed or force_refresh
+        if error and hasattr(self, "exp_api_status_lbl"):
+            self.exp_api_status_lbl.setText(
+                f"Общий реестр недоступен; сохранённый снимок не изменён. {error}"
+            )
+        incoming = getattr(self, "_incoming_viewer", None)
+        if incoming is not None and should_refresh:
+            incoming.refresh_server_review()
         if refresh_again:
             self._expense_read_attempts.clear()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3:
-            self.load_expense_document_filters()
-            self.load_expense_documents()
-            if self.exp_document_tabs.currentIndex() == 1:
-                self.load_object_expense_overview()
-        elif getattr(self, "tabs", None) and self.tabs.currentIndex() == 5:
+            if objects_changed or was_online != self._expense_online:
+                self.load_expense_document_filters()
+            if should_refresh:
+                self.load_expense_documents()
+                if self.exp_document_tabs.currentIndex() == 1:
+                    self.load_object_expense_overview()
+        elif should_refresh and getattr(self, "tabs", None) and self.tabs.currentIndex() == 5:
             self.load_object_overview()
         requested = getattr(self, "_expense_requested_key", key)
         if requested != key or refresh_again:

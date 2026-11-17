@@ -201,6 +201,30 @@ class IncomingDisplayTests(unittest.TestCase):
                     "Avrundning 0.00 SEK", "Att betala 1068.70 SEK",
                 )),
             )
+
+            def cell(text, x, y, width=65):
+                return {"text": text, "x0": x, "y0": y, "x1": x + width, "y1": y + 10}
+
+            window.original_pages = ({
+                "page": 2, "source": "synthetic-bauhaus-full-invoice.pdf",
+                "text": (
+                    "Fakturasammanställning\nArtiklar ex. moms\nMoms\nAvrundning\n"
+                    "Fakturabelopp\nTotalsumma 854,96 SEK 213,74 SEK 0,00 SEK 1 068,70 SEK\n"
+                    "Att betala 1 068,70 SEK"
+                ),
+                "elements": [
+                    cell("Artiklar ex. moms", 266, 518, 87),
+                    cell("Moms", 402, 518, 30),
+                    cell("Avrundning", 463, 518, 64),
+                    cell("Fakturabelopp", 534, 518, 78),
+                    cell("Totalsumma", 32, 549, 58),
+                    cell("854,96 SEK", 294, 549, 52),
+                    cell("213,74 SEK", 379, 549, 48),
+                    cell("0,00 SEK", 463, 549, 48),
+                    cell("1 068,70 SEK", 534, 549, 62),
+                    cell("Att betala 1 068,70 SEK", 484, 565, 98),
+                ],
+            },)
             evidence = [
                 {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
             ]
@@ -349,15 +373,13 @@ class IncomingDisplayTests(unittest.TestCase):
 
     def test_marker_suggestion_is_blocked_when_any_original_page_is_unreadable(self):
         window = self.open_window(document_id=1)
-        reader = SimpleNamespace(
-            is_encrypted=False,
-            pages=[
-                SimpleNamespace(extract_text=lambda: "P1037Projektnamn:\nInvoice header and details"),
-                SimpleNamespace(extract_text=lambda: ""),
-            ],
+        extraction = ExtractionResult(
+            "P1037Projektnamn:\nInvoice header and details",
+            "test", 1.0,
+            ("P1037Projektnamn:\nInvoice header and details", ""),
         )
 
-        with patch("offline_review_ui.PdfReader", return_value=reader):
+        with patch("offline_review_ui.extract_local_document", return_value=extraction):
             evidence, suggestions, warning = window._object_marker_suggestions()
 
         self.assertEqual([(item["value"], item["page"]) for item in evidence], [("P1037", 1)])
@@ -718,6 +740,10 @@ class IncomingDisplayTests(unittest.TestCase):
         self.host._incoming_viewer = window
         if not hasattr(self.host, "_expense_read_cache"):
             self.host._expense_read_cache = {}
+        if not hasattr(self.host, "_expense_online"):
+            self.host._expense_online = False
+        if not hasattr(self.host, "_expense_read_force_refresh"):
+            self.host._expense_read_force_refresh = False
         self.host._expense_read_attempts = {}
         self.desktop.SmartReportApp._on_expense_read_completed(
             self.host, (None, None), self.host._expense_objects, [], None)
@@ -880,9 +906,27 @@ class IncomingDisplayTests(unittest.TestCase):
             supplier_name="Sickla IF",
             recipient_name="Bygger och renoverar i Sthlm AB",
             supplier_org_number="814000-5797",
+            net_amount="724.74",
+            vat_amount="181.19",
+            gross_amount="905.93",
+            rounding_amount="0.00",
+            amount_due="905.93",
             field_sources={
                 "supplier_name": [{"page": 1, "text": "Sickla IF"}],
                 "recipient_name": [{"page": 1, "text": "Bygger och renoverar i Sthlm AB"}],
+                "net_amount": [{"page": 1, "text": "724,74SEK"}],
+                "vat_amount": [{"page": 1, "text": "181,19SEK"}],
+                "gross_amount": [{
+                    "kind": "derived_from_stated_totals",
+                    "operation": "net_plus_vat",
+                    "sources": [{"page": 1, "text": "724,74SEK"}, {"page": 1, "text": "181,19SEK"}],
+                }],
+                "rounding_amount": [{
+                    "kind": "derived_from_stated_totals",
+                    "operation": "invoice_total_minus_net_and_vat",
+                    "sources": [{"page": 1, "text": "905,93SEK"}],
+                }],
+                "amount_due": [{"page": 1, "text": "905,93SEK"}],
             },
         )
         result = {"fields": recognized, "state": "requires_review", "errors": []}
@@ -896,6 +940,8 @@ class IncomingDisplayTests(unittest.TestCase):
         recognize.assert_called_once()
         self.assertIn("Isolated Supplier AB", confirm.call_args.args[2])
         self.assertIn("Sickla IF", confirm.call_args.args[2])
+        self.assertIn("стр. 1: нетто + НДС", confirm.call_args.args[2])
+        self.assertNotIn("стр. None", confirm.call_args.args[2])
         self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Sickla IF")
         self.assertIsNone(self.store.latest(1)[1]["confirmed_type"])
         self.assertFalse(self.store.latest(1)[1]["original_checked"])

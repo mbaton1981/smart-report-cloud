@@ -12,7 +12,7 @@ from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 from werkzeug.security import generate_password_hash
 
@@ -52,6 +52,8 @@ class CatalogSyncTests(unittest.TestCase):
 
         cls.server = server
         cls.desktop = desktop
+        cls.server.SYNC_API_KEY = os.environ["SYNC_API_KEY"]
+        cls.desktop.SYNC_API_KEY = os.environ["SYNC_API_KEY"]
         cls.qt_app = QApplication.instance() or QApplication([])
         from PyQt6.QtGui import QFont, QFontDatabase
         font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeui.ttf"
@@ -977,7 +979,7 @@ class CatalogSyncTests(unittest.TestCase):
                      "base": base, "travel": obj["transport_rate"], "ob": {}}
             conn.execute("UPDATE shifts SET customer_pricing=? WHERE id=?", (json.dumps(quote), row["id"]))
 
-    def _worker(self, failure=None):
+    def _worker(self, failure=None, get_observations=None, manual=False):
         mode = {"value": failure}
 
         class Response:
@@ -992,9 +994,16 @@ class CatalogSyncTests(unittest.TestCase):
             def raise_for_status(self):
                 if self.status_code >= 400:
                     import requests
-                    raise requests.HTTPError(f"isolated HTTP {self.status_code}")
+                    payload = self.response.get_json(silent=True) or {}
+                    reason = payload.get("error")
+                    detail = f": {reason}" if isinstance(reason, str) and reason else ""
+                    raise requests.HTTPError(
+                        f"isolated HTTP {self.status_code}{detail}"
+                    )
 
         def fake_get(url, **kwargs):
+            if get_observations is not None:
+                get_observations.append((urlsplit(url).path, kwargs.get("params")))
             response = self.server_client.get(
                 urlsplit(url).path,
                 query_string=kwargs.get("params"),
@@ -1037,7 +1046,7 @@ class CatalogSyncTests(unittest.TestCase):
         with patch.object(self.desktop.requests, "get", side_effect=fake_get), \
              patch.object(self.desktop.requests, "post", side_effect=fake_post), \
              patch.object(self.desktop.requests, "request", side_effect=fake_request):
-            harness = SimpleNamespace(_manual_sync_requested=False)
+            harness = SimpleNamespace(_manual_sync_requested=manual)
             harness.apply_remote_shift = lambda cursor, shift: self.desktop.SmartReportApp.apply_remote_shift(
                 harness, cursor, shift
             )
@@ -1045,6 +1054,122 @@ class CatalogSyncTests(unittest.TestCase):
                 harness
             )
             return self.desktop.SmartReportApp.perform_sync_logic(harness)
+
+    def test_incomplete_shift_does_not_force_repeated_full_pull(self):
+        conn = self.desktop.get_db_connection()
+        conn.execute("""
+            INSERT INTO shifts (date,employee,company,object_name,hours,rate,transport,entry_type)
+            VALUES ('2026-10-17','Incomplete Test','Renatur','Test Site',8,0,0,'work')
+        """)
+        conn.execute("UPDATE shift_sync_state SET value='7' WHERE name='cursor'")
+        conn.commit()
+        conn.close()
+
+        manual_requests = []
+        manual_result = self._worker(
+            get_observations=manual_requests, manual=True,
+        )
+        manual_pulls = [
+            params for path, params in manual_requests if path == "/sync/pull"
+        ]
+        self.assertEqual(manual_pulls, [{"since": 0}])
+        self.assertFalse(manual_result["shift_data_changed"])
+
+        conn = self.desktop.get_db_connection()
+        conn.execute("UPDATE shift_sync_state SET value='7' WHERE name='cursor'")
+        conn.commit()
+        conn.close()
+
+        automatic_requests = []
+        automatic_result = self._worker(get_observations=automatic_requests)
+        automatic_pulls = [
+            params for path, params in automatic_requests if path == "/sync/pull"
+        ]
+        self.assertEqual(automatic_pulls, [{"since": 7}])
+        self.assertFalse(automatic_result["shift_data_changed"])
+
+    def test_sync_completion_skips_rebuild_when_no_data_changed(self):
+        def make_window():
+            return SimpleNamespace(
+                _sync_worker=object(),
+                _manual_sync_requested=False,
+                _incoming_viewer=None,
+                _object_edit_sync_pending=False,
+                _async_expense_reads=True,
+                _expense_read_dirty=False,
+                tabs=SimpleNamespace(currentIndex=lambda: 3),
+                table_supplier_documents=object(),
+                exp_date_from=SimpleNamespace(text=lambda: "2026-10-01"),
+                exp_date_to=SimpleNamespace(text=lambda: "2026-10-31"),
+                exp_document_tabs=SimpleNamespace(currentIndex=lambda: 1),
+                exp_api_status_lbl=SimpleNamespace(setText=Mock()),
+                load_shifts_history=Mock(),
+                load_service_categories_table=Mock(),
+                load_expense_documents=Mock(),
+                load_object_expense_overview=Mock(),
+                _invalidate_expense_reads=Mock(),
+                _schedule_expense_read=Mock(),
+            )
+
+        no_change = make_window()
+        self.desktop.SmartReportApp._on_sync_completed(
+            no_change, True, 0, 0, 0, 0, 0, "", "", "", False, False, False,
+        )
+        no_change.load_shifts_history.assert_not_called()
+        no_change.load_expense_documents.assert_not_called()
+        no_change.load_object_expense_overview.assert_not_called()
+        no_change._schedule_expense_read.assert_called_once_with(
+            ("2026-10-01", "2026-10-31")
+        )
+
+        changed = make_window()
+        self.desktop.SmartReportApp._on_sync_completed(
+            changed, True, 0, 0, 0, 0, 0, "", "", "", True, False, True,
+        )
+        changed.load_shifts_history.assert_called_once_with()
+        changed.load_expense_documents.assert_not_called()
+        changed.load_object_expense_overview.assert_not_called()
+        changed._invalidate_expense_reads.assert_called_once_with()
+        self.assertTrue(changed._expense_read_force_refresh)
+
+    def test_expense_read_does_not_refresh_unchanged_document_card(self):
+        key = ("2026-10-01", "2026-10-31")
+        documents = [{"id": 17, "invoice_number": "synthetic"}]
+        objects = [{"id": 3, "name": "Synthetic object"}]
+        window = SimpleNamespace(
+            _expense_refresh_again=False,
+            _expense_read_busy=True,
+            _expense_read_task=object(),
+            _expense_online=True,
+            _expense_read_error="",
+            _expense_read_attempts={},
+            _expense_read_cache={key: documents},
+            _expense_objects=objects,
+            _expense_read_force_refresh=False,
+            _incoming_viewer=None,
+            _expense_requested_key=key,
+            tabs=SimpleNamespace(currentIndex=lambda: 3),
+            exp_document_tabs=SimpleNamespace(currentIndex=lambda: 1),
+            load_expense_document_filters=Mock(),
+            load_expense_documents=Mock(),
+            load_object_expense_overview=Mock(),
+            load_object_overview=Mock(),
+            _schedule_expense_read=Mock(),
+            exp_api_status_lbl=SimpleNamespace(setText=Mock()),
+        )
+        self.desktop.SmartReportApp._on_expense_read_completed(
+            window, key, objects, documents, "",
+        )
+        window.load_expense_document_filters.assert_not_called()
+        window.load_expense_documents.assert_not_called()
+        window.load_object_expense_overview.assert_not_called()
+
+        window._expense_read_force_refresh = True
+        self.desktop.SmartReportApp._on_expense_read_completed(
+            window, key, objects, documents, "",
+        )
+        window.load_expense_documents.assert_called_once_with()
+        window.load_object_expense_overview.assert_called_once_with()
 
     def test_expense_create_is_idempotent_by_client_id(self):
         desktop_conn = self.desktop.get_db_connection()
@@ -3726,6 +3851,7 @@ class CatalogSyncTests(unittest.TestCase):
         window._expense_read_busy = False
         window._expense_read_task = None
         window._expense_online = False
+        window._expense_objects = []
         window.exp_api_status_lbl = self.desktop.QLabel()
         gate = threading.Event()
         calls = []
@@ -5737,6 +5863,8 @@ class CatalogSyncTests(unittest.TestCase):
             "conflicts": 0, "linked_legacy": 7, "unresolved_legacy": 0,
             "imported_employees": 0, "unresolved_employees": 0,
             "conflict_details": "", "unresolved_legacy_details": "",
+            "shift_data_changed": False, "catalog_data_changed": True,
+            "expense_data_changed": False,
         })
         self.assertTrue(all(row[3] and row[4] and row[5] == 1 for row in rows))
         self.assertEqual(
@@ -5780,6 +5908,9 @@ class CatalogSyncTests(unittest.TestCase):
         repeated = self._worker()
         self.assertEqual(repeated["linked_legacy"], 0)
         self.assertEqual(repeated["conflicts"], 0)
+        self.assertFalse(repeated["shift_data_changed"])
+        self.assertFalse(repeated["catalog_data_changed"])
+        self.assertFalse(repeated["expense_data_changed"])
         desktop_conn = self.desktop.get_db_connection()
         self.assertEqual(
             desktop_conn.execute("SELECT COUNT(*) FROM objects WHERE company = 'Renatur'").fetchone()[0],
