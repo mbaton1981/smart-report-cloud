@@ -83,6 +83,7 @@ class OfflineReviewWindow(QDialog):
         self.preview_document_id = None
         self.original_error = None
         self.partial_proposal_candidate = None
+        self.full_invoice_proposal = None
         self.inputs, self.origins = {}, {}
         self._validation_styles = {}
         self.setWindowTitle("SmartReport — Входящие документы" if integrated
@@ -241,10 +242,26 @@ class OfflineReviewWindow(QDialog):
             self.allocations.setMinimumHeight(190)
             self.allocations.setMinimumWidth(0)
             self.allocations.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.proposal_summary_label = QLabel()
+            self.proposal_summary_label.setObjectName("proposal_summary")
+            self.proposal_summary_label.setWordWrap(True)
+            self.proposal_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            form.addRow(self.proposal_summary_label)
+            self.proposal_details_button = QPushButton("Подробности проверки")
+            self.proposal_details_button.setObjectName("proposal_details_toggle")
+            self.proposal_details_button.setCheckable(True)
             self.proposal_label = QLabel()
             self.proposal_label.setWordWrap(True)
             self.proposal_label.setTextFormat(Qt.TextFormat.RichText)
             self.proposal_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            self.proposal_label.setVisible(False)
+            self.proposal_details_button.toggled.connect(self.proposal_label.setVisible)
+            self.proposal_details_button.toggled.connect(
+                lambda checked: self.proposal_details_button.setText(
+                    "Скрыть подробности" if checked else "Подробности проверки"
+                )
+            )
+            form.addRow(self.proposal_details_button)
             form.addRow(self.proposal_label)
             self.apply_proposal_button = QPushButton("Заполнить форму предложением")
             self.apply_proposal_button.setObjectName("apply_allocation_proposal")
@@ -255,8 +272,12 @@ class OfflineReviewWindow(QDialog):
             form.addRow(self.apply_proposal_button)
             form.addRow(QLabel("Назначение и распределение:"))
             form.addRow(self.allocations)
-            self.add_allocation_button = QPushButton("Добавить часть")
-            self.add_allocation_button.clicked.connect(lambda: self.add_allocation())
+            self.add_allocation_button = QPushButton("Разделить между объектами")
+            self.add_allocation_button.setToolTip(
+                "Добавит отдельную строку, не меняя введённые суммы. Для учёта суммы частей "
+                "должны совпасть с итогом документа; НДС распределяется по долям."
+            )
+            self.add_allocation_button.clicked.connect(self.start_split_allocation)
             form.addRow(self.add_allocation_button)
             self.allocation_total = QLabel()
             self.allocation_total.setWordWrap(True)
@@ -492,7 +513,9 @@ class OfflineReviewWindow(QDialog):
             return None
         markers = {item.get("normalized") for item in marker_evidence if item.get("normalized")}
         labels = {str(item.get("label") or "").casefold().rstrip(".") for item in marker_evidence}
-        if len(markers) != 1 or not {"projektnamn", "rekvisitionsnr"}.issubset(labels):
+        project_labels = {"projektnamn", "rekvisitionsnr"}
+        if (len(markers) != 1 or not labels.intersection(project_labels)
+                or not labels.issubset(project_labels)):
             return None
         marker = next(item["value"] for item in marker_evidence if item.get("normalized") in markers)
         candidates = {
@@ -589,6 +612,7 @@ class OfflineReviewWindow(QDialog):
     def show_proposal(self):
         self.proposal = self.store.allocation_proposal(self.document_id)
         proposal = self.proposal
+        self.full_invoice_proposal = None
         infrastructure_fee = (
             self.store.base(self.document_id).get("document_subtype") == "infrastructure_fee_decision")
         lines = ["<b>Предложение по маркировкам и позициям на страницах PDF. "
@@ -648,6 +672,7 @@ class OfflineReviewWindow(QDialog):
         if complete_proposal is not None:
             proposal = complete_proposal
             self.proposal = proposal
+            self.full_invoice_proposal = proposal
         partial_candidate = self._partial_marker_candidate(
             proposal, marker_evidence, object_suggestions, marker_warning)
         self.partial_proposal_candidate = partial_candidate
@@ -679,6 +704,13 @@ class OfflineReviewWindow(QDialog):
                 lines.append(f"Округление документа: {proposal['rounding']} SEK. Распределено пропорционально "
                              "суммам с НДС, остаточные эре — по наибольшим дробным долям. "
                              f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
+        if complete_proposal is not None:
+            part = complete_proposal["parts"][0]
+            lines.append(
+                f"<b>Проверенные итоги документа:</b> нетто {part['net_amount']} SEK; "
+                f"НДС {part['vat_amount']} SEK; округление {part['rounding']} SEK; "
+                f"к оплате {part['gross_amount']} SEK."
+            )
         if partial_candidate:
             lines.append(
                 f"<b>Частичное предложение:</b> маркировка «{escape(partial_candidate['marker'])}» "
@@ -687,13 +719,67 @@ class OfflineReviewWindow(QDialog):
                 "по оригиналу. Общий итог фактуры не считается суммой этой доли.")
         lines.extend(escape(text) for text in proposal["errors"])
         self.proposal_label.setText("<br>".join(lines))
+        if complete_proposal is not None:
+            part = complete_proposal["parts"][0]
+            marker = next(
+                (item for item in marker_evidence if item.get("normalized") == part["marker"]),
+                marker_evidence[0],
+            )
+            label = str(marker.get("label") or "").casefold().rstrip(".")
+            basis = "реквизиции" if label == "rekvisitionsnr" else "маркировке"
+            page = f", стр. {marker['page']}" if marker.get("page") else ""
+            self.proposal_summary_label.setText(
+                f"Найден объект {part['object_name']} по {basis} {marker['value']}{page}. "
+                "Подтвердите, относится ли к нему вся покупка."
+            )
+            amount = parse_invoice_money(complete_proposal["total"])
+            amount_label = f"{amount:,.2f}".replace(",", " ").replace(".", ",")
+            currency = self.inputs["currency_code"].text().strip().upper() or "SEK"
+            self.apply_proposal_button.setText(
+                f"Вся фактура на {part['object_name']} — {amount_label} {currency} с НДС"
+            )
+        elif partial_candidate:
+            marker = next(
+                (item for item in marker_evidence
+                 if item.get("normalized") == partial_candidate["marker"]),
+                marker_evidence[0],
+            )
+            label = str(marker.get("label") or "маркировке").casefold().rstrip(".")
+            basis = "реквизиции" if label == "rekvisitionsnr" else "маркировке"
+            page = f", стр. {marker['page']}" if marker.get("page") else ""
+            self.proposal_summary_label.setText(
+                f"Найден объект {partial_candidate['name']} по {basis} "
+                f"{marker['value']}{page}. Проверьте сумму доли по оригиналу."
+            )
+            self.apply_proposal_button.setText(
+                f"Назначить строку объекту {partial_candidate['name']}"
+            )
+        elif marker_warning:
+            self.proposal_summary_label.setText(
+                "Не удалось проверить все страницы. Автоматическое распределение не предложено."
+            )
+            self.apply_proposal_button.setText("Заполнить форму предложением")
+        elif len({item.get("normalized") for item in marker_evidence
+                  if item.get("normalized")}) > 1:
+            self.proposal_summary_label.setText(
+                "Найдены противоречащие маркировки. Проверьте распределение вручную."
+            )
+            self.apply_proposal_button.setText("Заполнить форму предложением")
+        elif proposal["parts"] and not proposal["errors"]:
+            self.proposal_summary_label.setText(
+                "Найдено распределение по позициям. Проверьте сумму и основание в подробностях."
+            )
+            self.apply_proposal_button.setText("Заполнить форму предложением")
+        else:
+            self.proposal_summary_label.setText(
+                "Уверенное распределение не предложено. Проверьте оригинал и суммы."
+            )
+            self.apply_proposal_button.setText("Заполнить форму предложением")
+        self.proposal_details_button.setChecked(False)
         full_proposal = bool(proposal["parts"]) and not proposal["errors"]
-        self.apply_proposal_button.setText(
-            "Подставить объект — сумму указать вручную" if partial_candidate
-            else "Заполнить форму предложением")
         self.apply_proposal_button.setToolTip(
-            "Подставит только предложенный объект; сумма части останется пустой. "
-            "Проверьте оригинал и укажите сумму вручную. Ничего не сохраняется."
+            "Назначит объект этой строке, сохранив введённую сумму. Сумму доли проверьте по оригиналу; "
+            "ничего не сохраняется."
             if partial_candidate else
             "Только заполнит форму данными из маркеров и позиций PDF. "
             "Проверьте результат и нажмите «Учесть как расход»; до этого ничего не сохранено.")
@@ -726,28 +812,56 @@ class OfflineReviewWindow(QDialog):
                 if partial_candidate is not None:
                     if self.partial_proposal_matches_form(partial_candidate):
                         self.status.setText(
-                            "Объект подставлен в форму; сумма части не заполнена. "
-                            "Укажите её вручную по оригиналу. Ничего не сохранено."
+                            "Объект уже выбран. Сумма строки сохранена; сверьте её с оригиналом. "
+                            "Ничего не сохранено."
                         )
                         return
-                    if self.allocations.rowCount() and QMessageBox.question(
-                        self, "Подставить объект?",
-                        "Заменить текущие строки одной строкой с предложенным объектом? "
-                        "Сумма части останется пустой: укажите её вручную по оригиналу. "
-                        "Общий итог фактуры не переносится в сумму части. Сохранение — отдельной кнопкой.",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No,
-                    ) != QMessageBox.StandardButton.Yes:
+                    if self.allocations.rowCount() > 1:
+                        QMessageBox.warning(
+                            self, "Распределение уже разделено",
+                            "Существующие строки и суммы оставлены без изменений. "
+                            "Выберите объект в нужной строке вручную.",
+                        )
                         return
-                    self.allocations.setRowCount(0)
-                    self.add_allocation({
-                        "object_id": partial_candidate["object_id"],
-                        "gross_amount": None,
-                    })
+                    if not self.allocations.rowCount():
+                        self.add_allocation({
+                            "object_id": partial_candidate["object_id"],
+                            "gross_amount": None,
+                        })
+                    else:
+                        combo = self.allocations.cellWidget(0, 0)
+                        destination, object_id = self.allocation_target(0)
+                        if destination != "unselected" and object_id != partial_candidate["object_id"]:
+                            message = (
+                                "Будет изменено назначение строки 1:\n"
+                                f"{self._allocation_row_description(0)}\n"
+                                f"Новое назначение: {partial_candidate['name']}. "
+                                "Введённая сумма останется без изменений; сохранение — отдельной кнопкой."
+                            )
+                            if QMessageBox.question(
+                                self, "Изменить назначение строки?", message,
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No,
+                            ) != QMessageBox.StandardButton.Yes:
+                                return
+                        target_index = combo.findData(partial_candidate["object_id"])
+                        if target_index < 0:
+                            QMessageBox.warning(
+                                self, "Объект не выбран",
+                                "Предложенный объект больше не доступен. Обновите список объектов.",
+                            )
+                            return
+                        combo.setCurrentIndex(target_index)
                     self.partial_proposal_candidate = partial_candidate
+                    amount_item = self.allocations.item(0, 1)
+                    amount_text = amount_item.text().strip() if amount_item else ""
+                    amount_status = (
+                        f"Сумма {amount_text} сохранена; проверьте, относится ли к объекту вся покупка."
+                        if amount_text else
+                        "Сумму части укажите вручную по оригиналу."
+                    )
                     self.status.setText(
-                        "Только объект подставлен в форму. Укажите сумму части вручную по оригиналу; "
-                        "фактура не сохранена и не учтена."
+                        f"Объект выбран в форме. {amount_status} Ничего не сохранено и не учтено."
                     )
                     return
                 QMessageBox.warning(
@@ -770,15 +884,47 @@ class OfflineReviewWindow(QDialog):
                 "Предложение уже заполнено в форме. Проверьте объекты и суммы; ничего не сохранено."
             )
             return
-        loaded_payload = getattr(self, "loaded_payload", {})
-        gross_changed = (parse_invoice_money(self.inputs["gross_amount"].text())
-                         != parse_invoice_money(loaded_payload.get("gross_amount")))
-        if self.allocations.rowCount() or gross_changed:
-            if QMessageBox.question(self, "Применить предложение?",
-                    "Заменить текущие строки распределения предложением и установить итог с указанным "
-                    "округлением? Нетто и НДС не меняются. Сохранение — отдельной кнопкой.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+        total = parse_invoice_money(proposal["total"])
+        current_total = parse_invoice_money(self.inputs["gross_amount"].text())
+        if self.allocations.rowCount() == 1:
+            amount_item = self.allocations.item(0, 1)
+            row_total = parse_invoice_money(amount_item.text()) if amount_item else None
+            if row_total == total:
+                combo = self.allocations.cellWidget(0, 0)
+                destination, object_id = self.allocation_target(0)
+                target_id = proposal["parts"][0].get("object_id")
+                replacing_target = destination != "unselected" and object_id != target_id
+                replacing_total = current_total != total
+                if replacing_target or replacing_total:
+                    message = self._proposal_replacement_message(proposal)
+                    if QMessageBox.question(
+                        self, "Применить предложение?", message,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    ) != QMessageBox.StandardButton.Yes:
+                        return
+                target_index = combo.findData(target_id)
+                if target_index < 0:
+                    QMessageBox.warning(
+                        self, "Объект не выбран",
+                        "Предложенный объект больше не доступен. Обновите список объектов.",
+                    )
+                    return
+                combo.setCurrentIndex(target_index)
+                self.inputs["gross_amount"].setText(proposal["total"])
+                self.partial_proposal_candidate = None
+                self.status.setText(
+                    "Объект назначен в форме; введённая сумма строки сохранена. "
+                    "Нетто, НДС и округление не изменены. Ничего не сохранено."
+                )
+                return
+        if self.allocations.rowCount() or current_total != total:
+            message = self._proposal_replacement_message(proposal)
+            if QMessageBox.question(
+                self, "Применить предложение?", message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
                 return
         self.partial_proposal_candidate = None
         self.allocations.setRowCount(0)
@@ -793,11 +939,66 @@ class OfflineReviewWindow(QDialog):
         if candidate is None or self.allocations.rowCount() != 1:
             return False
         destination, object_id = self.allocation_target(0)
-        amount = self.allocations.item(0, 1)
-        return (
-            destination == "object" and object_id == candidate["object_id"]
-            and (amount is None or not amount.text().strip())
+        return destination == "object" and object_id == candidate["object_id"]
+
+    @staticmethod
+    def _format_proposal_amount(value):
+        amount = parse_invoice_money(value)
+        if amount is None:
+            return str(value or "не указана")
+        return f"{amount:,.2f}".replace(",", " ").replace(".", ",")
+
+    def _allocation_row_description(self, row):
+        combo = self.allocations.cellWidget(row, 0)
+        item = self.allocations.item(row, 1)
+        amount = item.text().strip() if item else ""
+        currency = self.inputs["currency_code"].text().strip().upper() or "валюта не указана"
+        description = (
+            f"Строка {row + 1}: {combo.currentText()} — "
+            f"{self._format_proposal_amount(amount)} {currency}"
         )
+        original = combo.property("reviewOriginalPart") or {}
+        if original.get("expense_category"):
+            description += f"; категория: {original['expense_category']}"
+        if original.get("note"):
+            description += f"; примечание: {original['note']}"
+        return description
+
+    def _proposal_replacement_message(self, proposal):
+        currency = self.inputs["currency_code"].text().strip().upper() or "SEK"
+        lines = ["Будет заменено:"]
+        if self.allocations.rowCount():
+            lines.extend(
+                self._allocation_row_description(row)
+                for row in range(self.allocations.rowCount())
+            )
+        else:
+            lines.append(
+                "Строк распределения нет; итог в форме: "
+                f"{self._format_proposal_amount(self.inputs['gross_amount'].text())} {currency}"
+            )
+        lines.append("Новый вариант:")
+        for part in proposal["parts"]:
+            target = part.get("object_name") or "назначение не указано"
+            lines.append(
+                f"{target} — {self._format_proposal_amount(part.get('gross_amount'))} {currency}"
+            )
+        lines.append(
+            "Нетто, НДС и округление нового варианта взяты из проверенных итогов документа. "
+            "Изменение останется в форме; сохранение и учёт — отдельные действия."
+        )
+        return "\n".join(lines)
+
+    def start_split_allocation(self):
+        if not self.allocations.rowCount():
+            proposal = self.full_invoice_proposal or self.proposal
+            parts = proposal.get("parts", []) if not proposal.get("errors") else []
+            for part in parts:
+                self.add_allocation(part)
+            while self.allocations.rowCount() < 2:
+                self.add_allocation()
+        else:
+            self.add_allocation()
 
     def proposal_matches_form(self, proposal):
         from expense_documents import parse_invoice_money

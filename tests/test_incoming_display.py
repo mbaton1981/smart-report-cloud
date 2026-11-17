@@ -22,6 +22,8 @@ class IncomingDisplayTests(unittest.TestCase):
     setUp = integration.IncomingIntegrationTests.setUp
     stage = integration.IncomingIntegrationTests.stage
     approve = integration.IncomingIntegrationTests.approve
+    request = integration.IncomingIntegrationTests.request
+    sync = integration.IncomingIntegrationTests.sync
 
     def test_document_preview_controls_reflow_in_small_dialog(self):
         dialogs = (
@@ -111,8 +113,6 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertFalse(window.apply_proposal_button.isEnabled())
 
     def test_marker_only_proposal_selects_object_but_leaves_amount_manual_and_unsaved(self):
-        from PyQt6.QtWidgets import QMessageBox
-
         self.host._expense_objects = [{
             "id": self.object_id, "name": "Isolated p1037 object",
             "markning": "p1037", "is_active": 1,
@@ -138,70 +138,214 @@ class IncomingDisplayTests(unittest.TestCase):
                              return_value=(evidence, suggestions, None)):
             window.show_proposal()
             self.assertTrue(window.apply_proposal_button.isEnabled())
+            existing_amount = window.allocations.item(0, 1).text()
+            self.assertEqual(existing_amount, "125.00")
             self.assertIn("сумму части вручную", window.proposal_label.text())
             self.assertIn("не считается суммой этой доли", window.proposal_label.text())
-            with patch.object(QMessageBox, "question",
-                              return_value=QMessageBox.StandardButton.Yes):
-                window.apply_proposal_button.click()
+            window.apply_proposal_button.click()
             window.amount_choices.addItem("Сумма документа", "125.00")
             window.amount_choices.setCurrentIndex(window.amount_choices.count() - 1)
 
         self.assertEqual(window.allocations.rowCount(), 1)
         self.assertEqual(window.allocations.cellWidget(0, 0).currentData(), self.object_id)
-        self.assertEqual(window.allocations.item(0, 1).text(), "")
+        self.assertEqual(window.allocations.item(0, 1).text(), existing_amount)
         self.assertEqual(window.inputs["gross_amount"].text(), "125.00")
         self.assertIsNone(self.store.card(1))
         self.assertEqual(self.store.latest(1)[0], 0)
-        self.assertIn("не сохранена и не учтена", window.status.text())
+        self.assertIn("Сумма 125.00 сохранена", window.status.text())
+        self.assertIn("не сохранено и не учтено", window.status.text())
 
-    def test_confirmed_single_project_total_fills_form_without_saving_expense(self):
+    def test_requisition_only_full_invoice_saves_syncs_and_reports_once(self):
         from PyQt6.QtWidgets import QMessageBox
 
         self.host._expense_objects = [{
             "id": self.object_id, "name": "Isolated p1037 object",
             "markning": "p1037", "is_active": 1,
+        }, {
+            "id": self.object_id + 100000, "name": "Other object",
+            "markning": "p1041", "is_active": 1,
         }]
-        window = self.open_window(document_id=1)
-        self.addCleanup(lambda: setattr(window, "loaded_payload", window.payload()))
-        window.original_page_texts = ("\n".join((
-            "Faktura", "Fakturanummer TEST-123", "Fakturadatum 2026-10-21",
-            "Projektnamn: P1037", "Rekvisitionsnr.: 1037",
-            "Netto 100.00 SEK", "Moms 25 % 25.00 SEK",
-            "Öresavrundning 0.00 SEK", "Att betala 125.00 SEK",
-        )),)
-        evidence = [
-            {"label": "Projektnamn", "value": "P1037", "normalized": "1037", "page": 1},
-            {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
-        ]
-        suggestions = [{
-            "object_id": self.object_id, "name": "Isolated p1037 object",
-            "markning": "p1037", "is_active": 1, "score": 100,
-            "reason": "Найдена маркировка p1037",
-        }]
-        proposal = {
-            "parts": [], "warnings": [],
-            "errors": ["Подтверждённые суммы заказов не распознаны."],
-            "rounding": "0.00", "total": None,
-        }
+        get_base = self.store.base
 
-        with patch.object(self.store, "allocation_proposal", return_value=proposal), \
-                patch.object(window, "_object_marker_suggestions",
-                             return_value=(evidence, suggestions, None)):
-            window.show_proposal()
-            self.assertTrue(window.apply_proposal_button.isEnabled())
-            self.assertEqual(window.apply_proposal_button.text(), "Заполнить форму предложением")
-            self.assertIn("125.00", window.proposal_label.text())
-            with patch.object(QMessageBox, "question",
-                              return_value=QMessageBox.StandardButton.Yes):
+        def bauhaus_test_base(document_id):
+            base = get_base(document_id)
+            if document_id == 1:
+                base.update(
+                    net_amount="854.96", vat_amount="213.74", gross_amount="1068.70",
+                    rounding_amount="0.00", amount_due="1068.70", order_proposals=[],
+                )
+            return base
+
+        with patch.object(self.store, "base", side_effect=bauhaus_test_base):
+            _, initial_review = self.store.latest(1)
+            initial_review.update(
+                net_amount="854.96", vat_amount="213.74", gross_amount="1068.70",
+                rounding_amount="0.00", amount_due="1068.70",
+            )
+            self.store.conn.execute(
+                "UPDATE revisions SET payload_json=? WHERE document_id=1 AND revision=0",
+                (json.dumps(initial_review, ensure_ascii=False, sort_keys=True),),
+            )
+            self.store.conn.commit()
+            window = self.open_window(document_id=1)
+            self.addCleanup(lambda: setattr(window, "loaded_payload", window.payload()))
+            self.assertEqual(window.loaded_review["amount_due"], "1068.70")
+            self.assertEqual(window.inputs["rounding_amount"].text(), "0.00")
+            window.original_page_texts = (
+                "\n".join((
+                    "Faktura", "Fakturanummer TEST-123", "Fakturadatum 2026-10-21",
+                    "Rekvisitionsnr.: 1037",
+                )),
+                "\n".join((
+                    "Fakturasammanställning", "Netto 854.96 SEK", "Moms 25 % 213.74 SEK",
+                    "Avrundning 0.00 SEK", "Att betala 1068.70 SEK",
+                )),
+            )
+            evidence = [
+                {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
+            ]
+            suggestions = [{
+                "object_id": self.object_id, "name": "Isolated p1037 object",
+                "markning": "p1037", "is_active": 1, "score": 100,
+                "reason": "Найдена маркировка p1037 в поле Rekvisitionsnr.: 1037, стр. 1",
+            }]
+            proposal = {
+                "parts": [], "warnings": [],
+                "errors": ["Подтверждённые суммы заказов не распознаны."],
+                "rounding": "0.00", "total": None,
+            }
+
+            with patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                    patch.object(window, "_object_marker_suggestions",
+                                 return_value=(evidence, suggestions, None)):
+                self.assertEqual(window.allocations.rowCount(), 1)
+                self.assertEqual(window.allocations.item(0, 1).text(), "1068.70")
+                other_index = window.allocations.cellWidget(0, 0).findData(self.object_id + 100000)
+                window.allocations.cellWidget(0, 0).setCurrentIndex(other_index)
+                window.allocations.item(0, 1).setText("500.00")
+                window.show_proposal()
+                self.assertTrue(window.apply_proposal_button.isEnabled())
+                self.assertIn("Найден объект Isolated p1037 object по реквизиции 1037, стр. 1.",
+                              window.proposal_summary_label.text())
+                self.assertIn("Вся фактура на Isolated p1037 object — 1 068,70 SEK с НДС",
+                              window.apply_proposal_button.text())
+                self.assertFalse(window.proposal_label.isVisible())
+                self.assertIn("854.96 SEK", window.proposal_label.text())
+                window.proposal_details_button.click()
+                self.assertTrue(window.proposal_label.isVisible())
+
+                with patch.object(QMessageBox, "question",
+                                  return_value=QMessageBox.StandardButton.No) as question:
+                    window.apply_proposal_button.click()
+                replacement_text = question.call_args.args[2]
+                self.assertIn("Строка 1: Other object (p1041) — 500,00 SEK", replacement_text)
+                self.assertIn("Isolated p1037 object — 1 068,70 SEK", replacement_text)
+                self.assertEqual(
+                    window.allocations.cellWidget(0, 0).currentData(),
+                    self.object_id + 100000,
+                )
+                self.assertEqual(window.allocations.item(0, 1).text(), "500.00")
+
+                combo = window.allocations.cellWidget(0, 0)
+                combo.setCurrentIndex(combo.findData("unselected"))
+                window.allocations.item(0, 1).setText("1068.70")
+                window.inputs["gross_amount"].setText("1068.70")
                 window.apply_proposal_button.click()
 
-        self.assertEqual(window.allocations.rowCount(), 1)
-        self.assertEqual(window.allocations.cellWidget(0, 0).currentData(), self.object_id)
-        self.assertEqual(window.allocations.item(0, 1).text(), "125.00")
-        self.assertEqual(window.inputs["gross_amount"].text(), "125.00")
-        self.assertIsNone(self.store.card(1))
-        self.assertEqual(self.store.latest(1)[0], 0)
-        self.assertIn("ничего не сохранено", window.status.text())
+            self.assertEqual(window.allocations.cellWidget(0, 0).currentData(), self.object_id)
+            self.assertEqual(window.allocations.item(0, 1).text(), "1068.70")
+            self.assertEqual(window.inputs["gross_amount"].text(), "1068.70")
+            self.assertIsNone(self.store.card(1))
+            self.assertEqual(self.store.latest(1)[0], 0)
+            self.assertIn("Ничего не сохранено", window.status.text())
+
+            window.checked.setChecked(True)
+            payload = window.payload()
+            payload["confirmed_type"] = "invoice"
+            self.assertEqual(self.store.save(1, payload, 0), 1)
+            window.loaded_payload = window.payload()
+            window.close()
+
+            reopened = self.open_window(document_id=1)
+            revision, saved = self.store.latest(1)
+            self.assertEqual(revision, 1)
+            self.assertEqual(
+                tuple(saved[key] for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due")),
+                ("854.96", "213.74", "0.00", "1068.70"),
+            )
+            self.assertEqual(reopened.allocations.rowCount(), 1)
+            self.assertEqual(reopened.allocations.cellWidget(0, 0).currentData(), self.object_id)
+            self.assertEqual(reopened.allocations.item(0, 1).text(), "1068.70")
+
+            card = self.store.transfer(1, revision)
+            self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+            documents = self.server_client.get(
+                "/api/expense-documents",
+                headers={"X-Sync-Key": "isolated-sync-test-key"},
+            ).get_json()["documents"]
+            self.assertEqual(len(documents), 1)
+            synced = documents[0]
+            self.assertEqual(synced["client_id"], card["client_id"])
+            self.assertEqual(synced["verification_status"], "confirmed")
+            self.assertEqual(
+                tuple(synced[key] for key in ("net_amount", "vat_amount", "rounding_amount", "gross_amount")),
+                ("854.96", "213.74", "0.00", "1068.70"),
+            )
+            self.assertEqual(len(synced["allocations"]), 1)
+            self.assertEqual(synced["allocations"][0]["object_id"], self.object_id)
+            self.assertEqual(
+                tuple(synced["allocations"][0][key]
+                      for key in ("net_amount", "vat_amount", "rounding_amount", "gross_amount")),
+                ("854.96", "213.74", "0.00", "1068.70"),
+                synced["allocations"],
+            )
+
+            conn = self.desktop.get_db_connection()
+            object_row = conn.execute(
+                "SELECT id, sync_id FROM objects WHERE id=?", (self.object_id,)
+            ).fetchone()
+            conn.close()
+            self.assertIsNotNone(object_row)
+            overview = self.desktop.SmartReportApp._read_object_overview(
+                None, object_row["id"], object_row["sync_id"], self.object_id,
+                None, None, documents, True, True,
+            )
+            self.assertEqual(overview["expense_count"], 1)
+            self.assertEqual(overview["expense_sums"]["net_amount"], {"SEK": "854.96"})
+            self.assertEqual(overview["expense_sums"]["vat_amount"], {"SEK": "213.74"})
+            self.assertEqual(overview["expense_sums"]["gross_amount"], {"SEK": "1068.70"})
+
+    def test_split_button_preserves_sum_and_allocation_breakdown_splits_vat(self):
+        from decimal import Decimal
+        from expense_documents import allocation_breakdown, validate_allocations
+
+        window = self.open_window(document_id=1)
+        self.addCleanup(lambda: setattr(window, "loaded_payload", window.payload()))
+        original_amount = window.allocations.item(0, 1).text()
+        window.add_allocation_button.click()
+        self.assertEqual(window.allocations.rowCount(), 2)
+        self.assertEqual(window.allocations.item(0, 1).text(), original_amount)
+        self.assertEqual(window.allocations.item(1, 1).text(), "")
+
+        parts = [
+            {"object_id": self.object_id, "gross_amount": "500.00"},
+            {"object_id": self.object_id + 1, "gross_amount": "568.70"},
+        ]
+        valid, _message = validate_allocations("1068.70", parts)
+        self.assertTrue(valid)
+        breakdown = allocation_breakdown("1068.70", "854.96", "213.74", parts)["allocations"]
+        self.assertEqual(
+            (sum(Decimal(part["net_amount"]) for part in breakdown),
+             sum(Decimal(part["vat_amount"]) for part in breakdown)),
+            (Decimal("854.96"), Decimal("213.74")),
+        )
+        self.assertNotEqual(breakdown[0]["vat_amount"], Decimal("213.74"))
+        self.assertNotEqual(breakdown[1]["vat_amount"], Decimal("213.74"))
+        valid, _message = validate_allocations(
+            "1068.70",
+            [{"object_id": self.object_id, "gross_amount": "1068.71"}],
+        )
+        self.assertFalse(valid)
 
     def test_marker_suggestion_is_blocked_when_any_original_page_is_unreadable(self):
         window = self.open_window(document_id=1)

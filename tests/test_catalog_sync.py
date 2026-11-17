@@ -668,14 +668,19 @@ class CatalogSyncTests(unittest.TestCase):
             {
                 "document_date": "2026-10-22", "currency_code": "SEK",
                 "verification_status": "confirmed",
-                "allocations": [{"object_id": 31001, "gross_amount": "110.00", "net_amount": "100.00"}],
+                "allocations": [{
+                    "object_id": 31001, "gross_amount": "110.00",
+                    "net_amount": "100.00", "vat_amount": "10.00",
+                }],
             },
             {
                 "document_date": "2026-10-22", "currency_code": "SEK",
                 "verification_status": "confirmed",
                 "allocations": [
-                    {"object_id": 31001, "gross_amount": "30.00", "net_amount": "25.00"},
-                    {"object_id": 31002, "gross_amount": "70.00", "net_amount": "60.00"},
+                    {"object_id": 31001, "gross_amount": "30.00",
+                     "net_amount": "25.00", "vat_amount": "5.00"},
+                    {"object_id": 31002, "gross_amount": "70.00",
+                     "net_amount": "60.00", "vat_amount": "10.00"},
                 ],
             },
             {
@@ -703,6 +708,7 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(result["work_cost"], 1100)
         self.assertEqual(result["expense_sums"]["gross_amount"], {"SEK": "140.00"})
         self.assertEqual(result["expense_sums"]["net_amount"], {"SEK": "125.00"})
+        self.assertEqual(result["expense_sums"]["vat_amount"], {"SEK": "15.00"})
         self.assertEqual(result["expense_count"], 2)
         from assistant_project import expense_summary, shift_summary
         from assistant_ui import ProjectOverviewWorker
@@ -763,6 +769,7 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertIsNone(incomplete["work_cost"])
         self.assertEqual(incomplete["expense_sums"]["gross_amount"], {"SEK": "50.00"})
         self.assertTrue(incomplete["expense_unknown"]["net_amount"])
+        self.assertTrue(incomplete["expense_unknown"]["vat_amount"])
         from PyQt6.QtCore import QSignalBlocker
         from PyQt6.QtTest import QTest
 
@@ -798,8 +805,9 @@ class CatalogSyncTests(unittest.TestCase):
             [label.text() for label in (
                 window.object_hours_value, window.object_employees_value, window.object_work_cost_value,
                 window.object_expense_gross_value, window.object_expense_net_value,
+                window.object_expense_vat_value,
             )],
-            ["10.00 ч", "1", "1 100.00 SEK", "140.00 SEK", "125.00 SEK"],
+            ["10.00 ч", "1", "1 100.00 SEK", "140.00 SEK", "125.00 SEK", "15.00 SEK"],
         )
         self.assertIn("22.10.2026", window.object_period_caption.text())
         self.assertEqual(window.object_detail_mark.text(), "p3001")

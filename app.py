@@ -13835,15 +13835,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_work_cost_value = QLabel("—")
         self.object_expense_gross_value = QLabel("—")
         self.object_expense_net_value = QLabel("—")
-        for label, value, note, detail_label, detail_value in (
+        self.object_expense_vat_value = QLabel("—")
+        for label, value, note, detail_label, detail_value, extra_label, extra_value in (
             ("Рабочие часы", self.object_hours_value, "Часы работы и OB, без повторного учёта.",
-             "Сотрудников за период", self.object_employees_value),
+             "Сотрудников за период", self.object_employees_value, "", None),
             ("Расчёт клиенту", self.object_work_cost_value,
              "SEK · без НДС\nРабота / фиксированная цена и OB. Транспорт в этот показатель не входит.",
-             "", None),
+             "", None, "", None),
             ("Подтверждённые расходы", self.object_expense_gross_value,
              "С НДС · только подтверждённые доли объекта.\nВалюты показаны раздельно.",
-             "Те же расходы без НДС", self.object_expense_net_value),
+             "Нетто доли объекта", self.object_expense_net_value,
+             "НДС доли объекта", self.object_expense_vat_value),
         ):
             metric = QFrame()
             metric.setObjectName("objectMetric")
@@ -13866,14 +13868,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             metric_layout.addWidget(caption)
             metric_layout.addWidget(value)
             metric_layout.addWidget(explanation)
-            if detail_value is not None:
-                subcaption = QLabel(detail_label)
+            for sublabel, subvalue in (
+                (detail_label, detail_value), (extra_label, extra_value),
+            ):
+                if subvalue is None:
+                    continue
+                subcaption = QLabel(sublabel)
                 subcaption.setWordWrap(True)
                 desktop_theme.apply_style(subcaption, "color: #a0aec0;")
-                detail_value.setWordWrap(True)
-                detail_value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                subvalue.setWordWrap(True)
+                subvalue.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
                 metric_layout.addWidget(subcaption)
-                metric_layout.addWidget(detail_value)
+                metric_layout.addWidget(subvalue)
             metric_layout.addStretch(1)
             metrics.addWidget(metric, 1)
         desktop_theme.adapt_box_layout(overview_page, metrics, compact_width=760)
@@ -15233,7 +15239,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             for value in (
                 self.object_hours_value, self.object_employees_value,
                 self.object_work_cost_value, self.object_expense_gross_value,
-                self.object_expense_net_value,
+                self.object_expense_net_value, self.object_expense_vat_value,
             ):
                 value.setText("—")
             self.object_expense_status.setText(
@@ -15289,7 +15295,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 for value in (
                     self.object_hours_value, self.object_employees_value,
                     self.object_work_cost_value, self.object_expense_gross_value,
-                    self.object_expense_net_value,
+                    self.object_expense_net_value, self.object_expense_vat_value,
                 ):
                     value.setText("—")
                 return
@@ -15299,7 +15305,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         for value in (
             self.object_hours_value, self.object_employees_value,
             self.object_work_cost_value, self.object_expense_gross_value,
-            self.object_expense_net_value,
+            self.object_expense_net_value, self.object_expense_vat_value,
         ):
             value.setText("…")
         documents = list(expense_cache.get((None, None), []))
@@ -15413,7 +15419,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 else sum(float(line["amount"]) for line in work_lines)
             )
 
-            expense_sums = {field: {} for field in ("gross_amount", "net_amount")}
+            expense_sums = {
+                field: {} for field in ("gross_amount", "net_amount", "vat_amount")
+            }
             expense_unknown = {field: False for field in expense_sums}
             matched_expense_count = 0
             if server_id is not None:
@@ -15492,7 +15500,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             for value in (
                 self.object_hours_value, self.object_employees_value,
                 self.object_work_cost_value, self.object_expense_gross_value,
-                self.object_expense_net_value,
+                self.object_expense_net_value, self.object_expense_vat_value,
             ):
                 value.setText("—")
             return
@@ -15520,6 +15528,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if not result["expense_linked"]:
             self.object_expense_gross_value.setText("Неизвестно")
             self.object_expense_net_value.setText("Неизвестно")
+            self.object_expense_vat_value.setText("Неизвестно")
         else:
             self.object_expense_gross_value.setText(self._object_money_text(
                 result["expense_sums"]["gross_amount"], result["expense_unknown"]["gross_amount"],
@@ -15527,6 +15536,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ))
             self.object_expense_net_value.setText(self._object_money_text(
                 result["expense_sums"]["net_amount"], result["expense_unknown"]["net_amount"],
+                result["expense_count"], result["expense_snapshot_available"],
+            ))
+            self.object_expense_vat_value.setText(self._object_money_text(
+                result["expense_sums"]["vat_amount"], result["expense_unknown"]["vat_amount"],
                 result["expense_count"], result["expense_snapshot_available"],
             ))
         period_label = (
