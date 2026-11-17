@@ -9924,6 +9924,31 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     + f" Проверка оригинала завершилась ошибкой: {error}"
                 )
 
+        if (getattr(self, "tabs", None) and self.tabs.currentIndex() == 5
+                and all(hasattr(self, name) for name in (
+                    "table_objects", "object_all_period", "object_date_from", "object_date_to",
+                ))):
+            selected_row = (
+                self.table_objects.currentRow()
+                if self.table_objects.selectionModel().hasSelection() else -1
+            )
+            identity = self.table_objects.item(selected_row, 0) if selected_row >= 0 else None
+            current_object_id = (
+                identity.data(Qt.ItemDataRole.UserRole + 3) if identity is not None else None
+            )
+            current_from = (
+                None if self.object_all_period.isChecked()
+                else self.object_date_from.text().strip()
+            )
+            current_to = (
+                None if self.object_all_period.isChecked()
+                else self.object_date_to.text().strip()
+            )
+            if (current_object_id == request["object_id"]
+                    and current_from == request["date_from"]
+                    and current_to == request["date_to"]):
+                self.load_object_overview()
+
     def retry_object_expense_original_recovery(self, *_):
         selected = self.object_expenses_object.currentData()
         if selected in (None, "company"):
@@ -15390,12 +15415,19 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         ):
             value.setText("…")
         documents = list(expense_cache.get((None, None), []))
+        if (server_id is not None and documents
+                and hasattr(self, "_object_expense_recovery_cache")):
+            self._schedule_object_expense_original_recovery(
+                server_id, date_from, date_to, documents,
+                {"id": server_id, "markning": mark},
+            )
+        recovery_cache = dict(getattr(self, "_object_expense_recovery_cache", {}))
         expense_online = bool(getattr(self, "_expense_online", False))
         task = ObjectOverviewTask(
             request_id,
             lambda: self._read_object_overview(
                 object_id, sync_id, server_id, date_from, date_to, documents, expense_online,
-                (None, None) in expense_cache,
+                (None, None) in expense_cache, recovery_cache,
             ),
         )
         task.signals.completed.connect(self._on_object_overview_ready)
@@ -15410,8 +15442,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def _read_object_overview(
         self, object_id, expected_sync_id, server_id, date_from, date_to,
-        expense_documents, expense_online, expense_snapshot_available,
+        expense_documents, expense_online, expense_snapshot_available, recovery_cache=None,
     ):
+        recovery_cache = recovery_cache or {}
         conn = get_db_connection()
         try:
             conn.execute("PRAGMA query_only=ON")
@@ -15515,7 +15548,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     if date_to and document_date > date_to:
                         continue
                     allocations = [
-                        allocation for allocation in document.get("allocations", [])
+                        (allocation_index, allocation)
+                        for allocation_index, allocation in enumerate(
+                            document.get("allocations") or []
+                        )
                         if allocation.get("object_id") is not None
                         and int(allocation["object_id"]) == int(server_id)
                         and not allocation.get("company_expense")
@@ -15525,7 +15561,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         continue
                     matched_expense_count += 1
                     currency = str(document.get("currency_code") or "UNKNOWN")
-                    for allocation in allocations:
+                    recovery_entry = recovery_cache.get(
+                        SmartReportApp._object_expense_recovery_key(document, server_id),
+                    )
+                    recovered_allocations = (
+                        recovery_entry.get("allocations", {}) if recovery_entry else {}
+                    )
+                    for allocation_index, source_allocation in allocations:
+                        allocation = dict(source_allocation)
+                        allocation.update(recovered_allocations.get(allocation_index, {}))
                         for field in expense_sums:
                             amount = parse_decimal(allocation.get(field))
                             if amount is None:

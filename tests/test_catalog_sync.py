@@ -691,6 +691,7 @@ class CatalogSyncTests(unittest.TestCase):
                 "allocations": [{"object_id": 31001, "gross_amount": "999.00", "net_amount": "900.00"}],
             },
             {
+                "id": 7004, "sync_version": 1,
                 "document_date": "2026-10-23", "currency_code": "SEK",
                 "verification_status": "confirmed",
                 "allocations": [{"object_id": 31001, "gross_amount": "50.00", "net_amount": None}],
@@ -772,6 +773,29 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(incomplete["expense_sums"]["gross_amount"], {"SEK": "50.00"})
         self.assertTrue(incomplete["expense_unknown"]["net_amount"])
         self.assertTrue(incomplete["expense_unknown"]["vat_amount"])
+        recovery_document = documents[3]
+        recovery_cache = {
+            self.desktop.SmartReportApp._object_expense_recovery_key(
+                recovery_document, 31001,
+            ): {
+                "allocations": {
+                    0: {
+                        "net_amount": "40.00",
+                        "vat_amount": "10.00",
+                        "net_recovered_from_original": True,
+                    },
+                },
+            },
+        }
+        recovered = self.desktop.SmartReportApp._read_object_overview(
+            None, object_id, sync_id, 31001, "2026-10-23", "2026-10-23",
+            documents, True, True, recovery_cache,
+        )
+        self.assertEqual(recovered["expense_sums"]["net_amount"], {"SEK": "40.00"})
+        self.assertEqual(recovered["expense_sums"]["vat_amount"], {"SEK": "10.00"})
+        self.assertFalse(recovered["expense_unknown"]["net_amount"])
+        self.assertFalse(recovered["expense_unknown"]["vat_amount"])
+        self.assertIsNone(recovery_document["allocations"][0]["net_amount"])
         from PyQt6.QtCore import QSignalBlocker
         from PyQt6.QtTest import QTest
 
@@ -780,6 +804,7 @@ class CatalogSyncTests(unittest.TestCase):
         self._object_card_window = window
         self._setup_catalog_window(window)
         window._expense_read_cache = {(None, None): documents}
+        window._object_expense_recovery_cache = {}
         window.object_all_period.setChecked(False)
         window.object_date_from.setText("2026-10-22")
         window.object_date_to.setText("2026-10-22")
@@ -822,12 +847,26 @@ class CatalogSyncTests(unittest.TestCase):
         wait_for_overview()
         self.assertEqual(window.object_work_cost_value.text(), "Нет рабочих записей")
         self.assertIn("Нет рабочих записей", window.object_overview_status.text())
-        window.object_date_from.setText("2026-10-23")
-        window.object_date_to.setText("2026-10-23")
-        wait_for_overview()
+        with patch.object(
+            window, "_schedule_object_expense_original_recovery",
+        ) as schedule_recovery:
+            window.object_date_from.setText("2026-10-23")
+            window.object_date_to.setText("2026-10-23")
+            window.load_object_overview()
+            wait_for_overview()
+            schedule_recovery.assert_any_call(
+                31001, "2026-10-23", "2026-10-23", documents,
+                {"id": 31001, "markning": "p3001"},
+            )
         self.assertEqual(window.object_work_cost_value.text(), "Неизвестно")
         self.assertEqual(window.object_expense_net_value.text(), "Неизвестно")
         self.assertIn("Расчёт неполный", window.object_overview_status.text())
+        window._object_expense_recovery_cache.update(recovery_cache)
+        window.load_object_overview()
+        wait_for_overview()
+        self.assertEqual(window.object_expense_gross_value.text(), "50.00 SEK")
+        self.assertEqual(window.object_expense_net_value.text(), "40.00 SEK")
+        self.assertEqual(window.object_expense_vat_value.text(), "10.00 SEK")
         conn = self.desktop.get_db_connection()
         after = {
             table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
