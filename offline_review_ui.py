@@ -543,23 +543,27 @@ class OfflineReviewWindow(QDialog):
             key: parse_invoice_money(fields.get(key))
             for key in ("net_amount", "vat_amount", "gross_amount", "rounding_amount", "amount_due")
         }
-        if (any(value is None or not value.is_finite() for value in money.values())
+        rounding_is_explicit = money["rounding_amount"] is not None
+        rounding = money["rounding_amount"] if rounding_is_explicit else Decimal("0.00")
+        if (any(money[key] is None or not money[key].is_finite()
+                for key in ("net_amount", "vat_amount", "gross_amount", "amount_due"))
+                or rounding_is_explicit and not money["rounding_amount"].is_finite()
                 or money["net_amount"] < 0 or money["vat_amount"] < 0
                 or money["gross_amount"] != money["net_amount"] + money["vat_amount"]
-                or money["net_amount"] + money["vat_amount"] + money["rounding_amount"]
-                != money["amount_due"]):
+                or money["net_amount"] + money["vat_amount"] + rounding != money["amount_due"]):
             return None
         sources = fields.get("field_sources") or {}
-        for key in ("net_amount", "vat_amount", "rounding_amount"):
+        for key in ("net_amount", "vat_amount"):
             if not sources.get(key) or not any(
                 source.get("kind") in {"invoice_total", "fiscal_summary_total"}
-                or key == "rounding_amount"
-                and source.get("kind") == "derived_from_stated_totals"
-                and source.get("operation") == "invoice_total_minus_net_and_vat"
-                and money["rounding_amount"] == 0
                 for source in sources[key]
             ):
                 return None
+        if rounding_is_explicit and not any(
+            source.get("kind") in {"invoice_total", "fiscal_summary_total"}
+            for source in sources.get("rounding_amount", [])
+        ):
+            return None
         if not sources.get("amount_due") or not any(
             source.get("kind") == "invoice_total" for source in sources["amount_due"]
         ):
@@ -574,20 +578,25 @@ class OfflineReviewWindow(QDialog):
             "warning": "", "net_amount": decimal_text(money["net_amount"]),
             "vat_amount": decimal_text(money["vat_amount"]),
             "before_rounding": decimal_text(money["gross_amount"]),
-            "rounding": decimal_text(money["rounding_amount"]),
+            "rounding": decimal_text(rounding),
+            "rounding_explicit": rounding_is_explicit,
             "gross_amount": decimal_text(money["amount_due"]),
             "pages": sorted({
                 int(item["page"]) for item in marker_evidence if item.get("page")
             } | {
                 int(source["page"])
-                for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due")
+                for key in (
+                    "net_amount", "vat_amount", "amount_due",
+                    *(("rounding_amount",) if rounding_is_explicit else ()),
+                )
                 for source in sources.get(key, []) if source.get("page")
             }),
             "orders": [],
         }
         return {
             **proposal, "parts": [part], "warnings": [], "errors": [],
-            "rounding": decimal_text(money["rounding_amount"]),
+            "rounding": decimal_text(rounding),
+            "rounding_explicit": rounding_is_explicit,
             "total": decimal_text(money["amount_due"]),
         }
 
@@ -700,24 +709,36 @@ class OfflineReviewWindow(QDialog):
                           if options else
                           "Выберите объект или общие расходы.")
             marker_label = part["marker"] or "Без маркировки — заказ " + ", ".join(part["orders"])
+            rounding_text = (
+                part["rounding"] if part.get("rounding_explicit", True)
+                else "не указано в документе"
+            )
             lines.append(
                 f"{escape(marker_label)} — {escape(suggestion)}: "
                 f"<b>{part['gross_amount']}</b>; до округления {part['before_rounding']}, "
-                f"доля округления {part['rounding']}; стр. {', '.join(map(str, part['pages']))}"
+                f"доля округления {rounding_text}; стр. {', '.join(map(str, part['pages']))}"
                 + (f" — <b>{escape(part['warning'])}</b>" if part["warning"] else ""))
         if proposal["total"]:
             if infrastructure_fee:
                 lines.append(
                     f"Сумма к оплате распределена без изменения исходного итога: {proposal['total']} SEK.")
+            elif proposal.get("rounding_explicit") is False:
+                lines.append(
+                    "Округление в документе не указано; итог совпадает с нетто + НДС. "
+                    f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
             else:
                 lines.append(f"Округление документа: {proposal['rounding']} SEK. Распределено пропорционально "
                              "суммам с НДС, остаточные эре — по наибольшим дробным долям. "
                              f"Итог: {proposal['total']} SEK. Нетто и НДС не изменяются.")
         if complete_proposal is not None:
             part = complete_proposal["parts"][0]
+            rounding_text = (
+                f"округление {part['rounding']} SEK" if part["rounding_explicit"]
+                else "округление в документе не указано"
+            )
             lines.append(
                 f"<b>Проверенные итоги документа:</b> нетто {part['net_amount']} SEK; "
-                f"НДС {part['vat_amount']} SEK; округление {part['rounding']} SEK; "
+                f"НДС {part['vat_amount']} SEK; {rounding_text}; "
                 f"к оплате {part['gross_amount']} SEK."
             )
         if partial_candidate:
@@ -992,10 +1013,16 @@ class OfflineReviewWindow(QDialog):
             lines.append(
                 f"{target} — {self._format_proposal_amount(part.get('gross_amount'))} {currency}"
             )
-        lines.append(
-            "Нетто, НДС и округление нового варианта взяты из проверенных итогов документа. "
-            "Изменение останется в форме; сохранение и учёт — отдельные действия."
-        )
+        if proposal.get("rounding_explicit") is False:
+            lines.append(
+                "Нетто и НДС взяты из проверенных итогов. Округление в документе не указано; "
+                "расчётный остаток 0,00 не считается распознанной строкой."
+            )
+        else:
+            lines.append(
+                "Нетто, НДС и округление нового варианта взяты из проверенных итогов документа."
+            )
+        lines.append("Изменение останется в форме; сохранение и учёт — отдельные действия.")
         return "\n".join(lines)
 
     def start_split_allocation(self):

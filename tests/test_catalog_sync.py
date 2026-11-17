@@ -1043,15 +1043,23 @@ class CatalogSyncTests(unittest.TestCase):
             )
             return Response(response)
 
-        with patch.object(self.desktop.requests, "get", side_effect=fake_get), \
-             patch.object(self.desktop.requests, "post", side_effect=fake_post), \
-             patch.object(self.desktop.requests, "request", side_effect=fake_request):
-            harness = SimpleNamespace(_manual_sync_requested=manual)
+        session = SimpleNamespace(
+            get=fake_get, post=fake_post, request=fake_request,
+        )
+        with patch.object(self.desktop.requests, "get", side_effect=AssertionError(
+                    "Sync should use its persistent HTTP session")), \
+             patch.object(self.desktop.requests, "post", side_effect=AssertionError(
+                 "Sync should use its persistent HTTP session")), \
+             patch.object(self.desktop.requests, "request", side_effect=AssertionError(
+                 "Sync should use its persistent HTTP session")):
+            harness = SimpleNamespace(
+                _manual_sync_requested=manual, _sync_http_session=session,
+            )
             harness.apply_remote_shift = lambda cursor, shift: self.desktop.SmartReportApp.apply_remote_shift(
                 harness, cursor, shift
             )
-            harness._sync_expense_document_outbox = lambda: self.desktop.SmartReportApp._sync_expense_document_outbox(
-                harness
+            harness._sync_expense_document_outbox = lambda session=None: self.desktop.SmartReportApp._sync_expense_document_outbox(
+                harness, session=session
             )
             return self.desktop.SmartReportApp.perform_sync_logic(harness)
 

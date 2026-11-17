@@ -104,9 +104,11 @@ class EndToEndTests(LiveHTTP, unittest.TestCase):
 
     def sync(self):
         d = self.desktop
-        host = SimpleNamespace(_manual_sync_requested=False)
+        host = SimpleNamespace(_manual_sync_requested=False, _sync_http_session=self.web)
         host.apply_remote_shift = lambda cursor, row: d.SmartReportApp.apply_remote_shift(host, cursor, row)
-        host._sync_expense_document_outbox = lambda: d.SmartReportApp._sync_expense_document_outbox(host)
+        host._sync_expense_document_outbox = lambda session=None: d.SmartReportApp._sync_expense_document_outbox(
+            host, session=session,
+        )
         return d.SmartReportApp.perform_sync_logic(host)
 
     def test_customer_ready_scheme_simple_web_desktop_pdf_close_sync_reopen(self):

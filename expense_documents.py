@@ -1308,29 +1308,6 @@ def parse_invoice_pages(pages):
             }]
         elif abs(expected_gross - gross_value) > Decimal("0.02"):
             diagnostics.append("Сумма без НДС + НДС не совпадает с итогом до округления.")
-        due_value = parse_decimal(fields.get("amount_due"))
-        explicit_invoice_total = any(
-            source.get("kind") in {"invoice_total", "fiscal_summary_total"}
-            and re.search(r"\bFakturabelopp\b", str(source.get("caption") or ""), re.IGNORECASE)
-            for source in field_sources.get("amount_due", [])
-        )
-        if (
-            fields.get("rounding_amount") is None
-            and not fields.get("prepaid")
-            and explicit_invoice_total
-            and due_value is not None
-            and gross_value == expected_gross == due_value
-        ):
-            fields["rounding_amount"] = "0.00"
-            field_sources["rounding_amount"] = [{
-                "kind": "derived_from_stated_totals",
-                "operation": "invoice_total_minus_net_and_vat",
-                "sources": (
-                    field_sources.get("amount_due", [])
-                    + field_sources.get("net_amount", [])
-                    + field_sources.get("vat_amount", [])
-                ),
-            }]
     if (fields.get("document_type") == "receipt" and gross_value is not None
             and fields.get("currency_code") == "USD"):
         line_total = _receipt_line_amount_total(text, fields.get("currency_code"))

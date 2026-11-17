@@ -151,15 +151,18 @@ def raise_for_sync_response(response):
     response.raise_for_status()
 
 
-def ensure_sync_dataset():
+def ensure_sync_dataset(session=None):
     from sync_dataset import file_dataset, require_response_dataset
     dataset = file_dataset(DB_FILE)
     if dataset:
-        response = requests.get(
+        get = session.get if session is not None else requests.get
+        response = get(
             f"{CLOUD_URL.rstrip('/')}/sync/capabilities", headers=sync_headers(), timeout=4
         )
         require_response_dataset(response, dataset)
         raise_for_sync_response(response)
+        return response
+    return None
 
 
 def request_expense_api(method, path, **kwargs):
@@ -3478,7 +3481,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             conn.close()
         return revision
 
-    def _sync_expense_document_outbox(self):
+    def _sync_expense_document_outbox(self, session=None):
+        http_request = session.request if session is not None else requests.request
         conn = get_db_connection()
         # Прежние версии пометили дубль с удалённой записью как конфликт; сервер теперь отвечает deleted_original.
         conn.execute("""
@@ -3527,7 +3531,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ):
                 required_features.add("expense_support_links_v1")
             try:
-                capability_response = requests.request(
+                capability_response = http_request(
                     "GET",
                     f"{CLOUD_URL.rstrip('/')}/api/expense-documents/capabilities",
                     headers=sync_headers(), timeout=5,
@@ -3610,7 +3614,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     data = {"payload": json.dumps(payload, ensure_ascii=False)} if files else None
 
                 try:
-                    response = requests.request(
+                    response = http_request(
                         method,
                         f"{CLOUD_URL.rstrip('/')}{endpoint}",
                         headers=sync_headers(),
@@ -3763,10 +3767,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def perform_sync_logic(self):
         if ISOLATED_CANDIDATE or ASSISTANT_CANDIDATE:
             raise RuntimeError("Синхронизация отключена в изолированном кандидате.")
+        session = getattr(self, "_sync_http_session", None)
+        if session is None:
+            session = requests.Session()
+            self._sync_http_session = session
         shift_data_changed = False
         catalog_data_changed = False
         expense_data_changed = False
-        ensure_sync_dataset()
+        capabilities = ensure_sync_dataset(session=session)
         headers = sync_headers()
         downloaded_ids = []
         typed_sync_supported = False
@@ -3778,7 +3786,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         local_ob_enabled = ob_schema_ready(schema_conn.cursor())
         schema_conn.close()
         try:
-            capabilities = requests.get(f"{CLOUD_URL}/sync/capabilities", headers=headers, timeout=4)
+            if capabilities is None:
+                capabilities = session.get(
+                    f"{CLOUD_URL}/sync/capabilities", headers=headers, timeout=4
+                )
             if getattr(capabilities, 'status_code', None) == 200:
                 capability_data = capabilities.json()
                 submission_types = set(capability_data.get('submission_types', []))
@@ -3804,7 +3815,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             holiday_sync_supported = False
             ob_sync_supported = False
 
-        response = requests.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=4)
+        response = session.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=4)
         response.raise_for_status()
         downloaded = response.json().get('shifts', [])
         conn = get_db_connection()
@@ -3827,7 +3838,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             conn.close()
 
         if downloaded_ids:
-            acknowledged = requests.post(
+            acknowledged = session.post(
                 f"{CLOUD_URL}/mark-synced", headers=headers, json={"ids": downloaded_ids}, timeout=4
             )
             acknowledged.raise_for_status()
@@ -3840,7 +3851,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         manual_requested = bool(getattr(self, '__dict__', {}).get('_manual_sync_requested', False))
         pull_since = 0 if manual_requested else current_cursor
-        response = requests.get(
+        response = session.get(
             f"{CLOUD_URL}/sync/pull", headers=headers, params={"since": pull_since}, timeout=4
         )
         response.raise_for_status()
@@ -3931,7 +3942,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 for change in changes
             ) and not capability_data.get("fixed_pricing"):
                 raise ValueError("Сервер не поддерживает Fast pris. Обновите сервер; локальные подтверждения сохранены.")
-            pushed = requests.post(
+            pushed = session.post(
                 f"{CLOUD_URL}/sync/push", headers=headers, json={"changes": changes}, timeout=4
             )
             raise_for_sync_response(pushed)
@@ -3983,7 +3994,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             finally:
                 conn.close()
 
-        catalog_response = requests.get(
+        catalog_response = session.get(
             f"{CLOUD_URL}/api/expense-objects?include_inactive=1&include_service_categories=1",
             headers=headers,
             timeout=4,
@@ -4055,7 +4066,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 f"{json.dumps(employees, ensure_ascii=False)}",
                 flush=True,
             )
-        metadata_response = requests.post(
+        metadata_response = session.post(
             f"{CLOUD_URL}/sync-desktop-data", headers=headers,
             json=metadata_payload, timeout=4
         )
@@ -4199,7 +4210,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 raise
             finally:
                 conn.close()
-        employee_catalog_response = requests.get(
+        employee_catalog_response = session.get(
             f"{CLOUD_URL}/api/sync/employee-catalog",
             headers=headers,
             timeout=4,
@@ -4225,9 +4236,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             raise
         finally:
             conn.close()
-        expense_sync_result = self._sync_expense_document_outbox()
+        expense_sync_result = self._sync_expense_document_outbox(session=session)
         if capability_data.get("payroll_history"):
-            payroll_response = requests.get(f"{CLOUD_URL}/sync/payroll", headers=headers, timeout=20)
+            payroll_response = session.get(f"{CLOUD_URL}/sync/payroll", headers=headers, timeout=20)
             raise_for_sync_response(payroll_response)
             payroll_ui.cache(sys.modules[__name__], payroll_response.json()["events"])
         expense_data_changed = bool(
@@ -8674,6 +8685,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.statusBar().showMessage("Завершение синхронизации перед закрытием…")
             event.ignore()
             return
+        session = getattr(self, "_sync_http_session", None)
+        if session is not None:
+            session.close()
+            self._sync_http_session = None
         super().closeEvent(event)
 
     def open_assistant(self):

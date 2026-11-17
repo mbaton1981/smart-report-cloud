@@ -118,6 +118,7 @@ class IncomingDisplayTests(unittest.TestCase):
             "markning": "p1037", "is_active": 1,
         }]
         window = self.open_window(document_id=1)
+        window.original_pages = ()
         self.addCleanup(lambda: setattr(window, "loaded_payload", window.payload()))
         evidence = [
             {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
@@ -154,6 +155,49 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertEqual(self.store.latest(1)[0], 0)
         self.assertIn("Сумма 125.00 сохранена", window.status.text())
         self.assertIn("не сохранено и не учтено", window.status.text())
+
+    def test_full_invoice_proposal_works_without_an_explicit_rounding_line(self):
+        self.host._expense_objects = [{
+            "id": self.object_id, "name": "Isolated p1037 object",
+            "markning": "p1037", "is_active": 1,
+        }]
+        window = self.open_window(document_id=1)
+        evidence = [
+            {"label": "Rekvisitionsnr.", "value": "1037", "normalized": "1037", "page": 1},
+        ]
+        suggestions = [{
+            "object_id": self.object_id, "name": "Isolated p1037 object",
+            "markning": "p1037", "is_active": 1, "score": 100,
+            "reason": "Rekvisitionsnr. 1037, стр. 1",
+        }]
+        parsed_fields = {
+            "net_amount": "100.00", "vat_amount": "25.00",
+            "gross_amount": "125.00", "rounding_amount": None,
+            "amount_due": "125.00", "prepaid": False,
+            "field_sources": {
+                "net_amount": [{"kind": "invoice_total", "page": 1}],
+                "vat_amount": [{"kind": "invoice_total", "page": 1}],
+                "amount_due": [{"kind": "invoice_total", "page": 1}],
+            },
+        }
+        proposal = {"parts": [], "warnings": [], "errors": [], "rounding": "0.00", "total": None}
+
+        with patch.object(self.store, "base", return_value={
+            "document_type": "invoice", "document_subtype": None, "order_proposals": [],
+        }), patch.object(self.store, "allocation_proposal", return_value=proposal), \
+                patch.object(window, "_object_marker_suggestions",
+                             return_value=(evidence, suggestions, None)), \
+                patch("offline_review_ui.parse_invoice_pages", return_value=parsed_fields):
+            window.original_page_texts = ("Faktura\nRekvisitionsnr. 1037\nFakturabelopp 125,00 SEK",)
+            window.original_pages = ({"page": 1, "text": window.original_page_texts[0]},)
+            window.show_proposal()
+
+        self.assertIn("Вся фактура на Isolated p1037 object — 125,00 SEK с НДС",
+                      window.apply_proposal_button.text())
+        self.assertIn("округление в документе не указано", window.proposal_label.text())
+        self.assertNotIn("Округление документа: 0.00 SEK", window.proposal_label.text())
+        self.assertEqual(self.store.latest(1)[0], 0)
+        self.assertIsNone(self.store.card(1))
 
     def test_requisition_only_full_invoice_saves_syncs_and_reports_once(self):
         from PyQt6.QtWidgets import QMessageBox
@@ -909,7 +953,7 @@ class IncomingDisplayTests(unittest.TestCase):
             net_amount="724.74",
             vat_amount="181.19",
             gross_amount="905.93",
-            rounding_amount="0.00",
+            rounding_amount=None,
             amount_due="905.93",
             field_sources={
                 "supplier_name": [{"page": 1, "text": "Sickla IF"}],
@@ -920,11 +964,6 @@ class IncomingDisplayTests(unittest.TestCase):
                     "kind": "derived_from_stated_totals",
                     "operation": "net_plus_vat",
                     "sources": [{"page": 1, "text": "724,74SEK"}, {"page": 1, "text": "181,19SEK"}],
-                }],
-                "rounding_amount": [{
-                    "kind": "derived_from_stated_totals",
-                    "operation": "invoice_total_minus_net_and_vat",
-                    "sources": [{"page": 1, "text": "905,93SEK"}],
                 }],
                 "amount_due": [{"page": 1, "text": "905,93SEK"}],
             },
@@ -941,8 +980,10 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIn("Isolated Supplier AB", confirm.call_args.args[2])
         self.assertIn("Sickla IF", confirm.call_args.args[2])
         self.assertIn("стр. 1: нетто + НДС", confirm.call_args.args[2])
+        self.assertNotIn("Указанное округление", confirm.call_args.args[2])
         self.assertNotIn("стр. None", confirm.call_args.args[2])
         self.assertEqual(self.store.latest(1)[1]["supplier_name"], "Sickla IF")
+        self.assertIsNone(self.store.latest(1)[1]["rounding_amount"])
         self.assertIsNone(self.store.latest(1)[1]["confirmed_type"])
         self.assertFalse(self.store.latest(1)[1]["original_checked"])
         self.assertIsNone(self.store.card(1))
