@@ -82,6 +82,9 @@ def recognize_invoice(paths, parser=None, ai_fallback=None):
                 fields = apply_selection(fields, ai_fallback(layout), private)
                 methods.add("openai_masked_layout")
                 fields.setdefault("review_reasons", []).append("Резервный ИИ выбрал блоки обезличенного макета; проверьте реквизиты.")
+                from document_costs import extract_cost_fields
+                # Снимок cost_fields не должен отставать от полей, заполненных после разбора.
+                fields["object_cost_fields"] = extract_cost_fields(pages, fields)
             except (ValueError, RuntimeError, requests.RequestException) as error:
                 fields.setdefault("review_reasons", []).append(f"Резервный ИИ: {error}")
     fields["raw_text"] = "\n\n".join(text_parts)

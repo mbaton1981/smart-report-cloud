@@ -305,12 +305,18 @@ class IncomingStore(OfflineReviewStore):
         if revision == 0:
             base = self.base(document_id)
             costs = self.cost_fields(document_id)
+            tax_decision = base.get("document_type") == "tax_decision"
             reviewed = bool(self.allocations(payload) or payload.get("confirmed_type")
                             or payload.get("original_checked"))
             for key in EDITABLE:
                 manual = any(source.get("kind") == "manual"
                              for source in base.get("field_sources", {}).get(key, []))
                 if key in costs and not (reviewed or manual):
+                    # Устаревший пустой снимок cost_fields (поле распозналось позже
+                    # снимка) не должен затирать сохранённое значение фактуры/чека.
+                    if (not tax_decision and costs[key] in (None, "", "UNKNOWN")
+                            and payload.get(key) not in (None, "", "UNKNOWN")):
+                        continue
                     payload[key] = costs[key]
             amounts = [parse_invoice_money(base.get(key)) for key in ("net_amount", "vat_amount")]
             gross_manual = any(source.get("kind") == "manual"

@@ -124,6 +124,35 @@ Kvitton och fakturor"""
         self.assertEqual(fields["rounding_amount"], "0.50")
         self.assertEqual(fields["field_sources"]["net_amount"][0]["kind"], "derived_from_stated_totals")
 
+    def test_rental_invoice_datum_column_not_mixed_with_period_or_due_dates(self):
+        fields = parse_invoice_pages([{"page": 1, "text": """FAKTURA
+Nr
+12785007
+Datum Fakturakundnr Sida
+2026-11-15 73165892 1/1
+CRAMO AB
+1 PRODNR 8333225 KAPMASKIN -150MM VATTENKYLD 23 S/N 1588722  ÅTERL S*
+UTH.DAT 261110 PERIOD 261110-261111 (2 BDAG) 376,00/STYCK 752,00
+6 ARTNR 05836528 DIAKLINGA BETONG 350X25,4MM
+DATUM 261111 Minsta avgift 494,50
+SUMMA EXKL. MOMS 2.283,48
+Moms 25,00 % på 2.283,48 570,87
+Öresutjämning -0,35
+BETALNING OSS TILLHANDA SENAST 2026-11-30
+ SEK 2.854,00
+ATT BETALA"""}])
+
+        self.assertEqual(fields["document_type"], "invoice")
+        self.assertEqual(fields["document_date"], "2026-11-15")
+        source = fields["field_sources"]["document_date"][0]
+        self.assertEqual((source["caption"], source["text"], source["kind"]),
+                         ("Datum", "2026-11-15", "header"))
+        self.assertIsNone(fields["due_date"])
+        self.assertEqual(fields["due_date_kind"], "ambiguous")
+        self.assertEqual(fields["object_cost_fields"]["document_date"], "2026-11-15")
+        self.assertNotIn("Не подтверждено поле document_date; проверьте оригинал.",
+                         fields["review_reasons"])
+
     def test_tax_amount_does_not_require_invoice_or_vat(self):
         fields = parse_invoice_pages([{"page": 1, "text": TAX_TEXT}])
         costs = fields["object_cost_fields"]
@@ -340,6 +369,37 @@ class DocumentActionTests(unittest.TestCase):
         self.assertEqual(original_before, self.store.original(document_id).read_bytes())
         self.assertIsNone(self.store.card(document_id))
         self.assertIsNone(self.store.action(document_id)[1])
+
+    def test_unreviewed_draft_keeps_stored_date_despite_stale_cost_snapshot(self):
+        document_id = 1
+        base = self.store.base(document_id)
+        revision, payload = self.store.latest(document_id)
+        base.update({
+            "document_type": "invoice",
+            "document_date": "2026-11-15",
+            "field_sources": {},
+            "object_cost_fields": {"document_date": None},
+        })
+        payload.update({
+            "document_date": "2026-11-15", "allocations": [],
+            "confirmed_type": None, "original_checked": False,
+        })
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=?",
+                                    (packed(base), document_id))
+            self.store.conn.execute(
+                "UPDATE revisions SET payload_json=? WHERE document_id=? AND revision=?",
+                (packed(payload), document_id, revision))
+
+        _, refreshed = self.store.latest(document_id)
+        self.assertEqual(refreshed["document_date"], "2026-11-15")
+
+        base["document_type"] = "tax_decision"
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=?",
+                                    (packed(base), document_id))
+        _, tax_payload = self.store.latest(document_id)
+        self.assertIsNone(tax_payload["document_date"])
 
     def test_statuses_need_no_fields_preserve_pdf_history_and_dedup(self):
         self.tax()

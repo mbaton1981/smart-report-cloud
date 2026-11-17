@@ -963,6 +963,7 @@ def parse_invoice_pages(pages):
     fallback_invoice_candidates = []
     fallback_vat_candidates = []
     fallback_due_candidates = []
+    fallback_date_candidates = []
     for source_page in pages:
         page = {
             **source_page,
@@ -989,6 +990,25 @@ def parse_invoice_pages(pages):
                     "attachment_index": page.get("attachment_index", 0),
                     "text": page_lines[index + 2], "caption": "Faktura Nr", "kind": "header",
                 }))
+            # Колоночный заголовок «Datum …» со значениями строкой ниже: дата берётся
+            # из колонки под подписью. Строки позиций аренды и сроков оплаты содержат
+            # цифры в строке подписи либо не проходят проверку формата даты.
+            if index + 1 < len(page_lines) and not any(ch.isdigit() for ch in line):
+                header_tokens = line.split()
+                date_columns = [pos for pos, token in enumerate(header_tokens)
+                                if re.fullmatch(labels["document_date"], token, re.IGNORECASE)]
+                if len(date_columns) == 1:
+                    value_tokens = page_lines[index + 1].split()
+                    position = date_columns[0]
+                    value = (checked_value("document_date", value_tokens[position])
+                             if position < len(value_tokens) else None)
+                    if value:
+                        fallback_date_candidates.append((value, {
+                            "source": page.get("source"), "page": page.get("page", 1),
+                            "attachment_index": page.get("attachment_index", 0),
+                            "text": value_tokens[position],
+                            "caption": header_tokens[position], "kind": "header",
+                        }))
             if re.fullmatch(r"A(?:TT)?\s+BETALA\s*:?", line, re.IGNORECASE) and index:
                 amount_line = re.sub(r"^SEK\s*", "", page_lines[index - 1], flags=re.IGNORECASE)
                 amount_line = re.sub(r"\s*(?:SEK|kr)\s*$", "", amount_line, flags=re.IGNORECASE).strip()
@@ -1207,6 +1227,7 @@ def parse_invoice_pages(pages):
         ("invoice_number", fallback_invoice_candidates),
         ("vat_amount", fallback_vat_candidates),
         ("amount_due", fallback_due_candidates),
+        ("document_date", fallback_date_candidates),
     ):
         if not candidates[key]:
             candidates[key].extend(fallbacks)
