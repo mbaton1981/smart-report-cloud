@@ -914,7 +914,8 @@ def enforce_dataset_boundary():
         return None
     guarded = (
         request.path.startswith(("/sync/", "/api/sync/", "/api/expense-", "/admin/", "/api/employee-cards", "/api/assistant/", "/api/admin/shifts/", "/api/admin/analytics"))
-        or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced", "/api/customer-terms"}
+        or request.path in {"/sync-desktop-data", "/get-unsynced", "/mark-synced", "/api/customer-terms",
+                            "/api/customer-invoices"}
     )
     if guarded:
         supplied = request.headers.get(HEADER)

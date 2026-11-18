@@ -46,6 +46,18 @@ class CustomerBillingTests(unittest.TestCase):
         return self.server_client.post("/api/customer-invoices", headers=self.headers,
                                        json=payload or self.payload)
 
+    def test_customer_invoice_requires_the_current_dataset(self):
+        with closing(self.server.get_db_connection()) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS sync_dataset (id INTEGER PRIMARY KEY,dataset_id TEXT NOT NULL)")
+            connection.execute("INSERT OR REPLACE INTO sync_dataset VALUES (1,'isolated-billing-dataset')")
+            connection.commit()
+        self.assertEqual(self.post().status_code, 409)
+        denied = self.server_client.get("/api/customer-invoices", headers=self.headers,
+                                        query_string={"object_id": self.object_id})
+        self.assertEqual(denied.status_code, 409)
+        self.headers["X-SmartReport-Dataset"] = "isolated-billing-dataset"
+        self.assertEqual(self.post().status_code, 200)
+
     def test_customer_invoice_is_atomic_and_retry_does_not_duplicate_members(self):
         first = self.post()
         self.assertEqual(first.status_code, 200, first.get_json())
