@@ -284,7 +284,7 @@ class CustomerReportTests(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "dag_comp_cb"))
         self.assertFalse(hasattr(self.window, "dag_date_from"))
         buttons = [button.text() for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)]
-        self.assertIn("Сформировать PDF", buttons)
+        self.assertIn("PDF по часам и поездкам", buttons)
         self.assertNotIn("Рассчитать доплаты", buttons)
         self.assertIn("PDF только журнала (SV)", buttons)
 
@@ -537,7 +537,7 @@ class CustomerReportTests(unittest.TestCase):
             patch.object(self.desktop.QMessageBox, "information"),
             patch.object(self.desktop.QMessageBox, "critical") as critical,
         ):
-            for label in ("Сформировать PDF", "PDF только журнала (SV)"):
+            for label in ("PDF по часам и поездкам", "PDF только журнала (SV)"):
                 button = next(
                     button for button in self.window.tab_invoice.findChildren(self.desktop.QPushButton)
                     if button.text() == label
