@@ -10241,12 +10241,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Разбор расходов по категориям")
         dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        dialog.setWindowState(dialog.windowState() | Qt.WindowState.WindowMaximized)
         dialog.resize(1160, 650)
         dialog.setMinimumSize(980, 500)
         layout = QVBoxLayout(dialog)
         instruction = QLabel(
-            "Категория назначается каждой доле отдельно. Предложения основаны на содержании, "
-            "не сохраняются автоматически и не меняют суммы или назначение."
+            "Расходы уже распределены по объектам. Здесь выбирается только категория для отчёта: "
+            "материалы, подрядчики или другие расходы. При выборе категории строка отмечается автоматически."
         )
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
@@ -10343,6 +10344,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 table.setCellWidget(row, 6, original_button)
                 table.setItem(row, 7, QTableWidgetItem(
                     "Текущее подтверждение" if current_source == "user"
+                    else "Категория не выбрана" if suggested == CATEGORY_UNCLASSIFIED
                     else "Предложено · не сохранено"
                 ))
                 table.item(row, 5).setToolTip(evidence)
@@ -10350,6 +10352,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "document": dict(document),
                     "allocation_index": int(allocation_index),
                     "share": share,
+                    "saved_share": dict(allocation),
                     "checkbox": include,
                     "category_combo": category_combo,
                     "saved_category": current_category,
@@ -10380,6 +10383,24 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         selection_actions.addStretch(1)
         layout.insertLayout(1, selection_actions)
 
+        bulk_actions = QHBoxLayout()
+        bulk_actions.addWidget(QLabel("Для всех строк без категории:"))
+        bulk_category = QComboBox()
+        bulk_category.setObjectName("bulkExpenseCategory")
+        bulk_category.addItem("Выберите категорию…", None)
+        for category in EXPENSE_CATEGORIES:
+            if category != CATEGORY_UNCLASSIFIED:
+                bulk_category.addItem(category, category)
+        bulk_actions.addWidget(bulk_category, 1)
+        bulk_apply = QPushButton("Применить к неразобранным")
+        bulk_apply.setObjectName("applyBulkExpenseCategory")
+        bulk_apply.setEnabled(False)
+        bulk_actions.addWidget(bulk_apply)
+        layout.insertLayout(2, bulk_actions)
+        change_note = QLabel("Выберите категорию для неразобранных строк. Суммы и НДС сохраняются.")
+        change_note.setWordWrap(True)
+        layout.insertWidget(3, change_note)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         save_button = QPushButton("Сохранить выбранные категории")
@@ -10389,6 +10410,43 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
         close_button.clicked.connect(dialog.reject)
+
+        def refresh_changes():
+            changed = sum(
+                row["checkbox"].checkState() == Qt.CheckState.Checked
+                and row["category_combo"].currentData() != row["saved_category"]
+                for row in review_rows
+            )
+            save_button.setEnabled(bool(changed))
+            save_button.setText(f"Сохранить изменения ({changed})" if changed else "Сохранить изменения")
+            change_note.setText(
+                f"Изменений к сохранению: {changed}. Суммы, НДС и объекты останутся прежними."
+                if changed else "Нет изменений. Галочка сама по себе не назначает категорию; выберите её в строке или сразу для всех неразобранных."
+            )
+
+        def category_changed(row):
+            changed = row["category_combo"].currentData() != row["saved_category"]
+            row["checkbox"].setCheckState(Qt.CheckState.Checked if changed else Qt.CheckState.Unchecked)
+            row["status_item"].setText("Изменено · не сохранено" if changed else "Без изменений")
+            refresh_changes()
+
+        for row in review_rows:
+            row["category_combo"].currentIndexChanged.connect(lambda _index, row=row: category_changed(row))
+        table.itemChanged.connect(lambda _item: refresh_changes())
+        bulk_category.currentIndexChanged.connect(lambda _index: bulk_apply.setEnabled(bulk_category.currentData() is not None))
+
+        def apply_bulk_category():
+            category = bulk_category.currentData()
+            if category is None:
+                return
+            for row in review_rows:
+                combo = row["category_combo"]
+                if combo.currentData() == CATEGORY_UNCLASSIFIED:
+                    combo.setCurrentIndex(combo.findData(category))
+            refresh_changes()
+
+        bulk_apply.clicked.connect(apply_bulk_category)
+        refresh_changes()
 
         def select_all_suggestions():
             for row in review_rows:
@@ -10414,7 +10472,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     combo = row["category_combo"]
                     document = row["document"]
                     allocations = document.get("allocations") or []
-                    if combo.currentData() != CATEGORY_UNCLASSIFIED or len(allocations) != 1:
+                    if combo.currentData() != CATEGORY_UNCLASSIFIED:
                         continue
                     document_id = document.get("server_document_id") or document["id"]
                     try:
@@ -10422,7 +10480,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         if details.get("sync_version") != document.get("sync_version"):
                             row["status_item"].setText("Документ изменился. Откройте разбор заново.")
                             continue
-                        category, evidence = suggest_expense_category(details, row["share"])
+                        category, evidence = suggest_expense_category(details, row["share"], len(allocations))
                     except Exception as error:
                         logging.warning("Could not load recognized text for expense %s: %s", document_id, error)
                         row["status_item"].setText("Текст документа недоступен. Откройте оригинал.")
@@ -10476,7 +10534,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 capabilities = request_expense_api(
                     "GET", "/api/expense-documents/capabilities",
                 )
-                if "allocation_categories_v1" not in capabilities.get("features", []):
+                if "allocation_category_patch_v1" not in capabilities.get("features", []):
                     raise RuntimeError(
                         "Сервер не поддерживает категории долей. Записи не изменены."
                     )
@@ -10512,7 +10570,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                                 "Состав долей изменился; документ не обновлён."
                             )
                         current_part = allocations[index]
-                        original_part = row["share"]
+                        original_part = row["saved_share"]
                         if (
                             current_part.get("object_id") != original_part.get("object_id")
                             or parse_decimal(current_part.get("gross_amount"))
@@ -10539,20 +10597,28 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         current_part["expense_category_evidence"] = evidence
                         updates[index] = row
 
-                    payload = dict(current)
-                    payload["allocations"] = allocations
-                    payload["expected_version"] = int(current["sync_version"])
-                    request_expense_api(
-                        "PUT",
-                        f"/api/expense-documents/{document_id}",
+                    payload = {"expected_version": int(current["sync_version"]), "allocations": [
+                        {key: allocations[index][key] for key in ("allocation_id", "expense_category", "expense_category_evidence")}
+                        for index in updates
+                    ]}
+                    result = request_expense_api(
+                        "POST",
+                        f"/api/expense-documents/{document_id}/allocation-categories",
                         json=payload,
                     )
+                    saved_document = result["document"]
+                    saved_version = int(saved_document["sync_version"])
+                    for review_row in review_rows:
+                        review_id = review_row["document"].get("server_document_id") or review_row["document"].get("id")
+                        if review_id == document_id:
+                            review_row["document"]["sync_version"] = saved_version
+                            review_row["saved_share"] = dict(saved_document["allocations"][review_row["allocation_index"]])
                     saved_count += len(document_rows)
                     for index, row in updates.items():
                         row["saved_category"] = allocations[index]["expense_category"]
                         row["checkbox"].setCheckState(Qt.CheckState.Unchecked)
                         row["status_item"].setText(
-                            f"Сохранено, новая версия {int(current['sync_version']) + 1}"
+                            f"Сохранено, новая версия {saved_version}"
                         )
                 except Exception as error:
                     logging.exception(
@@ -10562,6 +10628,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     failed_count += len(document_rows)
                     for row in document_rows:
                         row["status_item"].setText(f"Не сохранено: {error}")
+
+            refresh_changes()
 
             if saved_count:
                 self._invalidate_expense_reads()

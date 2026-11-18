@@ -1384,6 +1384,12 @@ class CatalogSyncTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 201, created.get_json())
         original = created.get_json()["document"]
+        server_conn = self.server.get_db_connection()
+        server_conn.execute("UPDATE expense_allocations SET allocated_vat=NULL WHERE document_id=?", (original["id"],))
+        server_conn.commit()
+        server_conn.close()
+        original = self.server_client.get(f"/api/expense-documents/{original['id']}", headers=headers).get_json()["document"]
+        original.pop("recognized_text", None)
         already_categorized = {
             **original, "id": original["id"] + 1000, "client_id": str(uuid.uuid4()),
             "document_date": "2026-11-15", "invoice_number": "64",
@@ -1421,12 +1427,21 @@ class CatalogSyncTests(unittest.TestCase):
             clear_all = dialog.findChild(self.desktop.QPushButton, "clearExpenseCategorySelection")
             combo = table.cellWidget(0, 4)
             self.assertEqual(combo.currentData(), self.desktop.CATEGORY_UNCLASSIFIED)
+            self.assertFalse(dialog.findChild(self.desktop.QPushButton, "saveCategoryReview").isEnabled())
+            bulk = dialog.findChild(self.desktop.QComboBox, "bulkExpenseCategory")
+            bulk.setCurrentIndex(bulk.findData(self.desktop.CATEGORY_MATERIALS))
+            dialog.findChild(self.desktop.QPushButton, "applyBulkExpenseCategory").click()
+            self.assertEqual(combo.currentData(), self.desktop.CATEGORY_MATERIALS)
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Checked)
+            self.assertEqual(table.cellWidget(1, 4).currentData(), self.desktop.CATEGORY_MATERIALS)
+            self.assertEqual(table.item(1, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            combo.setCurrentIndex(combo.findData(self.desktop.CATEGORY_UNCLASSIFIED))
             select_all.click()
             self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
             dialog.findChild(self.desktop.QPushButton, "suggestStoredExpenseCategories").click()
             self.assertEqual(combo.currentData(), self.desktop.CATEGORY_SUBCONTRACTOR_WORK)
             self.assertIn("Byggtjänster", table.item(0, 5).text())
-            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Checked)
             table.item(1, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
             select_all.click()
             self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Checked)
@@ -1457,7 +1472,13 @@ class CatalogSyncTests(unittest.TestCase):
                 dialog.findChild(
                     self.desktop.QPushButton, "saveCategoryReview",
                 ).click()
-                no_selection.assert_called_once()
+                no_selection.assert_not_called()
+                self.assertFalse(dialog.findChild(self.desktop.QPushButton, "saveCategoryReview").isEnabled())
+            combo.setCurrentIndex(combo.findData(self.desktop.CATEGORY_MATERIALS))
+            with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes), \
+                    patch.object(self.desktop.QMessageBox, "information"):
+                dialog.findChild(self.desktop.QPushButton, "saveCategoryReview").click()
+            self.assertEqual(table.item(0, 7).text(), "Сохранено, новая версия 3")
             dialog.reject()
             return dialog.result()
 
@@ -1478,26 +1499,46 @@ class CatalogSyncTests(unittest.TestCase):
             ), patch.object(
                 self.desktop.QDialog, "exec", new=accept_category_review,
             ):
+                window._object_expense_recovery_cache[window._object_expense_recovery_key(original, object_id)] = {
+                    "allocations": {0: {"vat_amount": "0.00", "net_recovered_from_original": True}},
+                    "status": "recovered", "verified_count": 1,
+                }
                 window.open_expense_category_review()
 
             current = self.server_client.get(
                 f"/api/expense-documents/{original['id']}", headers=headers,
             ).get_json()["document"]
-            self.assertEqual(current["sync_version"], 2)
+            self.assertEqual(current["sync_version"], 3)
             self.assertEqual(current["supplier_name"], original["supplier_name"])
             self.assertEqual(current["verification_status"], "confirmed")
             for field in ("net_amount", "vat_amount", "gross_amount", "rounding_amount", "amount_due"):
                 self.assertEqual(current[field], original[field])
             self.assertEqual(current["allocations"][0]["object_id"], object_id)
             self.assertEqual(current["allocations"][0]["net_amount"], "67240.00")
+            self.assertIsNone(current["allocations"][0]["vat_amount"])
             self.assertEqual(
                 current["allocations"][0]["expense_category"],
-                self.desktop.CATEGORY_SUBCONTRACTOR_WORK,
+                self.desktop.CATEGORY_MATERIALS,
             )
             self.assertEqual(
                 current["allocations"][0]["expense_category_source"], "user",
             )
             self.assertIn("пользователь", current["allocations"][0]["expense_category_evidence"].casefold())
+            self.assertEqual(current["allocations"][0]["allocation_id"], original["allocations"][0]["allocation_id"])
+            endpoint = f"/api/expense-documents/{original['id']}/allocation-categories"
+            update = {"allocation_id": current["allocations"][0]["allocation_id"],
+                      "expense_category": self.desktop.CATEGORY_SUBCONTRACTOR_WORK,
+                      "expense_category_evidence": "Explicit isolated test choice"}
+            stale = self.server_client.post(endpoint, headers=headers, json={"expected_version": 1, "allocations": [update]})
+            self.assertEqual(stale.status_code, 409)
+            invalid = self.server_client.post(endpoint, headers=headers,
+                                              json={"expected_version": 3, "allocations": [update, {**update, "allocation_id": -1}]})
+            self.assertEqual(invalid.status_code, 400)
+            forbidden = self.server_client.post(endpoint, headers=headers,
+                                                json={"expected_version": 3, "allocations": [{**update, "net_amount": "1.00"}]})
+            self.assertEqual(forbidden.status_code, 400)
+            preserved = self.server_client.get(f"/api/expense-documents/{original['id']}", headers=headers).get_json()["document"]
+            self.assertEqual(preserved, current)
             server_conn = self.server.get_db_connection()
             self.assertEqual(server_conn.execute(
                 "SELECT COUNT(*) FROM expense_documents WHERE client_id=?", (client_id,)

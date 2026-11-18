@@ -2007,6 +2007,7 @@ def expense_document_capabilities_api():
         }
         if {"expense_category_source", "expense_category_evidence"}.issubset(allocation_columns):
             net_features.append("allocation_categories_v1")
+            net_features.append("allocation_category_patch_v1")
         evidence_table = connection.execute("""
             SELECT 1 FROM sqlite_master
             WHERE type='table' AND name='expense_document_evidence'
@@ -2652,6 +2653,61 @@ def expense_document_update_api(document_id):
         conn.rollback()
         logger.exception("Не удалось обновить документ расхода.")
         return jsonify({"ok": False, "error": "Не удалось обновить документ."}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/expense-documents/<int:document_id>/allocation-categories", methods=["POST"])
+def expense_allocation_categories_api(document_id):
+    """Change categories in place without reinterpreting saved financial fields."""
+    if not expense_api_authorized():
+        return jsonify(ok=False, error="Доступ запрещён."), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"expected_version", "allocations"}:
+        return jsonify(ok=False, error="Ожидаются только категории и версия документа."), 400
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        document = conn.execute("SELECT * FROM expense_documents WHERE id=? AND is_deleted=0", (document_id,)).fetchone()
+        if document is None:
+            return jsonify(ok=False, error="Документ не найден."), 404
+        if type(payload.get("expected_version")) is not int or payload["expected_version"] != document["sync_version"]:
+            return jsonify(ok=False, conflict=True, error="Документ изменился; откройте категории заново."), 409
+        if document["verification_status"] != "confirmed":
+            raise ValueError("Сначала подтвердите документ.")
+        updates = payload.get("allocations")
+        if not isinstance(updates, list) or not 1 <= len(updates) <= 500:
+            raise ValueError("Выберите изменённые категории.")
+        before = [dict(row) for row in conn.execute("SELECT * FROM expense_allocations WHERE document_id=? ORDER BY id", (document_id,))]
+        ids = {row["id"] for row in before}
+        seen = set()
+        for part in updates:
+            if not isinstance(part, dict) or set(part) - {"allocation_id", "expense_category", "expense_category_evidence"}:
+                raise ValueError("Изменение сумм через категории запрещено.")
+            allocation_id = part.get("allocation_id")
+            category = part.get("expense_category")
+            evidence = str(part.get("expense_category_evidence") or "").strip()
+            if type(allocation_id) is not int or allocation_id not in ids or allocation_id in seen:
+                raise ValueError("Доля отсутствует или повторяется.")
+            if category not in EXPENSE_CATEGORIES or not evidence or len(evidence) > 500:
+                raise ValueError("Выберите категорию и основание подтверждения.")
+            seen.add(allocation_id)
+            conn.execute("UPDATE expense_allocations SET expense_category=?,expense_category_source=?,expense_category_evidence=? WHERE id=? AND document_id=?",
+                         (category, "unclassified" if category == CATEGORY_UNCLASSIFIED else "user", evidence, allocation_id, document_id))
+        after = [dict(row) for row in conn.execute("SELECT * FROM expense_allocations WHERE document_id=? ORDER BY id", (document_id,))]
+        old_snapshot = _allocation_history_snapshot(before, database_rows=True)
+        new_snapshot = _allocation_history_snapshot(after, database_rows=True)
+        if old_snapshot != new_snapshot:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute("INSERT INTO expense_allocation_history(document_id,changed_at,old_allocations_json,new_allocations_json) VALUES(?,?,?,?)",
+                         (document_id, now, json.dumps(old_snapshot, ensure_ascii=False), json.dumps(new_snapshot, ensure_ascii=False)))
+            conn.execute("UPDATE expense_documents SET sync_version=sync_version+1,updated_at=? WHERE id=?", (now, document_id))
+        conn.commit()
+        current = conn.execute("SELECT * FROM expense_documents WHERE id=?", (document_id,)).fetchone()
+        return jsonify(ok=True, document=serialize_expense_document(conn.cursor(), current))
+    except (ValueError, TypeError) as error:
+        conn.rollback()
+        return jsonify(ok=False, error=str(error)), 400
     finally:
         conn.close()
 
