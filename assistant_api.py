@@ -2791,6 +2791,12 @@ def register_assistant(app, connect, authenticate):
         return handle(lambda conn, actor: jsonify(ok=True, translations=translate_descriptions(
             conn, actor, request.get_json(silent=True))))
 
+    @app.route("/api/assistant/expense-categories", methods=["POST"])
+    def assistant_expense_categories():
+        from expense_category_ai import request_categories
+        return handle(lambda conn, actor: jsonify(ok=True, suggestions=request_categories(
+            conn, actor, request.get_json(silent=True))))
+
     @app.route("/api/assistant/invoice-layout", methods=["POST"])
     def assistant_invoice_layout():
         from invoice_layout_ai import request_selection

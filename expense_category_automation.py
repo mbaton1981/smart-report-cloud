@@ -4,6 +4,7 @@ from pathlib import Path
 from document_costs import verified_original_order_allocation_proposal
 from expense_documents import extract_local_document, parse_decimal
 from expense_categories import CATEGORY_UNCLASSIFIED, confirmed_expense_category, suggest_expense_category
+from expense_item_content import single_allocation_content
 
 
 def propose_document_categories(document, objects, paths=()):
@@ -14,6 +15,8 @@ def propose_document_categories(document, objects, paths=()):
         if source == "user":
             continue
         category, evidence = suggest_expense_category(document, allocation, len(allocations))
+        if document.get("has_original") or document.get("attachments"):
+            category, evidence = CATEGORY_UNCLASSIFIED, "Читаем содержание оригинала."
         result[index] = {"category": category, "evidence": evidence, "content": allocation.get("note") or ""}
     if not any(item["category"] == CATEGORY_UNCLASSIFIED for item in result.values()) or not paths:
         return result
@@ -26,6 +29,15 @@ def propose_document_categories(document, objects, paths=()):
                 pages.append({"source": path.name, "page": page_index + 1, "attachment_index": attachment,
                               "text": text, "elements": extracted.page_elements[page_index]
                               if page_index < len(extracted.page_elements) else ()})
+        content = single_allocation_content(pages, document)
+        if len(allocations) == 1:
+            if 0 in result:
+                if content:
+                    category, evidence = suggest_expense_category({}, {"note": content})
+                    result[0].update(category=category, evidence="Товарные строки оригинала. " + evidence, content=content)
+                else:
+                    result[0].update(category=CATEGORY_UNCLASSIFIED, content="", evidence="Товарные строки оригинала не выделены; нужна проверка.")
+            return result
         parts = verified_original_order_allocation_proposal(pages, document, objects)
         for index, proposal in result.items():
             if proposal["category"] != CATEGORY_UNCLASSIFIED:

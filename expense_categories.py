@@ -83,6 +83,10 @@ def suggest_expense_category(document, allocation, allocation_count=1):
         str(document.get("document_comment") or "").strip(),
         str(document.get("recognized_text") or document.get("raw_text") or "").strip(),
     ))))
+    supplier = " ".join(str(document.get("supplier_name") or "").casefold().split())
+    document_text = "\n".join(line for line in document_text.splitlines()
+                              if " ".join(line.casefold().split()) != supplier
+                              and not re.search(r"(?:moms\s*%.*frakt|frakt\s+ex\.?\s*moms.*artik|nettosumma\s+artiklar|avrundningsdifferens.*fakturabelopp)", line, re.IGNORECASE))
     if allocation_text and not (_MIXED_WORK_AND_MATERIALS.search(allocation_text) or any(
         pattern.search(allocation_text) for pattern in _CATEGORY_TERMS.values()
     )):

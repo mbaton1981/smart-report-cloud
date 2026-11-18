@@ -171,7 +171,7 @@ def request_expense_api(method, path, **kwargs):
     headers = sync_headers(kwargs.pop("headers", {}))
     ensure_sync_dataset()
     response = requests.request(
-        method, f"{CLOUD_URL.rstrip('/')}{path}", headers=headers, timeout=20, **kwargs
+        method, f"{CLOUD_URL.rstrip('/')}{path}", headers=headers, timeout=kwargs.pop("timeout", 20), **kwargs
     )
     from sync_dataset import file_dataset, require_response_dataset
     require_response_dataset(response, file_dataset(DB_FILE))
@@ -8854,6 +8854,35 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def incoming_allocation_objects(self):
         return self._expense_server_objects(include_inactive=True)[0]
 
+    def incoming_category_suggestions(self, proposals):
+        from expense_category_ai import classify_unknown
+
+        def request(payload):
+            capabilities = request_expense_api("GET", "/api/expense-documents/capabilities")
+            if "expense_category_ai_v1" not in capabilities.get("features", []):
+                raise RuntimeError("Для ИИ-разбора товарных строк требуется обновление сервера.")
+            return request_expense_api("POST", "/api/assistant/expense-categories", json=payload, timeout=105)
+
+        from PyQt6.QtCore import QThread
+        if not any(isinstance(items, dict) and any(
+                item.get("category") == CATEGORY_UNCLASSIFIED and item.get("content") for item in items.values())
+                for items in proposals.values()):
+            return
+        if QThread.currentThread() != QApplication.instance().thread():
+            classify_unknown(proposals, request)
+            return
+        from PyQt6.QtWidgets import QProgressDialog
+        loop = QEventLoop()
+        task = ObjectOverviewTask(0, lambda: classify_unknown(proposals, request))
+        task.signals.completed.connect(lambda *_args: loop.quit())
+        progress = QProgressDialog("ИИ определяет категории по товарным строкам…", "", 0, 0, self)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QThreadPool.globalInstance().start(task)
+        loop.exec()
+        progress.close()
+
     def _expense_server_objects(self, *, include_inactive=False):
         if include_inactive:
             conn = get_db_connection()
@@ -10323,6 +10352,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     suggested, evidence = suggest_expense_category(
                         document, share, len(document.get("allocations") or []),
                     )
+                    if document.get("has_original") or document.get("attachments"):
+                        suggested, evidence = CATEGORY_UNCLASSIFIED, "Читаем товарные строки оригинала."
                 currency = str(document.get("currency_code") or "SEK")
                 net = parse_decimal(share.get("net_amount"))
                 net_label = f"{net:,.2f} {currency}" if net is not None else "Неизвестно"
@@ -10517,6 +10548,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             results[document_id] = proposals
                         except Exception as error:
                             results[document_id] = str(error)
+                    self.incoming_category_suggestions(results)
                     return results
 
                 loop = QEventLoop()

@@ -101,6 +101,9 @@ class IncomingStore(OfflineReviewStore):
             except (ReviewError, OSError, ValueError):
                 paths = []
             suggestions = propose_document_categories(dict(base, allocations=allocations), objects, paths)
+            provider = getattr(self.host, "incoming_category_suggestions", None)
+            if provider:
+                provider({document_id: suggestions})
             for index, suggestion in suggestions.items():
                 if suggestion["category"] != CATEGORY_UNCLASSIFIED:
                     proposal["parts"][index].update(expense_category=suggestion["category"], expense_category_source="suggested",
