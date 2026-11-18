@@ -10240,6 +10240,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Разбор расходов по категориям")
+        dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         dialog.resize(1160, 650)
         dialog.setMinimumSize(980, 500)
         layout = QVBoxLayout(dialog)
@@ -10351,6 +10352,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "share": share,
                     "checkbox": include,
                     "category_combo": category_combo,
+                    "saved_category": current_category,
                     "suggested": suggested,
                     "evidence": evidence,
                     "evidence_item": table.item(row, 5),
@@ -10364,11 +10366,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             message.setWordWrap(True)
             layout.addWidget(message)
 
-        buttons = QHBoxLayout()
+        selection_actions = QHBoxLayout()
         find_categories_button = QPushButton("Предложить категории по документам")
         find_categories_button.setObjectName("suggestStoredExpenseCategories")
         find_categories_button.setEnabled(bool(review_rows))
-        buttons.addWidget(find_categories_button)
+        selection_actions.addWidget(find_categories_button)
+        select_all_button = QPushButton("Отметить все предложения")
+        select_all_button.setObjectName("selectAllExpenseCategorySuggestions")
+        selection_actions.addWidget(select_all_button)
+        clear_selection_button = QPushButton("Снять все отметки")
+        clear_selection_button.setObjectName("clearExpenseCategorySelection")
+        selection_actions.addWidget(clear_selection_button)
+        selection_actions.addStretch(1)
+        layout.insertLayout(1, selection_actions)
+
+        buttons = QHBoxLayout()
         buttons.addStretch(1)
         save_button = QPushButton("Сохранить выбранные категории")
         save_button.setObjectName("saveCategoryReview")
@@ -10377,6 +10389,23 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
         close_button.clicked.connect(dialog.reject)
+
+        def select_all_suggestions():
+            for row in review_rows:
+                category = row["category_combo"].currentData()
+                if category != CATEGORY_UNCLASSIFIED and category != row["saved_category"]:
+                    row["checkbox"].setCheckState(Qt.CheckState.Checked)
+                elif category == row["saved_category"]:
+                    row["checkbox"].setCheckState(Qt.CheckState.Unchecked)
+
+        def clear_selection():
+            for row in review_rows:
+                row["checkbox"].setCheckState(Qt.CheckState.Unchecked)
+
+        select_all_button.setEnabled(bool(review_rows))
+        clear_selection_button.setEnabled(bool(review_rows))
+        select_all_button.clicked.connect(select_all_suggestions)
+        clear_selection_button.clicked.connect(clear_selection)
 
         def find_categories():
             find_categories_button.setEnabled(False)
@@ -10416,10 +10445,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             selected_rows = [
                 row for row in review_rows
                 if row["checkbox"].checkState() == Qt.CheckState.Checked
+                and row["category_combo"].currentData() != row["saved_category"]
             ]
             if not selected_rows:
                 QMessageBox.information(
-                    dialog, "Категории расходов", "Отметьте доли, которые нужно сохранить.",
+                    dialog, "Категории расходов", "Отметьте доли с новыми или изменёнными категориями.",
                 )
                 return
             selected_documents = {
@@ -10519,6 +10549,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     )
                     saved_count += len(document_rows)
                     for index, row in updates.items():
+                        row["saved_category"] = allocations[index]["expense_category"]
                         row["checkbox"].setCheckState(Qt.CheckState.Unchecked)
                         row["status_item"].setText(
                             f"Сохранено, новая версия {int(current['sync_version']) + 1}"

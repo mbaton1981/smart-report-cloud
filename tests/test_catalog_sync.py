@@ -1384,6 +1384,12 @@ class CatalogSyncTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 201, created.get_json())
         original = created.get_json()["document"]
+        already_categorized = {
+            **original, "id": original["id"] + 1000, "client_id": str(uuid.uuid4()),
+            "document_date": "2026-11-15", "invoice_number": "64",
+            "allocations": [{**allocation, "expense_category": "Материалы и закупки",
+                             "expense_category_source": "user"} for allocation in original["allocations"]],
+        }
         object_row = {"id": object_id, "name": "p1037", "markning": "p1037"}
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
@@ -1409,14 +1415,25 @@ class CatalogSyncTests(unittest.TestCase):
 
         def accept_category_review(dialog):
             table = dialog.findChild(self.desktop.QTableWidget)
-            self.assertEqual(table.rowCount(), 1)
+            self.assertEqual(table.rowCount(), 2)
+            self.assertTrue(dialog.windowFlags() & self.desktop.Qt.WindowType.WindowMaximizeButtonHint)
+            select_all = dialog.findChild(self.desktop.QPushButton, "selectAllExpenseCategorySuggestions")
+            clear_all = dialog.findChild(self.desktop.QPushButton, "clearExpenseCategorySelection")
             combo = table.cellWidget(0, 4)
             self.assertEqual(combo.currentData(), self.desktop.CATEGORY_UNCLASSIFIED)
+            select_all.click()
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
             dialog.findChild(self.desktop.QPushButton, "suggestStoredExpenseCategories").click()
             self.assertEqual(combo.currentData(), self.desktop.CATEGORY_SUBCONTRACTOR_WORK)
             self.assertIn("Byggtjänster", table.item(0, 5).text())
             self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
-            table.item(0, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
+            table.item(1, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
+            select_all.click()
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Checked)
+            self.assertEqual(table.item(1, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            clear_all.click()
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            select_all.click()
             with patch.object(
                 self.desktop.QMessageBox, "question",
                 return_value=self.desktop.QMessageBox.StandardButton.Yes,
@@ -1432,6 +1449,8 @@ class CatalogSyncTests(unittest.TestCase):
                 table.item(0, 0).checkState(),
                 self.desktop.Qt.CheckState.Unchecked,
             )
+            select_all.click()
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
             with patch.object(
                 self.desktop.QMessageBox, "information",
             ) as no_selection:
@@ -1453,7 +1472,7 @@ class CatalogSyncTests(unittest.TestCase):
             )
             with patch.object(
                 window, "_expense_document_snapshot",
-                return_value=([original], True),
+                return_value=([original, already_categorized], True),
             ), patch.object(
                 self.desktop, "request_expense_api", side_effect=fake_api,
             ), patch.object(
