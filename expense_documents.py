@@ -169,6 +169,7 @@ _ENGLISH_MONTHS = (
     "July", "August", "September", "October", "November", "December",
 )
 _ENGLISH_DATE = re.compile(r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})")
+_ENGLISH_INVOICE_COLUMNS = ("invoice #", "invoice date", "terms", "due date", "currency")
 
 
 def _date_value(value: str | None) -> str | None:
@@ -341,6 +342,9 @@ def parse_document_text(text: str) -> dict[str, Any]:
         re.search(r"(?:fakturanummer|invoice\s*(?:number|no\.?))\s*:", full_text, re.IGNORECASE)
         and re.search(r"(?:fakturadatum|faktureringsdatum|invoice\s*date)\s*:",
                       full_text, re.IGNORECASE)
+        or any(line.casefold() == "invoice" for line in lines[:3])
+        and re.search(r"^Invoice\s*#\s*$", full_text, re.IGNORECASE | re.MULTILINE)
+        and re.search(r"^Invoice\s+Date\s*$", full_text, re.IGNORECASE | re.MULTILINE)
     )
     is_receipt = (receipt_heading or bool(re.search(
         r"kvitto|receipt|kassakvitto|\bkontantnota\b", lower_text)) and not has_invoice_identity)
@@ -910,7 +914,7 @@ def parse_invoice_pages(pages):
         "vat_amount": r"Moms\s+totalt|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
         "rounding_amount": r"Öresavrundning|Öresavr\.?|Öresutjämning|Avrundning|Avrundningsdifferens|Rounding",
         "amount_due": r"A(?:tt)?\s+betala(?:\s*\((?:SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN)\))?|Kvar\s+att\s+betala|Summa\s+att\s+betala|Belopp\s+att\s+betala|Totalt\s+att\s+betala|Amount\s+due|Fakturatotal|Fakturabelopp|Totalt\s+fakturerat\s+belopp\s+inkl\.?\s*moms|Totalt\s+belopp\s+inkl\.?\s*moms|Totalbelopp\s+i\s+SEK",
-        "gross_amount": r"Summa\s+totalt|Totalt?(?:\s+belopp)?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Totalt",
+        "gross_amount": r"Summa\s+totalt|Totalt?(?:\s+belopp)?\s+inkl\.?\s*moms|Summa\s+inkl\.?\s*moms|Totalbelopp(?:\s+inkl\.?\s*moms)?(?:\s+i\s+SEK)?|Invoice\s+total|Totalt",
         "taxable_net_amount": r"Totalbelopp\s+momspliktigt",
         "exempt_net_amount": r"Totalbelopp\s+ej\s+momspliktigt",
     }
@@ -978,6 +982,8 @@ def parse_invoice_pages(pages):
         return None
 
     fallback_invoice_candidates = []
+    fallback_supplier_candidates = []
+    fallback_gross_candidates = []
     fallback_vat_candidates = []
     fallback_due_candidates = []
     fallback_date_candidates = []
@@ -999,7 +1005,29 @@ def parse_invoice_pages(pages):
         cells = [cell for row in rows for cell in row]
         page_lines = [line.strip() for line in str(page.get("text") or "").splitlines() if line.strip()]
         for index, line in enumerate(page_lines):
-            header = ("invoice #", "invoice date", "terms", "due date", "currency")
+            source = {"source": page.get("source"), "page": page.get("page", 1),
+                      "attachment_index": page.get("attachment_index", 0)}
+            if 0 < index < 10 and index + 1 < len(page_lines):
+                issue = re.fullmatch(r"Date\s+of\s+issue\s*:?\s+(.+)", page_lines[index - 1], re.IGNORECASE)
+                due = re.fullmatch(r"Date\s+due\s*:?\s+(.+)", line, re.IGNORECASE)
+                seller = page_lines[index + 1]
+                if (issue and due and checked_value("document_date", issue[1])
+                        and checked_value("due_date", due[1])
+                        and re.fullmatch(r"[\w&.,'’()\- ]+\s+Limited", seller, re.IGNORECASE)
+                        and any(re.fullmatch(r"Bill\s+to\s*:?", item, re.IGNORECASE)
+                                for item in page_lines[index + 2:index + 14])):
+                    fallback_supplier_candidates.append((seller, {
+                        **source, "text": seller, "kind": "seller_header_block",
+                    }))
+            total = re.fullmatch(r"Total\s*:?\s+(.+)", line, re.IGNORECASE)
+            if total and fields.get("document_type") == "invoice" and index + 1 < len(page_lines):
+                due_total = re.fullmatch(r"Amount\s+due\s*:?\s+(.+)", page_lines[index + 1], re.IGNORECASE)
+                amount = checked_value("gross_amount", total[1])
+                if amount is not None and due_total and checked_value("amount_due", due_total[1]) is not None:
+                    fallback_gross_candidates.append((amount, {
+                        **source, "text": line, "caption": "Total", "kind": "invoice_total",
+                    }))
+            header = _ENGLISH_INVOICE_COLUMNS
             if (line.casefold() == header[0]
                     and tuple(item.casefold() for item in page_lines[index:index + len(header)]) == header):
                 values = page_lines[index + len(header):index + 2 * len(header)]
@@ -1014,6 +1042,14 @@ def parse_invoice_pages(pages):
                             "attachment_index": page.get("attachment_index", 0),
                             "text": values[1], "caption": page_lines[index + 1], "kind": "header",
                         }))
+                    heading = next((pos for pos, item in enumerate(page_lines[:3])
+                                    if item.casefold() == "invoice"), None)
+                    if heading is not None and heading + 1 < index:
+                        seller = page_lines[heading + 1]
+                        if re.fullmatch(r"[\w&.,'’()\- ]+\s+Inc\.?", seller, re.IGNORECASE):
+                            fallback_supplier_candidates.append((seller, {
+                                **source, "text": seller, "kind": "seller_header_block",
+                            }))
             if (line.casefold() == "faktura" and index + 2 < len(page_lines)
                     and re.fullmatch(r"nr\.?", page_lines[index + 1], re.IGNORECASE)
                     and re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{1,120}", page_lines[index + 2])):
@@ -1257,6 +1293,7 @@ def parse_invoice_pages(pages):
                     candidates[key].append((value, source))
     for key, fallbacks in (
         ("invoice_number", fallback_invoice_candidates),
+        ("gross_amount", fallback_gross_candidates),
         ("vat_amount", fallback_vat_candidates),
         ("amount_due", fallback_due_candidates),
         ("document_date", fallback_date_candidates),
@@ -1283,6 +1320,8 @@ def parse_invoice_pages(pages):
             candidates["supplier_name"].append((company, {"page": page.get("page", 1), "text": cell["text"],
                                                        "kind": kind}))
             supplier_identity = invoice_supplier_identifiers(page, company)
+    if not candidates["supplier_name"]:
+        candidates["supplier_name"].extend(fallback_supplier_candidates)
     fiscal_summary_pages = {
         (source.get("attachment_index", 0), source["page"])
         for _, source in candidates["taxable_net_amount"]

@@ -57,10 +57,27 @@ class CostExtractionTests(unittest.TestCase):
         fields = parse_invoice_pages([{
             "page": 1,
             "text": "INVOICE\nGitHub, Inc.\nInvoice #\nInvoice Date\nTerms\nDue Date\nCurrency\n"
-                    "INV-123\nNov 17, 2026\nDue Upon Receipt\nNov 25, 2026\nUSD",
+                    "INV-123\nNov 17, 2026\nDue Upon Receipt\nNov 25, 2026\nUSD\n"
+                    "INVOICE TOTAL: $100.00",
         }])
         self.assertEqual(fields["document_date"], "2026-11-17")
+        self.assertEqual(fields["document_type"], "invoice")
+        self.assertEqual(fields["supplier_name"], "GitHub, Inc.")
+        self.assertEqual(fields["gross_amount"], "100.00")
         self.assertEqual(fields["field_sources"]["document_date"][0]["caption"], "Invoice Date")
+
+    def test_english_invoice_keeps_seller_and_printed_total_with_ambiguous_currency(self):
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "Invoice\nInvoice number INV-123\nDate of issue November 17, 2026\n"
+                    "Date due November 17, 2026\nExample Ireland Limited\nStreet 1\n"
+                    "Bill to\nRecipient Limited\nSubtotal 100.00kr\nTotal 100.00kr\n"
+                    "Amount due 100.00kr\nTax to be paid on reverse charge basis",
+        }])
+        self.assertEqual(fields["supplier_name"], "Example Ireland Limited")
+        self.assertEqual(fields["gross_amount"], "100.00")
+        self.assertEqual(fields["amount_due"], "100.00")
+        self.assertEqual(fields["currency_code"], "UNKNOWN")
 
     def test_swedish_short_year_invoice_date_is_parsed_as_year_first(self):
         from expense_documents import _date_value

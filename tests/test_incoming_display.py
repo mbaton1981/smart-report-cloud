@@ -941,6 +941,9 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIsNone(self.store.card(1))
 
     def test_rerecognition_preview_shows_changes_before_updating_unconfirmed_draft(self):
+        from threading import Event
+
+        from PyQt6.QtCore import QTimer
         from PyQt6.QtWidgets import QMessageBox
 
         window = self.open_window(document_id=1)
@@ -969,14 +972,22 @@ class IncomingDisplayTests(unittest.TestCase):
             },
         )
         result = {"fields": recognized, "state": "requires_review", "errors": []}
+        ui_ticked = Event()
+        responsive_during_recognition = []
 
-        with patch("invoice_processing.recognize_invoice", return_value=result) as recognize, \
+        def recognize_while_waiting_for_ui(_originals):
+            responsive_during_recognition.append(ui_ticked.wait(2))
+            return result
+
+        with patch("invoice_processing.recognize_invoice", side_effect=recognize_while_waiting_for_ui) as recognize, \
                 patch.object(QMessageBox, "question",
                              return_value=QMessageBox.StandardButton.Yes) as confirm, \
                 patch.object(QMessageBox, "information"):
+            QTimer.singleShot(10, ui_ticked.set)
             window.rerecognition_button.click()
 
         recognize.assert_called_once()
+        self.assertEqual(responsive_during_recognition, [True])
         self.assertIn("Isolated Supplier AB", confirm.call_args.args[2])
         self.assertIn("Sickla IF", confirm.call_args.args[2])
         self.assertIn("стр. 1: нетто + НДС", confirm.call_args.args[2])

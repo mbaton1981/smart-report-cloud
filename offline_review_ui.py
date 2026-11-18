@@ -3,17 +3,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sqlite3
 import sys
 from decimal import Decimal
 from html import escape
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEventLoop, QThread, Qt
 from PyQt6.QtGui import QColor, QPalette, QBrush
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QScrollArea, QSplitter, QTextEdit,
+    QLineEdit, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSplitter, QTextEdit,
     QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
     QStyledItemDelegate, QStyle,
 )
@@ -39,6 +40,21 @@ LABELS = {
 TYPES = {"invoice": "Фактура", "receipt": "Чек", "unclassified": "Тип не установлен",
          "tax_decision": "Решение о транспортном налоге", "order_confirmation": "Подтверждение заказа",
          "credit_note": "Кредитная фактура", "proforma": "Проформа", "manual": "Вручную"}
+
+
+class InvoiceRecognitionThread(QThread):
+    def __init__(self, original):
+        super().__init__()
+        self.original = original
+        self.result = None
+
+    def run(self):
+        from invoice_processing import recognize_invoice
+
+        try:
+            self.result = recognize_invoice([self.original])
+        except Exception as error:
+            logging.error("Invoice re-recognition failed: %s", type(error).__name__)
 
 
 class IncomingDocumentDelegate(QStyledItemDelegate):
@@ -1616,7 +1632,7 @@ class OfflineReviewWindow(QDialog):
         self.refresh_document_labels()
 
     def preview_rerecognition(self):
-        if not self.integrated or self.document_id is None:
+        if not self.integrated or self.document_id is None or getattr(self, "_recognition_running", False):
             return
         if self.payload() != self.loaded_payload:
             QMessageBox.warning(
@@ -1625,20 +1641,42 @@ class OfflineReviewWindow(QDialog):
             )
             return
 
-        from invoice_processing import recognize_invoice
-
-        preview_revision, preview_payload = self.store.latest(self.document_id)
-        preview_base = self.store.base(self.document_id)
+        document_id = self.document_id
         try:
-            result = recognize_invoice([self.store.original(self.document_id)])
-        except (ReviewError, OSError, ValueError, RuntimeError) as error:
-            QMessageBox.warning(self, "Повторный разбор не выполнен", str(error))
+            preview_revision, preview_payload = self.store.latest(document_id)
+            preview_base = self.store.base(document_id)
+            original = self.store.original(document_id)
+        except (ReviewError, OSError, sqlite3.Error, ValueError):
+            QMessageBox.warning(self, "Повторный разбор не выполнен",
+                                "Не удалось прочитать черновик или оригинал.")
             return
-        if result.get("errors") or result.get("state") == "failed":
-            details = "\n".join(str(error) for error in result.get("errors") or [])
+
+        progress = QProgressDialog("Распознаём PDF. Это может занять некоторое время.", "", 0, 0, self)
+        progress.setCancelButton(None)
+        progress.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setWindowTitle("Повторное распознавание")
+        worker = InvoiceRecognitionThread(original)
+        loop = QEventLoop()
+        worker.finished.connect(loop.quit, Qt.ConnectionType.QueuedConnection)
+        self._recognition_running = True
+        self.rerecognition_button.setEnabled(False)
+        try:
+            progress.show()
+            worker.start()
+            loop.exec()
+        finally:
+            worker.wait()
+            progress.close()
+            self._recognition_running = False
+            self.rerecognition_button.setEnabled(self.original_available)
+        if self.document_id != document_id or self.payload() != self.loaded_payload:
+            return
+        result = worker.result
+        if not result or result.get("errors") or result.get("state") == "failed":
             QMessageBox.warning(
                 self, "Повторный разбор не выполнен",
-                details or "Старые данные черновика сохранены.",
+                "Не удалось распознать оригинал. Прежние поля черновика сохранены.",
             )
             return
 
@@ -1659,11 +1697,10 @@ class OfflineReviewWindow(QDialog):
         for key in comparison_keys:
             old_value = (preview_payload.get(key) if key in EDITABLE else base.get(key))
             new_value = recognized.get(key)
-            if old_value == new_value:
+            if old_value == new_value or new_value in (None, "", "UNKNOWN"):
                 continue
             old_text = "не распознано" if old_value in (None, "", "UNKNOWN") else str(old_value)
-            new_text = ("не распознано при повторном разборе"
-                        if new_value in (None, "", "UNKNOWN") else str(new_value))
+            new_text = str(new_value)
             evidence = (recognized.get("field_sources") or {}).get(key) or []
 
             def format_source(source):
@@ -1676,7 +1713,10 @@ class OfflineReviewWindow(QDialog):
                     "net_plus_vat": "нетто + НДС",
                     "invoice_total_minus_net_and_vat": "итог фактуры минус нетто и НДС",
                 }.get(source.get("operation"), source.get("operation") or source.get("kind"))
-                return f"{'стр. ' + ', '.join(pages) + ': ' if pages else ''}{detail}"
+                snippet = " ".join(str(detail or "").split())
+                if len(snippet) > 120:
+                    snippet = snippet[:117] + "..."
+                return f"{'стр. ' + ', '.join(pages) + ': ' if pages else ''}{snippet}"
 
             evidence_text = "; ".join(format_source(source) for source in evidence[:2])
             line = f"{labels.get(key, key)}: «{old_text}» → «{new_text}»"
@@ -1724,7 +1764,7 @@ class OfflineReviewWindow(QDialog):
             return
         try:
             self.store.record_recognition(
-                self.document_id, result, replace_automatic=True,
+                document_id, result, replace_automatic=True,
                 expected_revision=preview_revision,
                 expected_payload=preview_payload,
                 expected_base=preview_base,
@@ -1916,6 +1956,9 @@ class OfflineReviewWindow(QDialog):
         preview.close()
 
     def closeEvent(self, event):
+        if getattr(self, "_recognition_running", False):
+            event.ignore()
+            return
         dialog = getattr(self, "_mail_import_dialog", None)
         if dialog is not None and dialog.worker is not None:
             dialog.request_stop()
