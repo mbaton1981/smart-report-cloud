@@ -17,6 +17,21 @@ from expense_categories import confirmed_expense_category
 from object_package_report import collect_object_expenses, write_object_report_package
 
 
+def price_shift_entry(report, row):
+    calculation = priced_report(report, [row])
+    totals = calculation["totals"]
+    total = parse_decimal(totals.get("invoice_total"))
+    work = parse_decimal(totals.get("work_amount"))
+    ob = parse_decimal(totals.get("ob_amount"))
+    travel = parse_decimal(totals.get("transport_amount"))
+    incomplete = [line["label"] for line in calculation["cost_lines"] if line.get("amount") is None]
+    reason = ("Не указана цена поездки" if incomplete and all(label.startswith("Resa") for label in incomplete)
+              else "Требуется уточнить клиентские цены" if incomplete else "К включению в счёт")
+    return {"net": total if total is not None else parse_decimal(totals.get("known_subtotal")),
+            "complete": total is not None, "work_net": work + ob if work is not None and ob is not None else None,
+            "travel_net": travel, "reason": reason}
+
+
 def open_next_invoice(host):
     import app as desktop
 
@@ -49,8 +64,7 @@ def open_next_invoice(host):
         entries, warnings = prepare_next_invoice(report["journal_rows"], documents, obj["server_id"], cutoff, state["members"])
         for entry in entries:
             if entry["member"]["kind"] == "shift":
-                calculation = priced_report(report, [entry["row"]])
-                entry["net"] = parse_decimal(calculation["totals"].get("invoice_total"))
+                entry.update(price_shift_entry(report, entry["row"]))
         return report, entries, warnings, state, supported
 
     loop = QEventLoop()
@@ -98,6 +112,13 @@ def open_next_invoice(host):
         ))
         history.setWordWrap(True)
         layout.addWidget(history)
+    total_label = QLabel()
+    total_label.setObjectName("nextInvoiceCategoryTotals")
+    total_label.setWordWrap(True)
+    font = total_label.font()
+    font.setBold(True)
+    total_label.setFont(font)
+    layout.addWidget(total_label)
     table = QTableWidget(len(entries), 6)
     table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / документ", "Сумма без НДС", "Состояние"])
     table.setColumnWidth(0, 80)
@@ -121,13 +142,18 @@ def open_next_invoice(host):
             confirmed_expense_category(entry["allocation"].get("expense_category"),
                                        entry["allocation"].get("expense_category_source"))[0]
         )
-        for column, text in enumerate((entry["date"], entry["category"], entry["label"],
+        work_text = (f"{entry['work_net']:,.2f} SEK" if entry.get("work_net") is not None else
+                     "Неизвестно" if entry["member"]["kind"] == "shift" else "")
+        travel_text = (f"{entry['travel_net']:,.2f} SEK" if entry.get("travel_net") is not None else
+                       "Цена не указана" if entry["member"]["kind"] == "shift" else "")
+        description = entry["label"]
+        if entry["member"]["kind"] == "shift":
+            description += f"\nРабота · {work_text}\nПоездки · {travel_text}"
+        for column, text in enumerate((entry["date"], entry["category"], description,
                                        f"{net:,.2f} {entry['currency']}" if net is not None else "Неизвестно",
-                                       "Нет достоверной суммы или валюты" if net is None else "К включению в счёт"), 1):
+                                       entry.get("reason") or ("Нет достоверной суммы или валюты" if net is None else "К включению в счёт")), 1):
             table.setItem(index, column, QTableWidgetItem(text))
-    total_label = QLabel()
-    total_label.setWordWrap(True)
-    layout.addWidget(total_label)
+    table.resizeRowsToContents()
     form = QFormLayout()
     number = QLineEdit()
     number.setPlaceholderText("Номер фактуры, которую вы выставили клиенту")
@@ -161,10 +187,14 @@ def open_next_invoice(host):
                 key = (entry["category"], entry["currency"])
                 categories[key] = categories.get(key, Decimal(0)) + entry["net"]
         lines = [f"{category} · {value:,.2f} {currency} без НДС" for (category, currency), value in sorted(categories.items())]
-        lines.append("Итого без НДС · " + " · ".join(f"{value:,.2f} {currency}" for currency, value in sorted(totals.items())))
+        incomplete = any(entry.get("complete") is False for entry in selected())
+        lines.append(("Известная часть без НДС · " if incomplete else "Итого без НДС · ")
+                     + " · ".join(f"{value:,.2f} {currency}" for currency, value in sorted(totals.items())))
+        if incomplete:
+            lines.append("Стоимость часов включена. Для сохранения выбранного состава уточните недостающие цены.")
         total_label.setText("\n".join(lines))
         valid = bool(selected()) and all(entry.get("net") is not None for entry in selected())
-        save_button.setEnabled(supported and valid and len(totals) == 1 and reviewed.isChecked()
+        save_button.setEnabled(supported and valid and not incomplete and len(totals) == 1 and reviewed.isChecked()
                                and bool(number.text().strip()) and not committed)
         if len(totals) > 1:
             total_label.setText(total_label.text() + " · Для выставления выберите одну валюту.")

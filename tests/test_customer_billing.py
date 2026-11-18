@@ -117,7 +117,12 @@ class CustomerBillingTests(unittest.TestCase):
             local = dict(connection.execute("SELECT * FROM objects WHERE is_active=1 LIMIT 1").fetchone())
             connection.execute("UPDATE objects SET server_id=? WHERE id=?", (self.object_id, local["id"]))
             connection.commit()
-        report = {"journal_rows": [self.shift], "journal_segments": {}, "company": local["company"],
+        incomplete_shift = copy.deepcopy(self.shift)
+        incomplete_shift.update(sync_id="incomplete-shift", id=self.shift["id"] + 1000, date="2026-11-02")
+        quote = json.loads(incomplete_shift["customer_pricing"])
+        quote.update(travel=None, date_from="2026-11-02", date_to="2026-11-02")
+        incomplete_shift["customer_pricing"] = json.dumps(quote)
+        report = {"journal_rows": [self.shift, incomplete_shift], "journal_segments": {}, "company": local["company"],
                   "object": local["name"], "object_id": local["id"], "date_from": "1900-01-01", "date_to": "2026-11-18"}
         window = self.desktop.QMainWindow()
         self.addCleanup(window.close)
@@ -141,12 +146,17 @@ class CustomerBillingTests(unittest.TestCase):
             from PyQt6.QtWidgets import QTableWidget, QPushButton, QLineEdit, QCheckBox
             table = dialog.findChild(QTableWidget)
             self.assertIsNotNone(table, str([(type(widget).__name__, widget.objectName()) for widget in dialog.children()]))
-            self.assertEqual(table.rowCount(), 3)
+            self.assertEqual(table.rowCount(), 4)
             self.assertEqual(table.horizontalHeaderItem(2).text(), "Категория")
             self.assertEqual(table.item(0, 2).text(), "Материалы и закупки")
             self.assertEqual(table.item(1, 2).text(), "Наши часы и поездки")
-            self.assertEqual(table.item(2, 4).text(), "Неизвестно")
-            self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            self.assertEqual(table.item(2, 4).text(), "3,600.00 SEK")
+            self.assertIn("Работа · 3,600.00 SEK", table.item(2, 3).text())
+            self.assertIn("Поездки · Цена не указана", table.item(2, 3).text())
+            self.assertIn("цена поездки", table.item(2, 5).text())
+            self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Checked)
+            self.assertEqual(table.item(3, 4).text(), "Неизвестно")
+            self.assertEqual(table.item(3, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
             with patch.object(self.desktop.QFileDialog, "getSaveFileName", return_value=(str(output), "PDF")), \
@@ -154,11 +164,13 @@ class CustomerBillingTests(unittest.TestCase):
                     patch.object(self.desktop.QMessageBox, "warning", side_effect=lambda *args: self.fail(args[2])):
                 buttons["Предварительный PDF"].click()
             text = " ".join(page.extract_text() for page in PdfReader(output).pages)
-            self.assertIn("4 150,00 SEK", text)
+            self.assertIn("7 750,00 SEK", text)
             for field in dialog.findChildren(QLineEdit):
                 if "Номер фактуры" in field.placeholderText():
                     field.setText("UI-INVOICE-1")
             dialog.findChild(QCheckBox).setChecked(True)
+            self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
+            table.item(2, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
             self.assertTrue(buttons["Сохранить как выставленное"].isEnabled())
             with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes), \
                     patch.object(self.desktop.QMessageBox, "information"):
