@@ -12131,6 +12131,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         export_pdf_inv_btn = QPushButton("Сформировать PDF")
         export_pdf_inv_btn.setObjectName("primaryAction")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
+        next_invoice_btn = QPushButton("Подготовить следующий счёт")
+        next_invoice_btn.setObjectName("prepareNextCustomerInvoice")
+        next_invoice_btn.clicked.connect(self.open_next_customer_invoice)
+        card_layout.addRow(next_invoice_btn)
 
         confirm_hours_btn = QPushButton("Подтвердить часы")
         confirm_hours_btn.setObjectName("secondaryAction")
@@ -13532,6 +13536,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.load_shifts_history()
         if count:
             self.background_sync_with_cloud()
+
+    def open_next_customer_invoice(self):
+        from next_customer_invoice import open_next_invoice
+        try:
+            open_next_invoice(self)
+        except (ValueError, sqlite3.Error) as error:
+            QMessageBox.warning(self, "Следующий счёт", str(error))
 
     def mark_period_as_invoiced(self):
         try:

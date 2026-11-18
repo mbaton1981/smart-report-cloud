@@ -895,6 +895,8 @@ def init_cloud_db():
     upgrade_connection = sqlite3.connect(DB_FILE, timeout=30.0, isolation_level=None)
     try:
         upgrade_connection.execute("PRAGMA foreign_keys=ON")
+        from customer_billing import ensure_schema as ensure_billing_schema
+        ensure_billing_schema(upgrade_connection)
         if os.environ.get('SMARTREPORT_UPGRADE_NET_SCHEMA') == '1':
             migrate_invoice_net_schema(upgrade_connection)
         if invoice_net_schema_ready(upgrade_connection):
@@ -2015,6 +2017,7 @@ def expense_document_capabilities_api():
         if "payment_reference" in {row[1] for row in connection.execute("PRAGMA table_info(expense_documents)")}:
             net_features.append("payment_reference_v1")
         net_features.append("object_costs_v1")
+        net_features.append("customer_invoice_batches_v1")
         net_features.append("object_cost_allocations_v1")
         if expense_document_type_schema_ready(connection):
             net_features.append("document_type_v1")
@@ -5461,6 +5464,34 @@ def management_analytics():
         return jsonify({"ok": False, "error": "Не удалось рассчитать аналитику. Данные не изменены."}), 500
     finally:
         conn.close()
+
+
+@app.route('/api/customer-invoices', methods=['GET', 'POST'])
+def customer_invoices_api():
+    if not expense_api_authorized():
+        return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
+    from customer_billing import invoice_state, record_invoice
+    connection = get_db_connection()
+    try:
+        if request.method == 'GET':
+            object_id = int(request.args.get('object_id', ''))
+            return jsonify({"ok": True, **invoice_state(connection, object_id)})
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ValueError("Ожидается состав клиентской фактуры.")
+        connection.execute("BEGIN IMMEDIATE")
+        result = record_invoice(
+            connection, payload, serialize_document=serialize_expense_document,
+            next_sequence=next_change_sequence, segments=get_ob_segments,
+            now=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+        )
+        connection.commit()
+        return jsonify({"ok": True, **result})
+    except (ValueError, TypeError, sqlite3.IntegrityError) as error:
+        connection.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 409
+    finally:
+        connection.close()
 
 
 @app.route('/api/admin/shifts/reopen', methods=['POST'])
