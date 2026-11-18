@@ -2,6 +2,8 @@ from pathlib import Path
 import os
 import re
 import sys
+from time import monotonic
+
 import requests
 
 from expense_documents import (
@@ -10,9 +12,10 @@ from expense_documents import (
 )
 
 
-def recognize_invoice(paths, parser=None, ai_fallback=None):
+def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=False):
     from expense_documents import extract_local_document, ocr_pdf_heading
 
+    started = monotonic()
     pages, text_parts, errors, methods = [], [], [], set()
     for attachment_index, source in enumerate(paths):
         try:
@@ -68,6 +71,7 @@ def recognize_invoice(paths, parser=None, ai_fallback=None):
             fields["order_proposal_warnings"].append(str(error))
     needs_help = any(fields.get(key) in (None, "", "UNKNOWN")
                      for key in required_document_fields(fields.get("document_type")))
+    timings = {"local_seconds": monotonic() - started, "ai_seconds": 0.0, "ai_requests": 0}
     if needs_help and not fields.get("non_invoice_document_type") and fields.get("document_type") not in {"order_confirmation", "delivery_note"}:
         from invoice_layout_ai import apply_selection, desktop_selection, masked_layout
         if ai_fallback is None:
@@ -79,7 +83,13 @@ def recognize_invoice(paths, parser=None, ai_fallback=None):
         if ai_fallback is not None:
             try:
                 layout, private = masked_layout(pages)
-                fields = apply_selection(fields, ai_fallback(layout), private)
+                request_started = monotonic()
+                timings["ai_requests"] += 1
+                try:
+                    selection = ai_fallback(layout)
+                finally:
+                    timings["ai_seconds"] += monotonic() - request_started
+                fields = apply_selection(fields, selection, private)
                 methods.add("openai_masked_layout")
                 fields.setdefault("review_reasons", []).append("Резервный ИИ выбрал блоки обезличенного макета; проверьте реквизиты.")
                 from document_costs import extract_cost_fields
@@ -93,5 +103,8 @@ def recognize_invoice(paths, parser=None, ai_fallback=None):
                if fields.get(key) in (None, "", "UNKNOWN")]
     if not any(page["text"].strip() for page in pages):
         errors.append("Не удалось извлечь текст; оригинал сохранён, доступен повтор обработки.")
-    return {"fields": fields, "methods": sorted(methods), "errors": errors, "page_count": len(pages),
-            "missing_fields": missing, "state": "failed" if errors else "requires_review"}
+    result = {"fields": fields, "methods": sorted(methods), "errors": errors, "page_count": len(pages),
+              "missing_fields": missing, "state": "failed" if errors else "requires_review"}
+    if include_timings:
+        result["timings"] = timings
+    return result

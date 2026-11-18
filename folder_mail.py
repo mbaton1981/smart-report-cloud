@@ -11,6 +11,7 @@ import tempfile
 from datetime import date, timedelta
 from email import policy
 from email.parser import BytesParser
+from functools import partial
 from pathlib import Path
 from threading import Event
 from time import monotonic
@@ -91,25 +92,53 @@ def imap_date(value):
 
 
 def import_folder(store, password, *, start=None, end=None, should_stop=None, progress=None,
-                  client_factory=imaplib.IMAP4_SSL, recognizer=recognize_invoice):
+                  client_factory=imaplib.IMAP4_SSL, recognizer=None):
     if date.today() < IMPORT_START_DATE:
         raise FolderError("import_not_started")
     start, end = checked_period(*(recent_period() if start is None and end is None else (start, end)))
     start = max(start, IMPORT_START_DATE)
     if end < start:
         raise FolderError("before_import_start")
+    if recognizer is None:
+        recognizer = partial(recognize_invoice, include_timings=True)
     report = {"messages": 0, "new_drafts": 0, "duplicates": 0, "excluded": 0, "without_pdf": 0,
               "recognition_failed": 0, "skipped": 0, "total": 0, "completed": 0,
               "stopped": False, "phase": "connecting",
               "start": start.isoformat(), "end": end.isoformat()}
+    timings = {"elapsed_seconds": 0.0, "connection_search_seconds": 0.0,
+               "download_seconds": 0.0, "local_seconds": 0.0,
+               "ai_seconds": 0.0, "ai_requests": 0, "measured_pdfs": 0}
+    started = monotonic()
     last_progress = [None, 0.0]
+
     def notify(phase):
         report["phase"] = phase
+        now = monotonic()
+        timings["elapsed_seconds"] = now - started
+        report["timings"] = dict(timings)
         if progress:
-            now = monotonic()
             if phase != last_progress[0] or now - last_progress[1] >= 0.1:
                 progress(dict(report))
                 last_progress[:] = [phase, now]
+
+    def fetch(uid, query, stage):
+        start_fetch = monotonic()
+        try:
+            return checked(client.uid("FETCH", str(uid), query), stage)
+        finally:
+            timings["download_seconds"] += monotonic() - start_fetch
+
+    def recognize_pdf(document_id):
+        notify("recognizing")
+        result = store.recognize_document(document_id, recognizer)
+        measured = result.get("timings")
+        if measured is not None:
+            timings["measured_pdfs"] += 1
+            for key in ("local_seconds", "ai_seconds", "ai_requests"):
+                timings[key] += measured[key]
+        failed = result.get("state") == "failed"
+        report["recognition_failed"] += int(failed)
+        return failed
 
     def stopping():
         if should_stop and should_stop():
@@ -146,6 +175,7 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
             raise FolderError("search") from None
         if any(not 1 <= uid <= 4294967295 for uid in uids):
             raise FolderError("search")
+        timings["connection_search_seconds"] = monotonic() - started
         report["total"] = len(uids)
         notify("processing")
         for uid in uids:
@@ -161,14 +191,14 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
                 continue
             report["messages"] += 1
             notify("downloading")
-            metadata = checked(client.uid("FETCH", str(uid), "(UID RFC822.SIZE)"), "size")
+            metadata = fetch(uid, "(UID RFC822.SIZE)", "size")
             headers = [item for item in metadata if isinstance(item, bytes) and b"RFC822.SIZE" in item]
             size = re.search(rb"\bRFC822.SIZE\s+(\d+)", headers[0]) if len(headers) == 1 else None
             if not size or int(size[1]) > MAX_MESSAGE_BYTES:
                 raise FolderError("size")
             if stopping():
                 return report
-            body = checked(client.uid("FETCH", str(uid), "(UID BODY.PEEK[])"), "fetch")
+            body = fetch(uid, "(UID BODY.PEEK[])", "fetch")
             parts = [item for item in body if isinstance(item, tuple) and len(item) == 2]
             if (len(parts) != 1 or not all(isinstance(item, bytes) for item in parts[0])
                     or re.findall(rb"\bUID\s+(\d+)\b", parts[0][0]) != [str(uid).encode()]):
@@ -202,11 +232,7 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
                     document_id = existing[0]
                     if (store.base(document_id).get("_recognition_state") in ("pending", "failed")
                             and store.latest(document_id)[0] == 0 and not store.card(document_id)):
-                        notify("recognizing")
-                        result = store.recognize_document(document_id, recognizer)
-                        if result.get("state") == "failed":
-                            failed = True
-                            report["recognition_failed"] += 1
+                        failed |= recognize_pdf(document_id)
                     report["duplicates"] += 1
                     continue
                 # Persist a recoverable draft before OCR; failure never discards the original.
@@ -215,11 +241,7 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
                 report["new_drafts"] += 1
                 if stopping():
                     return report
-                notify("recognizing")
-                result = store.recognize_document(document_id, recognizer)
-                if result.get("state") == "failed":
-                    failed = True
-                    report["recognition_failed"] += 1
+                failed |= recognize_pdf(document_id)
             if not pdf_count:
                 report["without_pdf"] += 1
             if stopping():
@@ -240,6 +262,8 @@ def import_folder(store, password, *, start=None, end=None, should_stop=None, pr
             except (imaplib.IMAP4.error, OSError):
                 # The read-only import's result remains valid if the server closed the session.
                 pass
+        timings["elapsed_seconds"] = monotonic() - started
+        report["timings"] = dict(timings)
 
 
 ERRORS = {
@@ -259,7 +283,7 @@ ERRORS = {
 
 
 def report_text(report):
-    return (
+    text = (
         f"INBOX · {report['start']} — {report['end']}. "
         f"Проверено: {report['completed']}/{report['total']}; "
         f"пропущено обработанных: {report['skipped']}; "
@@ -267,6 +291,19 @@ def report_text(report):
         f"ранее удалённых тестовых PDF пропущено: {report['excluded']}; "
         f"без PDF: {report['without_pdf']}; ошибок OCR: {report['recognition_failed']}. "
         "Расходы не создавались.")
+    timings = report.get("timings")
+    if timings and report["phase"] in ("finished", "stopped"):
+        text += (f"\nВремя: всего {timings['elapsed_seconds']:.1f} с, "
+                 f"подключение и поиск {timings['connection_search_seconds']:.1f} с, "
+                 f"получение писем {timings['download_seconds']:.1f} с.")
+        if timings["measured_pdfs"]:
+            text += f" Локальный разбор PDF: {timings['local_seconds']:.1f} с."
+            if timings["ai_requests"]:
+                text += (f" Резервный ИИ: {timings['ai_seconds']:.1f} с "
+                         f"(запросов: {timings['ai_requests']}).")
+            else:
+                text += " Резервный ИИ не вызывался."
+    return text
 
 
 def archive_period(parent):

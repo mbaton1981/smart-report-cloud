@@ -1,16 +1,22 @@
+import io
 import json
 import tempfile
 import unittest
 from datetime import date, timedelta
+from functools import partial
+from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from reportlab.pdfgen import canvas
 
 from folder_mail import (
-    FOLDER, HOST, ADDRESS, FolderError, import_folder, load_reminder_state,
+    FOLDER, HOST, ADDRESS, FolderError, import_folder, load_reminder_state, report_text,
     save_reminder_state,
 )
 from incoming_documents import IncomingStore
+from invoice_processing import recognize_invoice
 from test_mail_automation import eml, pdf, recognized
 
 
@@ -122,6 +128,56 @@ class FolderMailTests(unittest.TestCase):
         for path in self.store.root.rglob("*"):
             if path.is_file():
                 self.assertNotIn(b"isolated-only", path.read_bytes())
+
+    def test_real_pdf_mail_to_review_draft_measures_stages_and_skips_replay(self):
+        output = io.BytesIO()
+        page = canvas.Canvas(output, invariant=1)
+        lines = (
+            "Invoice", "Invoice number SUB-123", "Date of issue November 17, 2026",
+            "Date due November 17, 2026", "Subscription Provider Limited", "Bill to",
+            "Example Customer", "Monthly subscription", "Subtotal 896.00kr",
+            "Total 896.00kr", "Amount due 896.00kr",
+        )
+        for index, line in enumerate(lines):
+            page.drawString(40, 780 - 20 * index, line)
+        page.save()
+        FolderIMAP.messages = {1: eml(output.getvalue(), name="subscription.pdf")}
+        fallback = Mock(side_effect=RuntimeError("Test fallback unavailable"))
+        clock = count()
+        with patch("folder_mail.monotonic", clock.__next__), \
+                patch("invoice_processing.monotonic", clock.__next__), \
+                patch("folder_mail.recognize_invoice", partial(recognize_invoice, ai_fallback=fallback)):
+            report = import_folder(self.store, "isolated-only", client_factory=FolderIMAP)
+        fallback.assert_called_once()
+
+        self.assertEqual(report["new_drafts"], 1)
+        self.assertEqual(report["recognition_failed"], 0)
+        self.assertEqual(report["timings"]["measured_pdfs"], 1)
+        self.assertEqual(report["timings"]["ai_requests"], 1)
+        self.assertEqual(report["timings"]["download_seconds"], 2.0)
+        self.assertEqual(report["timings"]["local_seconds"], 1.0)
+        self.assertEqual(report["timings"]["ai_seconds"], 1.0)
+        self.assertIn("Резервный ИИ:", report_text(report))
+        _, payload = self.store.latest(1)
+        self.assertEqual(payload["supplier_name"], "Subscription Provider Limited")
+        self.assertEqual(payload["document_date"], "2026-11-17")
+        self.assertEqual(payload["gross_amount"], "896.00")
+        self.assertIn("Не указана валюта", self.store.attention_reasons(1))
+        self.assertIn("Не выбрано назначение", self.store.attention_reasons(1))
+        self.assertIsNone(self.store.card(1))
+
+        FolderIMAP.commands.clear()
+        unused = Mock()
+        repeated = import_folder(self.store, "isolated-only", client_factory=FolderIMAP,
+                                 recognizer=unused)
+        unused.assert_not_called()
+        self.assertEqual(repeated["skipped"], 1)
+        self.assertEqual(repeated["new_drafts"], 0)
+        self.assertEqual(repeated["timings"]["download_seconds"], 0)
+        self.assertEqual(repeated["timings"]["ai_requests"], 0)
+        self.assertFalse(any(command[0] == "FETCH" for command in FolderIMAP.commands))
+        self.assertEqual(len(self.store.documents()), 1)
+        self.assertEqual(self.store.latest(1)[1], payload)
 
     def test_interruption_resumes_without_duplicates(self):
         FolderIMAP.fail = 4
