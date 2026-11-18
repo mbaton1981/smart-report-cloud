@@ -480,6 +480,26 @@ class ProposalIntegrationTests(unittest.TestCase):
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
             window.close()
 
+    def test_verified_categories_prefill_each_incoming_share_without_manual_reselection(self):
+        from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
+        window, _document_id, objects = self.prepare()
+        fields = fixture()
+        for index, order in enumerate(fields["order_proposals"]):
+            for item in order["vat_items"]:
+                item["description"] = "Byggtjänster 8 tim" if index in (1, 2) else "GIPSSKIVA"
+        parts = propose_object_allocations(fields, objects)["parts"]
+        window.allocations.setRowCount(0)
+        for part in parts:
+            window.add_allocation(part, suggest_category=False)
+        self.assertEqual(window.allocations.cellWidget(0, 3).currentData(), CATEGORY_MATERIALS)
+        self.assertEqual(window.allocations.cellWidget(1, 3).currentData(), CATEGORY_SUBCONTRACTOR_WORK)
+        window.checked.setChecked(True)
+        payload = window.payload()
+        self.assertEqual(payload["allocations"][0]["expense_category"], CATEGORY_MATERIALS)
+        self.assertEqual(payload["allocations"][1]["expense_category"], CATEGORY_SUBCONTRACTOR_WORK)
+        self.assertTrue(all(part["expense_category_source"] == "user" for part in payload["allocations"]))
+        self.assertEqual([part["gross_amount"] for part in payload["allocations"]], ["592.32", "2411.02", "2282.66"])
+
     def prepare_beijer(self):
         from test_mail_automation import pdf
         objects = []

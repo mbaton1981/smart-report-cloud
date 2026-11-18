@@ -89,7 +89,23 @@ class IncomingStore(OfflineReviewStore):
 
     def allocation_proposal(self, document_id):
         from document_costs import propose_object_allocations
-        return propose_object_allocations(self.base(document_id), self.objects())
+        from expense_categories import CATEGORY_UNCLASSIFIED
+        from expense_category_automation import propose_document_categories
+        base, objects = self.base(document_id), self.objects()
+        proposal = propose_object_allocations(base, objects)
+        if proposal["parts"] and not proposal["errors"] and any(
+                part.get("expense_category") == CATEGORY_UNCLASSIFIED for part in proposal["parts"]):
+            allocations = [dict(part, rounding_amount=part.get("rounding")) for part in proposal["parts"]]
+            try:
+                paths = [self.original(document_id)]
+            except (ReviewError, OSError, ValueError):
+                paths = []
+            suggestions = propose_document_categories(dict(base, allocations=allocations), objects, paths)
+            for index, suggestion in suggestions.items():
+                if suggestion["category"] != CATEGORY_UNCLASSIFIED:
+                    proposal["parts"][index].update(expense_category=suggestion["category"], expense_category_source="suggested",
+                                                   expense_category_evidence=suggestion["evidence"], content=suggestion["content"])
+        return proposal
 
     @staticmethod
     def allocations(payload):

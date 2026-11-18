@@ -545,7 +545,10 @@ class OfflineReviewWindow(QDialog):
             category.setItemData(index, category.itemText(index))
         current, source = confirmed_expense_category(part.get("expense_category"), part.get("expense_category_source"))
         evidence = part.get("expense_category_evidence") or ""
-        if source != "user" and suggest_category:
+        if (source != "user" and part.get("expense_category_source") == "suggested"
+                and part.get("content") and part.get("expense_category") in EXPENSE_CATEGORIES[:-1]):
+            current = part["expense_category"]
+        elif source != "user" and suggest_category:
             base = self.store.base(self.document_id)
             current, evidence = suggest_expense_category({**base, "recognized_text": base.get("raw_text")}, part)
         category.setCurrentText(current)
@@ -1598,11 +1601,13 @@ class OfflineReviewWindow(QDialog):
             self.show_proposal()
             document_total = parse_invoice_money(payload.get("gross_amount"))
             if (not parts and not card and self.revision == 0 and not self.proposal["errors"]
-                    and len(self.proposal["parts"]) == 1 and self.proposal["parts"][0].get("object_id") is not None
+                    and self.proposal["parts"] and all(part.get("object_id") is not None for part in self.proposal["parts"])
                     and document_total is not None
-                    and parse_invoice_money(self.proposal["parts"][0].get("gross_amount")) == document_total):
+                    and sum((parse_invoice_money(part.get("gross_amount")) or Decimal(0)
+                             for part in self.proposal["parts"]), Decimal(0)) == document_total):
                 parts = self.proposal["parts"]
-                self.add_allocation(parts[0], suggest_category=True)
+                for part in parts:
+                    self.add_allocation(part, suggest_category=len(parts) == 1)
             if not parts and not self.proposal["parts"]:
                 self.add_allocation({"gross_amount": payload.get("gross_amount")}, suggest_category=not card)
             self.update_allocation_total()

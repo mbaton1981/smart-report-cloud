@@ -40,9 +40,13 @@ _CATEGORY_TERMS = {
         re.IGNORECASE,
     ),
     CATEGORY_MATERIALS: re.compile(
-        r"\b(?:material(?:kostnad)?|byggmaterial|byggvaror|virke|skruv|"
+        r"\b(?:material(?:kostnad)?|byggmaterial|byggvaror|virke|\w*skruv\w*|"
         r"isolering|betong|färg|varuinköp|materialinköp|farmarskruv|överlappsskruv|"
-        r"spånskiveskruv|kap(?:skiva|skivor)|trälim)\b",
+        r"spånskiveskruv|kap(?:skiva|skivor)|trälim|flatborrset|knivblad|torktrasa|storsäck|"
+        r"säkerhetskniv|träbock|wipes|gipsskr|byggregel|läkt|glespanel|dyckert|"
+        r"städduk|handske|vinkelpensel|filtmask|slägga|vägg/bjälklagsk|gipsskiva|"
+        r"osb(?:/3)?|k-ply|golvspån|underlagsduk|limträbalk|fiberduk|formrör|"
+        r"armeringsstål|grovbetong|byggpall|byggsäck)\b",
         re.IGNORECASE,
     ),
     CATEGORY_OTHER: re.compile(
@@ -101,6 +105,10 @@ def suggest_expense_category(document, allocation, allocation_count=1):
         candidate for candidate, pattern in _CATEGORY_TERMS.items()
         if pattern.search(content)
     ]
+    if (CATEGORY_MATERIALS in matched and CATEGORY_OTHER in matched
+            and not re.search(r"\b(?:hyra|hyrkostnad|administrationsavgift|serviceavgift|parkering)\b", content, re.IGNORECASE)):
+        # Delivery on a goods order is part of the purchase; do not invent a split.
+        matched.remove(CATEGORY_OTHER)
     if len(matched) != 1:
         return CATEGORY_UNCLASSIFIED, (
             "В содержании несколько категорий или нет однозначной строки."

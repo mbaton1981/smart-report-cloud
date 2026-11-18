@@ -51,6 +51,20 @@ class ExpenseCategorySuggestionTests(unittest.TestCase):
 
         self.assertEqual(category, CATEGORY_UNCLASSIFIED)
 
+    def test_construction_products_are_recognized_from_order_lines(self):
+        for content in ("FLATBORRSET DT70751\nKNIVBLAD FATMAX", "TRÄSKRUV 4,5X50\nBYGGREGEL G4-2",
+                        "FRAKT 245,00\nGIPSSKIVA GNE 13X900X2500\nOSB/3 11X897X2500"):
+            with self.subTest(content=content):
+                category, evidence = suggest_expense_category({}, {"note": content}, 3)
+                self.assertEqual(category, CATEGORY_MATERIALS)
+                self.assertIn("Пояснение к доле", evidence)
+        category, _ = suggest_expense_category({}, {"note": "Hyra av verktyg; GIPSSKIVA"})
+        self.assertEqual(category, CATEGORY_UNCLASSIFIED)
+
+    def test_same_supplier_does_not_assign_a_category_without_content(self):
+        category, _ = suggest_expense_category({"supplier_name": "BEIJER BYGGMATERIAL AB"}, {}, 2)
+        self.assertEqual(category, CATEGORY_UNCLASSIFIED)
+
 
 if __name__ == "__main__":
     unittest.main()

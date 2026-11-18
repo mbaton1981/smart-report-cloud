@@ -46,10 +46,11 @@ def propose_object_allocations(fields, objects):
         key = normalize_object_marking(marker) if known_marker else f"unmarked:{marker.casefold() or identifier}"
         part = grouped.setdefault(key, {"marker": marker,
                                          "net": Decimal(0), "vat": Decimal(0),
-                                         "pages": set(), "orders": []})
+                                         "pages": set(), "orders": [], "content": []})
         part["net"] += net
         part["vat"] += vat
         part["orders"].append(identifier)
+        part["content"].extend(item["description"] for item in items if item.get("description"))
         part["pages"].update(int(item["page"]) for item in items)
     net, vat = (parse_invoice_money(fields.get(key)) for key in ("net_amount", "vat_amount"))
     rounding = parse_invoice_money(fields.get("rounding_amount")) if fields.get("rounding_amount") not in (None, "") else Decimal(0)
@@ -99,6 +100,9 @@ def propose_object_allocations(fields, objects):
         else:
             warning = "Объект неактивен — выберите объект или общие расходы"
         adjustment = Decimal(cents[key]) / 100 * (-1 if rounding < 0 else 1)
+        from expense_categories import suggest_expense_category
+        content = "\n".join(dict.fromkeys(part["content"]))
+        category, evidence = suggest_expense_category({}, {"note": content})
         result["parts"].append({
             "marker": part["marker"], "object_id": object_id,
             "object_name": options[0]["name"] if object_id is not None else "",
@@ -108,6 +112,8 @@ def propose_object_allocations(fields, objects):
             "rounding": decimal_text(adjustment),
             "gross_amount": decimal_text(part["net"] + part["vat"] + adjustment),
             "pages": sorted(part["pages"]), "orders": part["orders"],
+            "content": content, "expense_category": category,
+            "expense_category_source": "suggested", "expense_category_evidence": evidence,
         })
         if warning:
             result["warnings"].append(f"{part['marker'] or 'Без маркировки'}: {warning}")

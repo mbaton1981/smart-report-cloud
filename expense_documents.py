@@ -2039,6 +2039,8 @@ def allocation_vat_from_items(pages, orders, invoice_net, invoice_vat):
             bucket["net"] += net
             bucket["vat"] += vat
             bucket["items"].append({"page": page.get("page", 1), "item": item_cells[0]["text"],
+                                    "description": " ".join(cell["text"] for cell in row
+                                                            if columns[0][1] <= cell["x0"] < columns[1][0]),
                                     "net_amount": decimal_text(net), "vat_rate": decimal_text(rate),
                                     "vat_amount": decimal_text(vat)})
     for identifier, row in expected.items():

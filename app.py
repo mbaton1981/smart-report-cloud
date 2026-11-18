@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QDate, QTimer, QThread, pyqtSignal, QEvent, QObject, QRunnable, QThreadPool,
-    QItemSelectionModel, QSignalBlocker,
+    QItemSelectionModel, QSignalBlocker, QEventLoop,
 )
 from PyQt6.QtGui import QIcon, QColor, QDesktopServices, QFont, QImage, QPixmap
 from PyQt6.QtCore import QUrl
@@ -7776,6 +7776,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         actions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         actions_button.setMenu(actions_menu)
         actions_button.setToolTip("Загрузка, распознавание и другие действия с расходами")
+        auto_categories_button = QPushButton("Авторазбор всех объектов")
+        auto_categories_button.setObjectName("autoExpenseCategoriesAllObjects")
+        auto_categories_button.clicked.connect(lambda: self.open_expense_category_review(all_objects=True, automatic=True))
+        title_row.addWidget(auto_categories_button, 0, Qt.AlignmentFlag.AlignTop)
         title_row.addWidget(actions_button, 0, Qt.AlignmentFlag.AlignTop)
         page_layout.addLayout(title_row)
 
@@ -8771,11 +8775,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         open_button.clicked.connect(self.open_selected_object_expense_original)
         classify_button = QPushButton("Разобрать расходы по категориям")
         classify_button.clicked.connect(self.open_expense_category_review)
+        auto_classify_button = QPushButton("Авторазбор всех объектов")
+        auto_classify_button.clicked.connect(lambda: self.open_expense_category_review(all_objects=True, automatic=True))
         retry_originals_button = QPushButton("Повторить проверку оригиналов")
         retry_originals_button.clicked.connect(self.retry_object_expense_original_recovery)
         for button in (
             edit_button, vat_button, delete_button, open_button,
-            classify_button, retry_originals_button,
+            auto_classify_button, classify_button, retry_originals_button,
         ):
             actions.addWidget(button)
         layout.addLayout(actions)
@@ -10216,36 +10222,48 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.object_expenses_table.item(row_index, 5).setToolTip(net_tooltip)
             self.object_expenses_table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, document)
 
-    def open_expense_category_review(self, *_):
-        selected_object = self.object_expenses_object.currentData()
-        if selected_object in (None, "company"):
+    def open_expense_category_review(self, *_, all_objects=False, automatic=False):
+        selected_object = self.object_expenses_object.currentData() if not all_objects else None
+        if not all_objects and selected_object in (None, "company"):
             QMessageBox.information(
                 self, "Категории расходов",
                 "Выберите объект, чтобы разобрать категории его долей расходов.",
             )
             return
-        object_id = int(selected_object)
+        object_id = int(selected_object) if not all_objects else None
         date_from = (
             self.object_expenses_date_from.text().strip()
-            if self.object_expenses_period_enabled.isChecked() else None
+            if not all_objects and self.object_expenses_period_enabled.isChecked() else None
         )
         date_to = (
             self.object_expenses_date_to.text().strip()
-            if self.object_expenses_period_enabled.isChecked() else None
+            if not all_objects and self.object_expenses_period_enabled.isChecked() else None
         )
-        documents, _online = self._expense_document_snapshot(date_from, date_to)
-        confirmed, _excluded = collect_object_expenses(
-            documents, object_id, date_from, date_to,
-        )
+        if all_objects:
+            try:
+                snapshot = fetch_all_expense_documents(None, None)
+                documents, _online = self._expense_document_snapshot(None, None, server_snapshot=(snapshot, True))
+            except Exception as error:
+                QMessageBox.warning(self, "Авторазбор расходов", str(error))
+                return
+        else:
+            documents, _online = self._expense_document_snapshot(date_from, date_to)
+        target_ids = sorted({int(part["object_id"]) for document in documents
+                             for part in document.get("allocations") or [] if part.get("object_id") is not None}) if all_objects else [object_id]
+        confirmed = [(target_id, document) for target_id in target_ids
+                     for document in collect_object_expenses(documents, target_id, date_from, date_to)[0]]
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Разбор расходов по категориям")
+        dialog.setWindowTitle("Авторазбор расходов · все объекты" if all_objects else "Разбор расходов по категориям")
         dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         dialog.setWindowState(dialog.windowState() | Qt.WindowState.WindowMaximized)
         dialog.resize(1160, 650)
         dialog.setMinimumSize(980, 500)
         layout = QVBoxLayout(dialog)
         instruction = QLabel(
+            "Программа читает оригиналы по всем объектам и сама подставляет найденные категории. "
+            "Нажмите «Сохранить изменения», чтобы подтвердить весь найденный набор. Неоднозначные строки оставлены на проверку."
+            if all_objects else
             "Расходы уже распределены по объектам. Здесь выбирается только категория для отчёта: "
             "материалы, подрядчики или другие расходы. При выборе категории строка отмечается автоматически."
         )
@@ -10275,15 +10293,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout.addWidget(table, 1)
 
         review_rows = []
-        for document in confirmed:
+        for row_object_id, document in confirmed:
             server_id = document.get("server_document_id") or document.get("id")
             version = document.get("sync_version")
             if not isinstance(server_id, int) or version is None:
                 continue
             allocations = document.get("object_allocations") or []
             allocation_indexes = document.get("object_allocation_indexes") or []
-            recovery_key = self._object_expense_recovery_key(document, object_id)
-            recovery_entry = self._object_expense_recovery_cache.get(recovery_key) or {}
+            recovery_key = self._object_expense_recovery_key(document, row_object_id)
+            recovery_entry = getattr(self, "_object_expense_recovery_cache", {}).get(recovery_key) or {}
             for allocation, allocation_index in zip(allocations, allocation_indexes):
                 share = dict(allocation)
                 share.update(
@@ -10293,6 +10311,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     share.get("expense_category"),
                     share.get("expense_category_source"),
                 )
+                if all_objects and current_source == "user":
+                    continue
                 if current_source == "user":
                     suggested = current_category
                     evidence = str(
@@ -10321,7 +10341,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 include.setCheckState(Qt.CheckState.Unchecked)
                 table.setItem(row, 0, include)
                 table.setItem(row, 1, QTableWidgetItem(
-                    f"{document.get('supplier_name') or 'Поставщик не указан'}\n"
+                    (f"{share.get('object_name') or 'Объект ' + str(row_object_id)}\n" if all_objects else "")
+                    + f"{document.get('supplier_name') or 'Поставщик не указан'}\n"
                     f"№ {document.get('invoice_number') or 'не указан'}"
                 ))
                 table.setItem(row, 2, QTableWidgetItem(net_label))
@@ -10359,9 +10380,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "suggested": suggested,
                     "evidence": evidence,
                     "evidence_item": table.item(row, 5),
+                    "content_item": table.item(row, 3),
                     "status_item": table.item(row, 7),
                 })
 
+        table.resizeRowsToContents()
         if not review_rows:
             message = QLabel(
                 "В выбранном объекте нет подтверждённых долей, доступных для категоризации."
@@ -10468,33 +10491,79 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         def find_categories():
             find_categories_button.setEnabled(False)
             try:
+                from PyQt6.QtWidgets import QProgressDialog
+                from expense_category_automation import propose_document_categories
+                import tempfile
+                pending_documents = {row["document"].get("server_document_id") or row["document"]["id"]: row["document"]
+                                     for row in review_rows if row["category_combo"].currentData() == CATEGORY_UNCLASSIFIED}
+                if not pending_documents:
+                    return
+                catalog, _online = self._expense_server_objects(include_inactive=True)
+
+                def propose():
+                    results = {}
+                    for document_id, document in pending_documents.items():
+                        try:
+                            details = request_expense_api("GET", f"/api/expense-documents/{document_id}")["document"]
+                            if details.get("sync_version") != document.get("sync_version"):
+                                raise ValueError("Документ изменился. Откройте разбор заново.")
+                            proposals = propose_document_categories(details, catalog)
+                            if any(item["category"] == CATEGORY_UNCLASSIFIED for item in proposals.values()):
+                                with tempfile.TemporaryDirectory(prefix="smartreport-category-originals-") as directory:
+                                    paths, errors = self._download_object_report_originals([details], directory, lambda _message: None)
+                                    key = expense_document_key(details)
+                                    if not errors.get(key):
+                                        proposals = propose_document_categories(details, catalog, paths.get(key, []))
+                            results[document_id] = proposals
+                        except Exception as error:
+                            results[document_id] = str(error)
+                    return results
+
+                loop = QEventLoop()
+                outcome = []
+                task = ObjectOverviewTask(0, propose)
+                task.signals.completed.connect(lambda _id, result, error: (outcome.append((result, error)), loop.quit()))
+                progress = QProgressDialog("Читаем оригиналы и определяем категории всех долей…", "", 0, 0, dialog)
+                progress.setCancelButton(None)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.show()
+                QThreadPool.globalInstance().start(task)
+                loop.exec()
+                progress.close()
+                results, error = outcome[0]
+                if error:
+                    raise RuntimeError(error)
                 for row in review_rows:
                     combo = row["category_combo"]
                     document = row["document"]
-                    allocations = document.get("allocations") or []
                     if combo.currentData() != CATEGORY_UNCLASSIFIED:
                         continue
                     document_id = document.get("server_document_id") or document["id"]
-                    try:
-                        details = request_expense_api("GET", f"/api/expense-documents/{document_id}")["document"]
-                        if details.get("sync_version") != document.get("sync_version"):
-                            row["status_item"].setText("Документ изменился. Откройте разбор заново.")
-                            continue
-                        category, evidence = suggest_expense_category(details, row["share"], len(allocations))
-                    except Exception as error:
-                        logging.warning("Could not load recognized text for expense %s: %s", document_id, error)
-                        row["status_item"].setText("Текст документа недоступен. Откройте оригинал.")
+                    proposals = results.get(document_id)
+                    if isinstance(proposals, str):
+                        row["status_item"].setText(proposals)
                         continue
+                    proposal = (proposals or {}).get(row["allocation_index"])
+                    if not proposal:
+                        continue
+                    category, evidence = proposal["category"], proposal["evidence"]
+                    if proposal.get("content"):
+                        row["content_item"].setText(proposal["content"][:500])
                     row.update(suggested=category, evidence=evidence)
                     evidence_item = row["evidence_item"]
                     evidence_item.setText(evidence)
                     evidence_item.setToolTip(evidence)
                     combo.setCurrentIndex(combo.findData(category))
                     row["status_item"].setText(
-                        "Предложено · проверьте и отметьте" if category != CATEGORY_UNCLASSIFIED
+                        "Определено автоматически" if category != CATEGORY_UNCLASSIFIED
                         else "Требуется сверка оригинала"
                     )
+            except Exception as error:
+                QMessageBox.warning(dialog, "Авторазбор расходов", str(error))
             finally:
+                select_all_suggestions()
+                refresh_changes()
+                table.resizeRowsToContents()
                 find_categories_button.setEnabled(True)
 
         find_categories_button.clicked.connect(find_categories)
@@ -10646,6 +10715,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
 
         save_button.clicked.connect(save_selected_categories)
+        if automatic:
+            QTimer.singleShot(0, find_categories)
         dialog.exec()
 
     def _store_expense_originals(self, paths, client_id):
