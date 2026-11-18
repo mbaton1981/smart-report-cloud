@@ -28,15 +28,19 @@
   открытая 1.0.116 сохранена пользователю. Установщик `../installer/SmartReport-Setup-1.0.117.exe`,
   SHA-256 `8a41473dc13490d96b1dc76c90b92e5bdf0d37ee6afb2a2ae9665466b13e6b06`.
   Резерв ярлыков `%TEMP%\SmartReport-1.0.116-to-1.0.117-5812d87a-8790-4202-a98f-79d8d316e63b`.
-- НЕ ЗАВЕРШЕНО: ручной deploy Render. Пользователь открыл отдельное окно Chrome,
-  открыто Manual Deploy → Deploy a specific commit. В списке виден `2e0cb61`.
-  При попытке выбора Computer Use остановлен: "Computer Use has been stopped for
-  this turn because it could not determine the current browser URL on Windows with
-  enough confidence to enforce policy. Stop your work and send a final message
-  noting why Computer Use ended." Ввод в UI после отказа не выполнялся.
-  Последний подтверждённый Live остаётся `5ca1753`. Требуется завершить deploy
-  `2e0cb61` и read-only проверить capability; финансовые записи в этой задаче
-  не менялись и составы фактур не сохранялись.
+- ЗАВЕРШЕНО: ручной deploy Render в следующем пользовательском ходе. После прежней
+  остановки Computer Use пользователь заново открыл отдельное окно Render. Через
+  штатное Manual Deploy → Deploy latest commit обновлена `69b9f1c` (исходники
+  `2e0cb61` плюс документация и исправления подписей тестов). Deploy
+  `dep-dbv0gomk1f9s73b1m4cg`, начат 2026-11-18 21:19:46 Europe/Stockholm,
+  завершён за 1m 4s со статусом Deploy succeeded|Live. Read-only запрос рабочего API
+  подтвердил `accountant_invoice_batches_v1=True`. В момент перезапуска был
+  временный HTTP 502, после готовности запрос успешен. Рабочие финансовые записи
+  не изменялись, фактуры от имени пользователя не сохранялись.
+- Старое открытое окно хранит результат проверки capabilities на момент открытия.
+  Для сохранения нужно закрыть только это окно, открыть «Документы бухгалтеру»
+  заново, ввести реальный номер уже выставленной фактуры, отметить «Сверил состав
+  и прежние счета клиенту», нажать «Сохранить как выставленное» и подтвердить.
 
 ## Исправление цены поездки по разрешению пользователя (2026-11-18)
 
