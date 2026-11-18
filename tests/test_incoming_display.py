@@ -55,6 +55,21 @@ class IncomingDisplayTests(unittest.TestCase):
         self.qt_app.processEvents()
         return window
 
+    def test_currency_suggestion_prefills_existing_unreviewed_invoice(self):
+        fields = self.store.base(1)
+        fields.update(currency_code="UNKNOWN", gross_amount="125.00",
+                      raw_text="Invoice\nBill to\nExample AB\n123 45 Stockholm\nSweden\nTotal 125.00kr")
+        with self.store.conn:
+            self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=1", (json.dumps(fields),))
+            self.store.conn.execute("UPDATE revisions SET payload_json=json_set(payload_json, '$.currency_code', 'UNKNOWN') "
+                                    "WHERE document_id=1 AND revision=0")
+        window = self.open_window(document_id=1)
+        self.assertEqual(window.inputs["currency_code"].text(), "SEK")
+        self.assertIn("Sweden", window.origins["currency_code"].text())
+        self.assertTrue(window.origins["currency_code"].isVisible())
+        self.assertEqual(self.store.latest(1)[1]["currency_code"], "UNKNOWN")
+        self.assertIsNone(self.store.card(1))
+
     def test_project_marker_suggestion_shows_source_without_allocating_it(self):
         window = self.open_window(document_id=1)
         window.allocations.setRowCount(0)

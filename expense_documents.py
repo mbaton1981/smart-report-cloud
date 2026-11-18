@@ -133,6 +133,40 @@ def _invoice_recipient_details(text: str) -> tuple[str, str] | None:
     return None
 
 
+def invoice_currency_suggestion(fields):
+    """Suggest a currency from an ambiguous kr total and the billing address."""
+    if fields.get("document_type") != "invoice" or fields.get("currency_code") not in (None, "", "UNKNOWN"):
+        return None
+    text = _clean_extracted_text(fields.get("raw_text"))
+    if re.search(r"\b(?:SEK|NOK|DKK|ISK|EUR|USD|GBP|CHF|PLN)\b", text, re.IGNORECASE):
+        return None
+    total = parse_invoice_money(fields.get("gross_amount"))
+    if total is None or not any(
+        parse_invoice_money(match[1]) == total for match in re.finditer(
+            r"^[ \t]*(?:Invoice[ \t]+total|Total|Amount[ \t]+due)[ \t]*:?[ \t]*(.+?kr)[ \t]*$",
+            text, re.IGNORECASE | re.MULTILINE,
+        )
+    ):
+        return None
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    billing_headers = [index for index, line in enumerate(lines) if re.fullmatch(r"Bill to\s*:?", line, re.IGNORECASE)]
+    if len(billing_headers) != 1:
+        return None
+    address = lines[billing_headers[0] + 1:billing_headers[0] + 8]
+    countries = {"sweden": ("SEK", r"\d{3} ?\d{2}"),
+                 "denmark": ("DKK", r"\d{4}"), "norway": ("NOK", r"\d{4}")}
+    for postcode_line, country in zip(address, address[1:]):
+        if re.match(r"(?:Ship to|Subtotal|Total|Amount due)\b", postcode_line, re.IGNORECASE):
+            break
+        if country.casefold() in countries:
+            currency, postcode = countries[country.casefold()]
+            if re.search(rf"(?<!\d){postcode}(?!\d)", postcode_line):
+                return currency, f"Предложено {currency}: итог в kr, страна в адресе плательщика — {country}."
+            break
+    return None
+
+
 def _invoice_footer_registration_blocks(page, recipient_name: str | None = None):
     lines = [line.strip() for line in _clean_extracted_text(page.get("text") or "").splitlines()
              if line.strip()]

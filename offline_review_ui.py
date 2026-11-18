@@ -25,7 +25,8 @@ from expense_categories import (
     CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES, confirmed_expense_category, suggest_expense_category,
 )
 from expense_documents import (
-    DocumentExtractionError, extract_local_document, match_objects, object_marker_evidence, object_marking_matches,
+    DocumentExtractionError, extract_local_document, invoice_currency_suggestion, match_objects,
+    object_marker_evidence, object_marking_matches,
     pages_with_insufficient_text, parse_invoice_pages, parse_invoice_money, decimal_text,
 )
 from offline_review import EDITABLE, OfflineReviewStore, ReviewError, current_classification
@@ -1484,6 +1485,13 @@ class OfflineReviewWindow(QDialog):
         provenance = self.store.provenance(self.document_id, self.payload())
         for key, label in self.origins.items():
             label.setText(provenance[key])
+        if self.integrated:
+            suggestion = getattr(self, "currency_suggestion", None)
+            active = suggestion is not None and self.inputs["currency_code"].text() == suggestion[0]
+            label = self.origins["currency_code"]
+            if active:
+                label.setText(suggestion[1])
+            label.setVisible(active)
 
     def select_document(self):
         if self.integrated:
@@ -1532,6 +1540,12 @@ class OfflineReviewWindow(QDialog):
         self.server_version = payload.get("server_version")
         card = self.store.card(self.document_id)
         base = current_classification(self.store.base(self.document_id))
+        self.currency_suggestion = None
+        if (self.integrated and card is None and self.revision == 0
+                and payload.get("currency_code") in (None, "", "UNKNOWN")):
+            self.currency_suggestion = invoice_currency_suggestion({
+                **base, "gross_amount": payload.get("gross_amount"),
+            })
         self.update_field_labels(base)
         order_number = base.get("order_number")
         self.order_number_label.setText(
@@ -1545,7 +1559,8 @@ class OfflineReviewWindow(QDialog):
             )
         for key, field in self.inputs.items():
             field.blockSignals(True)
-            field.setText(str(payload[key]) if payload.get(key) not in (None, "UNKNOWN") else "")
+            value = self.currency_suggestion[0] if key == "currency_code" and self.currency_suggestion else payload.get(key)
+            field.setText(str(value) if value not in (None, "UNKNOWN") else "")
             field.blockSignals(False)
         self.kind.setCurrentIndex(max(0, self.kind.findData(payload.get("confirmed_type"))))
         self.object.set_object_choices(

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import test_incoming_integration as integration
 from document_costs import extract_cost_fields
-from expense_documents import parse_invoice_pages, required_document_fields
+from expense_documents import invoice_currency_suggestion, parse_invoice_pages, required_document_fields
 from mail_import import mail_review_warnings, recognition_status
 from offline_review import ReviewError, packed
 
@@ -44,6 +44,17 @@ Totalt att betala i kronor 8"""},
 
 
 class CostExtractionTests(unittest.TestCase):
+    def test_kr_currency_suggestion_requires_a_billing_country_and_matching_total(self):
+        fields = {"document_type": "invoice", "currency_code": "UNKNOWN", "gross_amount": "896.00"}
+        address = "Seller in Ireland\nBill to\nExample AB\n123 45 Stockholm\nSweden\nTotal 896.00kr"
+        suggestion = invoice_currency_suggestion({**fields, "raw_text": address})
+        self.assertEqual(suggestion[0], "SEK")
+        for text in (address.replace("Bill to", "Ship to"), address.replace("896.00kr", "9.00kr"),
+                     address.replace("123 45 Stockholm\nSweden", "Unknown location"),
+                     address + "\nCurrency: DKK"):
+            self.assertIsNone(invoice_currency_suggestion({**fields, "raw_text": text}))
+        self.assertIsNone(invoice_currency_suggestion({**fields, "currency_code": "EUR", "raw_text": address}))
+
     def test_english_invoice_dates_keep_issue_and_due_dates_separate(self):
         fields = parse_invoice_pages([{
             "page": 1,
