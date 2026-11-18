@@ -17,6 +17,21 @@ class CategoryAutomationTests(unittest.TestCase):
     tearDown = catalog_tests.CatalogSyncTests.tearDown
     _add_company = catalog_tests.CatalogSyncTests._add_company
 
+    def test_semantic_fallback_keeps_main_window_responsive_and_only_suggests(self):
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.close)
+        proposals = {99: {0: dict(category=CATEGORY_UNCLASSIFIED, content="MASKERINGSTEJP UV STANDARD", evidence="", gross_amount="125.00")}}
+        def request(method, path, **kwargs):
+            if path.endswith("capabilities"):
+                return {"features": ["expense_category_ai_v1"]}
+            self.assertEqual(kwargs["json"]["groups"], [{"id": "1", "lines": ["MASKERINGSTEJP UV STANDARD"]}])
+            return {"suggestions": [dict(id="1", category=CATEGORY_MATERIALS, confidence=.99, evidence_lines=[1])]}
+        with patch.object(self.desktop, "request_expense_api", side_effect=request):
+            window.incoming_category_suggestions(proposals)
+        self.assertEqual(proposals[99][0]["category"], CATEGORY_MATERIALS)
+        self.assertEqual(proposals[99][0]["gross_amount"], "125.00")
+
     def test_global_action_recognizes_two_objects_and_saves_categories_in_one_review(self):
         from expense_documents import migrate_invoice_net_schema, ensure_expense_allocation_category_schema
         headers = {"X-Sync-Key": "isolated-sync-test-key"}
