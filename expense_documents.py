@@ -164,8 +164,25 @@ def _invoice_footer_registration_blocks(page, recipient_name: str | None = None)
             break
 
 
+_ENGLISH_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+_ENGLISH_DATE = re.compile(r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})")
+
+
 def _date_value(value: str | None) -> str | None:
     if not value:
+        return None
+    english_date = _ENGLISH_DATE.fullmatch(value.strip())
+    if english_date:
+        name, day, year = english_date.groups()
+        for month, full_name in enumerate(_ENGLISH_MONTHS, 1):
+            if name.casefold() in (full_name.casefold(), full_name[:3].casefold()):
+                try:
+                    return datetime(int(year), month, int(day)).strftime("%Y-%m-%d")
+                except ValueError:
+                    return None
         return None
     match = re.search(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b", value)
     if match:
@@ -234,13 +251,13 @@ def parse_document_text(text: str) -> dict[str, Any]:
         lines, r"OCR(?:-nummer)?|Betalningsreferens|Payment\s*reference|Transaction\s*ID")
     order_number = _label_value(lines, r"Ordernummer|Order\s*(?:#|nr\.?|no\.?|number)")
     document_date = _date_value(_label_value(
-        lines, r"Fakturadatum|Invoice\s*date|Kvitto(?:datum)?|Document\s*date|Date"))
+        lines, r"Fakturadatum|Invoice\s*date|Date\s+of\s+issue|Kvitto(?:datum)?|Document\s*date|Date"))
     if is_transfer_receipt:
         transfer_date = _date_value(_label_value(
             lines, r"Transfer\s+date|Transaction\s+date|Överföringsdatum|Overforingsdatum|Transaktionsdatum|Datum|Date"
         ))
         document_date = transfer_date or document_date
-    due_date = _date_value(_label_value(lines, r"Förfallodatum|Forfallodatum|Due\s*date|Payment\s*due"))
+    due_date = _date_value(_label_value(lines, r"Förfallodatum|Forfallodatum|Due\s*date|Date\s+due|Payment\s*due"))
 
     net_raw = _label_value(lines, r"Netto|Belopp\s+ex(?:kl)?\.?\s*moms|Summa\s+exkl\.?\s*moms|Amount\s+excl\.?\s*VAT")
     due_raw = _label_value(
@@ -886,8 +903,8 @@ def parse_invoice_pages(pages):
                           r"Faktura\s*nr\.?|Invoice\s*(?:number|no\.?)",
         "payment_reference": r"OCR(?:(?:-|\s+)\s*(?:nummer|nr)(?:/meddelande)?|/Meddelande|-/referensnummer)?|Betalningsreferens|Payment\s*reference|Transaction\s*ID|Vänligen\s+ange\s+referens",
         "order_number": r"Ordernummer|Order\s*(?:#|nr\.?|no\.?|number)",
-        "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date|Date",
-        "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda(?:\s+senast)?|Tillhanda\s+senast|Due\s*date|Payment\s*due",
+        "document_date": r"Fakturadatum|Faktureringsdatum|Datum|Invoice\s*date|Date\s+of\s+issue|Date",
+        "due_date": r"Förfallodatum|Förfallodag|Oss\s+tillhanda(?:\s+senast)?|Tillhanda\s+senast|Due\s*date|Date\s+due|Payment\s*due",
         "currency_code": r"Fakturans\s+valuta|Valuta|Currency",
         "net_amount": r"Netto|Nettosumma(?:\s+artiklar)?|Artiklar\s+ex\.?\s*moms|Summa\s+netto|Varuvärde|Belopp\s+ex(?:kl)?\.?\s*moms|(?:Summa|Totalt?)(?:\s+belopp)?\s+exkl(?:usive|\.)?\s*moms|Exkl\.?\s*moms|Totalt\s+fakturerat\s+belopp\s+exkl\.?\s*moms",
         "vat_amount": r"Moms\s+totalt|Moms\s*belopp(?:\s+(?:i\s+)?SEK)?|Moms(?:\s*\(?\s*\d+(?:[,.]\d+)?\s*%\s*\)?)?|Total\s+moms|Total\s+VAT|Summa\s+moms\s+på\s+momsbelagda\s+produkter,?\s*\d+\s*%",
@@ -945,7 +962,7 @@ def parse_invoice_pages(pages):
                 r"\d{1,2}[./]\d{1,2}[./]\d{4})"
                 r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]M)?(?:\s+[A-Z]{2,5})?)?"
             )
-            return _date_value(value) if re.fullmatch(pattern, value) else None
+            return _date_value(value) if re.fullmatch(pattern, value) or _ENGLISH_DATE.fullmatch(value) else None
         if key == "currency_code":
             return value.upper() if re.fullmatch(r"SEK|EUR|NOK|DKK|USD|GBP|CHF|PLN", value, re.IGNORECASE) else None
         if key == "invoice_number":
@@ -982,6 +999,21 @@ def parse_invoice_pages(pages):
         cells = [cell for row in rows for cell in row]
         page_lines = [line.strip() for line in str(page.get("text") or "").splitlines() if line.strip()]
         for index, line in enumerate(page_lines):
+            header = ("invoice #", "invoice date", "terms", "due date", "currency")
+            if (line.casefold() == header[0]
+                    and tuple(item.casefold() for item in page_lines[index:index + len(header)]) == header):
+                values = page_lines[index + len(header):index + 2 * len(header)]
+                if (len(values) == len(header)
+                        and checked_value("invoice_number", values[0])
+                        and checked_value("due_date", values[3])
+                        and checked_value("currency_code", values[4])):
+                    value = checked_value("document_date", values[1])
+                    if value:
+                        fallback_date_candidates.append((value, {
+                            "source": page.get("source"), "page": page.get("page", 1),
+                            "attachment_index": page.get("attachment_index", 0),
+                            "text": values[1], "caption": page_lines[index + 1], "kind": "header",
+                        }))
             if (line.casefold() == "faktura" and index + 2 < len(page_lines)
                     and re.fullmatch(r"nr\.?", page_lines[index + 1], re.IGNORECASE)
                     and re.fullmatch(r"(?=[\w/-]*\d)[\w/-]{1,120}", page_lines[index + 2])):

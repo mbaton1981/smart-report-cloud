@@ -44,6 +44,24 @@ Totalt att betala i kronor 8"""},
 
 
 class CostExtractionTests(unittest.TestCase):
+    def test_english_invoice_dates_keep_issue_and_due_dates_separate(self):
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "Invoice\nInvoice number INV-123\nDate of issue November 17, 2026\n"
+                    "Date due Nov 25, 2026\nUSD",
+        }])
+        self.assertEqual(fields["document_date"], "2026-11-17")
+        self.assertEqual(fields["due_date"], "2026-11-25")
+
+    def test_column_order_recovers_invoice_date_with_english_month(self):
+        fields = parse_invoice_pages([{
+            "page": 1,
+            "text": "INVOICE\nGitHub, Inc.\nInvoice #\nInvoice Date\nTerms\nDue Date\nCurrency\n"
+                    "INV-123\nNov 17, 2026\nDue Upon Receipt\nNov 25, 2026\nUSD",
+        }])
+        self.assertEqual(fields["document_date"], "2026-11-17")
+        self.assertEqual(fields["field_sources"]["document_date"][0]["caption"], "Invoice Date")
+
     def test_swedish_short_year_invoice_date_is_parsed_as_year_first(self):
         from expense_documents import _date_value
 
