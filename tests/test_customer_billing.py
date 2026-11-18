@@ -125,6 +125,11 @@ class CustomerBillingTests(unittest.TestCase):
         window.inv_date_to = self.desktop.create_date_field("2026-11-18")
         window.collect_invoice_report = lambda **kwargs: report
         output = Path(self._case.name) / "next-customer-invoice.pdf"
+        self.document["allocations"][0].update(expense_category="Материалы и закупки", expense_category_source="user")
+        unknown = copy.deepcopy(self.document)
+        unknown["id"] += 1000
+        unknown["document_date"] = "2026-11-17"
+        unknown["allocations"][0]["net_amount"] = None
 
         def api(method, endpoint, **kwargs):
             response = self.server_client.open(endpoint, method=method, headers=self.headers,
@@ -136,7 +141,12 @@ class CustomerBillingTests(unittest.TestCase):
             from PyQt6.QtWidgets import QTableWidget, QPushButton, QLineEdit, QCheckBox
             table = dialog.findChild(QTableWidget)
             self.assertIsNotNone(table, str([(type(widget).__name__, widget.objectName()) for widget in dialog.children()]))
-            self.assertEqual(table.rowCount(), 2)
+            self.assertEqual(table.rowCount(), 3)
+            self.assertEqual(table.horizontalHeaderItem(2).text(), "Категория")
+            self.assertEqual(table.item(0, 2).text(), "Материалы и закупки")
+            self.assertEqual(table.item(1, 2).text(), "Наши часы и поездки")
+            self.assertEqual(table.item(2, 4).text(), "Неизвестно")
+            self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
             with patch.object(self.desktop.QFileDialog, "getSaveFileName", return_value=(str(output), "PDF")), \
@@ -156,7 +166,7 @@ class CustomerBillingTests(unittest.TestCase):
             return dialog.result()
 
         with patch.object(self.desktop, "request_expense_api", side_effect=api), \
-                patch.object(self.desktop, "fetch_all_expense_documents", return_value=[self.document]), \
+                patch.object(self.desktop, "fetch_all_expense_documents", return_value=[self.document, unknown]), \
                 patch.object(self.desktop.QDialog, "exec", new=inspect):
             open_next_invoice(window)
         state = api("GET", "/api/customer-invoices", params={"object_id": self.object_id})

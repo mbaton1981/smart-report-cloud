@@ -122,9 +122,9 @@ def prepare_next_invoice(rows, documents, object_id, cutoff, members):
             currency = document.get("currency_code") or "UNKNOWN"
             if net is None or currency == "UNKNOWN":
                 warnings.append(f"У расхода №{document['id']} неизвестно нетто или валюта.")
-                continue
             entries.append({"member": member, "document": document, "allocation": allocation,
-                            "date": document_date, "currency": currency, "net": net,
+                            "date": document_date, "currency": currency,
+                            "net": net if currency != "UNKNOWN" else None,
                             "label": f"{document.get('supplier_name') or 'Поставщик не указан'} · "
                                      f"№{document.get('invoice_number') or document['id']}"})
     return sorted(entries, key=lambda item: (item["date"], item["member"]["key"])), list(dict.fromkeys(warnings))

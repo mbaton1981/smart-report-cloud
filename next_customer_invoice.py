@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 
 from customer_billing import prepare_next_invoice, priced_report
 from expense_documents import parse_decimal
+from expense_categories import confirmed_expense_category
 from object_package_report import collect_object_expenses, write_object_report_package
 
 
@@ -97,24 +98,32 @@ def open_next_invoice(host):
         ))
         history.setWordWrap(True)
         layout.addWidget(history)
-    table = QTableWidget(len(entries), 5)
-    table.setHorizontalHeaderLabels(["Включить", "Дата", "Часы / расход", "Сумма без НДС", "Состояние"])
+    table = QTableWidget(len(entries), 6)
+    table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / документ", "Сумма без НДС", "Состояние"])
     table.setColumnWidth(0, 80)
     table.setColumnWidth(1, 115)
-    table.setColumnWidth(2, 410)
-    table.setColumnWidth(3, 180)
-    table.setColumnWidth(4, 270)
+    table.setColumnWidth(2, 190)
+    table.setColumnWidth(3, 330)
+    table.setColumnWidth(4, 160)
+    table.setColumnWidth(5, 235)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     layout.addWidget(table, 1)
     for index, entry in enumerate(entries):
         item = QTableWidgetItem()
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
         net = entry.get("net")
+        if net is None:
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         item.setCheckState(Qt.CheckState.Checked if net is not None else Qt.CheckState.Unchecked)
         table.setItem(index, 0, item)
-        for column, text in enumerate((entry["date"], entry["label"],
+        entry["category"] = (
+            "Наши часы и поездки" if entry["member"]["kind"] == "shift" else
+            confirmed_expense_category(entry["allocation"].get("expense_category"),
+                                       entry["allocation"].get("expense_category_source"))[0]
+        )
+        for column, text in enumerate((entry["date"], entry["category"], entry["label"],
                                        f"{net:,.2f} {entry['currency']}" if net is not None else "Неизвестно",
-                                       "Сверьте цену" if net is None else "К включению в счёт"), 1):
+                                       "Нет достоверной суммы или валюты" if net is None else "К включению в счёт"), 1):
             table.setItem(index, column, QTableWidgetItem(text))
     total_label = QLabel()
     total_label.setWordWrap(True)
@@ -145,11 +154,15 @@ def open_next_invoice(host):
                 if table.item(index, 0).checkState() == Qt.CheckState.Checked]
 
     def refresh(*_):
-        totals = {}
+        totals, categories = {}, {}
         for entry in selected():
             if entry.get("net") is not None:
                 totals[entry["currency"]] = totals.get(entry["currency"], Decimal(0)) + entry["net"]
-        total_label.setText("Итого без НДС · " + " · ".join(f"{value:,.2f} {currency}" for currency, value in sorted(totals.items())))
+                key = (entry["category"], entry["currency"])
+                categories[key] = categories.get(key, Decimal(0)) + entry["net"]
+        lines = [f"{category} · {value:,.2f} {currency} без НДС" for (category, currency), value in sorted(categories.items())]
+        lines.append("Итого без НДС · " + " · ".join(f"{value:,.2f} {currency}" for currency, value in sorted(totals.items())))
+        total_label.setText("\n".join(lines))
         valid = bool(selected()) and all(entry.get("net") is not None for entry in selected())
         save_button.setEnabled(supported and valid and len(totals) == 1 and reviewed.isChecked()
                                and bool(number.text().strip()) and not committed)
