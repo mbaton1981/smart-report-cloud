@@ -78,7 +78,7 @@ def priced_report(report, rows):
     return result
 
 
-def prepare_next_invoice(rows, documents, object_id, cutoff, members):
+def prepare_next_invoice(rows, documents, object_id, cutoff, members, *, accountant=False):
     date.fromisoformat(cutoff)
     entries, warnings = [], []
     for row in rows:
@@ -120,7 +120,9 @@ def prepare_next_invoice(rows, documents, object_id, cutoff, members):
                 continue
             net = parse_decimal(allocation.get("net_amount"))
             currency = document.get("currency_code") or "UNKNOWN"
-            if net is None or currency == "UNKNOWN":
+            if accountant and (parse_decimal(allocation.get("gross_amount")) is None or currency == "UNKNOWN"):
+                warnings.append(f"У расхода №{document['id']} неизвестна сумма с НДС или валюта.")
+            elif not accountant and (net is None or currency == "UNKNOWN"):
                 warnings.append(f"У расхода №{document['id']} неизвестно нетто или валюта.")
             entries.append({"member": member, "document": document, "allocation": allocation,
                             "date": document_date, "currency": currency,
@@ -131,6 +133,10 @@ def prepare_next_invoice(rows, documents, object_id, cutoff, members):
 
 
 def record_invoice(connection, payload, *, serialize_document, next_sequence, segments, now):
+    purpose = payload.get("purpose", "priced_invoice")
+    if purpose not in ("priced_invoice", "accountant"):
+        raise ValueError("Неизвестное назначение документа.")
+    accountant = purpose == "accountant"
     operation_id = payload.get("operation_id")
     number = str(payload.get("invoice_number") or "").strip()
     if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 100:
@@ -176,9 +182,11 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ob_segments'",
             ).fetchone() is None:
                 raise ValueError("Для смены OB отсутствует разбивка часов.")
-            require_final_prices(row, segments(connection.cursor(), row["sync_id"]) if row["entry_type"] == "ob" else [])
+            if not accountant:
+                require_final_prices(row, segments(connection.cursor(), row["sync_id"]) if row["entry_type"] == "ob" else [])
             work.append(row)
-            currencies.add("SEK")
+            if not accountant:
+                currencies.add("SEK")
         elif requested.get("kind") == "expense":
             row = connection.execute("SELECT * FROM expense_documents WHERE id=? AND is_deleted=0", (requested.get("document_id"),)).fetchone()
             if row is None:
@@ -199,7 +207,8 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
             allocation = document["allocations"][index]
             if (snapshot != requested or allocation.get("object_id") != object_id
                     or document.get("supporting_to_document_id") or document["verification_status"] != "confirmed"
-                    or parse_decimal(snapshot["net_amount"]) is None or snapshot["currency"] in (None, "", "UNKNOWN")):
+                    or parse_decimal(allocation.get("gross_amount") if accountant else snapshot["net_amount"]) is None
+                    or snapshot["currency"] in (None, "", "UNKNOWN")):
                 raise ValueError("Расход или его доля изменились. Обновите состав.")
             currencies.add(snapshot["currency"])
         else:
@@ -210,7 +219,7 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
             raise ValueError("Строка уже включена в клиентскую фактуру. Обновите состав.")
         seen.add(snapshot["key"])
         snapshots.append(snapshot)
-    if len(currencies) > 1:
+    if not accountant and len(currencies) > 1:
         raise ValueError("Выберите строки в одной валюте. Для пересчёта валют нужен отдельный согласованный курс.")
     connection.execute("INSERT INTO customer_invoice_batches VALUES (?,?,?,?,?,?)",
                        (operation_id, object_id, number, payload["invoice_date"], serialized, now))
@@ -221,7 +230,7 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
     from customer_intervals import calculated_row
     for row in work:
         quote = row_prices(row)
-        if quote.get("interval_terms"):
+        if not accountant and quote.get("interval_terms"):
             quote["interval_calculation"] = calculated_row(row, quote)
             store_pricing(connection.cursor(), "incoming_submissions", row["sync_id"], quote)
         connection.execute("""UPDATE incoming_submissions SET invoiced=1, version=version+1,

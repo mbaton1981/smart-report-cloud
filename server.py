@@ -2019,6 +2019,7 @@ def expense_document_capabilities_api():
             net_features.append("payment_reference_v1")
         net_features.append("object_costs_v1")
         net_features.append("customer_invoice_batches_v1")
+        net_features.append("accountant_invoice_batches_v1")
         net_features.append("object_cost_allocations_v1")
         if expense_document_type_schema_ready(connection):
             net_features.append("document_type_v1")

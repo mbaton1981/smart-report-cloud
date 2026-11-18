@@ -12131,7 +12131,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         export_pdf_inv_btn = QPushButton("PDF по часам и поездкам")
         export_pdf_inv_btn.setObjectName("primaryAction")
         export_pdf_inv_btn.clicked.connect(self.export_invoice_to_pdf)
-        next_invoice_btn = QPushButton("Подготовить следующий счёт · часы, материалы и подрядчики")
+        next_invoice_btn = QPushButton("Документы бухгалтеру · часы, OB, поездки и расходы")
         next_invoice_btn.setObjectName("prepareNextCustomerInvoice")
         next_invoice_btn.clicked.connect(self.open_next_customer_invoice)
         card_layout.addRow(next_invoice_btn)

@@ -1,9 +1,8 @@
 """Desktop workflow for the next customer invoice and its immutable membership."""
-from copy import deepcopy
-from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 import uuid
+import tempfile
 
 from PyQt6.QtCore import QEventLoop, QDate, QThreadPool, Qt
 from PyQt6.QtWidgets import (
@@ -11,25 +10,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QFileDialog, QProgressDialog,
 )
 
-from customer_billing import prepare_next_invoice, priced_report
+from customer_billing import prepare_next_invoice
 from expense_documents import parse_decimal
 from expense_categories import confirmed_expense_category
-from object_package_report import collect_object_expenses, write_object_report_package
-
-
-def price_shift_entry(report, row):
-    calculation = priced_report(report, [row])
-    totals = calculation["totals"]
-    total = parse_decimal(totals.get("invoice_total"))
-    work = parse_decimal(totals.get("work_amount"))
-    ob = parse_decimal(totals.get("ob_amount"))
-    travel = parse_decimal(totals.get("transport_amount"))
-    incomplete = [line["label"] for line in calculation["cost_lines"] if line.get("amount") is None]
-    reason = ("Не указана цена поездки" if incomplete and all(label.startswith("Resa") for label in incomplete)
-              else "Требуется уточнить клиентские цены" if incomplete else "К включению в счёт")
-    return {"net": total if total is not None else parse_decimal(totals.get("known_subtotal")),
-            "complete": total is not None, "work_net": work + ob if work is not None and ob is not None else None,
-            "travel_net": travel, "reason": reason}
+from object_package_report import collect_object_expenses, _recover_report_share_tax
+from accountant_report import write_accountant_report
 
 
 def open_next_invoice(host):
@@ -55,16 +40,27 @@ def open_next_invoice(host):
             "date_from": "1900-01-01", "date_to": cutoff,
         })
         capabilities = desktop.request_expense_api("GET", "/api/expense-documents/capabilities")
-        supported = "customer_invoice_batches_v1" in capabilities.get("features", [])
+        supported = "accountant_invoice_batches_v1" in capabilities.get("features", [])
         if obj.get("server_id") is None:
             raise ValueError("Сначала синхронизируйте объект с сервером.")
         state = (desktop.request_expense_api("GET", "/api/customer-invoices", params={"object_id": obj["server_id"]})
-                 if supported else {"members": {}, "batches": []})
+                 if "customer_invoice_batches_v1" in capabilities.get("features", []) else {"members": {}, "batches": []})
         documents = desktop.fetch_all_expense_documents(None, None)
-        entries, warnings = prepare_next_invoice(report["journal_rows"], documents, obj["server_id"], cutoff, state["members"])
-        for entry in entries:
-            if entry["member"]["kind"] == "shift":
-                entry.update(price_shift_entry(report, entry["row"]))
+        entries, warnings = prepare_next_invoice(report["journal_rows"], documents, obj["server_id"], cutoff,
+                                                 state["members"], accountant=True)
+        needed = {entry["document"]["id"]: entry["document"] for entry in entries
+                  if entry["member"]["kind"] == "expense" and entry.get("net") is None}
+        download = getattr(host, "_download_object_report_originals", None)
+        if needed and download:
+            recovered, _excluded = collect_object_expenses(list(needed.values()), obj["server_id"])
+            with tempfile.TemporaryDirectory(prefix="smartreport-accountant-originals-") as directory:
+                paths, errors = download(list(needed.values()), directory, lambda _message: None)
+                _recover_report_share_tax({"object": dict(obj, id=obj["server_id"]), "expenses": recovered}, paths, errors)
+            by_part = {(doc["id"], index): allocation for doc in recovered
+                       for index, allocation in zip(doc["object_allocation_indexes"], doc["object_allocations"])}
+            for entry in entries:
+                if entry["member"]["kind"] == "expense":
+                    entry["display_allocation"] = by_part.get((entry["document"]["id"], entry["member"]["index"]), entry["allocation"])
         return report, entries, warnings, state, supported
 
     loop = QEventLoop()
@@ -89,7 +85,7 @@ def open_next_invoice(host):
         return
     report, entries, warnings, state, supported = result
     dialog = QDialog(host)
-    dialog.setWindowTitle(f"Следующий счёт · {obj['name']}")
+    dialog.setWindowTitle(f"Документы бухгалтеру к следующему счёту · {obj['name']}")
     dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
     dialog.resize(1180, 760)
     layout = QVBoxLayout(dialog)
@@ -120,7 +116,7 @@ def open_next_invoice(host):
     total_label.setFont(font)
     layout.addWidget(total_label)
     table = QTableWidget(len(entries), 6)
-    table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / документ", "Сумма без НДС", "Состояние"])
+    table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / OB / документ", "Сумма документа", "Состояние"])
     table.setColumnWidth(0, 80)
     table.setColumnWidth(1, 115)
     table.setColumnWidth(2, 190)
@@ -132,26 +128,34 @@ def open_next_invoice(host):
     for index, entry in enumerate(entries):
         item = QTableWidgetItem()
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
-        net = entry.get("net")
-        if net is None:
+        shift = entry["member"]["kind"] == "shift"
+        allocation = entry.get("display_allocation", entry.get("allocation", {}))
+        available = shift or (parse_decimal(allocation.get("gross_amount")) is not None and entry["currency"] != "UNKNOWN")
+        if not available:
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        item.setCheckState(Qt.CheckState.Checked if net is not None else Qt.CheckState.Unchecked)
+        item.setCheckState(Qt.CheckState.Checked if available else Qt.CheckState.Unchecked)
         table.setItem(index, 0, item)
         entry["category"] = (
             "Наши часы и поездки" if entry["member"]["kind"] == "shift" else
             confirmed_expense_category(entry["allocation"].get("expense_category"),
                                        entry["allocation"].get("expense_category_source"))[0]
         )
-        work_text = (f"{entry['work_net']:,.2f} SEK" if entry.get("work_net") is not None else
-                     "Неизвестно" if entry["member"]["kind"] == "shift" else "")
-        travel_text = (f"{entry['travel_net']:,.2f} SEK" if entry.get("travel_net") is not None else
-                       "Цена не указана" if entry["member"]["kind"] == "shift" else "")
         description = entry["label"]
-        if entry["member"]["kind"] == "shift":
-            description += f"\nРабота · {work_text}\nПоездки · {travel_text}"
+        if shift:
+            row = entry["row"]
+            description += f"\nПоездки · {row.get('transport') or 0:g}"
+            if row["entry_type"] == "ob":
+                description += f"\nOB · {row['hours']:g} ч"
+                from customer_report import CATEGORY_LABELS
+                for part in report.get("journal_segments", {}).get(row["sync_id"], []):
+                    description += f"\n{CATEGORY_LABELS.get(part['category'], part['category'])} · {part['hours']:g} ч"
+        net = parse_decimal(allocation.get("net_amount"))
+        gross = parse_decimal(allocation.get("gross_amount"))
+        amount_text = "—" if shift else (
+            f"{net:,.2f} {entry['currency']} без НДС" if net is not None else
+            f"{gross:,.2f} {entry['currency']} с НДС" if gross is not None else "Сумма не указана")
         for column, text in enumerate((entry["date"], entry["category"], description,
-                                       f"{net:,.2f} {entry['currency']}" if net is not None else "Неизвестно",
-                                       entry.get("reason") or ("Нет достоверной суммы или валюты" if net is None else "К включению в счёт")), 1):
+                                       amount_text, "К передаче бухгалтеру" if available else "Нет суммы документа или валюты"), 1):
             table.setItem(index, column, QTableWidgetItem(text))
     table.resizeRowsToContents()
     form = QFormLayout()
@@ -180,24 +184,29 @@ def open_next_invoice(host):
                 if table.item(index, 0).checkState() == Qt.CheckState.Checked]
 
     def refresh(*_):
-        totals, categories = {}, {}
+        categories = {}
+        hours = trips = ob_hours = Decimal(0)
         for entry in selected():
-            if entry.get("net") is not None:
-                totals[entry["currency"]] = totals.get(entry["currency"], Decimal(0)) + entry["net"]
-                key = (entry["category"], entry["currency"])
-                categories[key] = categories.get(key, Decimal(0)) + entry["net"]
-        lines = [f"{category} · {value:,.2f} {currency} без НДС" for (category, currency), value in sorted(categories.items())]
-        incomplete = any(entry.get("complete") is False for entry in selected())
-        lines.append(("Известная часть без НДС · " if incomplete else "Итого без НДС · ")
-                     + " · ".join(f"{value:,.2f} {currency}" for currency, value in sorted(totals.items())))
-        if incomplete:
-            lines.append("Стоимость часов включена. Для сохранения выбранного состава уточните недостающие цены.")
+            if entry["member"]["kind"] == "shift":
+                hours += Decimal(str(entry["row"]["hours"]))
+                if entry["row"]["entry_type"] == "ob":
+                    ob_hours += Decimal(str(entry["row"]["hours"]))
+                trips += Decimal(str(entry["row"].get("transport") or 0))
+                continue
+            allocation = entry.get("display_allocation", entry["allocation"])
+            net = parse_decimal(allocation.get("net_amount"))
+            amount = net if net is not None else parse_decimal(allocation.get("gross_amount"))
+            if amount is not None:
+                key = (entry["category"], entry["currency"], "без НДС" if net is not None else "с НДС")
+                categories[key] = categories.get(key, Decimal(0)) + amount
+        lines = [f"Часы · {hours:g} ч · Из них смены OB · {ob_hours:g} ч · Поездки · {trips:g}",
+                 "Стоимость работы, OB и поездок определяет бухгалтер."]
+        lines += [f"{category} · {value:,.2f} {currency} {basis}"
+                  for (category, currency, basis), value in sorted(categories.items())]
         total_label.setText("\n".join(lines))
-        valid = bool(selected()) and all(entry.get("net") is not None for entry in selected())
-        save_button.setEnabled(supported and valid and not incomplete and len(totals) == 1 and reviewed.isChecked()
+        valid = bool(selected())
+        save_button.setEnabled(supported and valid and reviewed.isChecked()
                                and bool(number.text().strip()) and not committed)
-        if len(totals) > 1:
-            total_label.setText(total_label.text() + " · Для выставления выберите одну валюту.")
         pdf_button.setEnabled(valid)
 
     table.itemChanged.connect(refresh)
@@ -210,34 +219,15 @@ def open_next_invoice(host):
         if not path:
             return
         try:
-            shift_rows = [entry["row"] for entry in selection if entry["member"]["kind"] == "shift"]
-            expense_docs = {}
-            for entry in selection:
-                if entry["member"]["kind"] != "expense":
-                    continue
-                document_id = entry["document"]["id"]
-                if document_id not in expense_docs:
-                    expense_docs[document_id] = deepcopy(entry["document"])
-                    document = expense_docs[document_id]
-                    document["allocations"] = []
-                document = expense_docs[document_id]
-                document["allocations"].append(entry["allocation"])
-            expenses, excluded = collect_object_expenses(list(expense_docs.values()), obj["server_id"])
-            data = {"object": obj, "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "period_label": f"К следующему счёту · по {cutoff}", "language": "ru",
-                    "customer_report": priced_report(report, shift_rows), "expenses": expenses,
-                    "excluded_expenses": excluded, "expense_snapshot_available": True,
-                    "include_copies": False, "include_customer_cost": True,
-                    "incomplete_reasons": ["Предварительный состав клиентской фактуры."],
-                    }
-            write_object_report_package(Path(path), data, font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD)
+            write_accountant_report(Path(path), obj, selection, report, cutoff,
+                                    font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD)
             QMessageBox.information(dialog, "Отчёт сохранён", path)
         except Exception as error:
             QMessageBox.warning(dialog, "PDF не сформирован", str(error))
 
     def commit():
         nonlocal committed, submitted_payload
-        payload = {"operation_id": operation_id, "object_id": obj["server_id"],
+        payload = {"operation_id": operation_id, "object_id": obj["server_id"], "purpose": "accountant",
                    "invoice_number": number.text().strip(), "invoice_date": invoice_date.date().toString("yyyy-MM-dd"),
                    "members": [entry["member"] for entry in selected()]}
         if submitted_payload is not None and submitted_payload != payload:

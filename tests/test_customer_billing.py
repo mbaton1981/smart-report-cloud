@@ -92,6 +92,33 @@ class CustomerBillingTests(unittest.TestCase):
         with closing(self.server.get_db_connection()) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM customer_invoice_members").fetchone()[0], 0)
 
+    def test_accountant_handoff_accepts_unknown_ob_price_and_net_without_repricing(self):
+        with closing(self.desktop.get_db_connection()) as local_connection:
+            segment_schema = local_connection.execute("SELECT sql FROM sqlite_master WHERE name='ob_segments'").fetchone()[0]
+        with closing(self.server.get_db_connection()) as connection:
+            connection.execute(segment_schema)
+            quote = json.loads(self.shift["customer_pricing"])
+            quote["travel"] = None
+            connection.execute("UPDATE incoming_submissions SET submission_type='ob',customer_pricing=? WHERE sync_id='billing-shift'",
+                               (json.dumps(quote),))
+            connection.execute("UPDATE expense_allocations SET allocated_net=NULL,allocated_vat=NULL WHERE document_id=?", (self.document["id"],))
+            connection.commit()
+            shift = dict(connection.execute("SELECT * FROM incoming_submissions WHERE sync_id='billing-shift'").fetchone())
+        shift["entry_type"] = "ob"
+        document = self.server_client.get(f"/api/expense-documents/{self.document['id']}", headers=self.headers).get_json()["document"]
+        payload = {**self.payload, "purpose": "accountant", "members": [shift_member(shift), expense_member(document, 0)]}
+        response = self.post(payload)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(self.post(payload).status_code, 200)
+        with closing(self.server.get_db_connection()) as connection:
+            actual = dict(connection.execute("SELECT * FROM incoming_submissions WHERE sync_id='billing-shift'").fetchone())
+            self.assertEqual(actual["customer_pricing"], shift["customer_pricing"])
+            self.assertEqual(actual["invoiced"], 1)
+            self.assertEqual(actual["hours"], shift["hours"])
+            self.assertEqual(actual["transport"], shift["transport"])
+        duplicate = {**payload, "operation_id": "duplicate-accountant", "invoice_number": "OTHER"}
+        self.assertEqual(self.post(duplicate).status_code, 409)
+
     def test_late_invoice_is_in_next_selection_and_billed_members_are_excluded(self):
         entries, warnings = prepare_next_invoice([self.shift], [self.document], self.object_id, "2026-11-18", {})
         self.assertEqual(len(entries), 2)
@@ -118,11 +145,13 @@ class CustomerBillingTests(unittest.TestCase):
             connection.execute("UPDATE objects SET server_id=? WHERE id=?", (self.object_id, local["id"]))
             connection.commit()
         incomplete_shift = copy.deepcopy(self.shift)
-        incomplete_shift.update(sync_id="incomplete-shift", id=self.shift["id"] + 1000, date="2026-11-02")
+        incomplete_shift.update(sync_id="incomplete-shift", id=self.shift["id"] + 1000, date="2026-11-02", entry_type="ob")
         quote = json.loads(incomplete_shift["customer_pricing"])
         quote.update(travel=None, date_from="2026-11-02", date_to="2026-11-02")
         incomplete_shift["customer_pricing"] = json.dumps(quote)
-        report = {"journal_rows": [self.shift, incomplete_shift], "journal_segments": {}, "company": local["company"],
+        report = {"journal_rows": [self.shift, incomplete_shift],
+                  "journal_segments": {"incomplete-shift": [{"category": "weekday_early_evening", "hours": 8,
+                                                              "start_time": "16:00", "end_time": "00:00"}]}, "company": local["company"],
                   "object": local["name"], "object_id": local["id"], "date_from": "1900-01-01", "date_to": "2026-11-18"}
         window = self.desktop.QMainWindow()
         self.addCleanup(window.close)
@@ -150,13 +179,14 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertEqual(table.horizontalHeaderItem(2).text(), "Категория")
             self.assertEqual(table.item(0, 2).text(), "Материалы и закупки")
             self.assertEqual(table.item(1, 2).text(), "Наши часы и поездки")
-            self.assertEqual(table.item(2, 4).text(), "3,600.00 SEK")
-            self.assertIn("Работа · 3,600.00 SEK", table.item(2, 3).text())
-            self.assertIn("Поездки · Цена не указана", table.item(2, 3).text())
-            self.assertIn("цена поездки", table.item(2, 5).text())
+            self.assertEqual(table.item(2, 4).text(), "—")
+            self.assertNotIn("SEK", table.item(2, 3).text())
+            self.assertIn("OB1", table.item(2, 3).text())
+            self.assertIn("Поездки · 1", table.item(2, 3).text())
+            self.assertEqual(table.item(2, 5).text(), "К передаче бухгалтеру")
             self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Checked)
-            self.assertEqual(table.item(3, 4).text(), "Неизвестно")
-            self.assertEqual(table.item(3, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            self.assertIn("125.00 SEK с НДС", table.item(3, 4).text())
+            self.assertEqual(table.item(3, 0).checkState(), self.desktop.Qt.CheckState.Checked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
             with patch.object(self.desktop.QFileDialog, "getSaveFileName", return_value=(str(output), "PDF")), \
@@ -164,13 +194,19 @@ class CustomerBillingTests(unittest.TestCase):
                     patch.object(self.desktop.QMessageBox, "warning", side_effect=lambda *args: self.fail(args[2])):
                 buttons["Предварительный PDF"].click()
             text = " ".join(page.extract_text() for page in PdfReader(output).pages)
-            self.assertIn("7 750,00 SEK", text)
+            self.assertIn("100,00 SEK", text)
+            self.assertIn("250,00 SEK", text)
+            self.assertNotIn("3 600,00", text)
+            self.assertNotIn("450,00", text)
+            self.assertNotIn("7 750,00", text)
+            self.assertIn("OB1", text)
             for field in dialog.findChildren(QLineEdit):
                 if "Номер фактуры" in field.placeholderText():
                     field.setText("UI-INVOICE-1")
             dialog.findChild(QCheckBox).setChecked(True)
-            self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
+            self.assertTrue(buttons["Сохранить как выставленное"].isEnabled())
             table.item(2, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            table.item(3, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
             self.assertTrue(buttons["Сохранить как выставленное"].isEnabled())
             with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes), \
                     patch.object(self.desktop.QMessageBox, "information"):
