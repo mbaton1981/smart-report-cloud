@@ -1368,7 +1368,7 @@ class CatalogSyncTests(unittest.TestCase):
                 "rounding_amount": "0.00",
                 "amount_due": "67240.00",
                 "verification_status": "confirmed",
-                "recognized_text": "Arbete utförd på objektet",
+                "recognized_text": "1 Byggtjänster 164,00 tim 410,00",
                 "allocations": [{
                     "object_id": object_id,
                     "destination": "object",
@@ -1378,7 +1378,7 @@ class CatalogSyncTests(unittest.TestCase):
                     "rounding_amount": "0.00",
                     "expense_category": "Не классифицировано",
                     "expense_category_source": "unclassified",
-                    "note": "Arbete utförd på objektet",
+                    "note": "p1037",
                 }],
             },
         )
@@ -1410,11 +1410,13 @@ class CatalogSyncTests(unittest.TestCase):
         def accept_category_review(dialog):
             table = dialog.findChild(self.desktop.QTableWidget)
             self.assertEqual(table.rowCount(), 1)
-            table.item(0, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
             combo = table.cellWidget(0, 4)
-            combo.setCurrentIndex(combo.findData(
-                self.desktop.CATEGORY_SUBCONTRACTOR_WORK,
-            ))
+            self.assertEqual(combo.currentData(), self.desktop.CATEGORY_UNCLASSIFIED)
+            dialog.findChild(self.desktop.QPushButton, "suggestStoredExpenseCategories").click()
+            self.assertEqual(combo.currentData(), self.desktop.CATEGORY_SUBCONTRACTOR_WORK)
+            self.assertIn("Byggtjänster", table.item(0, 5).text())
+            self.assertEqual(table.item(0, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            table.item(0, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
             with patch.object(
                 self.desktop.QMessageBox, "question",
                 return_value=self.desktop.QMessageBox.StandardButton.Yes,

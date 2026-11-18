@@ -21,6 +21,9 @@ from PyQt6.QtWidgets import (
 from pypdf.errors import PyPdfError
 
 from document_preview import DocumentGalleryDialog
+from expense_categories import (
+    CATEGORY_UNCLASSIFIED, EXPENSE_CATEGORIES, confirmed_expense_category, suggest_expense_category,
+)
 from expense_documents import (
     DocumentExtractionError, extract_local_document, match_objects, object_marker_evidence, object_marking_matches,
     pages_with_insufficient_text, parse_invoice_pages, parse_invoice_money, decimal_text,
@@ -243,16 +246,18 @@ class OfflineReviewWindow(QDialog):
         form.addRow(self.show_archived_objects)
         if integrated:
             self.object.hide()
-            self.allocations = QTableWidget(0, 3)
+            self.allocations = QTableWidget(0, 4)
             self.allocations.setObjectName("review_allocations")
-            self.allocations.setHorizontalHeaderLabels(["Назначение", "Сумма части", ""])
+            self.allocations.setHorizontalHeaderLabels(["Назначение", "Сумма части", "", "Категория"])
             header = self.allocations.horizontalHeader()
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
             header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
             metrics = self.allocations.fontMetrics()
             self.allocations.setColumnWidth(1, max(135, metrics.horizontalAdvance("9 999 999,99") + 38))
             self.allocations.setColumnWidth(2, max(100, QPushButton("Убрать").sizeHint().width() + 10))
+            self.allocations.setColumnWidth(3, 178)
             self.allocations.verticalHeader().hide()
             self.allocations.setMinimumHeight(190)
             self.allocations.setMinimumWidth(0)
@@ -285,6 +290,23 @@ class OfflineReviewWindow(QDialog):
                 "Проверьте результат и нажмите «Учесть как расход»; до этого ничего не сохранено.")
             self.apply_proposal_button.clicked.connect(self.apply_proposal)
             form.addRow(self.apply_proposal_button)
+            self.payment_receipt = QComboBox()
+            self.payment_receipt.setObjectName("payment_receipt_choice")
+            self.payment_receipt_open = QPushButton("Открыть выбранный чек")
+            self.payment_receipt_open.clicked.connect(
+                lambda: self.open_registered_original(self, self.payment_receipt.currentData())
+            )
+            self.payment_receipt.currentIndexChanged.connect(
+                lambda: self.payment_receipt_open.setEnabled(self.payment_receipt.currentData() is not None)
+            )
+            self.payment_balance = QLabel()
+            self.payment_balance.setWordWrap(True)
+            form.addRow(self.payment_balance)
+            form.addRow(self.payment_receipt)
+            form.addRow(self.payment_receipt_open)
+            self.payment_receipt.hide()
+            self.payment_receipt_open.hide()
+            self.payment_balance.hide()
             form.addRow(QLabel("Назначение и распределение:"))
             form.addRow(self.allocations)
             self.add_allocation_button = QPushButton("Разделить между объектами")
@@ -303,7 +325,7 @@ class OfflineReviewWindow(QDialog):
             self.inputs["currency_code"].textChanged.connect(self.update_allocation_total)
         else:
             form.addRow("Объект:", self.object)
-        self.checked = QCheckBox("Сверил оригинал")
+        self.checked = QCheckBox("Сверил оригинал, назначение и категории" if integrated else "Сверил оригинал")
         self.checked.setObjectName("review_original_checked")
         form.addRow(self.checked)
         self.original_check_help = QLabel(
@@ -417,6 +439,7 @@ class OfflineReviewWindow(QDialog):
                     "prepaid" if self.receipt_paid.isChecked() else None}
         if self.integrated:
             from expense_documents import parse_invoice_money, decimal_text
+            result["payment_receipt_id"] = self.payment_receipt.currentData()
             net = parse_invoice_money(result.get("net_amount"))
             vat = parse_invoice_money(result.get("vat_amount"))
             gross = parse_invoice_money(result.get("gross_amount"))
@@ -433,6 +456,21 @@ class OfflineReviewWindow(QDialog):
                     for key in ("net_amount", "vat_amount", "rounding_amount", "note", "expense_category"):
                         if key in original:
                             part[key] = original[key]
+                category = self.allocations.cellWidget(row, 3)
+                selected_category = category.currentData()
+                old_category, old_source = confirmed_expense_category(
+                    (original or {}).get("expense_category"), (original or {}).get("expense_category_source"),
+                )
+                category_chosen = category.property("categoryChosen")
+                if selected_category != CATEGORY_UNCLASSIFIED and (
+                    category_chosen or old_source != "user" and self.checked.isChecked()
+                    or old_source == "user" and self.server_version is None
+                ):
+                    part.update(expense_category=selected_category, expense_category_source="user",
+                                expense_category_evidence=category.toolTip())
+                elif category_chosen and old_category != CATEGORY_UNCLASSIFIED:
+                    part.update(expense_category=CATEGORY_UNCLASSIFIED, expense_category_source="unclassified",
+                                expense_category_evidence="")
                 if (original in original_parts and len(original_parts) == 1 and self.allocations.rowCount() == 1
                       and parse_invoice_money(original_parts[0].get("gross_amount"))
                           != parse_invoice_money(gross_amount)
@@ -457,7 +495,7 @@ class OfflineReviewWindow(QDialog):
             return "company", None
         return "unselected", None
 
-    def add_allocation(self, part=None):
+    def add_allocation(self, part=None, *, suggest_category=False):
         part = part or {}
         row = self.allocations.rowCount()
         self.allocations.insertRow(row)
@@ -498,6 +536,31 @@ class OfflineReviewWindow(QDialog):
             self.update_allocation_total()
         remove.clicked.connect(remove_row)
         self.allocations.setCellWidget(row, 2, remove)
+        category = QComboBox()
+        category.setObjectName("incoming_expense_category")
+        category.setMinimumContentsLength(12)
+        category.addItems(EXPENSE_CATEGORIES)
+        for index in range(category.count()):
+            category.setItemData(index, category.itemText(index))
+        current, source = confirmed_expense_category(part.get("expense_category"), part.get("expense_category_source"))
+        evidence = part.get("expense_category_evidence") or ""
+        if source != "user" and suggest_category:
+            base = self.store.base(self.document_id)
+            current, evidence = suggest_expense_category({**base, "recognized_text": base.get("raw_text")}, part)
+        category.setCurrentText(current)
+        category.setProperty("categoryChosen", False)
+        category.setToolTip(evidence or "Выберите категорию по содержанию оригинала.")
+
+        def category_changed(_index):
+            changed = category.currentData() != current
+            category.setProperty("categoryChosen", changed or source != "user")
+            category.setToolTip(
+                "Категория выбрана пользователем после сверки оригинала."
+                if changed else evidence or "Выберите категорию по содержанию оригинала."
+            )
+
+        category.activated.connect(category_changed)
+        self.allocations.setCellWidget(row, 3, category)
         self.allocations.setRowHeight(row, max(combo.sizeHint().height(), remove.sizeHint().height(),
                                                self.allocations.fontMetrics().height() + 18) + 8)
         self.update_allocation_total()
@@ -975,7 +1038,7 @@ class OfflineReviewWindow(QDialog):
         self.partial_proposal_candidate = None
         self.allocations.setRowCount(0)
         for part in proposal["parts"]:
-            self.add_allocation(part)
+            self.add_allocation(part, suggest_category=len(proposal["parts"]) == 1)
         self.inputs["gross_amount"].setText(proposal["total"])
         self.status.setText(
             "Предложение заполнено только в форме. Проверьте объекты и суммы; ничего не сохранено. "
@@ -1161,15 +1224,16 @@ class OfflineReviewWindow(QDialog):
             return
         self.action_revision, action = self.store.action(self.document_id)
         card = self.store.card(self.document_id)
+        is_payment_receipt = self.store.payment_receipt_parent(self.document_id) is not None
         self.financial_panel.setVisible(True)
-        self.save_button.setVisible(card is None or self.server_version is not None)
-        self.ignore_button.setEnabled(card is None)
+        self.save_button.setVisible(not is_payment_receipt and (card is None or self.server_version is not None))
+        self.ignore_button.setEnabled(card is None and not is_payment_receipt)
         self.restore_button.setVisible(action == "ignore" and card is None)
         self.restore_button.setEnabled(action == "ignore" and card is None)
-        self.later_button.setEnabled(card is None)
+        self.later_button.setEnabled(card is None and not is_payment_receipt)
         document_type = current_classification(self.store.base(self.document_id)).get("document_type")
         self.transfer_button.setEnabled(
-            card is None and self.original_available
+            card is None and not is_payment_receipt and self.original_available
             and document_type in {"invoice", "receipt", "tax_decision"})
         allocations = self.store.allocations(self.store.current_review(self.document_id)[1])
         can_reassign = (card is not None and len(allocations) == 1
@@ -1190,7 +1254,7 @@ class OfflineReviewWindow(QDialog):
         for key, label_widget in self.field_labels.items():
             label = LABELS[key]
             if self.integrated and key == "gross_amount":
-                label = "Сумма к оплате по документу"
+                label = "Итог документа" if base.get("prepaid") else "Сумма к оплате по документу"
             if self.integrated and key == "supplier_name":
                 label = "Поставщик / организация / получатель сбора"
             if self.integrated and key in ("invoice_number", "vat_amount", "net_amount"):
@@ -1466,6 +1530,7 @@ class OfflineReviewWindow(QDialog):
                                   else self.store.latest(self.document_id))
         self.loaded_review = payload
         self.server_version = payload.get("server_version")
+        card = self.store.card(self.document_id)
         base = current_classification(self.store.base(self.document_id))
         self.update_field_labels(base)
         order_number = base.get("order_number")
@@ -1489,13 +1554,42 @@ class OfflineReviewWindow(QDialog):
             placeholder="Обязательно выберите объект",
         )
         if self.integrated:
+            receipt_id = payload.get("payment_receipt_id")
+            paid_balance = parse_invoice_money(base.get("amount_due")) if base.get("prepaid") else None
+            self.payment_balance.setText(
+                f"Остаток к оплате по оригиналу: {decimal_text(paid_balance)} {payload.get('currency_code') or ''}"
+                if paid_balance is not None else ""
+            )
+            self.payment_balance.setVisible(paid_balance is not None)
+            candidates = self.store.payment_receipt_candidates(self.document_id, payload)
+            if receipt_id is not None and receipt_id not in candidates:
+                candidates.append(receipt_id)
+            self.payment_receipt.clear()
+            self.payment_receipt.addItem("Выберите чек, если он подтверждает оплату этой фактуры", None)
+            for candidate in candidates:
+                receipt = self.store.base(candidate)
+                self.payment_receipt.addItem(
+                    f"Чек №{candidate} · {receipt.get('supplier_name')} · "
+                    f"{receipt.get('gross_amount')} {receipt.get('currency_code')}", candidate,
+                )
+            self.payment_receipt.setCurrentIndex(max(0, self.payment_receipt.findData(receipt_id)))
+            self.payment_receipt.setVisible(bool(candidates))
+            self.payment_receipt.setEnabled(card is None)
+            self.payment_receipt_open.setVisible(bool(candidates))
             self.allocations.setRowCount(0)
             parts = self.store.allocations(payload)
             for part in parts:
-                self.add_allocation(part)
+                self.add_allocation(part, suggest_category=not card and not payload.get("original_checked") and len(parts) == 1)
             self.show_proposal()
+            document_total = parse_invoice_money(payload.get("gross_amount"))
+            if (not parts and not card and self.revision == 0 and not self.proposal["errors"]
+                    and len(self.proposal["parts"]) == 1 and self.proposal["parts"][0].get("object_id") is not None
+                    and document_total is not None
+                    and parse_invoice_money(self.proposal["parts"][0].get("gross_amount")) == document_total):
+                parts = self.proposal["parts"]
+                self.add_allocation(parts[0], suggest_category=True)
             if not parts and not self.proposal["parts"]:
-                self.add_allocation({"gross_amount": payload.get("gross_amount")})
+                self.add_allocation({"gross_amount": payload.get("gross_amount")}, suggest_category=not card)
             self.update_allocation_total()
         self.checked.setChecked(payload.get("original_checked") is True)
         self.amount_choices.blockSignals(True)
@@ -1588,7 +1682,6 @@ class OfflineReviewWindow(QDialog):
             except (ReviewError, OSError, ValueError) as error:
                 self.original_error = f"Оригинал недоступен; перенос запрещён: {error}"
                 self.status.setText(self.original_error)
-        card = self.store.card(self.document_id)
         if self.integrated:
             self.rerecognition_button.setEnabled(self.original_available)
         editable = card is None or self.integrated and self.server_version is not None

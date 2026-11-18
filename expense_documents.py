@@ -834,7 +834,13 @@ def invoice_supplier_identifiers(page, supplier_name):
 def invoice_context(text):
     return {
         "reverse_charge": bool(re.search(r"omvänd\s+(?:moms|skattskyldighet|betalningsskyldighet)|reverse\s+charge", text or "", re.IGNORECASE)),
-        "prepaid": bool(re.search(r"förskottsbetald|betalt\s+med\s+kort|kvar\s+att\s+betala", text or "", re.IGNORECASE)),
+        "prepaid": bool(re.search(
+            r"förskottsbetald|betalt\s+med\s+kort|kvar\s+att\s+betala|"
+            r"^[ \t]*Applied[ \t]+transactions[ \t]*:[ \t]*\r?\n"
+            r"(?:[ \t]*\r?\n)*[^\r\n]*[ \t]-[$€£]?\d[^\r\n]*"
+            r"[\s\S]*?^[ \t]*Balance[ \t]+due[ \t]*:",
+            text or "", re.IGNORECASE | re.MULTILINE,
+        )),
     }
 
 
@@ -984,6 +990,7 @@ def parse_invoice_pages(pages):
     fallback_invoice_candidates = []
     fallback_supplier_candidates = []
     fallback_gross_candidates = []
+    fallback_net_candidates = []
     fallback_vat_candidates = []
     fallback_due_candidates = []
     fallback_date_candidates = []
@@ -1027,6 +1034,28 @@ def parse_invoice_pages(pages):
                     fallback_gross_candidates.append((amount, {
                         **source, "text": line, "caption": "Total", "kind": "invoice_total",
                     }))
+            if fields.get("document_type") == "invoice" and index + 2 < len(page_lines):
+                subtotal = re.fullmatch(r"Subtotal\s*:\s*(.+)", line, re.IGNORECASE)
+                tax_line, total_line = page_lines[index + 1:index + 3]
+                tax = re.fullmatch(r"Tax\s*:\s*(.+)", tax_line, re.IGNORECASE)
+                invoice_total = re.fullmatch(r"Invoice\s+total\s*:\s*(.+)", total_line, re.IGNORECASE)
+                if subtotal and tax and invoice_total:
+                    net, vat, gross = (parse_invoice_money(match[1]) for match in (subtotal, tax, invoice_total))
+                    if None not in (net, vat, gross) and net + vat == gross:
+                        fallback_net_candidates.append((decimal_text(net), {
+                            **source, "text": line, "caption": "Subtotal", "kind": "invoice_tax_summary",
+                        }))
+                        fallback_vat_candidates.append((decimal_text(vat), {
+                            **source, "text": tax_line, "caption": "Tax", "kind": "invoice_tax_summary",
+                        }))
+            if (fields.get("document_type") == "invoice" and index + 1 < len(page_lines)
+                    and re.fullmatch(r"Balance\s+due\s*:", line, re.IGNORECASE)
+                    and invoice_context("\n".join(page_lines[:index + 1]))["prepaid"]):
+                balance = checked_value("amount_due", page_lines[index + 1])
+                if balance is not None:
+                    fallback_due_candidates.append((balance, {
+                        **source, "text": page_lines[index + 1], "caption": line, "kind": "payment_balance",
+                    }))
             header = _ENGLISH_INVOICE_COLUMNS
             if (line.casefold() == header[0]
                     and tuple(item.casefold() for item in page_lines[index:index + len(header)]) == header):
@@ -1035,6 +1064,9 @@ def parse_invoice_pages(pages):
                         and checked_value("invoice_number", values[0])
                         and checked_value("due_date", values[3])
                         and checked_value("currency_code", values[4])):
+                    fallback_invoice_candidates.append((values[0], {
+                        **source, "text": values[0], "caption": line, "kind": "header",
+                    }))
                     value = checked_value("document_date", values[1])
                     if value:
                         fallback_date_candidates.append((value, {
@@ -1294,6 +1326,7 @@ def parse_invoice_pages(pages):
     for key, fallbacks in (
         ("invoice_number", fallback_invoice_candidates),
         ("gross_amount", fallback_gross_candidates),
+        ("net_amount", fallback_net_candidates),
         ("vat_amount", fallback_vat_candidates),
         ("amount_due", fallback_due_candidates),
         ("document_date", fallback_date_candidates),

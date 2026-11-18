@@ -96,6 +96,39 @@ class IncomingIntegrationTests(unittest.TestCase):
                        object_id=self.object_id, original_checked=True)
         return self.store.save(document_id, payload, revision)
 
+    def test_paid_invoice_and_selected_receipt_create_one_expense(self):
+        from expense_documents import parse_invoice_pages
+
+        base = self.store.base(1)
+        base.update(parse_invoice_pages([{"text": (
+            "INVOICE\nSUBTOTAL: $100.00\nTAX: $0.00\nINVOICE TOTAL: $100.00\n"
+            "APPLIED TRANSACTIONS:\nP-123 Nov 17, 2026 -$100.00\nBALANCE DUE:\n$0.00"
+        )}]))
+        base.update(document_type="invoice", supplier_name="Isolated Supplier AB", document_date="2026-10-21",
+                    currency_code="USD", invoice_number="TEST-123")
+        receipt = self.store.base(2)
+        receipt.update(currency_code="USD", gross_amount="100.00")
+        with self.store.conn:
+            for document_id, fields in ((1, base), (2, receipt)):
+                self.store.conn.execute("UPDATE documents SET base_json=? WHERE id=?", (packed(fields), document_id))
+        revision, payload = self.store.latest(1)
+        payload.update(confirmed_type="invoice", original_checked=True, payment_receipt_id=2,
+                       supplier_name="Isolated Supplier AB", document_date="2026-10-21", currency_code="USD",
+                       gross_amount="100.00", net_amount="100.00", vat_amount="0.00",
+                       allocations=[{"destination": "company", "gross_amount": "100.00"}])
+        self.assertEqual(self.store.payment_receipt_candidates(1, payload), [2])
+        revision = self.store.save(1, payload, revision)
+        self.store.transfer(1, revision)
+        self.assertEqual(self.store.payment_receipt_parent(2), 1)
+        with self.assertRaisesRegex(ReviewError, "подтверждение оплаты"):
+            self.store.transfer(2, 0)
+        self.sync()
+        conn = self.server.get_db_connection()
+        self.addCleanup(conn.close)
+        expenses = conn.execute("SELECT gross_amount, currency_code FROM expense_documents").fetchall()
+        self.assertEqual([tuple(row) for row in expenses], [("100.00", "USD")])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM expense_document_attachments").fetchone()[0], 2)
+
     def request(self, method, url, headers=None, **kwargs):
         assert urlsplit(url).hostname == "isolated-testserver"
         self.calls.append((method, urlsplit(url).path))

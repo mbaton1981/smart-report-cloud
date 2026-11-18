@@ -10351,7 +10351,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "share": share,
                     "checkbox": include,
                     "category_combo": category_combo,
+                    "suggested": suggested,
                     "evidence": evidence,
+                    "evidence_item": table.item(row, 5),
                     "status_item": table.item(row, 7),
                 })
 
@@ -10363,6 +10365,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             layout.addWidget(message)
 
         buttons = QHBoxLayout()
+        find_categories_button = QPushButton("Предложить категории по документам")
+        find_categories_button.setObjectName("suggestStoredExpenseCategories")
+        find_categories_button.setEnabled(bool(review_rows))
+        buttons.addWidget(find_categories_button)
         buttons.addStretch(1)
         save_button = QPushButton("Сохранить выбранные категории")
         save_button.setObjectName("saveCategoryReview")
@@ -10371,6 +10377,40 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
         close_button.clicked.connect(dialog.reject)
+
+        def find_categories():
+            find_categories_button.setEnabled(False)
+            try:
+                for row in review_rows:
+                    combo = row["category_combo"]
+                    document = row["document"]
+                    allocations = document.get("allocations") or []
+                    if combo.currentData() != CATEGORY_UNCLASSIFIED or len(allocations) != 1:
+                        continue
+                    document_id = document.get("server_document_id") or document["id"]
+                    try:
+                        details = request_expense_api("GET", f"/api/expense-documents/{document_id}")["document"]
+                        if details.get("sync_version") != document.get("sync_version"):
+                            row["status_item"].setText("Документ изменился. Откройте разбор заново.")
+                            continue
+                        category, evidence = suggest_expense_category(details, row["share"])
+                    except Exception as error:
+                        logging.warning("Could not load recognized text for expense %s: %s", document_id, error)
+                        row["status_item"].setText("Текст документа недоступен. Откройте оригинал.")
+                        continue
+                    row.update(suggested=category, evidence=evidence)
+                    evidence_item = row["evidence_item"]
+                    evidence_item.setText(evidence)
+                    evidence_item.setToolTip(evidence)
+                    combo.setCurrentIndex(combo.findData(category))
+                    row["status_item"].setText(
+                        "Предложено · проверьте и отметьте" if category != CATEGORY_UNCLASSIFIED
+                        else "Требуется сверка оригинала"
+                    )
+            finally:
+                find_categories_button.setEnabled(True)
+
+        find_categories_button.clicked.connect(find_categories)
 
         def save_selected_categories():
             selected_rows = [
@@ -10459,8 +10499,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                             evidence = "Пользователь оставил долю без разбивки."
                         else:
                             source = "user"
+                            basis = (row["evidence"] if category == row["suggested"]
+                                     else "Категория выбрана вручную после сверки оригинала.")
                             evidence = (
-                                f"Пользователь подтвердил категорию. {row['evidence']}"
+                                f"Пользователь подтвердил категорию. {basis}"
                             )
                         current_part["expense_category"] = category
                         current_part["expense_category_source"] = source

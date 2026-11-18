@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from expense_documents import decimal_text, parse_invoice_money
+from expense_categories import confirmed_expense_category
 from offline_review import APPLICATION_ID, EDITABLE, OfflineReviewStore, ReviewError, current_classification, digest, packed
 
 
@@ -99,7 +100,12 @@ class IncomingStore(OfflineReviewStore):
 
     def clean_payload(self, payload):
         cleaned = super().clean_payload({key: value for key, value in payload.items()
-                                         if key not in ("allocations", "server_version")})
+                                         if key not in ("allocations", "server_version", "payment_receipt_id")})
+        receipt_id = payload.get("payment_receipt_id")
+        if receipt_id is not None:
+            if type(receipt_id) is not int or receipt_id <= 0:
+                raise ReviewError("Выберите чек из входящих документов.")
+            cleaned["payment_receipt_id"] = receipt_id
         parts = self.allocations(payload)
         if not isinstance(parts, list) or len(parts) > 100:
             raise ReviewError("Распределение: не более 100 строк.")
@@ -121,12 +127,15 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Выберите объект для этой части.")
             cleaned["allocations"].append({"destination": destination, "object_id": object_id,
                                            "gross_amount": decimal_text(amount)})
-            for key, limit in (("note", 500), ("expense_category", 100)):
+            for key, limit in (("note", 500), ("expense_category", 100), ("expense_category_evidence", 500)):
                 if key in part:
                     value = part[key]
                     if value is not None and (not isinstance(value, str) or len(value) > limit):
                         raise ReviewError("Некорректное примечание или категория части.")
                     cleaned["allocations"][-1][key] = value
+            if "expense_category_source" in part:
+                category, source = confirmed_expense_category(part.get("expense_category"), part["expense_category_source"])
+                cleaned["allocations"][-1].update(expense_category=category, expense_category_source=source)
             for key in ("net_amount", "vat_amount", "rounding_amount"):
                 if key in part:
                     value = parse_invoice_money(part[key])
@@ -169,7 +178,8 @@ class IncomingStore(OfflineReviewStore):
                                            "object_id": row.get("object_id"),
                                            "gross_amount": row.get("gross_amount"),
                                            **{key: row[key] for key in ("net_amount", "vat_amount", "rounding_amount",
-                                                                        "note", "expense_category")
+                                                                        "note", "expense_category",
+                                                                        "expense_category_source", "expense_category_evidence")
                                               if key in row}}
                                           for row in existing.get("allocations", [])]
                 payload["object_id"] = (payload["allocations"][0]["object_id"]
@@ -182,6 +192,8 @@ class IncomingStore(OfflineReviewStore):
         card = self.card(document_id)
         if card is None:
             return self.save_revision(document_id, cleaned, expected_revision)
+        if cleaned.get("payment_receipt_id") != json.loads(card["payload_json"]).get("payment_receipt_id"):
+            raise ReviewError("Чек к уже учтённому расходу меняется из его карточки в реестре.")
         if self.host.incoming_delivery_pending(card["client_id"]):
             raise ReviewError("Сначала завершите передачу или разберите конфликт в обычном реестре.")
         existing = self._existing(card["client_id"], required=True)
@@ -257,7 +269,43 @@ class IncomingStore(OfflineReviewStore):
             return base["object_cost_fields"]
         return extract_cost_fields([{"page": 1, "text": base.get("raw_text") or ""}], base)
 
+    def payment_receipt_parent(self, document_id):
+        row = self.conn.execute(
+            "SELECT document_id FROM register WHERE json_extract(payload_json, '$.payment_receipt_id')=?",
+            (document_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def payment_receipt_candidates(self, document_id, invoice):
+        base = self.base(document_id)
+        if (base.get("document_type") != "invoice" or not base.get("prepaid")
+                or parse_invoice_money(base.get("amount_due")) != Decimal(0)):
+            return []
+        supplier = str(invoice.get("supplier_name") or "").strip().casefold()
+        amount = parse_invoice_money(invoice.get("gross_amount"))
+        currency = invoice.get("currency_code")
+        date_value = invoice.get("document_date")
+        if not supplier or not date_value or not currency or currency == "UNKNOWN" or amount is None or amount <= 0:
+            return []
+        candidates = []
+        for row in self.conn.execute(
+            "SELECT id FROM documents WHERE id<>? AND json_extract(base_json, '$.document_type')='receipt' ORDER BY id",
+            (document_id,),
+        ):
+            receipt_id = row[0]
+            receipt = self.base(receipt_id)
+            if (receipt.get("document_type") == "receipt" and not self.card(receipt_id)
+                    and self.payment_receipt_parent(receipt_id) in (None, document_id)
+                    and self.action(receipt_id)[1] != "ignore"
+                    and str(receipt.get("supplier_name") or "").strip().casefold() == supplier
+                    and receipt.get("currency_code") == currency and receipt.get("document_date") == date_value
+                    and parse_invoice_money(receipt.get("gross_amount")) == amount):
+                candidates.append(receipt_id)
+        return candidates
+
     def transfer(self, document_id, expected_revision):
+        if self.payment_receipt_parent(document_id) is not None:
+            raise ReviewError("Чек уже используется как подтверждение оплаты. Второй расход не создан.")
         if self.action(document_id)[1] in ("ignore", "later"):
             raise ReviewError("Сначала выберите «Учесть как расход».")
         revision, reviewed = self.latest(document_id)
@@ -283,7 +331,22 @@ class IncomingStore(OfflineReviewStore):
                 if self.action(document_id)[1] in ("ignore", "later"):
                     raise ReviewError("Статус изменён: сначала выберите «Учесть как расход».")
                 if self.card(document_id) is None:
+                    if self.payment_receipt_parent(document_id) is not None:
+                        raise ReviewError("Чек уже используется как подтверждение оплаты.")
                     linked_client = self._check_existing_register(document_id, reviewed)
+                    receipt_id = reviewed.get("payment_receipt_id")
+                    if receipt_id is not None:
+                        if receipt_id not in self.payment_receipt_candidates(document_id, reviewed):
+                            raise ReviewError("Чек больше не доступен или его реквизиты отличаются. Сверьте оригиналы.")
+                        receipt_sha = self.conn.execute("SELECT sha256 FROM documents WHERE id=?", (receipt_id,)).fetchone()[0]
+                        try:
+                            snapshot = self.host.incoming_register_snapshot()
+                        except ValueError as error:
+                            raise ReviewError(str(error)) from error
+                        for existing in snapshot:
+                            if (receipt_sha in (existing.get("required_attachment_sha256") or [])
+                                    or any(item.get("sha256") == receipt_sha for item in existing.get("attachments") or [])):
+                                raise ReviewError("Чек уже есть в реестре или очереди. Сверьте существующий расход.")
                     if linked_client and self.conn.execute(
                             "SELECT 1 FROM register WHERE client_id=?", (linked_client,)).fetchone():
                         raise ReviewError("Этот оригинал уже связан с другой карточкой. "
@@ -629,6 +692,9 @@ class IncomingStore(OfflineReviewStore):
         return next((row for row in matches if row.get("id") and not row.get("local_pending")), None)
 
     def accounting_status(self, document_id):
+        parent = self.payment_receipt_parent(document_id)
+        if parent is not None:
+            return f"Подтверждение оплаты к документу №{parent}", self.accounting_status(parent)[1]
         card = self.card(document_id)
         if card is None:
             action = self.action(document_id)[1]
@@ -660,6 +726,8 @@ class IncomingStore(OfflineReviewStore):
         return "Ожидает проверки в реестре", False
 
     def attention_reasons(self, document_id):
+        if self.payment_receipt_parent(document_id) is not None:
+            return []
         if self.action(document_id)[1] == "ignore":
             return []
         card = self.card(document_id)
@@ -763,6 +831,7 @@ class IncomingStore(OfflineReviewStore):
         if delivered:
             return card
         payload = json.loads(card["payload_json"])
+        receipt_id = payload.pop("payment_receipt_id", None)
         base = self.base(card["document_id"])
         existing = self._existing(card["client_id"])
         document_type = (payload.get("confirmed_type")
@@ -792,7 +861,12 @@ class IncomingStore(OfflineReviewStore):
         # Retry the same client_id through the normal outbox. The queue is durable before
         # recording delivery; a lost response cannot change the document's identity.
         original = self.original(card["document_id"])
-        staged = self.host._store_expense_originals([str(original)], card["client_id"])
+        paths = [str(original)]
+        if receipt_id is not None:
+            receipt = self.original(receipt_id)
+            paths.append(str(receipt))
+            payload["required_attachment_sha256"].append(digest(receipt.read_bytes()))
+        staged = self.host._store_expense_originals(paths, card["client_id"])
         self.host.queue_expense_document_operation(
             card["client_id"], "upsert", payload,
             server_document_id=existing.get("id") if existing else None,

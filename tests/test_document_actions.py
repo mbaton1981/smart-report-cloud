@@ -58,12 +58,18 @@ class CostExtractionTests(unittest.TestCase):
             "page": 1,
             "text": "INVOICE\nGitHub, Inc.\nInvoice #\nInvoice Date\nTerms\nDue Date\nCurrency\n"
                     "INV-123\nNov 17, 2026\nDue Upon Receipt\nNov 25, 2026\nUSD\n"
-                    "INVOICE TOTAL: $100.00",
+                    "SUBTOTAL: $100.00\nTAX: $0.00\nINVOICE TOTAL: $100.00\n"
+                    "APPLIED TRANSACTIONS:\nP-123 Nov 17, 2026 -$100.00\nBALANCE DUE:\n$0.00",
         }])
         self.assertEqual(fields["document_date"], "2026-11-17")
         self.assertEqual(fields["document_type"], "invoice")
         self.assertEqual(fields["supplier_name"], "GitHub, Inc.")
+        self.assertEqual(fields["invoice_number"], "INV-123")
         self.assertEqual(fields["gross_amount"], "100.00")
+        self.assertEqual(fields["net_amount"], "100.00")
+        self.assertEqual(fields["vat_amount"], "0.00")
+        self.assertEqual(fields["amount_due"], "0.00")
+        self.assertTrue(fields["prepaid"])
         self.assertEqual(fields["field_sources"]["document_date"][0]["caption"], "Invoice Date")
 
     def test_english_invoice_keeps_seller_and_printed_total_with_ambiguous_currency(self):

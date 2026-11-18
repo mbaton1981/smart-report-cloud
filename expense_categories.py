@@ -35,13 +35,14 @@ def confirmed_expense_category(value, source):
 _CATEGORY_TERMS = {
     CATEGORY_SUBCONTRACTOR_WORK: re.compile(
         r"\b(?:underentreprenör(?:s)?(?:arbete)?|subcontract(?:or)?\s+work|"
-        r"arbetskostnad|timarbete|montering|målning|snickeri|elinstallation|"
+        r"arbetskostnad|timarbete|byggtjänst(?:er)?|montering|målning|snickeri|elinstallation|"
         r"renoveringsarbete|arbete)\b",
         re.IGNORECASE,
     ),
     CATEGORY_MATERIALS: re.compile(
         r"\b(?:material(?:kostnad)?|byggmaterial|byggvaror|virke|skruv|"
-        r"isolering|betong|färg|varuinköp|materialinköp)\b",
+        r"isolering|betong|färg|varuinköp|materialinköp|farmarskruv|överlappsskruv|"
+        r"spånskiveskruv|kap(?:skiva|skivor)|trälim)\b",
         re.IGNORECASE,
     ),
     CATEGORY_OTHER: re.compile(
@@ -57,6 +58,11 @@ _MIXED_WORK_AND_MATERIALS = re.compile(
     r"\b(?:arbete|arbeten|arbetskostnad)\b",
     re.IGNORECASE,
 )
+_ZERO_FREIGHT = re.compile(
+    r"^[ \t]*Frakt[ \t]+exkl\.?[ \t]+moms[ \t]*:?[ \t]*(?:\r?\n[ \t]*)?"
+    r"0[,.]00[ \t]*(?:SEK|EUR|NOK|DKK|USD|GBP|kr)?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def suggest_expense_category(document, allocation, allocation_count=1):
@@ -69,10 +75,14 @@ def suggest_expense_category(document, allocation, allocation_count=1):
         return category, evidence
 
     allocation_text = str(allocation.get("note") or "").strip()
-    document_text = "\n".join(filter(None, (
+    document_text = _ZERO_FREIGHT.sub("", "\n".join(filter(None, (
         str(document.get("document_comment") or "").strip(),
-        str(document.get("recognized_text") or "").strip(),
-    )))
+        str(document.get("recognized_text") or document.get("raw_text") or "").strip(),
+    ))))
+    if allocation_text and not (_MIXED_WORK_AND_MATERIALS.search(allocation_text) or any(
+        pattern.search(allocation_text) for pattern in _CATEGORY_TERMS.values()
+    )):
+        allocation_text = ""
     content = allocation_text or (
         document_text if int(allocation_count or 1) == 1 else ""
     )
