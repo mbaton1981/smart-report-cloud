@@ -178,9 +178,55 @@ class ObjectPackageReportTests(unittest.TestCase):
         self.assertEqual(before["known_sek_expense"], Decimal("30.00"))
         self.assertEqual(after["known_sek_expense"], Decimal("30.00"))
         self.assertEqual(before["known_total"], after["known_total"])
+        self.assertEqual(before["supplier_net"], after["supplier_net"])
+        self.assertEqual(after["supplier_net"][0]["document_count"], 1)
         categories = after["category_net_by_currency"]["SEK"]
         self.assertEqual(categories[CATEGORY_SUBCONTRACTOR_WORK]["known"], Decimal("20.00"))
         self.assertEqual(categories[CATEGORY_MATERIALS]["known"], Decimal("10.00"))
+
+    def test_supplier_summary_keeps_partial_amounts_and_currencies_separate(self):
+        def document(identifier, net, currency="SEK", supplier="Trade & Co", **kwargs):
+            item = _document(identifier, currency=currency, net=net, allocations=[{
+                "object_id": 42, "destination": "object", "net_amount": net,
+            }], **kwargs)
+            item["supplier_name"] = supplier
+            return item
+
+        expenses, excluded = collect_object_expenses([
+            document(1, "12.50"),
+            document(2, None, supplier="trade  & co"),
+            document(3, "-2.50"),
+            document(4, "30.00", currency="EUR"),
+            document(5, "123.00", currency="USD", status="requires_review"),
+            document(6, None, supplier=""),
+            document(7, "44.00", currency="UNKNOWN"),
+        ], 42)
+        report = {"journal_rows": [], "cost_lines": [], "totals": {}}
+        data = {
+            "object": {"id": 42, "name": "Object"},
+            "generated_at": "2026-11-03 12:00", "period_label": "2026-11-02",
+            "customer_report": report, "language": "sv", "include_copies": False,
+            "expenses": expenses, "excluded_expenses": excluded, "expense_snapshot_available": True,
+        }
+        summary = _object_total_summary(data, _customer_summary(report))
+        self.assertEqual([
+            (row["supplier"], row["currency"], row["known"], row["unknown_count"], row["document_count"])
+            for row in summary["supplier_net"]
+        ], [
+            ("Trade & Co", "SEK", Decimal("10.00"), 1, 3),
+            ("", "SEK", None, 1, 1),
+            ("Trade & Co", "EUR", Decimal("30.00"), 0, 1),
+            ("Trade & Co", "UNKNOWN", None, 0, 1),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "supplier-report.pdf"
+            write_object_report_package(target, data, font=self.font, bold_font=self.bold_font)
+            cover = " ".join(PdfReader(str(target)).pages[0].extract_text().split())
+
+        self.assertIn("Trade & Co 3 10,00 SEK · delbelopp, total ofullständig", cover)
+        self.assertIn("Okänd leverantör 1 Okänt · SEK", cover)
+        self.assertIn("Trade & Co 1 30,00 EUR", cover)
+        self.assertIn("Trade & Co 1 Valuta saknas", cover)
 
     def test_pdf_cover_shows_net_components_and_not_gross_expense(self):
         shared = _document(75, net="150.00", vat="30.00", gross="180.00", allocations=[

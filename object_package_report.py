@@ -431,13 +431,20 @@ def _object_total_summary(data, figures):
         "known": Decimal(0), "unknown_count": 0, "allocation_count": 0,
         "document_ids": set(),
     })
+    supplier_net = {}
     unknown_net_by_currency = defaultdict(int)
     foreign_share_count = 0
     unknown_currency_share_count = 0
     unknown_net_share_count = 0
 
     for document in expenses:
-        currency = str(document.get("currency_code") or "UNKNOWN").strip().upper()
+        currency = str(document.get("currency_code") or "").strip().upper() or "UNKNOWN"
+        supplier = " ".join(str(document.get("supplier_name") or "").split())
+        supplier_total = supplier_net.setdefault((currency, supplier.casefold()), {
+            "supplier": supplier, "currency": currency, "known": None,
+            "unknown_count": 0, "document_count": 0,
+        })
+        supplier_total["document_count"] += 1
         allocations = document.get("object_allocations") or []
         if not allocations:
             allocations = [document.get("share") or {}]
@@ -456,9 +463,13 @@ def _object_total_summary(data, figures):
                 unknown_net_share_count += 1
                 unknown_net_by_currency[currency] += 1
                 category_total["unknown_count"] += 1
+                supplier_total["unknown_count"] += 1
             else:
                 expense_net[currency] += net
                 category_total["known"] += net
+                if currency != "UNKNOWN":
+                    previous_net = supplier_total["known"]
+                    supplier_total["known"] = net if previous_net is None else previous_net + net
             if currency == "UNKNOWN":
                 unknown_currency_share_count += 1
             elif currency != "SEK":
@@ -575,6 +586,10 @@ def _object_total_summary(data, figures):
         "known_total": known_total,
         "complete": complete,
         "expense_net_by_currency": dict(expense_net),
+        "supplier_net": sorted(supplier_net.values(), key=lambda row: (
+            row["currency"] != "SEK", row["currency"] == "UNKNOWN", row["currency"],
+            row["known"] is None, -(row["known"] or Decimal(0)), row["supplier"].casefold(),
+        )),
         "category_net_by_currency": {
             currency: {
                 category: {
@@ -1146,9 +1161,36 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             "Итог рассчитан по данным отчёта; наценка на материалы не добавлялась.",
             styles["detail_note"],
         ),
-        PageBreak(),
     ])
 
+    if total_summary["supplier_net"]:
+        supplier_rows = [[
+            "Leverantör" if swedish else "Поставщик",
+            "Dokument" if swedish else "Документы",
+            "Objektets andel exkl. moms" if swedish else "Доля объекта без НДС",
+        ]]
+        for row in total_summary["supplier_net"]:
+            if row["currency"] == "UNKNOWN":
+                net = "Valuta saknas" if swedish else "Валюта не указана"
+            else:
+                known = row["known"]
+                net = amount_or_partial(
+                    None if row["unknown_count"] else known, known, row["currency"],
+                )
+                if known is None:
+                    net = f"{net} · {row['currency']}"
+            supplier_rows.append([
+                row["supplier"] or ("Okänd leverantör" if swedish else "Неизвестный поставщик"),
+                str(row["document_count"]),
+                net,
+            ])
+        story.extend([
+            raw_paragraph("Per leverantör" if swedish else "По поставщикам", styles["heading"]),
+            raw_table(supplier_rows, [available * .45, available * .14, available * .41],
+                      font, bold_font, alignments=((1, "CENTER"), (2, "RIGHT")), font_size=9),
+        ])
+
+    story.append(PageBreak())
     story.extend([
         raw_paragraph("Arbetsjournal" if swedish else "Журнал работ", styles["section_title"]),
         raw_paragraph(
