@@ -39,8 +39,18 @@ $versionInfoPath = Join-Path $build "version_info.txt"
 $versionInfo | Set-Content -Encoding UTF8 $versionInfoPath
 $env:SMARTREPORT_VERSION_INFO = $versionInfoPath
 $env:PYTHONIOENCODING = "utf-8"
-& $BuildPython -m PyInstaller --noconfirm --clean --distpath "$build\dist" --workpath "$build\work" "$PSScriptRoot\smartreport.spec"
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибкой" }
+$previousPath = $env:Path
+try {
+    # PyInstaller resolves DLL imports against PATH. The build tools are
+    # passed by absolute path, so libraries from the host app are unnecessary.
+    $env:Path = "$env:SystemRoot\System32;$env:SystemRoot"
+    & $BuildPython -m PyInstaller --noconfirm --clean --distpath "$build\dist" --workpath "$build\work" "$PSScriptRoot\smartreport.spec"
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибкой" }
+} finally {
+    $env:Path = $previousPath
+}
+& $BuildPython "$PSScriptRoot\verify_frozen_startup.py" "$build\dist\SmartReport\SmartReport.exe"
+if ($LASTEXITCODE -ne 0) { throw "Собранный SmartReport не прошёл проверку запуска" }
 foreach ($launcher in @("launch_existing_profile.ps1", "launch_fresh_profile.ps1")) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $launcher) `
         -Destination (Join-Path $build "dist\SmartReport\$launcher") -Force
