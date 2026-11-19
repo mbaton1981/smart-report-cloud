@@ -729,9 +729,9 @@ class CalendarInvariantTests(unittest.TestCase):
                     minute = local.hour * 60 + local.minute
                     if local.weekday() >= 5 or local.date() in app.swedish_public_holidays(local.year):
                         key = "helg"
-                    elif 360 <= minute < 1020:
+                    elif 360 <= minute < 1080:
                         key = "day"
-                    elif 300 <= minute < 360 or 1020 <= minute < 1080:
+                    elif 300 <= minute < 360:
                         key = "ob1"
                     elif 1080 <= minute < 1320:
                         key = "ob2"

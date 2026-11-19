@@ -800,10 +800,10 @@ class PayrollIntegrationTests(unittest.TestCase):
 
     def test_automatic_payroll_table_pdf_and_details_agree_without_writes(self):
         conn = self.seed_management_shift()
-        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,entry_type,start_time,end_time)
-            VALUES('ordinary','2026-10-21','Management Test','Renatur','Other site',8,'work','07:00','16:00'),
-                  ('saturday','2026-10-24','Management Test','Renatur','Site',4,'ob','08:00','12:00'),
-                  ('private','2026-10-25','Management Test','Privat','Site',4,'ob','08:00','12:00')""")
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,rate,entry_type,start_time,end_time)
+            VALUES('ordinary','2026-10-21','Management Test','Renatur','Other site',8,999,'work','07:00','16:00'),
+                  ('saturday','2026-10-24','Management Test','Renatur','Site',4,999,'ob','08:00','12:00'),
+                  ('private','2026-10-25','Management Test','Privat','Site',4,999,'ob','08:00','12:00')""")
         conn.commit()
         before = list(conn.iterdump())
         window = self.salary_window(management_mode=True)
