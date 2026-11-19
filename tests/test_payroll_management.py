@@ -46,14 +46,14 @@ class ManagementPayrollTests(unittest.TestCase):
                 self.add(kind=kind)
                 report = self.report()
                 self.assertEqual(report["worked"], 4)
-                self.assertEqual(report["categories"], dict(day=1, ob1=1, ob2=2, ob3=0, helg=0, unknown=0))
-                self.assertEqual((report["base"], report["premium"], report["total"]), (400, 100, 500))
+                self.assertEqual(report["categories"], dict(day=2, ob1=0, ob2=2, ob3=0, helg=0, unknown=0))
+                self.assertEqual((report["base"], report["premium"], report["total"]), (400, 80, 480))
                 self.assertEqual(report["above_norm"], 0)
 
     def test_all_weekday_boundaries(self):
         for start, end, category, premium in (
             ("00:00", "05:00", "ob3", 350), ("05:00", "06:00", "ob1", 20),
-            ("06:00", "17:00", "day", 0), ("17:00", "18:00", "ob1", 20),
+            ("06:00", "18:00", "day", 0),
             ("18:00", "22:00", "ob2", 160), ("22:00", "24:00", "ob3", 140)):
             with self.subTest(start=start):
                 segments = management.split_interval("2026-10-21", start, end, None, holidays)
@@ -72,7 +72,7 @@ class ManagementPayrollTests(unittest.TestCase):
 
     def test_holiday_eve_not_automatically_a_holiday(self):
         parts = management.split_interval("2026-12-24", "16:00", "20:00", None, holidays)
-        self.assertEqual([p["category"] for p in parts], ["day", "ob1", "ob2"])
+        self.assertEqual([p["category"] for p in parts], ["day", "ob2"])
 
     def test_midnight_and_period_boundary_preserve_hours(self):
         self.add(day="2026-10-23", start="23:00", end="03:00")
@@ -94,9 +94,9 @@ class ManagementPayrollTests(unittest.TestCase):
     def test_no_automatic_rounding_of_minutes(self):
         self.add(hours=1.5, start="16:15", end="17:45")
         r = self.report()
-        self.assertEqual(r["categories"]["day"], .75)
-        self.assertEqual(r["categories"]["ob1"], .75)
-        self.assertEqual(r["total"], 165)
+        self.assertEqual(r["categories"]["day"], 1.5)
+        self.assertEqual(r["categories"]["ob1"], 0)
+        self.assertEqual(r["total"], 150)
 
     def test_unspecified_break_not_arbitrarily_assigned_to_ob(self):
         self.add(hours=3)
@@ -107,7 +107,7 @@ class ManagementPayrollTests(unittest.TestCase):
         self.assertIn("перерыва", r["lines"][0]["warnings"][0])
 
     def test_no_times_exports_hours_with_base_only_and_unknown_category(self):
-        self.add(start=None, end=None)
+        self.add(start=None, end=None, kind="ob")
         r = self.report()
         self.assertEqual(r["worked"], 4)
         self.assertEqual(r["categories"]["unknown"], 4)
@@ -117,12 +117,13 @@ class ManagementPayrollTests(unittest.TestCase):
         self.db.execute("UPDATE employees SET salary_rate=245.8")
         self.add("four", hours=4)
         self.add("seven", day="2026-10-22", hours=7, end="23:00")
-        for key, hours in (("eight1", 8), ("eight2", 8), ("six", 6), ("two", 2)):
-            self.add(key, hours=hours, start=None, end=None)
+        for key, day, hours in (("eight1", "2026-10-23", 8), ("eight2", "2026-10-26", 8),
+                                ("six", "2026-10-27", 6), ("two", "2026-10-28", 2)):
+            self.add(key, day=day, hours=hours, start=None, end=None)
         r = self.report()
         self.assertEqual(r["worked"], 35)
-        self.assertEqual(r["categories"]["unknown"], 24)
-        self.assertEqual((r["base"], r["premium"], r["total"]), (8603, 860.3, 9463.3))
+        self.assertEqual(r["categories"]["unknown"], 0)
+        self.assertEqual((r["base"], r["premium"], r["total"]), (8603, 761.98, 9364.98))
         self.assertEqual(r["above_norm"], 0)
         self.assertEqual(sum(r["categories"].values()), 35)
 
@@ -143,7 +144,7 @@ class ManagementPayrollTests(unittest.TestCase):
         self.db.execute("INSERT INTO shifts SELECT 'two','Unknown',date,company,object_name,entry_type,hours,start_time,end_time FROM shifts")
         result = management.reports(self.db.cursor(), "2026-10-01", "2026-10-31", holidays, lambda a,b:176)
         self.assertEqual(len(result), 2)
-        self.assertEqual(next(r for r in result if r["employee"] == "Worker")["total"], 500)
+        self.assertEqual(next(r for r in result if r["employee"] == "Worker")["total"], 480)
         self.assertIsNone(next(r for r in result if r["employee"] == "Unknown")["total"])
 
     def test_atf_and_absences_are_separate_from_worked_and_ob(self):
@@ -152,14 +153,14 @@ class ManagementPayrollTests(unittest.TestCase):
             self.add(key=kind, hours=2, start=None, end=None, kind=kind)
         r = self.report()
         self.assertEqual(r["worked"], 4)
-        self.assertEqual(r["total"], 500)
+        self.assertEqual(r["total"], 480)
         self.assertEqual(r["absence"], dict(atf=2, sick=2, vacation=2, holiday=2))
 
     def test_old_ob_segments_reclassify_only_in_memory(self):
         self.add(kind="ob", start=None, end=None)
         self.db.execute("INSERT INTO ob_segments VALUES(1,'one','2026-10-21','16:00','20:00',4,'old',50,1.5,999,5994)")
         r = self.report()
-        self.assertEqual(r["total"], 500)
+        self.assertEqual(r["total"], 480)
         self.assertEqual(self.db.execute("SELECT amount FROM ob_segments").fetchone()[0], 5994)
 
     def test_confirmed_history_and_payments_not_changed_by_current_rate_estimate(self):
@@ -168,10 +169,10 @@ class ManagementPayrollTests(unittest.TestCase):
                         status="closed", paid=True, amounts=dict(base_salary=123), revision=1)
         self.db.execute("INSERT INTO payroll_events VALUES(1,'op','{}',?,'admin','now')",
                         (json.dumps(dict(kind="close", snapshot=snapshot)),))
-        self.assertEqual(self.report()["total"], 500)
+        self.assertEqual(self.report()["total"], 480)
         self.db.execute("UPDATE employees SET salary_rate=200")
         r = self.report()
-        self.assertEqual(r["total"], 1000)
+        self.assertEqual(r["total"], 960)
         self.assertEqual(r["saved_periods"], 1)
         self.assertEqual(history.state(history.events(self.db.cursor()))[2][("Worker","2026-10-01","2026-10-31")], snapshot)
         self.assertEqual(self.db.execute("SELECT change_amount FROM balance").fetchone()[0], 1234.56)
@@ -180,7 +181,7 @@ class ManagementPayrollTests(unittest.TestCase):
         self.add()
         self.db.execute("DROP TABLE payroll_events")
         self.db.execute("PRAGMA query_only=ON")
-        self.assertEqual(self.report()["total"], 500)
+        self.assertEqual(self.report()["total"], 480)
 
     def test_wrong_date_range_explicit_error(self):
         with self.assertRaisesRegex(ValueError, "Начало"):
@@ -191,7 +192,7 @@ class ManagementPayrollTests(unittest.TestCase):
                                      ("16:00", None, "окончания"), (None, "20:00", "начала")):
             with self.subTest(start=start, end=end):
                 self.db.execute("DELETE FROM shifts")
-                self.add(start=start, end=end)
+                self.add(start=start, end=end, kind="ob")
                 line = self.report()["lines"][0]
                 self.assertEqual(line["start_time"], start)
                 self.assertEqual(line["end_time"], end)
@@ -213,6 +214,6 @@ class ManagementPayrollTests(unittest.TestCase):
         self.db.execute("INSERT INTO ob_segments VALUES(1,'one','2026-10-21','16:00','20:00',4,'old',50,1.5,999,5994)")
         line = self.report()["lines"][0]
         self.assertEqual(line["categories"]["unknown"], 0)
-        self.assertEqual(line["total"], 500)
+        self.assertEqual(line["total"], 480)
         self.assertEqual(line["saved_intervals"], [
             dict(date="2026-10-21", start_time="16:00", end_time="20:00", hours=4)])

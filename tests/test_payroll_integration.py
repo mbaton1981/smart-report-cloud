@@ -218,7 +218,7 @@ class PayrollIntegrationTests(unittest.TestCase):
                    if window.table_salary.item(i, 0).text() == "Management Test")
         self.assertEqual(window.table_salary.item(row, 1).text(), "100.00")
         self.assertEqual(window.table_salary.item(row, 2).text(), "4")
-        self.assertEqual(window.table_salary.item(row, 9).text(), "500.00")
+        self.assertEqual(window.table_salary.item(row, 9).text(), "480.00")
         self.assertIn("OB1", window.table_salary.horizontalHeaderItem(4).text())
         from PyQt6.QtCore import Qt
         from PyQt6.QtTest import QTest
@@ -232,7 +232,7 @@ class PayrollIntegrationTests(unittest.TestCase):
             QTest.mouseClick(button, Qt.MouseButton.LeftButton)
             text = "\n".join(p.extract_text() for p in PdfReader(Path(folder)/"hours.pdf").pages)
             self.assertIn("Предварительный расчёт по текущим ставкам", text)
-            self.assertIn("500.00", text)
+            self.assertIn("480.00", text)
             self.assertIn("OB1", text)
             self.assertIn("OB2", text)
             self.assertIn("Всего", text)
@@ -471,7 +471,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertEqual(window.table_salary.rowCount(), 3)
         self.assertEqual(window.table_salary.item(2, 0).text(), "ИТОГО")
         self.assertEqual(window.table_salary.item(2, 2).text(), "6")
-        self.assertEqual(window.table_salary.item(2, 9).text(), "900.00")
+        self.assertEqual(window.table_salary.item(2, 9).text(), "880.00")
         window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Andrii Piskun"))
         self.assertEqual(window.table_salary.rowCount(), 2)
         self.assertEqual(window.table_salary.item(0, 0).text(), "Andrii Piskun")
@@ -520,14 +520,14 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertEqual(len(reader.pages), 1)
         text = reader.pages[0].extract_text()
         self.assertIn("ИТОГО", text)
-        self.assertIn("6,000.00", text)
+        self.assertIn("5,760.00", text)
         self.assertEqual(payroll_ui.summary_total(items)["worked"], 48)
         items[0] = dict(items[0], total=None)
         self.assertIsNone(payroll_ui.summary_total(items)["total"])
         pdf = BytesIO()
         payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
         self.assertIn("Не определено", PdfReader(pdf).pages[0].extract_text())
-        self.assertNotIn("5,500.00", PdfReader(pdf).pages[0].extract_text())
+        self.assertNotIn("5,280.00", PdfReader(pdf).pages[0].extract_text())
 
     def test_summary_many_employees_readable_multipage_with_repeated_header_and_one_total(self):
         self.seed_management_shift()
@@ -541,7 +541,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         self.assertTrue(all("ФИО" in p.extract_text() for p in reader.pages))
         text = "\n".join(p.extract_text() for p in reader.pages)
         self.assertEqual(text.count("ИТОГО"), 1)
-        self.assertIn("50,000.00", text)
+        self.assertIn("48,000.00", text)
 
     def test_summary_rate_is_actual_current_salary_rate_per_employee_and_refreshes(self):
         conn = self.seed_management_shift()
@@ -608,8 +608,9 @@ class PayrollIntegrationTests(unittest.TestCase):
             self.assertIn("/FontFile2", descriptor)
         widths = table.call_args.kwargs["colWidths"]
         from reportlab.pdfbase.pdfmetrics import stringWidth
-        self.assertEqual(len(widths), len(payroll_ui.MANAGEMENT_HEADERS))
-        for header, width in zip(payroll_ui.MANAGEMENT_HEADERS, widths):
+        visible_headers = payroll_ui.MANAGEMENT_HEADERS[:11]+payroll_ui.MANAGEMENT_HEADERS[15:]
+        self.assertEqual(len(widths), len(visible_headers))
+        for header, width in zip(visible_headers, widths):
             self.assertGreaterEqual(width-8, max(stringWidth(w, self.desktop.DEFAULT_FONT_BOLD, 9)
                                                 for w in header.split()))
 
@@ -735,7 +736,7 @@ class PayrollIntegrationTests(unittest.TestCase):
             items = payroll_ui.selected_reports(other_window, self.desktop)
             first = next(r for r in items if r["employee"] == "Management Test")
             second = next(r for r in items if r["employee"] == "Other")
-            self.assertEqual((first["norm"], first["above_norm"], first["total"]), (2, 2, 500))
+            self.assertEqual((first["norm"], first["above_norm"], first["total"]), (2, 2, 480))
             self.assertEqual((second["norm"], second["above_norm"], second["total"]), (176, 0, 100))
             self.assertEqual(payroll_ui.summary_total(items)["above_norm"], 2)
             pdf = BytesIO()
@@ -797,6 +798,64 @@ class PayrollIntegrationTests(unittest.TestCase):
             self.assertIn("Не удалось сохранить", critical.call_args.args[2])
             self.assertFalse(path.exists())
 
+    def test_automatic_payroll_table_pdf_and_details_agree_without_writes(self):
+        conn = self.seed_management_shift()
+        conn.execute("""INSERT INTO shifts(sync_id,date,employee,company,object_name,hours,entry_type,start_time,end_time)
+            VALUES('ordinary','2026-10-21','Management Test','Renatur','Other site',8,'work','07:00','16:00'),
+                  ('saturday','2026-10-24','Management Test','Renatur','Site',4,'ob','08:00','12:00'),
+                  ('private','2026-10-25','Management Test','Privat','Site',4,'ob','08:00','12:00')""")
+        conn.commit()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        window.load_salary_table_template()
+        report = payroll_ui.selected_reports(window, self.desktop)[0]
+        self.assertEqual(report["worked"], 20)
+        self.assertEqual(report["categories"]["day"], 12)
+        self.assertEqual(report["overtime"], dict(ot_a=1, ot_b=2, ot_c=1, ot_d=0))
+        self.assertEqual((report["premium"], report["total"]), (480, 2480))
+        self.assertEqual(window.table_salary.item(0, 11).text(), "1")
+        pdf = BytesIO()
+        payroll_ui.write_pdf(pdf, [report], self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)
+        text = "\n".join(page.extract_text() for page in PdfReader(pdf).pages)
+        self.assertIn("2,480.00", text)
+        self.assertIn("Övertid A", text)
+        self.assertIn("Övertid D", text)
+        from PyQt6.QtWidgets import QDialog, QTableWidget
+        def inspect(dialog):
+            table = dialog.findChild(QTableWidget)
+            self.assertEqual(table.columnCount(), 8)
+            labels = [table.item(r, 4).text() for r in range(table.rowCount())]
+            self.assertIn("Övertid B +50%", labels)
+            return 0
+        with patch.object(QDialog, "exec", inspect):
+            payroll_ui.show_auto_details(window, self.desktop)
+        self.assertEqual(list(conn.iterdump()), before)
+
+    def test_auto_schedule_editor_persists_employee_and_effective_date_only(self):
+        conn = self.seed_management_shift()
+        before = list(conn.iterdump())
+        window = self.salary_window(management_mode=True)
+        from PyQt6.QtWidgets import QComboBox, QDialog, QTimeEdit, QPushButton
+        from PyQt6.QtCore import QTime
+        def edit(dialog):
+            employee = dialog.findChild(QComboBox, "payrollAutoEmployee")
+            employee.setCurrentIndex(employee.findData("Management Test"))
+            dialog.findChild(QTimeEdit, "payrollAuto_start").setTime(QTime(8, 0))
+            dialog.findChild(QTimeEdit, "payrollAuto_end").setTime(QTime(17, 0))
+            next(b for b in dialog.findChildren(QPushButton) if b.text() == "Сохранить график").click()
+            return 0
+        with patch.object(QDialog, "exec", edit), patch.object(payroll_ui.QMessageBox, "critical") as critical:
+            payroll_ui.edit_auto_schedule(window, self.desktop)
+        critical.assert_not_called()
+        settings = payroll_ui.read_auto_settings(self.desktop)
+        self.assertEqual(len(settings["schedules"]), 1)
+        self.assertEqual(settings["schedules"][0]["employee"], "Management Test")
+        self.assertEqual(settings["schedules"][0]["effective_from"], "2026-10-01")
+        import payroll_auto
+        self.assertEqual(payroll_auto.schedule_for(settings, "Management Test", "2026-09-30")["start"], "07:00")
+        self.assertEqual(payroll_auto.schedule_for(settings, "Management Test", "2026-10-01")["start"], "08:00")
+        self.assertEqual(list(conn.iterdump()), before)
+
     def test_unknown_ob_details_follow_employee_period_and_show_existing_interval_mismatch(self):
         conn = self.seed_management_shift()
         conn.execute("UPDATE shifts SET hours=3")
@@ -807,7 +866,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         window = self.salary_window(management_mode=True)
         window.load_salary_table_template()
         self.assertEqual(sum(r["hours"] for r in payroll_ui.unknown_ob_rows(
-            payroll_ui.selected_reports(window, self.desktop))), 11)
+            payroll_ui.selected_reports(window, self.desktop))), 3)
         window.sal_employee_filter.setCurrentIndex(window.sal_employee_filter.findData("Management Test"))
         rows = payroll_ui.unknown_ob_rows(payroll_ui.selected_reports(window, self.desktop))
         self.assertEqual(len(rows), 1)

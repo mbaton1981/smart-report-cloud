@@ -4464,6 +4464,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         card_layout.addLayout(payroll_actions)
         desktop_theme.adapt_box_layout(card, payroll_actions, compact_width=1080)
         reference_actions = QHBoxLayout()
+        self.sal_auto_schedule_btn = QPushButton("График и авторазбор…")
+        self.sal_auto_schedule_btn.clicked.connect(lambda: payroll_ui.edit_auto_schedule(self, sys.modules[__name__]))
+        self.sal_auto_details_btn = QPushButton("Как распределились часы…")
+        self.sal_auto_details_btn.clicked.connect(lambda: payroll_ui.show_auto_details(self, sys.modules[__name__]))
+        reference_actions.addWidget(self.sal_auto_schedule_btn)
+        reference_actions.addWidget(self.sal_auto_details_btn)
         self.sal_ob_reference_btn = QPushButton("Сверхурочные · Övertid")
         self.sal_ob_reference_btn.setObjectName("secondaryAction")
         self.sal_ob_reference_btn.setToolTip(

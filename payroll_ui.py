@@ -8,9 +8,9 @@ import tempfile
 import uuid
 from xml.sax.saxutils import escape
 
-from PyQt6.QtCore import QIODevice, QSaveFile, Qt
+from PyQt6.QtCore import QDate, QIODevice, QSaveFile, Qt, QTime
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QCheckBox, QComboBox, QDateEdit, QTimeEdit, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
     QAbstractItemView, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
     QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
 )
@@ -23,6 +23,7 @@ from reportlab.platypus.doctemplate import LayoutError
 
 import payroll_history as history
 import payroll_management as management
+import payroll_auto as automatic
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +34,156 @@ HISTORY_HEADERS = [
     "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)", "Semestertimmar\ntim", "Röda dagar\ntim",
 ]
 MANAGEMENT_HEADERS = [
-    "ФИО", "Ставка,\nSEK/ч", "Всего,\nч", "Без OB,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
+    "ФИО", "Ставка,\nSEK/ч", "Всего,\nч", "Обычные,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
     "OB3 ночь\n+70%, ч", "OB3 Helg\n+70%, ч", "OB\nне определён,\nч", "Зарплата,\nSEK",
     "Сверх нормы,\nч",
+    "Övertid A\n+30%, ч", "Övertid B\n+50%, ч", "Övertid C\n+70%, ч", "Övertid D\n+100%, ч",
     "ATF,\nч", "Болезнь,\nч", "Отпуск,\nч", "Праздн.,\nч",
 ]
 
 ABSENCE_KEYS = ("atf", "sick", "vacation", "holiday")
+ABSENCE_START = 15
+
+
+def auto_settings_path(app):
+    return app.desktop_auth.app_data_dir() / "payroll-auto-schedules.json"
+
+
+def read_auto_settings(app):
+    path = auto_settings_path(app)
+    return automatic.validate_settings(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else dict(version=1, schedules=[])
+
+
+def edit_auto_schedule(window, app):
+    try:
+        settings = read_auto_settings(app)
+        items = selected_reports(window, app)
+        dialog = QDialog(window)
+        dialog.setObjectName("payrollAutoScheduleDialog")
+        dialog.setWindowTitle("График для автоматического расчёта зарплаты")
+        layout = QVBoxLayout(dialog)
+        note = QLabel("Обычный график по умолчанию: Пн–Пт 07:00–16:00, перерыв 12:00–13:00. "
+                      "По выходным и праздникам — OB. Privat — обычные часы без доплат. "
+                      "График используется только для предварительного расчёта в этой программе.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        layout.addLayout(form)
+        employee = QComboBox()
+        employee.setObjectName("payrollAutoEmployee")
+        employee.addItem("Общий график", None)
+        for name in sorted({r["employee"] for r in items}):
+            employee.addItem(name, name)
+        effective = QDateEdit(QDate.fromString(window.sal_date_from.text(), "yyyy-MM-dd"))
+        effective.setDisplayFormat("yyyy-MM-dd")
+        effective.setCalendarPopup(True)
+        form.addRow("Для кого", employee)
+        form.addRow("Действует с даты", effective)
+        controls = {}
+        for key, label in (("start", "Начало"), ("end", "Окончание"),
+                           ("break_start", "Перерыв с"), ("break_end", "Перерыв до")):
+            control = QTimeEdit()
+            control.setDisplayFormat("HH:mm")
+            control.setObjectName("payrollAuto_"+key)
+            form.addRow(label, control)
+            controls[key] = control
+        break_enabled = QCheckBox("Неоплачиваемый перерыв")
+        form.addRow(break_enabled)
+        day_controls = []
+        day_row = QHBoxLayout()
+        for label in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"):
+            check = QCheckBox(label)
+            day_controls.append(check)
+            day_row.addWidget(check)
+        layout.addLayout(day_row)
+        def load():
+            schedule = automatic.schedule_for(settings, employee.currentData(), effective.date().toString("yyyy-MM-dd"))
+            for key in ("start", "end"):
+                controls[key].setTime(QTime.fromString(schedule[key], "HH:mm"))
+            gap = schedule["breaks"][0] if schedule["breaks"] else dict(start="12:00", end="13:00")
+            controls["break_start"].setTime(QTime.fromString(gap["start"], "HH:mm"))
+            controls["break_end"].setTime(QTime.fromString(gap["end"], "HH:mm"))
+            break_enabled.setChecked(bool(schedule["breaks"]))
+            for index, check in enumerate(day_controls):
+                check.setChecked(index in schedule["days"])
+        employee.currentIndexChanged.connect(load)
+        effective.dateChanged.connect(load)
+        load()
+        actions = QHBoxLayout()
+        layout.addLayout(actions)
+        def save():
+            try:
+                day = effective.date().toString("yyyy-MM-dd")
+                schedule = automatic.validate_schedule(dict(
+                    days=[i for i, check in enumerate(day_controls) if check.isChecked()],
+                    start=controls["start"].time().toString("HH:mm"),
+                    end=controls["end"].time().toString("HH:mm"),
+                    breaks=[dict(start=controls["break_start"].time().toString("HH:mm"),
+                                 end=controls["break_end"].time().toString("HH:mm"))] if break_enabled.isChecked() else []))
+                # Re-read at save time so another local edit is not discarded.
+                current = read_auto_settings(app)
+                current["schedules"] = [e for e in current["schedules"]
+                    if (e["employee"], e["effective_from"]) != (employee.currentData(), day)]
+                current["schedules"].append(dict(employee=employee.currentData(), effective_from=day, schedule=schedule))
+                data = json.dumps(automatic.validate_settings(current), ensure_ascii=False, indent=2).encode("utf-8")
+                output = QSaveFile(str(auto_settings_path(app)))
+                if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                    raise OSError(output.errorString())
+                if output.write(data) != len(data):
+                    output.cancelWriting()
+                    raise OSError(output.errorString())
+                if not output.commit():
+                    raise OSError(output.errorString())
+                dialog.accept()
+                window.load_salary_table_template()
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                QMessageBox.critical(dialog, "График", str(error))
+        for label, action in (("Сохранить график", save), ("Отмена", dialog.reject)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, action=action: action())
+            actions.addWidget(button)
+        dialog.exec()
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+        QMessageBox.critical(window, "График", str(error))
+
+
+def show_auto_details(window, app):
+    try:
+        items = selected_reports(window, app)
+        dialog = QDialog(window)
+        dialog.setWindowTitle("Как распределились часы — OB и Övertid")
+        dialog.resize(1150, 700)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels(["Сотрудник", "Дата", "Объект", "Интервал", "Категория", "Часы", "Доплата, SEK", "Основание"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for report in items:
+            for line in report["lines"]:
+                for segment in line["segments"]:
+                    category = segment["category"]
+                    premium = (segment["hours"]*report["rate"]*automatic.PREMIUM.get(category, 0)
+                               if report["rate"] is not None and category != "unknown" else None)
+                    values = [report["employee"], segment["date"], line["company"]+" · "+line["object_name"],
+                              f"{segment.get('start_time') or '—'}–{segment.get('end_time') or '—'}",
+                              automatic.LABELS.get(category, category), f"{segment['hours']:g}",
+                              summary_money(premium), line.get("explanation", "")+"\n"+"\n".join(line["warnings"])]
+                    row = table.rowCount()
+                    table.insertRow(row)
+                    for column, value in enumerate(values):
+                        cell = QTableWidgetItem(value)
+                        cell.setToolTip(value)
+                        table.setItem(row, column, cell)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(2, 230)
+        table.setColumnWidth(7, 350)
+        table.resizeRowsToContents()
+        layout.addWidget(table)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+        QMessageBox.critical(window, "Разбор часов", str(error))
 
 
 def employee_filter(window, items):
@@ -76,6 +220,7 @@ def summary_values(report):
             *[f"{report['categories'][key]:g}" for key in management.CATEGORIES],
             summary_money(report["total"]),
             f"{report['above_norm']:g}",
+            *[f"{report.get('overtime', {}).get(key, 0):g}" for key in automatic.OVERTIME],
             *[f"{report['absence'][key]:g}" for key in ABSENCE_KEYS]]
 
 
@@ -87,6 +232,7 @@ def summary_total(items):
     return dict(employee="ИТОГО", worked=sum(r["worked"] for r in items),
                 above_norm=sum(r["above_norm"] for r in items),
                 categories={k: sum(r["categories"][k] for r in items) for k in management.CATEGORIES},
+                overtime={k: sum(r.get("overtime", {}).get(k, 0) for r in items) for k in automatic.OVERTIME},
                 total=None if any(r["total"] is None for r in items) else history.money(sum(r["total"] for r in items)),
                 absence={k: sum(r["absence"][k] for r in items) for k in ABSENCE_KEYS})
 
@@ -257,7 +403,7 @@ def selected_reports(window, app):
     try:
         refresh_employees(window, conn.cursor())
         items = management.reports(conn.cursor(), window.sal_date_from.text(), window.sal_date_to.text(),
-                                   app.swedish_public_holidays, app.swedish_workday_norm)
+                                   app.swedish_public_holidays, app.swedish_workday_norm, read_auto_settings(app))
         norms = read_norms(app)
         for report in items:
             key = norm_key(report["employee"], report["date_from"], report["date_to"])
@@ -276,9 +422,12 @@ def management_number(value):
 
 def management_description(report):
     return (f"{management.NOTICE}. Ориентировочно, не ведомость: официальное начисление — в Fortnox. "
-            "Всего = без OB + OB1 + OB2 + OB3 ночь + OB3 Helg + OB не определён. "
+            "Всего = обычные часы + OB + Övertid + не определённые часы. "
             "OB входит в отработанные часы; к базе прибавляется только надбавка. "
             "Helg: суббота, воскресенье и официальные праздники Швеции (без канунов). "
+            "Övertid: дополнительные интервалы в будни при отработанном обычном дне по графику. "
+            "OB и Övertid за один час не складываются. Privat — без обеих доплат. "
+            "Расчёт по предоставленной памятке; актуальность соглашения отдельно не проверена. "
             "Сверх нормы — только сравнение с нормой 8 ч/будний день; это не подтверждённые сверхурочные. "
             "ATF и отсутствие не включены в отработанные часы или ориентировочную сумму. "
             "Ставки/период подтверждать и выплату отмечать для экспорта не нужно. «Баланс» не меняется." +
@@ -310,14 +459,15 @@ def render_management(window, app):
                 table.setItem(index, column, item)
         for column in range(table.columnCount()):
             table.setColumnWidth(column, 150 if column == 0 else 125)
-            table.setColumnHidden(column, column >= 11 and not any(r["absence"][ABSENCE_KEYS[column-11]] for r in items))
+            table.setColumnHidden(column, column >= ABSENCE_START and not any(r["absence"][ABSENCE_KEYS[column-ABSENCE_START]] for r in items))
         table.resizeRowsToContents()
     finally:
         table.blockSignals(False)
     window.sal_summary_hours_lbl.setText(f"Всего отработано: {sum(r['worked'] for r in items):g} ч")
     window.sal_summary_ob_lbl.setText("OB1 / OB2 / OB3: " + " / ".join(
         f"{sum(r['categories'][k] for r in items):g}" for k in ("ob1", "ob2")) +
-        f" / {sum(r['categories']['ob3']+r['categories']['helg'] for r in items):g} ч (часть итога)")
+        f" / {sum(r['categories']['ob3']+r['categories']['helg'] for r in items):g} ч (часть итога)" +
+        f" · Övertid: {sum(sum(r.get('overtime', {}).values()) for r in items):g} ч")
     window.sal_summary_vacation_lbl.setText(f"Отпуск: {sum(r['absence']['vacation'] for r in items):g} ч")
     known = sum(r["total"] for r in items if r["total"] is not None)
     incomplete = any(r["total"] is None for r in items)
@@ -328,7 +478,7 @@ def render_management(window, app):
     window.sal_summary_employer_lbl.setText("Официальное начисление: Fortnox")
     notes = [f"{r['employee']}: {estimate_note(r)}" for r in items if r["categories"]["unknown"]]
     window.payroll_history_note.setText(
-        management.NOTICE + ". " + "; ".join(notes))
+        management.NOTICE + ". Авторазбор OB и Övertid по графику. Privat — без доплат. " + "; ".join(notes))
     norm_label = getattr(window, "sal_norm_label", None)
     if norm_label is not None:
         standard = app.swedish_workday_norm(window.sal_date_from.text(), window.sal_date_to.text())
@@ -412,6 +562,9 @@ def status(report):
 
 
 def render(window, app):
+    for name in ("sal_auto_schedule_btn", "sal_auto_details_btn"):
+        if getattr(window, name, None) is not None:
+            getattr(window, name).setEnabled(management_mode(window))
     if getattr(window, "sal_norm_label", None) is not None:
         window.sal_norm_label.setVisible(management_mode(window))
         window.sal_norm_button.setVisible(management_mode(window))
@@ -791,17 +944,21 @@ def write_management_pdf(path, items, font, bold):
     style = ParagraphStyle("management", fontName=font, fontSize=9, leading=11,
                            splitLongWords=False)
     header_style = ParagraphStyle("management-header", parent=style, fontName=bold)
-    heading = ParagraphStyle("management-heading", parent=style, fontName=bold, fontSize=13, leading=16)
+    heading = ParagraphStyle("management-heading", parent=style, fontName=bold, fontSize=13, leading=16, keepWithNext=True)
     def p(text):
         return Paragraph(escape(str(text)), style)
     report = items[0]
-    columns = [*range(11), *[11+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
-    rows = [[Paragraph(escape(MANAGEMENT_HEADERS[i]).replace("\n", "<br/>"), header_style) for i in columns]]
-    rows.extend([p(summary_values(r)[i]) for i in columns] for r in [*items, summary_total(items)])
+    has_overtime = any(sum(r.get("overtime", {}).values()) for r in items)
+    columns = [*range(11), *([-1] if has_overtime else []),
+               *[ABSENCE_START+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
+    headers = ["Övertid,\nч" if i == -1 else MANAGEMENT_HEADERS[i] for i in columns]
+    rows = [[Paragraph(escape(header).replace("\n", "<br/>"), header_style) for header in headers]]
+    rows.extend([p(f"{sum(r.get('overtime', {}).values()):g}" if i == -1 else summary_values(r)[i])
+                 for i in columns] for r in [*items, summary_total(items)])
     width = A4[1]-60
     widths = [max(120 if i == 0 else 60 if i == 1 else 80 if i == 9 else 0,
-                  max(stringWidth(word, bold, 9) for word in MANAGEMENT_HEADERS[i].split())+8)
-              for i in columns]
+                  max(stringWidth(word, bold, 9) for word in header.split())+8)
+              for i, header in zip(columns, headers)]
     extra = (width-sum(widths))/len(columns)
     widths = [value+extra for value in widths]
     table = LongTable(rows, colWidths=widths, repeatRows=1)
@@ -818,7 +975,20 @@ def write_management_pdf(path, items, font, bold):
     story = [Paragraph("Зарплата за период — сводка", heading),
              p(f"{report['date_from']} — {report['date_to']}"), p(management.NOTICE),
              p(norm_description(report) + ". Сверх нормы — справочно, без доплаты."),
-             Spacer(1, 10), table, Spacer(1, 8), p("OB входит в отработанные часы. Официальное начисление — Fortnox.")]
+             Spacer(1, 10), table, Spacer(1, 8), p("OB и Övertid входят в отработанные часы и не складываются за один час. "
+             "Privat — без доплат. Официальное начисление — Fortnox."),
+             p("Övertid в будни — дополнительные интервалы при отработанном обычном дне по графику. "
+               "Расчёт по предоставленной памятке; актуальность соглашения отдельно не проверена.")]
+    if has_overtime:
+        ot_rows = [[p("Сотрудник"), *[p(automatic.LABELS[k]+", ч") for k in automatic.OVERTIME]]]
+        for entry in [*items, summary_total(items)]:
+            ot_rows.append([p(entry["employee"]), *[p(f"{entry.get('overtime', {}).get(k, 0):g}") for k in automatic.OVERTIME]])
+        ot_table = LongTable(ot_rows, colWidths=[width*.36, *[width*.16]*4], repeatRows=1)
+        ot_table.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("GRID", (0,0), (-1,-1), .3, colors.lightgrey),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e8edf2")),
+            ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+        story.extend([Spacer(1, 10), Paragraph("Сверхурочные — часть общего времени", heading), ot_table])
     warnings = []
     if any(r["categories"]["unknown"] for r in items):
         hours = sum(r["categories"]["unknown"] for r in items)
