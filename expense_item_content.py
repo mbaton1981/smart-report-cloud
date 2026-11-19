@@ -14,6 +14,22 @@ def single_allocation_content(pages, document):
         raise ValueError("Номер оригинала не совпадает с фактурой.")
     if fields.get("currency_code") not in (None, "", "UNKNOWN", document.get("currency_code")):
         raise ValueError("Валюта оригинала не совпадает с фактурой.")
+    # Rental invoices use numbered product blocks rather than a description table.
+    # Keep the rental period as evidence; never infer rental from the supplier name.
+    rental_lines = []
+    for page in pages:
+        active = False
+        for line in str(page.get("text") or "").splitlines():
+            line = line.strip()
+            if re.match(r"\d+\s+(?:PRODNR|ARTNR)\s+\d+\s+", line, re.I):
+                active = True
+                rental_lines.append(line)
+            elif active and re.match(r"(?:UTH\.DAT|DATUM)\s+\d+", line, re.I):
+                rental_lines.append(line)
+            elif re.match(r"Summa\s+orderrader|SUMMA\s+EXKL", line, re.I):
+                active = False
+    if any(re.search(r"UTH\.DAT\s+\d+\s+PERIOD", line, re.I) for line in rental_lines):
+        return "\n".join(rental_lines)
     lines = []
     for page in pages:
         active = current_item = False

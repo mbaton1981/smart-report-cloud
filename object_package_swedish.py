@@ -143,6 +143,7 @@ _LABELS = {
     "Материалы": "Material",
     "Материалы и закупки": "Material och inköp",
     "Работы подрядчиков": "Underentreprenörers arbete",
+    "Аренда оборудования": "Hyra av maskiner och utrustning",
     "Работа и материалы подрядчика, без разбивки": (
         "Underentreprenör – arbete och material, ej specificerat"
     ),

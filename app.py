@@ -10412,6 +10412,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     "evidence": evidence,
                     "evidence_item": table.item(row, 5),
                     "content_item": table.item(row, 3),
+                    "amount_item": table.item(row, 2),
                     "status_item": table.item(row, 7),
                 })
 
@@ -10523,7 +10524,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             find_categories_button.setEnabled(False)
             try:
                 from PyQt6.QtWidgets import QProgressDialog
-                from expense_category_automation import propose_document_categories
+                from expense_category_automation import propose_document_categories, category_review_amounts
                 import tempfile
                 pending_documents = {row["document"].get("server_document_id") or row["document"]["id"]: row["document"]
                                      for row in review_rows if row["category_combo"].currentData() == CATEGORY_UNCLASSIFIED}
@@ -10533,6 +10534,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
                 def propose():
                     results = {}
+                    amounts = {}
                     for document_id, document in pending_documents.items():
                         try:
                             details = request_expense_api("GET", f"/api/expense-documents/{document_id}")["document"]
@@ -10545,11 +10547,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                                     key = expense_document_key(details)
                                     if not errors.get(key):
                                         proposals = propose_document_categories(details, catalog, paths.get(key, []))
+                                    amounts[document_id] = category_review_amounts(
+                                        details, catalog, paths.get(key, []), errors.get(key))
                             results[document_id] = proposals
                         except Exception as error:
                             results[document_id] = str(error)
                     self.incoming_category_suggestions(results)
-                    return results
+                    return results, amounts
 
                 loop = QEventLoop()
                 outcome = []
@@ -10562,15 +10566,22 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 QThreadPool.globalInstance().start(task)
                 loop.exec()
                 progress.close()
-                results, error = outcome[0]
+                payload, error = outcome[0]
                 if error:
                     raise RuntimeError(error)
+                results, amounts = payload
                 for row in review_rows:
                     combo = row["category_combo"]
                     document = row["document"]
                     if combo.currentData() != CATEGORY_UNCLASSIFIED:
                         continue
                     document_id = document.get("server_document_id") or document["id"]
+                    amount = amounts.get(document_id, {}).get(row["allocation_index"])
+                    if amount:
+                        net = parse_decimal(amount.get("net_amount"))
+                        currency = amount.get("currency_code") or "UNKNOWN"
+                        row["amount_item"].setText(f"{net:,.2f} {currency}" if net is not None else "Неизвестно")
+                        row["amount_item"].setToolTip(amount.get("explanation") or "")
                     proposals = results.get(document_id)
                     if isinstance(proposals, str):
                         row["status_item"].setText(proposals)

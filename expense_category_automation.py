@@ -7,6 +7,26 @@ from expense_categories import CATEGORY_UNCLASSIFIED, confirmed_expense_category
 from expense_item_content import single_allocation_content
 
 
+def category_review_amounts(document, objects, paths=(), errors=None):
+    """Return display-only amounts using the same recovery as object reports."""
+    from object_package_report import collect_object_expenses, expense_document_key, _recover_report_share_tax
+    result = {}
+    for obj in objects:
+        expenses, _ = collect_object_expenses([document], obj["id"], None, None)
+        if not expenses:
+            continue
+        key = expense_document_key(document)
+        _recover_report_share_tax({"object": obj, "expenses": expenses}, {key: list(paths)}, {key: errors} if errors else {})
+        for item in expenses:
+            for share, index in zip(item.get("object_allocations") or [], item.get("object_allocation_indexes") or []):
+                result[index] = {"net_amount": share.get("net_amount"),
+                                 "currency_code": document.get("currency_code"),
+                                 "explanation": item.get("net_recovery_error") or (
+                                     "Проверено по оригиналу; сохранённая доля не изменена."
+                                     if share.get("net_recovered_from_original") else "")}
+    return result
+
+
 def propose_document_categories(document, objects, paths=()):
     allocations = document.get("allocations") or []
     result = {}

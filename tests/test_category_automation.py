@@ -7,7 +7,7 @@ from unittest.mock import patch
 import test_catalog_sync as catalog_tests
 from test_allocation_proposal import fixture, OBJECTS
 from document_costs import propose_object_allocations
-from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED
+from expense_categories import CATEGORY_EQUIPMENT_RENTAL, CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED
 
 
 class CategoryAutomationTests(unittest.TestCase):
@@ -43,8 +43,8 @@ class CategoryAutomationTests(unittest.TestCase):
             connection.commit()
             objects = [dict(row) for row in connection.execute("SELECT * FROM meta_objects WHERE markning IN ('AUTO1','AUTO2') ORDER BY id")]
         documents = []
-        for index, (obj, text) in enumerate(zip((objects[0], objects[1], objects[0]),
-                                               ("GIPSSKIVA 13X900X2500", "Byggtjänster 8 tim", "Unknown item"))):
+        for index, (obj, text) in enumerate(zip((objects[0], objects[1], objects[0], objects[1]),
+                                               ("GIPSSKIVA 13X900X2500", "Byggtjänster 8 tim", "Unknown item", "Hyra av maskin"))):
             payload = {"client_id": uuid.uuid4().hex, "supplier_name": "Same supplier", "invoice_number": f"AUTO-{index}",
                        "document_date": "2026-11-01", "currency_code": "SEK", "verification_status": "confirmed",
                        "net_amount": "100.00", "vat_amount": "25.00", "gross_amount": "125.00",
@@ -68,8 +68,8 @@ class CategoryAutomationTests(unittest.TestCase):
         def inspect(dialog):
             self.qt_app.processEvents()
             table = dialog.findChild(self.desktop.QTableWidget)
-            self.assertEqual(table.rowCount(), 3)
-            for index, category in enumerate((CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED)):
+            self.assertEqual(table.rowCount(), 4)
+            for index, category in enumerate((CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, CATEGORY_EQUIPMENT_RENTAL)):
                 row = next(row for row in range(table.rowCount()) if f"AUTO-{index}" in table.item(row, 1).text())
                 self.assertEqual(table.cellWidget(row, 4).currentData(), category)
                 self.assertEqual(table.item(row, 0).checkState(), self.desktop.Qt.CheckState.Unchecked
@@ -90,7 +90,7 @@ class CategoryAutomationTests(unittest.TestCase):
                 patch.object(self.desktop, "request_expense_api", side_effect=api), \
                 patch.object(self.desktop.QDialog, "exec", new=inspect):
             window.open_expense_category_review(all_objects=True, automatic=True)
-        for document, category in zip(documents, (CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED)):
+        for document, category in zip(documents, (CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, CATEGORY_EQUIPMENT_RENTAL)):
             current = api("GET", f"/api/expense-documents/{document['id']}")["document"]
             self.assertEqual(current["allocations"][0]["expense_category"], category)
             for key in ("net_amount", "vat_amount", "gross_amount", "rounding_amount", "object_id", "allocation_id"):

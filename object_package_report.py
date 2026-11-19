@@ -30,7 +30,7 @@ from expense_documents import (
     DocumentExtractionError, extract_local_document, object_marking_matches, parse_decimal,
 )
 from expense_categories import (
-    CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
+    CATEGORY_EQUIPMENT_RENTAL, CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
     CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, confirmed_expense_category,
 )
 from object_package_swedish import swedish_category, swedish_document_type, swedish_label
@@ -1000,6 +1000,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
 
     total_summary = _object_total_summary(data, figures)
     category_specs = (
+        (CATEGORY_EQUIPMENT_RENTAL, "Аренда оборудования · без НДС", "Hyra av maskiner och utrustning · exkl. moms", "#f3f5f4"),
         (CATEGORY_MATERIALS, "Материалы и закупки · без НДС", "Material och inköp · exkl. moms", "#f7f2e7"),
         (CATEGORY_SUBCONTRACTOR_WORK, "Работы подрядчиков · без НДС", "Underentreprenörers arbete · exkl. moms", "#edf3f8"),
         (CATEGORY_SUBCONTRACTOR_MIXED, "Работа и материалы подрядчика, без разбивки · без НДС",

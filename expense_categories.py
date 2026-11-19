@@ -6,17 +6,20 @@ CATEGORY_MATERIALS = "Материалы и закупки"
 CATEGORY_SUBCONTRACTOR_WORK = "Работы подрядчиков"
 CATEGORY_SUBCONTRACTOR_MIXED = "Работа и материалы подрядчика, без разбивки"
 CATEGORY_OTHER = "Прочие расходы"
+CATEGORY_EQUIPMENT_RENTAL = "Аренда оборудования"
 CATEGORY_UNCLASSIFIED = "Не классифицировано"
 
 EXPENSE_CATEGORIES = (
     CATEGORY_MATERIALS,
     CATEGORY_SUBCONTRACTOR_WORK,
     CATEGORY_SUBCONTRACTOR_MIXED,
+    CATEGORY_EQUIPMENT_RENTAL,
     CATEGORY_OTHER,
     CATEGORY_UNCLASSIFIED,
 )
 
 CATEGORY_LABELS_SV = {
+    CATEGORY_EQUIPMENT_RENTAL: "Hyra av maskiner och utrustning",
     CATEGORY_MATERIALS: "Material och inköp",
     CATEGORY_SUBCONTRACTOR_WORK: "Underentreprenörers arbete",
     CATEGORY_SUBCONTRACTOR_MIXED: "Underentreprenör – arbete och material, ej specificerat",
@@ -33,6 +36,10 @@ def confirmed_expense_category(value, source):
 
 
 _CATEGORY_TERMS = {
+    CATEGORY_EQUIPMENT_RENTAL: re.compile(
+        r"\b(?:maskinhyra|verktygshyra|uthyrning|hyra\s+(?:av\s+)?(?:maskin\w*|verktyg\w*|utrustning))\b|"
+        r"UTH\.DAT\s+\d+\s+PERIOD\s+\d+\s*-\s*\d+", re.IGNORECASE,
+    ),
     CATEGORY_SUBCONTRACTOR_WORK: re.compile(
         r"\b(?:underentreprenör(?:s)?(?:arbete)?|subcontract(?:or)?\s+work|"
         r"arbetskostnad|timarbete|byggtjänst(?:er)?|montering|målning|snickeri|elinstallation|"
@@ -109,6 +116,16 @@ def suggest_expense_category(document, allocation, allocation_count=1):
         candidate for candidate, pattern in _CATEGORY_TERMS.items()
         if pattern.search(content)
     ]
+    rental_blocks = re.split(r"(?m)^\d+\s+(?:PRODNR|ARTNR)\s+\d+\s+", content)[1:]
+    if (CATEGORY_EQUIPMENT_RENTAL in matched and rental_blocks
+            and all(re.search(r"UTH\.DAT\s+\d+\s+PERIOD|Minsta avgift|RENGÖRING MASKIN|VÄSSNING AV MEJSEL", block, re.I)
+                    for block in rental_blocks)):
+        # Material words in rented equipment names (e.g. a concrete blade) are
+        # not purchases. Each block must evidence rental or its incidental fee.
+        matched = [CATEGORY_EQUIPMENT_RENTAL]
+    if CATEGORY_EQUIPMENT_RENTAL in matched and CATEGORY_OTHER in matched:
+        if not re.search(r"\b(?:parkering|administrationsavgift)\b", content, re.IGNORECASE):
+            matched.remove(CATEGORY_OTHER)
     if (CATEGORY_MATERIALS in matched and CATEGORY_OTHER in matched
             and not re.search(r"\b(?:hyra|hyrkostnad|administrationsavgift|serviceavgift|parkering)\b", content, re.IGNORECASE)):
         # Delivery on a goods order is part of the purchase; do not invent a split.
