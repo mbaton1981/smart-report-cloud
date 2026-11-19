@@ -187,7 +187,7 @@ class PayrollPdfPreviewDialog(QDialog):
             painter.end()
 
 
-def open_preview(source, suggested_path, parent):
+def open_preview(source, suggested_path, parent, *, title=None):
     try:
         dialog = PayrollPdfPreviewDialog(source, suggested_path, parent)
     except (ImportError, OSError, ValueError, RuntimeError) as error:
@@ -207,6 +207,8 @@ def open_preview(source, suggested_path, parent):
         logger.info("Salary PDF opened in system viewer; retained temporary file=%s", external)
         return
     try:
+        if title:
+            dialog.setWindowTitle(title)
         dialog.exec()
     finally:
         dialog.release_resources()

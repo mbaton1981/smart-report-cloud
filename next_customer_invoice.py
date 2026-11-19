@@ -215,13 +215,15 @@ def open_next_invoice(host):
 
     def export_pdf():
         selection = selected()
-        path, _filter = QFileDialog.getSaveFileName(dialog, "Предварительный отчёт к счёту", "Следующий-счёт.pdf", "PDF (*.pdf)")
-        if not path:
-            return
         try:
-            write_accountant_report(Path(path), obj, selection, report, cutoff,
-                                    font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD)
-            QMessageBox.information(dialog, "Отчёт сохранён", path)
+            from payroll_preview import open_preview
+            filename = "Следующий-счёт.pdf"
+            with tempfile.TemporaryDirectory(prefix="SmartReport-accountant-preview-") as folder:
+                path = Path(folder) / filename
+                write_accountant_report(path, obj, selection, report, cutoff,
+                                        font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD)
+                open_preview(path, (Path(desktop.REPORTS_DIR) / filename).resolve(), dialog,
+                             title="Предпросмотр документа бухгалтеру")
         except Exception as error:
             QMessageBox.warning(dialog, "PDF не сформирован", str(error))
 

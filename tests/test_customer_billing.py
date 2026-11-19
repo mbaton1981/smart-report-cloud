@@ -189,10 +189,16 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertEqual(table.item(3, 0).checkState(), self.desktop.Qt.CheckState.Checked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
-            with patch.object(self.desktop.QFileDialog, "getSaveFileName", return_value=(str(output), "PDF")), \
+            def preview(source, suggested, parent, **kwargs):
+                self.assertTrue(Path(source).is_file())
+                self.assertEqual(kwargs['title'], 'Предпросмотр документа бухгалтеру')
+                output.write_bytes(Path(source).read_bytes())
+            with patch('payroll_preview.open_preview', side_effect=preview) as viewer, \
+                    patch.object(self.desktop.QFileDialog, "getSaveFileName", side_effect=AssertionError('Preview must not ask to save')), \
                     patch.object(self.desktop.QMessageBox, "information"), \
                     patch.object(self.desktop.QMessageBox, "warning", side_effect=lambda *args: self.fail(args[2])):
                 buttons["Предварительный PDF"].click()
+                viewer.assert_called_once()
             text = " ".join(page.extract_text() for page in PdfReader(output).pages)
             self.assertIn("100,00 SEK", text)
             self.assertIn("250,00 SEK", text)
