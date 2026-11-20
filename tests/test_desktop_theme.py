@@ -165,25 +165,28 @@ class DesktopThemeTests(unittest.TestCase):
 
     def test_section_accent_follows_keyboard_navigation_and_theme(self):
         tabs = QTabWidget()
-        tabs.addTab(QWidget(), "Ввод часов")
-        tabs.addTab(QWidget(), "Зарплата")
-        tabs.addTab(QWidget(), "Баланс")
-        theme.install_section_tabs(tabs, {0: "hours", 1: "salary", 2: "balance"})
+        sections = ("hours", "salary", "balance", "expenses", "reports", "objects", "catalogs", "analytics")
+        for title in sections + ("Other",):
+            tabs.addTab(QWidget(), title)
+        theme.install_section_tabs(tabs, dict(enumerate(sections)))
         bar = tabs.tabBar()
         tabs.show()
         self.application.processEvents()
         bar.setFocus()
-        self.assertIn(theme.SECTION_ACCENTS["hours"]["light"][0], bar.styleSheet())
 
-        QTest.keyClick(bar, Qt.Key.Key_Right)
-        self.assertEqual(tabs.currentIndex(), 1)
-        self.assertIn(theme.SECTION_ACCENTS["salary"]["light"][0], bar.styleSheet())
-        self.assertTrue(self.manager.toggle())
-        self.assertEqual(tabs.currentIndex(), 1)
-        self.assertIn(theme.SECTION_ACCENTS["salary"]["dark"][0], bar.styleSheet())
+        for index, section in enumerate(sections):
+            self.assertEqual(tabs.currentIndex(), index)
+            for palette in ("light", "dark"):
+                if self.manager.name != palette:
+                    self.assertTrue(self.manager.toggle())
+                with self.subTest(section=section, palette=palette):
+                    self.assertEqual(tabs.currentIndex(), index)
+                    surface, ink = theme.SECTION_ACCENTS[section][palette]
+                    self.assertIn(f"background-color: {surface}", bar.styleSheet())
+                    self.assertIn(f"border-bottom-color: {ink}", bar.styleSheet())
+            QTest.keyClick(bar, Qt.Key.Key_Right)
 
-        QTest.keyClick(bar, Qt.Key.Key_Right)
-        self.assertEqual(tabs.currentIndex(), 2)
+        self.assertEqual(tabs.currentIndex(), len(sections))
         self.assertEqual(bar.styleSheet(), "")
         tabs.deleteLater()
 

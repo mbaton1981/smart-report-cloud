@@ -363,17 +363,42 @@ def line_icon(name, stroke, size=18):
 TAB_ICON_COLORS = {"dark": "#9fbbd3", "light": "#4a7398"}
 SECTION_ACCENTS = {
     "hours": {
-        "light": ("#f1e9fa", "#613591", "#c8b4df"),
-        "dark": ("#352844", "#e1c5ff", "#735492"),
+        "light": ("#f1e9fa", "#613591"),
+        "dark": ("#352844", "#e1c5ff"),
     },
     "salary": {
-        "light": ("#e4f4ef", "#145e50", "#a1cfc2"),
-        "dark": ("#203b38", "#a5efdc", "#467a6f"),
+        "light": ("#e4f4ef", "#145e50"),
+        "dark": ("#203b38", "#a5efdc"),
+    },
+    "balance": {
+        "light": ("#e5effb", "#244c7b"),
+        "dark": ("#24364f", "#adcaff"),
     },
     "expenses": {
-        "light": ("#faeee3", "#81401e", "#dcb89f"),
-        "dark": ("#422f29", "#ffd0ae", "#875b45"),
+        "light": ("#faeee3", "#81401e"),
+        "dark": ("#422f29", "#ffd0ae"),
     },
+    "reports": {
+        "light": ("#fae9ef", "#853452"),
+        "dark": ("#472c3a", "#ffc0d4"),
+    },
+    "objects": {
+        "light": ("#ecf1dc", "#495d25"),
+        "dark": ("#333b23", "#d6e8a7"),
+    },
+    "catalogs": {
+        "light": ("#f7efcf", "#6b5018"),
+        "dark": ("#413722", "#f3d58a"),
+    },
+    "analytics": {
+        "light": ("#e0f2f7", "#105c72"),
+        "dark": ("#203b47", "#a5e7f7"),
+    },
+}
+SECTION_PANEL_BORDERS = {
+    "hours": {"light": "#c8b4df", "dark": "#735492"},
+    "salary": {"light": "#a1cfc2", "dark": "#467a6f"},
+    "expenses": {"light": "#dcb89f", "dark": "#875b45"},
 }
 
 
@@ -389,7 +414,7 @@ def install_section_tabs(tabs, names):
         default_stroke = TAB_ICON_COLORS[theme_name]
         selected_stroke = default_stroke
         if active:
-            surface, selected_stroke, _ = active[theme_name]
+            surface, selected_stroke = active[theme_name]
             bar.setStyleSheet(f"""
                 QTabBar::tab:selected {{
                     background-color: {surface}; color: {selected_stroke};
@@ -435,14 +460,15 @@ class SectionHeading(QFrame):
             manager.changed.connect(self._update_icon)
 
     def _update_icon(self, theme):
-        _, ink, _ = SECTION_ACCENTS[self.section][theme]
+        _, ink = SECTION_ACCENTS[self.section][theme]
         self.icon.setPixmap(line_icon(self.section, ink).pixmap(QSize(18, 18)))
 
 
 def section_stylesheet(theme):
     rules = []
-    for section, palettes in SECTION_ACCENTS.items():
-        surface, ink, border = palettes[theme]
+    for section, borders in SECTION_PANEL_BORDERS.items():
+        surface, ink = SECTION_ACCENTS[section][theme]
+        border = borders[theme]
         heading = f'QFrame#smartreportSectionHeading[smartreportSection="{section}"]'
         rules.append(f"""
             {heading}, QFrame#card[smartreportSection="{section}"] {{
