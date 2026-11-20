@@ -10,7 +10,7 @@ from xml.sax.saxutils import escape
 
 from PyQt6.QtCore import QDate, QIODevice, QSaveFile, Qt, QTime
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QTimeEdit, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QCheckBox, QComboBox, QTimeEdit, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
     QAbstractItemView, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
     QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
 )
@@ -24,6 +24,7 @@ from reportlab.platypus.doctemplate import LayoutError
 import payroll_history as history
 import payroll_management as management
 import payroll_auto as automatic
+from date_widgets import CalendarDateEdit
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,8 @@ def edit_auto_schedule(window, app):
         employee.addItem("Общий график", None)
         for name in sorted({r["employee"] for r in items}):
             employee.addItem(name, name)
-        effective = QDateEdit(QDate.fromString(window.sal_date_from.text(), "yyyy-MM-dd"))
+        effective = CalendarDateEdit(QDate.fromString(window.sal_date_from.text(), "yyyy-MM-dd"))
         effective.setDisplayFormat("yyyy-MM-dd")
-        effective.setCalendarPopup(True)
         form.addRow("Для кого", employee)
         form.addRow("Действует с даты", effective)
         controls = {}

@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PyQt6.QtCore import QDate, QPoint, Qt
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QTableView, QWidget
+    from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QTableView, QToolButton, QWidget
 except ImportError:  # pragma: no cover
     QApplication = None
 
@@ -117,6 +117,32 @@ class CalendarDateEditTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(calendar.isVisible())
         self.assertEqual(calendar.selectedDate(), QDate(2026, 8, 1))
+
+    def test_week_column_is_not_selectable_at_october_november_boundary(self):
+        self.field.setDate(QDate(2026, 11, 19))
+        calendar = self.open_calendar()
+        view = calendar.findChild(QTableView, "qt_calendar_calendarview")
+        model = view.model()
+        week = model.index(1, 0)
+        october_day = model.index(1, 1)
+        self.assertEqual(week.data(), 44)
+        self.assertEqual(october_day.data(), 26)
+        self.assertEqual(model.index(1, 7).data(), 1)
+
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=view.visualRect(week).center())
+        self.assertTrue(calendar.isVisible())
+        self.assertEqual(self.field.date(), QDate(2026, 11, 19))
+
+        previous_month = calendar.findChild(QToolButton, "qt_calendar_prevmonth")
+        QTest.mouseClick(previous_month, Qt.MouseButton.LeftButton)
+        self.assertEqual(calendar.monthShown(), 10)
+        self.assertEqual(self.field.date(), QDate(2026, 11, 19))
+        next_month = calendar.findChild(QToolButton, "qt_calendar_nextmonth")
+        QTest.mouseClick(next_month, Qt.MouseButton.LeftButton)
+        self.assertEqual(calendar.monthShown(), 11)
+
+        QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=view.visualRect(october_day).center())
+        self.assertEqual(self.field.date(), QDate(2026, 10, 26))
 
 
 if __name__ == "__main__":

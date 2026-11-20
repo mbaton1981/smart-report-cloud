@@ -278,7 +278,13 @@ def line_icon(name, stroke, size=18):
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
     line = lambda *points: painter.drawLine(QPointF(*points[:2]), QPointF(*points[2:]))
-    if name == "hours":
+    if name == "chevron-left":
+        line(15, 5, 8, 12)
+        line(8, 12, 15, 19)
+    elif name == "chevron-right":
+        line(9, 5, 16, 12)
+        line(16, 12, 9, 19)
+    elif name == "hours":
         painter.drawEllipse(QPointF(12, 12), 8.5, 8.5)
         line(12, 7.5, 12, 12)
         line(12, 12, 15.5, 14)

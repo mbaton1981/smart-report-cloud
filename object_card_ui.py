@@ -9,13 +9,14 @@ from zoneinfo import ZoneInfo
 from PyQt6.QtCore import QDate, Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTextEdit,
     QInputDialog, QVBoxLayout, QWidget, QHeaderView,
 )
 
 import info_mail
+from date_widgets import CalendarDateEdit
 from object_records import (
     DOCUMENT_CATEGORIES, OFFER_STATUSES, ObjectRecordError, ObjectRecordStore,
 )
@@ -84,8 +85,7 @@ class AddAgreementDialog(QDialog):
         self.setWindowTitle("Новая договорённость")
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self.agreement_date = QDateEdit(QDate.currentDate())
-        self.agreement_date.setCalendarPopup(True)
+        self.agreement_date = CalendarDateEdit(QDate.currentDate())
         self.agreement_date.setDisplayFormat("yyyy-MM-dd")
         self.text = QTextEdit()
         self.text.setPlaceholderText("Коротко опишите договорённость…")
