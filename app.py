@@ -2838,7 +2838,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.tabs.insertTab(index, scroll_area, title)
         self.tabs.blockSignals(blocked)
         self.tabs.setCurrentIndex(current_tab)
-        desktop_theme.install_tab_icons(self.tabs, dict(enumerate(
+        desktop_theme.install_section_tabs(self.tabs, dict(enumerate(
             ("hours", "salary", "balance", "expenses", "reports", "objects", "catalogs", "analytics")
         )))
 
@@ -2944,7 +2944,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         form_actions = QHBoxLayout()
         form_actions.addWidget(save_btn, 1)
         form_actions.addWidget(cancel_shift_btn)
-        card_layout.addRow(form_actions)
 
         # Форма ручного ввода целиком живёт в отдельном окне «Добавить смену»;
         # отмена ничего не записывает, значения сохраняются до следующего открытия.
@@ -2952,17 +2951,19 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.shift_form_dialog.setWindowTitle("Добавить смену")
         self.shift_form_dialog.setMinimumSize(620, 560)
         dialog_layout = QVBoxLayout(self.shift_form_dialog)
+        dialog_layout.addWidget(desktop_theme.SectionHeading("hours", self.shift_form_dialog.windowTitle()))
         form_scroll = QScrollArea()
         form_scroll.setWidgetResizable(True)
         form_scroll.setFrameShape(QFrame.Shape.NoFrame)
         form_scroll.setWidget(card)
         dialog_layout.addWidget(form_scroll)
+        dialog_layout.addLayout(form_actions)
         cancel_shift_btn.clicked.connect(self.shift_form_dialog.reject)
 
         control_card = QFrame()
         control_card.setObjectName("card")
+        control_card.setProperty("smartreportSection", "hours")
         control_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        desktop_theme.apply_style(control_card, "QFrame#card { background-color: #242933; border: 1px solid #3182ce; border-radius: 8px; margin-top: 5px; }")
         c_layout = QVBoxLayout(control_card)
         c_layout.setSpacing(8)
 
@@ -3068,10 +3069,27 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         layout.addWidget(control_card)
 
-        layout.addWidget(QLabel(
-            "<b>История смен (зелёные — выставлены в счёт; синие — часы подтверждены, "
-            "клиентская стоимость не рассчитана):</b>"
-        ))
+        journal_header = QWidget()
+        journal_row = QHBoxLayout(journal_header)
+        journal_row.setContentsMargins(0, 2, 0, 2)
+        journal_row.setSpacing(8)
+        journal_row.addWidget(QLabel("<b>История смен</b>"))
+        for title, background, foreground, detail in (
+            ("Часы подтверждены", desktop_theme.SHIFT_CONFIRMED_BG, desktop_theme.SHIFT_CONFIRMED_FG,
+             "Клиентская стоимость пока не рассчитана"),
+            ("Выставлено в счёт", desktop_theme.SHIFT_INVOICED_BG, desktop_theme.SHIFT_INVOICED_FG,
+             "Смена включена в клиентский счёт"),
+        ):
+            legend = QLabel(title)
+            legend.setToolTip(detail)
+            desktop_theme.apply_style(
+                legend, f"QLabel {{ background-color: {background}; color: {foreground}; "
+                        "border-radius: 6px; padding: 4px 8px; font-weight: 600; }",
+            )
+            journal_row.addWidget(legend, alignment=Qt.AlignmentFlag.AlignLeft)
+        journal_row.addStretch()
+        layout.addWidget(journal_header)
+        desktop_theme.adapt_box_layout(journal_header, journal_row, compact_width=495)
         
         self.table_shifts = QTableWidget()
         self.table_shifts.setMinimumHeight(220)
@@ -4389,7 +4407,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout = QVBoxLayout(self.tab_salary)
         total_card = QFrame()
         total_card.setObjectName("card")
-        desktop_theme.apply_style(total_card, "QFrame#card { background-color: #242933; border: 1px solid #4299e1; border-radius: 8px; margin-bottom: 5px; }")
+        total_card.setProperty("smartreportSection", "salary")
         t_layout = QHBoxLayout(total_card)
         t_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         
@@ -4678,6 +4696,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
+        layout.addWidget(desktop_theme.SectionHeading("salary", reference["title"]))
 
         explanation = QLabel(reference["explanation"])
         explanation.setWordWrap(True)
@@ -10316,6 +10335,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         dialog.resize(1160, 650)
         dialog.setMinimumSize(980, 500)
         layout = QVBoxLayout(dialog)
+        layout.addWidget(desktop_theme.SectionHeading("expenses", dialog.windowTitle()))
         instruction = QLabel(
             "Программа читает оригиналы по всем объектам и сама подставляет найденные категории. "
             "Нажмите «Сохранить изменения», чтобы подтвердить весь найденный набор. Неоднозначные строки оставлены на проверку."
@@ -17511,6 +17531,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         dialog.setWindowTitle("Изменить смену")
         dialog.setMinimumWidth(650)
         form = QFormLayout(dialog)
+        form.addRow(desktop_theme.SectionHeading("hours", dialog.windowTitle()))
         date_field = create_date_field(shift['date'])
         employee_field = QComboBox()
         employee_field.setEditable(True)

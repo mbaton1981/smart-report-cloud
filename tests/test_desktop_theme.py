@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication, QBoxLayout, QDialog, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
@@ -161,6 +162,30 @@ class DesktopThemeTests(unittest.TestCase):
             dialog.close()
             tabs.close()
             paused_table.deleteLater()
+
+    def test_section_accent_follows_keyboard_navigation_and_theme(self):
+        tabs = QTabWidget()
+        tabs.addTab(QWidget(), "Ввод часов")
+        tabs.addTab(QWidget(), "Зарплата")
+        tabs.addTab(QWidget(), "Баланс")
+        theme.install_section_tabs(tabs, {0: "hours", 1: "salary", 2: "balance"})
+        bar = tabs.tabBar()
+        tabs.show()
+        self.application.processEvents()
+        bar.setFocus()
+        self.assertIn(theme.SECTION_ACCENTS["hours"]["light"][0], bar.styleSheet())
+
+        QTest.keyClick(bar, Qt.Key.Key_Right)
+        self.assertEqual(tabs.currentIndex(), 1)
+        self.assertIn(theme.SECTION_ACCENTS["salary"]["light"][0], bar.styleSheet())
+        self.assertTrue(self.manager.toggle())
+        self.assertEqual(tabs.currentIndex(), 1)
+        self.assertIn(theme.SECTION_ACCENTS["salary"]["dark"][0], bar.styleSheet())
+
+        QTest.keyClick(bar, Qt.Key.Key_Right)
+        self.assertEqual(tabs.currentIndex(), 2)
+        self.assertEqual(bar.styleSheet(), "")
+        tabs.deleteLater()
 
     def test_switch_does_not_remeasure_content_sized_table_columns(self):
         import desktop_ui

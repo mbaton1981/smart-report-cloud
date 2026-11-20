@@ -24,6 +24,7 @@ from reportlab.platypus.doctemplate import LayoutError
 import payroll_history as history
 import payroll_management as management
 import payroll_auto as automatic
+import desktop_theme
 from date_widgets import CalendarDateEdit
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ def edit_auto_schedule(window, app):
         dialog.setObjectName("payrollAutoScheduleDialog")
         dialog.setWindowTitle("График для автоматического расчёта зарплаты")
         layout = QVBoxLayout(dialog)
+        layout.addWidget(desktop_theme.SectionHeading("salary", dialog.windowTitle()))
         note = QLabel("Обычный график по умолчанию: Пн–Пт 07:00–16:00, перерыв 12:00–13:00. "
                       "По выходным и праздникам — OB. Privat — обычные часы без доплат. "
                       "График используется только для предварительного расчёта в этой программе.")
@@ -154,6 +156,7 @@ def show_auto_details(window, app):
         dialog.setWindowTitle("Как распределились часы — OB и Övertid")
         dialog.resize(1150, 700)
         layout = QVBoxLayout(dialog)
+        layout.addWidget(desktop_theme.SectionHeading("salary", dialog.windowTitle()))
         table = QTableWidget(0, 8)
         table.setHorizontalHeaderLabels(["Сотрудник", "Дата", "Объект", "Интервал", "Категория", "Часы", "Доплата, SEK", "Основание"])
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -279,6 +282,7 @@ def edit_norm(window, app):
         dialog.setObjectName("payrollNormDialog")
         dialog.setWindowTitle("Индивидуальная норма — только управленческий отчёт")
         layout = QVBoxLayout(dialog)
+        layout.addWidget(desktop_theme.SectionHeading("salary", dialog.windowTitle()))
         note = QLabel(norm_description(items[0]) + "\nНорма сохраняется локально для сотрудника и точных дат "
                       "выбранного периода. Другие периоды не меняются. Доплаты и операции «Баланса» не создаются.")
         note.setWordWrap(True)
@@ -357,6 +361,7 @@ def show_unknown_ob(window, app):
     dialog.setWindowTitle("OB не определён — исходные записи")
     dialog.resize(1250, 650)
     layout = QVBoxLayout(dialog)
+    layout.addWidget(desktop_theme.SectionHeading("salary", dialog.windowTitle()))
     notice = QLabel(f"Всего OB не определён: {sum(r['hours'] for r in rows):g} ч · "
                     f"{window.sal_date_from.text()} — {window.sal_date_to.text()}\n"
                     "«Не сохранено» означает отсутствие значения в записи, а не 00:00. "
@@ -661,6 +666,7 @@ def open_history(window, app, *, employee_name="", object_key=None):
     dialog.setWindowTitle("Зарплата: ставки, подтверждение и корректировки")
     dialog.resize(1000, 820)
     layout = QVBoxLayout(dialog)
+    layout.addWidget(desktop_theme.SectionHeading("salary", dialog.windowTitle()))
     form = QFormLayout()
     employee, objects = QComboBox(), QComboBox()
     employee.setObjectName("payroll_employee")

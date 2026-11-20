@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QHeaderView,
 )
 import customer_intervals as intervals
+import desktop_theme
 from customer_intervals_ui import CustomerTermsDialog, TimeFactsEditor
 from customer_pricing import ensure_pricing_schema, row_prices, store_pricing
 from customer_report import prepare_customer_costs
@@ -206,6 +207,7 @@ class CustomerIntervalsMixin:
             dialog = QDialog(self)
             dialog.setWindowTitle("Фактическое время новой смены")
             layout = QVBoxLayout(dialog)
+            layout.addWidget(desktop_theme.SectionHeading("hours", dialog.windowTitle()))
             editor = TimeFactsEditor(getattr(self, "__dict__", {}).get("_new_time_facts"))
             layout.addWidget(editor)
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -254,6 +256,7 @@ class CustomerIntervalsMixin:
             dialog = QDialog(self)
             dialog.setWindowTitle(f"Время и режим — №{identifier} · {row['employee']} · {row['date']}")
             layout = QVBoxLayout(dialog)
+            layout.addWidget(desktop_theme.SectionHeading("hours", dialog.windowTitle()))
             note = QLabel(f"Сохранено {row['hours']:g} ч. Старые OB-часы не превращаются в интервалы автоматически.\n"
                           "Зарплатные OB-сегменты не меняются. Для OB сумма часов должна остаться прежней.")
             note.setWordWrap(True)

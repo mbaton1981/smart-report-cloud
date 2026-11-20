@@ -361,22 +361,101 @@ def line_icon(name, stroke, size=18):
 
 
 TAB_ICON_COLORS = {"dark": "#9fbbd3", "light": "#4a7398"}
+SECTION_ACCENTS = {
+    "hours": {
+        "light": ("#f1e9fa", "#613591", "#c8b4df"),
+        "dark": ("#352844", "#e1c5ff", "#735492"),
+    },
+    "salary": {
+        "light": ("#e4f4ef", "#145e50", "#a1cfc2"),
+        "dark": ("#203b38", "#a5efdc", "#467a6f"),
+    },
+    "expenses": {
+        "light": ("#faeee3", "#81401e", "#dcb89f"),
+        "dark": ("#422f29", "#ffd0ae", "#875b45"),
+    },
+}
 
 
-def install_tab_icons(tabs, names):
-    """names: tab index -> icon name; icons follow the current theme."""
+def install_section_tabs(tabs, names):
+    """Color the active section while retaining the native tab bar and shortcuts."""
     manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+    bar = tabs.tabBar()
     tabs.setIconSize(QSize(18, 18))
 
     def refresh(theme_name):
+        current = tabs.currentIndex()
+        active = SECTION_ACCENTS.get(names.get(current))
+        default_stroke = TAB_ICON_COLORS[theme_name]
+        selected_stroke = default_stroke
+        if active:
+            surface, selected_stroke, _ = active[theme_name]
+            bar.setStyleSheet(f"""
+                QTabBar::tab:selected {{
+                    background-color: {surface}; color: {selected_stroke};
+                    border-bottom-color: {selected_stroke};
+                }}
+            """)
+        else:
+            bar.setStyleSheet("")
         for index, name in names.items():
             if index < tabs.count():
-                tabs.setTabIcon(index, line_icon(name, TAB_ICON_COLORS.get(theme_name, TAB_ICON_COLORS["dark"])))
+                stroke = selected_stroke if index == current else default_stroke
+                tabs.setTabIcon(index, line_icon(name, stroke))
 
     refresh(current_theme())
+    tabs.currentChanged.connect(lambda _index: refresh(current_theme()))
     if manager is not None:
         manager.changed.connect(refresh)
         tabs.destroyed.connect(lambda *_: manager.changed.disconnect(refresh))
+
+
+class SectionHeading(QFrame):
+    def __init__(self, section, title, parent=None):
+        super().__init__(parent)
+        self.section = section
+        self.setObjectName("smartreportSectionHeading")
+        self.setProperty("smartreportSection", section)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(10)
+        self.icon = QLabel(self)
+        self.icon.setObjectName("smartreportSectionIcon")
+        self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.icon.setFixedSize(32, 32)
+        layout.addWidget(self.icon)
+        heading = QLabel(title, self)
+        heading.setObjectName("smartreportSectionTitle")
+        heading.setTextFormat(Qt.TextFormat.PlainText)
+        heading.setWordWrap(True)
+        layout.addWidget(heading, 1)
+        self._update_icon(current_theme())
+        manager = getattr(QApplication.instance(), "_smartreport_theme", None)
+        if manager is not None:
+            manager.changed.connect(self._update_icon)
+
+    def _update_icon(self, theme):
+        _, ink, _ = SECTION_ACCENTS[self.section][theme]
+        self.icon.setPixmap(line_icon(self.section, ink).pixmap(QSize(18, 18)))
+
+
+def section_stylesheet(theme):
+    rules = []
+    for section, palettes in SECTION_ACCENTS.items():
+        surface, ink, border = palettes[theme]
+        heading = f'QFrame#smartreportSectionHeading[smartreportSection="{section}"]'
+        rules.append(f"""
+            {heading}, QFrame#card[smartreportSection="{section}"] {{
+                background-color: {surface}; border: 1px solid {border}; border-radius: 9px;
+            }}
+            {heading} QLabel#smartreportSectionTitle {{
+                background-color: transparent; color: {ink}; font-size: 17px; font-weight: 650;
+            }}
+            {heading} QLabel#smartreportSectionIcon {{
+                background-color: transparent; border: 1px solid {border}; border-radius: 8px;
+            }}
+        """)
+    return "".join(rules)
 
 
 EXTRA = """
@@ -458,16 +537,14 @@ QComboBox::down-arrow, QDateEdit::down-arrow {
 QPushButton#successAction { background-color: #276749; color: #ffffff; border-color: #38a169; }
 QPushButton#successAction:disabled { background-color: #252b35; color: #718096; border-color: #323946; }
 QLabel#smartreportBrand { font-size: 18px; font-weight: 600; color: #eef3f8; }
-QLabel#smartreportCaption { color: #8e9db0; font-size: 12px; }
-QLabel#smartreportProductCaption { color: #8e9db0; font-size: 11px; }
+QLabel#smartreportProductCaption { color: #e6edf5; font-size: 17px; font-weight: 650; }
 QFrame#smartreportBrandPlate { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 6px; }
 """
 LIGHT_EXTRA = """
 QFrame#smartreportHeader { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 10px; }
 QFrame#smartreportBrandPlate { background-color: #ffffff; border: 1px solid #dfe7ee; border-radius: 6px; }
 QLabel#smartreportBrand { color: #1f3447; }
-QLabel#smartreportCaption { color: #6d8193; }
-QLabel#smartreportProductCaption { color: #6d8193; }
+QLabel#smartreportProductCaption { color: #263b4e; }
 QPushButton#themeToggle { background-color: #f2f6f9; color: #2c4052; border: 1px solid #d3dee7; }
 QPushButton#themeToggle:hover { background-color: #e8f0f6; border-color: #4a7398; }
 QTabBar::tab { background-color: transparent; color: #4f6577; border-bottom: 3px solid transparent; }
@@ -574,7 +651,7 @@ class ThemeManager(QObject):
         if self.name == "light":
             style += LIGHT_EXTRA.replace("__CHEVRON__", (assets / "theme-chevron.svg").as_posix()).replace(
                 "__UP__", (assets / "theme-up.svg").as_posix())
-        return style
+        return style + section_stylesheet(self.name)
 
     def apply(self):
         self.application.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
@@ -723,11 +800,6 @@ def header(parent=None):
     product_caption = QLabel("SmartReport")
     product_caption.setObjectName("smartreportProductCaption")
     row.addWidget(product_caption)
-    toggle = ThemeToggle(manager)
-    row.addSpacing(12)
-    row.addWidget(toggle)
     row.addStretch()
-    caption = QLabel("Смены · Расходы · Отчёты")
-    caption.setObjectName("smartreportCaption")
-    row.addWidget(caption)
+    row.addWidget(ThemeToggle(manager))
     return panel
