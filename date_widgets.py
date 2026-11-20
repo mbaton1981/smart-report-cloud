@@ -8,6 +8,48 @@ from PyQt6.QtWidgets import (
 import desktop_theme
 
 
+CALENDAR_COLORS = {
+    "light": {
+        "navigation": "#532c76",
+        "button": "#6d4191",
+        "button_hover": "#8455a7",
+        "button_border": "#a274c0",
+        "navigation_text": "#fff8ff",
+        "header": "#e9d7f7",
+        "weeks": "#dbc2ef",
+        "divider": "#bc99d6",
+        "grid": "#faf1ff",
+        "weekend": "#f9e1ec",
+        "adjacent": "#efe1f7",
+        "text": "#352146",
+        "weekend_text": "#802951",
+        "muted": "#6c567a",
+        "selected": "#08796c",
+        "selected_text": "#ffffff",
+        "today": "#a84511",
+    },
+    "dark": {
+        "navigation": "#39214e",
+        "button": "#573579",
+        "button_hover": "#714798",
+        "button_border": "#8b63ab",
+        "navigation_text": "#fff2ff",
+        "header": "#4a305e",
+        "weeks": "#563a6a",
+        "divider": "#8967a1",
+        "grid": "#2e203b",
+        "weekend": "#452640",
+        "adjacent": "#352741",
+        "text": "#f3e4ff",
+        "weekend_text": "#ffc4e1",
+        "muted": "#b6a1c5",
+        "selected": "#69dfbb",
+        "selected_text": "#142e2a",
+        "today": "#ffac63",
+    },
+}
+
+
 class PopupBoundsGuard(QObject):
     def eventFilter(self, watched, event):
         if event.type() != QEvent.Type.Show:
@@ -27,13 +69,20 @@ class PopupBoundsGuard(QObject):
 
 
 class CalendarHeaderDelegate(QStyledItemDelegate):
+    def __init__(self, view, calendar):
+        super().__init__(view)
+        self.calendar = calendar
+
     def paint(self, painter, option, index):
         week_column = index.column() == 0
         heading = index.row() == 0
         rect = option.rect
+        colors = self.calendar.colors
+        weekend_heading = heading and index.column() >= 6
+        background = "weeks" if week_column else "weekend" if weekend_heading else "header"
         painter.save()
-        painter.fillRect(rect, desktop_theme.color("#252d38" if week_column else "#303c4b"))
-        painter.setPen(desktop_theme.color("#4a5568"))
+        painter.fillRect(rect, QColor(colors[background]))
+        painter.setPen(QColor(colors["divider"]))
         if week_column:
             painter.drawLine(rect.topRight(), rect.bottomRight())
         if heading:
@@ -42,7 +91,7 @@ class CalendarHeaderDelegate(QStyledItemDelegate):
         font.setPixelSize(11 if week_column else 12)
         font.setWeight(QFont.Weight.DemiBold if heading else QFont.Weight.Medium)
         painter.setFont(font)
-        painter.setPen(desktop_theme.color("#a0aec0" if week_column else "#e2e8f0"))
+        painter.setPen(QColor(colors["weekend_text" if weekend_heading else "text"]))
         label = "Нед." if week_column and heading else index.data()
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(label or ""))
         painter.restore()
@@ -55,18 +104,51 @@ class ResponsiveCalendarWidget(QCalendarWidget):
         self.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
         self.setHorizontalHeaderFormat(self.HorizontalHeaderFormat.ShortDayNames)
         self.setVerticalHeaderFormat(self.VerticalHeaderFormat.ISOWeekNumbers)
+        self._update_colors(desktop_theme.current_theme())
         view = self.findChild(QTableView, "qt_calendar_calendarview")
         if view is not None:
-            self._header_delegate = CalendarHeaderDelegate(view)
+            self._header_delegate = CalendarHeaderDelegate(view, self)
             view.setItemDelegateForRow(0, self._header_delegate)
             view.setItemDelegateForColumn(0, self._header_delegate)
-        self._update_navigation()
         manager = getattr(QApplication.instance(), "_smartreport_theme", None)
         if manager is not None:
-            manager.changed.connect(self._update_navigation)
+            manager.changed.connect(self._update_colors)
 
-    def _update_navigation(self):
-        stroke = desktop_theme.color("#e2e8f0").name()
+    def _update_colors(self, theme):
+        colors = self.colors = CALENDAR_COLORS[theme]
+        self.setStyleSheet(f"""
+            QWidget#qt_calendar_navigationbar {{
+                background-color: {colors["navigation"]};
+            }}
+            QCalendarWidget QToolButton, QSpinBox#qt_calendar_yearedit {{
+                color: {colors["navigation_text"]};
+                background-color: {colors["button"]};
+                border: 1px solid {colors["button_border"]};
+            }}
+            QCalendarWidget QToolButton:hover, QCalendarWidget QToolButton:pressed,
+            QCalendarWidget QToolButton:focus, QSpinBox#qt_calendar_yearedit:focus {{
+                background-color: {colors["button_hover"]};
+                border-color: {colors["navigation_text"]};
+            }}
+            QCalendarWidget QToolButton:disabled {{
+                color: {colors["muted"]};
+                background-color: {colors["adjacent"]};
+                border-color: {colors["divider"]};
+            }}
+            QCalendarWidget QAbstractItemView, QCalendarWidget QMenu {{
+                color: {colors["text"]};
+                background-color: {colors["grid"]};
+                border: 1px solid {colors["divider"]};
+                selection-color: {colors["selected_text"]};
+                selection-background-color: {colors["selected"]};
+            }}
+            QCalendarWidget QMenu::item:selected {{
+                color: {colors["selected_text"]};
+                background-color: {colors["selected"]};
+            }}
+        """)
+
+        stroke = colors["navigation_text"]
         for name, icon, label in (
             ("qt_calendar_prevmonth", "chevron-left", "Предыдущий месяц"),
             ("qt_calendar_nextmonth", "chevron-right", "Следующий месяц"),
@@ -84,18 +166,19 @@ class ResponsiveCalendarWidget(QCalendarWidget):
         selected = date == self.selectedDate() and enabled
         today = date == QDate.currentDate() and in_month and enabled
         weekend = date.dayOfWeek() >= Qt.DayOfWeek.Saturday.value
+        colors = self.colors
+        background = "adjacent" if not in_month else "weekend" if weekend else "grid"
 
         painter.save()
-        painter.fillRect(rect, desktop_theme.color("#252d38" if weekend else "#28303d"))
+        painter.fillRect(rect, QColor(colors[background]))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         badge = QRectF(rect).adjusted(4, 3, -4, -3)
         if selected:
             painter.setPen(Qt.PenStyle.NoPen)
-            selection = "#52718a" if desktop_theme.current_theme() == "light" else "#2b6cb0"
-            painter.setBrush(QColor(selection))
+            painter.setBrush(QColor(colors["selected"]))
             painter.drawRoundedRect(badge, 6, 6)
         elif today:
-            painter.setPen(QPen(desktop_theme.color("#4299e1"), 1.5))
+            painter.setPen(QPen(QColor(colors["today"]), 1.5))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(badge, 6, 6)
 
@@ -104,12 +187,12 @@ class ResponsiveCalendarWidget(QCalendarWidget):
         font.setWeight(QFont.Weight.DemiBold if selected or today else QFont.Weight.Normal)
         painter.setFont(font)
         if selected:
-            foreground = QColor("#ffffff")
+            foreground = "selected_text"
         elif not enabled or not in_month:
-            foreground = desktop_theme.color("#718096")
+            foreground = "muted"
         else:
-            foreground = desktop_theme.color("#e2e8f0")
-        painter.setPen(foreground)
+            foreground = "weekend_text" if weekend else "text"
+        painter.setPen(QColor(colors[foreground]))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(date.day()))
         painter.restore()
 
