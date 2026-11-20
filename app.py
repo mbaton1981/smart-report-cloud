@@ -2667,6 +2667,16 @@ def stockholm_month_bounds(offset_months=0):
     return start.isoformat(), end.isoformat()
 
 
+def set_report_month_dates(date_from, date_to, offset_months):
+    start, end = stockholm_month_bounds(offset_months)
+    if (date_from.text(), date_to.text()) == (start, end):
+        return False
+    with QSignalBlocker(date_from), QSignalBlocker(date_to):
+        date_from.setText(start)
+        date_to.setText(end)
+    return True
+
+
 def requeue_expense_document_restore(queued, payload, result):
     """Переводит повторную загрузку удалённого оригинала в восстановление исходной записи."""
     old_client_id = queued["client_id"]
@@ -4416,14 +4426,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         card_layout.addLayout(employee_layout)
         desktop_theme.adapt_box_layout(card, employee_layout, compact_width=700)
         period_layout.addWidget(QLabel("<b>Период:</b>"))
-        self.sal_date_from = create_date_field("2026-10-01")
-        self.sal_date_to = create_date_field("2026-10-31")
+        month_start, month_end = stockholm_month_bounds(-1)
+        self.sal_date_from = create_date_field(month_start)
+        self.sal_date_to = create_date_field(month_end)
         calc_btn = QPushButton("Обновить расчёт")
         calc_btn.clicked.connect(self.calculate_salary)
 
         period_layout.addWidget(self.sal_date_from)
         period_layout.addWidget(QLabel("по"))
         period_layout.addWidget(self.sal_date_to)
+        for offset, label, name in ((0, "Этот месяц", "salaryThisMonth"),
+                                    (-1, "Прошлый месяц", "salaryLastMonth")):
+            button = QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(lambda _checked=False, month=offset: self.set_salary_period_month(month))
+            period_layout.addWidget(button)
         period_layout.addWidget(calc_btn)
 
         preview_salary_pdf_btn = QPushButton("Предпросмотр PDF")
@@ -4789,6 +4806,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def on_salary_report_mode_changed(self):
         self.sal_history_parameters.setVisible(not payroll_ui.management_mode(self))
         self.load_salary_table_template()
+
+    def set_salary_period_month(self, offset_months):
+        set_report_month_dates(self.sal_date_from, self.sal_date_to, offset_months)
+        self.calculate_salary()
 
     def eventFilter(self, watched, event):
         if getattr(self, "table_salary", None) is watched and event.type() == QEvent.Type.Resize:
@@ -12262,8 +12283,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         card_layout = QFormLayout(card)
         card_layout.setSpacing(8)
 
-        self.inv_date_from = create_date_field("2026-10-01")
-        self.inv_date_to = create_date_field("2026-10-31")
+        month_start, month_end = stockholm_month_bounds(-1)
+        self.inv_date_from = create_date_field(month_start)
+        self.inv_date_to = create_date_field(month_end)
         
         self.inv_comp_cb = QComboBox()
         self.load_companies_into_combobox(self.inv_comp_cb)
@@ -12283,6 +12305,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         period_layout.addWidget(self.inv_date_from)
         period_layout.addWidget(QLabel("по:"))
         period_layout.addWidget(self.inv_date_to)
+        for offset, label, name in ((0, "Этот месяц", "invoiceThisMonth"),
+                                    (-1, "Прошлый месяц", "invoiceLastMonth")):
+            button = QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(lambda _checked=False, month=offset: self.set_invoice_period_month(month))
+            period_layout.addWidget(button)
         period_layout.addStretch(1)
         card_layout.addRow("Период:", period_layout)
         desktop_theme.adapt_box_layout(card, period_layout, compact_width=700)
@@ -12435,8 +12463,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if selected_id is not None and selected_index < 0:
             self._clear_invoice_preview()
 
+    def set_invoice_period_month(self, offset_months):
+        if set_report_month_dates(self.inv_date_from, self.inv_date_to, offset_months):
+            self._clear_invoice_preview()
+            self.invoice_summary_note.setText("Период изменён. Нажмите «Просмотр сводки и журнала».")
+
     def _clear_invoice_preview(self):
-        """Selected object is no longer listed: drop its stale preview without picking another object."""
+        """Drop a preview that no longer matches the report filters."""
         if not hasattr(self, "invoice_summary_table"):
             return
         self._reset_fast_pris_draft()
@@ -12444,6 +12477,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.invoice_summary_table.clearContents()
         self.invoice_summary_note.setText("Выберите объект и нажмите «Просмотр сводки и журнала».")
         self.invoice_status_note.clear()
+        self.invoice_ob_rules_lbl.clear()
         if hasattr(self, "table_dagbok"):
             self._render_dagbok_report({"journal_rows": [], "journal_segments": {}})
         self._invoice_report = None

@@ -131,10 +131,31 @@ class PayrollIntegrationTests(unittest.TestCase):
         window.tab_salary = self.desktop.QWidget()
         window.setCentralWidget(window.tab_salary)
         window.setup_salary_tab()
+        window.sal_date_from.setText("2026-10-01")
+        window.sal_date_to.setText("2026-10-31")
         if not management_mode:
             window.sal_report_mode.setCurrentIndex(1)
         self.addCleanup(window.close)
         return window
+
+    def test_month_buttons_refresh_salary_with_both_dates_at_year_boundary(self):
+        window = self.salary_window(management_mode=True)
+        from datetime import datetime
+
+        with patch.object(self.desktop, "datetime", wraps=datetime) as clock, \
+                patch.object(window, "load_salary_table_template") as refresh:
+            clock.now.return_value = datetime(2027, 1, 2, 10)
+
+            def check_period(start, end):
+                self.assertEqual((window.sal_date_from.text(), window.sal_date_to.text()), (start, end))
+
+            refresh.side_effect = lambda: check_period("2026-12-01", "2026-12-31")
+            window.findChild(self.desktop.QPushButton, "salaryLastMonth").click()
+            refresh.assert_called_once_with()
+            refresh.reset_mock()
+            refresh.side_effect = lambda: check_period("2027-01-01", "2027-01-31")
+            window.findChild(self.desktop.QPushButton, "salaryThisMonth").click()
+            refresh.assert_called_once_with()
 
     def payroll_draft(self):
         self.prepare()

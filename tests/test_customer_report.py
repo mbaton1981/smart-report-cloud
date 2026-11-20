@@ -95,6 +95,27 @@ class CustomerReportTests(unittest.TestCase):
         self.patcher.stop()
         self.conn.close()
 
+    def test_invoice_month_buttons_clear_previous_period_preview_and_keep_object(self):
+        from datetime import datetime
+
+        self.shift()
+        window = self.window
+        selected_object = window.inv_obj_cb.currentData()
+        window.generate_activity_report()
+        self.assertEqual(window.table_invoice.rowCount(), 1)
+
+        with patch.object(self.desktop, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2027, 1, 2, 10)
+            window.tab_invoice.findChild(self.desktop.QPushButton, "invoiceLastMonth").click()
+            self.assertEqual((window.inv_date_from.text(), window.inv_date_to.text()), ("2026-12-01", "2026-12-31"))
+            self.assertEqual(window.table_invoice.rowCount(), 0)
+            self.assertIsNone(window._invoice_report)
+            self.assertEqual(window.inv_obj_cb.currentData(), selected_object)
+            self.assertIn("Период изменён", window.invoice_summary_note.text())
+
+            window.tab_invoice.findChild(self.desktop.QPushButton, "invoiceThisMonth").click()
+            self.assertEqual((window.inv_date_from.text(), window.inv_date_to.text()), ("2027-01-01", "2027-01-31"))
+
     def shift(self, name="Andrii Piskun", day="2026-10-21", hours=8, rate=0,
               transport=0, kind="work", object_name="Tomteboda ÄTA", comment="Montering", confirmed=True):
         identifier = str(self.conn.execute("SELECT COUNT(*) FROM shifts").fetchone()[0] + 1)
