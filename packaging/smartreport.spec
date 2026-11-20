@@ -1,10 +1,15 @@
 # PyInstaller: сборка настольного клиента SmartReport (папка, без Python на целевом ПК)
 import os
+import ssl
 from PyInstaller.utils.hooks import collect_all
 
 root = os.path.abspath(os.path.join(SPECPATH, ".."))
 datas = [(os.path.join(root, "ob_rules.json"), "."),
          (os.path.join(root, "assets"), "assets")]
+# The Codex Python SSLContext reads this trust-policy file next to ssl.py.
+tls_rejected_cas = os.path.join(os.path.dirname(ssl.__file__), "codex-rejected-cas.pem")
+if os.path.isfile(tls_rejected_cas):
+    datas.append((tls_rejected_cas, "."))
 manifest = os.environ.get("SMARTREPORT_BUILD_MANIFEST")
 if manifest:
     datas.append((manifest, "."))

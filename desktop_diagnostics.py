@@ -187,6 +187,23 @@ def verify_theme_ram(app_module, work_dir, case, out_path):
     return 0
 
 
+def verify_tls_ram(out_path):
+    """Initialize the same verified TLS context as cloud requests without connecting."""
+    import ssl
+
+    import requests
+    from urllib3.util.ssl_ import create_urllib3_context
+
+    context = create_urllib3_context()
+    context.load_verify_locations(cafile=requests.certs.where())
+    proof = dict(
+        frozen=bool(getattr(sys, "frozen", False)),
+        certificate_verification=context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname,
+    )
+    Path(out_path).write_text(json.dumps(proof), encoding="utf-8")
+    return 0
+
+
 def verify_approved_update(app_module, work_dir, out_path):
     """Inspect an existing approved profile without startup migrations or network."""
     from contextlib import closing
@@ -1589,6 +1606,8 @@ def run(app_module, action, work_dir, case="case", out_path=None):
         return verify_pdf_save_ram(app_module, work_dir, out_path)
     if action == "theme-ram":
         return verify_theme_ram(app_module, work_dir, case, out_path)
+    if action == "tls-ram":
+        return verify_tls_ram(out_path)
     if action == "new-shift-prices-ram":
         return verify_new_shift_prices_ram(app_module, work_dir, out_path)
     if action == "employee-cards-local":
