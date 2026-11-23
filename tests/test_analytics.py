@@ -377,7 +377,8 @@ class AnalyticsTests(unittest.TestCase):
         support = self.document(allocations=allocations[:1], supporting_to_document_id=1)
         support["id"] = 2
         data = self.calculate(documents=[parent, support])
-        self.assertEqual(data["totals"]["expenses"], 100)
+        self.assertEqual(data["totals"]["expenses"], 200)
+        self.assertEqual(next(row for row in data["rows"] if row["key"] == "unresolved_net")["expenses"], 100)
         self.assertEqual(len(data["unknown_expenses"]), 1)
         self.assertEqual(len(data["billing"]), 2)
         self.assertIsNone(next(row for row in data["billing"] if row["share"] == 2)["net"])

@@ -333,8 +333,12 @@ class ExpenseSharingTests(unittest.TestCase):
             conn.close()
         rows = {row["key"]: row for row in report["rows"]}
         self.assertEqual(report["totals"]["expenses"], 200)
-        self.assertEqual(rows["general"]["expenses"], 120)
-        self.assertEqual(rows[f"object:{projects[0]}"]["expenses"], 80)
+        self.assertEqual(rows["general"]["expenses"], 100)
+        self.assertEqual(rows["unresolved_net"]["expenses"], 100)
+        object_row = rows[f"object:{projects[0]}"]
+        self.assertEqual(object_row["expenses"], 0)
+        self.assertTrue(object_row["partial"])
+        self.assertIsNone(report["billing"][0]["net"])
 
     def test_update_queue_commit_crash_replays_same_revision_and_document(self):
         projects = self.configure_incoming()

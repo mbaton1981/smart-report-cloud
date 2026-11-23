@@ -310,6 +310,8 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
                    unknown_records=0, cost_missing=False, revenue_missing=False, notes=[], fixed=[],
                    has_expense=False, billing={})
     groups["general"] = general
+    unresolved_net = Decimal(0)
+    unresolved_net_count = 0
     unknown_expenses, expense_count, undated = [], 0, 0
     for document in documents:
         if document.get("supporting_to_document_id"):
@@ -384,11 +386,16 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
         if None in relevant_values or (not scoped and net is None):
             unknown_expenses.append(dict(id=document["id"], reason="Часть расхода без НДС требует сверки",
                                          amount=document["gross_amount"], currency="SEK"))
-        remainder_known = not scoped and net is not None and None not in net_values
-        if remainder_known:
-            general["expenses"] += float(net - assigned)
-            general["has_expense"] |= not allocations or net != assigned
-        expense_count += int(remainder_known or any(value is not None for value in relevant_values))
+        document_total_known = not scoped and net is not None
+        if document_total_known:
+            remainder = net - assigned
+            if None in net_values:
+                unresolved_net += remainder
+                unresolved_net_count += 1
+            else:
+                general["expenses"] += float(remainder)
+                general["has_expense"] |= not allocations or remainder != 0
+        expense_count += int(document_total_known or any(value is not None for value in relevant_values))
         for target, value in zip(targets, net_values):
             if value is not None:
                 target["expenses"] += float(value)
@@ -433,6 +440,12 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
         notes.add("Сохранённых зарплатных начислений за период нет. Результат не отражает полную экономику.")
     if unknown_expenses:
         notes.add(f"Расходов с неполными или исключёнными суммами: {len(unknown_expenses)}.")
+    if unresolved_net_count:
+        groups["unresolved_net"] = {
+            **general, "key": "unresolved_net", "label": "Нетто фактур без точной разбивки",
+            "expenses": float(unresolved_net), "has_expense": True, "cost_missing": True,
+            "notes": ["Сумма фактур подтверждена. Распределение остатка по объектам требует сверки."],
+        }
     rows = []
     for item in groups.values():
         if not selected(item) or (item["key"] == "general" and (company or object_key)):
