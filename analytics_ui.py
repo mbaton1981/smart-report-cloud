@@ -6,16 +6,88 @@ from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QD
 from PyQt6.QtGui import QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
-    QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+    QDialog, QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
 )
 from date_widgets import CalendarDateEdit
-from analytics import period, HOW
+from analytics import BILLING_LABELS, HOW, period
 
 logger = logging.getLogger(__name__)
 
 
 def number(value):
     return f"{value:,.2f}".replace(",", " ")
+
+
+def billing_summary(counts):
+    if not counts:
+        return "—"
+    return f"{counts['hours']:g} ч · {counts['expenses']} дол."
+
+
+def open_billing_details(parent, entries, scope, start, end):
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Состав клиентских счетов")
+    dialog.resize(1220, 680)
+    layout = QVBoxLayout(dialog)
+    context = QLabel(
+        f"{scope} · {start} — {end}\n"
+        "Отбор по датам смен и документов поставщиков. Состав по данным SmartReport."
+    )
+    context.setTextFormat(Qt.TextFormat.PlainText)
+    context.setWordWrap(True)
+    layout.addWidget(context)
+    filters = QHBoxLayout()
+    status, kind = QComboBox(), QComboBox()
+    status.addItem("Все статусы", "")
+    for key, label in BILLING_LABELS.items():
+        status.addItem(label, key)
+    for key, label in (("", "Часы и расходы"), ("shift", "Только часы"), ("expense", "Только расходы")):
+        kind.addItem(label, key)
+    filters.addWidget(status)
+    filters.addWidget(kind)
+    filters.addStretch()
+    layout.addLayout(filters)
+    table = QTableWidget(0, 7, dialog)
+    table.setHorizontalHeaderLabels(("Дата", "Объект", "Смена / документ", "Часы / без НДС",
+                                     "Категория", "Статус", "Клиентский счёт"))
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    layout.addWidget(table)
+    count = QLabel()
+    layout.addWidget(count)
+    close = QPushButton("Закрыть", dialog)
+    close.clicked.connect(dialog.accept)
+    layout.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def fill():
+        shown = [entry for entry in entries
+                 if status.currentData() in ("", entry["status"]) and kind.currentData() in ("", entry["kind"])]
+        table.setRowCount(len(shown))
+        for index, entry in enumerate(shown):
+            if entry["kind"] == "shift":
+                description = entry["description"]
+                quantity, category = f"{entry['hours']:g} ч", "Рабочая смена"
+            else:
+                description = f"{entry['description']} · доля {entry['share']}"
+                quantity = "Нетто неизвестно" if entry["net"] is None else f"{number(entry['net'])} {entry['currency']}"
+                category = entry["category"]
+            invoice = f"№{entry['invoice_number']} · {entry['invoice_date']}" if entry["invoice_number"] else "—"
+            values = (entry["date"], entry["object_label"], description, quantity,
+                      category, BILLING_LABELS[entry["status"]], invoice)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                table.setItem(index, column, item)
+        table.resizeRowsToContents()
+        count.setText(f"Строк в отборе: {len(shown)}" if shown else "В этом отборе записей нет.")
+
+    status.currentIndexChanged.connect(fill)
+    kind.currentIndexChanged.connect(fill)
+    fill()
+    dialog.exec()
 
 
 class ReadSignals(QObject):
@@ -192,8 +264,8 @@ class AnalyticsWidget(QWidget):
         self.card_widgets = []
         for column, (key, text) in enumerate((
                 ("hours", "Рабочие часы"), ("employees", "Сотрудники"),
-                ("revenue", "Стоимость работ"), ("cost", "Учтённые затраты"),
-                ("result", "Предварительный результат"))):
+                ("revenue", "Оценка работ"), ("cost", "Учтённые затраты"),
+                ("result", "Расчётная разница"))):
             card = QFrame()
             card.setObjectName("card")
             contents = QVBoxLayout(card)
@@ -213,9 +285,9 @@ class AnalyticsWidget(QWidget):
             self.cards[key] = value
             self.card_widgets.append(card)
         layout.addLayout(cards)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(("Объект", "Часы", "Стоимость · SEK", "Затраты · SEK",
-                                             "Результат · SEK", "Полнота данных"))
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(("Объект", "Часы", "Оценка работ · SEK", "Затраты · SEK",
+                                             "Результат · SEK", "Полнота данных", "В счёте", "Ожидает счёта"))
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -227,6 +299,12 @@ class AnalyticsWidget(QWidget):
         self.table.setMinimumHeight(240)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.table)
+        self.billing_button = QPushButton("Состав счетов…")
+        self.billing_button.setEnabled(False)
+        self.billing_button.setToolTip("Откройте состав выбранного объекта. Для всего отбора выберите строку «ИТОГО».")
+        self.billing_button.clicked.connect(self.show_billing)
+        self.table.cellDoubleClicked.connect(self.show_billing)
+        layout.addWidget(self.billing_button, alignment=Qt.AlignmentFlag.AlignLeft)
         self.hours_chart, self.objects_chart = Chart("hours"), Chart("objects")
         charts = QHBoxLayout()
         self.charts_layout = charts
@@ -312,6 +390,7 @@ class AnalyticsWidget(QWidget):
 
     def changed(self):
         self.serial += 1
+        self.billing_button.setEnabled(False)
         self.status.setText("Отбор изменён · ожидается расчёт. Ниже пока предыдущий результат.")
         if self.isVisible():
             self.debounce.start()
@@ -358,6 +437,7 @@ class AnalyticsWidget(QWidget):
             return
         if error:
             self.status.setText(f"Не удалось обновить: {error}\nПредыдущие данные не подтверждены как актуальные.")
+            self.billing_button.setEnabled(False)
         else:
             self.payload = payload
             stable = {key: value for key, value in payload.items() if key != "calculated_at"}
@@ -367,8 +447,24 @@ class AnalyticsWidget(QWidget):
                 self.fingerprint = fingerprint
             self.status.setText(f"Расчёт: {payload['calculated_at']} · {payload['source']}. "
                                 "Обновление только чтением; локальные изменения попадут после штатного обмена.")
+            self.billing_button.setEnabled("billing" in payload)
+            if "billing" not in payload:
+                self.status.setText("Сервер использует прежний расчёт аналитики. Состав счетов появится после обновления сервера.")
         if self.pending and self.isVisible():
             self.debounce.start()
+
+    def show_billing(self):
+        if not self.billing_button.isEnabled():
+            return
+        data = self.payload
+        selected = self.table.item(self.table.currentRow(), 0)
+        key = selected.data(Qt.ItemDataRole.UserRole) if selected else None
+        if key and key != "__total__":
+            scope = selected.text()
+            entries = [entry for entry in data["billing"] if entry["object_key"] == key]
+        else:
+            scope, entries = data["scope"], data["billing"]
+        open_billing_details(self, entries, scope, data["start"], data["end"])
 
     def render(self, data):
         self._render_count += 1
@@ -407,6 +503,16 @@ class AnalyticsWidget(QWidget):
             completeness.setToolTip("\n".join(details))
             label.setToolTip(row["label"]+"\n"+"\n".join(details))
             self.table.setItem(index, 5, completeness)
+            for column, status in ((6, "included"), (7, "pending")):
+                counts = row.get("billing", {})
+                item = QTableWidgetItem(billing_summary(counts.get(status)))
+                item.setToolTip("\n".join(f"{BILLING_LABELS[key]} · {billing_summary(value)}"
+                                          for key, value in counts.items()))
+                self.table.setItem(index, column, item)
+            extra_billing = [BILLING_LABELS[key] for key in ("legacy", "review", "changed")
+                             if key in row.get("billing", {})]
+            if extra_billing:
+                completeness.setText(completeness.text() + "\n" + "\n".join(extra_billing))
         if data["rows"]:
             index = len(data["rows"])
             item = QTableWidgetItem("ИТОГО")
@@ -415,6 +521,10 @@ class AnalyticsWidget(QWidget):
             for column, key in enumerate(("hours", "revenue", "cost", "result"), 1):
                 self.table.setItem(index, column, NumericItem(totals[key], totals["partial"] and key != "hours"))
             self.table.setItem(index, 5, QTableWidgetItem("Частично" if totals["partial"] else "Внесённые данные"))
+            for column, status in ((6, "included"), (7, "pending")):
+                entries = [row["billing"][status] for row in data["rows"] if status in row.get("billing", {})]
+                summed = {key: sum(entry[key] for entry in entries) for key in ("hours", "expenses")}
+                self.table.setItem(index, column, QTableWidgetItem(billing_summary(summed) if entries else "—"))
         self.table.setSortingEnabled(sorting)
         for index in range(self.table.rowCount()):
             if self.table.item(index, 0).data(Qt.ItemDataRole.UserRole) == selected_key:
@@ -424,6 +534,7 @@ class AnalyticsWidget(QWidget):
                 break
         self.table.verticalScrollBar().setValue(scroll)
         self.table.horizontalScrollBar().setValue(horizontal)
+        self.table.resizeRowsToContents()
         self.hours_chart.set_data(data["hours_chart"], totals["has_data"])
         self.objects_chart.set_data(data["objects_chart"], totals["has_data"])
         lines = [
@@ -445,7 +556,7 @@ class AnalyticsWidget(QWidget):
                                  f"{fixed['start']} — {fixed['end']} отдельно; часы включены, сумма не распределена.")
         for expense in data["unknown_expenses"]:
             lines.append(f"• Документ №{expense['id']}: {expense['reason']}; "
-                         f"{expense['amount'] or 'сумма неизвестна'} {expense['currency']} — отдельно, не в итоге.")
+                         f"сумма документа {expense['amount'] or 'неизвестна'} {expense['currency']}.")
         self.coverage.setText("\n".join(lines))
         current = self.customer.currentData()
         if [self.customer.itemData(i) for i in range(1, self.customer.count())] != data["companies"]:

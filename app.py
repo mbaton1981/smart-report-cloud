@@ -53,6 +53,7 @@ from customer_supplements_ui import calculate_supplements
 from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_catalog_price, catalog_price_preview, checked_rate, ensure_pricing_schema, fill_missing_prices, require_final_prices, row_prices, store_pricing, reopen_invoiced_shifts
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
+from payroll_management import swedish_public_holidays, swedish_workday_norm
 import payroll_ui
 from payroll_preview import open_saved_pdf
 import employee_cards
@@ -182,6 +183,14 @@ def request_expense_api(method, path, **kwargs):
     if not response.ok:
         raise RuntimeError(payload.get("error") or f"Сервер вернул HTTP {response.status_code}.")
     return payload
+
+
+def fetch_management_analytics(parameters):
+    settings = payroll_ui.read_auto_settings(sys.modules[__name__])
+    if settings["schedules"]:
+        return request_expense_api("POST", "/api/admin/analytics", params=parameters,
+                                   json={"schedule_settings": settings})
+    return request_expense_api("GET", "/api/admin/analytics", params=parameters)
 
 
 EXPENSE_DOCUMENT_PAGE_SIZE = 1000
@@ -369,57 +378,6 @@ def ensure_local_service_category_schema(cursor):
                 "WHERE service_type IS NULL AND name = ? AND COALESCE(markning, '') = ?",
                 (service_type, expected_name, marking),
             )
-
-
-def swedish_public_holidays(year):
-    a = year % 19
-    b = year // 100
-    c = year % 100
-    d = b // 4
-    e = b % 4
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i = c // 4
-    k = c % 4
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
-    easter_month = (h + l - 7 * m + 114) // 31
-    easter_day = (h + l - 7 * m + 114) % 31 + 1
-    easter = date(year, easter_month, easter_day)
-    midsummer_day = date(year, 6, 20) + timedelta(
-        days=(5 - date(year, 6, 20).weekday()) % 7
-    )
-    all_saints_day = date(year, 10, 31) + timedelta(
-        days=(5 - date(year, 10, 31).weekday()) % 7
-    )
-    holidays = {
-        date(year, 1, 1), date(year, 1, 6),
-        easter - timedelta(days=2), easter, easter + timedelta(days=1),
-        date(year, 5, 1), easter + timedelta(days=39),
-        easter + timedelta(days=49), midsummer_day, all_saints_day,
-        date(year, 12, 25), date(year, 12, 26),
-    }
-    if year >= 2005:
-        holidays.add(date(year, 6, 6))
-    return holidays
-
-
-def swedish_workday_norm(date_from, date_to, hours_per_day=8.0):
-    start = date.fromisoformat(date_from)
-    end = date.fromisoformat(date_to)
-    if start > end:
-        return 0.0
-    holidays = set()
-    for year in range(start.year, end.year + 1):
-        holidays.update(swedish_public_holidays(year))
-    workdays = 0
-    current = start
-    while current <= end:
-        if current.weekday() < 5 and current not in holidays:
-            workdays += 1
-        current += timedelta(days=1)
-    return workdays * float(hours_per_day)
 
 
 def get_db_connection():
@@ -2827,9 +2785,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.setup_sprav_tab()
         if self.can_request_shift_reopen():
             from analytics_ui import AnalyticsWidget
-            self.analytics_tab = AnalyticsWidget(
-                lambda parameters: request_expense_api("GET", "/api/admin/analytics", params=parameters), self,
-            )
+            self.analytics_tab = AnalyticsWidget(fetch_management_analytics, self)
             self.tabs.addTab(self.analytics_tab, "Аналитика")
         
         self.load_dropdowns()

@@ -1,10 +1,12 @@
 import copy
+from contextlib import closing
 from datetime import date, datetime
 import json
 import unittest
 from unittest.mock import patch
 
 import analytics
+from customer_billing import expense_member, shift_member
 from customer_report import prepare_customer_costs
 from fixed_pricing import create_fixed, fixed_quote
 import payroll_history as payroll
@@ -119,7 +121,7 @@ class AnalyticsTests(unittest.TestCase):
         try:
             obj = c.execute("SELECT * FROM meta_objects WHERE name='Travel A'").fetchone()
             allocation = dict(object_id=obj["id"], company="Renatur", object_name="Travel A",
-                              gross_amount="75", net_amount=None, vat_amount=None)
+                              gross_amount="75", net_amount="60", vat_amount="15")
         finally:
             c.close()
         docs = [self.document(allocations=[allocation])]
@@ -340,6 +342,93 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(data["totals"]["known_hours"], 8)
         self.assertFalse(data["rows"][0]["revenue_missing"])
         self.assertEqual(data["totals"]["revenue"], 0)
+
+    def test_open_payroll_uses_employee_day_across_objects_before_filtering(self):
+        self.submit("day", "work", "Travel A", 0)
+        self.submit("evening", "ob", "Travel B", 0)
+        with closing(self.server.get_db_connection()) as connection:
+            object_id = connection.execute("SELECT id FROM meta_objects WHERE name='Travel B'").fetchone()[0]
+        result = self.calculate(object_key=f"object:{object_id}")
+        self.assertEqual(result["totals"]["wages"], 1320)
+        self.assertEqual(result["totals"]["estimated_wage_records"], 1)
+        settings = dict(version=1, schedules=[dict(
+            employee="Travel Test", effective_from="2026-10-01",
+            schedule=dict(days=[0, 1, 2, 3, 4], start="14:00", end="22:00", breaks=[]),
+        )])
+        with patch.object(self.server, "bearer_admin_user", return_value={"role": "admin"}):
+            response = self.server_client.post(
+                "/api/admin/analytics", query_string=dict(start="2026-10-01", end="2026-10-31",
+                                                           object_key=f"object:{object_id}"),
+                json=dict(schedule_settings=settings),
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["analytics"]["totals"]["wages"], 1120)
+
+    def test_expenses_count_known_object_shares_and_skip_explicit_support(self):
+        with closing(self.server.get_db_connection()) as connection:
+            objects = {row["name"]: row["id"] for row in connection.execute("SELECT id,name FROM meta_objects")}
+        allocations = [
+            dict(object_id=objects["Travel A"], company="Renatur", object_name="Travel A",
+                 gross_amount="125", net_amount="100", vat_amount="25"),
+            dict(object_id=objects["Travel B"], company="Renatur", object_name="Travel B",
+                 gross_amount="100", net_amount=None, vat_amount=None),
+        ]
+        parent = self.document(net="200", gross="225", vat="25", allocations=allocations)
+        support = self.document(allocations=allocations[:1], supporting_to_document_id=1)
+        support["id"] = 2
+        data = self.calculate(documents=[parent, support])
+        self.assertEqual(data["totals"]["expenses"], 100)
+        self.assertEqual(len(data["unknown_expenses"]), 1)
+        self.assertEqual(len(data["billing"]), 2)
+        self.assertIsNone(next(row for row in data["billing"] if row["share"] == 2)["net"])
+        scoped = self.calculate(documents=[parent, support], object_key=f"object:{objects['Travel A']}")
+        self.assertFalse(scoped["totals"]["cost_partial"])
+        self.assertEqual(scoped["totals"]["expenses"], 100)
+        recovered = self.calculate(documents=[parent, support], recover_expense_nets=lambda *args: {1: "100"})
+        self.assertFalse(recovered["totals"]["cost_partial"])
+        self.assertEqual(recovered["totals"]["expenses"], 200)
+        self.assertIsNone(parent["allocations"][1]["net_amount"])
+
+    def test_billing_uses_invoice_members_for_shifts_and_each_expense_share(self):
+        with closing(self.server.get_db_connection()) as connection:
+            for sync_id in ("billed", "legacy", "pending"):
+                self.submit(sync_id, "work", "Travel A", 0)
+                connection.execute("UPDATE incoming_submissions SET created_at=date WHERE sync_id=?", (sync_id,))
+                connection.commit()
+            object_id = connection.execute("SELECT id FROM meta_objects WHERE name='Travel A'").fetchone()[0]
+            billed = dict(connection.execute("SELECT * FROM incoming_submissions WHERE sync_id='billed'").fetchone())
+            allocation = dict(object_id=object_id, company="Renatur", object_name="Travel A",
+                              gross_amount="125", net_amount="100", vat_amount="25")
+            document = self.document(net="200", gross="250", vat="50", sync_version=1,
+                                     allocations=[allocation, {**allocation, "expense_category": "Аренда оборудования"}])
+            connection.execute("INSERT INTO customer_invoice_batches VALUES (?,?,?,?,?,?)",
+                               ("batch", object_id, "INV-40", "2026-11-02", "{}", "2026-11-02"))
+            for member in (shift_member(billed), expense_member(document, 0)):
+                connection.execute("INSERT INTO customer_invoice_members VALUES (?,?,?,?)",
+                                   (member["key"], "batch", object_id, json.dumps(member)))
+            connection.execute("UPDATE incoming_submissions SET invoiced=1 WHERE sync_id IN ('billed','legacy')")
+            connection.commit()
+        data = self.calculate(documents=[document], object_key=f"object:{object_id}")
+        entries = data["billing"]
+        self.assertEqual([(r["status"], r["invoice_number"]) for r in entries if r["kind"] == "shift"],
+                         [("included", "INV-40"), ("legacy", ""), ("pending", "")])
+        self.assertEqual([(r["share"], r["status"], r["invoice_number"]) for r in entries if r["kind"] == "expense"],
+                         [(1, "included", "INV-40"), (2, "pending", "")])
+        self.assertEqual(data["rows"][0]["billing"]["included"], dict(shifts=1, hours=8, expenses=1))
+        from analytics_ui import AnalyticsWidget
+        widget = AnalyticsWidget(lambda _: {"ok": True, "analytics": data})
+        self.addCleanup(widget.deleteLater)
+        self.addCleanup(widget.close)
+        widget.last_parameters = widget.parameters()
+        widget.received(widget.serial, data, "")
+        self.assertEqual(widget.table.item(0, 6).text(), "8 ч · 1 дол.")
+        with patch("analytics_ui.open_billing_details") as details:
+            widget.table.setCurrentCell(0, 0)
+            widget.billing_button.click()
+            self.assertEqual(details.call_args.args[1], entries)
+        document["allocations"][0]["gross_amount"] = "124"
+        self.assertEqual({r["status"] for r in self.calculate(documents=[document])["billing"]
+                          if r["kind"] == "expense"}, {"changed"})
 
     def test_ob_missing_segments_unknown_not_invented_and_no_business_writes(self):
         self.submit("ob", "ob", "Travel B", 1)

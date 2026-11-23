@@ -13,6 +13,7 @@ import csv
 import io
 import uuid
 from pathlib import Path
+from functools import lru_cache
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape
@@ -5494,13 +5495,79 @@ def serialize_submission(row, cursor=None):
         })
     return payload
 
-@app.route("/api/admin/analytics", methods=["GET"])
+@lru_cache(maxsize=128)
+def recover_analytics_object_net(document_json, object_json, files):
+    from object_package_report import _recover_report_share_tax, collect_object_expenses, expense_document_key
+
+    document, target = json.loads(document_json), json.loads(object_json)
+    expenses, _ = collect_object_expenses([document], target["id"])
+    _recover_report_share_tax(
+        {"object": target, "expenses": expenses},
+        {expense_document_key(document): [path for path, _, _ in files]}, {},
+    )
+    return tuple(
+        (index, allocation["net_amount"])
+        for expense in expenses
+        for index, allocation in zip(expense["object_allocation_indexes"], expense["object_allocations"])
+        if allocation.get("net_recovered_from_original")
+    )
+
+
+def analytics_expense_nets(cursor, document, objects):
+    object_ids = {
+        a["object_id"] for a in document["allocations"]
+        if a["object_id"] in objects and not a.get("company_expense")
+        and a.get("destination") != "company" and parse_decimal(a.get("net_amount")) is None
+    }
+    if not object_ids or not document.get("has_original"):
+        return {}
+    originals = cursor.execute("""
+        SELECT stored_name FROM expense_document_attachments WHERE document_id=? ORDER BY ordinal,id
+    """, (document["id"],)).fetchall()
+    if not originals:
+        originals = cursor.execute("SELECT stored_name FROM expense_documents WHERE id=?", (document["id"],)).fetchall()
+    files = []
+    try:
+        root = expense_documents_root()
+        for (name,) in originals:
+            if not name:
+                return {}
+            original = (root / name).resolve()
+            if original.parent != root or not original.is_file():
+                return {}
+            info = original.stat()
+            files.append((str(original), info.st_mtime_ns, info.st_size))
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    identity = {key: document[key] for key in (
+        "id", "client_id", "invoice_number", "net_amount", "vat_amount", "gross_amount",
+        "rounding_amount", "currency_code", "verification_status", "document_date", "allocations",
+    )}
+    recovered = {}
+    for object_id in sorted(object_ids):
+        recovered.update(recover_analytics_object_net(
+            json.dumps(identity, sort_keys=True), json.dumps(objects[object_id], sort_keys=True), tuple(files),
+        ))
+    return recovered
+
+
+@app.route("/api/admin/analytics", methods=["GET", "POST"])
 def management_analytics():
     if bearer_admin_user() is None:
         return jsonify({"ok": False, "error": "Финансовая аналитика доступна только директору/администратору."}), 403
     import analytics
     conn = get_db_connection()
     try:
+        settings = None
+        if request.method == "POST":
+            from payroll_auto import validate_settings
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                raise ValueError("Ожидаются настройки рабочего графика.")
+            try:
+                settings = validate_settings(payload.get("schedule_settings"))
+            except (KeyError, TypeError, AttributeError) as error:
+                raise ValueError("Некорректные настройки рабочего графика.") from error
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
         cursor = conn.cursor()
@@ -5514,6 +5581,7 @@ def management_analytics():
             cursor, request.args.get("start", ""), request.args.get("end", ""),
             [serialize_expense_document(cursor, doc) for doc in documents],
             company=request.args.get("company", ""), object_key=request.args.get("object_key", ""),
+            schedule_settings=settings, recover_expense_nets=lambda doc, objects: analytics_expense_nets(cursor, doc, objects),
         )
         return jsonify({"ok": True, "analytics": result})
     except ValueError as error:

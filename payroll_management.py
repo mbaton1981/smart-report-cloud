@@ -14,6 +14,57 @@ LABELS = dict(day="Без OB", ob1="OB1 +20%", ob2="OB2 +40%",
 PREMIUM = dict(day=0, ob1=.2, ob2=.4, ob3=.7, helg=.7)
 
 
+def swedish_public_holidays(year):
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    easter_month = (h + l - 7 * m + 114) // 31
+    easter_day = (h + l - 7 * m + 114) % 31 + 1
+    easter = date(year, easter_month, easter_day)
+    midsummer_day = date(year, 6, 20) + timedelta(
+        days=(5 - date(year, 6, 20).weekday()) % 7
+    )
+    all_saints_day = date(year, 10, 31) + timedelta(
+        days=(5 - date(year, 10, 31).weekday()) % 7
+    )
+    holidays = {
+        date(year, 1, 1), date(year, 1, 6),
+        easter - timedelta(days=2), easter, easter + timedelta(days=1),
+        date(year, 5, 1), easter + timedelta(days=39),
+        easter + timedelta(days=49), midsummer_day, all_saints_day,
+        date(year, 12, 25), date(year, 12, 26),
+    }
+    if year >= 2005:
+        holidays.add(date(year, 6, 6))
+    return holidays
+
+
+def swedish_workday_norm(date_from, date_to, hours_per_day=8.0):
+    start = date.fromisoformat(date_from)
+    end = date.fromisoformat(date_to)
+    if start > end:
+        return 0.0
+    holidays = set()
+    for year in range(start.year, end.year + 1):
+        holidays.update(swedish_public_holidays(year))
+    workdays = 0
+    current = start
+    while current <= end:
+        if current.weekday() < 5 and current not in holidays:
+            workdays += 1
+        current += timedelta(days=1)
+    return workdays * float(hours_per_day)
+
+
 def split_interval(day, start, end, zone, holidays):
     """Split exact local times; never round or stack weekday and holiday premiums."""
     result = []
