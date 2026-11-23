@@ -1,11 +1,9 @@
-"""Preview the generated PDF bytes; saving and printing never recalculate payroll."""
+"""Open PDFs in a dialog owned by the SmartReport screen that launched them."""
 import logging
 from pathlib import Path
-import shutil
-import tempfile
 
-from PyQt6.QtCore import QBuffer, QIODevice, QPointF, QRectF, QSaveFile, Qt, QUrl
-from PyQt6.QtGui import QDesktopServices, QImage, QPageLayout, QPainter
+from PyQt6.QtCore import QBuffer, QIODevice, QPointF, QRectF, QSaveFile, Qt
+from PyQt6.QtGui import QImage, QPageLayout, QPainter
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
 
@@ -77,6 +75,9 @@ class PayrollPdfPreviewDialog(QDialog):
             button.clicked.connect(callback)
             actions.addWidget(button)
         actions.addStretch()
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(self.reject)
+        actions.addWidget(close_button)
         layout.addLayout(actions)
         layout.addWidget(self.preview, 1)
         self.finished.connect(self.release_resources)
@@ -104,12 +105,13 @@ class PayrollPdfPreviewDialog(QDialog):
         if hasattr(self, "preview"):
             self.preview.setDocument(None)
         self.document.close()
+        self._buffer.close()
         for document in self._pdf_documents:
             document.close()
         self._pdf_documents.clear()
 
     def save_as(self):
-        selected, _ = QFileDialog.getSaveFileName(self, "Сохранить зарплатный PDF",
+        selected, _ = QFileDialog.getSaveFileName(self, "Сохранить PDF",
                                                   str(self.suggested_path), "PDF (*.pdf)")
         if not selected:
             return
@@ -129,10 +131,10 @@ class PayrollPdfPreviewDialog(QDialog):
                 if not output.commit():
                     raise OSError(output.errorString())
         except OSError as error:
-            logger.exception("Salary PDF preview Save As failed; destination=%s", target)
+            logger.exception("PDF preview Save As failed; destination=%s", target)
             QMessageBox.critical(self, "Ошибка сохранения PDF", f"Не удалось сохранить файл:\n{target}\n{error}")
             return
-        logger.info("Salary preview saved: %s", target)
+        logger.info("PDF preview saved: %s", target)
         QMessageBox.information(self, "PDF сохранён", f"Файл сохранён:\n{target}")
 
     def print_pdf(self):
@@ -149,7 +151,7 @@ class PayrollPdfPreviewDialog(QDialog):
         try:
             self.print_document(printer)
         except (OSError, ValueError, RuntimeError) as error:
-            logger.exception("Salary PDF printing failed")
+            logger.exception("PDF preview printing failed")
             QMessageBox.critical(self, "Ошибка печати", f"Не удалось напечатать PDF:\n{error}")
 
     def print_document(self, printer):
@@ -188,27 +190,22 @@ class PayrollPdfPreviewDialog(QDialog):
 
 
 def open_preview(source, suggested_path, parent, *, title=None):
-    try:
-        dialog = PayrollPdfPreviewDialog(source, suggested_path, parent)
-    except (ImportError, OSError, ValueError, RuntimeError) as error:
-        logger.exception("Embedded salary PDF preview unavailable; using system viewer")
-        # The external viewer may load lazily or stay open after SmartReport exits.
-        # Keep its separate temporary file; never give it a file deleted on dialog close.
-        with tempfile.NamedTemporaryFile(prefix="SmartReport-payroll-", suffix=".pdf", delete=False) as temporary:
-            external = Path(temporary.name)
-        try:
-            shutil.copyfile(source, external)
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(external))):
-                raise OSError("Системная программа просмотра PDF не найдена или не открыла файл.")
-        except (OSError, RuntimeError) as fallback_error:
-            external.unlink(missing_ok=True)
-            raise RuntimeError(f"Встроенный просмотр недоступен: {error}\n"
-                               f"Не удалось открыть PDF в системной программе: {fallback_error}") from fallback_error
-        logger.info("Salary PDF opened in system viewer; retained temporary file=%s", external)
-        return
+    dialog = PayrollPdfPreviewDialog(source, suggested_path, parent)
     try:
         if title:
             dialog.setWindowTitle(title)
         dialog.exec()
     finally:
         dialog.release_resources()
+        dialog.deleteLater()
+        if parent is not None and parent.window().isVisible():
+            parent.window().activateWindow()
+
+
+def open_saved_pdf(path, parent, *, title="Просмотр PDF"):
+    path = Path(path).resolve()
+    try:
+        open_preview(path, path, parent, title=title)
+    except (ImportError, OSError, ValueError, RuntimeError) as error:
+        logger.exception("Could not preview PDF: %s", path)
+        QMessageBox.warning(parent, "Просмотр PDF", f"Не удалось открыть PDF:\n{path}\n{error}")

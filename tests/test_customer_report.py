@@ -554,7 +554,7 @@ class CustomerReportTests(unittest.TestCase):
         with (
             patch.object(self.desktop, "write_customer_pdf", side_effect=write),
             patch.object(self.desktop.os, "makedirs"),
-            patch.object(self.desktop.os, "startfile", create=True),
+            patch.object(self.desktop, "open_saved_pdf") as preview,
             patch.object(self.desktop.QMessageBox, "information"),
             patch.object(self.desktop.QMessageBox, "critical") as critical,
         ):
@@ -565,6 +565,11 @@ class CustomerReportTests(unittest.TestCase):
                 )
                 button.click()
         critical.assert_not_called()
+        self.assertEqual(
+            [call.kwargs["title"] for call in preview.call_args_list],
+            ["Отчёт по часам и поездкам", "Журнал работ"],
+        )
+        self.assertTrue(all(call.args[1] is self.window for call in preview.call_args_list))
         self.assertEqual(
             [(journal_only, activity_only, len(pdf.pages)) for journal_only, activity_only, pdf in exported],
             [(False, True, 1), (True, True, 1)],
@@ -600,7 +605,7 @@ class CustomerReportTests(unittest.TestCase):
             patch.object(self.window, "_collect_journal_translations", side_effect=translated),
             patch.object(self.desktop, "write_customer_pdf", side_effect=write),
             patch.object(self.desktop.os, "makedirs"),
-            patch.object(self.desktop.os, "startfile", create=True),
+            patch.object(self.desktop, "open_saved_pdf"),
             patch.object(self.desktop.QMessageBox, "information"),
             patch.object(self.desktop.QMessageBox, "critical") as critical,
         ):

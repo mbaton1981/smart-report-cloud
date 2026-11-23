@@ -1101,6 +1101,15 @@ class ObjectPackageReportTests(unittest.TestCase):
                             " ".join(swedish_text.split()),
                         )
                         self.assertIn("Original invoice page", swedish_text)
+                        message = Mock()
+                        message.clickedButton.return_value = message.addButton.return_value
+                        with patch.object(app, "QMessageBox", return_value=message), \
+                                patch.object(app, "open_saved_pdf") as preview, \
+                                patch.object(app.QDesktopServices, "openUrl") as external:
+                            app.SmartReportApp._on_full_object_report_ready(controller, 7, swedish_result, "")
+                        preview.assert_called_once_with(Path(swedish_result["path"]), controller,
+                                                        title="Полный отчёт по объекту")
+                        external.assert_not_called()
 
 
 class ExpensePaginationTests(unittest.TestCase):

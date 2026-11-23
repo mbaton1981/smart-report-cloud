@@ -51,7 +51,10 @@ def verify_frozen_startup(executable):
         if not (result.get("database_opened") is False
                 and result.get("server_contacted") is False and result.get("field_unchanged") is True):
             raise RuntimeError("Packaged Qt startup did not produce the expected diagnostic result")
-        print("Packaged TLS and Qt startup verified with an isolated profile")
+        pdf = run_diagnostic(executable, "pdf-save-ram", root, environment)
+        if not (pdf.get("returned_to_owner") and pdf.get("memory_pdf_saved") and pdf.get("same_path_saved")):
+            raise RuntimeError("Packaged PDF preview did not open, save and return to its parent window")
+        print("Packaged TLS, Qt startup and PDF preview verified with an isolated profile")
 
 
 if __name__ == "__main__":

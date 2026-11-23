@@ -2,7 +2,6 @@
 import os
 import shutil
 import traceback
-import subprocess
 import sqlite3
 import math
 import requests
@@ -55,6 +54,7 @@ from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_ca
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 import payroll_ui
+from payroll_preview import open_saved_pdf
 import employee_cards
 import desktop_theme
 import input_safety
@@ -5258,14 +5258,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ]
             document.build(story)
             QMessageBox.information(self, "Löneunderlag", f"PDF sparad:\n{base_filename}")
-            if sys.platform == "win32":
-                os.startfile(filepath)
-            elif sys.platform == "darwin":
-                subprocess.run(["open", filepath])
-            else:
-                subprocess.run(["xdg-open", filepath])
         except Exception as error:
             QMessageBox.critical(self, "Löneunderlag", f"Kunde inte skapa PDF: {error}")
+            return
+        open_saved_pdf(filepath, self, title="Зарплатный отчёт")
 
     def setup_balance_tab(self):
         layout = QVBoxLayout(self.tab_balance)
@@ -13319,13 +13315,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 activity_only=True,
             )
             QMessageBox.information(self, "Отчёты и фактурирование", f"PDF sparad:\n{filepath}")
-            if sys.platform == "win32":
-                os.startfile(filepath)
-            else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(filepath)))
         except Exception as error:
             logging.exception("Customer report PDF export failed")
             QMessageBox.critical(self, "Ошибка PDF", f"Не удалось создать PDF: {error}")
+            return
+        open_saved_pdf(filepath, self, title="Журнал работ" if journal_only else "Отчёт по часам и поездкам")
 
     @staticmethod
     def _journal_description_swedish(text):
@@ -16422,7 +16416,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         message.addButton(QMessageBox.StandardButton.Close)
         message.exec()
         if message.clickedButton() is open_pdf:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+            open_saved_pdf(path, self, title="Полный отчёт по объекту")
         elif message.clickedButton() is open_folder:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent.resolve())))
 

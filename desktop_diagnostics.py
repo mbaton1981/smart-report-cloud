@@ -99,11 +99,13 @@ def verify_voice_device_ram(app_module, work_dir, out_path):
 
 
 def verify_pdf_save_ram(app_module, work_dir, out_path):
-    """Exercise frozen PDF Save As without opening any database or server."""
+    """Exercise the saved report preview and Save As without a database or server."""
     from io import BytesIO
     from unittest.mock import patch
     from reportlab.pdfgen import canvas
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtGui import QDesktopServices
+    from PyQt6.QtWidgets import QApplication, QDialog
     import payroll_preview
     application = QApplication.instance() or QApplication([])
     work = Path(work_dir)
@@ -127,9 +129,38 @@ def verify_pdf_save_ram(app_module, work_dir, out_path):
         finally:
             dialog.release_resources()
             dialog.close()
+    parent = QDialog()
+    parent.show()
+    application.processEvents()
+    preview = {}
+
+    def inspect_preview():
+        active = application.activeModalWidget()
+        if active is None:
+            return
+        try:
+            preview["owned"] = active.parent() is parent
+            preview["title"] = active.windowTitle()
+            preview["rendered"] = "Synthetic PDF" in active.document.getAllText(0).text()
+        finally:
+            active.close()
+
+    try:
+        with patch.object(QDesktopServices, "openUrl") as external, \
+                patch.object(payroll_preview.QMessageBox, "warning", side_effect=RuntimeError("PDF viewer failed")):
+            QTimer.singleShot(0, inspect_preview)
+            payroll_preview.open_saved_pdf(target, parent, title="Отчёт SmartReport")
+            external.assert_not_called()
+        application.processEvents()
+        if preview != {"owned": True, "title": "Отчёт SmartReport", "rendered": True}:
+            raise AssertionError("Saved PDF did not open inside the owning SmartReport window")
+        if application.activeModalWidget() is not None or application.activeWindow() is not parent:
+            raise AssertionError("Closing the preview did not return to the owning window")
+    finally:
+        parent.close()
     proof = dict(frozen=bool(getattr(sys, "frozen", False)), memory_pdf_saved=True,
                  same_path_saved=True, database_opened=False, server_contacted=False,
-                 pdf=str(target), sha256=hashlib.sha256(data).hexdigest())
+                 returned_to_owner=True, pdf=str(target), sha256=hashlib.sha256(data).hexdigest())
     Path(out_path).write_text(json.dumps(proof, indent=2), encoding="utf-8")
     return 0
 
@@ -243,7 +274,7 @@ def verify_approved_update(app_module, work_dir, out_path):
     with patch("requests.sessions.Session.request", side_effect=RuntimeError("Read-only verification: network forbidden")), \
             patch.object(app_module, "get_db_connection", connection), \
             patch.object(app_module, "REPORTS_DIR", str(work)), \
-            patch.object(app_module.os, "startfile", create=True), \
+            patch.object(app_module, "open_saved_pdf"), \
             patch.object(QMessageBox, "information") as information, \
             patch.object(QMessageBox, "critical", side_effect=RuntimeError("PDF export failed")):
         window = app_module.SmartReportApp.__new__(app_module.SmartReportApp)
@@ -477,7 +508,7 @@ def verify_reports_ui_readonly(app_module, work_dir, out_path):
             patch.object(app_module, "get_db_connection", connection), \
             patch.object(app_module, "init_db_once"), \
             patch.object(app_module, "REPORTS_DIR", str(work)), \
-            patch.object(app_module.os, "startfile", create=True), \
+            patch.object(app_module, "open_saved_pdf"), \
             patch.object(sys, "excepthook", exception_hook):
         window = app_module.SmartReportApp()
         window.auto_sync_timer.stop()
@@ -773,7 +804,7 @@ def verify_fast_pris_ram(app_module, work_dir, out_path):
     with patch("requests.sessions.Session.request", side_effect=RuntimeError("RAM acceptance: network forbidden")), \
             patch.object(app_module, "get_db_connection", connection), \
             patch.object(app_module, "REPORTS_DIR", str(work)), \
-            patch.object(app_module.os, "startfile", create=True), \
+            patch.object(app_module, "open_saved_pdf"), \
             patch.object(QMessageBox, "information", message), \
             patch.object(QMessageBox, "warning", message), \
             patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \

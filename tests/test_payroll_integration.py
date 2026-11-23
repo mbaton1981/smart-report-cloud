@@ -390,20 +390,21 @@ class PayrollIntegrationTests(unittest.TestCase):
             finally:
                 dialog.release_resources()
 
-    def test_preview_system_fallback_keeps_pdf_available_after_preview_cleanup(self):
+    def test_saved_pdf_preview_failure_reports_existing_file(self):
         with tempfile.TemporaryDirectory() as folder:
             _, window, source = self.preview_pdf_fixture(folder)
             original = source.read_bytes()
+            from PyQt6.QtGui import QDesktopServices
             with patch.object(payroll_preview, "PayrollPdfPreviewDialog", side_effect=ImportError("viewer missing")), \
-                    patch.object(payroll_preview.QDesktopServices, "openUrl", return_value=True) as open_url, \
+                    patch.object(QDesktopServices, "openUrl") as open_url, \
+                    patch.object(payroll_preview.QMessageBox, "warning") as warning, \
                     self.assertLogs("payroll_preview", level="ERROR"):
-                payroll_preview.open_preview(source, source, window)
-            external = Path(open_url.call_args.args[0].toLocalFile())
-            try:
-                self.assertNotEqual(source, external)
-                self.assertEqual(external.read_bytes(), original)
-            finally:
-                external.unlink()
+                payroll_preview.open_saved_pdf(source, window)
+            open_url.assert_not_called()
+            self.assertIs(warning.call_args.args[0], window)
+            self.assertIn(str(source), warning.call_args.args[2])
+            self.assertIn("viewer missing", warning.call_args.args[2])
+            self.assertEqual(source.read_bytes(), original)
 
     def test_preview_print_dialog_accepts_selected_page_and_reports_print_failure(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -454,18 +455,18 @@ class PayrollIntegrationTests(unittest.TestCase):
         picker.assert_not_called()
         self.assertEqual(before, list(conn.iterdump()))
 
-    def test_preview_fallback_failure_shows_clear_error(self):
+    def test_preview_failure_shows_clear_error_and_stays_inside_app(self):
         self.seed_management_shift()
         window = self.salary_window(management_mode=True)
+        from PyQt6.QtGui import QDesktopServices
         with patch.object(payroll_preview, "PayrollPdfPreviewDialog", side_effect=RuntimeError("render failed")), \
-                patch.object(payroll_preview.QDesktopServices, "openUrl", return_value=False) as open_url, \
+                patch.object(QDesktopServices, "openUrl") as open_url, \
                 patch.object(payroll_ui.QMessageBox, "critical") as critical, \
                 self.assertLogs(level="ERROR"):
             payroll_ui.preview(window, self.desktop)
         text = critical.call_args.args[2]
         self.assertIn("render failed", text)
-        self.assertIn("Системная программа", text)
-        self.assertFalse(Path(open_url.call_args.args[0].toLocalFile()).exists())
+        open_url.assert_not_called()
 
     def test_preview_generation_error_and_empty_period_are_visible(self):
         window = self.salary_window(management_mode=True)

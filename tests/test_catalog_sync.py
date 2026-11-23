@@ -3508,7 +3508,7 @@ class CatalogSyncTests(unittest.TestCase):
 
             with patch.object(self.desktop, 'REPORTS_DIR', str(Path(self._case.name) / 'reports')), \
                  patch.object(self.desktop.SimpleDocTemplate, 'build') as build, \
-                 patch.object(self.desktop.os, 'startfile', create=True), \
+                 patch.object(self.desktop, "open_saved_pdf"), \
                  patch.object(self.desktop.QMessageBox, 'information'), \
                  patch.object(self.desktop.QMessageBox, 'critical') as critical, \
                  patch.object(self.desktop.QMessageBox, 'warning') as warning:
@@ -3550,7 +3550,7 @@ class CatalogSyncTests(unittest.TestCase):
             window.inv_date_to.setDate(self.desktop.QDate(2026, 10, 31))
             reports_dir = Path(self._case.name) / 'actual-pdf'
             with patch.object(self.desktop, 'REPORTS_DIR', str(reports_dir)), \
-                 patch.object(self.desktop.os, 'startfile', create=True), \
+                 patch.object(self.desktop, "open_saved_pdf"), \
                  patch.object(self.desktop.QMessageBox, 'information'), \
                  patch.object(self.desktop.QMessageBox, 'critical') as critical:
                 window.export_invoice_to_pdf()
@@ -3703,7 +3703,7 @@ class CatalogSyncTests(unittest.TestCase):
                 reports_dir = Path(self._case.name) / 'ob-only-pdf'
                 with patch.object(self.desktop, 'REPORTS_DIR', str(reports_dir)), \
                      patch.object(window, '_collect_journal_translations', return_value={ob_id: 'Bevarad manuell kommentar'}), \
-                     patch.object(self.desktop.os, 'startfile', create=True), \
+                     patch.object(self.desktop, "open_saved_pdf"), \
                      patch.object(self.desktop.QMessageBox, 'information'), \
                      patch.object(self.desktop.QMessageBox, 'critical') as errors:
                     window.export_invoice_to_pdf()
@@ -7821,7 +7821,7 @@ class CatalogSyncTests(unittest.TestCase):
              patch("payroll_ui.QFileDialog.getSaveFileName",
                    return_value=(str(Path(report_dir)/"Loneunderlag_test.pdf"), "PDF (*.pdf)")), \
              patch.object(self.desktop.QMessageBox, "information"), \
-             patch.object(self.desktop.os, "startfile", create=True):
+             patch.object(self.desktop, "open_saved_pdf"):
             self.desktop.SmartReportApp.export_salary_to_pdf(salary_ui)
             from pypdf import PdfReader
             pdf_path = next(Path(report_dir).glob("Loneunderlag_*.pdf"))

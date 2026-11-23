@@ -20,6 +20,7 @@ from date_widgets import CalendarDateEdit
 from object_records import (
     DOCUMENT_CATEGORIES, OFFER_STATUSES, ObjectRecordError, ObjectRecordStore,
 )
+from payroll_preview import open_saved_pdf
 
 
 FILE_FILTER = (
@@ -42,7 +43,9 @@ def _show_error(parent, title: str, error: Exception):
 
 
 def _open_file(parent, path: Path):
-    if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+    if path.suffix.casefold() == ".pdf":
+        open_saved_pdf(path, parent, title=path.name)
+    elif not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
         QMessageBox.warning(parent, "Открытие файла", "Windows не смогла открыть выбранное вложение.")
 
 
