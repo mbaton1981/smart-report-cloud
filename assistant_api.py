@@ -1124,6 +1124,7 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
             "sick": Decimal("0"),
             "vacation": Decimal("0"),
             "holiday": Decimal("0"),
+            "unpaid_leave": Decimal("0"),
             "unknown": Decimal("0"),
             "records": 0,
             "work_records": 0,
@@ -1169,7 +1170,7 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
                 })
                 unlinked[kind] += hours
                 unlinked["dates"].add(raw["date"])
-        elif kind in {"atf", "sick", "vacation", "holiday"}:
+        elif kind in {"atf", "sick", "vacation", "holiday", "unpaid_leave"}:
             employee_totals[kind] += hours
         else:
             employee_totals["unknown"] += hours
@@ -1598,7 +1599,7 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
         })
 
     totals_by_kind = {kind: sum((entry[kind] for entry in totals.values()), Decimal("0"))
-                      for kind in ("work", "ob", "atf", "sick", "vacation", "holiday", "unknown")}
+                      for kind in ("work", "ob", "atf", "sick", "vacation", "holiday", "unpaid_leave", "unknown")}
     overall_work = totals_by_kind["work"] + totals_by_kind["ob"]
 
     def display(value):
@@ -1612,12 +1613,16 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
             display(entry["atf"]), display(entry["sick"]), display(entry["vacation"]),
             display(entry["holiday"]), display(entry["unknown"]), entry["records"],
         ])
+        if totals_by_kind["unpaid_leave"]:
+            rows[-1].append(display(entry["unpaid_leave"]))
     rows.append([
         "Общий итог", "", display(overall_work), display(totals_by_kind["work"]),
         display(totals_by_kind["ob"]), display(totals_by_kind["atf"]),
         display(totals_by_kind["sick"]), display(totals_by_kind["vacation"]),
         display(totals_by_kind["holiday"]), display(totals_by_kind["unknown"]), processed,
     ])
+    if totals_by_kind["unpaid_leave"]:
+        rows[-1].append(display(totals_by_kind["unpaid_leave"]))
     employee_count = len(totals)
     linked_count = sum(entry["employee_id"] is not None for entry in totals.values())
     unlinked_names = sorted({entry["employee"] for entry in totals.values()
@@ -1627,7 +1632,7 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
         for row in conn.execute(
             "SELECT DISTINCT s.submission_type FROM incoming_submissions s WHERE " +
             " AND ".join(filters) + " AND COALESCE(s.submission_type,'') NOT IN "
-            "('work','ob','atf','sick','vacation','holiday')",
+            "('work','ob','atf','sick','vacation','holiday','unpaid_leave')",
             values,
         )
     }, key=str.casefold)
@@ -1650,6 +1655,10 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
             f'{group["submission_type"]}, {group["hours"]} ч — {group["copies"]} совпадающих записей.'
             for group in duplicate_groups
         )
+    unpaid_leave_summary = (
+        f'Отпуск за свой счёт {display(totals_by_kind["unpaid_leave"])} ч. '
+        if totals_by_kind["unpaid_leave"] else ""
+    )
     summary = (
         f'Период {plan["date_from"]} — {plan["date_to"]}: обработано записей {processed}; '
         f'сотрудников/отдельных групп {employee_count} (связано со справочником {linked_count}); '
@@ -1657,6 +1666,7 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
         f'Остальные категории отдельно: ATF {display(totals_by_kind["atf"])}, '
         f'больничные {display(totals_by_kind["sick"])}, отпуск {display(totals_by_kind["vacation"])}, '
         f'праздничные {display(totals_by_kind["holiday"])} ч. '
+        f'{unpaid_leave_summary}'
         'OB входит в отработанное время и не прибавляется повторно.'
     )
     return {
@@ -1665,6 +1675,7 @@ def submission_hours_summary(conn, plan, *, director_status=False, summary_view=
                 "Сотрудник", "Связь со справочником", "Отработано, ч (OB включён)",
                 "Обычные часы, ч", "OB, ч (включены)", "ATF, ч", "Больничные, ч",
                 "Отпуск, ч", "Праздничные, ч", "Неизвестные типы, ч", "Записей",
+                *(["Отпуск за свой счёт, ч"] if totals_by_kind["unpaid_leave"] else []),
             ],
             "rows": rows,
         },

@@ -154,7 +154,7 @@ class ManagementPayrollTests(unittest.TestCase):
         r = self.report()
         self.assertEqual(r["worked"], 4)
         self.assertEqual(r["total"], 480)
-        self.assertEqual(r["absence"], dict(atf=2, sick=2, vacation=2, holiday=2))
+        self.assertEqual(r["absence"], dict(atf=2, sick=2, vacation=2, holiday=2, unpaid_leave=0))
 
     def test_old_ob_segments_reclassify_only_in_memory(self):
         self.add(kind="ob", start=None, end=None)

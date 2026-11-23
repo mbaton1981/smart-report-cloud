@@ -54,6 +54,10 @@ from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, apply_ca
 from fixed_pricing import fixed_quote, report_agreements, signature
 import payroll_history
 from payroll_management import swedish_public_holidays, swedish_workday_norm
+from service_categories import (
+    ABSENCE_TYPES, SERVICE_OBJECTS as SPECIAL_OBJECTS, SERVICE_TYPE_MARKINGS,
+    UNPAID_LEAVE as RECORD_TYPE_UNPAID_LEAVE, UNPAID_LEAVE_NAME, UNPAID_LEAVE_LABEL_RU,
+)
 import payroll_ui
 from payroll_preview import open_saved_pdf
 import employee_cards
@@ -268,6 +272,7 @@ RECORD_TYPE_LABELS = {
     RECORD_TYPE_SICK: "Больничный",
     RECORD_TYPE_VACATION: "Отпуск / Semestertimmar",
     RECORD_TYPE_HOLIDAY: "Красные дни / Röda dagar",
+    RECORD_TYPE_UNPAID_LEAVE: f"{UNPAID_LEAVE_LABEL_RU} / {UNPAID_LEAVE_NAME}",
     RECORD_TYPE_REVIEW: "Требует проверки",
 }
 
@@ -279,6 +284,7 @@ def record_type_short_label(record_type):
         RECORD_TYPE_SICK: "Больничный",
         RECORD_TYPE_VACATION: "Отпуск",
         RECORD_TYPE_HOLIDAY: "Красные дни",
+        RECORD_TYPE_UNPAID_LEAVE: UNPAID_LEAVE_LABEL_RU,
         RECORD_TYPE_REVIEW: "Проверка",
     }
     return mapping.get(record_type, "Работа")
@@ -307,18 +313,6 @@ def format_ob_detail(start_time, end_time, total_hours, segments=None):
         parts.append(f"{hrs:g} ч {short_cat}")
     breakdown_str = " / ".join(parts)
     return f"{interval_str}: {breakdown_str}" if breakdown_str else interval_str
-SPECIAL_OBJECTS = {
-    RECORD_TYPE_ATF: ("Arbetstidsförkortning", "p1000"),
-    RECORD_TYPE_SICK: ("Sjuk", "p1001"),
-    RECORD_TYPE_VACATION: ("Semestertimmar", "p1002"),
-    RECORD_TYPE_HOLIDAY: (None, "p1004"),
-}
-SERVICE_TYPE_MARKINGS = {
-    RECORD_TYPE_ATF: "p1000",
-    RECORD_TYPE_SICK: "p1001",
-    RECORD_TYPE_VACATION: "p1002",
-    RECORD_TYPE_HOLIDAY: "p1004",
-}
 SERVICE_TYPE_DESCRIPTIONS = {
     RECORD_TYPE_ATF: (
         "АТФ: часы выделяются отдельно от обычной работы и клиентского счёта. "
@@ -335,6 +329,10 @@ SERVICE_TYPE_DESCRIPTIONS = {
     RECORD_TYPE_HOLIDAY: (
         "Красные дни: часы выделяются отдельно от обычной работы и клиентского счёта. "
         "В текущей зарплатной истории они отображаются отдельно и не получают отдельную оплату."
+    ),
+    RECORD_TYPE_UNPAID_LEAVE: (
+        "Отпуск за свой счёт · P1003. Часы отсутствия видны бухгалтеру отдельно. "
+        "Оплата по этой записи — 0 SEK."
     ),
 }
 
@@ -366,6 +364,8 @@ def ensure_local_service_category_schema(cursor):
         if column_name not in columns:
             cursor.execute(f"ALTER TABLE objects ADD COLUMN {column_name} {definition}")
     for service_type, (expected_name, marking) in SPECIAL_OBJECTS.items():
+        if service_type == RECORD_TYPE_UNPAID_LEAVE:
+            continue
         if expected_name is None:
             cursor.execute(
                 "UPDATE objects SET service_type = ?, service_builtin = 1 "
@@ -1740,7 +1740,7 @@ def calculate_payroll_components(
 def compact_blocked_shift_operations(cursor, allowed_types=None):
     allowed_types = set(allowed_types or (
         RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK, RECORD_TYPE_VACATION,
-        RECORD_TYPE_HOLIDAY,
+        RECORD_TYPE_HOLIDAY, RECORD_TYPE_UNPAID_LEAVE,
     ))
     cursor.execute("SELECT DISTINCT sync_id FROM shift_sync_outbox WHERE state = 'blocked'")
     sync_ids = [row['sync_id'] for row in cursor.fetchall()]
@@ -2842,10 +2842,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.load_companies_into_combobox(self.comp_cb)
 
         self.record_type_cb = QComboBox()
-        for record_type in (
-            RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF,
-            RECORD_TYPE_SICK, RECORD_TYPE_VACATION, RECORD_TYPE_HOLIDAY,
-        ):
+        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, *ABSENCE_TYPES):
             self.record_type_cb.addItem(record_type_label(record_type), record_type)
         
         self.obj_cb = QComboBox()
@@ -3307,10 +3304,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 return
 
         record_type = shift.get('record_type') or shift.get('submission_type') or RECORD_TYPE_WORK
-        if record_type not in (
-            RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK,
-            RECORD_TYPE_VACATION, RECORD_TYPE_HOLIDAY, RECORD_TYPE_OB,
-        ):
+        if record_type not in (RECORD_TYPE_WORK, RECORD_TYPE_OB, *ABSENCE_TYPES):
             record_type = RECORD_TYPE_REVIEW
         if record_type == RECORD_TYPE_WORK:
             work_rate_cache = float(shift.get('rate', 0.0) or 0.0)
@@ -3766,6 +3760,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         typed_sync_supported = False
         vacation_sync_supported = False
         holiday_sync_supported = False
+        unpaid_leave_sync_supported = False
         ob_sync_supported = False
         capability_data = {}
         schema_conn = get_db_connection()
@@ -3791,6 +3786,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     RECORD_TYPE_HOLIDAY in submission_types
                     and capability_data.get('typed_tombstones') is True
                 )
+                unpaid_leave_sync_supported = (
+                    RECORD_TYPE_UNPAID_LEAVE in submission_types
+                    and capability_data.get('typed_tombstones') is True
+                )
                 ob_sync_supported = (
                     "ob" in set(capability_data.get('submission_types', []))
                     and capability_data.get('typed_tombstones') is True
@@ -3799,6 +3798,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             typed_sync_supported = False
             vacation_sync_supported = False
             holiday_sync_supported = False
+            unpaid_leave_sync_supported = False
             ob_sync_supported = False
 
         response = session.get(f"{CLOUD_URL}/get-unsynced", headers=headers, timeout=4)
@@ -3836,7 +3836,17 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         conn.close()
 
         manual_requested = bool(getattr(self, '__dict__', {}).get('_manual_sync_requested', False))
-        pull_since = 0 if manual_requested else current_cursor
+        # Older clients safely stored unknown types as "review". Replay those records
+        # once after the upgrade so confirmed server types are restored.
+        conn = get_db_connection()
+        try:
+            legacy_leave = unpaid_leave_sync_supported and conn.execute(
+                "SELECT 1 FROM shifts WHERE entry_type=? AND object_name=? LIMIT 1",
+                (RECORD_TYPE_REVIEW, UNPAID_LEAVE_NAME),
+            ).fetchone()
+        finally:
+            conn.close()
+        pull_since = 0 if manual_requested or legacy_leave else current_cursor
         response = session.get(
             f"{CLOUD_URL}/sync/pull", headers=headers, params={"since": pull_since}, timeout=4
         )
@@ -3872,31 +3882,22 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
-        if not ob_sync_supported:
-            cursor.execute("SELECT id, payload_json FROM shift_sync_outbox WHERE state = 'pending'")
-            for outbox_row in cursor.fetchall():
-                if json.loads(outbox_row['payload_json']).get('record_type') == RECORD_TYPE_OB:
-                    cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE id = ?", (outbox_row['id'],))
-        if not vacation_sync_supported:
-            cursor.execute("SELECT id, payload_json FROM shift_sync_outbox WHERE state = 'pending'")
-            for outbox_row in cursor.fetchall():
-                if json.loads(outbox_row['payload_json']).get('record_type') == RECORD_TYPE_VACATION:
-                    cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE id = ?", (outbox_row['id'],))
-        if not holiday_sync_supported:
-            cursor.execute("SELECT id, payload_json FROM shift_sync_outbox WHERE state = 'pending'")
-            for outbox_row in cursor.fetchall():
-                if json.loads(outbox_row['payload_json']).get('record_type') == RECORD_TYPE_HOLIDAY:
-                    cursor.execute("UPDATE shift_sync_outbox SET state = 'blocked' WHERE id = ?", (outbox_row['id'],))
-        if typed_sync_supported or vacation_sync_supported or holiday_sync_supported or ob_sync_supported:
-            allowed_types = set()
-            if typed_sync_supported:
-                allowed_types.update((RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK))
-            if vacation_sync_supported:
-                allowed_types.add(RECORD_TYPE_VACATION)
-            if holiday_sync_supported:
-                allowed_types.add(RECORD_TYPE_HOLIDAY)
-            if ob_sync_supported:
-                allowed_types.add(RECORD_TYPE_OB)
+        optional_types = {
+            RECORD_TYPE_OB: ob_sync_supported,
+            RECORD_TYPE_VACATION: vacation_sync_supported,
+            RECORD_TYPE_HOLIDAY: holiday_sync_supported,
+            RECORD_TYPE_UNPAID_LEAVE: unpaid_leave_sync_supported,
+        }
+        unsupported = {kind for kind, supported in optional_types.items() if not supported}
+        for outbox_row in cursor.execute(
+            "SELECT id, payload_json FROM shift_sync_outbox WHERE state = 'pending'"
+        ).fetchall():
+            if json.loads(outbox_row['payload_json']).get('record_type') in unsupported:
+                cursor.execute("UPDATE shift_sync_outbox SET state='blocked' WHERE id=?", (outbox_row['id'],))
+        allowed_types = {kind for kind, supported in optional_types.items() if supported}
+        if typed_sync_supported:
+            allowed_types.update((RECORD_TYPE_WORK, RECORD_TYPE_ATF, RECORD_TYPE_SICK))
+        if allowed_types:
             compact_blocked_shift_operations(cursor, allowed_types)
         cursor.execute('''
             SELECT o.operation_id, o.sync_id, o.operation, o.base_version, o.payload_json
@@ -3981,7 +3982,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 conn.close()
 
         catalog_response = session.get(
-            f"{CLOUD_URL}/api/expense-objects?include_inactive=1&include_service_categories=1",
+            f"{CLOUD_URL}/api/expense-objects?include_inactive=1&include_service_categories=1&include_unpaid_leave=1",
             headers=headers,
             timeout=4,
         )
@@ -15548,7 +15549,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             service_type = type_field.currentData()
             description.setText(
                 SERVICE_TYPE_DESCRIPTIONS[service_type]
-                if service_type else "Выберите один из четырёх поддерживаемых типов. "
+                if service_type else "Выберите тип расчёта из списка. "
                 "Новые формулы и автоматический подбор не применяются."
             )
 
@@ -15576,7 +15577,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if not name or not company or service_type not in SPECIAL_OBJECTS:
             QMessageBox.warning(
                 self, "Служебная категория",
-                "Укажите название, фирму и явно выберите один из четырёх поддерживаемых типов расчёта.",
+                "Укажите название, фирму и выберите тип расчёта.",
             )
             return None
         return name, company, service_type
@@ -17266,6 +17267,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         
         if record_type in (
             RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_VACATION, RECORD_TYPE_HOLIDAY,
+            RECORD_TYPE_UNPAID_LEAVE,
         ):
             self.background_sync_with_cloud()
             QMessageBox.information(self, "Успех", "OB-интервал сохранён и рассчитан." if record_type == RECORD_TYPE_OB else "Смена успешно сохранена!")
@@ -17632,10 +17634,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         company_field.addItems(companies)
         company_field.setCurrentText(shift['company'])
         record_type_field = QComboBox()
-        for record_type in (
-            RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_ATF,
-            RECORD_TYPE_SICK, RECORD_TYPE_VACATION, RECORD_TYPE_HOLIDAY,
-        ):
+        for record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, *ABSENCE_TYPES):
             record_type_field.addItem(record_type_label(record_type), record_type)
         current_type = shift['entry_type'] or RECORD_TYPE_REVIEW
         work_values = [
@@ -18041,7 +18040,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB, RECORD_TYPE_HOLIDAY):
             self.background_sync_with_cloud()
             QMessageBox.information(self, "Изменение сохранено", "Запись сохранена.")
-        elif record_type == RECORD_TYPE_VACATION:
+        elif record_type in (RECORD_TYPE_VACATION, RECORD_TYPE_UNPAID_LEAVE):
             self.background_sync_with_cloud()
             QMessageBox.information(self, "Изменение сохранено", "Запись сохранена и поставлена в очередь синхронизации.")
         else:

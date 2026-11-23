@@ -201,6 +201,7 @@
                         <option value="sick">Больничный</option>
                         <option value="vacation">Отпуск / Semestertimmar</option>
                         <option value="holiday">Красные дни / Röda dagar</option>
+                        <option value="unpaid_leave">Отпуск за свой счёт / Obetald ledighet</option>
                         <option value="ob">OB/сверхурочные</option>
                     </select>
                 </div>
@@ -313,6 +314,7 @@
                 <option value="sick">Больничный</option>
                 <option value="vacation">Отпуск / Semestertimmar</option>
                 <option value="holiday">Красные дни / Röda dagar</option>
+                <option value="unpaid_leave">Отпуск за свой счёт / Obetald ledighet</option>
                 <option value="ob">OB/сверхурочные</option>
             </select>
             <label for="edit-object">Объект</label>
@@ -499,6 +501,9 @@
                     opt.textContent = obj.display;
                     objectSelect.appendChild(opt);
                 });
+                if (submissionType === 'unpaid_leave' && filtered.length === 1) {
+                    objectSelect.selectedIndex = 1;
+                }
             }
         }
 
@@ -506,15 +511,12 @@
             const submissionType = document.getElementById('submission_type').value;
             const special = !['work', 'ob'].includes(submissionType);
             const isOb = submissionType === 'ob';
-            document.getElementById('hours-label').textContent = isOb
-                ? 'Рассчитано часов:'
-                : (submissionType === 'atf'
-                    ? 'Часы АТФ:'
-                    : (submissionType === 'sick'
-                        ? 'Больничные часы:'
-                        : (submissionType === 'vacation'
-                            ? 'Отпускные часы:'
-                            : (submissionType === 'holiday' ? 'Праздничные нерабочие часы:' : 'Отработано часов:'))));
+            const hoursLabels = {
+                ob: 'Рассчитано часов:', atf: 'Часы АТФ:', sick: 'Больничные часы:',
+                vacation: 'Отпускные часы:', holiday: 'Праздничные нерабочие часы:',
+                unpaid_leave: 'Часы отсутствия без оплаты:'
+            };
+            document.getElementById('hours-label').textContent = hoursLabels[submissionType] || 'Отработано часов:';
             document.getElementById('hours').readOnly = isOb;
             document.getElementById('ob-fields').style.display = isOb ? 'block' : 'none';
             const transportCheck = document.getElementById('transport_check');
@@ -1134,6 +1136,7 @@
                 let totalSickHours = 0;
                 let totalVacationHours = 0;
                 let totalHolidayHours = 0;
+                let totalUnpaidLeaveHours = 0;
                 let totalObHours = 0;
                 let totalsByObject = {};
 
@@ -1146,6 +1149,7 @@
                         const typeLabels = {
                             work: 'Работа', atf: 'АТФ', sick: 'Больничный',
                             vacation: 'Отпуск / Semestertimmar',
+                            unpaid_leave: 'Отпуск за свой счёт / Obetald ledighet',
                             holiday: 'Красные дни / Röda dagar', ob: 'OB/сверхурочные'
                         };
                         const typeLabel = typeLabels[submissionType] || 'Неизвестный тип';
@@ -1239,6 +1243,7 @@
                         else if (submissionType === 'sick') totalSickHours += shift.hours;
                         else if (submissionType === 'vacation') totalVacationHours += shift.hours;
                         else if (submissionType === 'holiday') totalHolidayHours += shift.hours;
+                        else if (submissionType === 'unpaid_leave') totalUnpaidLeaveHours += shift.hours;
                         else if (submissionType === 'ob') totalObHours += shift.hours;
 
                         let rawComment = shift.comment || "";
@@ -1303,8 +1308,9 @@
                     document.getElementById('print-table-body').innerHTML = printTableHtml;
                     document.getElementById('print-summary').innerHTML = summaryHtml;
                     document.getElementById('print-total-hours').textContent = `Рабочие часы: ${totalWorkHours} ч`;
-                    document.getElementById('print-special-hours').textContent = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · Красные дни: ${totalHolidayHours} ч · OB: ${formatObHours(totalObHours)} ч`;
-                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · Красные дни: ${totalHolidayHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    const specialHours = `АТФ: ${totalAtfHours} ч · Больничный: ${totalSickHours} ч · Отпуск: ${totalVacationHours} ч · Красные дни: ${totalHolidayHours} ч · За свой счёт: ${totalUnpaidLeaveHours} ч · OB: ${formatObHours(totalObHours)} ч`;
+                    document.getElementById('print-special-hours').textContent = specialHours;
+                    document.getElementById('history-period-totals').textContent = `Работа: ${totalWorkHours} ч · ${specialHours}`;
 
                 } else {
                     listContainer.innerHTML = '<li style="color: #636e72; justify-content: center;">За этот месяц нет записей о сменах.</li>';

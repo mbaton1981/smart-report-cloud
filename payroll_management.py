@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import payroll_history as history
 import payroll_auto as automatic
+from service_categories import ABSENCE_TYPES, UNPAID_LEAVE
 
 
 VERSION = "management-auto-payroll-2026-11-v3"
@@ -81,7 +82,7 @@ def split_interval(day, start, end, zone, holidays):
 
 def line(row, saved, zone, start, end, rate, holidays, classified=None):
     kind = row.get("entry_type", "work")
-    if kind not in ("work", "ob", "atf", "sick", "vacation", "holiday"):
+    if kind not in ("work", "ob", *ABSENCE_TYPES):
         return None
     hours = history.number(row["hours"], 48)
     warnings, segments = [], []
@@ -104,6 +105,8 @@ def line(row, saved, zone, start, end, rate, holidays, classified=None):
         all_hours = dict(categories, **overtime)
         premium = history.money(sum(Decimal(str(all_hours[key]))*Decimal(str(value))*Decimal(str(rate))
                                     for key, value in automatic.PREMIUM.items()))
+    if kind == UNPAID_LEAVE:
+        base = premium = 0.0
     if rate is None and worked:
         warnings.append("Зарплатная ставка в справочнике не задана: выгружены часы без суммы.")
     return dict(sync_id=row["sync_id"], date=row["date"], company=row["company"],
@@ -157,7 +160,7 @@ def reports(cursor, start, end, holidays, norm, settings=None):
             standard_norm=standard_norm, norm=standard_norm, norm_override=False,
             above_norm=max(0, worked-standard_norm),
             absence={key: sum(l["hours"] for l in lines if l["kind"] == key)
-                     for key in ("atf", "sick", "vacation", "holiday")},
+                     for key in ABSENCE_TYPES},
             saved_periods=sum(name == employee and left <= end and start <= right for name, left, right in periods),
         ))
     return result

@@ -10,6 +10,9 @@ from ob_calculator import calculate_work_interval, load_ob_rules
 
 RULES_VERSION = "payroll-1"
 WRITES_ENABLED = True
+from service_categories import ABSENCE_TYPES, UNPAID_LEAVE
+
+
 PARAMETERS = ("vacation", "tax", "employer_fee", "atf", "sick")
 
 
@@ -154,12 +157,21 @@ def signature(row, saved):
 def calculate_line(row, saved, rates, zones, start, end, overrides=None, reprice=False):
     source = signature(row, saved)
     kind = source["kind"]
-    if kind not in ("work", "ob", "atf", "sick", "vacation", "holiday"):
+    if kind not in ("work", "ob", *ABSENCE_TYPES):
         return None
     zone = zones.get((row["company"], row["object_name"]))
     zone_name = zone["timezone"] if zone else None
     segments, warnings = [], []
     hours = number(row["hours"], 48)
+    if kind == UNPAID_LEAVE:
+        day = row["date"]
+        if not start <= day <= end:
+            return None
+        segment = dict(date=day, hours=hours, rate=None, multiplier=0, amount=0.0,
+                       category=kind, premium_percent=0, source=UNPAID_LEAVE)
+        return dict(sync_id=row["sync_id"], kind=kind, source=source, timezone=zone_name,
+                    ambiguous_policy=zone["ambiguous_policy"] if zone else None,
+                    segments=[segment], hours=hours, warnings=[], amount=0.0)
     timed = bool(row.get("start_time") and row.get("end_time"))
     intervals = []
     if kind == "ob" and saved and not reprice:

@@ -325,6 +325,12 @@
             <span>Totalt röda dagar:</span>
             <span>{{ "%.2f"|format(totals_by_type.holiday) }} tim</span>
         </div>
+        {% if totals_by_type.unpaid_leave %}
+        <div class="totals-bar" style="margin-top: 8px; border-top: 1px dashed #b2bec3; font-size: 15px;">
+            <span>Obetald ledighet (P1003):</span>
+            <span>{{ "%.2f"|format(totals_by_type.unpaid_leave) }} tim</span>
+        </div>
+        {% endif %}
 
         <div class="signature-block">
             <div class="sig-line">Underskrift medarbetare</div>

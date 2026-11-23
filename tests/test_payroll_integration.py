@@ -602,7 +602,7 @@ class PayrollIntegrationTests(unittest.TestCase):
         window = self.salary_window(management_mode=True)
         report = payroll_ui.selected_reports(window, self.desktop)[0]
         items = [dict(report, employee=f"Андрей Пискун {i:02}", rate=245.8,
-                      absence=dict(atf=1, sick=1, vacation=1, holiday=1)) for i in range(12)]
+                      absence=dict(atf=1, sick=1, vacation=1, holiday=1, unpaid_leave=1)) for i in range(12)]
         pdf = BytesIO()
         with patch.object(payroll_ui, "LongTable", wraps=payroll_ui.LongTable) as table:
             payroll_ui.write_pdf(pdf, items, self.desktop.DEFAULT_FONT, self.desktop.DEFAULT_FONT_BOLD)

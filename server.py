@@ -35,6 +35,10 @@ from ob_calculator import calculate_work_interval
 from api_auth import LoginThrottle, ensure_token_table, issue_token, lookup_token, revoke_token
 from web_login_throttle import SQLiteLoginThrottle
 from object_reports import register_object_reports
+from service_categories import (
+    ABSENCE_TYPES, SERVICE_OBJECTS as SPECIAL_SUBMISSION_OBJECTS, SERVICE_TYPE_MARKINGS,
+    UNPAID_LEAVE, UNPAID_LEAVE_NAME,
+)
 from customer_pricing import NEW_SHIFT_PRICE_SOURCE, new_shift_pricing, ensure_pricing_schema, pricing_json, store_pricing, require_final_prices, reopen_invoiced_shifts
 from fixed_pricing import validate_fixed_storage
 import payroll_history
@@ -54,19 +58,7 @@ from reportlab.platypus import LongTable, Paragraph, SimpleDocTemplate, Spacer, 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SUBMISSION_TYPES = {"work", "atf", "sick", "vacation", "holiday", "ob"}
-SPECIAL_SUBMISSION_OBJECTS = {
-    "atf": ("Arbetstidsförkortning", "p1000"),
-    "sick": ("Sjuk", "p1001"),
-    "vacation": ("Semestertimmar", "p1002"),
-    "holiday": (None, "p1004"),
-}
-SERVICE_TYPE_MARKINGS = {
-    "atf": "p1000",
-    "sick": "p1001",
-    "vacation": "p1002",
-    "holiday": "p1004",
-}
+SUPPORTED_SUBMISSION_TYPES = {"work", "ob", *ABSENCE_TYPES}
 
 
 def matches_special_submission_object(name, marking, reference):
@@ -96,6 +88,8 @@ def ensure_cloud_service_category_schema(cursor):
         if column_name not in columns:
             cursor.execute(f"ALTER TABLE meta_objects ADD COLUMN {column_name} {definition}")
     for submission_type, (expected_name, marking) in SPECIAL_SUBMISSION_OBJECTS.items():
+        if submission_type == UNPAID_LEAVE:
+            continue
         if expected_name is None:
             cursor.execute(
                 "UPDATE meta_objects SET service_type = ?, service_builtin = 1 "
@@ -110,13 +104,41 @@ def ensure_cloud_service_category_schema(cursor):
             )
 
 
+def ensure_unpaid_leave_objects(cursor):
+    name, marking = SPECIAL_SUBMISSION_OBJECTS[UNPAID_LEAVE]
+    companies = cursor.execute("""
+        SELECT DISTINCT company FROM meta_objects
+        WHERE service_builtin=1 AND is_active=1 AND company IS NOT NULL AND company <> ''
+    """).fetchall()
+    for (company,) in companies:
+        existing = cursor.execute("""
+            SELECT name, service_type FROM meta_objects WHERE company=? AND (
+                service_type=? OR lower(trim(name))=lower(?)
+                OR lower(replace(markning, ' ', '')) IN (?, ?)
+            )
+        """, (company, UNPAID_LEAVE, name, marking, marking.removeprefix("p"))).fetchall()
+        alias = cursor.execute("""
+            SELECT 1 FROM service_category_aliases
+            WHERE company=? AND lower(trim(name))=lower(?) LIMIT 1
+        """, (company, name)).fetchone()
+        if existing or alias:
+            if not any(service_type == UNPAID_LEAVE for _, service_type in existing):
+                logger.warning("Unpaid leave category needs review: marking or name already in use for %s", company)
+            continue
+        cursor.execute("""
+            INSERT INTO meta_objects
+                (sync_id, name, markning, company, sync_version, service_type, service_builtin)
+            VALUES (?, ?, ?, ?, 1, ?, 1)
+        """, (str(uuid.uuid4()), name, marking, company, UNPAID_LEAVE))
+
+
 def resolve_submission_type(data, default="work"):
     provided = [data[key] for key in ("submission_type", "record_type") if key in data]
     if len(provided) == 2 and provided[0] != provided[1]:
         raise ValueError("Поля submission_type и record_type не совпадают.")
     submission_type = str(provided[0] if provided else default).strip()
     if submission_type not in SUPPORTED_SUBMISSION_TYPES:
-        raise ValueError("Неизвестный тип записи. Допустимы work, atf, sick, vacation, holiday, ob.")
+        raise ValueError("Неизвестный тип записи.")
     return submission_type
 
 
@@ -692,6 +714,7 @@ def init_cloud_db():
         if column_name not in object_columns:
             cursor.execute(f"ALTER TABLE meta_objects ADD COLUMN {column_name} {column_sql}")
     ensure_cloud_service_category_schema(cursor)
+    ensure_unpaid_leave_objects(cursor)
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_objects_sync_id ON meta_objects(sync_id) WHERE sync_id IS NOT NULL")
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS object_sync_events (
@@ -1971,6 +1994,8 @@ def expense_objects_api():
             conditions.append("is_active = 1")
         if not include_service_categories:
             conditions.append("service_type IS NULL")
+        elif request.args.get("include_unpaid_leave") != "1":
+            conditions.append("COALESCE(service_type, '') <> 'unpaid_leave'")
         query = (
             "SELECT id, sync_id, name, markning, company, rate, transport_rate, "
             "is_active, sync_version, service_type, service_builtin FROM meta_objects"
@@ -4266,7 +4291,8 @@ def check_missing_shifts():
     
     cursor.execute("""
         SELECT date FROM incoming_submissions
-        WHERE employee = ? AND date >= ? AND date <= ? AND is_deleted = 0 AND submission_type IN ('work', 'ob')
+        WHERE employee = ? AND date >= ? AND date <= ? AND is_deleted = 0
+          AND submission_type IN ('work', 'ob', 'unpaid_leave')
     """, (emp, start_check.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')))
     
     existing_dates = {row['date'] for row in cursor.fetchall()}
@@ -4307,7 +4333,7 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         FROM incoming_submissions
         WHERE normalize_employee_name(employee) = ?
           AND date >= ? AND date < ? AND is_deleted = 0
-          AND submission_type IN ('work', 'ob', 'vacation', 'holiday')
+          AND submission_type IN ('work', 'ob', 'vacation', 'holiday', 'unpaid_leave')
         ORDER BY date ASC, id ASC
     ''', (
         normalize_employee_name(employee),
@@ -4321,8 +4347,9 @@ def fetch_arbetsdagbok_records(cursor, employee, selected_month):
         'ob': 'Arbete (OB-post)',
         'vacation': 'Semester / Semestertimmar',
         'holiday': 'Röda dagar',
+        UNPAID_LEAVE: UNPAID_LEAVE_NAME,
     }
-    totals_by_type = {'work': 0.0, 'ob': 0.0, 'vacation': 0.0, 'holiday': 0.0}
+    totals_by_type = dict.fromkeys(type_labels, 0.0)
     totals_by_object = {}
     formatted_shifts = []
 
@@ -4559,6 +4586,10 @@ def download_arbetsdagbok_pdf():
         story.append(Paragraph(f"<b>Arbetad tid i OB-poster (hela passet): {total_ob:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt semester: {total_vacation:.2f} tim</b>", meta_style))
         story.append(Paragraph(f"<b>Totalt röda dagar: {total_holiday:.2f} tim</b>", meta_style))
+        if totals_by_type.get(UNPAID_LEAVE):
+            story.append(Paragraph(
+                f"<b>{UNPAID_LEAVE_NAME}: {totals_by_type[UNPAID_LEAVE]:.2f} tim</b>", meta_style,
+            ))
         document.build(story)
         output.seek(0)
     except Exception:

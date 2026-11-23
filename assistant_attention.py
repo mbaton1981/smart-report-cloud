@@ -195,7 +195,7 @@ def hours_weekly_overview(employees, rows, period, *, company="", object_name=""
         profiles[key] = {"name": employee["name"], "active": bool(employee["is_active"]),
                          "linked": True, "days": {}}
     absence = {"vacation": "Отпуск", "sick": "Больничный", "atf": "АТФ",
-               "holiday": "Красный день"}
+               "holiday": "Красный день", "unpaid_leave": "Отпуск за свой счёт"}
     unlinked, unknown_types = set(), set()
     for row in rows:
         if company and row.get("company") != company or object_name and row.get("object_name") != object_name:

@@ -26,6 +26,7 @@ import payroll_management as management
 import payroll_auto as automatic
 import desktop_theme
 from date_widgets import CalendarDateEdit
+from service_categories import ABSENCE_TYPES, UNPAID_LEAVE, UNPAID_LEAVE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ HISTORY_HEADERS = [
     "OB timmar /\nspecifikation", "Сверх нормы, ч", "Grundlön + OB\n(SEK)", "Semesterersättning\n(SEK)",
     "ATF/KLS\n(SEK)", "Sjuklön\n(SEK)", "Skatt\n(SEK)", "Nettolön\n(SEK)",
     "Arbetsgivaravgifter\n(SEK)", "Total kostnad\n(SEK)", "Semestertimmar\ntim", "Röda dagar\ntim",
+    "Obetald ledighet\ntim",
 ]
 MANAGEMENT_HEADERS = [
     "ФИО", "Ставка,\nSEK/ч", "Всего,\nч", "Обычные,\nч", "OB1\n+20%, ч", "OB2\n+40%, ч",
@@ -41,9 +43,10 @@ MANAGEMENT_HEADERS = [
     "Сверх нормы,\nч",
     "Övertid A\n+30%, ч", "Övertid B\n+50%, ч", "Övertid C\n+70%, ч", "Övertid D\n+100%, ч",
     "ATF,\nч", "Болезнь,\nч", "Отпуск,\nч", "Праздн.,\nч",
+    "За свой счёт,\nч",
 ]
 
-ABSENCE_KEYS = ("atf", "sick", "vacation", "holiday")
+ABSENCE_KEYS = ABSENCE_TYPES
 ABSENCE_START = 15
 
 
@@ -224,7 +227,7 @@ def summary_values(report):
             summary_money(report["total"]),
             f"{report['above_norm']:g}",
             *[f"{report.get('overtime', {}).get(key, 0):g}" for key in automatic.OVERTIME],
-            *[f"{report['absence'][key]:g}" for key in ABSENCE_KEYS]]
+            *[f"{report['absence'].get(key, 0):g}" for key in ABSENCE_KEYS]]
 
 
 def summary_money(value):
@@ -237,7 +240,7 @@ def summary_total(items):
                 categories={k: sum(r["categories"][k] for r in items) for k in management.CATEGORIES},
                 overtime={k: sum(r.get("overtime", {}).get(k, 0) for r in items) for k in automatic.OVERTIME},
                 total=None if any(r["total"] is None for r in items) else history.money(sum(r["total"] for r in items)),
-                absence={k: sum(r["absence"][k] for r in items) for k in ABSENCE_KEYS})
+                absence={k: sum(r["absence"].get(k, 0) for r in items) for k in ABSENCE_KEYS})
 
 
 def estimate_note(report):
@@ -464,7 +467,8 @@ def render_management(window, app):
                 table.setItem(index, column, item)
         for column in range(table.columnCount()):
             table.setColumnWidth(column, 150 if column == 0 else 125)
-            table.setColumnHidden(column, column >= ABSENCE_START and not any(r["absence"][ABSENCE_KEYS[column-ABSENCE_START]] for r in items))
+            table.setColumnHidden(column, column >= ABSENCE_START and not any(
+                r["absence"].get(ABSENCE_KEYS[column-ABSENCE_START], 0) for r in items))
         table.resizeRowsToContents()
     finally:
         table.blockSignals(False)
@@ -597,10 +601,11 @@ def render(window, app):
         for index, report in enumerate(items):
             lines = report["lines"]
             hours = {kind: sum(line["hours"] for line in lines if line["kind"] == kind)
-                     for kind in ("work", "ob", "atf", "sick", "vacation", "holiday")}
-            rates = sorted({s["rate"] for line in lines for s in line["segments"] if s["rate"] is not None})
+                     for kind in ("work", "ob", *ABSENCE_KEYS)}
+            pay_segments = [s for line in lines if line["kind"] != UNPAID_LEAVE for s in line["segments"]]
+            rates = sorted({s["rate"] for s in pay_segments if s["rate"] is not None})
             rate_text = " / ".join(number(rate) for rate in rates)
-            if not rate_text or any(s["rate"] is None for line in lines for s in line["segments"]):
+            if pay_segments and (not rate_text or any(s["rate"] is None for s in pay_segments)):
                 rate_text = (rate_text+" / " if rate_text else "")+"Требует подтверждения"
             values = [
                 report["employee"], f"{hours['work']:g}", f"{hours['atf']:g}", f"{hours['sick']:g}",
@@ -609,7 +614,7 @@ def render(window, app):
                 *[number(report["amounts"][key] if report["amounts"] else None) for key in (
                     "base_salary", "vacation_pay", "atf_pay", "sick_pay", "tax",
                     "net_pay", "employer_fee", "employer_total_cost")],
-                f"{hours['vacation']:g}", f"{hours['holiday']:g}",
+                f"{hours['vacation']:g}", f"{hours['holiday']:g}", f"{hours[UNPAID_LEAVE]:g}",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -921,16 +926,20 @@ def write_pdf(path, items, font, bold):
                       p(f"Beräkningsversion: {report['rules_version']} · Revision: {report.get('revision', 'utkast')}"),
                       p("Löneberäkning är inte en utbetalning. Balans ändras inte."), Spacer(1, 12)])
         hours = {kind: sum(line["hours"] for line in report["lines"] if line["kind"] == kind)
-                 for kind in ("work", "ob", "atf", "sick", "vacation", "holiday")}
+                 for kind in ("work", "ob", *ABSENCE_KEYS)}
         story.append(p(" · ".join(f"{label}: {hours[kind]:g} tim" for kind, label in (
             ("work", "Arbete"), ("ob", "OB"), ("atf", "ATF"), ("sick", "Sjukfrånvaro"),
             ("vacation", "Semestertimmar"), ("holiday", "Röda dagar")))))
+        if hours[UNPAID_LEAVE]:
+            story.append(p(f"{UNPAID_LEAVE_NAME} (P1003): {hours[UNPAID_LEAVE]:g} tim"))
         if "overtime_hours" in report:
             story.append(p(f"Сверх нормы, ч: {report['overtime_hours']:g}"))
         rows = [[p(v) for v in ("Datum / post", "Tim", "Timlön", "Faktor", "Belopp SEK")]]
         for line in report["lines"]:
             for s in line["segments"]:
-                rows.append([p(f"{s['date']} · {line['kind']}"), p(f"{s['hours']:g}"), p(number(s["rate"])),
+                label = UNPAID_LEAVE_NAME if line["kind"] == UNPAID_LEAVE else line["kind"]
+                rate_text = "—" if line["kind"] == UNPAID_LEAVE else number(s["rate"])
+                rows.append([p(f"{s['date']} · {label}"), p(f"{s['hours']:g}"), p(rate_text),
                              p(f"{s['multiplier']:g}"), p(number(s["amount"]))])
             for warning in line["warnings"]:
                 rows.append([p(warning), "", "", "", ""])
@@ -956,7 +965,8 @@ def write_management_pdf(path, items, font, bold):
     report = items[0]
     has_overtime = any(sum(r.get("overtime", {}).values()) for r in items)
     columns = [*range(11), *([-1] if has_overtime else []),
-               *[ABSENCE_START+i for i, key in enumerate(ABSENCE_KEYS) if any(r["absence"][key] for r in items)]]
+               *[ABSENCE_START+i for i, key in enumerate(ABSENCE_KEYS)
+                 if any(r["absence"].get(key, 0) for r in items)]]
     headers = ["Övertid,\nч" if i == -1 else MANAGEMENT_HEADERS[i] for i in columns]
     rows = [[Paragraph(escape(header).replace("\n", "<br/>"), header_style) for header in headers]]
     rows.extend([p(f"{sum(r.get('overtime', {}).values()):g}" if i == -1 else summary_values(r)[i])
@@ -985,6 +995,8 @@ def write_management_pdf(path, items, font, bold):
              "Privat — без доплат. Официальное начисление — Fortnox."),
              p("Övertid в будни — дополнительные интервалы при отработанном обычном дне по графику. "
                "Расчёт по предоставленной памятке; актуальность соглашения отдельно не проверена.")]
+    if any(r["absence"].get(UNPAID_LEAVE, 0) for r in items):
+        story.append(p("За свой счёт · P1003 · Obetald ledighet. Оплата за эти часы — 0 SEK."))
     if has_overtime:
         ot_rows = [[p("Сотрудник"), *[p(automatic.LABELS[k]+", ч") for k in automatic.OVERTIME]]]
         for entry in [*items, summary_total(items)]:

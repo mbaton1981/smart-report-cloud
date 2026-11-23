@@ -27,6 +27,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import LongTable, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 from werkzeug.utils import secure_filename
+from service_categories import UNPAID_LEAVE, UNPAID_LEAVE_LABEL_RU, UNPAID_LEAVE_NAME
 
 
 logger = logging.getLogger(__name__)
@@ -271,7 +272,7 @@ def build_report(conn: sqlite3.Connection, project: ReportObject, start: date, e
     for record in records:
         kind = record["submission_type"]
         employee = " ".join(record["employee"].split())
-        if kind not in TYPE_LABELS or not employee:
+        if (kind not in TYPE_LABELS and kind != UNPAID_LEAVE) or not employee:
             raise ReportDataError("В серверных записях обнаружен неизвестный тип часов или пустой сотрудник.")
         try:
             hours = Decimal(str(record["hours"]))
@@ -288,15 +289,16 @@ def build_report(conn: sqlite3.Connection, project: ReportObject, start: date, e
         for (day, employee, kind), hours in sorted(grouped.items())
     ]
     by_employee: dict[str, dict[str, Decimal]] = {}
+    kinds = (*TYPE_LABELS, UNPAID_LEAVE) if any(row.kind == UNPAID_LEAVE for row in rows) else tuple(TYPE_LABELS)
     for row in rows:
-        totals = by_employee.setdefault(row.employee, dict.fromkeys(TYPE_LABELS, ZERO))
+        totals = by_employee.setdefault(row.employee, dict.fromkeys(kinds, ZERO))
         totals[row.kind] += row.hours
     employees = [
         EmployeeTotal(name, hours)
         for name, hours in sorted(by_employee.items(), key=lambda item: item[0].casefold())
     ]
     totals = EmployeeTotal("Totalt", {
-        kind: sum((employee.hours[kind] for employee in employees), ZERO) for kind in TYPE_LABELS
+        kind: sum((employee.hours[kind] for employee in employees), ZERO) for kind in kinds
     })
     overlap, incomplete = check_ob_overlap(conn, project, start, end)
     return ObjectReport(
@@ -321,7 +323,14 @@ def _pdf_font() -> str:
     return name
 
 
+def report_type_labels(report: ObjectReport | None, labels: dict, leave_label: str) -> dict:
+    if report is not None and UNPAID_LEAVE in report.totals.hours:
+        return {**labels, UNPAID_LEAVE: leave_label}
+    return labels
+
+
 def report_pdf(report: ObjectReport) -> io.BytesIO:
+    labels = report_type_labels(report, TYPE_LABELS, UNPAID_LEAVE_NAME)
     font = _pdf_font()
     style = ParagraphStyle("ObjectReportCell", fontName=font, fontSize=8, leading=11)
     heading = ParagraphStyle(
@@ -362,16 +371,17 @@ def report_pdf(report: ObjectReport) -> io.BytesIO:
     for warning in report.warnings_sv:
         story.extend([Paragraph(escape(warning), warning_style), Spacer(1, 3 * mm)])
     summary: list[list[object]] = [[
-        "Medarbetare", *TYPE_LABELS.values(), "Totalt registrerade timmar",
+        "Medarbetare", *labels.values(), "Totalt registrerade timmar",
     ]]
     for employee in [*report.employees, report.totals]:
         summary.append([
-            employee.employee, *[f"{employee.hours[k]:.2f}" for k in TYPE_LABELS],
+            employee.employee, *[f"{employee.hours[k]:.2f}" for k in labels],
             f"{employee.total:.2f}",
         ])
-    story.extend([table(summary, [52 * mm] + [28 * mm] * 6 + [32 * mm]), Spacer(1, 6 * mm)])
+    story.extend([table(summary, [52 * mm] + [168 * mm / len(labels)] * len(labels) + [32 * mm]),
+                  Spacer(1, 6 * mm)])
     details: list[list[object]] = [["Datum", "Medarbetare", "Typ", "Timmar"]]
-    details.extend([[r.day, r.employee, TYPE_LABELS[r.kind], f"{r.hours:.2f}"] for r in report.rows])
+    details.extend([[r.day, r.employee, labels[r.kind], f"{r.hours:.2f}"] for r in report.rows])
     if not report.rows:
         story.append(paragraph("Inga poster för vald period."))
     else:
@@ -392,6 +402,7 @@ def report_pdf(report: ObjectReport) -> io.BytesIO:
 
 
 def report_xlsx(report: ObjectReport) -> io.BytesIO:
+    labels = report_type_labels(report, TYPE_LABELS, UNPAID_LEAVE_NAME)
     workbook = Workbook()
     summary = workbook.active
     if summary is None:
@@ -402,21 +413,24 @@ def report_xlsx(report: ObjectReport) -> io.BytesIO:
         [f"Period: {report.start.isoformat()} – {report.end.isoformat()} (inklusive)"],
         [f"Skapad: {report.generated_at}"], [SOURCE_NOTE], [ROUNDING_NOTE],
         [ACCOUNTING_NOTE], *[[warning] for warning in report.warnings_sv], [],
-        ["Medarbetare", *TYPE_LABELS.values(), "Totalt registrerade timmar"],
+        ["Medarbetare", *labels.values(), "Totalt registrerade timmar"],
     ]:
         summary.append(line)
     summary_header = summary.max_row
     for employee in [*report.employees, report.totals]:
         summary.append([
-            employee.employee, *[employee.hours[k] for k in TYPE_LABELS],
+            employee.employee, *[employee.hours[k] for k in labels],
             employee.total,
         ])
     details = workbook.create_sheet("Timmar")
     details.append(["Datum", "Medarbetare", "Typ", "Timmar"])
     for row in report.rows:
-        details.append([date.fromisoformat(row.day), row.employee, TYPE_LABELS[row.kind], row.hours])
+        details.append([date.fromisoformat(row.day), row.employee, labels[row.kind], row.hours])
+    summary_widths = [42, 15, 18, 12, 12, 15, 17]
+    if UNPAID_LEAVE in labels:
+        summary_widths.append(20)
     for sheet, header, widths in [
-        (summary, summary_header, [42, 15, 18, 12, 12, 15, 17, 28]),
+        (summary, summary_header, [*summary_widths, 28]),
         (details, 1, [16, 42, 24, 16]),
     ]:
         sheet.freeze_panes = f"B{header + 1}"
@@ -437,7 +451,7 @@ def report_xlsx(report: ObjectReport) -> io.BytesIO:
                     cell.fill = PatternFill("solid", fgColor="24527A")
         if sheet == summary:
             for row in range(2, summary_header - 1):
-                sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+                sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(widths))
                 sheet.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
                 sheet.row_dimensions[row].height = 32
                 if row >= 8:
@@ -504,7 +518,8 @@ def register_object_reports(app: Flask, database_path: Callable[[], str]) -> Non
             } if report else {}
             return render_template(
                 "object_report.html", projects=projects, report=report, values=values, error=error,
-                type_labels=TYPE_LABELS_RU, history_note=HISTORY_NOTE, accounting_note=ACCOUNTING_NOTE_RU,
+                type_labels=report_type_labels(report, TYPE_LABELS_RU, UNPAID_LEAVE_LABEL_RU),
+                history_note=HISTORY_NOTE, accounting_note=ACCOUNTING_NOTE_RU,
                 pdf_url=url_for(".object_report", output_format="pdf", **export_args) if report else "",
                 xlsx_url=url_for(".object_report", output_format="xlsx", **export_args) if report else "",
             ), status
