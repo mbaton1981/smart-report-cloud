@@ -57,7 +57,7 @@ class HistoricalPricesTests(unittest.TestCase):
 
     def load_history(self):
         if not hasattr(self.window, "table_shifts"):
-            self.window.table_shifts = self.desktop.QTableWidget(0, 15)
+            self.window.table_shifts = self.desktop.QTableWidget(0, 12)
         with patch.object(self.window, "load_dropdowns"), \
                 patch.object(self.window, "apply_shifts_filters"), \
                 patch.object(self.desktop.QMessageBox, "critical") as error:
@@ -166,19 +166,19 @@ class HistoricalPricesTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM shift_sync_outbox").fetchone()[0], queued)
         self.assertEqual(self.window.generate_invoice()["totals"]["work_amount"], (610 + 600) * 8)
 
-    def test_ob_history_shows_client_base_and_premiums_not_payroll(self):
+    def test_ob_history_and_editor_keep_historical_client_prices(self):
         identifier = self.ob()
         self.conn.execute("UPDATE shifts SET customer_pricing=NULL,start_time='16:00',end_time='20:00'")
         self.conn.commit()
         segments = list(map(tuple, self.conn.execute("SELECT * FROM ob_segments")))
         self.load_history()
         self.assertEqual(self.window.table_shifts.item(0, 8).text(), "Не задана")
-        self.assertEqual(self.window.table_shifts.item(0, 13).text(), "Не задана")
         self.confirm_period()
         self.load_history()
         self.assertEqual(self.window.table_shifts.item(0, 8).text(), "520.00")
-        self.assertEqual(self.window.table_shifts.item(0, 13).text(), "125.00")
-        self.assertEqual(self.window.table_shifts.item(0, 14).text(), "Не задана")
+        quote = row_prices(dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone()))
+        self.assertEqual(quote["ob"]["weekday_early_evening"], 125)
+        self.assertIsNone(quote["ob"].get("weekday_late_evening_night"))
         self.assertEqual(list(map(tuple, self.conn.execute("SELECT * FROM ob_segments"))), segments)
         self.assertEqual(self.window.generate_invoice()["totals"]["ob_amount"], 250)
         self.window.table_shifts.selectRow(0)
@@ -204,7 +204,8 @@ class HistoricalPricesTests(unittest.TestCase):
         self.assertEqual(list(map(tuple, self.conn.execute("SELECT * FROM ob_segments"))), segments)
         self.load_history()
         self.assertEqual(self.window.table_shifts.item(0, 8).text(), "550.00")
-        self.assertEqual(self.window.table_shifts.item(0, 13).text(), "150.00")
+        quote = row_prices(dict(self.conn.execute("SELECT * FROM shifts WHERE sync_id=?", (identifier,)).fetchone()))
+        self.assertEqual(quote["ob"]["weekday_early_evening"], 150)
 
     def test_merging_missing_prices_does_not_extend_individual_validity(self):
         identifier = self.shift()

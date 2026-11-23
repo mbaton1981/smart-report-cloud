@@ -52,7 +52,7 @@ class ReopenShiftTests(unittest.TestCase):
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
         self.addCleanup(window.deleteLater)
-        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.table_shifts = self.desktop.QTableWidget(0, 12)
         window.reopen_shift_btn = self.desktop.QPushButton()
         window.reopen_shift_btn.clicked.connect(window.reopen_selected_shift)
         window.load_dropdowns = lambda **kwargs: None
@@ -388,6 +388,11 @@ class ReopenShiftTests(unittest.TestCase):
             window.resize(1450, 1000)
             window.show()
             self.qt_app.processEvents()
+            table = window.table_shifts
+            self.assertEqual(table.columnCount(), 12)
+            self.assertEqual(table.horizontalHeaderItem(11).text(), "Статус часов / счёта")
+            self.assertGreater(table.columnWidth(4), table.columnWidth(3))
+            self.assertGreater(table.columnWidth(10), table.columnWidth(3))
             self.assertEqual(window.table_shifts.currentRow(), -1)
             item = window.table_shifts.item(0, 2)
             QTest.mouseClick(window.table_shifts.viewport(), Qt.MouseButton.LeftButton,

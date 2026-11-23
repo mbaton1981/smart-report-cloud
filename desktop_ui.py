@@ -76,8 +76,10 @@ class ExpenseRegisterTableDelegate(TableDelegate):
 
 
 class ReportTable(QTableWidget):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, stretch_columns=None, column_widths=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._stretch_columns = stretch_columns
+        self._column_widths = column_widths or {}
         self._refresh_pending = False
         self._refreshing = False
         self.setItemDelegate(TableDelegate(self))
@@ -127,22 +129,36 @@ class ReportTable(QTableWidget):
         try:
             header = self.horizontalHeader()
             header.setStretchLastSection(False)
+            flexible_columns = self._stretch_columns
+            if flexible_columns is None:
+                flexible_columns = tuple(column for column in range(self.columnCount())
+                                         if self.role_for_column(column) == "text")
             for column in range(self.columnCount()):
-                mode = (QHeaderView.ResizeMode.Stretch if self.role_for_column(column) == "text"
-                        else QHeaderView.ResizeMode.ResizeToContents)
-                header.setSectionResizeMode(column, mode)
+                if column in flexible_columns:
+                    header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+                elif column in self._column_widths:
+                    header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+                    header.resizeSection(column, self._column_widths[column])
+                else:
+                    header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
             text_columns = [column for column in range(self.columnCount())
-                            if not self.isColumnHidden(column) and self.role_for_column(column) == "text"]
+                            if not self.isColumnHidden(column) and column in flexible_columns]
             fixed_width = sum(header.sectionSize(column) for column in range(self.columnCount())
                               if not self.isColumnHidden(column) and column not in text_columns)
             minimum_text_width = 0
             for column in text_columns:
                 item = self.horizontalHeaderItem(column)
                 lines = item.text().splitlines() if item and item.text() else [""]
-                minimum_text_width += max(120, header.fontMetrics().horizontalAdvance(max(lines, key=len)) + 24)
+                minimum_text_width += self._column_widths.get(
+                    column, max(120, header.fontMetrics().horizontalAdvance(max(lines, key=len)) + 24),
+                )
             if self.viewport().width() - fixed_width < minimum_text_width:
                 for column in text_columns:
-                    header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+                    if column in self._column_widths:
+                        header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+                        header.resizeSection(column, self._column_widths[column])
+                    else:
+                        header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
             self.setTextElideMode(Qt.TextElideMode.ElideNone)
             self.resizeRowsToContents()
         finally:

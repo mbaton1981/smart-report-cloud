@@ -3091,30 +3091,19 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout.addWidget(journal_header)
         desktop_theme.adapt_box_layout(journal_header, journal_row, compact_width=495)
         
-        self.table_shifts = QTableWidget()
+        self.table_shifts = QTableWidget(
+            stretch_columns=(4, 10),
+            column_widths={4: 190, 7: 175, 8: 128, 10: 210, 11: 180},
+        )
         self.table_shifts.setMinimumHeight(220)
-        self.table_shifts.setColumnCount(15)
-        self.table_shifts.setHorizontalHeaderLabels(["ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы", "Детализация / OB", "Клиентская ставка (SEK/ч)", "Транспорт", "Комментарий", "Статус часов / счёта", "Зарплата OB (SEK)", "Клиентская доплата OB1 (SEK/ч)", "Клиентская доплата OB2 (SEK/ч)"])
+        headers = [
+            "ID", "Дата", "Сотрудник", "Фирма", "Объект", "Тип", "Часы",
+            "Детализация / OB", "Ставка клиента\n(SEK/ч)", "Транспорт",
+            "Комментарий", "Статус часов / счёта",
+        ]
+        self.table_shifts.setColumnCount(len(headers))
+        self.table_shifts.setHorizontalHeaderLabels(headers)
         self.table_shifts.setColumnHidden(0, True)
-        shifts_header = self.table_shifts.horizontalHeader()
-        shifts_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for column, width in {
-            1: 95,   # Дата: узкая ровно под YYYY-MM-DD
-            2: 125,  # Сотрудник: ровно под ФИО
-            3: 105,  # Фирма
-            4: 135,  # Объект
-            5: 75,   # Тип: узкая (Работа / OB / АТФ / Больничный)
-            6: 60,   # Часы: узкая под 2-3 цифры (напр. 8.0)
-            7: 175,  # Детализация / OB (16:00–23:00 (7 ч) / 2 ч OB1 / 2 ч OB2...)
-            8: 130,
-            9: 70,   # Транспорт: узкая под 0.0 / 1.0
-            11: 180, # Статус часов / счёта
-            12: 95,  # OB сумма (SEK)
-            13: 130,
-            14: 130,
-        }.items():
-            self.table_shifts.setColumnWidth(column, width)
-        shifts_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)  # Комментарий: забирает всё свободное место
         self.table_shifts.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.table_shifts.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table_shifts.setAlternatingRowColors(True)
@@ -17384,14 +17373,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     return f"{value:.2f}" if value is not None else "Не задана"
 
                 detalization = ""
-                ob_amount_str = ""
                 detail_tooltip = ""
                 if has_ob_schema and entry_type == RECORD_TYPE_OB:
                     segments = ob_segments_by_id.get(row["sync_id"], [])
-                    ob_amount = sum(segment["amount"] for segment in segments) if segments else None
-                    ob_amount_str = f"{ob_amount:.2f}" if ob_amount is not None else "Неизвестно"
                     detalization = format_ob_detail(row['start_time'], row['end_time'], row['hours'], segments)
                     if segments:
+                        ob_amount = sum(segment["amount"] for segment in segments)
                         detail_tooltip = ";\n".join(
                             f"{s['segment_date']} {s['start_time']}–{s['end_time']}: {s['hours']:.2f} ч (×{s['multiplier']:.2f}, {s['amount']:.2f} kr)"
                             for s in segments
@@ -17420,9 +17407,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     f"{float(row['transport'] or 0.0):.1f}" if row['transport'] else "0.0", # 9: Транспорт
                     row["comment"] or "",                            # 10: Комментарий
                     status_text,                                     # 11: Статус фактуры
-                    ob_amount_str,                                   # 12: OB сумма (SEK)
-                    client_rate(prices["ob"].get("weekday_early_evening")) if entry_type == RECORD_TYPE_OB else "—",
-                    client_rate(prices["ob"].get("weekday_late_evening_night")) if entry_type == RECORD_TYPE_OB else "—",
                 ]
 
                 for col_idx, val in enumerate(values):
@@ -17430,11 +17414,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     if col_idx == 0:
                         it.setData(Qt.ItemDataRole.UserRole, row["id"])
                         it.setData(Qt.ItemDataRole.UserRole + 1, row["sync_id"])
-                    if col_idx in (1, 5, 6, 8, 9, 11, 12, 13, 14):
+                    if col_idx in (1, 5, 6, 8, 9, 11):
                         it.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                     if col_idx == 7 and detail_tooltip:
                         it.setToolTip(detail_tooltip)
-                    elif col_idx in (8, 13, 14):
+                    elif col_idx == 8:
                         it.setToolTip("Применённая историческая клиентская цена из того же снимка, что и в отчёте. Не зарплатная ставка.")
                     elif col_idx in (2, 3, 4, 7, 10) and val:
                         it.setToolTip(str(val))

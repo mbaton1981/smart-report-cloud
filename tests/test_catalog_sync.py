@@ -6470,7 +6470,7 @@ class CatalogSyncTests(unittest.TestCase):
         window.setCentralWidget(window.tabs)
         window.resize(1600, 1000)
         window.table_shifts = self.desktop.QTableWidget()
-        window.table_shifts.setColumnCount(15)
+        window.table_shifts.setColumnCount(12)
         window.apply_shifts_filters = lambda: None
         window._sync_worker = None
         window._manual_sync_requested = False
@@ -6569,7 +6569,7 @@ class CatalogSyncTests(unittest.TestCase):
         window.tabs.addTab(self.desktop.QWidget(), "Ввод часов")
         window.tab_sprav = self.desktop.QWidget()
         window.tabs.addTab(window.tab_sprav, "Справочники")
-        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.table_shifts = self.desktop.QTableWidget(0, 12)
         window.apply_shifts_filters = lambda: None
         try:
             with patch.object(window, "load_employees_table") as employees_refresh, \
@@ -6620,7 +6620,7 @@ class CatalogSyncTests(unittest.TestCase):
 
         window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
         self.desktop.QMainWindow.__init__(window)
-        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.table_shifts = self.desktop.QTableWidget(0, 12)
         window.filter_obj = QComboBox()
         window.filter_obj.addItem("Current site", object_sync_id)
         window.filter_date_from = QLineEdit("2026-10-21")
@@ -6760,7 +6760,7 @@ class CatalogSyncTests(unittest.TestCase):
         window.tabs.addTab(self.desktop.QWidget(), "Ввод часов")
         window.tab_sprav = self.desktop.QWidget()
         window.tabs.addTab(window.tab_sprav, "Справочники")
-        window.table_shifts = self.desktop.QTableWidget(0, 15)
+        window.table_shifts = self.desktop.QTableWidget(0, 12)
         window.table_shifts.setSelectionBehavior(
             self.desktop.QAbstractItemView.SelectionBehavior.SelectRows
         )
