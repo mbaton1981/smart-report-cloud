@@ -8016,6 +8016,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_docs_result_count = QLabel("—")
         register_title_row.addWidget(register_title)
         register_title_row.addStretch(1)
+        register_title_row.addWidget(self._expense_original_archive_button(self.table_supplier_documents))
         register_title_row.addWidget(self.exp_docs_result_count)
         register_layout.addLayout(register_title_row)
         register_layout.addWidget(self.table_supplier_documents, 1)
@@ -8050,7 +8051,15 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         detail_layout.addWidget(self.exp_detail_preview)
         self.exp_detail_original_button = QPushButton("Открыть оригинал")
         self.exp_detail_original_button.clicked.connect(self.open_selected_document_original)
-        detail_layout.addWidget(self.exp_detail_original_button)
+        self.exp_detail_copy_button = QPushButton("Скачать копию")
+        self.exp_detail_copy_button.clicked.connect(
+            lambda: self._save_selected_expense_original(self.table_supplier_documents)
+        )
+        self.exp_detail_copy_button.setToolTip("Сохраняет оригинал со всеми страницами.")
+        original_actions = QHBoxLayout()
+        original_actions.addWidget(self.exp_detail_original_button)
+        original_actions.addWidget(self.exp_detail_copy_button)
+        detail_layout.addLayout(original_actions)
 
         info_grid = QGridLayout()
         self.exp_detail_values = {}
@@ -8384,6 +8393,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.exp_assign_button.setEnabled(False)
             self.exp_primary_action.setEnabled(False)
             self.exp_detail_original_button.setEnabled(False)
+            self.exp_detail_copy_button.setEnabled(False)
             return
 
         status = self._expense_register_status_key(document)
@@ -8481,6 +8491,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.exp_primary_action.setText("Проверить фактуру")
 
         self.exp_detail_original_button.setEnabled(True)
+        self.exp_detail_copy_button.setEnabled(bool(
+            document.get("local_attachment_paths") or document.get("attachments") or document.get("has_original")
+        ))
         self.exp_detail_preview.setPixmap(QPixmap())
         local_paths = [
             Path(path) for path in document.get("local_attachment_paths") or []
@@ -8807,6 +8820,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.object_expenses_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.object_expenses_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.object_expenses_table.cellDoubleClicked.connect(self.open_selected_object_expense_original)
+        controls.addWidget(self._expense_original_archive_button(self.object_expenses_table))
         layout.addWidget(self.object_expenses_table, 1)
 
         actions = QHBoxLayout()
@@ -8819,6 +8833,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         delete_button.clicked.connect(self.delete_selected_object_expense)
         open_button = QPushButton("Открыть оригинал")
         open_button.clicked.connect(self.open_selected_object_expense_original)
+        copy_button = QPushButton("Скачать копию")
+        copy_button.setToolTip("Сохраняет оригинал выбранного документа со всеми страницами.")
+        copy_button.clicked.connect(lambda: self._save_selected_expense_original(self.object_expenses_table))
         classify_button = QPushButton("Разобрать расходы по категориям")
         classify_button.clicked.connect(self.open_expense_category_review)
         auto_classify_button = QPushButton("Авторазбор всех объектов")
@@ -8826,7 +8843,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         retry_originals_button = QPushButton("Повторить проверку оригиналов")
         retry_originals_button.clicked.connect(self.retry_object_expense_original_recovery)
         for button in (
-            edit_button, vat_button, delete_button, open_button,
+            edit_button, vat_button, delete_button, open_button, copy_button,
             auto_classify_button, classify_button, retry_originals_button,
         ):
             actions.addWidget(button)
@@ -12253,6 +12270,110 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         document = self._selected_expense_document(self.object_expenses_table)
         if document:
             self._open_expense_document_original(document)
+
+    def _expense_original_archive_button(self, table):
+        button = QPushButton("Скачать копии (ZIP)")
+        button.setToolTip(
+            "Оригиналы всех документов в текущей выборке. Файл может содержать позиции других объектов."
+        )
+        button.clicked.connect(lambda: self._save_visible_expense_originals(table))
+        return button
+
+    def _save_selected_expense_original(self, table):
+        document = self._selected_expense_document(table)
+        if document:
+            self._save_expense_originals([document], archive=False)
+
+    def _save_visible_expense_originals(self, table):
+        documents = {}
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is None or table.isRowHidden(row):
+                continue
+            document = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(document, dict):
+                identity = self._expense_document_identity(document)
+                if identity is not None:
+                    documents.setdefault(identity, document)
+        if not documents:
+            QMessageBox.information(self, "Копии расходов", "В текущей выборке нет документов.")
+            return
+        self._save_expense_originals(list(documents.values()), archive=True)
+
+    def _save_expense_originals(self, documents, *, archive):
+        from PyQt6.QtCore import QStandardPaths
+        from PyQt6.QtWidgets import QProgressDialog
+        from expense_original_export import build_original_export, save_original_copy
+
+        title = "Копии расходов"
+        with tempfile.TemporaryDirectory(prefix="sr-expense-copies-") as directory:
+            loop = QEventLoop()
+            result = []
+            progress = QProgressDialog("Готовим копии оригиналов…", "", 0, 0, self)
+            progress.setWindowTitle(title)
+            progress.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+            progress.setCancelButton(None)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            task = ObjectPackageTask(
+                0, lambda report: build_original_export(
+                    documents, directory, self._download_object_report_originals,
+                    archive=archive, progress=report,
+                ),
+            )
+
+            def completed(_request_id, export, error):
+                result.append((export, error))
+                loop.quit()
+
+            task.signals.progress.connect(lambda _request_id, message: progress.setLabelText(message))
+            task.signals.completed.connect(completed)
+            progress.show()
+            QThreadPool.globalInstance().start(task)
+            loop.exec()
+            progress.close()
+            progress.deleteLater()
+            if not result:
+                return
+            export, error = result[0]
+            if error:
+                QMessageBox.warning(self, title, f"Подготовить копии не удалось.\n{error}")
+                return
+            source, filename, count, missing = export
+            missing_text = ""
+            if missing:
+                missing_text = f"Недоступны все или часть оригиналов у {len(missing)} документов.\n"
+                missing_text += "\n".join(missing[:8])
+                if len(missing) > 8:
+                    missing_text += f"\nЕщё документов: {len(missing) - 8}."
+            if not count:
+                QMessageBox.warning(self, title, missing_text or "В выборке нет доступных оригиналов.")
+                return
+            if missing_text:
+                QMessageBox.warning(self, title, "Будут сохранены доступные копии.\n" + missing_text)
+            downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+            extension = Path(filename).suffix
+            filters = "Архив ZIP (*.zip)" if extension.lower() == ".zip" else "Все файлы (*)"
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Сохранить копии расходов" if extension == ".zip" else "Сохранить копию расхода",
+                str(Path(downloads) / filename), filters,
+            )
+            if not filename:
+                return
+            target = Path(filename)
+            if extension and not target.suffix:
+                target = target.with_suffix(extension)
+                if target.exists() and QMessageBox.question(
+                    self, title, f"Заменить существующий файл «{target.name}»?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+            try:
+                save_original_copy(source, target)
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, title, f"Сохранить копии не удалось.\n{error}")
+                return
+        self.statusBar().showMessage(f"Сохранено файлов: {count} · {target}", 12000)
 
     def _expense_document_original_paths(self, document):
         local_paths = document.get("local_attachment_paths") or []

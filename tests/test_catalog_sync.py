@@ -2435,6 +2435,52 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_expense_original_export_saves_selected_and_visible_copies(self):
+        from hashlib import sha256
+        from zipfile import ZipFile
+
+        desktop = self.desktop
+        root = Path(self._case.name)
+        local_pdf = root / "original.pdf"
+        local_pdf.write_bytes(b"%PDF-synthetic local original")
+        remote_pdf = b"%PDF-synthetic server original"
+        first = dict(id=7, client_id="local-7", invoice_number="A/07",
+                     local_attachment_paths=[str(local_pdf)])
+        second = dict(id=7, invoice_number="B07", attachments=[
+            dict(id=3, original_name="second.pdf", sha256=sha256(remote_pdf).hexdigest()),
+        ])
+        omitted = dict(id=8, invoice_number="hidden", local_attachment_paths=[str(local_pdf)])
+        unavailable = dict(id=9, invoice_number="missing")
+        window = desktop.SmartReportApp.__new__(desktop.SmartReportApp)
+        desktop.QMainWindow.__init__(window)
+        self.addCleanup(window.deleteLater)
+        table = desktop.QTableWidget(5, 1, window)
+        for index, document in enumerate((first, first, second, omitted, unavailable)):
+            item = desktop.QTableWidgetItem()
+            item.setData(desktop.Qt.ItemDataRole.UserRole, document)
+            table.setItem(index, 0, item)
+        table.setRowHidden(3, True)
+        table.setCurrentCell(0, 0)
+        selected_copy, archive_copy = root / "copy.pdf", root / "copies.zip"
+        response = SimpleNamespace(content=remote_pdf, raise_for_status=lambda: None)
+        with patch.object(desktop.QFileDialog, "getSaveFileName", side_effect=[
+            (str(selected_copy), ""), (str(archive_copy), ""),
+        ]), patch.object(desktop.QMessageBox, "warning") as warning, patch.object(
+            desktop.requests, "get", return_value=response,
+        ) as fetch:
+            window._save_selected_expense_original(table)
+            window._expense_original_archive_button(table).click()
+        self.assertEqual(selected_copy.read_bytes(), local_pdf.read_bytes())
+        fetch.assert_called_once()
+        self.assertTrue(fetch.call_args.args[0].endswith("/api/expense-documents/7/attachments/3/original"))
+        warning.assert_called_once()
+        self.assertIn("missing", warning.call_args.args[2])
+        with ZipFile(archive_copy) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), 2)
+            self.assertTrue(all("/" not in name and "\\" not in name for name in names))
+            self.assertEqual([archive.read(name) for name in names], [local_pdf.read_bytes(), remote_pdf])
+
     def test_expense_outbox_offline_lost_ack_attachment_and_delete(self):
         from reportlab.pdfgen import canvas
 

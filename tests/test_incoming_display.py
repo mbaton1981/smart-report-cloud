@@ -720,6 +720,7 @@ class IncomingDisplayTests(unittest.TestCase):
         )
         for name in methods:
             setattr(host, name, lambda *_args, **_kwargs: None)
+        host._expense_original_archive_button = self.desktop.SmartReportApp._expense_original_archive_button.__get__(host)
         previous = getattr(self.qt_app, "_smartreport_theme", None)
         previous_style = self.qt_app.styleSheet()
         with tempfile.TemporaryDirectory() as temp:
