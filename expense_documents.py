@@ -548,7 +548,82 @@ def invoice_layout_rows(elements, caption_patterns=()):
     return result
 
 
+def _legacy_beijer_number(rows):
+    if not any(cell["text"].strip().casefold() == "beijer byggmaterial ab"
+               for row in rows for cell in row):
+        return None
+    for heading, labels in zip(rows[:5], rows[1:6]):
+        if (len(heading) == 2 and heading[0]["text"].strip().casefold() == "faktura"
+                and re.fullmatch(r"\d{12}", heading[1]["text"].strip())
+                and {cell["text"].strip().casefold() for cell in labels} >= {"kundnr", "fakturanr"}):
+            return heading[1]
+    return None
+
+
+def _legacy_beijer_totals(rows):
+    captions = ("fakturadatum", "förfallodatum", "avgift", "summa exkl.moms",
+                "moms kr", "moms %", "öresutj.", "att betala")
+    for heading, values in zip(rows, rows[1:]):
+        if tuple(cell["text"].strip().casefold().replace("exkl. moms", "exkl.moms")
+                 for cell in heading) != captions:
+            continue
+        if (len(values) not in (8, 9)
+                or min(cell["y0"] for cell in values) - max(cell["y1"] for cell in heading) > 24
+                or not all(re.fullmatch(r"\d{2}-\d{2}-\d{2}", cell["text"]) for cell in values[:2])):
+            continue
+        net, vat, rate, adjustment, currency, payable = values[-6:]
+        rounding = adjustment["text"].strip()
+        if rounding.endswith("-"):
+            rounding = "-" + rounding[:-1]
+        amounts = [parse_invoice_money(value) for value in
+                   (net["text"], vat["text"], rate["text"], rounding, payable["text"])]
+        net_amount, vat_amount, vat_rate, rounding_amount, amount_due = amounts
+        if (None in amounts or currency["text"].strip().upper() != "SEK"
+                or not Decimal(0) <= vat_rate <= Decimal(100)
+                or net_amount + vat_amount + rounding_amount != amount_due):
+            continue
+        return {
+            "net_amount": (net_amount, net, heading[3]),
+            "vat_amount": (vat_amount, vat, heading[4]),
+            "vat_rate": (vat_rate, rate, heading[5]),
+            "rounding_amount": (rounding_amount, adjustment, heading[6]),
+            "amount_due": (amount_due, payable, heading[7]),
+        }
+    return {}
+
+
+def _legacy_beijer_order_lines(rows):
+    lines, sources = [], []
+    for row in rows:
+        text = " ".join(cell["text"] for cell in row)
+        delivery = re.match(r"^Lev\.dat\s+\d{6}\b.*?\bFS\s*nr\s+(\d+-\d+)\b", text, re.IGNORECASE)
+        marker = re.match(r"^Lev\.adr\s+(P\s*\d{4,6})(?=\s|$)", text, re.IGNORECASE)
+        references = re.findall(r"\bMärke\s*/\s*Ordnr\.?\s+(P\s*\d{4,6})(?=\s|$)", text, re.IGNORECASE)
+        if delivery:
+            identifier = delivery[1]
+            cell = next(item for item in row if identifier in item["text"])
+            lines.append(f"Order nr: {identifier}")
+            kind = "order_header"
+        elif marker and all(normalize_object_marking(other) == normalize_object_marking(marker[1])
+                            for other in references):
+            cell = row[0]
+            lines.append(f"Proj.nr.: {marker[1]}")
+            kind = "order_header"
+        elif re.match(r"^Totalt\s+följesedel\b", text, re.IGNORECASE) and len(row) > 1:
+            cell = row[-1]
+            if parse_invoice_money(cell["text"]) is None:
+                continue
+            lines.append(f"Summa order: {cell['text']}")
+            kind = "order_total"
+        else:
+            continue
+        sources.append({"box": [cell[axis] for axis in ("x0", "y0", "x1", "y1")], "kind": kind})
+    return lines, sources
+
+
 def invoice_order_lines(rows):
+    if _legacy_beijer_number(rows):
+        return _legacy_beijer_order_lines(rows)
     captions = (
         r"Proj\s*\.\s*nr\s*\.?|Märkning|Ert\s+ordernr", r"Sälj\s*\.\s*ordnr\s*\.?",
         r"Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer|Order\b", r"Summa\s+order(?:\s+exkl\.?\s*moms)?",
@@ -1028,6 +1103,8 @@ def parse_invoice_pages(pages):
     fallback_vat_candidates = []
     fallback_due_candidates = []
     fallback_date_candidates = []
+    legacy_invoice_numbers = []
+    legacy_invoice_totals = {key: [] for key in ("net_amount", "vat_amount", "rounding_amount", "amount_due")}
     for source_page in pages:
         page = {
             **source_page,
@@ -1043,6 +1120,20 @@ def parse_invoice_pages(pages):
         else:
             rows = [[{"text": line.strip(), "x0": 0, "x1": 500, "y0": index * 15, "y1": index * 15 + 10}]
                     for index, line in enumerate(str(page.get("text") or "").splitlines()) if line.strip()]
+        legacy_number = _legacy_beijer_number(rows)
+        if legacy_number:
+            origin = {"source": page.get("source"), "page": page.get("page", 1),
+                      "attachment_index": page.get("attachment_index", 0)}
+            legacy_invoice_numbers.append((legacy_number["text"].strip(), {
+                **origin, "caption": "FAKTURA", "text": legacy_number["text"], "kind": "header",
+                "box": [legacy_number[axis] for axis in ("x0", "y0", "x1", "y1")],
+            }))
+            for key, (value, cell, caption) in _legacy_beijer_totals(rows).items():
+                if key in legacy_invoice_totals:
+                    legacy_invoice_totals[key].append((decimal_text(value), {
+                        **origin, "caption": caption["text"], "text": cell["text"], "kind": "invoice_total",
+                        "box": [cell[axis] for axis in ("x0", "y0", "x1", "y1")],
+                    }))
         cells = [cell for row in rows for cell in row]
         page_lines = [line.strip() for line in str(page.get("text") or "").splitlines() if line.strip()]
         for index, line in enumerate(page_lines):
@@ -1263,6 +1354,8 @@ def parse_invoice_pages(pages):
                 if len(currency_codes) == 1:
                     fields["currency_code"] = currency_codes.pop().upper()
             for key, label in labels.items():
+                if legacy_number and key == "invoice_number":
+                    continue
                 if key == "gross_amount" and not is_receipt and re.fullmatch(
                         r"Totalt", cell_text, re.IGNORECASE):
                     # An unqualified total is safe only in a labelled fiscal summary,
@@ -1357,6 +1450,14 @@ def parse_invoice_pages(pages):
                                               else 3 if row_with_total or ledger_row or re.search(r"\d.*%", cell_text)
                                               else 2 if re.search(r"belopp", cell_text, re.IGNORECASE) else 1)
                     candidates[key].append((value, source))
+    candidates["invoice_number"].extend(legacy_invoice_numbers)
+    for key, matches in legacy_invoice_totals.items():
+        if matches:
+            attachments = {source["attachment_index"] for _, source in matches}
+            candidates[key] = matches + [
+                (value, source) for value, source in candidates[key]
+                if source.get("attachment_index", 0) not in attachments
+            ]
     for key, fallbacks in (
         ("invoice_number", fallback_invoice_candidates),
         ("gross_amount", fallback_gross_candidates),
@@ -1643,6 +1744,11 @@ def parse_project_order_allocations(pages: list[dict[str, Any]]) -> dict[str, An
     project_since_total = False
     attachment = None
     for page in pages:
+        if page.get("elements") and not page.get("line_sources"):
+            rows = invoice_layout_rows(page["elements"])
+            if _legacy_beijer_number(rows):
+                lines, sources = _legacy_beijer_order_lines(rows)
+                page = {**page, "text": "\n".join(lines), "line_sources": sources}
         source_name = str(page.get("source") or page.get("name") or "PDF")
         page_attachment = (page.get("attachment_index", 0), source_name)
         if attachment != page_attachment:
@@ -1982,25 +2088,107 @@ def net_invoice_issues(fields, allocations):
     return issues
 
 
+def _invoice_order_events(rows):
+    lines, sources = invoice_order_lines(rows)
+    events = []
+    for line, source in zip(lines, sources):
+        match = re.match(r"^(?:Sälj\s*\.\s*ordnr\s*\.?|Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer):\s*(\S+)",
+                         line, re.IGNORECASE)
+        if match:
+            events.append((source["box"][1], match.group(1)))
+        elif re.match(r"Summa\s+order", line, re.IGNORECASE):
+            events.append((source["box"][1], None))
+    return sorted(events, key=lambda event: event[0])
+
+
+def _add_invoice_vat_item(bucket, page, item, description, net, rate):
+    vat = (net * rate / Decimal(100)).quantize(CENT, rounding=ROUND_HALF_UP)
+    bucket["net"] += net
+    bucket["vat"] += vat
+    bucket["items"].append({
+        "page": page.get("page", 1), "item": item, "description": description,
+        "net_amount": decimal_text(net), "vat_rate": decimal_text(rate),
+        "vat_amount": decimal_text(vat),
+    })
+
+
+def _legacy_beijer_vat_items(page_rows, totals, invoice_net, invoice_vat):
+    summaries = [summary for _, rows in page_rows if (summary := _legacy_beijer_totals(rows))]
+    totals_and_rates = {(summary["net_amount"][0], summary["vat_amount"][0], summary["vat_rate"][0])
+                        for summary in summaries}
+    if len(totals_and_rates) != 1:
+        raise ValueError("В итогах Beijer не подтверждена единая ставка НДС для накладных.")
+    net_total, vat_total, rate = totals_and_rates.pop()
+    if (net_total, vat_total) != (parse_invoice_money(invoice_net), parse_invoice_money(invoice_vat)):
+        raise ValueError("Итог НДС накладных Beijer не совпадает с суммой фактуры.")
+    order = article = None
+    description = []
+    for page, rows in page_rows:
+        events = iter(_invoice_order_events(rows))
+        event = next(events, None)
+        amount_left = None
+        for row in rows:
+            while event and event[0] <= min(cell["y0"] for cell in row) + 2:
+                order = event[1]
+                article = None
+                event = next(events, None)
+            if tuple(cell["text"].strip().casefold() for cell in row) == (
+                "art.nr / benämning", "antal", "enhet", "á-pris", "belopp",
+            ):
+                amount_left = (row[-2]["x1"] + row[-1]["x0"]) / 2
+                quantity_left = row[1]["x0"]
+                continue
+            if amount_left is None or order is None:
+                continue
+            heading = re.fullmatch(r"[A-Z]\s+\d+\s+(\d{5,14})",
+                                   " ".join(cell["text"] for cell in row), re.IGNORECASE)
+            if heading:
+                article = heading[1]
+                description = []
+                continue
+            if not article:
+                continue
+            amounts = [value for cell in row if cell["x0"] >= amount_left
+                       if (value := parse_invoice_money(cell["text"])) is not None]
+            description.extend(cell["text"] for cell in row if cell["x1"] < quantity_left)
+            if len(amounts) > 1 or order not in totals:
+                raise ValueError("Накладная Beijer содержит неоднозначную сумму позиции.")
+            if amounts:
+                _add_invoice_vat_item(totals[order], page, article, " ".join(description), amounts[0], rate)
+                article = None
+
+
 def allocation_vat_from_items(pages, orders, invoice_net, invoice_vat):
     expected = {str(row.get("order_id") or ""): row for row in orders}
     if not orders or "" in expected or len(expected) != len(orders):
         raise ValueError("Для расчёта НДС нужны однозначные номера исходных заказов.")
     totals = {key: {"net": Decimal(0), "vat": Decimal(0), "items": []} for key in expected}
+    page_rows = [(page, invoice_layout_rows(page.get("elements") or [])) for page in pages]
+    legacy_pages = [rows for _, rows in page_rows if _legacy_beijer_number(rows)]
+    if legacy_pages:
+        if len(legacy_pages) != len(page_rows) or len({page.get("attachment_index", 0) for page in pages}) != 1:
+            raise ValueError("Для разбивки НДС накладных Beijer нужен один оригинал фактуры.")
+        _legacy_beijer_vat_items(page_rows, totals, invoice_net, invoice_vat)
+    else:
+        _accumulate_invoice_vat_items(page_rows, totals)
+    for identifier, row in expected.items():
+        if not totals[identifier]["items"] or totals[identifier]["net"] != parse_invoice_money(row.get("net_amount")):
+            raise ValueError("Позиции не сходятся с net исходного заказа; требуется проверка НДС частей.")
+    if (sum((row["net"] for row in totals.values()), Decimal(0)) != parse_invoice_money(invoice_net)
+            or sum((row["vat"] for row in totals.values()), Decimal(0)) != parse_invoice_money(invoice_vat)):
+        raise ValueError("Построчный НДС или net не совпадает с итогом фактуры; автоматическое распределение отклонено.")
+    return [{**row, "vat_amount": decimal_text(totals[str(row["order_id"])]["vat"]),
+             "gross_amount": decimal_text(totals[str(row["order_id"])]["net"] + totals[str(row["order_id"])]["vat"]),
+             "vat_items": totals[str(row["order_id"])]["items"]} for row in orders]
+
+
+def _accumulate_invoice_vat_items(page_rows, totals):
     current_order = None
-    for page in pages:
-        rows = invoice_layout_rows(page.get("elements") or [])
-        lines, sources = invoice_order_lines(rows)
-        events = []
-        for line, source in zip(lines, sources):
-            match = re.match(r"^(?:Sälj\s*\.\s*ordnr\s*\.?|Order\s*(?:nr\.?|no\.?|number|#)|Ordernummer):\s*(\S+)", line, re.IGNORECASE)
-            if match:
-                events.append((source["box"][1], match.group(1)))
-            elif re.match(r"Summa\s+order", line, re.IGNORECASE):
-                events.append((source["box"][1], None))
-        events.sort(key=lambda event: event[0])
+    for page, rows in page_rows:
+        events = _invoice_order_events(rows)
         event_index = 0
         columns = None
+        description_only = None
         for row in rows:
             top = min(cell["y0"] for cell in row)
             while event_index < len(events) and events[event_index][0] <= top + 2:
@@ -2019,6 +2207,9 @@ def allocation_vat_from_items(pages, orders, invoice_net, invoice_vat):
                     return left, right
 
                 columns = (bounds(0), bounds(vat_column), bounds(sum_column))
+                headings = {cell["text"].strip().casefold(): cell["x0"] for cell in row}
+                description_only = ((headings["beskrivning"] - 4, headings["antal"])
+                                    if "beskrivning" in headings and "antal" in headings else None)
                 continue
             if columns is None or current_order is None:
                 continue
@@ -2028,30 +2219,19 @@ def allocation_vat_from_items(pages, orders, invoice_net, invoice_vat):
                 continue
             rates = [cell for cell in row if columns[1][0] <= cell["x0"] < columns[1][1]]
             amounts = [cell for cell in row if columns[2][0] <= cell["x0"] < columns[2][1]]
+            if not rates and not amounts and description_only and len(row) > 1 and all(
+                    cell is item_cells[0] or description_only[0] <= cell["x0"] < cell["x1"] <= description_only[1]
+                    for cell in row):
+                continue
             if current_order not in totals or len(rates) != 1 or len(amounts) != 1:
                 raise ValueError("Не все позиции имеют однозначный заказ, ставку и сумму; НДС частей не вычислен.")
             rate = parse_invoice_money(re.sub(r"\s*%$", "", rates[0]["text"]))
             net = parse_invoice_money(amounts[0]["text"])
             if rate is None or not Decimal(0) <= rate <= Decimal(100) or net is None:
                 raise ValueError("Не удалось достоверно прочитать ставку или net позиции.")
-            vat = (net * rate / Decimal(100)).quantize(CENT, rounding=ROUND_HALF_UP)
-            bucket = totals[current_order]
-            bucket["net"] += net
-            bucket["vat"] += vat
-            bucket["items"].append({"page": page.get("page", 1), "item": item_cells[0]["text"],
-                                    "description": " ".join(cell["text"] for cell in row
-                                                            if columns[0][1] <= cell["x0"] < columns[1][0]),
-                                    "net_amount": decimal_text(net), "vat_rate": decimal_text(rate),
-                                    "vat_amount": decimal_text(vat)})
-    for identifier, row in expected.items():
-        if not totals[identifier]["items"] or totals[identifier]["net"] != parse_invoice_money(row.get("net_amount")):
-            raise ValueError("Позиции не сходятся с net исходного заказа; требуется проверка НДС частей.")
-    if (sum((row["net"] for row in totals.values()), Decimal(0)) != parse_invoice_money(invoice_net)
-            or sum((row["vat"] for row in totals.values()), Decimal(0)) != parse_invoice_money(invoice_vat)):
-        raise ValueError("Построчный НДС или net не совпадает с итогом фактуры; автоматическое распределение отклонено.")
-    return [{**row, "vat_amount": decimal_text(totals[str(row["order_id"])]["vat"]),
-             "gross_amount": decimal_text(totals[str(row["order_id"])]["net"] + totals[str(row["order_id"])]["vat"]),
-             "vat_items": totals[str(row["order_id"])]["items"]} for row in orders]
+            description = " ".join(cell["text"] for cell in row
+                                   if columns[0][1] <= cell["x0"] < columns[1][0])
+            _add_invoice_vat_item(totals[current_order], page, item_cells[0]["text"], description, net, rate)
 
 
 def normalize_net_allocations(allocations):

@@ -70,6 +70,65 @@ def beijer_fixture():
 
 
 class ProposalTests(unittest.TestCase):
+    def test_legacy_beijer_matches_delivery_across_pages_and_reads_signed_rounding(self):
+        from invoice_processing import reconcile_invoice_orders
+
+        def page(number, body):
+            heading = [
+                (20, [(250, "FAKTURA"), (455, "260400000001")]),
+                (35, [(450, "Kundnr"), (515, "Fakturanr")]),
+                (50, [(450, "712345"), (515, "Se ovan")]),
+                (80, [(48, "Art.nr / Benämning"), (301, "Antal"), (366, "Enhet"),
+                      (397, "á-pris"), (505, "Belopp")]),
+                (760, [(46, "BEIJER BYGGMATERIAL AB")]),
+            ]
+            return {
+                "page": number, "source": "synthetic-beijer.pdf",
+                "text": "FAKTURA\nBEIJER BYGGMATERIAL AB",
+                "elements": [{"x0": x, "y0": y, "x1": x + 4 * len(text), "y1": y + 6,
+                              "text": text}
+                             for y, row in (*heading, *body) for x, text in row],
+            }
+
+        first = page(1, [
+            (110, [(47, "Lev.dat 261022"), (205, "FS nr 8800001-01")]),
+            (125, [(47, "Lev.adr P1035")]),
+            (140, [(46, "N 10 000000001")]),
+            (155, [(89, "Byggskruv"), (520, "30,40")]),
+        ])
+        final = page(2, [
+            (110, [(360, "Totalt följesedel"), (520, "30,40")]),
+            (125, [(47, "Lev.dat 261022"), (205, "FS nr 8800002-01")]),
+            (140, [(47, "Lev.adr P1022")]),
+            (155, [(46, "N 10 000000002")]),
+            (170, [(89, "Spik"), (520, "10,00")]),
+            (185, [(360, "Totalt följesedel"), (520, "10,00")]),
+            (300, [(45, "Fakturadatum"), (106, "Förfallodatum"), (171, "Avgift"),
+                   (227, "Summa exkl.moms"), (303, "Moms kr"), (383, "Moms %"),
+                   (429, "Öresutj."), (472, "ATT BETALA")]),
+            (315, [(47, "26-10-22"), (107, "26-11-21"), (251, "40,40"), (335, "10,10"),
+                   (389, "25,00"), (431, "0,50-"), (467, "SEK"), (515, "50,00")]),
+        ])
+        pages = [first, final]
+        fields = parse_invoice_pages(pages)
+        reconcile_invoice_orders(pages, fields)
+        self.assertEqual(
+            tuple(fields[key] for key in ("invoice_number", "net_amount", "vat_amount", "rounding_amount", "amount_due")),
+            ("260400000001", "40.40", "10.10", "-0.50", "50.00"),
+        )
+        self.assertEqual(fields["order_proposal_warnings"], [])
+        self.assertEqual([(item["project_code"], item["net_amount"], item["vat_amount"])
+                          for item in fields["order_proposals"]],
+                         [("P1035", "30.40", "7.60"), ("P1022", "10.00", "2.50")])
+        self.assertEqual([part["object_id"] for part in propose_object_allocations(fields, OBJECTS)["parts"]], [13, 5])
+
+        item = next(cell for cell in first["elements"] if cell["text"] == "30,40")
+        item["text"] = "30,39"
+        changed = parse_invoice_pages(pages)
+        reconcile_invoice_orders(pages, changed)
+        self.assertIsNone(changed["order_proposals"][0]["vat_amount"])
+        self.assertTrue(propose_object_allocations(changed, OBJECTS)["errors"])
+
     def test_project_order_parts_split_by_object_and_category_without_changing_totals(self):
         from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
 

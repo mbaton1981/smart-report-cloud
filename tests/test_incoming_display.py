@@ -1016,6 +1016,29 @@ class IncomingDisplayTests(unittest.TestCase):
         self.assertIsNone(self.store.card(1))
         self.assertEqual(self.store.original(1).read_bytes(), original)
 
+    def test_rerecognition_applies_new_order_evidence_with_the_same_invoice_fields(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        window = self.open_window(document_id=1)
+        original_fields = self.store.latest(1)[1]
+        orders = [{
+            "order_id": "8800001-01", "project_code": "P11041", "ambiguous": False,
+            "net_amount": "100.00", "vat_amount": "25.00",
+            "vat_items": [{"page": 1, "net_amount": "100.00", "vat_amount": "25.00"}],
+        }]
+        result = {"fields": {"order_proposals": orders, "order_proposal_warnings": []},
+                  "state": "requires_review", "errors": []}
+        with patch("invoice_processing.recognize_invoice", return_value=result), \
+                patch.object(QMessageBox, "question",
+                             return_value=QMessageBox.StandardButton.Yes) as confirm, \
+                patch.object(QMessageBox, "information"):
+            window.rerecognition_button.click()
+        confirm.assert_called_once()
+        self.assertIn("разбивка по заказам", confirm.call_args.args[2])
+        self.assertEqual(self.store.base(1)["order_proposals"], orders)
+        self.assertEqual(self.store.latest(1)[1], original_fields)
+        self.assertIsNone(self.store.card(1))
+
     def test_rerecognition_apply_rejects_changes_since_preview(self):
         revision, payload = self.store.latest(1)
         base = self.store.base(1)

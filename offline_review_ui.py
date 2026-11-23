@@ -872,15 +872,15 @@ class OfflineReviewWindow(QDialog):
                 "Не удалось проверить все страницы. Автоматическое распределение не предложено."
             )
             self.apply_proposal_button.setText("Заполнить форму предложением")
+        elif proposal["parts"] and not proposal["errors"]:
+            self.proposal_summary_label.setText(
+                "Найдено распределение по позициям. Проверьте сумму и основание в подробностях."
+            )
+            self.apply_proposal_button.setText("Заполнить форму предложением")
         elif len({item.get("normalized") for item in marker_evidence
                   if item.get("normalized")}) > 1:
             self.proposal_summary_label.setText(
                 "Найдены противоречащие маркировки. Проверьте распределение вручную."
-            )
-            self.apply_proposal_button.setText("Заполнить форму предложением")
-        elif proposal["parts"] and not proposal["errors"]:
-            self.proposal_summary_label.setText(
-                "Найдено распределение по позициям. Проверьте сумму и основание в подробностях."
             )
             self.apply_proposal_button.setText("Заполнить форму предложением")
         else:
@@ -1836,6 +1836,11 @@ class OfflineReviewWindow(QDialog):
             if evidence_text:
                 line += f" ({evidence_text})"
             changes.append(line)
+        orders = recognized.get("order_proposals") or []
+        if (orders and not recognized.get("order_proposal_warnings")
+                and all(order.get("vat_items") and not order.get("ambiguous") for order in orders)
+                and orders != base.get("order_proposals")):
+            changes.append(f"Обновлена разбивка по заказам из оригинала ({len(orders)}).")
         if not changes:
             QMessageBox.information(
                 self, "Повторный разбор",

@@ -12065,12 +12065,6 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         ]
         combined_text = "\n\n".join(text_parts)
         source_indices = {str(path): index for index, path in enumerate(paths)}
-        order_proposal = parse_project_order_allocations([
-            {"source": Path(path).name, "page": page + 1, "text": page_text,
-             "attachment_index": source_indices[str(path)]}
-            for path, extraction in extractions
-            for page, page_text in enumerate(extraction.pages or (extraction.text,))
-        ])
         structured_pages = [
             {"source": Path(path).name, "page": page + 1, "text": page_text,
              "attachment_index": source_indices[str(path)],
@@ -12114,11 +12108,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
                 QMessageBox.warning(self, "Документ не открыт", str(error))
             return
-        if "order_proposals" not in parsed:
-            parsed["order_proposals"] = order_proposal["orders"]
-        parsed["order_proposal_warnings"] = order_proposal["warnings"]
-        if order_proposal["warnings"]:
-            recognition_message += " " + "; ".join(order_proposal["warnings"])
+        from invoice_processing import reconcile_invoice_orders
+        reconcile_invoice_orders(structured_pages, parsed)
+        if parsed["order_proposal_warnings"]:
+            recognition_message += " " + "; ".join(parsed["order_proposal_warnings"])
         self._expense_document_review_dialog(
             document=None, source_paths=paths, parsed_fields=parsed,
             recognition_message=recognition_message,

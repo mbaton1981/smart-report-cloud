@@ -12,6 +12,25 @@ from expense_documents import (
 )
 
 
+def reconcile_invoice_orders(pages, fields):
+    proposals = parse_project_order_allocations(pages)
+    fields.setdefault("order_proposals", proposals["orders"])
+    warnings = list(dict.fromkeys([*fields.get("order_proposal_warnings", []), *proposals["warnings"]]))
+    orders = fields["order_proposals"]
+    if orders and all(order.get("order_id") for order in orders):
+        try:
+            fields["order_proposals"] = allocation_vat_from_items(
+                pages, orders, fields.get("net_amount"), fields.get("vat_amount")
+            )
+            warnings = [
+                warning for warning in warnings
+                if not (warning.startswith("НДС для заказа ") and "не распознан" in warning)
+            ]
+        except ValueError as error:
+            warnings.append(str(error))
+    fields["order_proposal_warnings"] = warnings
+
+
 def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=False):
     from expense_documents import extract_local_document, ocr_pdf_heading
 
@@ -52,23 +71,7 @@ def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=F
                 + "\n\n".join(page["text"] for page in attached_pages)
             )
     fields = (parser or parse_invoice_pages)(pages) if pages else {}
-    proposals = parse_project_order_allocations(pages)
-    fields.setdefault("order_proposals", proposals["orders"])
-    fields["order_proposal_warnings"] = list(dict.fromkeys(
-        [*fields.get("order_proposal_warnings", []), *proposals["warnings"]]
-    ))
-    orders = fields["order_proposals"]
-    if orders and all(order.get("order_id") for order in orders):
-        try:
-            fields["order_proposals"] = allocation_vat_from_items(
-                pages, orders, fields.get("net_amount"), fields.get("vat_amount")
-            )
-            fields["order_proposal_warnings"] = [
-                warning for warning in fields["order_proposal_warnings"]
-                if not (warning.startswith("НДС для заказа ") and "не распознан" in warning)
-            ]
-        except ValueError as error:
-            fields["order_proposal_warnings"].append(str(error))
+    reconcile_invoice_orders(pages, fields)
     needs_help = any(fields.get(key) in (None, "", "UNKNOWN")
                      for key in required_document_fields(fields.get("document_type")))
     timings = {"local_seconds": monotonic() - started, "ai_seconds": 0.0, "ai_requests": 0}
