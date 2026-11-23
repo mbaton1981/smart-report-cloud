@@ -460,10 +460,8 @@ class OfflineReviewWindow(QDialog):
                         for key in ("net_amount", "vat_amount", "rounding_amount"):
                             if key in original:
                                 part[key] = original[key]
-                    if original.get("expense_category_source") == "user":
-                        for key in ("expense_category", "expense_category_source", "expense_category_evidence"):
-                            if key in original:
-                                part[key] = original[key]
+                    if original in original_parts and "expense_category" in original:
+                        part["expense_category"] = original["expense_category"]
                 category = self.allocations.cellWidget(row, 3)
                 selected_category = category.currentData()
                 old_category, old_source = confirmed_expense_category(
