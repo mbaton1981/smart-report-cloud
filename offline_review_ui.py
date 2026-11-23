@@ -453,10 +453,14 @@ class OfflineReviewWindow(QDialog):
                 part = {"destination": destination, "object_id": object_id,
                         "gross_amount": gross_amount}
                 original = self.allocations.cellWidget(row, 0).property("reviewOriginalPart")
-                if original in original_parts:
-                    for key in ("net_amount", "vat_amount", "rounding_amount", "note", "expense_category"):
+                if original and parse_invoice_money(original.get("gross_amount")) == parse_invoice_money(gross_amount):
+                    for key in ("net_amount", "vat_amount", "rounding_amount", "note"):
                         if key in original:
                             part[key] = original[key]
+                    if original.get("expense_category_source") == "user":
+                        for key in ("expense_category", "expense_category_source", "expense_category_evidence"):
+                            if key in original:
+                                part[key] = original[key]
                 category = self.allocations.cellWidget(row, 3)
                 selected_category = category.currentData()
                 old_category, old_source = confirmed_expense_category(
@@ -497,7 +501,11 @@ class OfflineReviewWindow(QDialog):
         return "unselected", None
 
     def add_allocation(self, part=None, *, suggest_category=False):
-        part = part or {}
+        part = dict(part or {})
+        if "rounding" in part:
+            part["rounding_amount"] = part.pop("rounding")
+        if part.get("orders") and not part.get("note"):
+            part["note"] = ("Заказы " + ", ".join(part["orders"]))[:500]
         row = self.allocations.rowCount()
         self.allocations.insertRow(row)
         combo = ObjectPickerComboBox()
@@ -1997,7 +2005,10 @@ class OfflineReviewWindow(QDialog):
             self.checked.setFocus()
 
     def confirm_transfer(self):
-        problems = self.store.issues(self.document_id, self.payload())
+        payload = self.payload()
+        if self.integrated and self.store.card(self.document_id) is None:
+            payload = self.store.merge_matching_allocations(payload)
+        problems = self.store.issues(self.document_id, payload)
         if problems:
             QMessageBox.warning(self, "Перенос запрещён", "\n".join(problems))
             self._focus_validation_error(problems)
@@ -2016,7 +2027,7 @@ class OfflineReviewWindow(QDialog):
                 self.action_revision = self.store.set_action(
                     self.document_id, "expense", self.action_revision)
             if self.store.card(self.document_id) is None:
-                self.revision = self.store.save(self.document_id, self.payload(), self.revision)
+                self.revision = self.store.save(self.document_id, payload, self.revision)
             card = self.store.transfer(self.document_id, self.revision)
         except (ReviewError, OSError, sqlite3.Error) as error:
             QMessageBox.warning(self, "Перенос не завершён", str(error))

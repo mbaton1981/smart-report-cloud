@@ -539,6 +539,37 @@ class ProposalIntegrationTests(unittest.TestCase):
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
             window.close()
 
+    def test_transfer_combines_same_object_and_category_without_losing_tax(self):
+        from PyQt6.QtWidgets import QMessageBox
+        from expense_categories import CATEGORY_MATERIALS
+
+        window, document_id, objects = self.prepare_beijer()
+        window.apply_proposal_button.click()
+        unresolved = window.allocations.cellWidget(1, 0)
+        unresolved.setCurrentIndex(unresolved.findData(objects[0]["id"]))
+        for index in range(window.allocations.rowCount()):
+            category = window.allocations.cellWidget(index, 3)
+            category.setCurrentText(CATEGORY_MATERIALS)
+            category.activated.emit(category.currentIndex())
+        window.checked.setChecked(True)
+        with patch.object(QMessageBox, "warning") as warning:
+            window.transfer_button.click()
+        warning.assert_not_called()
+        self.assertEqual(self.sync()["synced"], 1)
+        card = self.store.card(document_id)
+        remote = next(row for row in self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"] if row["client_id"] == card["client_id"])
+        self.assertEqual(remote["gross_amount"], "5679.00")
+        parts = {part["object_id"]: part for part in remote["allocations"]}
+        self.assertEqual(set(parts), {row["id"] for row in objects})
+        combined = parts[objects[0]["id"]]
+        self.assertEqual([combined[key] for key in ("net_amount", "vat_amount", "rounding_amount", "gross_amount")],
+                         ["360.32", "90.08", "-0.01", "450.39"])
+        self.assertEqual(combined["expense_category"], CATEGORY_MATERIALS)
+        self.assertIn("8345806-01", combined["note"])
+        self.assertIn("8345807-01", combined["note"])
+
     def test_verified_categories_prefill_each_incoming_share_without_manual_reselection(self):
         from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
         window, _document_id, objects = self.prepare()

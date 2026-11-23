@@ -5233,6 +5233,67 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_saved_beijer_net_draft_recovers_from_original_in_review(self):
+        from reportlab.pdfgen import canvas
+        from expense_categories import CATEGORY_MATERIALS
+
+        original = Path(self._case.name) / "legacy-beijer.pdf"
+        pdf = canvas.Canvas(str(original))
+        pdf.drawString(45, 750, "Synthetic Beijer original")
+        pdf.save()
+        saved = {
+            "id": 123, "client_id": "saved-beijer-draft", "sync_version": 2,
+            "allocation_basis": "net", "verification_status": "requires_review",
+            "supplier_name": "BEIJER BYGGMATERIAL AB", "document_date": "2026-10-26",
+            "invoice_number": None, "net_amount": "100.00", "vat_amount": None,
+            "amount_due": "125.00", "currency_code": "SEK",
+            "local_attachment_paths": [str(original)],
+            "attachments": [{"sha256": self.desktop.sha256_file(original)}],
+            "allocations": [{"destination": "unselected", "net_amount": "100.00"}],
+        }
+        recognized = {
+            "fields": {**saved, "document_type": "invoice", "invoice_number": "260400000001",
+                       "vat_amount": "25.00", "gross_amount": "125.00", "rounding_amount": "0.00",
+                       "order_proposal_warnings": [], "order_proposals": [
+                           {"project_code": "P1035", "net_amount": "100.00", "vat_amount": "25.00",
+                            "vat_items": [{"description": "BYGGSKRUV"}]},
+                       ]},
+            "missing_fields": [], "errors": [],
+        }
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window._expense_document_snapshot = lambda *_args, **_kwargs: ([], True)
+        window._expense_objects = [{"id": 85, "name": "Site", "markning": "P1035", "is_active": True}]
+
+        def review(dialog):
+            inputs = {key: dialog.findChild(self.desktop.QLineEdit, f"invoice_{key}").text()
+                      for key in ("invoice_number", "vat_amount", "amount_due")}
+            self.assertEqual(inputs, {"invoice_number": "260400000001", "vat_amount": "25.00",
+                                      "amount_due": "125.00"})
+            table = dialog.findChild(self.desktop.QTableWidget, "invoiceAllocations")
+            self.assertEqual(table.item(0, 0).text(), "P1035")
+            dialog.findChild(self.desktop.QPushButton, "invoiceApplyObjectProposal").click()
+            self.assertEqual(table.cellWidget(0, 3).currentData(), 85)
+            self.assertEqual(table.cellWidget(0, 4).currentText(), CATEGORY_MATERIALS)
+            dialog.findChild(self.desktop.QPushButton, "invoiceDownloadOriginal").click()
+            dialog.reject()
+            return dialog.result()
+
+        try:
+            with patch("invoice_processing.recognize_invoice", return_value=recognized) as recognize, \
+                    patch.object(self.desktop.QDialog, "exec", new=review), \
+                    patch.object(self.desktop.QMessageBox, "information"), \
+                    patch.object(window, "_save_expense_originals") as download, \
+                    patch.object(window, "queue_expense_document_operation") as queue:
+                self.assertFalse(window._review_net_invoice(saved, [], {}))
+            recognize.assert_called_once_with([str(original)], allow_ai=False)
+            download.assert_called_once_with([saved], archive=False)
+            queue.assert_not_called()
+            self.assertIsNone(saved["vat_amount"])
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_net_invoice_api_sync_company_separation_and_rounding(self):
         from expense_documents import migrate_invoice_net_schema
 

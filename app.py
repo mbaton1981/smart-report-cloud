@@ -2546,7 +2546,7 @@ class DocumentPreviewDialog(QDialog):
 
 
 class DocumentGalleryDialog(QDialog):
-    def __init__(self, paths, title, parent=None, initial_page=0, initial_attachment=0):
+    def __init__(self, paths, title, parent=None, initial_page=0, initial_attachment=0, *, compact=False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1180, 900)
@@ -2555,6 +2555,7 @@ class DocumentGalleryDialog(QDialog):
         self._pages = []
         self._attachment_offsets = []
         self._page_index = 0
+        self._compact = compact
         starting_page = 0
         for attachment_index, path in enumerate(paths):
             self._attachment_offsets.append(len(self._pages))
@@ -2585,14 +2586,15 @@ class DocumentGalleryDialog(QDialog):
         self.next_button.setToolTip("Следующая страница")
         self.next_button.clicked.connect(lambda: self.show_page(self._page_index + 1))
         self.page_label = QLabel("")
-        self.page_label.setMinimumWidth(150)
+        self.page_label.setMinimumWidth(65 if compact else 150)
         self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         controls.addWidget(self.previous_button)
         controls.addWidget(self.page_label)
         controls.addWidget(self.next_button)
         controls.addStretch()
         layout.addLayout(controls)
-        desktop_theme.adapt_box_layout(self, controls, compact_width=620)
+        if not compact:
+            desktop_theme.adapt_box_layout(self, controls, compact_width=620)
         zoom_controls = QHBoxLayout()
         for label, callback in (
             ("−", lambda: self.preview.zoom(1 / 1.2)),
@@ -2605,7 +2607,8 @@ class DocumentGalleryDialog(QDialog):
             zoom_controls.addWidget(button)
         zoom_controls.addStretch()
         layout.addLayout(zoom_controls)
-        desktop_theme.adapt_box_layout(self, zoom_controls, compact_width=620)
+        if not compact:
+            desktop_theme.adapt_box_layout(self, zoom_controls, compact_width=620)
         layout.addWidget(self.preview, 1)
         self.show_page(starting_page)
 
@@ -2628,7 +2631,9 @@ class DocumentGalleryDialog(QDialog):
             pixmap = QPixmap(str(source))
         self.preview._image.setPixmap(pixmap)
         self.preview.fit_width()
-        self.page_label.setText(f"{self._page_index + 1} / {len(self._pages)} · {name}")
+        count = f"{self._page_index + 1} / {len(self._pages)}"
+        self.page_label.setText(count if self._compact else f"{count} · {name}")
+        self.page_label.setToolTip(name)
         self.previous_button.setEnabled(self._page_index > 0)
         self.next_button.setEnabled(self._page_index + 1 < len(self._pages))
 
@@ -10866,16 +10871,21 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def _review_net_invoice(self, document, source_paths, parsed_fields, server_document=None):
         fields = {**parsed_fields, **document}
+        server_document = server_document or document
+        preview_paths = list(source_paths or fields.get("local_attachment_paths") or [])
+        if not preview_paths and fields.get("has_original"):
+            preview_paths = self._expense_document_original_paths(server_document)
+        recovered = {}
+        if document and not server_document.get("local_conflict_payload") and not self._expense_has_assignment(document):
+            from invoice_processing import recover_beijer_draft_fields
+            recovered = recover_beijer_draft_fields(fields, preview_paths)
+            fields.update(recovered)
         source_text = str(fields.get("raw_text") or fields.get("recognized_text") or "")
         non_invoice_type = fields.get("non_invoice_document_type") or non_invoice_document_type(source_text)
         context = invoice_context(source_text)
         context["prepaid"] = context["prepaid"] or fields.get("prepaid") is True
         context["reverse_charge"] = context["reverse_charge"] or fields.get("reverse_charge") is True
-        server_document = server_document or document
         client_id = str(fields.get("client_id") or uuid.uuid4())
-        preview_paths = list(source_paths or fields.get("local_attachment_paths") or [])
-        if not preview_paths and fields.get("has_original"):
-            preview_paths = self._expense_document_original_paths(server_document)
         expense_documents = self._expense_document_snapshot()[0]
         current_document_id = server_document.get("server_document_id")
         if current_document_id is None and isinstance(server_document.get("id"), int):
@@ -10923,15 +10933,20 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 support_candidates.append((linked, "уже связано"))
         dialog = QDialog(self)
         dialog.setWindowTitle("Проверка фактуры и распределение расходов")
+        dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         dialog.resize(1040, 760)
         dialog.setMinimumSize(860, 650)
         layout = QVBoxLayout(dialog)
+        if recovered:
+            note = QLabel("Поля черновика заполнены по сохранённому PDF. Сверьте их перед сохранением.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
         top = QSplitter(Qt.Orientation.Horizontal)
         top.setChildrenCollapsible(False)
         gallery = None
         if preview_paths:
             try:
-                gallery = DocumentGalleryDialog(preview_paths, "Оригинал", dialog)
+                gallery = DocumentGalleryDialog(preview_paths, "Оригинал", dialog, compact=True)
                 gallery.setWindowFlags(Qt.WindowType.Widget)
                 top.addWidget(gallery)
                 dialog.finished.connect(lambda _result: gallery.close())
@@ -11133,6 +11148,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         confirm.setObjectName("invoiceConfirm")
         cancel = QPushButton("Отмена")
         actions.addWidget(draft)
+        if preview_paths:
+            download = QPushButton("Скачать копию")
+            download.setObjectName("invoiceDownloadOriginal")
+            download.clicked.connect(lambda: self._save_expense_originals(
+                [{**server_document, "local_attachment_paths": preview_paths}], archive=False))
+            actions.addWidget(download)
         actions.addStretch()
         actions.addWidget(confirm)
         actions.addWidget(cancel)
@@ -11315,11 +11336,19 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         due_reviewed.toggled.connect(refresh)
         def apply_object_proposal():
             filled = left_manual = 0
+            from expense_categories import suggest_expense_category
             for index, original in enumerate(source_rows):
                 destination_combo = table.cellWidget(index, 2)
                 object_combo = table.cellWidget(index, 3)
                 if destination_combo is None or object_combo is None:
                     continue
+                category_combo = table.cellWidget(index, 4)
+                items = "\n".join(item.get("description") or "" for item in original.get("vat_items") or [])
+                if items.strip() and category_combo.currentText() == CATEGORY_UNCLASSIFIED:
+                    category, evidence = suggest_expense_category({}, {"note": items})
+                    if category != CATEGORY_UNCLASSIFIED:
+                        category_combo.setCurrentText(category)
+                        category_combo.setToolTip("Предложено по оригиналу. " + evidence)
                 if destination_combo.currentData() != "unselected":
                     continue
                 code = str(

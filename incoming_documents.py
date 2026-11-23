@@ -117,6 +117,43 @@ class IncomingStore(OfflineReviewStore):
         return ([{"object_id": payload["object_id"], "gross_amount": payload.get("gross_amount")}]
                 if payload.get("object_id") is not None else [])
 
+    @staticmethod
+    def merge_matching_allocations(payload):
+        parts = IncomingStore.allocations(payload)
+        merged = []
+        assigned = {}
+        for part in parts:
+            target = part.get("object_id")
+            destination = part.get("destination") or ("object" if target is not None else "unselected")
+            category, source = confirmed_expense_category(
+                part.get("expense_category"), part.get("expense_category_source"),
+            )
+            gross = parse_invoice_money(part.get("gross_amount"))
+            if destination != "object" or target is None or gross is None or not gross.is_finite() or gross <= 0:
+                merged.append(part)
+                continue
+            key = (target, category, source)
+            previous = assigned.get(key)
+            if previous is None:
+                copy = dict(part)
+                assigned[key] = copy
+                merged.append(copy)
+                continue
+            previous["gross_amount"] = decimal_text(parse_invoice_money(previous["gross_amount"]) + gross)
+            for money in ("net_amount", "vat_amount", "rounding_amount"):
+                left, right = (parse_invoice_money(row.get(money)) for row in (previous, part))
+                if money == "rounding_amount" and all(row.get("net_amount") is not None and row.get("vat_amount") is not None
+                                                     for row in (previous, part)):
+                    left, right = left or Decimal(0), right or Decimal(0)
+                previous[money] = decimal_text(left + right) if (
+                    left is not None and right is not None and left.is_finite() and right.is_finite()) else None
+            for detail in ("note", "expense_category_evidence"):
+                text = "; ".join(dict.fromkeys(str(row.get(detail) or "").strip()
+                                               for row in (previous, part) if row.get(detail)))
+                if text:
+                    previous[detail] = text[:500]
+        return {**payload, "allocations": merged}
+
     def clean_payload(self, payload):
         cleaned = super().clean_payload({key: value for key, value in payload.items()
                                          if key not in ("allocations", "server_version", "payment_receipt_id")})

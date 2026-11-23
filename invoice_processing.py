@@ -7,8 +7,8 @@ from time import monotonic
 import requests
 
 from expense_documents import (
-    allocation_vat_from_items, parse_invoice_pages, parse_project_order_allocations,
-    required_document_fields,
+    allocation_vat_from_items, parse_invoice_money, parse_invoice_pages, parse_project_order_allocations,
+    required_document_fields, sha256_file,
 )
 
 
@@ -31,7 +31,7 @@ def reconcile_invoice_orders(pages, fields):
     fields["order_proposal_warnings"] = warnings
 
 
-def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=False):
+def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=False, allow_ai=True):
     from expense_documents import extract_local_document, ocr_pdf_heading
 
     started = monotonic()
@@ -75,7 +75,7 @@ def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=F
     needs_help = any(fields.get(key) in (None, "", "UNKNOWN")
                      for key in required_document_fields(fields.get("document_type")))
     timings = {"local_seconds": monotonic() - started, "ai_seconds": 0.0, "ai_requests": 0}
-    if needs_help and not fields.get("non_invoice_document_type") and fields.get("document_type") not in {"order_confirmation", "delivery_note"}:
+    if allow_ai and needs_help and not fields.get("non_invoice_document_type") and fields.get("document_type") not in {"order_confirmation", "delivery_note"}:
         from invoice_layout_ai import apply_selection, desktop_selection, masked_layout
         if ai_fallback is None:
             flask = sys.modules.get("flask")
@@ -111,3 +111,44 @@ def recognize_invoice(paths, parser=None, ai_fallback=None, *, include_timings=F
     if include_timings:
         result["timings"] = timings
     return result
+
+
+def recover_beijer_draft_fields(saved, paths):
+    supplier = " ".join(str(saved.get("supplier_name") or "").split()).casefold()
+    if (supplier != "beijer byggmaterial ab" or len(paths) != 1 or Path(paths[0]).suffix.casefold() != ".pdf"
+            or saved.get("verification_status") not in {"draft", "requires_review"}
+            or (saved.get("invoice_number") and saved.get("vat_amount") not in (None, ""))):
+        return {}
+    attachments = saved.get("attachments") or []
+    if len(attachments) > 1:
+        return {}
+    checksum = attachments[0].get("sha256") if attachments else saved.get("file_sha256")
+    try:
+        if checksum and sha256_file(paths[0]) != checksum:
+            return {}
+    except OSError:
+        return {}
+    result = recognize_invoice(paths, allow_ai=False)
+    fields = result["fields"]
+    if (result["errors"] or result["missing_fields"]
+            or " ".join(str(fields.get("supplier_name") or "").split()).casefold() != supplier
+            or fields.get("document_type") != "invoice"
+            or fields.get("document_date") != saved.get("document_date")
+            or fields.get("currency_code") != saved.get("currency_code")
+            or parse_invoice_money(saved.get("net_amount")) is None):
+        return {}
+    for key in ("net_amount", "vat_amount", "gross_amount", "amount_due", "rounding_amount"):
+        if saved.get(key) not in (None, "") and parse_invoice_money(saved[key]) != parse_invoice_money(fields.get(key)):
+            return {}
+    for key in ("invoice_number", "due_date", "payment_reference"):
+        if saved.get(key) not in (None, "") and saved[key] != fields.get(key):
+            return {}
+    recovered = {key: fields[key] for key in (
+        "invoice_number", "vat_amount", "gross_amount", "amount_due", "rounding_amount",
+        "due_date", "payment_reference",
+    ) if fields.get(key) not in (None, "")}
+    recovered["raw_text"] = fields.get("raw_text") or ""
+    recovered["review_reasons"] = fields.get("review_reasons") or []
+    if not fields["order_proposal_warnings"]:
+        recovered["order_proposals"] = fields["order_proposals"]
+    return recovered
