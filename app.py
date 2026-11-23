@@ -1843,6 +1843,14 @@ def shift_hours_confirmed(row):
     return bool(row is not None and "hours_confirmed" in row.keys() and row["hours_confirmed"])
 
 
+def shift_billing_status(row):
+    if "invoiced" in row.keys() and row["invoiced"] == 1:
+        return "Выставлен в счёт", (desktop_theme.SHIFT_INVOICED_BG, desktop_theme.SHIFT_INVOICED_FG)
+    if shift_hours_confirmed(row):
+        return "Часы подтверждены", (desktop_theme.SHIFT_CONFIRMED_BG, desktop_theme.SHIFT_CONFIRMED_FG)
+    return "В работе", None
+
+
 def record_type_label(record_type):
     return RECORD_TYPE_LABELS.get(record_type, RECORD_TYPE_LABELS[RECORD_TYPE_REVIEW])
 
@@ -4303,6 +4311,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if success:
             if shift_data_changed or catalog_data_changed or manual_requested:
                 self.load_shifts_history()
+            if ((shift_data_changed or manual_requested) and getattr(self, "_invoice_report", None)
+                    and hasattr(self, "table_dagbok") and self.table_dagbok.isColumnHidden(5)):
+                self.generate_activity_report(notify=False)
             if (
                 (catalog_data_changed or manual_requested)
                 and getattr(self, "tabs", None)
@@ -13226,8 +13237,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 "id", "date", "employee", "object_name", "entry_type", "hours", "transport", "sync_id",
                 "start_time", "end_time", "comment",
             ]
-            if "time_facts" in shift_columns:
-                report_columns.append("time_facts")
+            report_columns.extend(
+                name for name in ("time_facts", "invoiced", "hours_confirmed") if name in shift_columns
+            )
             rows = [dict(row) for row in cursor.execute(
                 f"SELECT {', '.join(report_columns)} FROM shifts WHERE company=? AND object_name IN ({placeholders}) "
                 "AND date>=? AND date<=? ORDER BY date,employee,id",
@@ -13248,17 +13260,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "totals": {"hours": sum(float(row["hours"] or 0) for row in work_rows)},
         }
 
-    def generate_activity_report(self):
+    def generate_activity_report(self, *, notify=True):
         try:
             report = self.collect_activity_report()
-        except ValueError as error:
+        except (ValueError, sqlite3.Error) as error:
             self.table_invoice.setRowCount(0)
             self._render_dagbok_report({"journal_rows": [], "journal_segments": {}}, activity_only=True)
             self.invoice_summary_table.setRowCount(0)
             self.invoice_summary_note.setText(str(error))
             self.invoice_status_note.clear()
             self._invoice_report = None
-            QMessageBox.warning(self, "Отчёты и фактурирование", str(error))
+            if notify:
+                QMessageBox.warning(self, "Отчёты и фактурирование", str(error))
             return None
 
         employees = {}
@@ -14081,24 +14094,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         layout.addWidget(journal_pdf)
         layout.addWidget(QLabel("<b>Журнал выполненных работ (Dagbok):</b>"))
         
-        self.table_dagbok = QTableWidget()
-        self.table_dagbok.setColumnCount(6)
-        self.table_dagbok.setHorizontalHeaderLabels(["Дата", "Сотрудник", "Тип", "Часы", "Детализация / OB", "Описание"])
-        
-        header = self.table_dagbok.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        
-        self.table_dagbok.setColumnWidth(0, 100)
-        self.table_dagbok.setColumnWidth(1, 150)
-        self.table_dagbok.setColumnWidth(2, 75)
-        self.table_dagbok.setColumnWidth(3, 70)
-        self.table_dagbok.setColumnWidth(4, 185)
-        self.table_dagbok.setAlternatingRowColors(True)
+        self.table_dagbok = QTableWidget(column_widths={0: 105, 3: 80, 6: 175})
+        self.table_dagbok.setColumnCount(7)
+        self.table_dagbok.setHorizontalHeaderLabels([
+            "Дата", "Сотрудник", "Тип", "Часы", "Детализация / OB", "Описание", "Статус часов / счёта",
+        ])
+        self.table_dagbok.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table_dagbok)
 
         dag_summary_box = QHBoxLayout()
@@ -14125,10 +14126,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         ob_segments_by_id = report['journal_segments']
         if activity_only:
             self.table_dagbok.setHorizontalHeaderLabels([
-                "Дата", "Сотрудник", "Фактическое время", "Часы", "Описание", "",
+                "Дата", "Сотрудник", "Фактическое время", "Часы", "Описание", "", "Статус часов / счёта",
             ])
-            for column in (2, 4):
-                self.table_dagbok.setColumnWidth(column, 185)
             self.table_dagbok.setColumnHidden(5, True)
             for label in (
                 self.dag_total_atf_lbl, self.dag_total_sick_lbl, self.dag_total_vacation_lbl,
@@ -14137,7 +14136,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 label.hide()
         else:
             self.table_dagbok.setHorizontalHeaderLabels([
-                "Дата", "Сотрудник", "Тип", "Часы", "Детализация / OB", "Описание",
+                "Дата", "Сотрудник", "Тип", "Часы", "Детализация / OB", "Описание", "Статус часов / счёта",
             ])
             self.table_dagbok.setColumnHidden(5, False)
             for label in (
@@ -14214,19 +14213,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             it_comm = QTableWidgetItem(str(comment))
             it_comm.setToolTip(str(comment))
 
-            self.table_dagbok.setItem(row_idx, 0, it_date)
-            self.table_dagbok.setItem(row_idx, 1, it_emp)
-            if activity_only:
-                self.table_dagbok.setItem(row_idx, 2, it_det)
-                self.table_dagbok.setItem(row_idx, 3, it_hrs)
-                self.table_dagbok.setItem(row_idx, 4, it_comm)
-                self.table_dagbok.setItem(row_idx, 5, QTableWidgetItem(""))
-            else:
-                self.table_dagbok.setItem(row_idx, 2, it_type)
-                self.table_dagbok.setItem(row_idx, 3, it_hrs)
-                self.table_dagbok.setItem(row_idx, 4, it_det)
-                self.table_dagbok.setItem(row_idx, 5, it_comm)
+            status, colors = shift_billing_status(row) if record_type in (RECORD_TYPE_WORK, RECORD_TYPE_OB) else ("—", None)
+            status_item = QTableWidgetItem(status)
+            details = (it_det, it_hrs, it_comm, QTableWidgetItem("")) if activity_only else (it_type, it_hrs, it_det, it_comm)
+            for column, item in enumerate((it_date, it_emp, *details, status_item)):
+                if colors:
+                    desktop_theme.item_color(item, colors[0])
+                    desktop_theme.item_color(item, colors[1], foreground=True)
+                self.table_dagbok.setItem(row_idx, column, item)
 
+        desktop_theme.refresh_table_item_colors(self.table_dagbok)
         worked_hours = totals[RECORD_TYPE_WORK] + totals[RECORD_TYPE_OB]
         self.dag_total_hours_lbl.setText(f"<b>Работа: {format_quantity(worked_hours, '.')} ч</b>")
         self.dag_total_atf_lbl.setText(f"<b>АТФ: {totals[RECORD_TYPE_ATF]:.1f} ч</b>")
@@ -17366,13 +17362,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
             self.table_shifts.setRowCount(len(rows))
             for row_idx, row in enumerate(rows):
-                is_inv = row["invoiced"] == 1
-                hours_confirmed = shift_hours_confirmed(row)
-                status_text = (
-                    "Выставлен в счёт" if is_inv else
-                    "Часы подтверждены · клиентская стоимость не рассчитана"
-                    if hours_confirmed else "В работе"
-                )
+                status_text, status_colors = shift_billing_status(row)
+                if status_text == "Часы подтверждены":
+                    status_text += " · клиентская стоимость не рассчитана"
                 delete_state = delete_states.get(row["sync_id"])
                 if delete_state in ("pending", "blocked"):
                     status_text += " · Удаление ожидает сервера"
@@ -17440,12 +17432,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                         it.setToolTip("Применённая историческая клиентская цена из того же снимка, что и в отчёте. Не зарплатная ставка.")
                     elif col_idx in (2, 3, 4, 7, 10) and val:
                         it.setToolTip(str(val))
-                    if is_inv:
-                        desktop_theme.item_color(it, desktop_theme.SHIFT_INVOICED_BG)
-                        desktop_theme.item_color(it, desktop_theme.SHIFT_INVOICED_FG, foreground=True)
-                    elif hours_confirmed:
-                        desktop_theme.item_color(it, desktop_theme.SHIFT_CONFIRMED_BG)
-                        desktop_theme.item_color(it, desktop_theme.SHIFT_CONFIRMED_FG, foreground=True)
+                    if status_colors:
+                        desktop_theme.item_color(it, status_colors[0])
+                        desktop_theme.item_color(it, status_colors[1], foreground=True)
                     self.table_shifts.setItem(row_idx, col_idx, it)
             desktop_theme.refresh_table_item_colors(table)
             self.load_dropdowns(refresh_tables=False)

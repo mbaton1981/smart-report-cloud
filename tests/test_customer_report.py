@@ -385,6 +385,36 @@ class CustomerReportTests(unittest.TestCase):
         for page in pdf.pages:
             self.assertIn("1,25", page.extract_text())
 
+    def test_journal_shows_saved_status_and_refreshes_it_after_sync(self):
+        for day in ("2026-10-21", "2026-10-22", "2026-10-23"):
+            self.shift(day=day)
+        self.conn.execute("UPDATE shifts SET invoiced=1, hours_confirmed=1 WHERE date='2026-10-21'")
+        self.conn.execute("UPDATE shifts SET hours_confirmed=1 WHERE date='2026-10-22'")
+        self.conn.commit()
+        before = list(self.conn.iterdump())
+        window = self.window
+        journal = window.table_dagbok
+        theme = self.desktop.desktop_theme
+        window.generate_activity_report()
+        self.assertEqual(journal.horizontalHeaderItem(6).text(), "Статус часов / счёта")
+        self.assertFalse(journal.isColumnHidden(6))
+        self.assertEqual([journal.item(index, 6).text() for index in range(3)],
+                         ["Выставлен в счёт", "Часы подтверждены", "В работе"])
+        self.assertEqual(journal.item(0, 0).data(theme.BACKGROUND_ROLE), theme.SHIFT_INVOICED_BG)
+        self.assertEqual(journal.item(1, 6).data(theme.BACKGROUND_ROLE), theme.SHIFT_CONFIRMED_BG)
+        self.assertIsNone(journal.item(2, 6).data(theme.BACKGROUND_ROLE))
+        self.assertEqual(list(self.conn.iterdump()), before)
+
+        self.conn.execute("UPDATE shifts SET invoiced=1 WHERE date='2026-10-23'")
+        self.conn.commit()
+        window._manual_sync_requested = False
+        with patch.object(window, "load_shifts_history") as history:
+            window._on_sync_completed(True, 0, 0, 0, 0, 0, "", "", "", shift_data_changed=True)
+        history.assert_called_once()
+        self.assertEqual(journal.item(2, 6).text(), "Выставлен в счёт")
+        self.assertEqual(journal.item(2, 0).data(theme.BACKGROUND_ROLE), theme.SHIFT_INVOICED_BG)
+        self.assertEqual(window._invoice_report["totals"]["hours"], 24)
+
     def test_activity_pdf_hides_unconfirmed_costs_and_payroll_details(self):
         self.ob(transport=1)
         report = self.window.generate_invoice()
