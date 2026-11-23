@@ -761,6 +761,37 @@ class CustomerReportTests(unittest.TestCase):
         self.assertEqual(translated, {"1": "Montering av dörrar", "2": "Montering och målning",
                                       "3": "Demontering av kylrum"})
 
+    def test_full_object_report_prefills_known_phrases_and_reuses_confirmed_text_offline(self):
+        self.shift(comment="Демонтаж стёкол.")
+        self.shift(day="2026-10-22", comment="Демонтаж стен 24 секции")
+        self.shift(day="2026-10-23", comment="Подготовка стекла к демонтажу")
+        self.shift(day="2026-10-24", comment="")
+        self.shift(day="2026-10-25", comment="Demontering av ventilation")
+        report = self.window.generate_invoice()
+        self.translation.save_confirmed_translations(
+            self.conn, report["journal_rows"], {"3": "Förberedelse inför demontering av glas"},
+        )
+        before = list(self.conn.iterdump())
+
+        def review(dialog):
+            self.assertEqual(dialog.table.rowCount(), 2)
+            first = dialog.findChild(self.desktop.QTextEdit, "journal_translation_1")
+            second = dialog.findChild(self.desktop.QTextEdit, "journal_translation_2")
+            self.assertEqual(first.toPlainText(), "Demontering av glas")
+            self.assertEqual(second.toPlainText(), "")
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(self.desktop.JournalTranslationDialog, "exec", review):
+            translations = self.window._collect_journal_translations(report, allow_draft=True)
+        self.assertEqual(translations, {
+            "1": "Demontering av glas",
+            "3": "Förberedelse inför demontering av glas",
+            "5": "Demontering av ventilation",
+        })
+        self.assertEqual(self.translator_calls, [])
+        self.assertEqual(list(self.conn.iterdump()), before)
+
     def test_manual_review_identifies_record_and_only_changes_pdf_translation(self):
         self.shift(comment="Неизвестноеслово <A>")
         self.shift(day="2026-10-22", comment="Неизвестноеслово <A>")

@@ -28,6 +28,20 @@ GLOSSARY = (
     ("утепление", "isolering"), ("внутренние окна", "invändiga fönster"), ("двери", "dörrar"),
 )
 
+JOURNAL_PHRASES = {
+    "демонтаж вентиляции": "Demontering av ventilation",
+    "демонтаж стекла": "Demontering av glas",
+    "демонтаж стекол": "Demontering av glas",
+    "демонтаж стен": "Demontering av väggar",
+    "подготовка стекла к демонтажу": "Förberedelse av glas inför demontering",
+}
+
+
+def suggest_journal_phrase(text):
+    """Suggest translations only for exact matches of complete descriptions."""
+    source = " ".join(text.casefold().replace("ё", "е").split()).removesuffix(".")
+    return JOURNAL_PHRASES.get(source, "")
+
 
 class TranslationError(Exception):
     pass

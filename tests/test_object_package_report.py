@@ -929,7 +929,7 @@ class ObjectPackageReportTests(unittest.TestCase):
             self.assertIn("Montering", generated_text)
             self.assertIn("Arbetsbeskrivning saknas", generated_text)
             self.assertIn(
-                "Arbetsbeskrivning behöver förtydligas",
+                "Svensk översättning saknas",
                 " ".join(generated_text.split()),
             )
             self.assertIn("Ej bekräftad", generated_text)

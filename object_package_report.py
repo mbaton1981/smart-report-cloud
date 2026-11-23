@@ -1213,7 +1213,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             Literal(str(row.get("employee") or ("Ej angiven" if swedish else "Не указан"))),
             Literal(
                 str(data.get("journal_translations", {}).get(row.get("sync_id"))
-                    or ("Arbetsbeskrivning behöver förtydligas" if str(row.get("comment") or "").strip()
+                    or ("Svensk översättning saknas" if str(row.get("comment") or "").strip()
                         else "Arbetsbeskrivning saknas"))
                 if swedish else str(row.get("comment") or "Описание не сохранено")
             ),
@@ -2108,7 +2108,7 @@ def write_object_report_package(
         )
         if missing_translations:
             data.setdefault("incomplete_reasons", []).append(
-                "Vissa arbetsbeskrivningar behöver översättas eller förtydligas."
+                "Vissa arbetsbeskrivningar saknar svensk översättning."
             )
         unconfirmed_hours = sum(
             1 for row in (data.get("customer_report") or {}).get("journal_rows", [])

@@ -2062,8 +2062,8 @@ class JournalTranslationDialog(QDialog):
         self._flagged = {}
         layout = QVBoxLayout(self)
         notice = QLabel(
-            "Введите или проверьте шведские описания. Пустые поля останутся отмечены как "
-            "требующие уточнения, а PDF будет черновиком. Исходные записи не изменяются."
+            "Проверьте предложенные формулировки или введите шведский перевод справа. "
+            "Если оставить поле пустым, в черновике PDF появится отметка «Нет перевода на шведский»."
             if allow_draft else
             "Перевод выполнен ИИ через сервер SmartReport. Автоматически проверяются только пустой текст, "
             "кириллица, числа и обозначения — смысл проверьте сами и при необходимости исправьте текст справа.\n"
@@ -13348,11 +13348,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "av och i på med till för från utan samt vid efter före mellan under över "
             "arbete arbeten elarbete eldragning montering demontering rivning installation "
             "målning målade färg isolering spackling städning städade renovering byte "
-            "gips kartong ventilation ventilationskanaler vägguttag väggar vägg tak "
+            "gips kartong glas ventilation ventilationskanaler vägguttag väggar vägg tak "
             "golv fönster dörrar dörr kakel avjämningsmassa avfall leverans "
             "invändiga utvändiga inre yttre rum rummen köksfläktar vattenrör "
             "skruvar lister socklar kök badrum hall trappa trappor "
-            "förberedelse förberedelser rengöring borttagning transport material "
+            "förberedelse förberedelser inför rengöring borttagning transport material "
             "verktyg bygg byggarbete betong trä metall rör kanaler el "
             "nya nytt gammal gamla befintlig befintliga färdig klart"
         ).split())
@@ -13365,11 +13365,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
         return translated
 
-    def _collect_journal_translations(self, report):
+    def _collect_journal_translations(self, report, *, allow_draft=False):
         import swedish_translation
         journal_rows = [
             row for row in report["journal_rows"]
             if row.get("entry_type") in WORK_TYPES
+            and (not allow_draft or str(row.get("comment") or "").strip())
         ]
         translations = {}
         if journal_rows:
@@ -13398,13 +13399,23 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             except ValueError:
                 pending.append(row)
         if pending:
-            entries = SmartReportApp._machine_translate_rows(self, pending)
-            dialog = JournalTranslationDialog(
-                entries, self, retry=lambda rows: SmartReportApp._machine_translate_rows(self, rows),
-            )
+            if allow_draft:
+                entries = []
+                for row in pending:
+                    suggestion = swedish_translation.suggest_journal_phrase(row["comment"])
+                    status = "Проверьте предложенный перевод" if suggestion else "Введите перевод на шведский"
+                    entries.append((row, suggestion, status, not suggestion))
+                dialog = JournalTranslationDialog(entries, self, allow_draft=True)
+            else:
+                entries = SmartReportApp._machine_translate_rows(self, pending)
+                dialog = JournalTranslationDialog(
+                    entries, self, retry=lambda rows: SmartReportApp._machine_translate_rows(self, rows),
+                )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
             translations.update(dialog.translations)
+            if allow_draft:
+                return translations
             connection = None
             try:
                 connection = get_db_connection()
@@ -16380,21 +16391,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
         if result.get("review_data") is not None:
             data = result["review_data"]
-            pending = []
+            journal_rows = []
             for row in data["customer_report"].get("journal_rows", []):
-                if row.get("entry_type") not in WORK_TYPES or not str(row.get("comment") or "").strip():
-                    continue
                 review_row = dict(row)
                 review_row.setdefault("id", row.get("sync_id"))
                 review_row.setdefault("object_name", data["object"].get("name") or "")
-                pending.append((review_row, "", "Требуется перевод и проверка", True))
-            translations = {}
-            if pending:
-                dialog = JournalTranslationDialog(pending, self, allow_draft=True)
-                if dialog.exec() != QDialog.DialogCode.Accepted:
-                    self.statusBar().showMessage("Формирование отчёта отменено.", 10000)
-                    return
-                translations = dialog.translations
+                journal_rows.append(review_row)
+            translations = SmartReportApp._collect_journal_translations(
+                self, {"journal_rows": journal_rows}, allow_draft=True,
+            )
+            if translations is None:
+                self.statusBar().showMessage("Формирование отчёта отменено.", 10000)
+                return
             data["journal_translations"] = translations
             self.object_full_report_button.setEnabled(False)
             task = ObjectPackageTask(
