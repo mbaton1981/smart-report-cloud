@@ -453,10 +453,13 @@ class OfflineReviewWindow(QDialog):
                 part = {"destination": destination, "object_id": object_id,
                         "gross_amount": gross_amount}
                 original = self.allocations.cellWidget(row, 0).property("reviewOriginalPart")
-                if original and parse_invoice_money(original.get("gross_amount")) == parse_invoice_money(gross_amount):
-                    for key in ("net_amount", "vat_amount", "rounding_amount", "note"):
-                        if key in original:
-                            part[key] = original[key]
+                if original:
+                    if "note" in original:
+                        part["note"] = original["note"]
+                    if parse_invoice_money(original.get("gross_amount")) == parse_invoice_money(gross_amount):
+                        for key in ("net_amount", "vat_amount", "rounding_amount"):
+                            if key in original:
+                                part[key] = original[key]
                     if original.get("expense_category_source") == "user":
                         for key in ("expense_category", "expense_category_source", "expense_category_evidence"):
                             if key in original:

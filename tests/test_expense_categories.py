@@ -53,7 +53,8 @@ class ExpenseCategorySuggestionTests(unittest.TestCase):
 
     def test_construction_products_are_recognized_from_order_lines(self):
         for content in ("FLATBORRSET DT70751\nKNIVBLAD FATMAX", "TRÄSKRUV 4,5X50\nBYGGREGEL G4-2",
-                        "FRAKT 245,00\nGIPSSKIVA GNE 13X900X2500\nOSB/3 11X897X2500"):
+                        "FRAKT 245,00\nGIPSSKIVA GNE 13X900X2500\nOSB/3 11X897X2500",
+                        "FRAKT ZON 1\nFANERBALK 45X220\nEMBALLAGE"):
             with self.subTest(content=content):
                 category, evidence = suggest_expense_category({}, {"note": content}, 3)
                 self.assertEqual(category, CATEGORY_MATERIALS)

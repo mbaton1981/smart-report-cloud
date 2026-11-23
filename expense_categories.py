@@ -53,7 +53,7 @@ _CATEGORY_TERMS = {
         r"säkerhetskniv|träbock|wipes|gipsskr|byggregel|läkt|glespanel|dyckert|"
         r"städduk|handske|vinkelpensel|filtmask|slägga|vägg/bjälklagsk|gipsskiva|"
         r"osb(?:/3)?|k-ply|golvspån|underlagsduk|limträbalk|fiberduk|formrör|"
-        r"armeringsstål|grovbetong|byggpall|byggsäck)\b",
+        r"armeringsstål|grovbetong|byggpall|byggsäck|fan[eé]rbalk\w*)\b",
         re.IGNORECASE,
     ),
     CATEGORY_OTHER: re.compile(

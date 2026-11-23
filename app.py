@@ -11049,7 +11049,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         apply_proposal_button = QPushButton("Заполнить форму предложением")
         apply_proposal_button.setObjectName("invoiceApplyObjectProposal")
         apply_proposal_button.setToolTip(
-            "Подставить объекты в строки без назначения по однозначным маркировкам PDF. "
+            "Подставить объекты по маркировкам PDF и предложить категории по товарным строкам. "
             "Неоднозначные и неизвестные маркировки остаются для ручного выбора; ничего не сохраняется."
         )
         add_row_button = QPushButton("Добавить строку")
@@ -11335,7 +11335,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         tax_reviewed.toggled.connect(refresh)
         due_reviewed.toggled.connect(refresh)
         def apply_object_proposal():
-            filled = left_manual = 0
+            filled = left_manual = categorized = 0
             from expense_categories import suggest_expense_category
             for index, original in enumerate(source_rows):
                 destination_combo = table.cellWidget(index, 2)
@@ -11349,6 +11349,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     if category != CATEGORY_UNCLASSIFIED:
                         category_combo.setCurrentText(category)
                         category_combo.setToolTip("Предложено по оригиналу. " + evidence)
+                        categorized += 1
                 if destination_combo.currentData() != "unselected":
                     continue
                 code = str(
@@ -11374,6 +11375,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             QMessageBox.information(
                 dialog, "Предложение по маркировкам",
                 f"Объекты подставлены: {filled}. Оставлено для ручного выбора: {left_manual}. "
+                f"Категории предложены для {categorized} строк. "
                 "Проверьте строки; ничего не сохранено и не подтверждено.",
             )
 
