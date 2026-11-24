@@ -186,6 +186,10 @@ class CustomerBillingTests(unittest.TestCase):
         unknown["client_id"] = "test-unknown-supplier-copy"
         unknown["document_date"] = "2026-11-17"
         unknown["allocations"][0]["net_amount"] = None
+        rental = copy.deepcopy(self.document)
+        rental.update(id=rental["id"] + 1001, client_id="test-rental", document_date="2026-10-20",
+                      invoice_number="RENTAL-1")
+        rental["allocations"][0]["expense_category"] = "Аренда оборудования"
 
         def api(method, endpoint, **kwargs):
             response = self.server_client.open(endpoint, method=method, headers=self.headers,
@@ -200,7 +204,7 @@ class CustomerBillingTests(unittest.TestCase):
         reviewed_translations = []
 
         def inspect(dialog):
-            from PyQt6.QtWidgets import QTableWidget, QPushButton, QLineEdit, QCheckBox, QTextEdit
+            from PyQt6.QtWidgets import QAbstractItemView, QCheckBox, QLineEdit, QPushButton, QTableWidget, QTextEdit
             if isinstance(dialog, self.desktop.JournalTranslationDialog):
                 self.assertEqual(dialog.table.rowCount(), 1)
                 self.assertIn("Документы бухгалтеру", dialog.parentWidget().windowTitle())
@@ -214,24 +218,43 @@ class CustomerBillingTests(unittest.TestCase):
                 return dialog.result()
             table = dialog.findChild(QTableWidget)
             self.assertIsNotNone(table, str([(type(widget).__name__, widget.objectName()) for widget in dialog.children()]))
-            self.assertEqual(table.rowCount(), 4)
+            self.assertEqual(table.rowCount(), 8)
+            self.assertEqual(table.verticalScrollMode(), QAbstractItemView.ScrollMode.ScrollPerPixel)
             self.assertEqual(table.horizontalHeaderItem(2).text(), "Категория")
-            self.assertEqual(table.item(0, 2).text(), "Материалы и закупки")
-            self.assertEqual(table.item(1, 2).text(), "Наши часы и поездки")
-            self.assertEqual(table.item(2, 4).text(), "—")
-            self.assertNotIn("SEK", table.item(2, 3).text())
-            self.assertIn("OB 2", table.item(2, 3).text())
-            self.assertIn("Поездки · 1", table.item(2, 3).text())
-            self.assertEqual(table.item(2, 5).text(), "К передаче бухгалтеру")
+            headings = [(i, table.item(i, 0).text()) for i in range(table.rowCount()) if table.columnSpan(i, 0) > 1]
+            self.assertEqual(headings, [
+                (0, "Материалы и закупки · 2"),
+                (3, "Аренда оборудования · 1"),
+                (5, "Наши часы и поездки · 2"),
+            ])
+            self.assertEqual([table.item(i, 1).text() for i in (1, 2, 4, 6, 7)],
+                             ["2026-10-21", "2026-11-17", "2026-10-20", "2026-11-01", "2026-11-02"])
+            self.assertFalse(table.item(0, 0).flags() & self.desktop.Qt.ItemFlag.ItemIsUserCheckable)
+            jump = dialog.findChild(QPushButton, "accountantInvoiceGroupNavigation")
+            sections = jump.menu().actions()
+            self.assertEqual([action.text() for action in sections],
+                             ["Материалы и закупки", "Аренда оборудования", "Наши часы и поездки"])
+            with patch.object(table, "scrollToItem") as scroll:
+                sections[1].trigger()
+                scroll.assert_called_once_with(table.item(3, 0), QAbstractItemView.ScrollHint.PositionAtTop)
+            self.assertEqual(table.item(1, 2).text(), "Материалы и закупки")
+            self.assertEqual(table.item(6, 2).text(), "Наши часы и поездки")
+            self.assertEqual(table.item(7, 4).text(), "—")
+            self.assertNotIn("SEK", table.item(7, 3).text())
+            self.assertIn("OB 2", table.item(7, 3).text())
+            self.assertIn("Поездки · 1", table.item(7, 3).text())
+            self.assertEqual(table.item(7, 5).text(), "К передаче бухгалтеру")
+            self.assertEqual(table.item(7, 0).checkState(), self.desktop.Qt.CheckState.Checked)
+            self.assertIn("125.00 SEK с НДС", table.item(2, 4).text())
             self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Checked)
-            self.assertIn("125.00 SEK с НДС", table.item(3, 4).text())
-            self.assertEqual(table.item(3, 0).checkState(), self.desktop.Qt.CheckState.Checked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
             checks = {field.text(): field for field in dialog.findChildren(QCheckBox)}
             checks["Включить поездки"].setChecked(False)
-            table.item(0, 6).setCheckState(self.desktop.Qt.CheckState.Checked)
-            table.item(3, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            table.item(1, 6).setCheckState(self.desktop.Qt.CheckState.Checked)
+            table.item(2, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            table.item(4, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            table.item(4, 6).setCheckState(self.desktop.Qt.CheckState.Checked)
             with patch("next_customer_invoice.edit_accountant_rates",
                        return_value=({"ob2": Decimal(720), "trip": Decimal(300)}, False)):
                 buttons["Тарифы пакета…"].click()
@@ -257,12 +280,13 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertIn("Demontering av väggar i källaren", text)
             self.assertIn("Demontering av väggar och sortering av rivningsavfall", text)
             self.assertNotIn("Демонтаж", text)
+            self.assertNotIn("RENTAL-1", text)
             self.assertIn("Totalt exkl. moms: att kontrollera", text)
             self.assertNotIn("Resor", text)
             self.assertEqual(text.count("TEST SUPPLIER ORIGINAL"), 1)
             checks["Включить поездки"].setChecked(True)
             checks["Включить Dagbok"].setChecked(False)
-            table.item(0, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            table.item(1, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
             with patch('payroll_preview.open_preview', side_effect=preview):
                 buttons["Предварительный PDF"].click()
             without_attachments = " ".join(page.extract_text() for page in PdfReader(output).pages)
@@ -275,8 +299,8 @@ class CustomerBillingTests(unittest.TestCase):
                     field.setText("UI-INVOICE-1")
             dialog.findChild(QCheckBox, "accountantInvoiceReviewed").setChecked(True)
             self.assertTrue(buttons["Сохранить как выставленное"].isEnabled())
+            table.item(7, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
             table.item(2, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
-            table.item(3, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
             self.assertTrue(buttons["Сохранить как выставленное"].isEnabled())
             with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes), \
                     patch.object(self.desktop.QMessageBox, "information"):
@@ -284,7 +308,7 @@ class CustomerBillingTests(unittest.TestCase):
             return dialog.result()
 
         with patch.object(self.desktop, "request_expense_api", side_effect=api), \
-                patch.object(self.desktop, "fetch_all_expense_documents", return_value=[self.document, unknown]), \
+                patch.object(self.desktop, "fetch_all_expense_documents", return_value=[self.document, unknown, rental]), \
                 patch.object(swedish_translation, "_request", side_effect=translate) as translator, \
                 patch.object(self.desktop.QDialog, "exec", new=inspect):
             open_next_invoice(window)

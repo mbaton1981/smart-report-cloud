@@ -8,18 +8,29 @@ import tempfile
 
 from PyQt6.QtCore import QEventLoop, QDate, QThreadPool, Qt
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QAbstractItemView, QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QProgressDialog,
 )
 
 from customer_billing import prepare_next_invoice
+import desktop_theme
 from expense_documents import parse_decimal
-from expense_categories import confirmed_expense_category
+from expense_categories import (
+    CATEGORY_MATERIALS, CATEGORY_EQUIPMENT_RENTAL, CATEGORY_SUBCONTRACTOR_WORK,
+    CATEGORY_SUBCONTRACTOR_MIXED, CATEGORY_OTHER, CATEGORY_UNCLASSIFIED, confirmed_expense_category,
+)
 from object_package_report import collect_object_expenses, expense_document_key, _recover_report_share_tax
 from accountant_report import TIME_LABELS, line_details, summarize_accountant, write_accountant_report
 import payroll_auto
 import payroll_history
 import payroll_ui
+
+
+WORK_CATEGORY = "Наши часы и поездки"
+CATEGORY_ORDER = (
+    CATEGORY_MATERIALS, CATEGORY_EQUIPMENT_RENTAL, CATEGORY_SUBCONTRACTOR_WORK,
+    CATEGORY_SUBCONTRACTOR_MIXED, CATEGORY_OTHER, CATEGORY_UNCLASSIFIED, WORK_CATEGORY,
+)
 
 
 def accountant_payroll(desktop, report, entries):
@@ -174,6 +185,17 @@ def open_next_invoice(host):
         QMessageBox.warning(host, "Следующий счёт", error)
         return
     report, entries, warnings, state, supported = result
+    groups = defaultdict(list)
+    for entry in entries:
+        if entry["member"]["kind"] == "shift":
+            category = WORK_CATEGORY
+        else:
+            allocation = entry["allocation"]
+            category, _ = confirmed_expense_category(
+                allocation.get("expense_category"), allocation.get("expense_category_source"),
+            )
+        entry["category"] = category
+        groups[category].append(entry)
     dialog = QDialog(host)
     dialog.setWindowTitle(f"Документы бухгалтеру к следующему счёту · {obj['name']}")
     dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
@@ -214,9 +236,15 @@ def open_next_invoice(host):
     rate_button.setToolTip("Клиентские ставки для PDF и выбор сохранённых особых условий.")
     for control in (include_trips, include_journal, rate_button):
         options.addWidget(control)
+    jump = QPushButton("Перейти к разделу…")
+    jump.setObjectName("accountantInvoiceGroupNavigation")
+    sections = QMenu(jump)
+    jump.setMenu(sections)
+    options.addWidget(jump)
+    jump.setVisible(len(groups) > 1)
     options.addStretch()
     layout.addLayout(options)
-    table = QTableWidget(len(entries), 7)
+    table = QTableWidget(len(entries) + len(groups), 7)
     table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / OB / документ", "Сумма документа", "Состояние", "Копия PDF"])
     table.horizontalHeaderItem(6).setToolTip("Добавить оригинал поставщика в приложения к этому пакету.")
     table.setColumnWidth(0, 80)
@@ -227,8 +255,35 @@ def open_next_invoice(host):
     table.setColumnWidth(5, 175)
     table.setColumnWidth(6, 95)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.verticalHeader().hide()
+    table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    table.verticalScrollBar().setSingleStep(24)
     layout.addWidget(table, 1)
-    for index, entry in enumerate(entries):
+
+    entry_rows = {}
+    next_row = 0
+    heading_font = table.font()
+    heading_font.setBold(True)
+    for category in CATEGORY_ORDER:
+        group = groups.get(category)
+        if not group:
+            continue
+        heading = QTableWidgetItem(f"{category} · {len(group)}")
+        heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        heading.setFont(heading_font)
+        heading.setBackground(desktop_theme.color("#26394b"))
+        heading.setForeground(desktop_theme.color("#dbeafe"))
+        table.setSpan(next_row, 0, 1, table.columnCount())
+        table.setItem(next_row, 0, heading)
+        sections.addAction(category).triggered.connect(
+            lambda _checked=False, item=heading: table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
+        )
+        for index, entry in enumerate(group, start=next_row + 1):
+            entry_rows[entry["member"]["key"]] = index
+        next_row += len(group) + 1
+
+    for entry in entries:
+        index = entry_rows[entry["member"]["key"]]
         item = QTableWidgetItem()
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
         shift = entry["member"]["kind"] == "shift"
@@ -238,11 +293,6 @@ def open_next_invoice(host):
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         item.setCheckState(Qt.CheckState.Checked if available else Qt.CheckState.Unchecked)
         table.setItem(index, 0, item)
-        entry["category"] = (
-            "Наши часы и поездки" if entry["member"]["kind"] == "shift" else
-            confirmed_expense_category(entry["allocation"].get("expense_category"),
-                                       entry["allocation"].get("expense_category_source"))[0]
-        )
         description = entry["label"]
         if shift:
             row = entry["row"]
@@ -291,8 +341,8 @@ def open_next_invoice(host):
     use_saved_terms = True
 
     def selected():
-        return [entry for index, entry in enumerate(entries)
-                if table.item(index, 0).checkState() == Qt.CheckState.Checked]
+        return [entry for entry in entries
+                if table.item(entry_rows[entry["member"]["key"]], 0).checkState() == Qt.CheckState.Checked]
 
     def refresh(*_):
         categories = {}
@@ -316,8 +366,9 @@ def open_next_invoice(host):
         )
         if summary["stored_terms"]:
             lines.append("В расчёте есть сохранённые особые условия клиента.")
+        amounts = sorted(categories.items(), key=lambda item: (CATEGORY_ORDER.index(item[0][0]), item[0]))
         lines += [f"{category} · {value:,.2f} {currency} {basis}"
-                  for (category, currency, basis), value in sorted(categories.items())]
+                  for (category, currency, basis), value in amounts]
         total_label.setText("\n".join(lines))
         valid = bool(selection)
         save_button.setEnabled(supported and valid and reviewed.isChecked()
@@ -341,10 +392,11 @@ def open_next_invoice(host):
     def export_pdf():
         selection = selected()
         copies = {}
-        for index, entry in enumerate(entries):
-            if (entry["member"]["kind"] == "expense"
-                    and table.item(index, 0).checkState() == Qt.CheckState.Checked
-                    and table.item(index, 6).checkState() == Qt.CheckState.Checked):
+        for entry in selection:
+            if entry["member"]["kind"] != "expense":
+                continue
+            index = entry_rows[entry["member"]["key"]]
+            if table.item(index, 6).checkState() == Qt.CheckState.Checked:
                 document = entry["document"]
                 copies[expense_document_key(document)] = document
         settings = dict(include_trips=include_trips.isChecked(), include_journal=include_journal.isChecked(),
