@@ -384,13 +384,24 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
             continue
         relevant_values = [value for target, value in zip(targets, net_values)
                            if not scoped or target is not general and selected(target)]
-        if None in relevant_values or (not scoped and net is None):
+        document_total_known = not scoped and net is not None
+        company_remainder_known = False
+        if document_total_known and None in net_values and gross is not None and vat is not None:
+            # A fully reconciled invoice can have a known total for company expenses
+            # even when the individual company shares lack saved net amounts.
+            missing = [allocation for allocation, value in zip(allocations, net_values) if value is None]
+            grosses = [parse_decimal(allocation.get("gross_amount")) for allocation in allocations]
+            if (all(part.get("object_id") is None and part.get("destination") == "company" for part in missing)
+                    and None not in grosses and sum(grosses, Decimal(0)) == gross
+                    and gross == net + vat + (rounding or Decimal(0))):
+                missing_gross = sum((amount for amount, value in zip(grosses, net_values) if value is None), Decimal(0))
+                company_remainder_known = min(0, missing_gross) <= net - assigned <= max(0, missing_gross)
+        if (None in relevant_values and not company_remainder_known) or (not scoped and net is None):
             unknown_expenses.append(dict(id=document["id"], reason="Часть расхода без НДС требует сверки",
                                          amount=document["gross_amount"], currency="SEK"))
-        document_total_known = not scoped and net is not None
         if document_total_known:
             remainder = net - assigned
-            if None in net_values:
+            if None in net_values and not company_remainder_known:
                 unresolved_net += remainder
                 unresolved_expenses.append(dict(
                     id=document["id"], date=day, supplier=document.get("supplier_name"),

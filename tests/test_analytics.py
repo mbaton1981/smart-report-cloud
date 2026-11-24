@@ -397,6 +397,32 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(recovered["totals"]["expenses"], 200)
         self.assertIsNone(parent["allocations"][1]["net_amount"])
 
+    def test_reconciled_invoice_attributes_company_remainder_without_changing_saved_shares(self):
+        with closing(self.server.get_db_connection()) as connection:
+            objects = {row["name"]: row["id"] for row in connection.execute("SELECT id,name FROM meta_objects")}
+        allocations = [
+            dict(object_id=objects["Travel A"], destination="object", gross_amount="1689.19", net_amount=None),
+            dict(object_id=None, destination="company", gross_amount="4047.00", net_amount=None),
+            dict(object_id=objects["Travel B"], destination="object", gross_amount="404.81", net_amount=None),
+        ]
+        invoice = self.document(net="4912.80", gross="6141.00", vat="1228.20", allocations=allocations)
+        recovered = {0: "1351.35", 2: "323.85"}
+        data = self.calculate(documents=[invoice], recover_expense_nets=lambda *_: recovered)
+        costs = {row["key"]: row["expenses"] for row in data["rows"]}
+        self.assertEqual(costs, {"general": 3237.60, f"object:{objects['Travel A']}": 1351.35,
+                                 f"object:{objects['Travel B']}": 323.85})
+        self.assertEqual(data["totals"]["expenses"], 4912.80)
+        self.assertFalse(data["totals"]["cost_partial"])
+        self.assertEqual(data["unresolved_expenses"], [])
+        self.assertTrue(all(part["net_amount"] is None for part in allocations))
+
+        for missing_values, general_gross in (({0: "1351.35"}, "4047.00"), (recovered, "4046.99")):
+            with self.subTest(recovered=missing_values, general_gross=general_gross):
+                allocations[1]["gross_amount"] = general_gross
+                incomplete = self.calculate(documents=[invoice], recover_expense_nets=lambda *_: missing_values)
+                self.assertTrue(incomplete["totals"]["cost_partial"])
+                self.assertEqual(len(incomplete["unresolved_expenses"]), 1)
+
     def test_billing_uses_invoice_members_for_shifts_and_each_expense_share(self):
         with closing(self.server.get_db_connection()) as connection:
             for sync_id in ("billed", "legacy", "pending"):

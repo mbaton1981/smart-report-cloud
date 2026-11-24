@@ -4639,6 +4639,11 @@ class CatalogSyncTests(unittest.TestCase):
                 self.assertEqual(window.exp_detail_values["number"].text(), requested["invoice_number"])
                 self.assertGreater(table.verticalScrollBar().value(), 0)
                 self.assertTrue(table.viewport().rect().contains(table.visualItemRect(table.currentItem()).center()))
+                self.assertEqual(window.exp_primary_action.text(), "Открыть распределение…")
+                self.assertTrue(window.exp_primary_action.isEnabled())
+                with patch.object(window, "review_selected_document") as review:
+                    window.exp_primary_action.click()
+                review.assert_called_once_with()
 
                 snapshot.return_value = (documents[:-1], True)
                 window._reveal_analytics_expense(requested)

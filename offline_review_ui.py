@@ -249,7 +249,7 @@ class OfflineReviewWindow(QDialog):
             self.object.hide()
             self.allocations = QTableWidget(0, 4)
             self.allocations.setObjectName("review_allocations")
-            self.allocations.setHorizontalHeaderLabels(["Назначение", "Сумма части", "", "Категория"])
+            self.allocations.setHorizontalHeaderLabels(["Назначение", "Сумма с НДС", "", "Категория"])
             header = self.allocations.horizontalHeader()
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -309,6 +309,13 @@ class OfflineReviewWindow(QDialog):
             self.payment_receipt_open.hide()
             self.payment_balance.hide()
             form.addRow(QLabel("Назначение и распределение:"))
+            allocation_help = QLabel(
+                "Назначение показывает, к какому объекту или к фирме относится расход. "
+                "Категория показывает, что купили или за что заплатили."
+            )
+            allocation_help.setWordWrap(True)
+            allocation_help.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            form.addRow(allocation_help)
             form.addRow(self.allocations)
             self.add_allocation_button = QPushButton("Разделить между объектами")
             self.add_allocation_button.setToolTip(
@@ -1278,8 +1285,8 @@ class OfflineReviewWindow(QDialog):
                 label = "Эмитент / поставщик"
             label_widget.setText(label + ":")
         if self.integrated and hasattr(self, "allocations"):
-            amount_label = "Сумма к оплате" if infrastructure_fee else "Сумма части"
-            self.allocations.setHorizontalHeaderLabels(["Назначение", amount_label, ""])
+            amount_label = "Сумма к оплате" if infrastructure_fee or base.get("prepaid") else "Сумма с НДС"
+            self.allocations.setHorizontalHeaderLabels(["Назначение", amount_label, "", "Категория"])
 
     def document_label(self, document_id):
         _, fields = (self.store.current_review(document_id) if self.integrated

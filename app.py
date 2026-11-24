@@ -8472,8 +8472,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.exp_primary_action.setText("Открыть исключённый документ")
             self.exp_primary_action.setToolTip("Оригинал сохранён; восстановление доступно в карточке документа.")
         elif status == "accounted":
-            self.exp_primary_action.setText("Расход учтён")
-            self.exp_primary_action.setEnabled(False)
+            self.exp_primary_action.setText("Открыть распределение…")
+            self.exp_primary_action.setToolTip("Показывает назначения, суммы и категории учтённой фактуры.")
         elif status == "transfer":
             self.exp_primary_action.setText("Проверить передачу")
         else:
@@ -8548,11 +8548,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self._invalidate_expense_reads()
             self.sync_with_cloud()
             return
-        if document.get("sync_state") == "conflict":
-            self.review_selected_document()
-            return
-        if self._expense_register_status_key(document) != "accounted":
-            self.review_selected_document()
+        self.review_selected_document()
 
     def open_mail_queue(self):
         from incoming_documents import enabled
