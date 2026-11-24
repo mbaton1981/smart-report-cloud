@@ -2,6 +2,7 @@ import copy
 import json
 import unittest
 from contextlib import closing
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,16 +139,19 @@ class CustomerBillingTests(unittest.TestCase):
     def test_desktop_preview_exports_only_selected_rows_and_records_invoice(self):
         from types import SimpleNamespace
         from next_customer_invoice import open_next_invoice
+        from object_package_report import expense_document_key
         from pypdf import PdfReader
+        from reportlab.pdfgen.canvas import Canvas
 
         with closing(self.desktop.get_db_connection()) as connection:
             local = dict(connection.execute("SELECT * FROM objects WHERE is_active=1 LIMIT 1").fetchone())
             connection.execute("UPDATE objects SET server_id=? WHERE id=?", (self.object_id, local["id"]))
             connection.commit()
         incomplete_shift = copy.deepcopy(self.shift)
-        incomplete_shift.update(sync_id="incomplete-shift", id=self.shift["id"] + 1000, date="2026-11-02", entry_type="ob")
+        incomplete_shift.update(sync_id="incomplete-shift", id=self.shift["id"] + 1000, date="2026-11-02",
+                                entry_type="ob", company="Test builder")
         quote = json.loads(incomplete_shift["customer_pricing"])
-        quote.update(travel=None, date_from="2026-11-02", date_to="2026-11-02")
+        quote.update(travel=None, date_from="2026-11-02", date_to="2026-11-02", company=incomplete_shift["company"])
         incomplete_shift["customer_pricing"] = json.dumps(quote)
         report = {"journal_rows": [self.shift, incomplete_shift],
                   "journal_segments": {"incomplete-shift": [{"category": "weekday_early_evening", "hours": 8,
@@ -159,9 +163,18 @@ class CustomerBillingTests(unittest.TestCase):
         window.inv_date_to = self.desktop.create_date_field("2026-11-18")
         window.collect_invoice_report = lambda **kwargs: report
         output = Path(self._case.name) / "next-customer-invoice.pdf"
+        original = Path(self._case.name) / "vendor-original.pdf"
+        canvas = Canvas(str(original))
+        canvas.drawString(60, 750, "TEST SUPPLIER ORIGINAL")
+        canvas.save()
+        window._download_object_report_originals = lambda documents, *_: (
+            {expense_document_key(document): [original] for document in documents
+             if document["id"] == self.document["id"]}, {},
+        )
         self.document["allocations"][0].update(expense_category="Материалы и закупки", expense_category_source="user")
         unknown = copy.deepcopy(self.document)
         unknown["id"] += 1000
+        unknown["client_id"] = "test-unknown-supplier-copy"
         unknown["document_date"] = "2026-11-17"
         unknown["allocations"][0]["net_amount"] = None
 
@@ -181,7 +194,7 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertEqual(table.item(1, 2).text(), "Наши часы и поездки")
             self.assertEqual(table.item(2, 4).text(), "—")
             self.assertNotIn("SEK", table.item(2, 3).text())
-            self.assertIn("OB1", table.item(2, 3).text())
+            self.assertIn("OB 2", table.item(2, 3).text())
             self.assertIn("Поездки · 1", table.item(2, 3).text())
             self.assertEqual(table.item(2, 5).text(), "К передаче бухгалтеру")
             self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Checked)
@@ -189,6 +202,13 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertEqual(table.item(3, 0).checkState(), self.desktop.Qt.CheckState.Checked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
+            checks = {field.text(): field for field in dialog.findChildren(QCheckBox)}
+            checks["Включить поездки"].setChecked(False)
+            table.item(0, 6).setCheckState(self.desktop.Qt.CheckState.Checked)
+            table.item(3, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            with patch("next_customer_invoice.edit_accountant_rates",
+                       return_value=({"ob2": Decimal(720), "trip": Decimal(300)}, False)):
+                buttons["Тарифы пакета…"].click()
             def preview(source, suggested, parent, **kwargs):
                 self.assertTrue(Path(source).is_file())
                 self.assertEqual(kwargs['title'], 'Предпросмотр документа бухгалтеру')
@@ -201,15 +221,28 @@ class CustomerBillingTests(unittest.TestCase):
                 viewer.assert_called_once()
             text = " ".join(page.extract_text() for page in PdfReader(output).pages)
             self.assertIn("100,00 SEK", text)
-            self.assertIn("250,00 SEK", text)
-            self.assertNotIn("3 600,00", text)
-            self.assertNotIn("450,00", text)
-            self.assertNotIn("7 750,00", text)
-            self.assertIn("OB1", text)
+            self.assertIn("125,00 SEK", text)
+            self.assertIn("4 500,00 SEK", text)
+            self.assertIn("2 880,00 SEK", text)
+            self.assertIn("OB 2", text)
+            self.assertIn("Dagbok", text)
+            self.assertIn("Totalt exkl. moms: att kontrollera", text)
+            self.assertNotIn("Resor", text)
+            self.assertEqual(text.count("TEST SUPPLIER ORIGINAL"), 1)
+            checks["Включить поездки"].setChecked(True)
+            checks["Включить Dagbok"].setChecked(False)
+            table.item(0, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            with patch('payroll_preview.open_preview', side_effect=preview):
+                buttons["Предварительный PDF"].click()
+            without_attachments = " ".join(page.extract_text() for page in PdfReader(output).pages)
+            self.assertNotIn("Dagbok", without_attachments)
+            self.assertNotIn("TEST SUPPLIER ORIGINAL", without_attachments)
+            self.assertIn("Resor: 2", without_attachments)
+            self.assertIn("600,00 SEK", without_attachments)
             for field in dialog.findChildren(QLineEdit):
                 if "Номер фактуры" in field.placeholderText():
                     field.setText("UI-INVOICE-1")
-            dialog.findChild(QCheckBox).setChecked(True)
+            dialog.findChild(QCheckBox, "accountantInvoiceReviewed").setChecked(True)
             self.assertTrue(buttons["Сохранить как выставленное"].isEnabled())
             table.item(2, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
             table.item(3, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)

@@ -1,4 +1,6 @@
 """Desktop workflow for the next customer invoice and its immutable membership."""
+from collections import defaultdict
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 import uuid
@@ -7,14 +9,101 @@ import tempfile
 from PyQt6.QtCore import QEventLoop, QDate, QThreadPool, Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QFileDialog, QProgressDialog,
+    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QProgressDialog,
 )
 
 from customer_billing import prepare_next_invoice
 from expense_documents import parse_decimal
 from expense_categories import confirmed_expense_category
-from object_package_report import collect_object_expenses, _recover_report_share_tax
-from accountant_report import write_accountant_report
+from object_package_report import collect_object_expenses, expense_document_key, _recover_report_share_tax
+from accountant_report import TIME_LABELS, line_details, summarize_accountant, write_accountant_report
+import payroll_auto
+import payroll_history
+import payroll_ui
+
+
+def accountant_payroll(desktop, report, entries):
+    selected = defaultdict(list)
+    for entry in entries:
+        if entry["member"]["kind"] == "shift":
+            selected[entry["row"]["employee"]].append(entry["row"])
+    if not selected:
+        return {}
+    settings = payroll_ui.read_auto_settings(desktop)
+    conn = desktop.get_db_connection()
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        _, zones, _ = payroll_history.state(payroll_history.events(conn.cursor()))
+        classified = {}
+        for employee, rows in selected.items():
+            start = min(row["date"] for row in rows)
+            end = (date.fromisoformat(max(row["date"] for row in rows)) + timedelta(days=1)).isoformat()
+            sources = {row["sync_id"]: (row, saved) for row, saved in
+                       payroll_history.source_rows(conn.cursor(), "shifts", employee, start, end)}
+            for row in rows:
+                saved = report.get("journal_segments", {}).get(row["sync_id"], [])
+                sources[row["sync_id"]] = (row, [{"segment_date": row["date"], **part} for part in saved])
+            result = payroll_auto.classify(list(sources.values()), employee, zones,
+                                           desktop.swedish_public_holidays, settings)
+            classified.update((row["sync_id"], result[row["sync_id"]]) for row in rows)
+        return classified
+    finally:
+        conn.close()
+
+
+def edit_accountant_rates(parent, rates, use_saved_terms):
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Тарифы для этого пакета")
+    form = QFormLayout(dialog)
+    note = QLabel(
+        "Заполните только ставки, которые хотите заменить. Пустые поля используют сохранённую клиентскую "
+        "ставку и проценты из зарплатной разбивки. Ставку для OB и Övertid вводите полностью, с доплатой. "
+        "При изменении часовых ставок сохранённые особые условия отключаются для этого пакета."
+    )
+    note.setWordWrap(True)
+    form.addRow(note)
+    saved = QCheckBox("Применять сохранённые особые условия клиента")
+    saved.setChecked(use_saved_terms)
+    saved.setToolTip("Снимите отметку, чтобы применить тарифы пакета вместо сохранённых доплат. Fast pris сохраняется.")
+    form.addRow(saved)
+    fields = {}
+    for key, label in [*TIME_LABELS.items(), ("trip", "Поездка")]:
+        if key == "unknown":
+            continue
+        edit = QLineEdit()
+        edit.setText(str(rates[key]) if key in rates else "")
+        edit.setPlaceholderText("Автоматически")
+        if key in payroll_auto.PREMIUM and payroll_auto.PREMIUM[key]:
+            label += f" (+{payroll_auto.PREMIUM[key]:.0%})"
+        form.addRow(label + (" · SEK/поездка" if key == "trip" else " · SEK/ч"), edit)
+        if key != "trip":
+            edit.textEdited.connect(lambda _: saved.setChecked(False))
+        fields[key] = edit
+    actions = QHBoxLayout()
+    apply = QPushButton("Применить")
+    close = QPushButton("Отмена")
+    actions.addWidget(apply)
+    actions.addWidget(close)
+    form.addRow(actions)
+    result = {}
+
+    def accept():
+        result.clear()
+        for key, edit in fields.items():
+            text = edit.text().strip()
+            value = parse_decimal(text) if text else None
+            if text and (value is None or not value.is_finite() or not 0 <= value <= 100000):
+                QMessageBox.warning(dialog, "Тарифы", "Введите ставку от 0 до 100 000 SEK или оставьте поле пустым.")
+                edit.setFocus()
+                return
+            if value is not None:
+                result[key] = value
+        dialog.accept()
+
+    apply.clicked.connect(accept)
+    close.clicked.connect(dialog.reject)
+    return (result, saved.isChecked()) if dialog.exec() == QDialog.DialogCode.Accepted else None
 
 
 def open_next_invoice(host):
@@ -48,6 +137,7 @@ def open_next_invoice(host):
         documents = desktop.fetch_all_expense_documents(None, None)
         entries, warnings = prepare_next_invoice(report["journal_rows"], documents, obj["server_id"], cutoff,
                                                  state["members"], accountant=True)
+        report["accountant_payroll"] = accountant_payroll(desktop, report, entries)
         needed = {entry["document"]["id"]: entry["document"] for entry in entries
                   if entry["member"]["kind"] == "expense" and entry.get("net") is None}
         download = getattr(host, "_download_object_report_originals", None)
@@ -115,14 +205,27 @@ def open_next_invoice(host):
     font.setBold(True)
     total_label.setFont(font)
     layout.addWidget(total_label)
-    table = QTableWidget(len(entries), 6)
-    table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / OB / документ", "Сумма документа", "Состояние"])
+    options = QHBoxLayout()
+    include_trips = QCheckBox("Включить поездки")
+    include_trips.setChecked(True)
+    include_journal = QCheckBox("Включить Dagbok")
+    include_journal.setChecked(True)
+    rate_button = QPushButton("Тарифы пакета…")
+    rate_button.setToolTip("Клиентские ставки для PDF и выбор сохранённых особых условий.")
+    for control in (include_trips, include_journal, rate_button):
+        options.addWidget(control)
+    options.addStretch()
+    layout.addLayout(options)
+    table = QTableWidget(len(entries), 7)
+    table.setHorizontalHeaderLabels(["Включить", "Дата", "Категория", "Часы / OB / документ", "Сумма документа", "Состояние", "Копия PDF"])
+    table.horizontalHeaderItem(6).setToolTip("Добавить оригинал поставщика в приложения к этому пакету.")
     table.setColumnWidth(0, 80)
     table.setColumnWidth(1, 115)
     table.setColumnWidth(2, 190)
-    table.setColumnWidth(3, 330)
-    table.setColumnWidth(4, 160)
-    table.setColumnWidth(5, 235)
+    table.setColumnWidth(3, 285)
+    table.setColumnWidth(4, 155)
+    table.setColumnWidth(5, 175)
+    table.setColumnWidth(6, 95)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     layout.addWidget(table, 1)
     for index, entry in enumerate(entries):
@@ -144,11 +247,7 @@ def open_next_invoice(host):
         if shift:
             row = entry["row"]
             description += f"\nПоездки · {row.get('transport') or 0:g}"
-            if row["entry_type"] == "ob":
-                description += f"\nOB · {row['hours']:g} ч"
-                from customer_report import CATEGORY_LABELS
-                for part in report.get("journal_segments", {}).get(row["sync_id"], []):
-                    description += f"\n{CATEGORY_LABELS.get(part['category'], part['category'])} · {part['hours']:g} ч"
+            description += "\n" + line_details(report, row)
         net = parse_decimal(allocation.get("net_amount"))
         gross = parse_decimal(allocation.get("gross_amount"))
         amount_text = "—" if shift else (
@@ -157,6 +256,15 @@ def open_next_invoice(host):
         for column, text in enumerate((entry["date"], entry["category"], description,
                                        amount_text, "К передаче бухгалтеру" if available else "Нет суммы документа или валюты"), 1):
             table.setItem(index, column, QTableWidgetItem(text))
+        copy = QTableWidgetItem()
+        if not shift:
+            copy.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            document = entry["document"]
+            has_copy = document.get("has_original") or document.get("attachments") or document.get("local_attachment_paths")
+            copy.setCheckState(Qt.CheckState.Checked if has_copy else Qt.CheckState.Unchecked)
+        else:
+            copy.setFlags(Qt.ItemFlag.NoItemFlags)
+        table.setItem(index, 6, copy)
     table.resizeRowsToContents()
     form = QFormLayout()
     number = QLineEdit()
@@ -166,6 +274,7 @@ def open_next_invoice(host):
     form.addRow("Дата фактуры", invoice_date)
     layout.addLayout(form)
     reviewed = QCheckBox("Сверил состав и прежние счета клиенту")
+    reviewed.setObjectName("accountantInvoiceReviewed")
     layout.addWidget(reviewed)
     actions = QHBoxLayout()
     pdf_button = QPushButton("Предварительный PDF")
@@ -178,6 +287,8 @@ def open_next_invoice(host):
     operation_id = uuid.uuid4().hex
     committed = False
     submitted_payload = None
+    rates = {}
+    use_saved_terms = True
 
     def selected():
         return [entry for index, entry in enumerate(entries)
@@ -185,13 +296,11 @@ def open_next_invoice(host):
 
     def refresh(*_):
         categories = {}
-        hours = trips = ob_hours = Decimal(0)
-        for entry in selected():
+        selection = selected()
+        summary = summarize_accountant(report, selection, include_trips=include_trips.isChecked(),
+                                       rates=rates, use_saved_terms=use_saved_terms)
+        for entry in selection:
             if entry["member"]["kind"] == "shift":
-                hours += Decimal(str(entry["row"]["hours"]))
-                if entry["row"]["entry_type"] == "ob":
-                    ob_hours += Decimal(str(entry["row"]["hours"]))
-                trips += Decimal(str(entry["row"].get("transport") or 0))
                 continue
             allocation = entry.get("display_allocation", entry["allocation"])
             net = parse_decimal(allocation.get("net_amount"))
@@ -199,12 +308,18 @@ def open_next_invoice(host):
             if amount is not None:
                 key = (entry["category"], entry["currency"], "без НДС" if net is not None else "с НДС")
                 categories[key] = categories.get(key, Decimal(0)) + amount
-        lines = [f"Часы · {hours:g} ч · Из них смены OB · {ob_hours:g} ч · Поездки · {trips:g}",
-                 "Стоимость работы, OB и поездок определяет бухгалтер."]
+        hours, trips, total = summary["hours"], summary["trips"], summary["total"]
+        lines = [f"Часы · {hours:g} ч" + (f" · Поездки · {trips:g}" if include_trips.isChecked() else "")]
+        lines.append(
+            f"К выставлению · {total:,.2f} SEK без НДС" if total is not None else
+            f"К выставлению · требуется сверка · известная часть {summary['known']:,.2f} SEK без НДС"
+        )
+        if summary["stored_terms"]:
+            lines.append("В расчёте есть сохранённые особые условия клиента.")
         lines += [f"{category} · {value:,.2f} {currency} {basis}"
                   for (category, currency, basis), value in sorted(categories.items())]
         total_label.setText("\n".join(lines))
-        valid = bool(selected())
+        valid = bool(selection)
         save_button.setEnabled(supported and valid and reviewed.isChecked()
                                and bool(number.text().strip()) and not committed)
         pdf_button.setEnabled(valid)
@@ -212,16 +327,60 @@ def open_next_invoice(host):
     table.itemChanged.connect(refresh)
     number.textChanged.connect(refresh)
     reviewed.toggled.connect(refresh)
+    include_trips.toggled.connect(refresh)
+
+    def change_rates():
+        nonlocal rates, use_saved_terms
+        updated = edit_accountant_rates(dialog, rates, use_saved_terms)
+        if updated is not None:
+            rates, use_saved_terms = updated
+            refresh()
+
+    rate_button.clicked.connect(change_rates)
 
     def export_pdf():
         selection = selected()
+        copies = {}
+        for index, entry in enumerate(entries):
+            if (entry["member"]["kind"] == "expense"
+                    and table.item(index, 0).checkState() == Qt.CheckState.Checked
+                    and table.item(index, 6).checkState() == Qt.CheckState.Checked):
+                document = entry["document"]
+                copies[expense_document_key(document)] = document
+        settings = dict(include_trips=include_trips.isChecked(), include_journal=include_journal.isChecked(),
+                        rates=dict(rates), use_saved_terms=use_saved_terms)
         try:
             from payroll_preview import open_preview
             filename = "Следующий-счёт.pdf"
             with tempfile.TemporaryDirectory(prefix="SmartReport-accountant-preview-") as folder:
                 path = Path(folder) / filename
-                write_accountant_report(path, obj, selection, report, cutoff,
-                                        font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD)
+                def build(update):
+                    documents = list(copies.values())
+                    download = getattr(host, "_download_object_report_originals", None)
+                    sources, errors = download(documents, folder, update) if documents and download else ({}, {})
+                    write_accountant_report(path, obj, selection, report, cutoff, copy_documents=documents,
+                                            source_paths=sources, source_errors=errors,
+                                            font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD, **settings)
+
+                build_loop = QEventLoop()
+                result = []
+                task = desktop.ObjectPackageTask(0, build)
+                progress = QProgressDialog("Собираем PDF для бухгалтера…", "", 0, 0, dialog)
+                progress.setCancelButton(None)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                task.signals.progress.connect(lambda _, message: progress.setLabelText(message))
+
+                def finished(_, _value, error):
+                    result.append(error)
+                    build_loop.quit()
+
+                task.signals.completed.connect(finished)
+                progress.show()
+                QThreadPool.globalInstance().start(task)
+                build_loop.exec()
+                progress.close()
+                if result[0]:
+                    raise RuntimeError(result[0])
                 open_preview(path, (Path(desktop.REPORTS_DIR) / filename).resolve(), dialog,
                              title="Предпросмотр документа бухгалтеру")
         except Exception as error:
