@@ -142,14 +142,22 @@ class CustomerBillingTests(unittest.TestCase):
         from object_package_report import expense_document_key
         from pypdf import PdfReader
         from reportlab.pdfgen.canvas import Canvas
+        import swedish_translation
+
+        swedish_translation.clear_cache()
+        self.addCleanup(swedish_translation.clear_cache)
+        self.shift["comment"] = "Демонтаж стін у підвалі"
 
         with closing(self.desktop.get_db_connection()) as connection:
             local = dict(connection.execute("SELECT * FROM objects WHERE is_active=1 LIMIT 1").fetchone())
             connection.execute("UPDATE objects SET server_id=? WHERE id=?", (self.object_id, local["id"]))
             connection.commit()
+            swedish_translation.save_confirmed_translations(
+                connection, [self.shift], {self.shift["sync_id"]: "Demontering av väggar i källaren"},
+            )
         incomplete_shift = copy.deepcopy(self.shift)
         incomplete_shift.update(sync_id="incomplete-shift", id=self.shift["id"] + 1000, date="2026-11-02",
-                                entry_type="ob", company="Test builder")
+                                entry_type="ob", company="Test builder", comment="Демонтаж стен и сортировка отходов")
         quote = json.loads(incomplete_shift["customer_pricing"])
         quote.update(travel=None, date_from="2026-11-02", date_to="2026-11-02", company=incomplete_shift["company"])
         incomplete_shift["customer_pricing"] = json.dumps(quote)
@@ -162,6 +170,7 @@ class CustomerBillingTests(unittest.TestCase):
         window.inv_obj_cb = SimpleNamespace(currentData=lambda: local["id"])
         window.inv_date_to = self.desktop.create_date_field("2026-11-18")
         window.collect_invoice_report = lambda **kwargs: report
+        window._collect_journal_translations = self.desktop.SmartReportApp._collect_journal_translations.__get__(window)
         output = Path(self._case.name) / "next-customer-invoice.pdf"
         original = Path(self._case.name) / "vendor-original.pdf"
         canvas = Canvas(str(original))
@@ -184,8 +193,25 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.get_json())
             return response.get_json()
 
+        def translate(items, _database):
+            self.assertEqual([text for _, text in items], [incomplete_shift["comment"]])
+            return {identifier: "Rivning av väggar och sortering av avfall" for identifier, _ in items}
+
+        reviewed_translations = []
+
         def inspect(dialog):
-            from PyQt6.QtWidgets import QTableWidget, QPushButton, QLineEdit, QCheckBox
+            from PyQt6.QtWidgets import QTableWidget, QPushButton, QLineEdit, QCheckBox, QTextEdit
+            if isinstance(dialog, self.desktop.JournalTranslationDialog):
+                self.assertEqual(dialog.table.rowCount(), 1)
+                self.assertIn("Документы бухгалтеру", dialog.parentWidget().windowTitle())
+                editor = dialog.findChild(QTextEdit, f"journal_translation_{incomplete_shift['id']}")
+                reviewed_translations.append(editor.toPlainText())
+                if len(reviewed_translations) == 1:
+                    dialog.reject()
+                else:
+                    editor.setPlainText("Demontering av väggar och sortering av rivningsavfall")
+                    dialog.accept()
+                return dialog.result()
             table = dialog.findChild(QTableWidget)
             self.assertIsNotNone(table, str([(type(widget).__name__, widget.objectName()) for widget in dialog.children()]))
             self.assertEqual(table.rowCount(), 4)
@@ -218,6 +244,8 @@ class CustomerBillingTests(unittest.TestCase):
                     patch.object(self.desktop.QMessageBox, "information"), \
                     patch.object(self.desktop.QMessageBox, "warning", side_effect=lambda *args: self.fail(args[2])):
                 buttons["Предварительный PDF"].click()
+                viewer.assert_not_called()
+                buttons["Предварительный PDF"].click()
                 viewer.assert_called_once()
             text = " ".join(page.extract_text() for page in PdfReader(output).pages)
             self.assertIn("100,00 SEK", text)
@@ -226,6 +254,9 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertIn("2 880,00 SEK", text)
             self.assertIn("OB 2", text)
             self.assertIn("Dagbok", text)
+            self.assertIn("Demontering av väggar i källaren", text)
+            self.assertIn("Demontering av väggar och sortering av rivningsavfall", text)
+            self.assertNotIn("Демонтаж", text)
             self.assertIn("Totalt exkl. moms: att kontrollera", text)
             self.assertNotIn("Resor", text)
             self.assertEqual(text.count("TEST SUPPLIER ORIGINAL"), 1)
@@ -254,7 +285,13 @@ class CustomerBillingTests(unittest.TestCase):
 
         with patch.object(self.desktop, "request_expense_api", side_effect=api), \
                 patch.object(self.desktop, "fetch_all_expense_documents", return_value=[self.document, unknown]), \
+                patch.object(swedish_translation, "_request", side_effect=translate) as translator, \
                 patch.object(self.desktop.QDialog, "exec", new=inspect):
             open_next_invoice(window)
+        translator.assert_called_once()
+        self.assertEqual(reviewed_translations, ["Rivning av väggar och sortering av avfall"] * 2)
+        with closing(self.desktop.get_db_connection()) as connection:
+            self.assertEqual(swedish_translation.load_confirmed_translations(connection, [incomplete_shift]),
+                             {incomplete_shift["sync_id"]: "Demontering av väggar och sortering av rivningsavfall"})
         state = api("GET", "/api/customer-invoices", params={"object_id": self.object_id})
         self.assertEqual(len(state["members"]), 2)

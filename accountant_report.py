@@ -17,6 +17,7 @@ from expense_documents import parse_decimal
 from object_package_report import _prepare_sources, expense_document_key
 from object_package_swedish import swedish_category
 from payroll_auto import PREMIUM
+from swedish_translation import CYRILLIC
 
 
 TIME_LABELS = {
@@ -210,9 +211,14 @@ def write_accountant_report(filepath, obj, entries, report, cutoff, *, font, bol
     if include_journal and summary["shifts"]:
         story.extend([PageBreak(), paragraph("Dagbok", title), paragraph(scope, heading), Spacer(1, 8)])
         rows = [["Datum", "Medarbetare", "Arbetsbeskrivning / tid", "Timmar", *(["Resor"] if include_trips else [])]]
+        translations = report.get("journal_translations", {})
         for entry in summary["shifts"]:
             row = entry["row"]
-            details = "\n".join(filter(None, (str(row.get("comment") or "").strip(), line_details(report, row))))
+            description = (translations.get(row["sync_id"]) or "").strip()
+            if not description or CYRILLIC.search(description):
+                description = ("Svensk översättning saknas" if (row.get("comment") or "").strip()
+                               else "Arbetsbeskrivning saknas")
+            details = f"{description}\n{line_details(report, row)}"
             rows.append([row["date"], row["employee"], details, quantity(row["hours"]),
                          *([quantity(row.get("transport") or 0)] if include_trips else [])])
         story.append(table(rows, [63, 104, 225, 61, 50] if include_trips else [63, 104, 275, 61]))

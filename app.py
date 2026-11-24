@@ -13342,8 +13342,9 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             )
         return translated
 
-    def _collect_journal_translations(self, report, *, allow_draft=False):
+    def _collect_journal_translations(self, report, *, allow_draft=False, parent=None):
         import swedish_translation
+        parent = self if parent is None else parent
         journal_rows = [
             row for row in report["journal_rows"]
             if row.get("entry_type") in WORK_TYPES
@@ -13359,7 +13360,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 )
             except sqlite3.Error as error:
                 QMessageBox.warning(
-                    self, "Сохранённые переводы недоступны",
+                    parent, "Сохранённые переводы недоступны",
                     f"Не удалось прочитать подтверждённые переводы. "
                     f"Проверьте описания в этом отчёте.\n\n{error}",
                 )
@@ -13382,11 +13383,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                     suggestion = swedish_translation.suggest_journal_phrase(row["comment"])
                     status = "Проверьте предложенный перевод" if suggestion else "Введите перевод на шведский"
                     entries.append((row, suggestion, status, not suggestion))
-                dialog = JournalTranslationDialog(entries, self, allow_draft=True)
+                dialog = JournalTranslationDialog(entries, parent, allow_draft=True)
             else:
                 entries = SmartReportApp._machine_translate_rows(self, pending)
                 dialog = JournalTranslationDialog(
-                    entries, self, retry=lambda rows: SmartReportApp._machine_translate_rows(self, rows),
+                    entries, parent, retry=lambda rows: SmartReportApp._machine_translate_rows(self, rows),
                 )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
@@ -13401,7 +13402,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
                 )
             except (sqlite3.Error, ValueError) as error:
                 QMessageBox.warning(
-                    self, "Переводы не сохранены",
+                    parent, "Переводы не сохранены",
                     "Подтверждённые переводы используются в этом PDF, но не были "
                     f"сохранены для следующих отчётов.\n\n{error}",
                 )

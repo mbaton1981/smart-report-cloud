@@ -351,6 +351,15 @@ def open_next_invoice(host):
                         rates=dict(rates), use_saved_terms=use_saved_terms)
         try:
             from payroll_preview import open_preview
+            translations = {}
+            if settings["include_journal"]:
+                journal_rows = [entry["row"] for entry in selection
+                                if entry["member"]["kind"] == "shift" and (entry["row"].get("comment") or "").strip()]
+                if journal_rows:
+                    translations = host._collect_journal_translations({"journal_rows": journal_rows}, parent=dialog)
+                    if translations is None:
+                        return
+            pdf_report = {**report, "journal_translations": translations}
             filename = "Следующий-счёт.pdf"
             with tempfile.TemporaryDirectory(prefix="SmartReport-accountant-preview-") as folder:
                 path = Path(folder) / filename
@@ -358,7 +367,7 @@ def open_next_invoice(host):
                     documents = list(copies.values())
                     download = getattr(host, "_download_object_report_originals", None)
                     sources, errors = download(documents, folder, update) if documents and download else ({}, {})
-                    write_accountant_report(path, obj, selection, report, cutoff, copy_documents=documents,
+                    write_accountant_report(path, obj, selection, pdf_report, cutoff, copy_documents=documents,
                                             source_paths=sources, source_errors=errors,
                                             font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD, **settings)
 
