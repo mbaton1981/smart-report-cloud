@@ -2791,7 +2791,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.setup_sprav_tab()
         if self.can_request_shift_reopen():
             from analytics_ui import AnalyticsWidget
-            self.analytics_tab = AnalyticsWidget(fetch_management_analytics, self, request_correction=request_expense_api)
+            self.analytics_tab = AnalyticsWidget(fetch_management_analytics, self, request_correction=request_expense_api,
+                                                 reveal_expense=self._reveal_analytics_expense)
             self.tabs.addTab(self.analytics_tab, "Аналитика")
         
         self.load_dropdowns()
@@ -8157,6 +8158,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_document_tabs.setCurrentIndex(0)
         self._invalidate_expense_reads()
         self.load_expense_documents()
+
+    def _reveal_analytics_expense(self, document):
+        self.tabs.setCurrentIndex(3)
+        self._reveal_expense_document(document)
 
     def _confirm_show_hidden_expense_document(self, document, reasons, intro):
         box = QMessageBox(self)

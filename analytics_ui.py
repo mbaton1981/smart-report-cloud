@@ -8,7 +8,7 @@ from PyQt6.QtCore import QEventLoop, QObject, QRunnable, QThreadPool, QTimer, Qt
 from PyQt6.QtGui import QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
-    QDialog, QFrame, QLineEdit, QProgressDialog, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+    QDialog, QFrame, QLineEdit, QProgressDialog, QTableWidget, QTableWidgetItem, QMessageBox,
 )
 from date_widgets import CalendarDateEdit
 from desktop_ui import ReportTable
@@ -26,6 +26,58 @@ def billing_summary(counts):
     if not counts:
         return "—"
     return f"{counts['hours']:g} ч · {counts['expenses']} дол."
+
+
+def open_expense_breakdown(parent, documents, total, *, exact, open_document=None):
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Фактуры без точной разбивки")
+    dialog.resize(1080, 460)
+    layout = QVBoxLayout(dialog)
+    explanation = QLabel(
+        f"{number(total)} SEK без НДС уже учтено в общих затратах. "
+        "Остаток — сумма фактуры без НДС за вычетом долей с известными суммами.\n"
+        + ("" if exact else "В этом снимке доступны документы для сверки по внутреннему номеру. "
+           "Суммы по каждому документу появятся после обновления серверного расчёта.")
+    )
+    explanation.setWordWrap(True)
+    layout.addWidget(explanation)
+    table = ReportTable(len(documents), 7, dialog, stretch_columns=(2,),
+                        column_widths={0: 70, 1: 111, 2: 200, 3: 142, 4: 150, 5: 155, 6: 155})
+    table.setHorizontalHeaderLabels(("ID", "Дата", "Поставщик", "№ фактуры", "Фактура без НДС",
+                                     "Известные доли", "Остаток без НДС"))
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    for index, document in enumerate(documents):
+        values = [str(document["id"]), document.get("date") or "—", document.get("supplier") or "—",
+                  document.get("invoice_number") or "—"]
+        values.extend(number(Decimal(document[key])) if document.get(key) is not None else "—"
+                      for key in ("net_amount", "assigned_net", "remainder"))
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setToolTip(value)
+            table.setItem(index, column, item)
+    layout.addWidget(table)
+    actions = QHBoxLayout()
+    if open_document:
+        show = QPushButton("Показать в расходах", dialog)
+        show.setEnabled(False)
+        table.itemSelectionChanged.connect(lambda: show.setEnabled(bool(table.selectedItems())))
+
+        def show_selected(*_):
+            index = table.currentRow()
+            if index >= 0 and open_document(dialog, documents[index]["id"]):
+                dialog.accept()
+
+        show.clicked.connect(show_selected)
+        table.cellDoubleClicked.connect(show_selected)
+        actions.addWidget(show)
+    actions.addStretch()
+    close = QPushButton("Закрыть", dialog)
+    close.clicked.connect(dialog.accept)
+    actions.addWidget(close)
+    layout.addLayout(actions)
+    dialog.exec()
 
 
 def open_billing_details(parent, entries, scope, start, end, *, correct=None):
@@ -372,10 +424,11 @@ class Chart(QWidget):
 
 
 class AnalyticsWidget(QWidget):
-    def __init__(self, fetch, parent=None, *, request_correction=None):
+    def __init__(self, fetch, parent=None, *, request_correction=None, reveal_expense=None):
         super().__init__(parent)
         self.fetch, self.serial, self.busy = fetch, 0, False
         self.request_correction = request_correction
+        self.reveal_expense = reveal_expense
         self.pending, self.last_parameters, self.fingerprint = False, None, None
         self.payload, self.task = None, None
         self._render_count = 0
@@ -452,26 +505,30 @@ class AnalyticsWidget(QWidget):
             self.cards[key] = value
             self.card_widgets.append(card)
         layout.addLayout(cards)
-        self.table = QTableWidget(0, 8)
+        self.table = ReportTable(0, 8, stretch_columns=(0, 5, 6, 7),
+                                 column_widths={0: 235, 1: 74, 2: 151, 3: 142, 4: 150,
+                                                5: 170, 6: 144, 7: 164})
         self.table.setHorizontalHeaderLabels(("Объект", "Часы", "Оценка работ · SEK", "Затраты · SEK",
                                              "Результат · SEK", "Полнота данных", "В счёте", "Ожидает счёта"))
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (2, 3, 4):
-            self.table.setColumnWidth(column, 160)
-        self.table.setColumnWidth(5, 210)
         self.table.setMinimumHeight(240)
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.table)
+        table_actions = QHBoxLayout()
         self.billing_button = QPushButton("Состав счетов…")
         self.billing_button.setEnabled(False)
         self.billing_button.setToolTip("Откройте состав выбранного объекта. Для всего отбора выберите строку «ИТОГО».")
         self.billing_button.clicked.connect(self.show_billing)
-        self.table.cellDoubleClicked.connect(self.show_billing)
-        layout.addWidget(self.billing_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        table_actions.addWidget(self.billing_button)
+        self.expense_breakdown_button = QPushButton("Фактуры без точной разбивки…")
+        self.expense_breakdown_button.setEnabled(False)
+        self.expense_breakdown_button.clicked.connect(self.show_expense_breakdown)
+        table_actions.addWidget(self.expense_breakdown_button)
+        table_actions.addStretch()
+        layout.addLayout(table_actions)
+        self.table.cellDoubleClicked.connect(self.show_row_details)
         self.hours_chart, self.objects_chart = Chart("hours"), Chart("objects")
         charts = QHBoxLayout()
         self.charts_layout = charts
@@ -563,6 +620,7 @@ class AnalyticsWidget(QWidget):
     def changed(self):
         self.serial += 1
         self.billing_button.setEnabled(False)
+        self.expense_breakdown_button.setEnabled(False)
         self.status.setText("Отбор изменён · ожидается расчёт. Ниже пока предыдущий результат.")
         if self.isVisible():
             self.debounce.start()
@@ -610,6 +668,7 @@ class AnalyticsWidget(QWidget):
         if error:
             self.status.setText(f"Не удалось обновить: {error}\nПредыдущие данные не подтверждены как актуальные.")
             self.billing_button.setEnabled(False)
+            self.expense_breakdown_button.setEnabled(False)
         else:
             self.payload = payload
             stable = {key: value for key, value in payload.items() if key != "calculated_at"}
@@ -620,10 +679,41 @@ class AnalyticsWidget(QWidget):
             self.status.setText(f"Расчёт: {payload['calculated_at']} · {payload['source']}. "
                                 "Обновление только чтением; локальные изменения попадут после штатного обмена.")
             self.billing_button.setEnabled("billing" in payload)
+            self.expense_breakdown_button.setEnabled(self.unresolved_row() is not None)
             if "billing" not in payload:
                 self.status.setText("Сервер использует прежний расчёт аналитики. Состав счетов появится после обновления сервера.")
         if self.pending and self.isVisible():
             self.debounce.start()
+
+    def unresolved_row(self):
+        return next((row for row in (self.payload or {}).get("rows", []) if row["key"] == "unresolved_net"), None)
+
+    def show_row_details(self, row, _column):
+        if self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) == "unresolved_net":
+            self.show_expense_breakdown()
+        else:
+            self.show_billing()
+
+    def show_expense_breakdown(self):
+        if not self.expense_breakdown_button.isEnabled():
+            return
+        data = self.payload
+        exact = "unresolved_expenses" in data
+        documents = data["unresolved_expenses"] if exact else [
+            item for item in data["unknown_expenses"] if item["reason"] == "Часть расхода без НДС требует сверки"
+        ]
+        open_expense_breakdown(self, documents, self.unresolved_row()["expenses"], exact=exact,
+                               open_document=self._open_expense if self.reveal_expense and self.request_correction else None)
+
+    def _open_expense(self, parent, document_id):
+        try:
+            document = _run_correction(parent, "Загружаем документ…", lambda: self.request_correction(
+                "GET", f"/api/expense-documents/{document_id}")["document"])
+        except (KeyError, RuntimeError) as error:
+            QMessageBox.warning(parent, "Фактура", str(error))
+            return False
+        self.reveal_expense(document)
+        return True
 
     def show_billing(self):
         if not self.billing_button.isEnabled():
@@ -670,17 +760,22 @@ class AnalyticsWidget(QWidget):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(data["rows"])+int(bool(data["rows"])))
         for index, row in enumerate(data["rows"]):
-            label = QTableWidgetItem(row["label"])
+            unresolved = row["key"] == "unresolved_net"
+            label = QTableWidgetItem("Остаток фактур без разбивки по объектам" if unresolved else row["label"])
             label.setData(Qt.ItemDataRole.UserRole, row["key"])
             self.table.setItem(index, 0, label)
             for column, key in enumerate(("hours", "revenue", "cost", "result"), 1):
-                self.table.setItem(index, column, NumericItem(row[key], row["partial"] and key != "hours"))
-            completeness = QTableWidgetItem("Частичные данные" if row["partial"] else "Известные внесённые данные")
+                value = NumericItem(row[key], row["partial"] and key != "hours" and not unresolved)
+                if unresolved and key == "cost":
+                    value.setToolTip(f"{number(row[key])} SEK без НДС учтено в общих затратах.")
+                self.table.setItem(index, column, value)
+            completeness = QTableWidgetItem("Сверить доли" if unresolved else (
+                "Частичные данные" if row["partial"] else "Известные внесённые данные"))
             details = list(row["notes"])
             details.extend(f"Fast pris {f['start']} — {f['end']}: {number(f['amount'])} SEK · "
                            + ("включён" if f["included"] else "не отнесён к периоду") for f in row["fixed"])
             completeness.setToolTip("\n".join(details))
-            label.setToolTip(row["label"]+"\n"+"\n".join(details))
+            label.setToolTip(label.text()+"\n"+"\n".join(details))
             self.table.setItem(index, 5, completeness)
             for column, status in ((6, "included"), (7, "pending")):
                 counts = row.get("billing", {})

@@ -373,20 +373,27 @@ class AnalyticsTests(unittest.TestCase):
             dict(object_id=objects["Travel B"], company="Renatur", object_name="Travel B",
                  gross_amount="100", net_amount=None, vat_amount=None),
         ]
-        parent = self.document(net="200", gross="225", vat="25", allocations=allocations)
+        parent = self.document(net="200", gross="225", vat="25", allocations=allocations,
+                               supplier_name="Test supplier", invoice_number="MAT-42")
         support = self.document(allocations=allocations[:1], supporting_to_document_id=1)
         support["id"] = 2
         data = self.calculate(documents=[parent, support])
         self.assertEqual(data["totals"]["expenses"], 200)
         self.assertEqual(next(row for row in data["rows"] if row["key"] == "unresolved_net")["expenses"], 100)
+        self.assertEqual(data["unresolved_expenses"], [dict(
+            id=1, date="2026-10-20", supplier="Test supplier", invoice_number="MAT-42",
+            net_amount="200", assigned_net="100", remainder="100",
+        )])
         self.assertEqual(len(data["unknown_expenses"]), 1)
         self.assertEqual(len(data["billing"]), 2)
         self.assertIsNone(next(row for row in data["billing"] if row["share"] == 2)["net"])
         scoped = self.calculate(documents=[parent, support], object_key=f"object:{objects['Travel A']}")
         self.assertFalse(scoped["totals"]["cost_partial"])
+        self.assertEqual(scoped["unresolved_expenses"], [])
         self.assertEqual(scoped["totals"]["expenses"], 100)
         recovered = self.calculate(documents=[parent, support], recover_expense_nets=lambda *args: {1: "100"})
         self.assertFalse(recovered["totals"]["cost_partial"])
+        self.assertEqual(recovered["unresolved_expenses"], [])
         self.assertEqual(recovered["totals"]["expenses"], 200)
         self.assertIsNone(parent["allocations"][1]["net_amount"])
 

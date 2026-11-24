@@ -312,7 +312,7 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
                    has_expense=False, billing={})
     groups["general"] = general
     unresolved_net = Decimal(0)
-    unresolved_net_count = 0
+    unresolved_expenses = []
     unknown_expenses, expense_count, undated = [], 0, 0
     for document in documents:
         if document.get("supporting_to_document_id"):
@@ -392,7 +392,11 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
             remainder = net - assigned
             if None in net_values:
                 unresolved_net += remainder
-                unresolved_net_count += 1
+                unresolved_expenses.append(dict(
+                    id=document["id"], date=day, supplier=document.get("supplier_name"),
+                    invoice_number=document.get("invoice_number"), net_amount=str(net),
+                    assigned_net=str(assigned), remainder=str(remainder),
+                ))
             else:
                 general["expenses"] += float(remainder)
                 general["has_expense"] |= not allocations or remainder != 0
@@ -441,11 +445,11 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
         notes.add("Сохранённых зарплатных начислений за период нет. Результат не отражает полную экономику.")
     if unknown_expenses:
         notes.add(f"Расходов с неполными или исключёнными суммами: {len(unknown_expenses)}.")
-    if unresolved_net_count:
+    if unresolved_expenses:
         groups["unresolved_net"] = {
             **general, "key": "unresolved_net", "label": "Нетто фактур без точной разбивки",
             "expenses": float(unresolved_net), "has_expense": True, "cost_missing": True,
-            "notes": ["Сумма фактур подтверждена. Распределение остатка по объектам требует сверки."],
+            "notes": ["Остаток без НДС уже включён в общие затраты. Нужно сверить суммы долей по объектам."],
         }
     rows = []
     for item in groups.values():
@@ -501,6 +505,7 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
                 source="Серверный снимок; локальные неотправленные изменения не включены",
                 totals=totals, rows=rows, hours_chart=daily_points, objects_chart=chart_rows,
                 weekly=weekly, notes=sorted(notes), unknown_expenses=unknown_expenses,
+                unresolved_expenses=unresolved_expenses,
                 billing=sorted(billing, key=lambda entry: (entry["date"], entry["object_label"], entry["description"])),
                 objects=sorted(options.values(), key=lambda obj: obj["label"]),
                 companies=sorted({obj["company"] for obj in options.values() if obj["company"]}),

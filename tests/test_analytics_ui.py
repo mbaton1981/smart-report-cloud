@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -33,6 +33,40 @@ class AnalyticsResponsiveLayoutTests(unittest.TestCase):
         index = widget.filters_layout.indexOf(widget.object)
         self.assertEqual(widget.filters_layout.getItemPosition(index), (2, 0, 1, 2))
         self.assertEqual(widget.object.view().textElideMode(), Qt.TextElideMode.ElideNone)
+
+        widget.resize(1800, 900)
+        widget.show()
+        self.application.processEvents()
+        self.assertGreaterEqual(widget.table.columnWidth(7), 164)
+        self.assertLess(widget.table.columnWidth(0), widget.table.viewport().width() / 2)
+        self.assertEqual(widget.table.horizontalScrollBar().maximum(), 0)
+        widget.close()
+
+    def test_unresolved_expense_breakdown_opens_the_exact_document(self):
+        detail = dict(id=38, date="2026-11-10", supplier="Test supplier", invoice_number="MAT-42",
+                      net_amount="1000", assigned_net="750.50", remainder="249.50")
+        reveal = Mock()
+        request = Mock(return_value={"document": {"id": 38, "client_id": "client-38"}})
+        widget = AnalyticsWidget(lambda _: {}, request_correction=request, reveal_expense=reveal)
+        self.addCleanup(widget.deleteLater)
+        widget.payload = dict(rows=[dict(key="unresolved_net", expenses=249.5)], unresolved_expenses=[detail])
+        widget.expense_breakdown_button.setEnabled(True)
+
+        def inspect(dialog):
+            table = dialog.findChild(QTableWidget)
+            self.assertEqual(table.item(0, 3).text(), "MAT-42")
+            self.assertEqual(table.item(0, 6).text(), "249.50")
+            show = next(button for button in dialog.findChildren(QPushButton) if button.text() == "Показать в расходах")
+            self.assertFalse(show.isEnabled())
+            table.selectRow(0)
+            show.click()
+            return dialog.result()
+
+        with patch("analytics_ui._run_correction", side_effect=lambda _parent, _message, callback: callback()), \
+                patch.object(QDialog, "exec", new=inspect):
+            widget.expense_breakdown_button.click()
+        request.assert_called_once_with("GET", "/api/expense-documents/38")
+        reveal.assert_called_once_with({"id": 38, "client_id": "client-38"})
 
     def test_correction_dialog_submits_only_changed_expenses_after_confirmation(self):
         parent = QWidget()
