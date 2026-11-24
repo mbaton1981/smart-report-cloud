@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path
+import json
 import re
 import sys
 import tempfile
@@ -25,6 +26,7 @@ from reportlab.platypus import (
 )
 
 from customer_report import CATEGORY_LABELS, REPORT_ISSUER_NAME, WORK_TYPES, format_quantity
+from customer_billing import allocation_fingerprint, priced_report
 from document_costs import verified_original_order_allocation_proposal
 from expense_documents import (
     DocumentExtractionError, extract_local_document, object_marking_matches, parse_decimal,
@@ -33,6 +35,7 @@ from expense_categories import (
     CATEGORY_EQUIPMENT_RENTAL, CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
     CATEGORY_SUBCONTRACTOR_WORK, CATEGORY_UNCLASSIFIED, confirmed_expense_category,
 )
+from fixed_pricing import signature
 from object_package_swedish import swedish_category, swedish_document_type, swedish_label
 
 
@@ -422,6 +425,104 @@ def _customer_summary(report):
     }
 
 
+_BILLING_COLUMNS = ("billed", "pending", "review")
+_BILLING_COMPONENTS = ("work", "travel", "materials", "other")
+_BILLING_LABELS = {
+    "billed": ("Выставлено", "Fakturerat"),
+    "pending": ("Ожидает выставления", "Kvar att fakturera"),
+    "review": ("Требует сверки", "Att kontrollera"),
+}
+
+
+def _billing_breakdown(data, figures, work_rows):
+    """Allocate reported net amounts according to the current saved invoice membership."""
+    members = data["billing_members"]
+    expenses = data.get("expenses", [])
+    values = defaultdict(list)
+    if not data.get("expense_snapshot_available"):
+        values["materials", "review"].append(None)
+        values["other", "review"].append(None)
+    statuses = {}
+    foreign = set()
+    saved_expenses = defaultdict(list)
+    for member in (members or {}).values():
+        if member["kind"] == "expense":
+            saved_expenses[member["document_id"]].append(member)
+
+    for document in expenses:
+        doc_id = document.get("id")
+        original = document.get("allocations") or []
+        saved = saved_expenses.get(doc_id, [])
+        changed = any(
+            not 0 <= item["index"] < len(original)
+            or item["fingerprint"] != allocation_fingerprint(document, item["index"])
+            for item in saved
+        )
+        billed = {item["index"] for item in saved}
+        currency = str(document.get("currency_code") or "UNKNOWN").upper()
+        for index, part in zip(document["object_allocation_indexes"], document["object_allocations"]):
+            status = ("review" if members is None or changed or doc_id is None else
+                      "billed" if index in billed else "pending")
+            statuses[doc_id, index] = status
+            component = "materials" if part.get("expense_category") == CATEGORY_MATERIALS else "other"
+            if currency == "SEK":
+                values[component, status].append(parse_decimal(part.get("net_amount")))
+            else:
+                foreign.add(currency)
+                if currency == "UNKNOWN":
+                    values[component, "review"].append(None)
+
+    if data.get("include_customer_cost") and work_rows:
+        groups = defaultdict(list)
+        for row in work_rows:
+            member = (members or {}).get("shift:" + str(row.get("sync_id")))
+            if members is None or not row.get("sync_id") or (member and (
+                    member["signature"] != signature(row)
+                    or json.loads(member.get("customer_pricing") or "null") != json.loads(row.get("customer_pricing") or "null")
+                    or not row.get("invoiced"))):
+                status = "review"
+            else:
+                status = "billed" if row.get("invoiced") else "pending"
+            groups[status].append(row)
+
+        def work_values(group_figures, rows):
+            travel_complete = group_figures["travel_complete"] and all(row.get("transport") is not None for row in rows)
+            return {
+                "work": (group_figures["known_work_amount"], group_figures["work_complete"]),
+                "travel": (group_figures["known_travel_amount"], travel_complete),
+            }
+
+        report = data["customer_report"]
+        whole = work_values(figures, work_rows)
+        if len(groups) == 1:
+            projections = {next(iter(groups)): whole}
+        elif report.get("is_fast_pris"):
+            projections = {"review": whole}
+        else:
+            projections = {
+                status: work_values(_customer_summary(priced_report(
+                    {"journal_segments": report.get("journal_segments", {}), "is_fast_pris": False}, rows,
+                )), rows)
+                for status, rows in groups.items()
+            }
+        # OB intervals can overlap between statuses. Keep the reconciled report amount in review.
+        cents = Decimal("0.01")
+        for component, (total, total_complete) in whole.items():
+            by_status = {status: parts[component] for status, parts in projections.items()}
+            allocated = sum((amount or Decimal(0) for amount, _ in by_status.values()), Decimal(0))
+            if ((total or Decimal(0)).quantize(cents, rounding=ROUND_HALF_UP)
+                    != allocated.quantize(cents, rounding=ROUND_HALF_UP)
+                    or total_complete != all(complete for _, complete in by_status.values())):
+                by_status = {"review": (total, total_complete)}
+            for status, (amount, complete) in by_status.items():
+                if amount is not None:
+                    values[component, status].append(amount)
+                if not complete:
+                    values[component, status].append(None)
+
+    return values, statuses, bool(foreign)
+
+
 def _object_total_summary(data, figures):
     expenses = data.get("expenses", [])
     excluded = data.get("excluded_expenses", [])
@@ -774,6 +875,10 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     marking = str(object_row.get("markning") or "")
     object_display = object_title + (f" · {marking}" if marking else "")
     expenses = data.get("expenses", [])
+    billing_statuses = {}
+    billing_values = None
+    if "billing_members" in data:
+        billing_values, billing_statuses, foreign_billing = _billing_breakdown(data, figures, work_rows)
 
     styles.update({
         "cover_object": ParagraphStyle(
@@ -1150,6 +1255,55 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         ("TOPPADDING", (0, 0), (-1, -1), 9),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
     ]))
+    if billing_values is not None:
+        language_index = int(swedish)
+        components = _BILLING_COMPONENTS if data.get("include_customer_cost") else _BILLING_COMPONENTS[2:]
+        rows = [[
+            "Faktureringsstatus · exkl. moms" if swedish else "Статус выставления · без НДС",
+            *(_BILLING_LABELS[column][language_index] for column in _BILLING_COLUMNS),
+        ]]
+        names = {
+            "total": ("Итого по статусу", "Summa per status"),
+            "work": ("Работа", "Arbete"),
+            "travel": ("Поездки", "Resor"),
+            "materials": ("Материалы и закупки", "Material och inköp"),
+            "other": ("Остальные расходы", "Övriga kostnader"),
+        }
+        for component in ("total", *components):
+            row = [names[component][language_index]]
+            for column in _BILLING_COLUMNS:
+                if data["billing_members"] is None and column != "review":
+                    row.append("—")
+                    continue
+                parts = ([value for item in components for value in billing_values[item, column]]
+                         if component == "total" else billing_values[component, column])
+                known = [value for value in parts if value is not None]
+                if len(known) == len(parts):
+                    row.append(_amount_text(sum(known, Decimal(0)), "SEK"))
+                elif known:
+                    row.append(_amount_text(sum(known, Decimal(0)), "SEK") +
+                               (" · delbelopp" if swedish else " · известная часть"))
+                else:
+                    row.append("Okänt" if swedish else "Неизвестно")
+            rows.append(row)
+        billing_note = (
+            "Status enligt SmartReport. Beloppen följer rapportens sparade kundvillkor och objektets kostnadsandelar."
+            if swedish else
+            "Статусы из SmartReport. Суммы берутся из расчёта по сохранённым условиям и долям объекта."
+        )
+        if data["billing_members"] is None:
+            billing_note = ("Fakturasammansättningen är inte tillgänglig." if swedish else
+                            "Сохранённый состав счетов недоступен.")
+        if foreign_billing:
+            billing_note += (" Andra valutor visas i kostnadsregistret." if swedish else
+                             " Остальные валюты показаны в реестре расходов.")
+        story.extend([
+            Spacer(1, 6),
+            raw_table(rows, [available * .31, available * .23, available * .23, available * .23],
+                      font, bold_font, alignments=((1, "RIGHT"), (2, "RIGHT"), (3, "RIGHT")), font_size=9),
+            Spacer(1, 3),
+            raw_paragraph(billing_note, styles["notice"]),
+        ])
     story.extend([
         Spacer(1, 10),
         cards,
@@ -1343,13 +1497,18 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                     "Original ej bifogat" if swedish else "Оригинал не приложен"
                 )
             category_lines = []
-            for allocation in document.get("object_allocations") or []:
+            allocations = document.get("object_allocations") or []
+            indexes = document.get("object_allocation_indexes", range(len(allocations)))
+            for index, allocation in zip(indexes, allocations):
                 category = allocation.get("expense_category") or CATEGORY_UNCLASSIFIED
                 category_label = swedish_label(category) if swedish else category
                 net_value = _amount_text(allocation.get("net_amount"), currency)
                 if swedish:
                     net_value = swedish_label(net_value)
                 detail = f"{category_label} · {'netto' if swedish else 'нетто'} {net_value}"
+                status = billing_statuses.get((document.get("id"), index))
+                if status:
+                    detail += " · " + _BILLING_LABELS[status][int(swedish)]
                 note = str(
                     allocation.get("note") or document.get("document_comment")
                     or document.get("expense_description") or ""

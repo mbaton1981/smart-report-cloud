@@ -1,5 +1,6 @@
 import hashlib
 import importlib
+import json
 import os
 import sqlite3
 import tempfile
@@ -16,8 +17,10 @@ from reportlab.pdfgen import canvas
 from PIL import Image
 
 from expense_categories import CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK
+from customer_billing import expense_member, shift_member
+from customer_report import prepare_customer_costs
 from object_package_report import (
-    _customer_summary, _expense_description, _object_total_summary,
+    _billing_breakdown, _customer_summary, _expense_description, _object_total_summary,
     _recover_report_share_tax, collect_object_expenses,
     expense_totals_by_currency, write_object_report_package,
 )
@@ -55,6 +58,61 @@ class ObjectPackageReportTests(unittest.TestCase):
             cls.font, cls.bold_font = "ObjectPackageTestArial", "ObjectPackageTestArialBold"
         else:
             cls.font, cls.bold_font = "Helvetica", "Helvetica-Bold"
+
+    def test_cover_shows_saved_split_for_work_trips_and_individual_material_shares(self):
+        def allocation(value):
+            return dict(object_id=42, destination="object", net_amount=str(value), gross_amount=str(value),
+                        vat_amount="0", expense_category=CATEGORY_MATERIALS, expense_category_source="user")
+
+        def work(identifier, hours, trips, billed):
+            day = f"2026-11-0{identifier}"
+            return dict(
+                id=identifier, date=day, hours=hours, transport=trips, invoiced=billed,
+                entry_type="work", sync_id=f"shift-{identifier}", company="Privat", object_name="Test project", employee="Tester",
+                version=1, customer_pricing=json.dumps(dict(
+                    version=1, base=500, travel=100, ob={}, company="Privat", object_name="Test project",
+                    date_from=day, date_to=day, source="Test historical quote",
+                )),
+            )
+
+        shifts = [work(1, 8, 1, True), work(2, 6, 0, False)]
+        material = _document(11, allocations=[allocation(100), allocation(50)], net="150", vat="0", gross="150")
+        foreign = _document(12, currency="EUR", allocations=[allocation(900)], net="900", vat="0", gross="900")
+        changed = _document(13, allocations=[allocation(20)], net="20", vat="0", gross="20")
+        material["sync_version"] = changed["sync_version"] = 1
+        saved = [shift_member(shifts[0]), expense_member(material, 0), expense_member(changed, 0)]
+        changed["allocations"][0] = allocation(30)
+        report = prepare_customer_costs(dict(journal_rows=shifts, journal_segments={}, totals={"without_ob_hours": 14}))
+        expenses, _ = collect_object_expenses([material, foreign, changed], 42)
+        data = dict(object=dict(name="Test project", markning="P9999"), customer_report=report, language="sv",
+                    expenses=expenses, include_customer_cost=True, expense_snapshot_available=True,
+                    generated_at="2026-11-24 15:00", period_label="2026-11-01 — 2026-11-30",
+                    billing_members={member["key"]: member for member in saved})
+        figures = _customer_summary(report)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "billing-cover.pdf"
+            write_object_report_package(target, data, font=self.font, bold_font=self.bold_font)
+            pdf = PdfReader(target)
+            cover = " ".join(pdf.pages[0].extract_text().split())
+            full_text = " ".join(" ".join(page.extract_text().split()) for page in pdf.pages)
+
+        self.assertIn("Summa per status 4 200,00 SEK 3 050,00 SEK 30,00 SEK", cover)
+        self.assertIn("Resor 100,00 SEK 0,00 SEK 0,00 SEK", cover)
+        self.assertIn("Material och inköp 100,00 SEK 50,00 SEK 30,00 SEK", cover)
+        self.assertIn("Andra valutor visas i kostnadsregistret", cover)
+        self.assertIn("100,00 SEK · Fakturerat", full_text)
+        self.assertIn("50,00 SEK · Kvar att fakturera", full_text)
+        self.assertIn("30,00 SEK · Att kontrollera", full_text)
+
+        del data["billing_members"][saved[1]["key"]]
+        replacement = expense_member(material, 1)
+        data["billing_members"][replacement["key"]] = replacement
+        values, statuses, _ = _billing_breakdown(data, figures, shifts)
+        self.assertEqual((statuses[11, 0], statuses[11, 1]), ("pending", "billed"))
+        self.assertEqual(values["materials", "billed"], [Decimal(50)])
+        self.assertEqual(values["materials", "pending"], [Decimal(100)])
+        _, unavailable, _ = _billing_breakdown(dict(data, billing_members=None), figures, shifts)
+        self.assertEqual(set(unavailable.values()), {"review"})
 
     def test_expense_projection_uses_only_confirmed_object_shares_once(self):
         source = _document(1, allocations=[
@@ -1039,11 +1097,13 @@ class ObjectPackageReportTests(unittest.TestCase):
                     )
                     pool = SimpleNamespace(start=lambda task: task.run())
                     with patch.object(app, "fetch_all_expense_documents", return_value=[document]), \
+                            patch.object(app, "request_expense_api", return_value={"members": {}}) as billing, \
                             patch.object(app, "REPORTS_DIR", str(root)), \
                             patch.object(app, "DEFAULT_FONT", self.font), \
                             patch.object(app, "DEFAULT_FONT_BOLD", self.bold_font), \
                             patch.object(app.QThreadPool, "globalInstance", return_value=pool):
                         app.SmartReportApp._start_full_object_report(controller, object_row, options)
+                        billing.assert_called_once_with("GET", "/api/customer-invoices", params={"object_id": 42})
 
                     self.assertEqual(len(completions), 1)
                     _, result, error = completions[0]
@@ -1066,7 +1126,8 @@ class ObjectPackageReportTests(unittest.TestCase):
                             options, language="sv", customer_name="Test",
                             review_note="Kontrollera avrundningen.",
                         )
-                        with patch.object(app, "fetch_all_expense_documents", return_value=[document]):
+                        with patch.object(app, "fetch_all_expense_documents", return_value=[document]), \
+                                patch.object(app, "request_expense_api", return_value={"members": {}}):
                             review = controller._build_full_object_package(
                                 object_row, swedish_options, lambda _message: None,
                             )

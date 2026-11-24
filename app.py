@@ -16564,6 +16564,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         else:
             confirmed_expenses, excluded_expenses = [], []
 
+        billing_members = None
+        if server_id is not None and expense_online:
+            progress("Проверяем состав выставленных счетов…")
+            try:
+                membership = request_expense_api("GET", "/api/customer-invoices", params={"object_id": int(server_id)})
+                if isinstance(membership.get("members"), dict):
+                    billing_members = membership["members"]
+            except Exception:
+                logging.warning("Customer invoice membership unavailable for object report")
+
         work_range, unsynced_shift_count, unsynced_shift_states = (
             self._object_work_history_range(
                 object_row,
@@ -16678,6 +16688,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "include_customer_cost": options["include_customer_cost"],
             "include_copies": options["include_copies"],
             "expenses": confirmed_expenses,
+            "billing_members": billing_members,
             "excluded_expenses": excluded_expenses,
             "expense_snapshot_available": snapshot_available,
             "incomplete_reasons": incomplete_reasons,
