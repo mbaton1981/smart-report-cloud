@@ -151,7 +151,8 @@ def build(cursor, start, end, documents, company="", object_key="", now=None, sc
         billing.append(dict(
             object_key=item["key"], object_label=item["label"], status=status, kind=kind, date=day,
             description=description, invoice_number=member["invoice_number"] if member else "",
-            invoice_date=member["invoice_date"] if member else "", **details,
+            invoice_date=member["invoice_date"] if member else "",
+            invoice_object_id=member["object_id"] if member else None, **details,
         ))
 
     all_rows = [dict(r) for r in cursor.execute(

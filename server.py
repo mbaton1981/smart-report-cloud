@@ -5614,6 +5614,7 @@ def management_analytics():
             company=request.args.get("company", ""), object_key=request.args.get("object_key", ""),
             schedule_settings=settings, recover_expense_nets=lambda doc, objects: analytics_expense_nets(cursor, doc, objects),
         )
+        result["billing_correction"] = True
         return jsonify({"ok": True, "analytics": result})
     except ValueError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -5622,6 +5623,37 @@ def management_analytics():
         return jsonify({"ok": False, "error": "Не удалось рассчитать аналитику. Данные не изменены."}), 500
     finally:
         conn.close()
+
+
+@app.route("/api/admin/analytics/billing-correction", methods=["GET", "POST"])
+def invoice_expense_correction_api():
+    actor = bearer_admin_user()
+    if actor is None:
+        return jsonify({"ok": False, "error": "Исправление счёта доступно только директору/администратору."}), 403
+    from customer_billing import correct_invoice_expenses, invoice_expenses
+    connection = get_db_connection()
+    try:
+        if request.method == "GET":
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            correction = invoice_expenses(
+                connection, int(request.args.get("object_id", "")), request.args.get("invoice_number", ""),
+                serialize_expense_document,
+            )
+            return jsonify({"ok": True, "correction": correction})
+        connection.execute("BEGIN IMMEDIATE")
+        revision = correct_invoice_expenses(
+            connection, request.get_json(silent=True), actor=str(actor["user_id"]),
+            serialize_document=serialize_expense_document,
+            now=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        connection.commit()
+        return jsonify({"ok": True, "revision": revision})
+    except (ValueError, TypeError, sqlite3.IntegrityError) as error:
+        connection.rollback()
+        return jsonify({"ok": False, "error": str(error)}), 409
+    finally:
+        connection.close()
 
 
 @app.route('/api/customer-invoices', methods=['GET', 'POST'])

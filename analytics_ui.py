@@ -1,17 +1,21 @@
 """Director-only, asynchronous presentation of the shared analytics projection."""
 import json
 import logging
+import uuid
+from decimal import Decimal
 
-from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QDate, pyqtSignal
+from PyQt6.QtCore import QEventLoop, QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QDate, pyqtSignal
 from PyQt6.QtGui import QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
-    QDialog, QFrame, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
+    QDialog, QFrame, QLineEdit, QProgressDialog, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
 )
 from date_widgets import CalendarDateEdit
+from desktop_ui import ReportTable
 from analytics import BILLING_LABELS, HOW, period
 
 logger = logging.getLogger(__name__)
+CORRECTION_PATH = "/api/admin/analytics/billing-correction"
 
 
 def number(value):
@@ -24,7 +28,7 @@ def billing_summary(counts):
     return f"{counts['hours']:g} ч · {counts['expenses']} дол."
 
 
-def open_billing_details(parent, entries, scope, start, end):
+def open_billing_details(parent, entries, scope, start, end, *, correct=None):
     dialog = QDialog(parent)
     dialog.setWindowTitle("Состав клиентских счетов")
     dialog.resize(1220, 680)
@@ -47,25 +51,47 @@ def open_billing_details(parent, entries, scope, start, end):
     filters.addWidget(kind)
     filters.addStretch()
     layout.addLayout(filters)
-    table = QTableWidget(0, 7, dialog)
+    table = ReportTable(0, 7, dialog, stretch_columns=(1, 2, 4),
+                        column_widths={0: 112, 1: 220, 2: 285, 3: 142, 4: 155, 5: 145, 6: 152})
     table.setHorizontalHeaderLabels(("Дата", "Объект", "Смена / документ", "Часы / без НДС",
                                      "Категория", "Статус", "Клиентский счёт"))
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-    table.setAlternatingRowColors(True)
-    table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-    table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    table.setColumnHidden(1, bool(entries) and all(entry["object_label"] == scope for entry in entries))
     layout.addWidget(table)
     count = QLabel()
     layout.addWidget(count)
+    actions = QHBoxLayout()
+    edit = QPushButton("Исправить расходы в счёте…", dialog)
+    edit.setEnabled(False)
+    edit.setToolTip("Выберите строку с номером клиентского счёта.")
+    if correct is not None:
+        actions.addWidget(edit)
+    else:
+        edit.hide()
+    actions.addStretch()
     close = QPushButton("Закрыть", dialog)
     close.clicked.connect(dialog.accept)
-    layout.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
+    actions.addWidget(close)
+    layout.addLayout(actions)
+
+    def invoice_selection():
+        current = table.item(table.currentRow(), 0)
+        entry = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        if entry and entry["invoice_number"] and entry.get("invoice_object_id") is not None:
+            return entry["invoice_object_id"], entry["invoice_number"]
+        return None
+
+    def edit_selected():
+        invoice = invoice_selection()
+        if invoice and correct(dialog, *invoice):
+            dialog.accept()
 
     def fill():
         shown = [entry for entry in entries
                  if status.currentData() in ("", entry["status"]) and kind.currentData() in ("", entry["kind"])]
         table.setRowCount(len(shown))
+        table.setCurrentCell(-1, -1)
         for index, entry in enumerate(shown):
             if entry["kind"] == "shift":
                 description = entry["description"]
@@ -80,14 +106,149 @@ def open_billing_details(parent, entries, scope, start, end):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, entry)
                 table.setItem(index, column, item)
         table.resizeRowsToContents()
         count.setText(f"Строк в отборе: {len(shown)}" if shown else "В этом отборе записей нет.")
 
     status.currentIndexChanged.connect(fill)
     kind.currentIndexChanged.connect(fill)
+    if correct is not None:
+        table.currentCellChanged.connect(lambda *_: edit.setEnabled(invoice_selection() is not None))
+        edit.clicked.connect(edit_selected)
     fill()
     dialog.exec()
+
+
+def _run_correction(parent, message, callback):
+    from app import ObjectOverviewTask
+
+    loop = QEventLoop()
+    result = []
+    progress = QProgressDialog(message, "", 0, 0, parent)
+    progress.setCancelButton(None)
+    progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+    def finished(_, value, error):
+        result.append((value, error))
+        loop.quit()
+
+    task = ObjectOverviewTask(0, callback)
+    task.signals.completed.connect(finished)
+    progress.show()
+    QThreadPool.globalInstance().start(task)
+    loop.exec()
+    progress.close()
+    value, error = result[0]
+    if error:
+        raise RuntimeError(error)
+    return value
+
+
+def edit_invoice_expenses(parent, request, object_id, invoice_number):
+    params = {"object_id": object_id, "invoice_number": invoice_number}
+    try:
+        data = _run_correction(parent, "Загружаем расходы объекта…",
+                               lambda: request("GET", CORRECTION_PATH, params=params))["correction"]
+    except (KeyError, RuntimeError) as error:
+        QMessageBox.warning(parent, "Состав счёта", str(error))
+        return False
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(f"Исправить расходы · счёт №{invoice_number}")
+    dialog.resize(1050, 690)
+    layout = QVBoxLayout(dialog)
+    context = QLabel(f"{data['object_label']} · {data['invoice_date']}\n"
+                     "Галочкой отмечены расходы этого счёта. Снятый расход вернётся в очередь на выставление. "
+                     "Команда меняет только состав счёта в SmartReport.")
+    context.setWordWrap(True)
+    context.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(context)
+    search = QLineEdit()
+    search.setPlaceholderText("Найти по поставщику, номеру или дате")
+    layout.addWidget(search)
+    expenses = data["expenses"]
+    table = ReportTable(len(expenses), 5, dialog, stretch_columns=(2,),
+                        column_widths={0: 105, 1: 114, 2: 330, 3: 82, 4: 165})
+    table.setHorizontalHeaderLabels(("В счёте", "Дата", "Поставщик / документ", "Доля", "Без НДС"))
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    layout.addWidget(table)
+    checks = []
+    for index, entry in enumerate(expenses):
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if entry["included"] else Qt.CheckState.Unchecked)
+        table.setItem(index, 0, item)
+        checks.append(item)
+        snapshot = entry["snapshot"]
+        amount = (f"{number(Decimal(snapshot['net_amount']))} {snapshot['currency']}"
+                  if snapshot["net_amount"] is not None else "Нетто неизвестно")
+        for column, value in enumerate((entry["date"], entry["label"], str(snapshot["index"] + 1), amount), 1):
+            table.setItem(index, column, QTableWidgetItem(value))
+
+    summary = QLabel()
+    layout.addWidget(summary)
+    controls = QHBoxLayout()
+    controls.addStretch()
+    save = QPushButton("Сохранить исправление")
+    cancel = QPushButton("Отмена")
+    controls.addWidget(save)
+    controls.addWidget(cancel)
+    layout.addLayout(controls)
+    previous = None
+
+    def changes():
+        removed, added = [], []
+        for entry, item in zip(expenses, checks):
+            marked = item.checkState() == Qt.CheckState.Checked
+            if marked and not entry["included"]:
+                added.append(entry["snapshot"])
+            elif entry["included"] and not marked:
+                removed.append(entry["snapshot"]["key"])
+        return removed, added
+
+    def update():
+        removed, added = changes()
+        summary.setText(f"Снять · {len(removed)}     Добавить · {len(added)}")
+        save.setEnabled(bool(removed or added))
+
+    def filter_rows(text):
+        terms = text.casefold().split()
+        for index, entry in enumerate(expenses):
+            searchable = f"{entry['date']} {entry['label']}".casefold()
+            table.setRowHidden(index, not all(term in searchable for term in terms))
+
+    def apply():
+        nonlocal previous
+        removed, added = changes()
+        if QMessageBox.question(
+                dialog, f"Сохранить исправление счёта №{invoice_number}?",
+                f"Исключить расходов: {len(removed)}. Добавить: {len(added)}. "
+                "Все часы и поездки останутся в этом счёте.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        payload = {**params, "revision": data["revision"], "remove": removed, "add": added}
+        if previous is None or previous[0] != payload:
+            previous = payload, uuid.uuid4().hex
+        try:
+            response = _run_correction(
+                dialog, "Сохраняем исправление…",
+                lambda: request("POST", CORRECTION_PATH, json={**payload, "correction_id": previous[1]}),
+            )
+            if not response.get("ok"):
+                raise RuntimeError("Сервер не подтвердил сохранение состава. Откройте счёт заново для проверки.")
+        except RuntimeError as error:
+            QMessageBox.warning(dialog, "Исправление состава", str(error))
+            return
+        dialog.accept()
+
+    table.itemChanged.connect(update)
+    search.textChanged.connect(filter_rows)
+    save.clicked.connect(apply)
+    cancel.clicked.connect(dialog.reject)
+    update()
+    return dialog.exec() == QDialog.DialogCode.Accepted
 
 
 class ReadSignals(QObject):
@@ -211,9 +372,10 @@ class Chart(QWidget):
 
 
 class AnalyticsWidget(QWidget):
-    def __init__(self, fetch, parent=None):
+    def __init__(self, fetch, parent=None, *, request_correction=None):
         super().__init__(parent)
         self.fetch, self.serial, self.busy = fetch, 0, False
+        self.request_correction = request_correction
         self.pending, self.last_parameters, self.fingerprint = False, None, None
         self.payload, self.task = None, None
         self._render_count = 0
@@ -238,6 +400,11 @@ class AnalyticsWidget(QWidget):
         self.object.addItem("Все объекты", "")
         self.customer.setMinimumWidth(0)
         self.object.setMinimumWidth(0)
+        self.object.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.object.setMinimumContentsLength(18)
+        self.object.view().setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.object.view().setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.object.currentTextChanged.connect(self.object.setToolTip)
         self.refresh_button = QPushButton("Обновить")
         self.refresh_button.setObjectName("primaryAction")
         self.refresh_button.clicked.connect(self.refresh)
@@ -249,7 +416,7 @@ class AnalyticsWidget(QWidget):
         period_layout.addWidget(QLabel("по:", period_row))
         period_layout.addWidget(self.end)
         period_layout.addStretch(1)
-        self.filter_widgets = (period_row, self.preset, self.customer, self.object, self.refresh_button)
+        self.filter_widgets = (period_row, self.preset, self.customer, self.refresh_button)
         self.filters_layout = filters
         layout.addLayout(filters)
         self.scope = QLabel("Расчёт ещё не выполнен")
@@ -341,6 +508,8 @@ class AnalyticsWidget(QWidget):
             self.filters_layout.takeAt(0)
         for index, widget in enumerate(self.filter_widgets):
             self.filters_layout.addWidget(widget, index // filter_columns, index % filter_columns)
+        self.filters_layout.addWidget(self.object, (len(self.filter_widgets) + filter_columns - 1) // filter_columns,
+                                      0, 1, filter_columns)
 
         card_columns = 5 if width >= 1180 else 3 if width >= 760 else 2 if width >= 520 else 1
         while self.cards_layout.count():
@@ -386,6 +555,9 @@ class AnalyticsWidget(QWidget):
             self.object.addItem(text, selected)
             index = self.object.count()-1
         self.object.setCurrentIndex(max(0, index))
+        self.object.setToolTip(self.object.currentText())
+        for index in range(self.object.count()):
+            self.object.setItemData(index, self.object.itemText(index), Qt.ItemDataRole.ToolTipRole)
         self.object.blockSignals(blocked)
 
     def changed(self):
@@ -464,7 +636,14 @@ class AnalyticsWidget(QWidget):
             entries = [entry for entry in data["billing"] if entry["object_key"] == key]
         else:
             scope, entries = data["scope"], data["billing"]
-        open_billing_details(self, entries, scope, data["start"], data["end"])
+        correction = self._correct_invoice if self.request_correction and data.get("billing_correction") else None
+        open_billing_details(self, entries, scope, data["start"], data["end"], correct=correction)
+
+    def _correct_invoice(self, parent, object_id, number):
+        if edit_invoice_expenses(parent, self.request_correction, object_id, number):
+            self.refresh()
+            return True
+        return False
 
     def render(self, data):
         self._render_count += 1

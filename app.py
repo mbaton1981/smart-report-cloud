@@ -2785,7 +2785,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.setup_sprav_tab()
         if self.can_request_shift_reopen():
             from analytics_ui import AnalyticsWidget
-            self.analytics_tab = AnalyticsWidget(fetch_management_analytics, self)
+            self.analytics_tab = AnalyticsWidget(fetch_management_analytics, self, request_correction=request_expense_api)
             self.tabs.addTab(self.analytics_tab, "Аналитика")
         
         self.load_dropdowns()

@@ -136,6 +136,66 @@ class CustomerBillingTests(unittest.TestCase):
         unchanged["allocations"][0]["expense_category"] = "Материалы и закупки"
         self.assertEqual(allocation_fingerprint(unchanged, 0), allocation_fingerprint(self.document, 0))
 
+    def test_invoice_expense_correction_replaces_only_membership_and_rejects_stale_edits(self):
+        from api_auth import issue_token
+
+        path = "/api/admin/analytics/billing-correction"
+        payload = {**self.payload, "purpose": "accountant"}
+        self.assertEqual(self.post(payload).status_code, 200)
+        self.assertEqual(self.server_client.get(path).status_code, 403)
+        with closing(self.server.get_db_connection()) as connection:
+            new_doc = connection.execute("""
+                INSERT INTO expense_documents (client_id, supplier_name, invoice_number, document_date,
+                    net_amount, vat_amount, gross_amount, verification_status, created_at, updated_at)
+                VALUES ('correct-expense','Alternate supplier','NEW-42','2026-11-12',
+                    '200','50','250','confirmed','2026-11-12','2026-11-12')
+            """).lastrowid
+            connection.execute("""
+                INSERT INTO expense_allocations (document_id,object_id,allocated_gross,allocated_net,allocated_vat,destination)
+                VALUES (?,?,'250','200','50','object')
+            """, (new_doc, self.object_id))
+            shift_before = tuple(connection.execute("SELECT * FROM incoming_submissions WHERE sync_id='billing-shift'").fetchone())
+            connection.commit()
+            admin_id = connection.execute("SELECT id FROM users WHERE role='admin' AND is_active=1").fetchone()[0]
+            token, _ = issue_token(connection, admin_id)
+        params = {"object_id": self.object_id, "invoice_number": payload["invoice_number"]}
+        auth = {"Authorization": f"Bearer {token}"}
+
+        def correct(data):
+            return self.server_client.post(path, json=data, headers=auth)
+
+        model = self.server_client.get(path, query_string=params, headers=auth).get_json()["correction"]
+        self.assertEqual(model["revision"], 0)
+        before, available = model["expenses"]
+        self.assertTrue(before["included"])
+        self.assertFalse(available["included"])
+        self.assertEqual(available["snapshot"]["document_id"], new_doc)
+        correction = {**params, "correction_id": "swap", "revision": 0,
+                      "remove": [before["snapshot"]["key"]], "add": [available["snapshot"]]}
+        stale_doc = {**available["snapshot"], "version": available["snapshot"]["version"] + 1}
+        self.assertEqual(correct({**correction, "add": [stale_doc]}).status_code, 409)
+        self.assertEqual(correct({**correction, "remove": [self.payload["members"][0]["key"]]}).status_code, 409)
+        first = correct(correction)
+        self.assertEqual(first.status_code, 200, first.get_json())
+        self.assertEqual(correct(correction).get_json(), first.get_json())
+        self.assertEqual(correct({**correction, "correction_id": "stale"}).status_code, 409)
+        refreshed = self.server_client.get(path, query_string=params, headers=auth).get_json()["correction"]
+        self.assertEqual(refreshed["revision"], 1)
+        self.assertEqual([(item["snapshot"]["document_id"], item["included"]) for item in refreshed["expenses"]],
+                         [(new_doc, True), (self.document["id"], False)])
+        state = self.server_client.get("/api/customer-invoices", headers=self.headers, query_string=params).get_json()
+        self.assertEqual(set(state["members"]), {self.payload["members"][0]["key"], available["snapshot"]["key"]})
+        entries, _ = prepare_next_invoice([], [self.document], self.object_id, "2026-11-30", state["members"])
+        self.assertEqual([entry["member"]["key"] for entry in entries], [before["snapshot"]["key"]])
+        with closing(self.server.get_db_connection()) as connection:
+            self.assertEqual(tuple(connection.execute("SELECT * FROM incoming_submissions WHERE sync_id='billing-shift'").fetchone()),
+                             shift_before)
+            log = connection.execute("SELECT actor,removed_json,added_json FROM customer_invoice_corrections").fetchall()
+            self.assertEqual(len(log), 1)
+            self.assertEqual(log[0]["actor"], str(admin_id))
+            self.assertEqual(json.loads(log[0]["removed_json"]), [before["snapshot"]])
+            self.assertEqual(json.loads(log[0]["added_json"]), [available["snapshot"]])
+
     def test_desktop_preview_exports_only_selected_rows_and_records_invoice(self):
         from types import SimpleNamespace
         from next_customer_invoice import open_next_invoice

@@ -1,4 +1,4 @@
-"""Immutable customer-invoice membership and preparation of the next invoice."""
+"""Customer invoice composition and audited corrections to expense membership."""
 import hashlib
 import json
 from datetime import date
@@ -32,6 +32,12 @@ def ensure_schema(connection):
         member_key TEXT PRIMARY KEY, operation_id TEXT NOT NULL
             REFERENCES customer_invoice_batches(operation_id),
         object_id INTEGER NOT NULL, snapshot_json TEXT NOT NULL)""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS customer_invoice_corrections (
+            correction_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL
+            REFERENCES customer_invoice_batches(operation_id),
+            revision INTEGER NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL,
+            request_json TEXT NOT NULL, removed_json TEXT NOT NULL, added_json TEXT NOT NULL,
+            UNIQUE(operation_id, revision))""")
 
 
 def invoice_state(connection, object_id):
@@ -61,6 +67,151 @@ def expense_member(document, index):
         "fingerprint": allocation_fingerprint(document, index),
         "net_amount": allocation.get("net_amount"), "currency": document.get("currency_code"),
     }
+
+
+def checked_expense(connection, requested, object_id, accountant, serialize_document):
+    if type(requested.get("document_id")) is not int:
+        raise ValueError("Некорректный номер расхода.")
+    row = connection.execute("""
+        SELECT d.* FROM expense_documents d WHERE d.id=? AND d.is_deleted=0
+        AND NOT EXISTS (SELECT 1 FROM expense_processing p WHERE p.document_id=d.id AND p.state='split')
+    """, (requested.get("document_id"),)).fetchone()
+    if row is None:
+        raise ValueError("Расход удалён или разделён. Обновите состав.")
+    document = serialize_document(connection.cursor(), row)
+    existing_members = [json.loads(item[0]) for item in connection.execute(
+        "SELECT snapshot_json FROM customer_invoice_members WHERE member_key LIKE ?",
+        (f"expense:{document['id']}:%",),
+    )]
+    if any(member["index"] >= len(document["allocations"])
+           or member["fingerprint"] != allocation_fingerprint(document, member["index"])
+           for member in existing_members):
+        raise ValueError("Ранее выставленные доли изменились. Сверьте прежнюю фактуру.")
+    index = requested.get("index")
+    if type(index) is not int or not 0 <= index < len(document["allocations"]):
+        raise ValueError("Распределение расхода изменилось. Обновите состав.")
+    snapshot = expense_member(document, index)
+    allocation = document["allocations"][index]
+    if (snapshot != requested or allocation.get("object_id") != object_id or allocation.get("company_expense")
+            or allocation.get("destination") == "company" or document.get("supporting_to_document_id")
+            or document["verification_status"] != "confirmed"
+            or parse_decimal(allocation.get("gross_amount") if accountant else snapshot["net_amount"]) is None
+            or snapshot["currency"] in (None, "", "UNKNOWN")):
+        raise ValueError("Расход или его доля изменились. Обновите состав.")
+    return snapshot
+
+
+def _correction_invoice(connection, object_id, number):
+    invoice = connection.execute("""
+        SELECT b.*, o.markning, o.name FROM customer_invoice_batches b
+        JOIN meta_objects o ON o.id=b.object_id WHERE b.object_id=? AND b.invoice_number=?
+    """, (object_id, number)).fetchone()
+    if invoice is None:
+        raise ValueError("Сохранённый клиентский счёт не найден.")
+    return invoice
+
+
+def _correction_revision(connection, operation_id):
+    return connection.execute(
+        "SELECT COALESCE(MAX(revision), 0) FROM customer_invoice_corrections WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()[0]
+
+
+def invoice_expenses(connection, object_id, number, serialize_document):
+    invoice = _correction_invoice(connection, object_id, number)
+    operation_id = invoice["operation_id"]
+    accountant = json.loads(invoice["payload_json"]).get("purpose") == "accountant"
+    current, all_members = [], {}
+    for item in connection.execute("""
+        SELECT operation_id, member_key, snapshot_json FROM customer_invoice_members WHERE member_key LIKE 'expense:%'
+    """):
+        snapshot = json.loads(item["snapshot_json"])
+        all_members[item["member_key"]] = snapshot
+        if item["operation_id"] == operation_id:
+            doc = connection.execute("""
+                SELECT supplier_name, invoice_number, document_date FROM expense_documents WHERE id=?
+            """, (snapshot["document_id"],)).fetchone()
+            metadata = dict(doc) if doc else {}
+            label = f"{metadata.get('supplier_name') or 'Документ'} · №{metadata.get('invoice_number') or snapshot['document_id']}"
+            current.append(dict(snapshot=snapshot, label=label, date=metadata.get("document_date") or "", included=True))
+    documents = [serialize_document(connection.cursor(), row) for row in connection.execute("""
+        SELECT d.* FROM expense_documents d WHERE d.is_deleted=0 AND d.verification_status='confirmed'
+        AND EXISTS (SELECT 1 FROM expense_allocations a WHERE a.object_id=? AND a.document_id=d.id)
+        AND NOT EXISTS (SELECT 1 FROM expense_processing p WHERE p.document_id=d.id AND p.state='split')
+    """, (object_id,))]
+    entries, _ = prepare_next_invoice([], documents, object_id, "9999-12-31", all_members, accountant=accountant)
+    available = [
+        dict(snapshot=entry["member"], label=entry["label"], date=entry["date"], included=False)
+        for entry in entries
+        if entry["currency"] != "UNKNOWN"
+        and parse_decimal(entry["allocation"].get("gross_amount") if accountant else entry["net"]) is not None
+    ]
+    return dict(object_id=object_id, invoice_number=number, invoice_date=invoice["invoice_date"],
+                object_label=" · ".join(filter(None, (invoice["markning"], invoice["name"]))),
+                revision=_correction_revision(connection, operation_id),
+                expenses=sorted(current + available, key=lambda item: (item["included"], item["date"], item["label"]),
+                                reverse=True))
+
+
+def correct_invoice_expenses(connection, payload, *, actor, serialize_document, now):
+    if not isinstance(payload, dict):
+        raise ValueError("Ожидается исправление состава счёта.")
+    correction_id = payload.get("correction_id")
+    revision = payload.get("revision")
+    removed = payload.get("remove")
+    additions = payload.get("add")
+    object_id, number = payload.get("object_id"), payload.get("invoice_number")
+    if (not isinstance(correction_id, str) or not 1 <= len(correction_id) <= 100
+            or type(object_id) is not int or not isinstance(number, str) or type(revision) is not int
+            or not isinstance(removed, list) or not isinstance(additions, list)
+            or not 1 <= len(removed) + len(additions) <= 2000
+            or any(not isinstance(key, str) or not key.startswith("expense:") for key in removed)
+            or len(set(removed)) != len(removed)
+            or any(not isinstance(item, dict) or item.get("kind") != "expense" for item in additions)):
+        raise ValueError("Некорректный состав исправления расходов.")
+    invoice = _correction_invoice(connection, object_id, number)
+    operation_id = invoice["operation_id"]
+    request_json = packed(payload)
+    previous = connection.execute("""
+        SELECT request_json, revision FROM customer_invoice_corrections WHERE correction_id=?
+    """, (correction_id,)).fetchone()
+    if previous:
+        if previous["request_json"] != request_json:
+            raise ValueError("Этот запрос уже использован для другого исправления.")
+        return previous["revision"]
+    if revision != _correction_revision(connection, operation_id):
+        raise ValueError("Состав счёта уже изменился. Откройте его заново.")
+    current = {row["member_key"]: json.loads(row["snapshot_json"]) for row in connection.execute(
+        "SELECT member_key, snapshot_json FROM customer_invoice_members WHERE operation_id=?", (operation_id,),
+    )}
+    if any(key not in current or current[key]["kind"] != "expense" for key in removed):
+        raise ValueError("Одна из снимаемых позиций не входит в этот счёт.")
+    accountant = json.loads(invoice["payload_json"]).get("purpose") == "accountant"
+    added = {}
+    for requested in additions:
+        snapshot = checked_expense(connection, requested, object_id, accountant, serialize_document)
+        key = snapshot["key"]
+        if key in added or connection.execute(
+                "SELECT 1 FROM customer_invoice_members WHERE member_key=?", (key,)).fetchone():
+            raise ValueError("Расход уже включён в клиентский счёт. Обновите состав.")
+        added[key] = snapshot
+    removed_keys = set(removed)
+    remaining = [snapshot for key, snapshot in current.items() if key not in removed_keys] + list(added.values())
+    if not 1 <= len(remaining) <= 2000:
+        raise ValueError("В счёте должно остаться от 1 до 2000 позиций.")
+    currencies = {"SEK" if snapshot["kind"] == "shift" else snapshot["currency"] for snapshot in remaining}
+    if not accountant and len(currencies) > 1:
+        raise ValueError("Позиции этого счёта должны быть в одной валюте.")
+    connection.executemany("DELETE FROM customer_invoice_members WHERE operation_id=? AND member_key=?",
+                           [(operation_id, key) for key in removed])
+    connection.executemany("INSERT INTO customer_invoice_members VALUES (?, ?, ?, ?)",
+                           [(key, operation_id, object_id, packed(snapshot)) for key, snapshot in added.items()])
+    revision += 1
+    connection.execute("INSERT INTO customer_invoice_corrections VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       (correction_id, operation_id, revision, actor, now, request_json,
+                        packed([current[key] for key in removed]), packed(list(added.values()))))
+    return revision
 
 
 def priced_report(report, rows):
@@ -188,28 +339,7 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
             if not accountant:
                 currencies.add("SEK")
         elif requested.get("kind") == "expense":
-            row = connection.execute("SELECT * FROM expense_documents WHERE id=? AND is_deleted=0", (requested.get("document_id"),)).fetchone()
-            if row is None:
-                raise ValueError("Расход удалён. Обновите состав.")
-            document = serialize_document(connection.cursor(), row)
-            existing_members = [json.loads(item[0]) for item in connection.execute(
-                "SELECT snapshot_json FROM customer_invoice_members WHERE member_key LIKE ?",
-                (f"expense:{document['id']}:%",),
-            )]
-            if any(member["index"] >= len(document["allocations"])
-                   or member["fingerprint"] != allocation_fingerprint(document, member["index"])
-                   for member in existing_members):
-                raise ValueError("Ранее выставленные доли изменились. Сверьте прежнюю фактуру.")
-            index = requested.get("index")
-            if type(index) is not int or not 0 <= index < len(document["allocations"]):
-                raise ValueError("Распределение расхода изменилось.")
-            snapshot = expense_member(document, index)
-            allocation = document["allocations"][index]
-            if (snapshot != requested or allocation.get("object_id") != object_id
-                    or document.get("supporting_to_document_id") or document["verification_status"] != "confirmed"
-                    or parse_decimal(allocation.get("gross_amount") if accountant else snapshot["net_amount"]) is None
-                    or snapshot["currency"] in (None, "", "UNKNOWN")):
-                raise ValueError("Расход или его доля изменились. Обновите состав.")
+            snapshot = checked_expense(connection, requested, object_id, accountant, serialize_document)
             currencies.add(snapshot["currency"])
         else:
             raise ValueError("Неизвестный тип строки счёта.")
