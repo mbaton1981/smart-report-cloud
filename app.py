@@ -9543,6 +9543,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         # не может совпасть с серверным ID зарегистрированного расхода.
         selected_identity = getattr(self, "_selected_expense_identity", None)
         pinned_identity = selected_identity is not None
+        reveal_pending = getattr(self, "_expense_reveal_identity", None) is not None
         current_row = self.table_supplier_documents.currentRow()
         if selected_identity is None and current_row >= 0 and self.table_supplier_documents.item(current_row, 0):
             old_doc = self.table_supplier_documents.item(current_row, 0).data(Qt.ItemDataRole.UserRole)
@@ -9614,7 +9615,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             json.dumps(filtered, ensure_ascii=False, sort_keys=True, default=str),
         )
         if (render_signature == getattr(self, "_expense_register_render_signature", None)
-                and (getattr(self, "_expense_reveal_identity", None) is None or self._focus_revealed_expense())):
+                and (not reveal_pending or self._focus_revealed_expense())):
             self._update_expense_detail()
             if getattr(self, "_expense_selection_message", ""):
                 self.exp_api_status_lbl.setText(self._expense_selection_message)
@@ -9842,7 +9843,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         table.verticalScrollBar().setValue(vertical_scroll)
         table.horizontalScrollBar().setValue(horizontal_scroll)
         del blocker
-        self._focus_revealed_expense()
+        if reveal_pending:
+            self._focus_revealed_expense()
         self._expense_register_render_signature = render_signature
         if hasattr(self, "exp_docs_result_count"):
             self.exp_docs_result_count.setText(f"{len(filtered)} из {len(documents)}")
