@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QBoxLayout, QDialog, QLineEdit, QMessageBox, QPushButton, QTableWidget, QWidget
 
-from analytics_ui import AnalyticsWidget, edit_invoice_expenses
+from analytics_ui import AnalyticsWidget, billing_summary, edit_invoice_expenses
 from assistant_ui import AssistantDialog
 
 
@@ -54,9 +54,12 @@ class AnalyticsResponsiveLayoutTests(unittest.TestCase):
 
         def inspect(dialog):
             table = dialog.findChild(QTableWidget)
+            self.assertEqual(table.horizontalHeaderItem(5).text(), "Разнесено без НДС")
+            self.assertEqual(table.horizontalHeaderItem(6).text(), "К сверке без НДС")
             self.assertEqual(table.item(0, 3).text(), "MAT-42")
             self.assertEqual(table.item(0, 6).text(), "249.50")
-            show = next(button for button in dialog.findChildren(QPushButton) if button.text() == "Показать в расходах")
+            show = next(button for button in dialog.findChildren(QPushButton)
+                        if button.text() == "Открыть фактуру в расходах")
             self.assertFalse(show.isEnabled())
             table.selectRow(0)
             show.click()
@@ -67,6 +70,12 @@ class AnalyticsResponsiveLayoutTests(unittest.TestCase):
             widget.expense_breakdown_button.click()
         request.assert_called_once_with("GET", "/api/expense-documents/38")
         reveal.assert_called_once_with({"id": 38, "client_id": "client-38"})
+
+    def test_billing_summary_spells_out_expense_shares(self):
+        for count, label in ((0, "долей расходов"), (1, "доля расхода"), (2, "доли расходов"),
+                             (7, "долей расходов"), (11, "долей расходов"), (22, "доли расходов")):
+            with self.subTest(count=count):
+                self.assertEqual(billing_summary({"hours": 6, "expenses": count}), f"6 ч · {count} {label}")
 
     def test_correction_dialog_submits_only_changed_expenses_after_confirmation(self):
         parent = QWidget()

@@ -429,7 +429,7 @@ class AnalyticsTests(unittest.TestCase):
         self.addCleanup(widget.close)
         widget.last_parameters = widget.parameters()
         widget.received(widget.serial, data, "")
-        self.assertEqual(widget.table.item(0, 6).text(), "8 ч · 1 дол.")
+        self.assertEqual(widget.table.item(0, 6).text(), "8 ч · 1 доля расхода")
         with patch("analytics_ui.open_billing_details") as details:
             widget.table.setCurrentCell(0, 0)
             widget.billing_button.click()

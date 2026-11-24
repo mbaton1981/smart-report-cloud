@@ -25,7 +25,14 @@ def number(value):
 def billing_summary(counts):
     if not counts:
         return "—"
-    return f"{counts['hours']:g} ч · {counts['expenses']} дол."
+    parts = counts["expenses"]
+    if parts % 10 == 1 and parts % 100 != 11:
+        unit = "доля расхода"
+    elif 2 <= parts % 10 <= 4 and not 12 <= parts % 100 <= 14:
+        unit = "доли расходов"
+    else:
+        unit = "долей расходов"
+    return f"{counts['hours']:g} ч · {parts} {unit}"
 
 
 def open_expense_breakdown(parent, documents, total, *, exact, open_document=None):
@@ -35,7 +42,7 @@ def open_expense_breakdown(parent, documents, total, *, exact, open_document=Non
     layout = QVBoxLayout(dialog)
     explanation = QLabel(
         f"{number(total)} SEK без НДС уже учтено в общих затратах. "
-        "Остаток — сумма фактуры без НДС за вычетом долей с известными суммами.\n"
+        "Это часть фактур, для которой нужно сверить суммы без НДС по объектам.\n"
         + ("" if exact else "В этом снимке доступны документы для сверки по внутреннему номеру. "
            "Суммы по каждому документу появятся после обновления серверного расчёта.")
     )
@@ -44,7 +51,7 @@ def open_expense_breakdown(parent, documents, total, *, exact, open_document=Non
     table = ReportTable(len(documents), 7, dialog, stretch_columns=(2,),
                         column_widths={0: 70, 1: 111, 2: 200, 3: 142, 4: 150, 5: 155, 6: 155})
     table.setHorizontalHeaderLabels(("ID", "Дата", "Поставщик", "№ фактуры", "Фактура без НДС",
-                                     "Известные доли", "Остаток без НДС"))
+                                     "Разнесено без НДС", "К сверке без НДС"))
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -60,7 +67,10 @@ def open_expense_breakdown(parent, documents, total, *, exact, open_document=Non
     layout.addWidget(table)
     actions = QHBoxLayout()
     if open_document:
-        show = QPushButton("Показать в расходах", dialog)
+        hint = QLabel("Выберите фактуру и сверьте маркировки заказов и суммы по ним в оригинале.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        show = QPushButton("Открыть фактуру в расходах", dialog)
         show.setEnabled(False)
         table.itemSelectionChanged.connect(lambda: show.setEnabled(bool(table.selectedItems())))
 
