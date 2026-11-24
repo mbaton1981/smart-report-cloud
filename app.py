@@ -8098,6 +8098,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if isinstance(document, dict):
             self._selected_expense_identity = self._expense_document_identity(document)
             self._selected_expense_document_snapshot = dict(document)
+            self._expense_reveal_identity = None
             self._expense_selection_message = ""
 
     def _expense_document_hidden_reasons(self, document):
@@ -8133,13 +8134,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             reasons.append("поиск по поставщику или номеру")
         return reasons
 
-    def _reveal_expense_document(self, document):
+    def _reveal_expense_document(self, document, *, show_tab=False):
         """Расширяет фильтры до документа, не меняя его дату, и выбирает его по ID."""
-        self._selected_expense_identity = self._expense_document_identity(document)
+        identity = self._expense_document_identity(document)
+        self._selected_expense_identity = identity
+        self._expense_reveal_identity = identity
+        self._selected_expense_document_snapshot = dict(document)
         widgets = (self.exp_date_from, self.exp_date_to, self.exp_filter_object,
-                   self.exp_filter_unallocated, self.exp_filter_status, self.exp_search)
-        for widget in widgets:
-            widget.blockSignals(True)
+                   self.exp_filter_unallocated, self.exp_filter_status, self.exp_search,
+                   self.exp_document_tabs)
+        blockers = [QSignalBlocker(widget) for widget in widgets]
         try:
             document_date = QDate.fromString(str(document.get("document_date") or ""), "yyyy-MM-dd")
             if document_date.isValid():
@@ -8152,16 +8156,32 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.exp_filter_unallocated.setChecked(False)
             self.exp_filter_status.setCurrentIndex(max(0, self.exp_filter_status.findData("all")))
             self.exp_search.clear()
+            self.exp_document_tabs.setCurrentIndex(0)
         finally:
-            for widget in widgets:
-                widget.blockSignals(False)
-        self.exp_document_tabs.setCurrentIndex(0)
+            del blockers
         self._invalidate_expense_reads()
+        if show_tab:
+            self.tabs.setCurrentIndex(3)
         self.load_expense_documents()
 
     def _reveal_analytics_expense(self, document):
-        self.tabs.setCurrentIndex(3)
-        self._reveal_expense_document(document)
+        self._reveal_expense_document(document, show_tab=True)
+
+    def _focus_revealed_expense(self):
+        identity = getattr(self, "_expense_reveal_identity", None)
+        if identity is None:
+            return False
+        table = self.table_supplier_documents
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            document = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(document, dict) and self._expense_document_identity(document) == identity:
+                self._expense_reveal_identity = None
+                self._expense_selection_message = ""
+                table.setCurrentCell(row, 2)
+                table.scrollToItem(table.item(row, 2), QAbstractItemView.ScrollHint.PositionAtCenter)
+                return True
+        return False
 
     def _confirm_show_hidden_expense_document(self, document, reasons, intro):
         box = QMessageBox(self)
@@ -9593,7 +9613,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ),
             json.dumps(filtered, ensure_ascii=False, sort_keys=True, default=str),
         )
-        if render_signature == getattr(self, "_expense_register_render_signature", None):
+        if (render_signature == getattr(self, "_expense_register_render_signature", None)
+                and (getattr(self, "_expense_reveal_identity", None) is None or self._focus_revealed_expense())):
             self._update_expense_detail()
             if getattr(self, "_expense_selection_message", ""):
                 self.exp_api_status_lbl.setText(self._expense_selection_message)
@@ -9821,6 +9842,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         table.verticalScrollBar().setValue(vertical_scroll)
         table.horizontalScrollBar().setValue(horizontal_scroll)
         del blocker
+        self._focus_revealed_expense()
         self._expense_register_render_signature = render_signature
         if hasattr(self, "exp_docs_result_count"):
             self.exp_docs_result_count.setText(f"{len(filtered)} из {len(documents)}")

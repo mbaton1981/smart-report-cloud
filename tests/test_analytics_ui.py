@@ -45,23 +45,24 @@ class AnalyticsResponsiveLayoutTests(unittest.TestCase):
     def test_unresolved_expense_breakdown_opens_the_exact_document(self):
         detail = dict(id=38, date="2026-11-10", supplier="Test supplier", invoice_number="MAT-42",
                       net_amount="1000", assigned_net="750.50", remainder="249.50")
+        other = dict(detail, id=37, invoice_number="MAT-41", remainder="100")
         reveal = Mock()
         request = Mock(return_value={"document": {"id": 38, "client_id": "client-38"}})
         widget = AnalyticsWidget(lambda _: {}, request_correction=request, reveal_expense=reveal)
         self.addCleanup(widget.deleteLater)
-        widget.payload = dict(rows=[dict(key="unresolved_net", expenses=249.5)], unresolved_expenses=[detail])
+        widget.payload = dict(rows=[dict(key="unresolved_net", expenses=349.5)], unresolved_expenses=[other, detail])
         widget.expense_breakdown_button.setEnabled(True)
 
         def inspect(dialog):
             table = dialog.findChild(QTableWidget)
             self.assertEqual(table.horizontalHeaderItem(5).text(), "Разнесено без НДС")
             self.assertEqual(table.horizontalHeaderItem(6).text(), "К сверке без НДС")
-            self.assertEqual(table.item(0, 3).text(), "MAT-42")
-            self.assertEqual(table.item(0, 6).text(), "249.50")
+            self.assertEqual(table.item(1, 3).text(), "MAT-42")
+            self.assertEqual(table.item(1, 6).text(), "249.50")
             show = next(button for button in dialog.findChildren(QPushButton)
                         if button.text() == "Открыть фактуру в расходах")
             self.assertFalse(show.isEnabled())
-            table.selectRow(0)
+            table.selectRow(1)
             show.click()
             return dialog.result()
 

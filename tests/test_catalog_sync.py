@@ -4596,6 +4596,65 @@ class CatalogSyncTests(unittest.TestCase):
             window.close()
             window.deleteLater()
 
+    def test_analytics_expense_link_focuses_requested_invoice_in_unchanged_register(self):
+        def invoice(identifier):
+            return dict(id=identifier, client_id=f"beijer-{identifier}", supplier_name="Test Beijer",
+                        invoice_number=f"BEIJER-{identifier:04d}", document_date="2026-11-16",
+                        currency_code="SEK", gross_amount="125.00", net_amount="100.00",
+                        vat_amount="25.00", verification_status="confirmed", allocations=[], attachments=[])
+
+        documents = [invoice(identifier) for identifier in range(1, 39)]
+        requested = documents[-1]
+        window = self.desktop.SmartReportApp.__new__(self.desktop.SmartReportApp)
+        self.desktop.QMainWindow.__init__(window)
+        window.tabs = self.desktop.QTabWidget(window)
+        window.setCentralWidget(window.tabs)
+        for title in ("Hours", "Pay", "Balance"):
+            window.tabs.addTab(self.desktop.QWidget(), title)
+        window.tab_expenses = self.desktop.QWidget()
+        window.tab_object_expenses = self.desktop.QWidget()
+        window.tabs.addTab(window.tab_expenses, "Expenses")
+        window.tabs.addTab(self.desktop.QWidget(), "Analytics")
+        try:
+            with patch.object(window, "_expense_server_objects", return_value=([], True)):
+                window.setup_expenses_tab()
+            with patch.object(window, "_expense_register_snapshot", return_value=(documents, True)) as snapshot:
+                window.exp_date_from.setText("2026-11-01")
+                window.exp_date_to.setText("2026-11-30")
+                window.exp_filter_status.setCurrentIndex(window.exp_filter_status.findData("all"))
+                window.tabs.currentChanged.connect(lambda index: window.load_expense_documents() if index == 3 else None)
+                window.tabs.setCurrentIndex(3)
+                window.resize(1280, 800)
+                window.show()
+                self.desktop.QApplication.processEvents()
+                table = window.table_supplier_documents
+                table.setCurrentCell(0, 2)
+                original_item = table.item(0, 0)
+                self.assertNotEqual(window.exp_detail_values["number"].text(), requested["invoice_number"])
+
+                window.tabs.setCurrentIndex(4)
+                window._reveal_analytics_expense(requested)
+                self.assertEqual(window.tabs.currentIndex(), 3)
+                self.assertIs(table.item(0, 0), original_item)
+                self.assertEqual(window.exp_detail_values["number"].text(), requested["invoice_number"])
+                self.assertGreater(table.verticalScrollBar().value(), 0)
+                self.assertTrue(table.viewport().rect().contains(table.visualItemRect(table.currentItem()).center()))
+
+                snapshot.return_value = (documents[:-1], True)
+                window._reveal_analytics_expense(requested)
+                self.assertEqual(table.currentRow(), -1)
+                self.assertIn("больше не найден", window._expense_selection_message)
+                snapshot.return_value = (documents, True)
+                window.load_expense_documents()
+                self.assertEqual(window.exp_detail_values["number"].text(), requested["invoice_number"])
+
+                table.setCurrentCell(0, 2)
+                window.load_expense_documents()
+                self.assertIs(table.item(0, 0), table.item(table.currentRow(), 0))
+        finally:
+            window.close()
+            window.deleteLater()
+
     def test_queue_and_synced_documents_share_period_filter(self):
         client_id = str(uuid.uuid4())
         undated_id = str(uuid.uuid4())

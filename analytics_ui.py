@@ -63,6 +63,8 @@ def open_expense_breakdown(parent, documents, total, *, exact, open_document=Non
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
             item.setToolTip(value)
+            if column == 0:
+                item.setData(Qt.ItemDataRole.UserRole, document["id"])
             table.setItem(index, column, item)
     layout.addWidget(table)
     actions = QHBoxLayout()
@@ -74,13 +76,13 @@ def open_expense_breakdown(parent, documents, total, *, exact, open_document=Non
         show.setEnabled(False)
         table.itemSelectionChanged.connect(lambda: show.setEnabled(bool(table.selectedItems())))
 
-        def show_selected(*_):
-            index = table.currentRow()
-            if index >= 0 and open_document(dialog, documents[index]["id"]):
+        def show_selected(row):
+            item = table.item(row, 0)
+            if item and open_document(dialog, item.data(Qt.ItemDataRole.UserRole)):
                 dialog.accept()
 
-        show.clicked.connect(show_selected)
-        table.cellDoubleClicked.connect(show_selected)
+        show.clicked.connect(lambda: show_selected(table.currentRow()))
+        table.cellDoubleClicked.connect(lambda row, _column: show_selected(row))
         actions.addWidget(show)
     actions.addStretch()
     close = QPushButton("Закрыть", dialog)
@@ -719,6 +721,8 @@ class AnalyticsWidget(QWidget):
         try:
             document = _run_correction(parent, "Загружаем документ…", lambda: self.request_correction(
                 "GET", f"/api/expense-documents/{document_id}")["document"])
+            if not isinstance(document, dict) or document.get("id") != document_id:
+                raise RuntimeError("Сервер не вернул выбранную фактуру. Обновите аналитику и повторите переход.")
         except (KeyError, RuntimeError) as error:
             QMessageBox.warning(parent, "Фактура", str(error))
             return False
