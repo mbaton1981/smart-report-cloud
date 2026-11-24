@@ -6,9 +6,9 @@ from pathlib import Path
 import uuid
 import tempfile
 
-from PyQt6.QtCore import QEventLoop, QDate, QThreadPool, Qt
+from PyQt6.QtCore import QEventLoop, QThreadPool, Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
+    QAbstractItemView, QButtonGroup, QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QProgressDialog,
 )
 
@@ -132,12 +132,22 @@ def open_next_invoice(host):
         obj = dict(row)
     finally:
         connection.close()
-    cutoff = host.inv_date_to.date().toString("yyyy-MM-dd")
+    tab_cutoff = host.inv_date_to.date().toString("yyyy-MM-dd")
+    today = desktop.stockholm_today().isoformat()
+    month_start, month_end = desktop.stockholm_month_bounds()
+    previous_start, previous_end = desktop.stockholm_month_bounds(-1)
+    periods = [
+        ("За весь проект", None, today),
+        ("Этот месяц", month_start, month_end),
+        ("Прошлый месяц", previous_start, previous_end),
+        ("По дату отчёта", None, tab_cutoff),
+    ]
+    latest = max(end for _, _, end in periods)
 
     def fetch():
         report = host.collect_invoice_report(selection={
             "company": obj["company"], "object_id": obj["id"], "sync_id": obj["sync_id"],
-            "date_from": "1900-01-01", "date_to": cutoff,
+            "date_from": "1900-01-01", "date_to": latest,
         })
         capabilities = desktop.request_expense_api("GET", "/api/expense-documents/capabilities")
         supported = "accountant_invoice_batches_v1" in capabilities.get("features", [])
@@ -146,7 +156,7 @@ def open_next_invoice(host):
         state = (desktop.request_expense_api("GET", "/api/customer-invoices", params={"object_id": obj["server_id"]})
                  if "customer_invoice_batches_v1" in capabilities.get("features", []) else {"members": {}, "batches": []})
         documents = desktop.fetch_all_expense_documents(None, None)
-        entries, warnings = prepare_next_invoice(report["journal_rows"], documents, obj["server_id"], cutoff,
+        entries, warnings = prepare_next_invoice(report["journal_rows"], documents, obj["server_id"], latest,
                                                  state["members"], accountant=True)
         report["accountant_payroll"] = accountant_payroll(desktop, report, entries)
         needed = {entry["document"]["id"]: entry["document"] for entry in entries
@@ -201,10 +211,20 @@ def open_next_invoice(host):
     dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
     dialog.resize(1180, 760)
     layout = QVBoxLayout(dialog)
-    note = QLabel(
-        f"Состав по {cutoff} включительно. Включены ранние расходы, ещё не связанные с клиентской фактурой. "
-        "Номер выставленной фактуры сохранит состав для следующего счёта."
-    )
+    period_bar = QHBoxLayout()
+    period_buttons = QButtonGroup(dialog)
+    for index, (label, start, end) in enumerate(periods):
+        button = QPushButton(label)
+        button.setCheckable(True)
+        button.setToolTip(f"{start} — {end}" if start else f"Все невыставленные позиции по {end} включительно")
+        desktop_theme.apply_style(button, "QPushButton:checked { background-color: #24445f; color: #dbeafe; }")
+        period_buttons.addButton(button, index)
+        period_bar.addWidget(button)
+    period_buttons.button(0).setChecked(True)
+    period_bar.addStretch()
+    layout.addLayout(period_bar)
+    note = QLabel()
+    note.setObjectName("accountantInvoicePeriodNote")
     note.setWordWrap(True)
     layout.addWidget(note)
     if not supported:
@@ -241,7 +261,6 @@ def open_next_invoice(host):
     sections = QMenu(jump)
     jump.setMenu(sections)
     options.addWidget(jump)
-    jump.setVisible(len(groups) > 1)
     options.addStretch()
     layout.addLayout(options)
     table = QTableWidget(len(entries) + len(groups), 7)
@@ -258,9 +277,13 @@ def open_next_invoice(host):
     table.verticalHeader().hide()
     table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
     table.verticalScrollBar().setSingleStep(24)
+    empty = QLabel("Нет позиций к выставлению за выбранный период.")
+    empty.setWordWrap(True)
+    layout.addWidget(empty)
     layout.addWidget(table, 1)
 
     entry_rows = {}
+    headings = {}
     next_row = 0
     heading_font = table.font()
     heading_font.setBold(True)
@@ -275,9 +298,11 @@ def open_next_invoice(host):
         heading.setForeground(desktop_theme.color("#dbeafe"))
         table.setSpan(next_row, 0, 1, table.columnCount())
         table.setItem(next_row, 0, heading)
-        sections.addAction(category).triggered.connect(
+        action = sections.addAction(category)
+        action.triggered.connect(
             lambda _checked=False, item=heading: table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
         )
+        headings[category] = heading, action
         for index, entry in enumerate(group, start=next_row + 1):
             entry_rows[entry["member"]["key"]] = index
         next_row += len(group) + 1
@@ -319,7 +344,7 @@ def open_next_invoice(host):
     form = QFormLayout()
     number = QLineEdit()
     number.setPlaceholderText("Номер фактуры, которую вы выставили клиенту")
-    invoice_date = desktop.create_date_field(QDate.currentDate().toString("yyyy-MM-dd"))
+    invoice_date = desktop.create_date_field(today)
     form.addRow("Номер клиентской фактуры", number)
     form.addRow("Дата фактуры", invoice_date)
     layout.addLayout(form)
@@ -339,9 +364,10 @@ def open_next_invoice(host):
     submitted_payload = None
     rates = {}
     use_saved_terms = True
+    visible_entries = []
 
     def selected():
-        return [entry for entry in entries
+        return [entry for entry in visible_entries
                 if table.item(entry_rows[entry["member"]["key"]], 0).checkState() == Qt.CheckState.Checked]
 
     def refresh(*_):
@@ -380,6 +406,40 @@ def open_next_invoice(host):
     reviewed.toggled.connect(refresh)
     include_trips.toggled.connect(refresh)
 
+    def apply_period(index):
+        _label, start, end = periods[index]
+        note.setText(
+            f"Позиции к выставлению за {start} — {end}." if start else
+            f"Все невыставленные позиции по {end} включительно."
+        )
+        counts = defaultdict(int)
+        visible_entries.clear()
+        signals_blocked = table.blockSignals(True)
+        try:
+            for entry in entries:
+                day = entry["date"]
+                visible = (start is None or day >= start) and day <= end
+                table.setRowHidden(entry_rows[entry["member"]["key"]], not visible)
+                if visible:
+                    visible_entries.append(entry)
+                    counts[entry["category"]] += 1
+            for category, (heading, action) in headings.items():
+                count = counts.get(category, 0)
+                heading.setText(f"{category} · {count}")
+                table.setRowHidden(heading.row(), not count)
+                action.setVisible(bool(count))
+        finally:
+            table.blockSignals(signals_blocked)
+        jump.setVisible(len(counts) > 1)
+        empty.setVisible(not visible_entries)
+        table.scrollToTop()
+        if reviewed.isChecked():
+            reviewed.setChecked(False)
+        else:
+            refresh()
+
+    period_buttons.idToggled.connect(lambda index, checked: apply_period(index) if checked else None)
+
     def change_rates():
         nonlocal rates, use_saved_terms
         updated = edit_accountant_rates(dialog, rates, use_saved_terms)
@@ -391,6 +451,7 @@ def open_next_invoice(host):
 
     def export_pdf():
         selection = selected()
+        _label, period_start, cutoff = periods[period_buttons.checkedId()]
         copies = {}
         for entry in selection:
             if entry["member"]["kind"] != "expense":
@@ -419,7 +480,8 @@ def open_next_invoice(host):
                     documents = list(copies.values())
                     download = getattr(host, "_download_object_report_originals", None)
                     sources, errors = download(documents, folder, update) if documents and download else ({}, {})
-                    write_accountant_report(path, obj, selection, pdf_report, cutoff, copy_documents=documents,
+                    write_accountant_report(path, obj, selection, pdf_report, cutoff,
+                                            period_start=period_start, copy_documents=documents,
                                             source_paths=sources, source_errors=errors,
                                             font=desktop.DEFAULT_FONT, bold_font=desktop.DEFAULT_FONT_BOLD, **settings)
 
@@ -477,5 +539,5 @@ def open_next_invoice(host):
 
     pdf_button.clicked.connect(export_pdf)
     save_button.clicked.connect(commit)
-    refresh()
+    apply_period(period_buttons.checkedId())
     dialog.exec()

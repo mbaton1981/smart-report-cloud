@@ -95,7 +95,7 @@ class CustomerReportTests(unittest.TestCase):
         self.patcher.stop()
         self.conn.close()
 
-    def test_invoice_month_buttons_clear_previous_period_preview_and_keep_object(self):
+    def test_invoice_period_buttons_clear_previous_preview_and_keep_object(self):
         from datetime import datetime
 
         self.shift()
@@ -115,6 +115,11 @@ class CustomerReportTests(unittest.TestCase):
 
             window.tab_invoice.findChild(self.desktop.QPushButton, "invoiceThisMonth").click()
             self.assertEqual((window.inv_date_from.text(), window.inv_date_to.text()), ("2027-01-01", "2027-01-31"))
+
+            self.shift(day="2026-09-01", object_name="HOTEL Djurgården")
+            window.tab_invoice.findChild(self.desktop.QPushButton, "invoiceWholeProject").click()
+            self.assertEqual((window.inv_date_from.text(), window.inv_date_to.text()), ("2026-10-21", "2027-01-02"))
+            self.assertEqual(window.inv_obj_cb.currentData(), selected_object)
 
     def shift(self, name="Andrii Piskun", day="2026-10-21", hours=8, rate=0,
               transport=0, kind="work", object_name="Tomteboda ÄTA", comment="Montering", confirmed=True):

@@ -2626,11 +2626,14 @@ def create_half_hour_time_field(default_time):
     return field
 
 
+def stockholm_today():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Europe/Stockholm")).date()
+
+
 def stockholm_month_bounds(offset_months=0):
     """Первый и последний день календарного месяца по времени Стокгольма (ISO-даты)."""
-    from datetime import timedelta
-    from zoneinfo import ZoneInfo
-    today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+    today = stockholm_today()
     month_index = today.month - 1 + offset_months
     start = today.replace(year=today.year + month_index // 12,
                           month=month_index % 12 + 1, day=1)
@@ -2639,7 +2642,10 @@ def stockholm_month_bounds(offset_months=0):
 
 
 def set_report_month_dates(date_from, date_to, offset_months):
-    start, end = stockholm_month_bounds(offset_months)
+    return set_report_date_range(date_from, date_to, *stockholm_month_bounds(offset_months))
+
+
+def set_report_date_range(date_from, date_to, start, end):
     if (date_from.text(), date_to.text()) == (start, end):
         return False
     with QSignalBlocker(date_from), QSignalBlocker(date_to):
@@ -12429,6 +12435,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             button.setObjectName(name)
             button.clicked.connect(lambda _checked=False, month=offset: self.set_invoice_period_month(month))
             period_layout.addWidget(button)
+        project_period = QPushButton("За весь проект")
+        project_period.setObjectName("invoiceWholeProject")
+        project_period.clicked.connect(self.set_invoice_period_project)
+        period_layout.addWidget(project_period)
         period_layout.addStretch(1)
         card_layout.addRow("Период:", period_layout)
         desktop_theme.adapt_box_layout(card, period_layout, compact_width=700)
@@ -12585,6 +12595,26 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if set_report_month_dates(self.inv_date_from, self.inv_date_to, offset_months):
             self._clear_invoice_preview()
             self.invoice_summary_note.setText("Период изменён. Нажмите «Просмотр сводки и журнала».")
+
+    def set_invoice_period_project(self):
+        object_id = self.inv_obj_cb.currentData()
+        if object_id is None:
+            QMessageBox.information(self, "Период отчёта", "Выберите объект.")
+            return
+        try:
+            connection = get_db_connection()
+            try:
+                obj = connection.execute("SELECT * FROM objects WHERE id=?", (object_id,)).fetchone()
+            finally:
+                connection.close()
+            if obj is None:
+                raise ValueError("Выбранный объект больше не существует. Обновите справочник.")
+            start, end = self._object_history_period(obj)
+            if set_report_date_range(self.inv_date_from, self.inv_date_to, start, max(end, stockholm_today().isoformat())):
+                self._clear_invoice_preview()
+                self.invoice_summary_note.setText("Период изменён. Нажмите «Просмотр сводки и журнала».")
+        except (sqlite3.Error, ValueError) as error:
+            QMessageBox.warning(self, "Период отчёта", str(error))
 
     def _clear_invoice_preview(self):
         """Drop a preview that no longer matches the report filters."""

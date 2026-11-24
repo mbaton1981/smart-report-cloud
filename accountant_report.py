@@ -139,7 +139,7 @@ def summarize_accountant(report, entries, *, include_trips=True, rates=None, use
                 total=known if complete else None, known=known, stored_terms=bool(stored_terms))
 
 
-def write_accountant_report(filepath, obj, entries, report, cutoff, *, font, bold_font,
+def write_accountant_report(filepath, obj, entries, report, cutoff, *, font, bold_font, period_start=None,
                             include_trips=True, include_journal=True, rates=None, use_saved_terms=True,
                             copy_documents=(), source_paths=None, source_errors=None):
     """Render the handoff and merge selected supplier copies after its own pages."""
@@ -174,8 +174,9 @@ def write_accountant_report(filepath, obj, entries, report, cutoff, *, font, bol
     headline = f"Arbetade timmar: {quantity(summary['hours'])} h"
     if include_trips:
         headline += f"  ·  Resor: {quantity(summary['trips'])}"
+    period = f"{period_start} - {cutoff}" if period_start else f"Till och med {cutoff}"
     story = [paragraph(REPORT_ISSUER_NAME, heading), paragraph("Faktureringsunderlag", title),
-             paragraph(scope, heading), paragraph(f"Till och med {cutoff} · Markerade poster"),
+             paragraph(scope, heading), paragraph(f"{period} · Markerade poster"),
              Spacer(1, 11), paragraph(headline, heading), Spacer(1, 6)]
     total = summary["total"]
     story.append(paragraph(

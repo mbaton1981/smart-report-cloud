@@ -2,6 +2,7 @@ import copy
 import json
 import unittest
 from contextlib import closing
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -228,7 +229,7 @@ class CustomerBillingTests(unittest.TestCase):
         window = self.desktop.QMainWindow()
         self.addCleanup(window.close)
         window.inv_obj_cb = SimpleNamespace(currentData=lambda: local["id"])
-        window.inv_date_to = self.desktop.create_date_field("2026-11-18")
+        window.inv_date_to = self.desktop.create_date_field("2026-10-31")
         window.collect_invoice_report = lambda **kwargs: report
         window._collect_journal_translations = self.desktop.SmartReportApp._collect_journal_translations.__get__(window)
         output = Path(self._case.name) / "next-customer-invoice.pdf"
@@ -309,6 +310,25 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertEqual(table.item(2, 0).checkState(), self.desktop.Qt.CheckState.Checked)
             buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
             self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
+            self.assertTrue(buttons["За весь проект"].isChecked())
+            rows = (1, 2, 4, 6, 7)
+            self.assertEqual([row for row in rows if not table.isRowHidden(row)], list(rows))
+            reviewed = dialog.findChild(QCheckBox, "accountantInvoiceReviewed")
+            reviewed.setChecked(True)
+            buttons["Прошлый месяц"].click()
+            self.assertFalse(reviewed.isChecked())
+            self.assertEqual([row for row in rows if not table.isRowHidden(row)], [1, 4])
+            table.item(1, 0).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            buttons["По дату отчёта"].click()
+            self.assertEqual([row for row in rows if not table.isRowHidden(row)], [1, 4])
+            buttons["Этот месяц"].click()
+            self.assertEqual([row for row in rows if not table.isRowHidden(row)], [2, 6, 7])
+            self.assertTrue(table.isRowHidden(3))
+            self.assertFalse(sections[1].isVisible())
+            self.assertEqual(table.item(0, 0).text(), "Материалы и закупки · 1")
+            buttons["За весь проект"].click()
+            self.assertEqual(table.item(1, 0).checkState(), self.desktop.Qt.CheckState.Unchecked)
+            table.item(1, 0).setCheckState(self.desktop.Qt.CheckState.Checked)
             checks = {field.text(): field for field in dialog.findChildren(QCheckBox)}
             checks["Включить поездки"].setChecked(False)
             table.item(1, 6).setCheckState(self.desktop.Qt.CheckState.Checked)
@@ -331,6 +351,7 @@ class CustomerBillingTests(unittest.TestCase):
                 buttons["Предварительный PDF"].click()
                 viewer.assert_called_once()
             text = " ".join(page.extract_text() for page in PdfReader(output).pages)
+            self.assertIn("Till och med 2026-11-24", text)
             self.assertIn("100,00 SEK", text)
             self.assertIn("125,00 SEK", text)
             self.assertIn("4 500,00 SEK", text)
@@ -354,6 +375,13 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertNotIn("TEST SUPPLIER ORIGINAL", without_attachments)
             self.assertIn("Resor: 2", without_attachments)
             self.assertIn("600,00 SEK", without_attachments)
+            buttons["Этот месяц"].click()
+            with patch('payroll_preview.open_preview', side_effect=preview):
+                buttons["Предварительный PDF"].click()
+            month_pdf = " ".join(page.extract_text() for page in PdfReader(output).pages)
+            self.assertIn("2026-11-01 - 2026-11-30", month_pdf)
+            self.assertNotIn("2026-10-21", month_pdf)
+            buttons["За весь проект"].click()
             for field in dialog.findChildren(QLineEdit):
                 if "Номер фактуры" in field.placeholderText():
                     field.setText("UI-INVOICE-1")
@@ -368,6 +396,7 @@ class CustomerBillingTests(unittest.TestCase):
             return dialog.result()
 
         with patch.object(self.desktop, "request_expense_api", side_effect=api), \
+                patch.object(self.desktop, "stockholm_today", return_value=date(2026, 11, 24)), \
                 patch.object(self.desktop, "fetch_all_expense_documents", return_value=[self.document, unknown, rental]), \
                 patch.object(swedish_translation, "_request", side_effect=translate) as translator, \
                 patch.object(self.desktop.QDialog, "exec", new=inspect):
