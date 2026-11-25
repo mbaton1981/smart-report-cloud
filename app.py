@@ -3417,7 +3417,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
 
     def queue_expense_document_operation(
         self, client_id, operation, payload, server_document_id=None,
-        server_version=None, attachment_paths=None,
+        server_version=None, attachment_paths=None, *, conflict_revision=None,
     ):
         if operation not in {"upsert", "delete"}:
             raise ValueError("Недопустимая операция расходного документа.")
@@ -3426,10 +3426,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         try:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT server_document_id, server_version, revision, attachment_paths_json "
+                "SELECT server_document_id, server_version, revision, attachment_paths_json, state, operation "
                 "FROM expense_document_outbox WHERE client_id = ?",
                 (client_id,),
             ).fetchone()
+            if conflict_revision is not None and (
+                not existing or existing["state"] != "conflict" or existing["operation"] != "upsert"
+                or existing["revision"] != conflict_revision
+                or existing["server_document_id"] != server_document_id
+            ):
+                raise ValueError("Очередь передачи изменилась. Откройте актуальное распределение.")
             revision = int(existing["revision"] or 0) + 1 if existing else 1
             if server_document_id is None and existing:
                 server_document_id = existing["server_document_id"]
@@ -8476,8 +8482,11 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.exp_primary_action.setToolTip("Показывает назначения, суммы и категории учтённой фактуры.")
         elif status == "transfer":
             self.exp_primary_action.setText("Проверить передачу")
+            self.exp_primary_action.setToolTip("Открыть фактуру и проверить состояние передачи.")
         else:
             self.exp_primary_action.setText("Проверить фактуру")
+        if status == "transfer" and document.get("sync_error"):
+            self.exp_detail_hint.setText(str(document["sync_error"]))
 
         self.exp_detail_original_button.setEnabled(True)
         self.exp_detail_copy_button.setEnabled(bool(
@@ -8532,7 +8541,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if not document:
             return
         if SmartReportApp._expense_document_prefers_incoming_review(document):
-            self.open_incoming_documents(document["incoming_document_id"])
+            self._open_incoming_expense_review(document)
             return
         self._expense_document_review_dialog(document=document, assignment_only=True)
 
@@ -8636,7 +8645,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
     def incoming_delivery_pending(self, client_id):
         conn = get_db_connection()
         try:
-            return conn.execute("SELECT state,last_error FROM expense_document_outbox WHERE client_id=?",
+            return conn.execute("SELECT state,last_error,operation,server_document_id,revision "
+                                "FROM expense_document_outbox WHERE client_id=?",
                                 (client_id,)).fetchone()
         finally:
             conn.close()
@@ -12219,9 +12229,18 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         document = self._selected_expense_document(self.table_supplier_documents)
         if document:
             if SmartReportApp._expense_document_prefers_incoming_review(document):
-                self.open_incoming_documents(document["incoming_document_id"])
+                self._open_incoming_expense_review(document)
             else:
                 self._expense_document_review_dialog(document=document)
+
+    def _open_incoming_expense_review(self, document):
+        if document.get("sync_state") == "conflict":
+            try:
+                self.refresh_incoming_register()
+            except (OSError, ValueError, RuntimeError) as error:
+                QMessageBox.warning(self, "Распределение не обновлено", str(error))
+                return
+        self.open_incoming_documents(document["incoming_document_id"])
 
     def review_selected_object_expense(self, *_):
         document = self._selected_expense_document(self.object_expenses_table)

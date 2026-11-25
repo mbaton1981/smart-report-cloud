@@ -156,7 +156,8 @@ class IncomingStore(OfflineReviewStore):
 
     def clean_payload(self, payload):
         cleaned = super().clean_payload({key: value for key, value in payload.items()
-                                         if key not in ("allocations", "server_version", "payment_receipt_id")})
+                                         if key not in ("allocations", "server_version", "payment_receipt_id",
+                                                        "conflict_revision")})
         receipt_id = payload.get("payment_receipt_id")
         if receipt_id is not None:
             if type(receipt_id) is not int or receipt_id <= 0:
@@ -183,6 +184,11 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Выберите объект для этой части.")
             cleaned["allocations"].append({"destination": destination, "object_id": object_id,
                                            "gross_amount": decimal_text(amount)})
+            allocation_id = part.get("allocation_id")
+            if allocation_id is not None:
+                if type(allocation_id) is not int or allocation_id <= 0:
+                    raise ReviewError("Неверный номер сохранённой доли. Откройте актуальное распределение.")
+                cleaned["allocations"][-1]["allocation_id"] = allocation_id
             for key, limit in (("note", 500), ("expense_category", 100), ("expense_category_evidence", 500)):
                 if key in part:
                     value = part[key]
@@ -218,12 +224,15 @@ class IncomingStore(OfflineReviewStore):
             payload.pop("server_version", None)
         delivered = card and self.conn.execute("SELECT 1 FROM deliveries WHERE document_id=?",
                                                (document_id,)).fetchone()
-        if delivered and not self.host.incoming_delivery_pending(card["client_id"]):
+        pending = self.host.incoming_delivery_pending(card["client_id"]) if delivered else None
+        rejected_update = pending and pending["state"] == "conflict" and pending["operation"] == "upsert"
+        if delivered and (not pending or rejected_update):
             try:
                 existing = self._existing(card["client_id"])
             except ValueError:
                 return revision, payload
-            if existing:
+            if (existing and existing.get("allocation_basis") != "net"
+                    and (not pending or pending["server_document_id"] == existing.get("id"))):
                 payload = dict(payload)
                 for key in EDITABLE:
                     if key in existing:
@@ -233,14 +242,17 @@ class IncomingStore(OfflineReviewStore):
                                            ("object" if row.get("object_id") is not None else "company"),
                                            "object_id": row.get("object_id"),
                                            "gross_amount": row.get("gross_amount"),
-                                           **{key: row[key] for key in ("net_amount", "vat_amount", "rounding_amount",
-                                                                        "note", "expense_category",
-                                                                        "expense_category_source", "expense_category_evidence")
+                                           **{key: row[key] for key in (
+                                               "allocation_id", "net_amount", "vat_amount", "rounding_amount",
+                                               "note", "expense_category", "expense_category_source", "expense_category_evidence",
+                                           )
                                               if key in row}}
                                           for row in existing.get("allocations", [])]
                 payload["object_id"] = (payload["allocations"][0]["object_id"]
                                         if len(payload["allocations"]) == 1 else None)
                 payload["server_version"] = existing["sync_version"]
+                if rejected_update:
+                    payload["conflict_revision"] = pending["revision"]
         return revision, payload
 
     def save(self, document_id, payload, expected_revision):
@@ -250,12 +262,21 @@ class IncomingStore(OfflineReviewStore):
             return self.save_revision(document_id, cleaned, expected_revision)
         if cleaned.get("payment_receipt_id") != json.loads(card["payload_json"]).get("payment_receipt_id"):
             raise ReviewError("Чек к уже учтённому расходу меняется из его карточки в реестре.")
-        if self.host.incoming_delivery_pending(card["client_id"]):
-            raise ReviewError("Сначала завершите передачу или разберите конфликт в обычном реестре.")
+        pending = self.host.incoming_delivery_pending(card["client_id"])
+        conflict_revision = payload.get("conflict_revision")
+        if pending or conflict_revision is not None:
+            if (type(conflict_revision) is not int or not pending or pending["state"] != "conflict"
+                    or pending["operation"] != "upsert"
+                    or pending["revision"] != conflict_revision):
+                raise ReviewError("Очередь передачи изменилась. Откройте актуальное распределение.")
         existing = self._existing(card["client_id"], required=True)
         if (not existing or cleaned.get("server_version") is None
                 or cleaned["server_version"] != existing["sync_version"]):
             raise ReviewError("Распределение изменилось. Откройте актуальное распределение; правки не отправлены.")
+        if existing.get("allocation_basis") == "net":
+            raise ReviewError("Распределение без НДС редактируется в карточке фактуры в разделе «Расходы».")
+        if pending and pending["server_document_id"] != existing.get("id"):
+            raise ReviewError("Проверьте связь правки с фактурой в обычном реестре.")
         problems = self.issues(document_id, cleaned)
         if problems:
             raise ReviewError("\n".join(problems))
@@ -273,8 +294,9 @@ class IncomingStore(OfflineReviewStore):
                 datetime.now(timezone.utc).isoformat()))
             self.conn.execute("UPDATE register SET payload_json=?,revision=? WHERE document_id=?",
                               (packed(cleaned), revision + 1, document_id))
-            self.conn.execute("DELETE FROM deliveries WHERE document_id=?", (document_id,))
-        self.deliver(self.card(document_id))
+            if conflict_revision is None:
+                self.conn.execute("DELETE FROM deliveries WHERE document_id=?", (document_id,))
+        self.deliver(self.card(document_id), conflict_revision=conflict_revision)
         return revision + 1
 
     def action(self, document_id):
@@ -763,6 +785,9 @@ class IncomingStore(OfflineReviewStore):
                         action, "Выберите действие — расход не создан"), False
         pending = self.host.incoming_delivery_pending(card["client_id"])
         if pending:
+            if (pending["state"] == "conflict" and pending["operation"] == "upsert"
+                    and pending["server_document_id"] is not None):
+                return "Сервер отклонил правку. " + (pending["last_error"] or "Сверьте распределение."), False
             return ("Сохранено локально — ожидает синхронизации"
                     if not pending["last_error"] else "Не учтён на сервере: " + pending["last_error"]), False
         if not self.conn.execute("SELECT 1 FROM deliveries WHERE document_id=?", (document_id,)).fetchone():
@@ -881,10 +906,10 @@ class IncomingStore(OfflineReviewStore):
                 raise ReviewError("Возможный повтор покупки с другим PDF. Нужна ручная сверка.")
         return linked_client
 
-    def deliver(self, card, *, confirming=False):
+    def deliver(self, card, *, confirming=False, conflict_revision=None):
         delivered = self.conn.execute(
             "SELECT * FROM deliveries WHERE document_id=?", (card["document_id"],)).fetchone()
-        if delivered:
+        if delivered and conflict_revision is None:
             return card
         payload = json.loads(card["payload_json"])
         receipt_id = payload.pop("payment_receipt_id", None)
@@ -923,14 +948,17 @@ class IncomingStore(OfflineReviewStore):
             paths.append(str(receipt))
             payload["required_attachment_sha256"].append(digest(receipt.read_bytes()))
         staged = self.host._store_expense_originals(paths, card["client_id"])
-        self.host.queue_expense_document_operation(
-            card["client_id"], "upsert", payload,
-            server_document_id=existing.get("id") if existing else None,
-            server_version=payload.get("server_version") if payload.get("server_version") is not None
-                           else existing.get("sync_version") if existing else None,
-            attachment_paths=staged)
+        try:
+            self.host.queue_expense_document_operation(
+                card["client_id"], "upsert", payload,
+                server_document_id=existing.get("id") if existing else None,
+                server_version=payload.get("server_version") if payload.get("server_version") is not None
+                               else existing.get("sync_version") if existing else None,
+                attachment_paths=staged, conflict_revision=conflict_revision)
+        except ValueError as error:
+            raise ReviewError(str(error)) from error
         with self.conn:
-            self.conn.execute("INSERT INTO deliveries VALUES (?,'queued',?)",
+            self.conn.execute("INSERT INTO deliveries VALUES (?,'queued',?) ON CONFLICT(document_id) DO NOTHING",
                               (card["document_id"], card["client_id"]))
         callback = getattr(self.host, "incoming_after_queue", None)
         if callback:

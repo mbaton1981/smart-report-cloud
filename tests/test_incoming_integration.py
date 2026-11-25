@@ -428,6 +428,87 @@ class IncomingIntegrationTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_recover_rejected_object_swap_and_keep_the_accounted_shares(self):
+        from expense_categories import CATEGORY_EQUIPMENT_RENTAL, CATEGORY_MATERIALS
+        from offline_review_ui import OfflineReviewWindow
+
+        conn = self.server.get_db_connection()
+        other_id = conn.execute(
+            "INSERT INTO meta_objects(company,name,markning,rate,transport_rate,is_active) "
+            "VALUES ('Test','Other isolated object','T2',0,0,1)"
+        ).lastrowid
+        conn.commit()
+        conn.close()
+        self.host._expense_objects.append({"id": other_id, "name": "Other isolated object"})
+        self.host.incoming_delivery_pending = lambda client_id: (
+            self.desktop.SmartReportApp.incoming_delivery_pending(self.host, client_id))
+        self.host.incoming_register_snapshot = lambda: self.server_client.get(
+            "/api/expense-documents", headers={"X-Sync-Key": "isolated-sync-test-key"},
+        ).get_json()["documents"]
+
+        parts = [
+            {"object_id": self.object_id, "gross_amount": "50.50", "net_amount": "40.00",
+             "vat_amount": "10.00", "rounding_amount": "0.50", "expense_category": CATEGORY_MATERIALS,
+             "expense_category_source": "user", "expense_category_evidence": "Isolated materials"},
+            {"object_id": other_id, "gross_amount": "75.00", "net_amount": "60.00",
+             "vat_amount": "15.00", "rounding_amount": "0.00", "expense_category": CATEGORY_EQUIPMENT_RENTAL,
+             "expense_category_source": "user", "expense_category_evidence": "Isolated equipment"},
+        ]
+        revision, payload = self.store.latest(1)
+        payload.update(gross_amount="125.50", rounding_amount="0.50", original_checked=True, allocations=parts)
+        revision = self.store.save(1, payload, revision)
+        card = self.store.transfer(1, revision)
+        self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+        before = self.host.incoming_register_snapshot()[0]
+
+        revision, rejected = self.store.current_review(1)
+        for part, new_target in zip(rejected["allocations"], (other_id, self.object_id)):
+            part["object_id"] = new_target
+            for key in ("allocation_id", "expense_category_source", "expense_category_evidence"):
+                part.pop(key, None)
+        rejected_revision = self.store.save(1, rejected, revision)
+        conflict = self.sync()
+        self.assertEqual(conflict["conflicts"], 1, conflict)
+        self.assertTrue(any("категориями" in error for error in conflict["test_errors"]), conflict)
+        self.assertEqual(self.host.incoming_register_snapshot()[0]["sync_version"], before["sync_version"])
+
+        window = OfflineReviewWindow(self.store, integrated=True, document_id=1)
+        try:
+            self.assertIn("Открыто распределение с сервера", window.status.text())
+            self.assertTrue(window.save_button.isEnabled())
+            self.assertEqual(window.allocation_target(0), ("object", self.object_id))
+            self.assertEqual(window.allocation_target(1), ("object", other_id))
+            self.assertEqual(self.store.latest(1)[0], rejected_revision)
+            self.assertEqual(self.store.latest(1)[1]["allocations"][0]["object_id"], other_id)
+
+            for index, new_target in enumerate((other_id, self.object_id)):
+                picker = window.allocations.cellWidget(index, 0)
+                picker.setCurrentIndex(picker.findData(new_target))
+            corrected = window.payload()
+            self.assertEqual([part["allocation_id"] for part in corrected["allocations"]],
+                             [part["allocation_id"] for part in before["allocations"]])
+            with self.assertRaisesRegex(ReviewError, "Очередь передачи изменилась"):
+                self.store.save(1, {**corrected, "conflict_revision": corrected["conflict_revision"] - 1},
+                                window.revision)
+            self.store.save(1, corrected, window.revision)
+            self.assertEqual(self.sync()["synced"], 1, self.last_sync)
+            documents = self.host.incoming_register_snapshot()
+            self.assertEqual(len(documents), 1)
+            updated = documents[0]
+            self.assertEqual(updated["id"], before["id"])
+            self.assertEqual(updated["verification_status"], "confirmed")
+            self.assertEqual(updated["attachments"], before["attachments"])
+            for key in ("net_amount", "vat_amount", "gross_amount", "rounding_amount"):
+                self.assertEqual(updated[key], before[key], key)
+            for part, expected, new_target in zip(updated["allocations"], parts, (other_id, self.object_id)):
+                self.assertEqual(part["object_id"], new_target)
+                for key in expected.keys() - {"object_id"}:
+                    self.assertEqual(part[key], expected[key], key)
+            self.assertIsNone(self.host.incoming_delivery_pending(card["client_id"]))
+        finally:
+            window.loaded_payload = window.payload()
+            window.close()
+
     def test_existing_manual_document_conflicts_on_stale_allocations_without_losing_category(self):
         from offline_review_ui import OfflineReviewWindow
         from expense_categories import CATEGORY_MATERIALS

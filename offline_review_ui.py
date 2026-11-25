@@ -464,7 +464,7 @@ class OfflineReviewWindow(QDialog):
                     if "note" in original:
                         part["note"] = original["note"]
                     if parse_invoice_money(original.get("gross_amount")) == parse_invoice_money(gross_amount):
-                        for key in ("net_amount", "vat_amount", "rounding_amount"):
+                        for key in ("allocation_id", "net_amount", "vat_amount", "rounding_amount"):
                             if key in original:
                                 part[key] = original[key]
                     if original in original_parts and "expense_category" in original:
@@ -1255,11 +1255,7 @@ class OfflineReviewWindow(QDialog):
         self.transfer_button.setEnabled(
             card is None and not is_payment_receipt and self.original_available
             and document_type in {"invoice", "receipt", "tax_decision"})
-        allocations = self.store.allocations(self.store.current_review(self.document_id)[1])
-        can_reassign = (card is not None and len(allocations) == 1
-                        and allocations[0].get("destination", "object") == "object"
-                        and allocations[0].get("object_id") is not None)
-        self.reassign_button.setEnabled(can_reassign)
+        self.reassign_button.setEnabled(card is not None and not is_payment_receipt)
 
     @staticmethod
     def type_label(document_type, base):
@@ -1753,6 +1749,8 @@ class OfflineReviewWindow(QDialog):
         self.loaded_index = self.selector.currentIndex()
         if self.integrated:
             text, green = self.store.accounting_status(self.document_id)
+            if payload.get("conflict_revision") is not None:
+                text += "\nОткрыто распределение с сервера. Внесите правку и сохраните изменения."
             self.status.setText(text)
             desktop_theme.apply_style(self.status, "background:#1c4532;color:#68d391;padding:6px" if green else "")
             self.update_action_controls()
