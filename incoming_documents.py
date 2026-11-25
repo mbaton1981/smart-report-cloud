@@ -224,8 +224,10 @@ class IncomingStore(OfflineReviewStore):
             payload.pop("server_version", None)
         delivered = card and self.conn.execute("SELECT 1 FROM deliveries WHERE document_id=?",
                                                (document_id,)).fetchone()
-        pending = self.host.incoming_delivery_pending(card["client_id"]) if delivered else None
-        rejected_update = pending and pending["state"] == "conflict" and pending["operation"] == "upsert"
+        pending = dict(self.host.incoming_delivery_pending(card["client_id"]) or {}) if delivered else {}
+        rejected_update = (pending.get("state") == "conflict" and pending.get("operation") == "upsert"
+                           and type(pending.get("server_document_id")) is int
+                           and type(pending.get("revision")) is int)
         if delivered and (not pending or rejected_update):
             try:
                 existing = self._existing(card["client_id"])
@@ -262,12 +264,12 @@ class IncomingStore(OfflineReviewStore):
             return self.save_revision(document_id, cleaned, expected_revision)
         if cleaned.get("payment_receipt_id") != json.loads(card["payload_json"]).get("payment_receipt_id"):
             raise ReviewError("Чек к уже учтённому расходу меняется из его карточки в реестре.")
-        pending = self.host.incoming_delivery_pending(card["client_id"])
+        pending = dict(self.host.incoming_delivery_pending(card["client_id"]) or {})
         conflict_revision = payload.get("conflict_revision")
         if pending or conflict_revision is not None:
-            if (type(conflict_revision) is not int or not pending or pending["state"] != "conflict"
-                    or pending["operation"] != "upsert"
-                    or pending["revision"] != conflict_revision):
+            if (type(conflict_revision) is not int or pending.get("state") != "conflict"
+                    or pending.get("operation") != "upsert"
+                    or pending.get("revision") != conflict_revision):
                 raise ReviewError("Очередь передачи изменилась. Откройте актуальное распределение.")
         existing = self._existing(card["client_id"], required=True)
         if (not existing or cleaned.get("server_version") is None
@@ -275,7 +277,7 @@ class IncomingStore(OfflineReviewStore):
             raise ReviewError("Распределение изменилось. Откройте актуальное распределение; правки не отправлены.")
         if existing.get("allocation_basis") == "net":
             raise ReviewError("Распределение без НДС редактируется в карточке фактуры в разделе «Расходы».")
-        if pending and pending["server_document_id"] != existing.get("id"):
+        if pending and pending.get("server_document_id") != existing.get("id"):
             raise ReviewError("Проверьте связь правки с фактурой в обычном реестре.")
         problems = self.issues(document_id, cleaned)
         if problems:
@@ -783,10 +785,10 @@ class IncomingStore(OfflineReviewStore):
                     "later": "Разобрать позже — PDF сохранён, расход не создан",
                     "expense": "Проверьте данные и выберите назначение — расход ещё не создан"}.get(
                         action, "Выберите действие — расход не создан"), False
-        pending = self.host.incoming_delivery_pending(card["client_id"])
+        pending = dict(self.host.incoming_delivery_pending(card["client_id"]) or {})
         if pending:
-            if (pending["state"] == "conflict" and pending["operation"] == "upsert"
-                    and pending["server_document_id"] is not None):
+            if (pending.get("state") == "conflict" and pending.get("operation") == "upsert"
+                    and pending.get("server_document_id") is not None):
                 return "Сервер отклонил правку. " + (pending["last_error"] or "Сверьте распределение."), False
             return ("Сохранено локально — ожидает синхронизации"
                     if not pending["last_error"] else "Не учтён на сервере: " + pending["last_error"]), False

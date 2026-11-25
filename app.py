@@ -8541,7 +8541,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         if not document:
             return
         if SmartReportApp._expense_document_prefers_incoming_review(document):
-            self._open_incoming_expense_review(document)
+            SmartReportApp._open_incoming_expense_review(self, document)
             return
         self._expense_document_review_dialog(document=document, assignment_only=True)
 
@@ -12229,7 +12229,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         document = self._selected_expense_document(self.table_supplier_documents)
         if document:
             if SmartReportApp._expense_document_prefers_incoming_review(document):
-                self._open_incoming_expense_review(document)
+                SmartReportApp._open_incoming_expense_review(self, document)
             else:
                 self._expense_document_review_dialog(document=document)
 
