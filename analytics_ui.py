@@ -1,21 +1,29 @@
 """Director-only, asynchronous presentation of the shared analytics projection."""
 import json
 import logging
+import sqlite3
 import uuid
 from decimal import Decimal
 
 from PyQt6.QtCore import QEventLoop, QObject, QRunnable, QThreadPool, QTimer, Qt, QRectF, QDate, pyqtSignal
-from PyQt6.QtGui import QPainter, QPen, QColor
+from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QGridLayout, QLabel, QPushButton, QComboBox,
-    QDialog, QFrame, QLineEdit, QProgressDialog, QTableWidget, QTableWidgetItem, QMessageBox,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QGridLayout, QLabel,
+    QPushButton, QComboBox, QDialog, QFrame, QLineEdit, QProgressDialog, QTableWidget,
+    QTableWidgetItem, QMessageBox,
 )
+import desktop_theme
 from date_widgets import CalendarDateEdit
 from desktop_ui import ReportTable
 from analytics import BILLING_LABELS, HOW, period
+from expense_documents import is_service_category
 
 logger = logging.getLogger(__name__)
 CORRECTION_PATH = "/api/admin/analytics/billing-correction"
+OBJECT_STATUS_COLORS = {
+    "light": {"active": "#ffffff", "archived": "#e5e8eb", "service": "#fce8e8"},
+    "dark": {"active": "#28303d", "archived": "#373b42", "service": "#482e36"},
+}
 
 
 def number(value):
@@ -436,11 +444,12 @@ class Chart(QWidget):
 
 
 class AnalyticsWidget(QWidget):
-    def __init__(self, fetch, parent=None, *, request_correction=None, reveal_expense=None):
+    def __init__(self, fetch, parent=None, *, object_catalog=None, request_correction=None, reveal_expense=None):
         super().__init__(parent)
         self.fetch, self.serial, self.busy = fetch, 0, False
         self.request_correction = request_correction
         self.reveal_expense = reveal_expense
+        self.object_catalog = object_catalog
         self.pending, self.last_parameters, self.fingerprint = False, None, None
         self.payload, self.task = None, None
         self._render_count = 0
@@ -469,6 +478,9 @@ class AnalyticsWidget(QWidget):
         self.object.setMinimumContentsLength(18)
         self.object.view().setTextElideMode(Qt.TextElideMode.ElideNone)
         self.object.view().setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        theme = getattr(QApplication.instance(), "_smartreport_theme", None)
+        if theme is not None:
+            theme.changed.connect(self.update_object_colors)
         self.object.currentTextChanged.connect(self.object.setToolTip)
         self.refresh_button = QPushButton("Обновить")
         self.refresh_button.setObjectName("primaryAction")
@@ -627,7 +639,30 @@ class AnalyticsWidget(QWidget):
         self.object.setToolTip(self.object.currentText())
         for index in range(self.object.count()):
             self.object.setItemData(index, self.object.itemText(index), Qt.ItemDataRole.ToolTipRole)
+        self.update_object_colors()
         self.object.blockSignals(blocked)
+
+    def update_object_colors(self):
+        if self.object_catalog is None:
+            return
+        try:
+            catalog = {f"object:{item['id']}": item for item in self.object_catalog()}
+        except sqlite3.Error:
+            logger.warning("Unable to read the analytics object catalog", exc_info=True)
+            return
+        colors = OBJECT_STATUS_COLORS[desktop_theme.current_theme()]
+        background_role = Qt.ItemDataRole.BackgroundRole
+        for index in range(1, self.object.count()):
+            item = catalog.get(self.object.itemData(index))
+            if item is None:
+                status = None
+            elif is_service_category(item):
+                status = "service"
+            else:
+                status = "active" if item.get("is_active", 1) else "archived"
+            color = QColor(colors[status]) if status is not None else None
+            if self.object.itemData(index, background_role) != color:
+                self.object.setItemData(index, color, background_role)
 
     def changed(self):
         self.serial += 1
@@ -688,6 +723,8 @@ class AnalyticsWidget(QWidget):
             if fingerprint != self.fingerprint:
                 self.render(payload)
                 self.fingerprint = fingerprint
+            else:
+                self.update_object_colors()
             self.status.setText(f"Расчёт: {payload['calculated_at']} · {payload['source']}. "
                                 "Обновление только чтением; локальные изменения попадут после штатного обмена.")
             self.billing_button.setEnabled("billing" in payload)

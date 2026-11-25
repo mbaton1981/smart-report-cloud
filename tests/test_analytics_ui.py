@@ -5,7 +5,10 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QBoxLayout, QDialog, QLineEdit, QMessageBox, QPushButton, QTableWidget, QWidget
+from PyQt6.QtWidgets import (
+    QApplication, QBoxLayout, QDialog, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QWidget,
+)
 
 from analytics_ui import AnalyticsWidget, billing_summary, edit_invoice_expenses
 from assistant_ui import AssistantDialog
@@ -41,6 +44,36 @@ class AnalyticsResponsiveLayoutTests(unittest.TestCase):
         self.assertLess(widget.table.columnWidth(0), widget.table.viewport().width() / 2)
         self.assertEqual(widget.table.horizontalScrollBar().maximum(), 0)
         widget.close()
+
+    def test_object_dropdown_uses_catalog_status_by_server_id(self):
+        catalog = [
+            {"id": 31, "is_active": 1},
+            {"id": 32, "is_active": 0},
+            {"id": 33, "is_active": 0, "service_type": "unpaid_leave"},
+        ]
+        widget = AnalyticsWidget(lambda _: {}, object_catalog=lambda: catalog)
+        self.addCleanup(widget.deleteLater)
+        widget.payload = {"objects": [
+            {"key": f"object:{item['id']}", "label": label, "company": "Test"}
+            for item, label in zip(catalog, ("Active job", "Archived job", "Service category"))
+        ]}
+        widget.update_objects()
+        self.assertEqual(widget.object.currentData(), "")
+        for theme, expected in (
+            ("light", ("#ffffff", "#e5e8eb", "#fce8e8")),
+            ("dark", ("#28303d", "#373b42", "#482e36")),
+        ):
+            with self.subTest(theme=theme), patch("analytics_ui.desktop_theme.current_theme", return_value=theme):
+                widget.update_object_colors()
+                backgrounds = tuple(widget.object.itemData(row, Qt.ItemDataRole.BackgroundRole).name()
+                                    for row in range(1, widget.object.count()))
+                self.assertEqual(backgrounds, expected)
+        widget.object.setCurrentIndex(1)
+        catalog[0]["is_active"] = 0
+        with patch("analytics_ui.desktop_theme.current_theme", return_value="light"):
+            widget.update_object_colors()
+            self.assertEqual(widget.object.currentData(), "object:31")
+            self.assertEqual(widget.object.itemData(1, Qt.ItemDataRole.BackgroundRole).name(), "#e5e8eb")
 
     def test_unresolved_expense_breakdown_opens_the_exact_document(self):
         detail = dict(id=38, date="2026-11-10", supplier="Test supplier", invoice_number="MAT-42",
