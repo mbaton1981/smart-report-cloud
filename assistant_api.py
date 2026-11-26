@@ -2803,10 +2803,12 @@ def register_assistant(app, connect, authenticate):
             conn, actor, request.get_json(silent=True))))
 
     @app.route("/api/assistant/expense-categories", methods=["POST"])
+    @app.route("/api/assistant/company-expense-articles", methods=["POST"])
     def assistant_expense_categories():
         from expense_category_ai import request_categories
         return handle(lambda conn, actor: jsonify(ok=True, suggestions=request_categories(
-            conn, actor, request.get_json(silent=True))))
+            conn, actor, request.get_json(silent=True),
+            company=request.path.endswith("/company-expense-articles"))))
 
     @app.route("/api/assistant/invoice-layout", methods=["POST"])
     def assistant_invoice_layout():

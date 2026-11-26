@@ -2011,6 +2011,8 @@ def ensure_expense_allocation_category_schema(connection):
         for name, definition in (
             ("expense_category_source", "TEXT NOT NULL DEFAULT 'unclassified'"),
             ("expense_category_evidence", "TEXT NOT NULL DEFAULT ''"),
+            ("company_article", "TEXT NOT NULL DEFAULT ''"),
+            ("company_article_evidence", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in columns:
                 connection.execute(
@@ -2234,16 +2236,16 @@ def _accumulate_invoice_vat_items(page_rows, totals):
             _add_invoice_vat_item(totals[current_order], page, item_cells[0]["text"], description, net, rate)
 
 
-def normalize_net_allocations(allocations):
+def normalize_net_allocations(allocations, *, keep_company_shares=False):
     grouped = {}
-    for row in allocations:
+    for index, row in enumerate(allocations):
         destination = row.get("destination") or (
             "object" if row.get("object_id") is not None else "company")
         object_id = row.get("object_id") if destination == "object" else None
         category, category_source = confirmed_expense_category(
             row.get("expense_category"), row.get("expense_category_source"),
         )
-        key = (destination, object_id, category)
+        key = (destination, object_id, category, index if keep_company_shares and destination == "company" else None)
         net = parse_invoice_money(row.get("net_amount"))
         vat = parse_invoice_money(row.get("vat_amount"))
         if key not in grouped:

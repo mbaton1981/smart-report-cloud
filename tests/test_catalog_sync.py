@@ -2832,7 +2832,7 @@ class CatalogSyncTests(unittest.TestCase):
         self.assertEqual(calls, ["GET"])
         self.assertTrue(attachment_path.is_file())
 
-    def test_expense_ui_has_one_section_with_two_views(self):
+    def test_expense_ui_has_one_section_with_three_views(self):
         class Response:
             def __init__(self, response):
                 self.response = response
@@ -2860,10 +2860,10 @@ class CatalogSyncTests(unittest.TestCase):
             with patch.object(self.desktop.requests, "request", side_effect=fake_request):
                 window = self.desktop.SmartReportApp()
             window.auto_sync_timer.stop()
-            self.assertEqual(window.exp_document_tabs.count(), 2)
+            self.assertEqual(window.exp_document_tabs.count(), 3)
             self.assertEqual(
-                [window.exp_document_tabs.tabText(index) for index in range(2)],
-                ["Все документы", "По объектам"],
+                [window.exp_document_tabs.tabText(index) for index in range(3)],
+                ["Все документы", "По объектам", "Расходы фирмы"],
             )
             main_titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
             self.assertEqual(main_titles.count("Расходы"), 1)

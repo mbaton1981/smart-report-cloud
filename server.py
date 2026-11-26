@@ -1337,7 +1337,7 @@ def resolve_expense_allocations(cursor, raw_allocations, fields):
         issues = net_invoice_issues(fields, raw_allocations)
         if fields["verification_status"] == "confirmed" and issues:
             raise ValueError(" ".join(issues))
-        return normalize_net_allocations(raw_allocations)
+        return normalize_net_allocations(raw_allocations, keep_company_shares=True)
     if fields["gross_amount"] is None:
         if raw_allocations:
             raise ValueError("Сначала укажите итоговую сумму документа.")
@@ -1561,6 +1561,37 @@ class AllocationCategoryConflict(ValueError):
     pass
 
 
+def preserve_company_articles(old_rows, allocations, raw_allocations):
+    from company_expenses import company_share
+    saved = {row["id"]: dict(row) for row in old_rows if company_share(dict(row))}
+    if not any(item.get("company_article") for item in saved.values()):
+        return
+    ids = [raw.get("allocation_id") for raw in raw_allocations if type(raw.get("allocation_id")) is int]
+    if len(ids) != len(set(ids)):
+        raise AllocationCategoryConflict("Одна часть документа указана дважды.")
+    available = {k: v for k, v in saved.items() if k not in ids}
+    raw_company = [r for r in raw_allocations if company_share(r)]
+    for part, raw in zip((r for r in allocations if company_share(r)), raw_company, strict=True):
+        part_id = raw.get("allocation_id")
+        old = saved.get(part_id) if type(part_id) is int else None
+        if part_id is None:
+            candidates = [row for row in available.values() if all(
+                parse_decimal(part.get(key)) == parse_decimal(row.get(saved_key))
+                for key, saved_key in (("net_amount", "allocated_net"), ("gross_amount", "allocated_gross"),
+                                       ("vat_amount", "allocated_vat")))]
+            exact = [row for row in candidates if row["allocation_note"] == part.get("note")]
+            candidates = exact or candidates
+            if len(candidates) > 1 and any(r.get("company_article") for r in candidates):
+                raise AllocationCategoryConflict("У нескольких частей одинаковая сумма. Уточните распределение со статьями фирмы.")
+            if candidates:
+                old = available.pop(candidates[0]["id"])
+        if old and old.get("company_article"):
+            part["company_article"] = old["company_article"]
+            part["company_article_evidence"] = old["company_article_evidence"]
+    if not ids and any(r.get("company_article") for r in available.values()):
+        raise AllocationCategoryConflict("Редактор не указал, какая подтверждённая часть изменилась. Откройте актуальное распределение.")
+
+
 def _allocation_destination(item):
     return item.get("destination") or (
         "object" if item.get("object_id") is not None else "company"
@@ -1743,7 +1774,7 @@ def store_expense_allocation_rows(cursor, document_id, allocations, fields):
     if net_schema:
         columns.extend([
             "destination", "expense_category", "expense_category_source",
-            "expense_category_evidence",
+            "expense_category_evidence", "company_article", "company_article_evidence",
         ])
     if net_basis:
         cursor.execute("UPDATE expense_documents SET allocation_basis='net', rounding_amount=?, amount_due=? WHERE id=?",
@@ -1763,6 +1794,7 @@ def store_expense_allocation_rows(cursor, document_id, allocations, fields):
                 category, category_source,
                 str(item.get("expense_category_evidence") or "")[:500]
                 if category_source == "user" else "",
+                item.get("company_article") or "", item.get("company_article_evidence") or "",
             ])
         rows.append(row)
     cursor.executemany(f"INSERT INTO expense_allocations ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})", rows)
@@ -1772,7 +1804,7 @@ def serialize_expense_document(cursor, document, include_text=False):
     net_schema = invoice_net_schema_ready(cursor)
     allocation_extras = (
         ", a.id AS allocation_id, a.destination, a.expense_category, "
-        "a.expense_category_source, a.expense_category_evidence"
+        "a.expense_category_source, a.expense_category_evidence, a.company_article, a.company_article_evidence"
         if net_schema else ", a.id AS allocation_id"
     )
     cursor.execute(f"""
@@ -2048,6 +2080,8 @@ def expense_document_capabilities_api():
         net_features.append("customer_invoice_batches_v1")
         net_features.append("accountant_invoice_batches_v1")
         net_features.append("expense_category_ai_v1")
+        if {"company_article", "company_article_evidence"}.issubset(allocation_columns):
+            net_features.append("company_expense_articles_v1")
         net_features.append("object_cost_allocations_v1")
         if expense_document_type_schema_ready(connection):
             net_features.append("document_type_v1")
@@ -2611,6 +2645,9 @@ def expense_document_update_api(document_id):
         old_allocation_snapshot = _allocation_history_snapshot(
             old_allocation_rows, database_rows=True,
         )
+        if "allocations" not in payload and any(dict(row).get("company_article") for row in old_allocation_rows):
+            raise AllocationCategoryConflict("Клиент не передал части документа с подтверждёнными статьями фирмы.")
+        preserve_company_articles(old_allocation_rows, allocations, raw_allocations)
         new_allocation_snapshot = _allocation_history_snapshot(allocations)
         now = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
@@ -2680,6 +2717,54 @@ def expense_document_update_api(document_id):
         conn.rollback()
         logger.exception("Не удалось обновить документ расхода.")
         return jsonify({"ok": False, "error": "Не удалось обновить документ."}), 500
+    finally:
+        conn.close()
+
+
+@app.post("/api/expense-documents/company-articles")
+def save_company_articles():
+    from company_expenses import ARTICLES, UNKNOWN
+    if not expense_api_authorized():
+        return jsonify(ok=False, error="Доступ запрещён."), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) != {"changes"} or not isinstance(payload["changes"], list) or not 1 <= len(payload["changes"]) <= 5000:
+        return jsonify(ok=False, error="Выберите от 1 до 5000 частей расходов."), 400
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if "company_article" not in {row[1] for row in conn.execute("PRAGMA table_info(expense_allocations)")}:
+            return jsonify(ok=False, error="Обновите схему распределений на сервере."), 409
+        changed_docs = set()
+        seen = set()
+        for change in payload["changes"]:
+            if (not isinstance(change, dict) or set(change) != {"document_id", "allocation_id", "expected_version", "article", "evidence"}
+                    or any(type(change[k]) is not int for k in ("document_id", "allocation_id", "expected_version"))
+                    or change["allocation_id"] in seen or change["article"] not in (*ARTICLES, UNKNOWN)
+                    or not isinstance(change["evidence"], str) or not 1 <= len(change["evidence"].strip()) <= 500):
+                raise ValueError("Некорректная статья, основание или повторяющаяся часть.")
+            doc_id, part_id = change["document_id"], change["allocation_id"]
+            seen.add(part_id)
+            row = conn.execute("""SELECT d.sync_version, a.company_article FROM expense_documents d
+                JOIN expense_allocations a ON a.document_id=d.id
+                WHERE d.id=? AND a.id=? AND a.object_id IS NULL AND a.destination='company'
+                AND d.is_deleted=0 AND d.verification_status='confirmed'
+                AND NOT EXISTS (SELECT 1 FROM expense_document_evidence e WHERE e.supporting_document_id=d.id)
+                AND NOT EXISTS (SELECT 1 FROM expense_processing p WHERE p.document_id=d.id AND p.state='split')""",
+                (doc_id, part_id)).fetchone()
+            if row is None or row["sync_version"] != change["expected_version"]:
+                return jsonify(ok=False, conflict=True, error="Состав расходов изменился. Обновите вкладку и повторите разбор."), 409
+            article = "" if change["article"] == UNKNOWN else change["article"]
+            if row["company_article"] != article:
+                conn.execute("UPDATE expense_allocations SET company_article=?,company_article_evidence=? WHERE id=?",
+                             (article, change["evidence"].strip() if article else "", part_id))
+                changed_docs.add(doc_id)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.executemany("UPDATE expense_documents SET sync_version=sync_version+1,updated_at=? WHERE id=?",
+                         [(now, doc_id) for doc_id in changed_docs])
+        conn.commit()
+        return jsonify(ok=True, changed_documents=len(changed_docs))
+    except ValueError as error:
+        return jsonify(ok=False, error=str(error)), 400
     finally:
         conn.close()
 

@@ -2833,6 +2833,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             self.load_expense_documents()
             if self.exp_document_tabs.currentIndex() == 1:
                 self.load_object_expense_overview()
+            elif self.exp_document_tabs.currentIndex() == 2:
+                self.company_expenses.reload()
             self._maybe_show_mail_reminder()
         elif index == 5:
             self.load_objects_table()
@@ -4295,6 +4297,8 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             ):
                 self.load_service_categories_table()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 3 and hasattr(self, "table_supplier_documents"):
+            if self.exp_document_tabs.currentIndex() == 2 and (expense_data_changed or manual_requested):
+                self.company_expenses.reload()
             if getattr(self, "_async_expense_reads", False) and (
                 getattr(self, "_expense_read_dirty", False)
                 or self._manual_sync_requested
@@ -8090,6 +8094,13 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.exp_document_tabs.setUsesScrollButtons(True)
         self.exp_document_tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.exp_document_tabs.addTab(self.tab_object_expenses, "По объектам")
+        from company_expenses_ui import CompanyExpensesWidget
+        self.company_expenses = CompanyExpensesWidget(
+            fetch_all_expense_documents, self._company_article_review, self._save_company_articles,
+            self._reveal_expense_document, ObjectOverviewTask,
+            open_original=self._open_expense_document_original, today=stockholm_today,
+        )
+        self.exp_document_tabs.addTab(self.company_expenses, "Расходы фирмы")
         self.exp_document_tabs.currentChanged.connect(self._on_expense_view_changed)
         layout.addWidget(self.exp_document_tabs, 1)
         self.exp_date_from.dateChanged.connect(self.load_expense_documents)
@@ -8758,11 +8769,30 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         assistant_ui.open_dialog(self)
 
     def _on_expense_view_changed(self, index):
+        if index == 2:
+            self.company_expenses.reload()
+            return
         self.load_expense_document_filters()
         if index == 0:
             self.load_expense_documents()
         else:
             self.load_object_expense_overview()
+
+    @staticmethod
+    def _require_company_articles():
+        features = request_expense_api("GET", "/api/expense-documents/capabilities").get("features", [])
+        if "company_expense_articles_v1" not in features:
+            raise RuntimeError("Для подтверждения статей фирмы требуется обновление общего сервера.")
+
+    def _company_article_review(self, rows):
+        from company_expenses import review_proposals
+        self._require_company_articles()
+        objects, _online = self._expense_server_objects(include_inactive=True)
+        return review_proposals(rows, request_expense_api, self._download_object_report_originals, objects)
+
+    def _save_company_articles(self, changes):
+        self._require_company_articles()
+        return request_expense_api("POST", "/api/expense-documents/company-articles", json={"changes": changes})
 
     def setup_object_expenses_tab(self):
         layout = QVBoxLayout(self.tab_object_expenses)
