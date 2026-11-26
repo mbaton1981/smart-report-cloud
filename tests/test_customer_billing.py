@@ -1,5 +1,7 @@
 import copy
 import json
+import sqlite3
+import tempfile
 import unittest
 from contextlib import closing
 from datetime import date
@@ -64,13 +66,14 @@ class CustomerBillingTests(unittest.TestCase):
         from accountant_report import summarize_accountant
         from customer_billing import material_quote, priced_expense_member
         from expense_categories import CATEGORY_MATERIALS
-        from object_package_report import _billing_breakdown, collect_object_expenses
+        from object_package_report import collect_object_expenses, write_object_report_package
+        from pypdf import PdfReader
 
         def set_terms(percent, revision):
             return self.server_client.put("/api/customer-invoices", headers=self.headers, json={
                 "object_id": self.object_id, "revision": revision, "percent": percent})
 
-        self.assertEqual(set_terms(12, 0).status_code, 200)
+        self.assertEqual(set_terms(10, 0).status_code, 200)
         self.assertEqual(set_terms(0, 0).status_code, 409)
         with closing(self.server.get_db_connection()) as connection:
             connection.execute("""UPDATE expense_allocations SET expense_category=?,expense_category_source='user',
@@ -89,19 +92,47 @@ class CustomerBillingTests(unittest.TestCase):
         split["allocations"].append(dict(part, net_amount="4993.36", object_id=self.object_id + 1))
         entries, _ = prepare_next_invoice([], [split], self.object_id, "9999-12-31", {})
         self.assertEqual(summarize_accountant({}, entries, material_percent=12)["total"], Decimal("265.44"))
-        payload = dict(self.payload, material_markup_percent=12, members=[member])
+        payload = dict(self.payload, material_markup_percent=12, material_terms_revision=1, members=[member])
         self.assertEqual(self.post().status_code, 409)
+        self.assertEqual(self.post(dict(payload, material_terms_revision=0)).status_code, 409)
         self.assertEqual(self.post(dict(payload, members=[dict(member, material_pricing={})])).status_code, 409)
         result = self.post(payload)
         self.assertEqual(result.status_code, 200, result.get_json())
-        self.assertEqual(set_terms(0, 1).status_code, 200)
+        self.assertEqual(result.get_json()["material_terms"], dict(percent=10, revision=1))
+        for invalid in (-1, 101, True, 1.5):
+            self.assertEqual(set_terms(invalid, 1).status_code, 409)
+            self.assertEqual(self.post(dict(payload, operation_id="invalid", material_markup_percent=invalid)).status_code, 409)
         saved = self.post(payload).get_json()["members"]
         self.assertEqual(saved[member["key"]]["material_pricing"], member["material_pricing"])
         self.assertEqual(prepare_next_invoice([], [doc], self.object_id, "9999-12-31", saved)[0], [])
-        expenses, _ = collect_object_expenses([doc], self.object_id)
-        values, _, _ = _billing_breakdown(dict(expenses=expenses, billing_members=saved,
-                                               expense_snapshot_available=True, material_markup_percent=0), {}, [])
-        self.assertEqual(values["markup", "billed"], [Decimal("28.44")])
+        next_doc = dict(doc, id=doc["id"] + 1, client_id="next-material-purchase")
+        expenses, _ = collect_object_expenses([doc, next_doc], self.object_id)
+        data = dict(object={"id": self.object_id, "name": "Test"}, expenses=expenses, billing_members=saved,
+                    language="sv", period_label="2026-11", generated_at="2026-11-26",
+                    expense_snapshot_available=True, material_markup_percent=10)
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "rates.pdf"
+            write_object_report_package(pdf, data)
+            cover = " ".join(PdfReader(pdf).pages[0].extract_text().split())
+        self.assertIn("Materialpåslag 12 % 28,44 SEK 0,00 SEK", cover)
+        self.assertIn("Materialpåslag 10 % 0,00 SEK 23,70 SEK", cover)
+
+    def test_material_terms_schema_upgrades_existing_rates_and_revisions(self):
+        from customer_billing import ensure_schema, material_terms, update_material_terms
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("CREATE TABLE meta_objects (id INTEGER PRIMARY KEY)")
+            db.execute("INSERT INTO meta_objects VALUES (1),(2)")
+            db.execute("""CREATE TABLE object_material_terms (
+                object_id INTEGER PRIMARY KEY REFERENCES meta_objects(id),
+                percent INTEGER NOT NULL CHECK(percent IN (0,12)), revision INTEGER NOT NULL)""")
+            db.execute("INSERT INTO object_material_terms VALUES (1,12,4),(2,0,9)")
+            ensure_schema(db)
+            self.assertEqual(material_terms(db, 1), dict(percent=12, revision=4))
+            update_material_terms(db, dict(object_id=1, percent=10, revision=4))
+            ensure_schema(db)
+            self.assertEqual(material_terms(db, 1), dict(percent=10, revision=5))
+            self.assertEqual(material_terms(db, 2), dict(percent=0, revision=9))
 
     def test_customer_invoice_is_atomic_and_retry_does_not_duplicate_members(self):
         first = self.post()
@@ -411,10 +442,10 @@ class CustomerBillingTests(unittest.TestCase):
             checks["Включить поездки"].setChecked(True)
             checks["Включить Dagbok"].setChecked(False)
             table.item(1, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
-            markup_button = buttons["Наценка объекта · 0%…"]
-            with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes):
+            markup_button = buttons["Наценка счёта · 0%…"]
+            with patch("next_customer_invoice.QInputDialog.getInt", return_value=(10, True)):
                 markup_button.click()
-            self.assertEqual(markup_button.text(), "Наценка объекта · 12%…")
+            self.assertEqual(markup_button.text(), "Наценка счёта · 10%…")
             with patch('payroll_preview.open_preview', side_effect=preview):
                 buttons["Предварительный PDF"].click()
             without_attachments = " ".join(page.extract_text() for page in PdfReader(output).pages)
@@ -422,9 +453,9 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertNotIn("TEST SUPPLIER ORIGINAL", without_attachments)
             self.assertIn("Resor: 2", without_attachments)
             self.assertIn("600,00 SEK", without_attachments)
-            self.assertIn("Materialpåslag 12 %", without_attachments)
-            self.assertIn("112,00 SEK", without_attachments)
-            with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes):
+            self.assertIn("Materialpåslag 10 %", without_attachments)
+            self.assertIn("110,00 SEK", without_attachments)
+            with patch("next_customer_invoice.QInputDialog.getInt", return_value=(0, True)):
                 markup_button.click()
             buttons["Этот месяц"].click()
             with patch('payroll_preview.open_preview', side_effect=preview):

@@ -479,7 +479,7 @@ def _billing_breakdown(data, figures, work_rows):
                     quote = material_quote(part, data.get("material_markup_percent", 0), net)
                 values[component, status].append(net)
                 if quote:
-                    values["markup", status].append(None if changed else parse_decimal(quote["markup"]))
+                    values[("markup", quote["percent"]), status].append(None if changed else parse_decimal(quote["markup"]))
             else:
                 foreign.add(currency)
                 if currency == "UNKNOWN":
@@ -1283,17 +1283,20 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             "Faktureringsstatus · exkl. moms" if swedish else "Статус выставления · без НДС",
             *(_BILLING_LABELS[column][language_index] for column in _BILLING_COLUMNS),
         ]]
-        if any(billing_values["markup", status] for status in _BILLING_COLUMNS):
-            components = (*components, "markup")
+        markup_components = sorted({component for component, _ in billing_values
+                                    if isinstance(component, tuple) and component[0] == "markup"})
+        components = (*components, *markup_components)
         names = {
             "total": ("Итого по статусу", "Summa per status"),
             "work": ("Работа", "Arbete"),
             "travel": ("Поездки", "Resor"),
             "materials": ("Материалы и закупки", "Material och inköp"),
-            "markup": ("Наценка на материалы 12%", "Materialpåslag 12 %"),
             "subcontractor": ("Работы подрядчиков", "Underentreprenörers arbete"),
             "other": ("Остальные расходы", "Övriga kostnader"),
         }
+        for component in markup_components:
+            percent = component[1]
+            names[component] = (f"Наценка на материалы {percent}%", f"Materialpåslag {percent} %")
         for component in ("total", *components):
             row = [names[component][language_index]]
             for column in _BILLING_COLUMNS:

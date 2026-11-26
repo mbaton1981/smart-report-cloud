@@ -25,9 +25,25 @@ def allocation_fingerprint(document, index):
 
 
 def ensure_schema(connection):
-    connection.execute("""CREATE TABLE IF NOT EXISTS object_material_terms (
+    schema = """CREATE TABLE IF NOT EXISTS object_material_terms (
         object_id INTEGER PRIMARY KEY REFERENCES meta_objects(id),
-        percent INTEGER NOT NULL CHECK(percent IN (0,12)), revision INTEGER NOT NULL)""")
+        percent INTEGER NOT NULL CHECK(typeof(percent)='integer' AND percent BETWEEN 0 AND 100),
+        revision INTEGER NOT NULL)"""
+    connection.execute("SAVEPOINT upgrade_material_terms")
+    try:
+        connection.execute(schema)
+        sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='object_material_terms'").fetchone()[0]
+        if "percentin(0,12)" in "".join(sql.lower().split()):
+            connection.execute("ALTER TABLE object_material_terms RENAME TO previous_material_terms")
+            connection.execute(schema)
+            connection.execute("""INSERT INTO object_material_terms (object_id, percent, revision)
+                                  SELECT object_id, percent, revision FROM previous_material_terms""")
+            connection.execute("DROP TABLE previous_material_terms")
+    except Exception:
+        connection.execute("ROLLBACK TO upgrade_material_terms")
+        raise
+    finally:
+        connection.execute("RELEASE upgrade_material_terms")
     connection.execute("""CREATE TABLE IF NOT EXISTS customer_invoice_batches (
         operation_id TEXT PRIMARY KEY, object_id INTEGER NOT NULL,
         invoice_number TEXT NOT NULL, invoice_date TEXT NOT NULL,
@@ -52,7 +68,7 @@ def material_terms(connection, object_id):
 
 def update_material_terms(connection, payload):
     object_id, percent, revision = (payload.get(key) for key in ("object_id", "percent", "revision"))
-    if (type(object_id) is not int or type(percent) is not int or percent not in (0, 12)
+    if (type(object_id) is not int or type(percent) is not int or not 0 <= percent <= 100
             or type(revision) is not int or not connection.execute(
                 "SELECT 1 FROM meta_objects WHERE id=?", (object_id,)).fetchone()):
         raise ValueError("Проверьте объект и ставку наценки.")
@@ -86,7 +102,8 @@ def invoice_state(connection, object_id):
     members = {row["member_key"]: json.loads(row["snapshot_json"]) for row in connection.execute(
         "SELECT member_key,snapshot_json FROM customer_invoice_members WHERE object_id=?", (object_id,),
     )}
-    return {"batches": batches, "members": members, "material_terms": material_terms(connection, object_id)}
+    return {"batches": batches, "members": members, "material_terms": material_terms(connection, object_id),
+            "custom_invoice_markup": True}
 
 
 def shift_member(row):
@@ -377,7 +394,14 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
     if obj is None:
         raise ValueError("Объект отсутствует в справочнике.")
     percent = payload.get("material_markup_percent", 0)
-    if type(percent) is not int or percent != material_terms(connection, object_id)["percent"]:
+    terms = material_terms(connection, object_id)
+    if type(percent) is not int or not 0 <= percent <= 100:
+        raise ValueError("Наценка должна быть целым числом от 0 до 100%.")
+    if "material_terms_revision" in payload:
+        revision = payload["material_terms_revision"]
+        if type(revision) is not int or revision != terms["revision"]:
+            raise ValueError("Условия объекта изменились. Откройте следующий счёт заново.")
+    elif percent != terms["percent"]:
         raise ValueError("Проверьте текущую наценку объекта в обновлённом окне следующего счёта.")
     snapshots, seen, work, currencies = [], set(), [], set()
     from customer_pricing import require_final_prices, row_prices
