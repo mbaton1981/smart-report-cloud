@@ -147,7 +147,7 @@ class CompanyExpensesWidget(QWidget):
         controls.addStretch()
         self.currency, self.basis = QComboBox(), QComboBox()
         self.basis.addItem("Без НДС", "net")
-        self.basis.addItem("С НДС", "gross")
+        self.basis.addItem("По документу", "gross")
         controls.addWidget(self.currency)
         controls.addWidget(self.basis)
         refresh = QPushButton("Обновить")
@@ -169,7 +169,7 @@ class CompanyExpensesWidget(QWidget):
         layout.addLayout(chart_row, 2)
         self.documents_title = QLabel("Документы")
         layout.addWidget(self.documents_title)
-        self.documents = read_table(["Дата", "Поставщик / документ", "Статья", "Сумма части"], 1)
+        self.documents = read_table(["Дата", "Поставщик / документ", "Статья", "Доля по документу", "Доля без НДС"], 1)
         layout.addWidget(self.documents, 3)
         actions = QHBoxLayout()
         self.review_button = QPushButton("Разобрать статьи…")
@@ -303,6 +303,9 @@ class CompanyExpensesWidget(QWidget):
         self.sections.setTabText(2, f"К разбору ({unreviewed})" if unreviewed else REVIEW)
         self.displayed = [r for r in current if section(r.article) == group]
         amounts, missing = totals(self.displayed, basis)
+        basis_title = "без НДС" if basis == "net" else "по документу"
+        self.articles.setHorizontalHeaderLabels(["Статья", "Сумма " + basis_title,
+                                                 "Доля известной суммы" if missing else "Доля"])
         total = sum(amounts.values(), Decimal(0))
         amount_text = money(total, currency) if currency and (amounts or not missing) else "Сумма неизвестна"
         caption = amount_text if self.displayed else "Нет расходов"
@@ -319,7 +322,10 @@ class CompanyExpensesWidget(QWidget):
             item = QTableWidgetItem(name)
             item.setData(Qt.ItemDataRole.DecorationRole, QColor(self.chart.colors[(*ARTICLES, UNKNOWN).index(name)]))
             self.articles.setItem(i, 0, item)
-            self.articles.setItem(i, 1, QTableWidgetItem(money(value, currency) if value is not None else "Неизвестно"))
+            subtotal = money(value, currency) if value is not None else "Нет данных"
+            if name in missing:
+                subtotal += f" · вне итога: {missing[name]}"
+            self.articles.setItem(i, 1, QTableWidgetItem(subtotal))
             percent = f"{100*value/denominator:.1f} %" if value and value > 0 and denominator else "—"
             self.articles.setItem(i, 2, QTableWidgetItem(percent))
         self.articles.blockSignals(False)
@@ -327,11 +333,12 @@ class CompanyExpensesWidget(QWidget):
         lines = []
         if self.loaded:
             if self.displayed:
-                lines.append(("Известная сумма · " if missing else "Итого · ") + amount_text)
+                lines.append(("Известная сумма " if missing else "Итого ") + basis_title + " · " + amount_text)
             else:
                 lines.append("За выбранный период здесь пока нет документов.")
             if missing:
-                lines.append(f"Сумма или валюта неизвестна у {sum(missing.values())} частей.")
+                reason = f"нет суммы {basis_title}" if currency else "не указана валюта"
+                lines.append(f"Вне итога: {sum(missing.values())} строк ({reason}).")
             if any(v < 0 for v in amounts.values()):
                 lines.append("Возвраты учтены в итоге. Сектора показывают положительные статьи.")
             if self.period_key and currency:
@@ -373,9 +380,12 @@ class CompanyExpensesWidget(QWidget):
         self.documents.setRowCount(len(rows))
         for index, row in enumerate(rows):
             doc = row.document
-            title = f"{doc.get('supplier_name') or 'Поставщик не указан'} · №{doc.get('invoice_number') or '—'}"
+            title = doc.get("supplier_name") or "Поставщик не указан"
+            if doc.get("invoice_number"):
+                title += f" · №{doc['invoice_number']}"
             for col, text in enumerate((doc["document_date"], title, row.article,
-                                        money(getattr(row, self.basis.currentData()), row.currency))):
+                                        money(row.gross, row.currency),
+                                        money(row.net, row.currency) if row.net is not None else "Не указано")):
                 self.documents.setItem(index, col, QTableWidgetItem(text))
             self.documents.item(index, 0).setData(Qt.ItemDataRole.UserRole, doc)
         self.update_open()

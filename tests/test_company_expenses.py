@@ -208,6 +208,31 @@ class CompanyFlowTests(unittest.TestCase):
         QTest.mouseClick(table.cellWidget(2, 5), Qt.MouseButton.LeftButton)
         self.assertEqual(opened.call_args.args, (docs[2],))
 
+    def test_road_fees_show_known_document_amount_beside_missing_net(self):
+        doc = example()
+        share = dict(doc["allocations"][1], company_article=ROAD)
+        decision = dict(doc, supplier_name="Transportstyrelsen", id=20, invoice_number=None,
+                        allocations=[dict(share, gross_amount="1856", net_amount=None)])
+        documents = [decision] + [dict(doc, id=i, allocations=[dict(share, net_amount=n, gross_amount=g)])
+                                  for i, n, g in ((1, "3064", "3830"), (2, "919.74", "1149.68"),
+                                                  (3, "618.50", "773"))]
+        widget = CompanyExpensesWidget(Mock(), Mock(), Mock(), Mock(), Mock())
+        self.addCleanup(widget.close)
+        today = date.today()
+        widget.period_key = (today, today, today, today)
+        widget.rows = report_shares(documents)
+        widget.loaded = True
+        widget.currency.addItem("SEK", "SEK")
+        widget.draw()
+        widget.select_article(ROAD)
+        self.assertEqual(widget.chart.values, {ROAD: Decimal("4602.24")})
+        self.assertIn("вне итога: 1", widget.articles.item(0, 1).text())
+        self.assertEqual(widget.documents.item(0, 3).text(), "1 856,00 SEK")
+        self.assertEqual(widget.documents.item(0, 4).text(), "Не указано")
+        widget.basis.setCurrentIndex(widget.basis.findData("gross"))
+        self.assertEqual(widget.chart.values, {ROAD: Decimal("7608.68")})
+        self.assertNotIn("вне итога", widget.articles.item(0, 1).text())
+
     def test_review_column_drag_maximize_and_control_text(self):
         from types import SimpleNamespace
         from PyQt6.QtCore import QPoint, Qt
