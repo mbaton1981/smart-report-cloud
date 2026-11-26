@@ -97,6 +97,12 @@ class SpendingChart(QWidget):
 
 
 class ReviewTable(QTableWidget):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.columnCount() >= 5 and event.size().width() != event.oldSize().width():
+            other_width = sum(self.columnWidth(i) for i in range(self.columnCount()) if i != 4)
+            self.setColumnWidth(4, max(180, self.viewport().width() - other_width))
+
     def mouseMoveEvent(self, event):
         # Review uses individual clicks. Dragging across invoices must never select or scroll.
         event.accept()
@@ -418,7 +424,9 @@ class ArticleReview(QDialog):
     def __init__(self, rows, proposals, parent, open_original=None):
         super().__init__(parent)
         self.setWindowTitle("Статьи расходов фирмы")
-        self.resize(1050, 580)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        available = self.screen().availableGeometry()
+        self.resize(min(1280, available.width() - 32), min(740, available.height() - 80))
         self.rows = rows
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Проверьте предложения. Сохранение подтвердит только отмеченные строки."))
@@ -461,6 +469,20 @@ class ArticleReview(QDialog):
             combo.currentIndexChanged.connect(lambda _choice, row_index=index: table.setCurrentCell(row_index, 3))
             combo.activated.connect(lambda _choice, row_index=index: table.setCurrentCell(row_index, 3))
             self.entries.append((check, combo, selected, reason))
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.resizeColumnToContents(0)
+        table.setColumnWidth(1, 270)
+        table.resizeColumnToContents(2)
+        if rows:
+            combo = self.entries[0][1]
+            label_width = max(combo.fontMetrics().horizontalAdvance(text) for text in (UNKNOWN, *ARTICLES))
+            table.setColumnWidth(3, max(combo.sizeHint().width() + 32, label_width + 100))
+            if open_original is not None:
+                button_width = table.cellWidget(0, 5).sizeHint().width()
+                table.setColumnWidth(5, max(header.sectionSizeHint(5), button_width + 32))
+        table.setColumnWidth(4, 240)
         table.resizeRowsToContents()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         if open_original is not None:

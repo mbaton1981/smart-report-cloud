@@ -207,3 +207,55 @@ class CompanyFlowTests(unittest.TestCase):
         opened.assert_called_once_with(docs[0])
         QTest.mouseClick(table.cellWidget(2, 5), Qt.MouseButton.LeftButton)
         self.assertEqual(opened.call_args.args, (docs[2],))
+
+    def test_review_column_drag_maximize_and_control_text(self):
+        from types import SimpleNamespace
+        from PyQt6.QtCore import QPoint, Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QHeaderView, QStyle, QStyleOptionComboBox, QStyleOptionButton
+        import desktop_theme
+        from company_expenses import ARTICLES
+        self.addCleanup(self.qt_app.setStyleSheet, self.qt_app.styleSheet())
+        themed = SimpleNamespace(name="light", dark_style=self.desktop.DARK_THEME_QSS)
+        self.qt_app.setStyleSheet(desktop_theme.ThemeManager.stylesheet(themed))
+        doc = dict(example(), has_original=True)
+        editor = ArticleReview(report_shares([doc] * 29), {}, None, Mock())
+        self.addCleanup(editor.close)
+        editor.resize(1280, 640)
+        editor.show()
+        QTest.qWait(25)
+        table = editor.findChild(QTableWidget)
+        header = table.horizontalHeader()
+        self.assertTrue(editor.windowFlags() & Qt.WindowType.WindowMaximizeButtonHint)
+        self.assertTrue(all(header.sectionResizeMode(i) == QHeaderView.ResizeMode.Interactive
+                            for i in range(table.columnCount())))
+        combo = table.cellWidget(0, 3)
+        opt = QStyleOptionComboBox()
+        combo.initStyleOption(opt)
+        text_rect = combo.style().subControlRect(QStyle.ComplexControl.CC_ComboBox, opt,
+                                                 QStyle.SubControl.SC_ComboBoxEditField, combo)
+        self.assertGreaterEqual(text_rect.width(), max(combo.fontMetrics().horizontalAdvance(a) for a in ARTICLES) + 4)
+        button = table.cellWidget(0, 5)
+        bopt = QStyleOptionButton()
+        button.initStyleOption(bopt)
+        rect = button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, bopt, button)
+        self.assertGreaterEqual(rect.width(), button.fontMetrics().horizontalAdvance(button.text()))
+        for col in (3, 5):
+            table.horizontalScrollBar().setValue(table.horizontalScrollBar().maximum() if col == 5 else 0)
+            before = table.columnWidth(col)
+            edge = QPoint(header.sectionViewportPosition(col) + before - 2, header.height() // 2)
+            end = edge - QPoint(18, 0)
+            QTest.mousePress(header.viewport(), Qt.MouseButton.LeftButton, pos=edge)
+            QTest.mouseMove(header.viewport(), end)
+            QTest.mouseRelease(header.viewport(), Qt.MouseButton.LeftButton, pos=end)
+            self.assertEqual(table.columnWidth(col), before - 18)
+        editor.showMaximized()
+        QTest.qWait(10)
+        self.assertTrue(editor.isMaximized())
+        editor.showNormal()
+        editor.resize(800, 500)
+        QTest.qWait(10)
+        bar = table.horizontalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        bar.setValue(bar.maximum())
+        self.assertLessEqual(header.sectionViewportPosition(5) + table.columnWidth(5), table.viewport().width())
