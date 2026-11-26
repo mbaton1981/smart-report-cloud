@@ -27,6 +27,18 @@ def category_review_amounts(document, objects, paths=(), errors=None):
     return result
 
 
+def original_order_pages(paths):
+    pages = []
+    for attachment, raw_path in enumerate(paths):
+        path = Path(raw_path)
+        extracted = extract_local_document(path)
+        for page_index, text in enumerate(extracted.pages or (extracted.text,)):
+            pages.append({"source": path.name, "page": page_index + 1, "attachment_index": attachment,
+                          "text": text, "elements": extracted.page_elements[page_index]
+                          if page_index < len(extracted.page_elements) else ()})
+    return pages
+
+
 def propose_document_categories(document, objects, paths=()):
     allocations = document.get("allocations") or []
     result = {}
@@ -41,14 +53,7 @@ def propose_document_categories(document, objects, paths=()):
     if not any(item["category"] == CATEGORY_UNCLASSIFIED for item in result.values()) or not paths:
         return result
     try:
-        pages = []
-        for attachment, raw_path in enumerate(paths):
-            path = Path(raw_path)
-            extracted = extract_local_document(path)
-            for page_index, text in enumerate(extracted.pages or (extracted.text,)):
-                pages.append({"source": path.name, "page": page_index + 1, "attachment_index": attachment,
-                              "text": text, "elements": extracted.page_elements[page_index]
-                              if page_index < len(extracted.page_elements) else ()})
+        pages = original_order_pages(paths)
         content = single_allocation_content(pages, document)
         if len(allocations) == 1:
             if 0 in result:

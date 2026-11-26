@@ -21,6 +21,29 @@ def example():
 
 
 class ReportingTests(unittest.TestCase):
+    def test_company_net_requires_unique_complete_original_split(self):
+        from unittest.mock import patch
+        doc = dict(example(), has_original=True)
+        doc["allocations"][0].update(markning="P1234", gross_amount="40.00")
+        company = doc["allocations"][1]
+        company.update(net_amount=None, gross_amount="59.97")
+        parts = [dict(gross_amount="40", net_amount="32", vat_amount="8", rounding="0",
+                      object_options=[dict(id=99)]),
+                 dict(gross_amount="59.97", net_amount="48", vat_amount="12", rounding="-0.03",
+                      object_options=[])]
+        originals = lambda *_: ({"10": ["invoice.pdf"]}, {})
+        with patch("expense_category_automation.original_order_pages", return_value=[]), patch(
+                "document_costs.verified_original_order_allocation_proposal", return_value=parts):
+            self.assertEqual(report_shares([doc], originals)[0].net, Decimal("48"))
+            self.assertIsNone(company["net_amount"])
+            doc["allocations"][0]["gross_amount"] = "39.99"
+            self.assertIsNone(report_shares([doc], originals)[0].net)
+            doc["allocations"][0]["gross_amount"] = "40"
+            parts[0]["object_options"] = [dict(id=11)]
+            self.assertIsNone(report_shares([doc], originals)[0].net)
+            parts[0]["gross_amount"] = "59.97"
+            self.assertIsNone(report_shares([doc], originals)[0].net)
+
     def test_company_shares_only_unknown_net_credit_currency_and_tax(self):
         doc = example()
         share = doc["allocations"][1]

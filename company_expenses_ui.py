@@ -121,10 +121,11 @@ def read_table(headers, stretch, table_type=QTableWidget):
 
 
 class CompanyExpensesWidget(QWidget):
-    def __init__(self, fetch, review, save, reveal, worker, *, open_original=None, today=date.today):
+    def __init__(self, fetch, review, save, reveal, worker, *, open_original=None, originals=None, today=date.today):
         super().__init__()
         self.fetch, self.review, self.save, self.reveal, self.worker = fetch, review, save, reveal, worker
         self.open_original = open_original
+        self.originals = originals
         self.today = today
         self.tasks = {}
         self.sequence = self.latest_read = 0
@@ -259,13 +260,13 @@ class CompanyExpensesWidget(QWidget):
             self.reset_view()
         self.period_key = key
         self.status.setText("Загружаем подтверждённые документы…")
-        def ready(token, docs, error):
+        def ready(token, rows, error):
             if token != self.latest_read or self.dates() != (start, end):
                 return
             if error:
                 self.status.setText(("Показан предыдущий снимок. " if self.loaded else "Данные не загружены. ") + error)
                 return
-            self.rows = report_shares(docs)
+            self.rows = rows
             self.loaded = True
             currencies = sorted({r.currency for r in self.rows}, key=lambda c: (c != "SEK", not c, c))
             previous = self.currency.currentData()
@@ -284,7 +285,8 @@ class CompanyExpensesWidget(QWidget):
             undated = {r.document["id"] for r in self.rows if not r.document.get("document_date")}
             self.status.setText("По дате документа · подтверждённые расходы." +
                                 (f" Без даты вне периода: {len(undated)}." if undated else ""))
-        self.latest_read = self.run(lambda: self.fetch(first.isoformat(), end.isoformat()), ready)
+        self.latest_read = self.run(
+            lambda: report_shares(self.fetch(first.isoformat(), end.isoformat()), self.originals), ready)
 
     def active_rows(self, previous=False):
         if not self.period_key:

@@ -8098,6 +8098,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         self.company_expenses = CompanyExpensesWidget(
             fetch_all_expense_documents, self._company_article_review, self._save_company_articles,
             self._reveal_expense_document, ObjectOverviewTask,
+            originals=self._download_object_report_originals,
             open_original=self._open_expense_document_original, today=stockholm_today,
         )
         self.exp_document_tabs.addTab(self.company_expenses, "Расходы фирмы")
