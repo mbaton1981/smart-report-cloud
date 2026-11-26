@@ -60,6 +60,49 @@ class CustomerBillingTests(unittest.TestCase):
         self.headers["X-SmartReport-Dataset"] = "isolated-billing-dataset"
         self.assertEqual(self.post().status_code, 200)
 
+    def test_material_markup_uses_selected_net_and_freezes_on_invoice(self):
+        from accountant_report import summarize_accountant
+        from customer_billing import material_quote, priced_expense_member
+        from expense_categories import CATEGORY_MATERIALS
+        from object_package_report import _billing_breakdown, collect_object_expenses
+
+        def set_terms(percent, revision):
+            return self.server_client.put("/api/customer-invoices", headers=self.headers, json={
+                "object_id": self.object_id, "revision": revision, "percent": percent})
+
+        self.assertEqual(set_terms(12, 0).status_code, 200)
+        self.assertEqual(set_terms(0, 0).status_code, 409)
+        with closing(self.server.get_db_connection()) as connection:
+            connection.execute("""UPDATE expense_allocations SET expense_category=?,expense_category_source='user',
+                allocated_net='237.00',allocated_gross='296.27' WHERE document_id=?""",
+                               (CATEGORY_MATERIALS, self.document["id"]))
+            connection.commit()
+        doc = self.server_client.get(f"/api/expense-documents/{self.document['id']}", headers=self.headers).get_json()["document"]
+        part = doc["allocations"][0]
+        member = priced_expense_member(doc, 0, 12, part["net_amount"])
+        self.assertEqual(member["material_pricing"], dict(percent=12, base="237.00", markup="28.44", customer_net="265.44"))
+        self.assertIsNone(material_quote(dict(part, expense_category_source="suggested"), 12, 237))
+        self.assertIsNone(material_quote(dict(part, expense_category="Работы подрядчиков"), 12, 237))
+        self.assertIsNone(material_quote(part, 12, None)["markup"])
+        self.assertEqual(material_quote(part, 12, "-19.96")["markup"], "-2.40")
+        split = copy.deepcopy(doc)
+        split["allocations"].append(dict(part, net_amount="4993.36", object_id=self.object_id + 1))
+        entries, _ = prepare_next_invoice([], [split], self.object_id, "9999-12-31", {})
+        self.assertEqual(summarize_accountant({}, entries, material_percent=12)["total"], Decimal("265.44"))
+        payload = dict(self.payload, material_markup_percent=12, members=[member])
+        self.assertEqual(self.post().status_code, 409)
+        self.assertEqual(self.post(dict(payload, members=[dict(member, material_pricing={})])).status_code, 409)
+        result = self.post(payload)
+        self.assertEqual(result.status_code, 200, result.get_json())
+        self.assertEqual(set_terms(0, 1).status_code, 200)
+        saved = self.post(payload).get_json()["members"]
+        self.assertEqual(saved[member["key"]]["material_pricing"], member["material_pricing"])
+        self.assertEqual(prepare_next_invoice([], [doc], self.object_id, "9999-12-31", saved)[0], [])
+        expenses, _ = collect_object_expenses([doc], self.object_id)
+        values, _, _ = _billing_breakdown(dict(expenses=expenses, billing_members=saved,
+                                               expense_snapshot_available=True, material_markup_percent=0), {}, [])
+        self.assertEqual(values["markup", "billed"], [Decimal("28.44")])
+
     def test_customer_invoice_is_atomic_and_retry_does_not_duplicate_members(self):
         first = self.post()
         self.assertEqual(first.status_code, 200, first.get_json())
@@ -368,6 +411,10 @@ class CustomerBillingTests(unittest.TestCase):
             checks["Включить поездки"].setChecked(True)
             checks["Включить Dagbok"].setChecked(False)
             table.item(1, 6).setCheckState(self.desktop.Qt.CheckState.Unchecked)
+            markup_button = buttons["Наценка объекта · 0%…"]
+            with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes):
+                markup_button.click()
+            self.assertEqual(markup_button.text(), "Наценка объекта · 12%…")
             with patch('payroll_preview.open_preview', side_effect=preview):
                 buttons["Предварительный PDF"].click()
             without_attachments = " ".join(page.extract_text() for page in PdfReader(output).pages)
@@ -375,6 +422,10 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertNotIn("TEST SUPPLIER ORIGINAL", without_attachments)
             self.assertIn("Resor: 2", without_attachments)
             self.assertIn("600,00 SEK", without_attachments)
+            self.assertIn("Materialpåslag 12 %", without_attachments)
+            self.assertIn("112,00 SEK", without_attachments)
+            with patch.object(self.desktop.QMessageBox, "question", return_value=self.desktop.QMessageBox.StandardButton.Yes):
+                markup_button.click()
             buttons["Этот месяц"].click()
             with patch('payroll_preview.open_preview', side_effect=preview):
                 buttons["Предварительный PDF"].click()

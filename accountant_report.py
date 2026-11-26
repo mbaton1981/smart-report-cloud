@@ -10,7 +10,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import LongTable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 
-from customer_billing import priced_report
+from customer_billing import material_quote, priced_report
 from customer_pricing import row_prices
 from customer_report import REPORT_ISSUER_NAME
 from expense_documents import parse_decimal
@@ -68,13 +68,14 @@ def line_details(report, row):
     return "\n".join(lines)
 
 
-def summarize_accountant(report, entries, *, include_trips=True, rates=None, use_saved_terms=True):
+def summarize_accountant(report, entries, *, include_trips=True, rates=None, use_saved_terms=True, material_percent=0):
     rates = rates or {}
     expenses, shifts = [], []
     for entry in entries:
         (shifts if entry["member"]["kind"] == "shift" else expenses).append(entry)
     work = defaultdict(Decimal)
     materials = defaultdict(lambda: {"known": ZERO, "missing": 0})
+    markups = defaultdict(lambda: {"base": ZERO, "markup": ZERO, "count": 0, "missing": 0})
     stored_terms = []
     for entry in shifts:
         row = entry["row"]
@@ -126,26 +127,36 @@ def summarize_accountant(report, entries, *, include_trips=True, rates=None, use
         allocation = entry.get("display_allocation", entry["allocation"])
         key = (swedish_category(entry.get("category") or "Не классифицировано"), entry["currency"])
         net = parse_decimal(allocation.get("net_amount"))
+        quote = material_quote(entry["allocation"], material_percent, net)
+        if quote:
+            group = markups[entry["currency"]]
+            if net is None:
+                group["missing"] += 1
+            else:
+                group["count"] += 1
+                group["base"] += net
+                group["markup"] += Decimal(quote["markup"])
         if net is None:
             materials[key]["missing"] += 1
         else:
             materials[key]["known"] += net
     known = sum((line[-1] for line in lines if line[-1] is not None), ZERO)
     known += sum((item["known"] for (_, currency), item in materials.items() if currency == "SEK"), ZERO)
+    known += sum((item["markup"] for currency, item in markups.items() if currency == "SEK"), ZERO)
     complete = all(line[-1] is not None for line in lines) and all(
         currency == "SEK" and not item["missing"] for (_, currency), item in materials.items()
     )
     return dict(shifts=shifts, expenses=expenses, lines=lines, materials=materials, hours=hours, trips=trips,
-                total=known if complete else None, known=known, stored_terms=bool(stored_terms))
+                total=known if complete else None, known=known, markups=markups, stored_terms=bool(stored_terms))
 
 
 def write_accountant_report(filepath, obj, entries, report, cutoff, *, font, bold_font, period_start=None,
                             include_trips=True, include_journal=True, rates=None, use_saved_terms=True,
-                            copy_documents=(), source_paths=None, source_errors=None):
+                            copy_documents=(), source_paths=None, source_errors=None, material_percent=0):
     """Render the handoff and merge selected supplier copies after its own pages."""
     filepath = Path(filepath)
     summary = summarize_accountant(report, entries, include_trips=include_trips,
-                                   rates=rates, use_saved_terms=use_saved_terms)
+                                   rates=rates, use_saved_terms=use_saved_terms, material_percent=material_percent)
     copies = _prepare_sources(copy_documents, source_paths or {}, source_errors or {}, filepath.parent)
     appendix_numbers = {expense_document_key(item["document"]): i for i, item in enumerate(copies, 1)}
     style = ParagraphStyle("AccountantBody", fontName=font, fontSize=9, leading=12,
@@ -199,6 +210,16 @@ def write_accountant_report(filepath, obj, entries, report, cutoff, *, font, bol
                 amount = f"{amount} (känd del)" if item["known"] else "Att kontrollera"
             rows.append((label, amount, "Projektets andelar"))
         story.extend([Spacer(1, 11), table(rows, [213, 145, 145])])
+    if summary["markups"]:
+        rows = [["Material exkl. moms", f"Materialpåslag {material_percent} %", "Kundpris exkl. moms"]]
+        for currency, item in sorted(summary["markups"].items()):
+            suffix = " (känd del)" if item["missing"] else ""
+            if item["count"]:
+                rows.append([money(value, currency) + suffix for value in
+                             (item["base"], item["markup"], item["base"] + item["markup"])])
+            if item["missing"]:
+                rows.append([f"Att kontrollera: {item['missing']} andelar saknar nettobelopp.", "", ""])
+        story.extend([Spacer(1, 9), table(rows, [183, 155, 165])])
 
     if summary["expenses"]:
         story.extend([Spacer(1, 13), paragraph("Leverantörsdokument och fördelade kostnader", heading)])

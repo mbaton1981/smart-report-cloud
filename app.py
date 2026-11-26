@@ -14563,6 +14563,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         )
         self.object_documents_page = ObjectDocumentsPage(self.object_record_store)
         self.object_agreements_page = ObjectAgreementsPage(self.object_record_store)
+        self.object_agreements_page.material_terms_button.clicked.connect(self.edit_object_material_terms)
         self.object_section_tabs.addTab(self.object_documents_page, "Документы")
         self.object_section_tabs.addTab(self.object_agreements_page, "Договорённости")
         detail_layout.addWidget(self.object_section_tabs, 1)
@@ -16232,6 +16233,16 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         finally:
             conn.close()
 
+    def edit_object_material_terms(self):
+        from next_customer_invoice import edit_material_terms
+        try:
+            obj = self._selected_object_for_navigation()
+        except ValueError as error:
+            QMessageBox.warning(self, "Условия объекта", str(error))
+            return
+        if obj and edit_material_terms(self, obj, request_expense_api) is not None:
+            QMessageBox.information(self, "Условия объекта", "Наценка объекта сохранена.")
+
     def _object_history_period(self, object_row):
         conn = get_db_connection()
         try:
@@ -16674,12 +16685,14 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             confirmed_expenses, excluded_expenses = [], []
 
         billing_members = None
+        material_markup_percent = 0
         if server_id is not None and expense_online:
             progress("Проверяем состав выставленных счетов…")
             try:
                 membership = request_expense_api("GET", "/api/customer-invoices", params={"object_id": int(server_id)})
                 if isinstance(membership.get("members"), dict):
                     billing_members = membership["members"]
+                    material_markup_percent = membership.get("material_terms", {}).get("percent", 0)
             except Exception:
                 logging.warning("Customer invoice membership unavailable for object report")
 
@@ -16798,6 +16811,7 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             "include_copies": options["include_copies"],
             "expenses": confirmed_expenses,
             "billing_members": billing_members,
+            "material_markup_percent": material_markup_percent,
             "excluded_expenses": excluded_expenses,
             "expense_snapshot_available": snapshot_available,
             "incomplete_reasons": incomplete_reasons,

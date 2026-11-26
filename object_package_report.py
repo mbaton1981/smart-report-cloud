@@ -26,7 +26,7 @@ from reportlab.platypus import (
 )
 
 from customer_report import CATEGORY_LABELS, REPORT_ISSUER_NAME, WORK_TYPES, format_quantity
-from customer_billing import allocation_fingerprint, priced_report
+from customer_billing import allocation_fingerprint, material_quote, priced_report
 from document_costs import verified_original_order_allocation_proposal
 from expense_documents import (
     DocumentExtractionError, extract_local_document, object_marking_matches, parse_decimal,
@@ -459,7 +459,7 @@ def _billing_breakdown(data, figures, work_rows):
             or item["fingerprint"] != allocation_fingerprint(document, item["index"])
             for item in saved
         )
-        billed = {item["index"] for item in saved}
+        billed = {item["index"]: item for item in saved}
         currency = str(document.get("currency_code") or "UNKNOWN").upper()
         for index, part in zip(document["object_allocation_indexes"], document["object_allocations"]):
             status = ("review" if members is None or changed or doc_id is None else
@@ -469,7 +469,17 @@ def _billing_breakdown(data, figures, work_rows):
                 part.get("expense_category"), "other",
             )
             if currency == "SEK":
-                values[component, status].append(parse_decimal(part.get("net_amount")))
+                net = parse_decimal(part.get("net_amount"))
+                if index in billed:
+                    quote = billed[index].get("material_pricing")
+                    if quote and not changed:
+                        net = parse_decimal(quote["base"])
+                        component = "materials"
+                else:
+                    quote = material_quote(part, data.get("material_markup_percent", 0), net)
+                values[component, status].append(net)
+                if quote:
+                    values["markup", status].append(None if changed else parse_decimal(quote["markup"]))
             else:
                 foreign.add(currency)
                 if currency == "UNKNOWN":
@@ -1273,11 +1283,14 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             "Faktureringsstatus · exkl. moms" if swedish else "Статус выставления · без НДС",
             *(_BILLING_LABELS[column][language_index] for column in _BILLING_COLUMNS),
         ]]
+        if any(billing_values["markup", status] for status in _BILLING_COLUMNS):
+            components = (*components, "markup")
         names = {
             "total": ("Итого по статусу", "Summa per status"),
             "work": ("Работа", "Arbete"),
             "travel": ("Поездки", "Resor"),
             "materials": ("Материалы и закупки", "Material och inköp"),
+            "markup": ("Наценка на материалы 12%", "Materialpåslag 12 %"),
             "subcontractor": ("Работы подрядчиков", "Underentreprenörers arbete"),
             "other": ("Остальные расходы", "Övriga kostnader"),
         }
@@ -1323,9 +1336,9 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
         total_band,
         Spacer(1, 10),
         raw_paragraph(
-            "Sammanställning enligt rapportens uppgifter. Inget materialpåslag har lagts till."
+            "Kostnadssammanställningen visar material till inköpspris."
             if swedish else
-            "Итог рассчитан по данным отчёта; наценка на материалы не добавлялась.",
+            "В сводке затрат материалы показаны по закупочной стоимости.",
             styles["detail_note"],
         ),
     ])

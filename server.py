@@ -2079,6 +2079,7 @@ def expense_document_capabilities_api():
         net_features.append("object_costs_v1")
         net_features.append("customer_invoice_batches_v1")
         net_features.append("accountant_invoice_batches_v1")
+        net_features.append("object_material_markup_v1")
         net_features.append("expense_category_ai_v1")
         if {"company_article", "company_article_evidence"}.issubset(allocation_columns):
             net_features.append("company_expense_articles_v1")
@@ -5723,13 +5724,14 @@ def invoice_expense_correction_api():
             connection.execute("BEGIN")
             correction = invoice_expenses(
                 connection, int(request.args.get("object_id", "")), request.args.get("invoice_number", ""),
-                serialize_expense_document,
+                serialize_expense_document, recover_nets=analytics_expense_nets,
             )
             return jsonify({"ok": True, "correction": correction})
         connection.execute("BEGIN IMMEDIATE")
         revision = correct_invoice_expenses(
             connection, request.get_json(silent=True), actor=str(actor["user_id"]),
             serialize_document=serialize_expense_document,
+            recover_nets=analytics_expense_nets,
             now=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
         connection.commit()
@@ -5741,11 +5743,11 @@ def invoice_expense_correction_api():
         connection.close()
 
 
-@app.route('/api/customer-invoices', methods=['GET', 'POST'])
+@app.route('/api/customer-invoices', methods=['GET', 'POST', 'PUT'])
 def customer_invoices_api():
     if not expense_api_authorized():
         return jsonify({"ok": False, "error": "Доступ запрещён."}), 403
-    from customer_billing import invoice_state, record_invoice
+    from customer_billing import invoice_state, record_invoice, update_material_terms
     connection = get_db_connection()
     try:
         if request.method == 'GET':
@@ -5755,8 +5757,13 @@ def customer_invoices_api():
         if not isinstance(payload, dict):
             raise ValueError("Ожидается состав клиентской фактуры.")
         connection.execute("BEGIN IMMEDIATE")
+        if request.method == "PUT":
+            terms = update_material_terms(connection, payload)
+            connection.commit()
+            return jsonify({"ok": True, "material_terms": terms})
         result = record_invoice(
             connection, payload, serialize_document=serialize_expense_document,
+            recover_nets=analytics_expense_nets,
             next_sequence=next_change_sequence, segments=get_ob_segments,
             now=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
         )

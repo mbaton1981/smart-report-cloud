@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QProgressDialog,
 )
 
-from customer_billing import prepare_next_invoice
+from customer_billing import prepare_next_invoice, priced_expense_member
 import desktop_theme
 from expense_documents import parse_decimal
 from expense_categories import (
@@ -115,6 +115,33 @@ def edit_accountant_rates(parent, rates, use_saved_terms):
     apply.clicked.connect(accept)
     close.clicked.connect(dialog.reject)
     return (result, saved.isChecked()) if dialog.exec() == QDialog.DialogCode.Accepted else None
+
+
+def edit_material_terms(parent, obj, api, terms=None):
+    try:
+        if obj.get("server_id") is None:
+            raise ValueError("Сначала синхронизируйте объект с сервером.")
+        if terms is None:
+            state = api("GET", "/api/customer-invoices", params={"object_id": obj["server_id"]})
+            terms = state.get("material_terms")
+            if terms is None:
+                raise ValueError("Для настройки наценки требуется обновление сервера.")
+        percent = 0 if terms["percent"] else 12
+        action = "Отключить наценку" if not percent else "Установить наценку 12%"
+        if QMessageBox.question(parent, "Наценка на материалы",
+                                f"{action} для объекта {obj.get('markning') or ''} {obj['name']}?\n"
+                                "Условие применяется к нетто выбранных долей категории «Материалы и закупки» "
+                                "при подготовке следующих клиентских счетов.",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return None
+        updated = api("PUT", "/api/customer-invoices", json={
+            "object_id": obj["server_id"], "percent": percent, "revision": terms["revision"],
+        })
+        return updated["material_terms"]
+    except Exception as error:
+        QMessageBox.warning(parent, "Условия объекта", str(error))
+        return None
 
 
 def open_next_invoice(host):
@@ -254,7 +281,11 @@ def open_next_invoice(host):
     include_journal.setChecked(True)
     rate_button = QPushButton("Тарифы пакета…")
     rate_button.setToolTip("Клиентские ставки для PDF и выбор сохранённых особых условий.")
-    for control in (include_trips, include_journal, rate_button):
+    terms = state.get("material_terms", {"percent": 0, "revision": 0})
+    markup_button = QPushButton()
+    markup_button.setEnabled("material_terms" in state)
+    markup_button.setToolTip("Условие объекта для следующих счетов. Требуется сервер с поддержкой наценки.")
+    for control in (include_trips, include_journal, rate_button, markup_button):
         options.addWidget(control)
     jump = QPushButton("Перейти к разделу…")
     jump.setObjectName("accountantInvoiceGroupNavigation")
@@ -374,7 +405,8 @@ def open_next_invoice(host):
         categories = {}
         selection = selected()
         summary = summarize_accountant(report, selection, include_trips=include_trips.isChecked(),
-                                       rates=rates, use_saved_terms=use_saved_terms)
+                                       rates=rates, use_saved_terms=use_saved_terms, material_percent=terms["percent"])
+        markup_button.setText(f"Наценка объекта · {terms['percent']}%…")
         for entry in selection:
             if entry["member"]["kind"] == "shift":
                 continue
@@ -395,9 +427,16 @@ def open_next_invoice(host):
         amounts = sorted(categories.items(), key=lambda item: (CATEGORY_ORDER.index(item[0][0]), item[0]))
         lines += [f"{category} · {value:,.2f} {currency} {basis}"
                   for (category, currency, basis), value in amounts]
+        for currency, item in sorted(summary["markups"].items()):
+            if item["count"]:
+                lines.append(f"Материалы без НДС · закупка {item['base']:,.2f} + наценка {terms['percent']}% "
+                             f"({item['markup']:,.2f}) = клиенту {item['base'] + item['markup']:,.2f} {currency}")
+            if item["missing"]:
+                lines.append(f"Требуется сверка нетто по долям материалов ({item['missing']}).")
         total_label.setText("\n".join(lines))
         valid = bool(selection)
         save_button.setEnabled(supported and valid and reviewed.isChecked()
+                               and not any(item["missing"] for item in summary["markups"].values())
                                and bool(number.text().strip()) and not committed)
         pdf_button.setEnabled(valid)
 
@@ -449,6 +488,16 @@ def open_next_invoice(host):
 
     rate_button.clicked.connect(change_rates)
 
+    def change_markup():
+        nonlocal terms
+        updated = edit_material_terms(dialog, obj, desktop.request_expense_api, terms)
+        if updated is not None:
+            terms = updated
+            reviewed.setChecked(False)
+            refresh()
+
+    markup_button.clicked.connect(change_markup)
+
     def export_pdf():
         selection = selected()
         _label, period_start, cutoff = periods[period_buttons.checkedId()]
@@ -461,7 +510,7 @@ def open_next_invoice(host):
                 document = entry["document"]
                 copies[expense_document_key(document)] = document
         settings = dict(include_trips=include_trips.isChecked(), include_journal=include_journal.isChecked(),
-                        rates=dict(rates), use_saved_terms=use_saved_terms)
+                        rates=dict(rates), use_saved_terms=use_saved_terms, material_percent=terms["percent"])
         try:
             from payroll_preview import open_preview
             translations = {}
@@ -511,9 +560,18 @@ def open_next_invoice(host):
 
     def commit():
         nonlocal committed, submitted_payload
+        members = []
+        for entry in selected():
+            member = entry["member"]
+            if member["kind"] == "expense":
+                allocation = entry.get("display_allocation", entry["allocation"])
+                member = priced_expense_member(entry["document"], member["index"], terms["percent"], allocation.get("net_amount"))
+            members.append(member)
         payload = {"operation_id": operation_id, "object_id": obj["server_id"], "purpose": "accountant",
                    "invoice_number": number.text().strip(), "invoice_date": invoice_date.date().toString("yyyy-MM-dd"),
-                   "members": [entry["member"] for entry in selected()]}
+                   "members": members}
+        if "material_terms" in state:
+            payload["material_markup_percent"] = terms["percent"]
         if submitted_payload is not None and submitted_payload != payload:
             QMessageBox.warning(dialog, "Проверьте результат предыдущей попытки", "Закройте окно и откройте следующий счёт заново для проверки сохранённого состава.")
             return

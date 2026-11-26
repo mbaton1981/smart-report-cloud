@@ -2,7 +2,9 @@
 import hashlib
 import json
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
+from expense_categories import CATEGORY_MATERIALS, confirmed_expense_category
 from expense_documents import parse_decimal
 from fixed_pricing import signature
 
@@ -23,6 +25,9 @@ def allocation_fingerprint(document, index):
 
 
 def ensure_schema(connection):
+    connection.execute("""CREATE TABLE IF NOT EXISTS object_material_terms (
+        object_id INTEGER PRIMARY KEY REFERENCES meta_objects(id),
+        percent INTEGER NOT NULL CHECK(percent IN (0,12)), revision INTEGER NOT NULL)""")
     connection.execute("""CREATE TABLE IF NOT EXISTS customer_invoice_batches (
         operation_id TEXT PRIMARY KEY, object_id INTEGER NOT NULL,
         invoice_number TEXT NOT NULL, invoice_date TEXT NOT NULL,
@@ -40,6 +45,39 @@ def ensure_schema(connection):
             UNIQUE(operation_id, revision))""")
 
 
+def material_terms(connection, object_id):
+    row = connection.execute("SELECT percent, revision FROM object_material_terms WHERE object_id=?", (object_id,)).fetchone()
+    return dict(percent=row[0], revision=row[1]) if row else dict(percent=0, revision=0)
+
+
+def update_material_terms(connection, payload):
+    object_id, percent, revision = (payload.get(key) for key in ("object_id", "percent", "revision"))
+    if (type(object_id) is not int or type(percent) is not int or percent not in (0, 12)
+            or type(revision) is not int or not connection.execute(
+                "SELECT 1 FROM meta_objects WHERE id=?", (object_id,)).fetchone()):
+        raise ValueError("Проверьте объект и ставку наценки.")
+    current = material_terms(connection, object_id)
+    if current["revision"] != revision:
+        raise ValueError("Условия объекта изменились. Откройте окно заново.")
+    if current["percent"] != percent:
+        connection.execute("""INSERT INTO object_material_terms VALUES (?,?,?)
+            ON CONFLICT(object_id) DO UPDATE SET percent=excluded.percent, revision=excluded.revision""",
+                           (object_id, percent, revision + 1))
+    return material_terms(connection, object_id)
+
+
+def material_quote(allocation, percent, net):
+    category, _ = confirmed_expense_category(allocation.get("expense_category"), allocation.get("expense_category_source"))
+    if not percent or category != CATEGORY_MATERIALS:
+        return None
+    base = parse_decimal(net)
+    if base is None:
+        return dict(percent=percent, base=None, markup=None, customer_net=None)
+    markup = (base * percent / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return dict(percent=percent, base=format(base, ".2f"), markup=format(markup, ".2f"),
+                customer_net=format(base + markup, ".2f"))
+
+
 def invoice_state(connection, object_id):
     batches = [dict(row) for row in connection.execute(
         "SELECT operation_id,invoice_number,invoice_date,created_at FROM customer_invoice_batches "
@@ -48,7 +86,7 @@ def invoice_state(connection, object_id):
     members = {row["member_key"]: json.loads(row["snapshot_json"]) for row in connection.execute(
         "SELECT member_key,snapshot_json FROM customer_invoice_members WHERE object_id=?", (object_id,),
     )}
-    return {"batches": batches, "members": members}
+    return {"batches": batches, "members": members, "material_terms": material_terms(connection, object_id)}
 
 
 def shift_member(row):
@@ -69,7 +107,24 @@ def expense_member(document, index):
     }
 
 
-def checked_expense(connection, requested, object_id, accountant, serialize_document):
+def priced_expense_member(document, index, percent, net):
+    member = expense_member(document, index)
+    quote = material_quote(document["allocations"][index], percent, net)
+    if quote is not None:
+        member["material_pricing"] = quote
+    return member
+
+
+def billing_net(connection, document, index, object_id, percent, recover_nets):
+    allocation = document["allocations"][index]
+    net = allocation.get("net_amount")
+    if recover_nets and parse_decimal(net) is None and material_quote(allocation, percent, None):
+        obj = dict(connection.execute("SELECT id,name,markning FROM meta_objects WHERE id=?", (object_id,)).fetchone())
+        net = recover_nets(connection.cursor(), document, {object_id: obj}).get(index)
+    return net
+
+
+def checked_expense(connection, requested, object_id, accountant, serialize_document, percent=0, recover_nets=None):
     if type(requested.get("document_id")) is not int:
         raise ValueError("Некорректный номер расхода.")
     row = connection.execute("""
@@ -90,8 +145,11 @@ def checked_expense(connection, requested, object_id, accountant, serialize_docu
     index = requested.get("index")
     if type(index) is not int or not 0 <= index < len(document["allocations"]):
         raise ValueError("Распределение расхода изменилось. Обновите состав.")
-    snapshot = expense_member(document, index)
     allocation = document["allocations"][index]
+    net = billing_net(connection, document, index, object_id, percent, recover_nets)
+    snapshot = priced_expense_member(document, index, percent, net)
+    if snapshot.get("material_pricing") and parse_decimal(net) is None:
+        raise ValueError("Для наценки нужно сверить нетто доли материалов с оригиналом.")
     if (snapshot != requested or allocation.get("object_id") != object_id or allocation.get("company_expense")
             or allocation.get("destination") == "company" or document.get("supporting_to_document_id")
             or document["verification_status"] != "confirmed"
@@ -118,10 +176,12 @@ def _correction_revision(connection, operation_id):
     ).fetchone()[0]
 
 
-def invoice_expenses(connection, object_id, number, serialize_document):
+def invoice_expenses(connection, object_id, number, serialize_document, recover_nets=None):
     invoice = _correction_invoice(connection, object_id, number)
     operation_id = invoice["operation_id"]
-    accountant = json.loads(invoice["payload_json"]).get("purpose") == "accountant"
+    settings = json.loads(invoice["payload_json"])
+    accountant = settings.get("purpose") == "accountant"
+    percent = settings.get("material_markup_percent", 0)
     current, all_members = [], {}
     for item in connection.execute("""
         SELECT operation_id, member_key, snapshot_json FROM customer_invoice_members WHERE member_key LIKE 'expense:%'
@@ -141,6 +201,10 @@ def invoice_expenses(connection, object_id, number, serialize_document):
         AND NOT EXISTS (SELECT 1 FROM expense_processing p WHERE p.document_id=d.id AND p.state='split')
     """, (object_id,))]
     entries, _ = prepare_next_invoice([], documents, object_id, "9999-12-31", all_members, accountant=accountant)
+    for entry in entries:
+        document, index = entry["document"], entry["member"]["index"]
+        net = billing_net(connection, document, index, object_id, percent, recover_nets)
+        entry["member"] = priced_expense_member(document, index, percent, net)
     available = [
         dict(snapshot=entry["member"], label=entry["label"], date=entry["date"], included=False)
         for entry in entries
@@ -154,7 +218,7 @@ def invoice_expenses(connection, object_id, number, serialize_document):
                                 reverse=True))
 
 
-def correct_invoice_expenses(connection, payload, *, actor, serialize_document, now):
+def correct_invoice_expenses(connection, payload, *, actor, serialize_document, now, recover_nets=None):
     if not isinstance(payload, dict):
         raise ValueError("Ожидается исправление состава счёта.")
     correction_id = payload.get("correction_id")
@@ -187,10 +251,12 @@ def correct_invoice_expenses(connection, payload, *, actor, serialize_document, 
     )}
     if any(key not in current or current[key]["kind"] != "expense" for key in removed):
         raise ValueError("Одна из снимаемых позиций не входит в этот счёт.")
-    accountant = json.loads(invoice["payload_json"]).get("purpose") == "accountant"
+    settings = json.loads(invoice["payload_json"])
+    accountant = settings.get("purpose") == "accountant"
     added = {}
     for requested in additions:
-        snapshot = checked_expense(connection, requested, object_id, accountant, serialize_document)
+        snapshot = checked_expense(connection, requested, object_id, accountant, serialize_document,
+                                   settings.get("material_markup_percent", 0), recover_nets)
         key = snapshot["key"]
         if key in added or connection.execute(
                 "SELECT 1 FROM customer_invoice_members WHERE member_key=?", (key,)).fetchone():
@@ -283,7 +349,7 @@ def prepare_next_invoice(rows, documents, object_id, cutoff, members, *, account
     return sorted(entries, key=lambda item: (item["date"], item["member"]["key"])), list(dict.fromkeys(warnings))
 
 
-def record_invoice(connection, payload, *, serialize_document, next_sequence, segments, now):
+def record_invoice(connection, payload, *, serialize_document, next_sequence, segments, now, recover_nets=None):
     purpose = payload.get("purpose", "priced_invoice")
     if purpose not in ("priced_invoice", "accountant"):
         raise ValueError("Неизвестное назначение документа.")
@@ -310,6 +376,9 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
     obj = connection.execute("SELECT * FROM meta_objects WHERE id=?", (object_id,)).fetchone()
     if obj is None:
         raise ValueError("Объект отсутствует в справочнике.")
+    percent = payload.get("material_markup_percent", 0)
+    if type(percent) is not int or percent != material_terms(connection, object_id)["percent"]:
+        raise ValueError("Проверьте текущую наценку объекта в обновлённом окне следующего счёта.")
     snapshots, seen, work, currencies = [], set(), [], set()
     from customer_pricing import require_final_prices, row_prices
     for requested in raw_members:
@@ -339,7 +408,7 @@ def record_invoice(connection, payload, *, serialize_document, next_sequence, se
             if not accountant:
                 currencies.add("SEK")
         elif requested.get("kind") == "expense":
-            snapshot = checked_expense(connection, requested, object_id, accountant, serialize_document)
+            snapshot = checked_expense(connection, requested, object_id, accountant, serialize_document, percent, recover_nets)
             currencies.add(snapshot["currency"])
         else:
             raise ValueError("Неизвестный тип строки счёта.")
