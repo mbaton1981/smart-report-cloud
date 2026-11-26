@@ -457,6 +457,47 @@ class ObjectPackageReportTests(unittest.TestCase):
         self.assertTrue(expenses[0]["share"]["net_recovered_from_original"])
         self.assertIsNone(saved["allocations"][0]["net_amount"])
 
+    def test_whole_reverse_charge_invoice_in_report_and_pending_billing(self):
+        original = dict(supplier_name="Electric AB", invoice_number="258", document_date="2026-11-25",
+                        currency_code="SEK", document_type="invoice", reverse_charge=True,
+                        net_amount="25000.00", vat_amount=None, gross_amount="25000.00", amount_due="25000.00",
+                        field_sources={key: [{"kind": "invoice_total"}]
+                                       for key in ("net_amount", "gross_amount", "amount_due")})
+        share = dict(object_id=42, destination="object", gross_amount="25000.00",
+                     expense_category=CATEGORY_SUBCONTRACTOR_WORK, expense_category_source="user")
+        invoice = {**original, "id": 258, "verification_status": "confirmed", "allocations": [share]}
+        data = dict(object={"id": 42, "name": "Bathroom"}, expense_snapshot_available=True,
+                    period_label="2026-11-25", generated_at="2026-11-26", language="sv",
+                    include_customer_cost=False, billing_members={})
+        page = SimpleNamespace(pages=("original",), page_elements=((),), text="original")
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "object_package_report.extract_local_document", return_value=page,
+        ), patch("object_package_report.parse_invoice_pages", return_value=original), patch(
+            "object_package_report.verified_original_order_allocation_proposal", return_value=[],
+        ):
+            for label, changes, can_recover in (
+                ("entire", {}, True),
+                ("split", {"allocations": [share, dict(destination="company", gross_amount="10")]}, False),
+                ("partial", {"allocations": [dict(share, gross_amount="5000")]}, False),
+                ("different invoice", {"invoice_number": "259"}, False),
+                ("different currency", {"currency_code": "EUR"}, False),
+                ("conflicting tax", {"allocations": [dict(share, vat_amount="5000")]}, False),
+                ("conflicting net", {"net_amount": "20000"}, False),
+            ):
+                with self.subTest(label=label):
+                    data["expenses"], _ = collect_object_expenses([{**invoice, **changes}], 42)
+                    _recover_report_share_tax(data, {"258": ["invoice.pdf"]}, {})
+                    self.assertEqual(data["expenses"][0]["share"]["net_amount"],
+                                     Decimal("25000") if can_recover else None)
+                    if label in {"entire", "partial"}:
+                        pdf = Path(folder) / (label + ".pdf")
+                        write_object_report_package(pdf, data, font=self.font, bold_font=self.bold_font)
+                        cover = " ".join(PdfReader(str(pdf)).pages[0].extract_text().split())
+                        value = "25 000,00 SEK" if can_recover else "Okänt"
+                        self.assertIn("Underentreprenörers arbete 0,00 SEK " + value, cover)
+                        self.assertIn("Underentreprenörers arbete · exkl. moms " + value, cover)
+        self.assertNotIn("net_amount", share)
+
     def test_report_only_net_recovery_rejects_duplicate_gross_match(self):
         saved = _document(74, net=None, vat=None, gross="12.00", allocations=[{
             "object_id": 42, "destination": "object", "net_amount": None,

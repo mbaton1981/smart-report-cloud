@@ -30,6 +30,7 @@ from customer_billing import allocation_fingerprint, priced_report
 from document_costs import verified_original_order_allocation_proposal
 from expense_documents import (
     DocumentExtractionError, extract_local_document, object_marking_matches, parse_decimal,
+    parse_invoice_pages,
 )
 from expense_categories import (
     CATEGORY_EQUIPMENT_RENTAL, CATEGORY_MATERIALS, CATEGORY_OTHER, CATEGORY_SUBCONTRACTOR_MIXED,
@@ -426,7 +427,7 @@ def _customer_summary(report):
 
 
 _BILLING_COLUMNS = ("billed", "pending", "review")
-_BILLING_COMPONENTS = ("work", "travel", "materials", "other")
+_BILLING_COMPONENTS = ("work", "travel", "materials", "subcontractor", "other")
 _BILLING_LABELS = {
     "billed": ("Выставлено", "Fakturerat"),
     "pending": ("Ожидает выставления", "Kvar att fakturera"),
@@ -464,7 +465,9 @@ def _billing_breakdown(data, figures, work_rows):
             status = ("review" if members is None or changed or doc_id is None else
                       "billed" if index in billed else "pending")
             statuses[doc_id, index] = status
-            component = "materials" if part.get("expense_category") == CATEGORY_MATERIALS else "other"
+            component = {CATEGORY_MATERIALS: "materials", CATEGORY_SUBCONTRACTOR_WORK: "subcontractor"}.get(
+                part.get("expense_category"), "other",
+            )
             if currency == "SEK":
                 values[component, status].append(parse_decimal(part.get("net_amount")))
             else:
@@ -1137,8 +1140,10 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
                 if category in values
             )
         else:
-            category_value = display_amount(category_sek["known"], "SEK")
             unknown_count = category_sek["unknown_count"]
+            category_value = display_amount(
+                None if unknown_count == category_sek["allocation_count"] else category_sek["known"], "SEK",
+            )
             document_count = category_sek["document_count"]
         if category == CATEGORY_UNCLASSIFIED and len(active_categories) == 1:
             russian_label = "Расходы без разбивки / Ej kategoriserade kostnader"
@@ -1258,6 +1263,12 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
     if billing_values is not None:
         language_index = int(swedish)
         components = _BILLING_COMPONENTS if data.get("include_customer_cost") else _BILLING_COMPONENTS[2:]
+        has_subcontractor = CATEGORY_SUBCONTRACTOR_WORK in active_categories
+        if not has_subcontractor:
+            components = tuple(item for item in components if item != "subcontractor")
+        elif data.get("expense_snapshot_available") and not active_categories.difference(
+                {CATEGORY_MATERIALS, CATEGORY_SUBCONTRACTOR_WORK}):
+            components = tuple(item for item in components if item != "other")
         rows = [[
             "Faktureringsstatus · exkl. moms" if swedish else "Статус выставления · без НДС",
             *(_BILLING_LABELS[column][language_index] for column in _BILLING_COLUMNS),
@@ -1267,6 +1278,7 @@ def _main_pdf_bytes(data, font, bold_font, appendix_pages):
             "work": ("Работа", "Arbete"),
             "travel": ("Поездки", "Resor"),
             "materials": ("Материалы и закупки", "Material och inköp"),
+            "subcontractor": ("Работы подрядчиков", "Underentreprenörers arbete"),
             "other": ("Остальные расходы", "Övriga kostnader"),
         }
         for component in ("total", *components):
@@ -1786,6 +1798,55 @@ def _prepare_sources(expenses, source_paths, source_errors, work_dir):
     return prepared
 
 
+def _whole_invoice_tax(pages, document, target_object):
+    """Use the original invoice totals only for its sole, fully assigned object share."""
+    allocations = document.get("allocations") or []
+    if len(allocations) != 1 or len({p["attachment_index"] for p in pages}) != 1:
+        return None
+    allocation = allocations[0]
+    gross = parse_decimal(document.get("gross_amount"))
+    if (gross is None or parse_decimal(allocation.get("gross_amount")) != gross
+            or str(allocation.get("object_id")) != str(target_object["id"])
+            or allocation.get("company_expense") or allocation.get("destination") == "company"):
+        return None
+
+    fields = parse_invoice_pages(pages)
+
+    def normalized(value):
+        return " ".join(str(value or "").casefold().split())
+
+    if (fields.get("non_invoice_document_type") or fields.get("prepaid")
+            or fields.get("document_type") != "invoice"
+            or any(not fields.get(key) or normalized(fields[key]) != normalized(document.get(key))
+                   for key in ("invoice_number", "supplier_name", "document_date", "currency_code"))
+            or fields["currency_code"] == "UNKNOWN"):
+        return None
+    sources = fields.get("field_sources") or {}
+    if not all(sources.get(key) for key in ("net_amount", "gross_amount", "amount_due")):
+        return None
+    if any("Несколько различных значений поля" in reason for reason in fields.get("review_reasons", ())):
+        return None
+    net = parse_decimal(fields["net_amount"])
+    vat = parse_decimal(fields.get("vat_amount"))
+    invoice_gross = parse_decimal(fields["gross_amount"])
+    due = parse_decimal(fields["amount_due"])
+    rounding = parse_decimal(fields.get("rounding_amount"))
+    if rounding is None and invoice_gross == due:
+        rounding = Decimal(0)
+    if vat is None and fields.get("reverse_charge") and net == invoice_gross:
+        vat = Decimal(0)
+    if (None in (net, vat, rounding, invoice_gross, due) or net + vat != invoice_gross
+            or invoice_gross + rounding != due or due != gross):
+        return None
+    amounts = {"net_amount": net, "vat_amount": vat, "rounding_amount": rounding, "amount_due": due}
+    for key, amount in amounts.items():
+        saved = parse_decimal(document.get(key))
+        if saved is not None and saved != amount:
+            return None
+    return {"object_options": [target_object], "net_amount": str(net), "vat_amount": str(vat),
+            "rounding": str(rounding), "gross_amount": str(gross)}
+
+
 def _recover_report_share_tax(data, source_paths, source_errors):
     expenses = data.get("expenses", [])
     target_object = data["object"]
@@ -1832,7 +1893,8 @@ def _recover_report_share_tax(data, source_paths, source_errors):
             if not pages:
                 raise ValueError("В оригинале нет страниц для проверки.")
 
-            parts = verified_original_order_allocation_proposal(
+            whole = _whole_invoice_tax(pages, document, target_object)
+            parts = [whole] if whole is not None else verified_original_order_allocation_proposal(
                 pages, document, [target_object],
             )
         except (
