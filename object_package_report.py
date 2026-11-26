@@ -1863,9 +1863,11 @@ def _whole_invoice_tax(pages, document, target_object):
 def _recover_report_share_tax(data, source_paths, source_errors):
     expenses = data.get("expenses", [])
     target_object = data["object"]
-    target_id = target_object.get("id")
+    # Desktop object rows have both IDs. Expense allocations use the server ID.
+    target_id = target_object.get("server_id", target_object.get("id"))
     if target_id is None:
         return
+    target_object = dict(target_object, id=target_id)
 
     for document in expenses:
         allocations = document.get("object_allocations") or []

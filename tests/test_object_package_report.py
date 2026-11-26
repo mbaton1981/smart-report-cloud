@@ -466,7 +466,7 @@ class ObjectPackageReportTests(unittest.TestCase):
         share = dict(object_id=42, destination="object", gross_amount="25000.00",
                      expense_category=CATEGORY_SUBCONTRACTOR_WORK, expense_category_source="user")
         invoice = {**original, "id": 258, "verification_status": "confirmed", "allocations": [share]}
-        data = dict(object={"id": 42, "name": "Bathroom"}, expense_snapshot_available=True,
+        data = dict(object={"id": 7, "server_id": 42, "name": "Bathroom"}, expense_snapshot_available=True,
                     period_label="2026-11-25", generated_at="2026-11-26", language="sv",
                     include_customer_cost=False, billing_members={})
         page = SimpleNamespace(pages=("original",), page_elements=((),), text="original")
