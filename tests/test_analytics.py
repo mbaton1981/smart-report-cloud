@@ -2,8 +2,10 @@ import copy
 from contextlib import closing
 from datetime import date, datetime
 import json
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import analytics
 from customer_billing import expense_member, shift_member
@@ -396,6 +398,36 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(recovered["unresolved_expenses"], [])
         self.assertEqual(recovered["totals"]["expenses"], 200)
         self.assertIsNone(parent["allocations"][1]["net_amount"])
+
+    def test_server_verifies_whole_object_invoice_before_attributing_its_net(self):
+        folder = Path(self._case.name)
+        (folder / "invoice.pdf").touch()
+        cursor = Mock()
+        cursor.execute.return_value.fetchall.return_value = [("invoice.pdf",)]
+        with closing(self.server.get_db_connection()) as connection:
+            object_id = connection.execute("SELECT id FROM meta_objects WHERE name='Travel A'").fetchone()[0]
+        allocation = dict(object_id=object_id, destination="object", gross_amount="25000", net_amount=None)
+        invoice = self.document(net="25000", gross="25000", vat=None, allocations=[allocation],
+                                supplier_name="Electric AB", invoice_number="258", amount_due="25000",
+                                client_id="example", rounding_amount=None, has_original=True)
+        original = dict(invoice, document_type="invoice", reverse_charge=True,
+                        field_sources={k: ["invoice total"] for k in ("gross_amount", "net_amount", "amount_due")})
+        page = SimpleNamespace(pages=("invoice",), page_elements=((),), text="invoice")
+        with patch.object(self.server, "expense_documents_root", return_value=folder), patch(
+            "object_package_report.extract_local_document", return_value=page,
+        ), patch("object_package_report.parse_invoice_pages", return_value=original):
+            for changes, matches in (({}, True), ({"supplier_name": "Other AB"}, False),
+                                     ({"amount_due": "24999"}, False)):
+                with self.subTest(changes=changes):
+                    data = self.calculate(
+                        documents=[dict(invoice, **changes)],
+                        recover_expense_nets=lambda doc, objects: self.server.analytics_expense_nets(cursor, doc, objects),
+                    )
+                    costs = {row["key"]: row["expenses"] for row in data["rows"]}
+                    self.assertEqual(costs.get(f"object:{object_id}", 0), 25000 if matches else 0)
+                    self.assertEqual(costs.get("unresolved_net", 0), 0 if matches else 25000)
+                    self.assertEqual(data["totals"]["expenses"], 25000)
+                    self.assertIsNone(allocation["net_amount"])
 
     def test_reconciled_invoice_attributes_company_remainder_without_changing_saved_shares(self):
         with closing(self.server.get_db_connection()) as connection:

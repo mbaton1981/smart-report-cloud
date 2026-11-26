@@ -5656,7 +5656,7 @@ def analytics_expense_nets(cursor, document, objects):
     except (OSError, RuntimeError, ValueError):
         return {}
     identity = {key: document[key] for key in (
-        "id", "client_id", "invoice_number", "net_amount", "vat_amount", "gross_amount",
+        "id", "client_id", "supplier_name", "invoice_number", "net_amount", "vat_amount", "gross_amount", "amount_due",
         "rounding_amount", "currency_code", "verification_status", "document_date", "allocations",
     )}
     recovered = {}
