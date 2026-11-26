@@ -96,8 +96,14 @@ class SpendingChart(QWidget):
                     break
 
 
-def read_table(headers, stretch):
-    table = QTableWidget(0, len(headers))
+class ReviewTable(QTableWidget):
+    def mouseMoveEvent(self, event):
+        # Review uses individual clicks. Dragging across invoices must never select or scroll.
+        event.accept()
+
+
+def read_table(headers, stretch, table_type=QTableWidget):
+    table = table_type(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
     table.verticalHeader().hide()
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -416,7 +422,11 @@ class ArticleReview(QDialog):
         self.rows = rows
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Проверьте предложения. Сохранение подтвердит только отмеченные строки."))
-        table = read_table(["Включить", "Документ", "Сумма с НДС", "Статья", "Основание"], 4)
+        headers = ["Включить", "Документ", "Сумма с НДС", "Статья", "Основание"]
+        if open_original is not None:
+            headers.append("Оригинал")
+        table = read_table(headers, 4, ReviewTable)
+        table.setAutoScroll(False)
         table.setStyleSheet("QTableWidget::item:hover:!selected { background-color: palette(base); }")
         table.setRowCount(len(rows))
         layout.addWidget(table)
@@ -440,6 +450,12 @@ class ArticleReview(QDialog):
             evidence = QTableWidgetItem(reason)
             evidence.setToolTip(reason)
             table.setItem(index, 4, evidence)
+            if open_original is not None:
+                view = QPushButton("Открыть")
+                view.setAutoDefault(False)
+                view.setEnabled(bool(doc.get("has_original")))
+                view.clicked.connect(lambda _checked, document=doc: open_original(document))
+                table.setCellWidget(index, 5, view)
             combo.currentTextChanged.connect(lambda value, c=check, old=row.article: c.setChecked(value != old))
             check.clicked.connect(lambda _checked, row_index=index: table.setCurrentCell(row_index, 0))
             combo.currentIndexChanged.connect(lambda _choice, row_index=index: table.setCurrentCell(row_index, 3))

@@ -36,6 +36,9 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(suggest(dict(doc, recognized_text="Diesel", supplier_name="OpenAI"), {})[0], UNKNOWN)
         self.assertEqual(suggest({}, dict(note="Fordonsskatt"))[0], VEHICLE_TAX)
         self.assertEqual(section(VEHICLE_TAX), TAX)
+        fora = dict(doc, allocations=[{}], supplier_name="Fora AB")
+        self.assertEqual(section(suggest(fora, {})[0]), TAX)
+        self.assertEqual(suggest(dict(fora, allocations=[{}, {}]), {})[0], UNKNOWN)
         self.assertEqual(suggest({}, dict(note="Trängselskatt"))[0], ROAD)
         self.assertEqual(suggest(dict(doc, allocations=[share], supplier_name="GitHub, Inc."), {})[0], SOFTWARE)
 
@@ -180,3 +183,27 @@ class CompanyFlowTests(unittest.TestCase):
         original.click()
         opened.assert_called_once_with(doc)
         editor.close()
+
+    def test_fortnox_selection_survives_pointer_crossing_other_invoices(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        docs = [dict(example(), id=i, supplier_name=name, has_original=True)
+                for i, name in enumerate(("Fortnox AB", "Fora AB", "Parkeringsservice Svenska AB"), 1)]
+        opened = Mock()
+        editor = ArticleReview(report_shares(docs), {}, None, opened)
+        self.addCleanup(editor.close)
+        editor.show()
+        QTest.qWait(20)
+        table = editor.findChild(QTableWidget)
+        viewport = table.viewport()
+        def point(row):
+            return table.visualItemRect(table.item(row, 1)).center()
+        QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=point(0))
+        for row in (1, 2):
+            QTest.mouseMove(viewport, point(row))
+        self.assertEqual(table.currentRow(), 0)
+        original = next(b for b in editor.findChildren(QPushButton) if b.text() == "Открыть оригинал")
+        QTest.mouseClick(original, Qt.MouseButton.LeftButton)
+        opened.assert_called_once_with(docs[0])
+        QTest.mouseClick(table.cellWidget(2, 5), Qt.MouseButton.LeftButton)
+        self.assertEqual(opened.call_args.args, (docs[2],))

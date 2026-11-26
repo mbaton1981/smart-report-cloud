@@ -57,6 +57,8 @@ def suggest(document, share):
         return article, line[:300]
     if single and not hits:
         supplier = str(document.get("supplier_name") or "").strip()
+        if re.fullmatch(r"Fora(?:\s+AB)?", supplier, re.I):
+            return OTHER_TAX, "Подсказка по поставщику Fora · проверьте пенсионные и страховые взносы в оригинале"
         for pattern, article in ((r"^(?:GitHub|OpenAI)\b", SOFTWARE), (r"^Green Storage\b", STORAGE)):
             if re.search(pattern, supplier, re.I):
                 return article, "Подсказка по поставщику · " + supplier[:150]
