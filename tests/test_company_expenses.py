@@ -4,6 +4,7 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import Mock
 from uuid import uuid4
+from PyQt6.QtWidgets import QPushButton, QTableWidget
 
 import test_catalog_sync as catalog
 from company_expenses import (FUEL, ROAD, SOFTWARE, TAX, UNKNOWN, VEHICLE_TAX, report_shares,
@@ -156,3 +157,26 @@ class CompanyFlowTests(unittest.TestCase):
         window.sections.setCurrentIndex(1)
         self.assertEqual(window.chart.values, {VEHICLE_TAX: Decimal(500)})
         window.close()
+
+    def test_article_review_hover_does_not_select_and_category_pick_enables_original(self):
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtCore import QPoint
+        doc = example()
+        doc["has_original"] = True
+        rows = report_shares([doc])
+        opened = Mock()
+        editor = ArticleReview(rows, {10: {8: dict(category=FUEL, evidence="Diesel")}}, None, opened)
+        table = editor.findChild(QTableWidget)
+        editor.show()
+        QTest.qWait(20)
+        table.setCurrentCell(-1, -1)
+        QTest.mouseMove(table.viewport(), QPoint(400, 30))
+        self.assertEqual(table.currentRow(), -1)
+        editor.entries[0][1].setCurrentText(UNKNOWN)
+        self.assertEqual(table.currentRow(), 0)
+        original = next(button for button in editor.findChildren(QPushButton)
+                        if button.text() == "Открыть оригинал")
+        self.assertTrue(original.isEnabled())
+        original.click()
+        opened.assert_called_once_with(doc)
+        editor.close()

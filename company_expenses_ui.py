@@ -417,6 +417,7 @@ class ArticleReview(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Проверьте предложения. Сохранение подтвердит только отмеченные строки."))
         table = read_table(["Включить", "Документ", "Сумма с НДС", "Статья", "Основание"], 4)
+        table.setStyleSheet("QTableWidget::item:hover:!selected { background-color: palette(base); }")
         table.setRowCount(len(rows))
         layout.addWidget(table)
         self.entries = []
@@ -440,6 +441,9 @@ class ArticleReview(QDialog):
             evidence.setToolTip(reason)
             table.setItem(index, 4, evidence)
             combo.currentTextChanged.connect(lambda value, c=check, old=row.article: c.setChecked(value != old))
+            check.clicked.connect(lambda _checked, row_index=index: table.setCurrentCell(row_index, 0))
+            combo.currentIndexChanged.connect(lambda _choice, row_index=index: table.setCurrentCell(row_index, 3))
+            combo.activated.connect(lambda _choice, row_index=index: table.setCurrentCell(row_index, 3))
             self.entries.append((check, combo, selected, reason))
         table.resizeRowsToContents()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
