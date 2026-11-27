@@ -114,6 +114,31 @@ def shift_member(row):
     }
 
 
+def issued_history(connection, object_id):
+    """Read the current membership of each issued invoice in one database snapshot."""
+    batches = {}
+    for row in connection.execute("""
+        SELECT b.operation_id,b.invoice_number,b.invoice_date,b.payload_json,
+               EXISTS(SELECT 1 FROM customer_invoice_corrections c WHERE c.operation_id=b.operation_id) AS corrected
+        FROM customer_invoice_batches b WHERE b.object_id=? ORDER BY b.invoice_date DESC,b.created_at DESC
+    """, (object_id,)):
+        payload = json.loads(row["payload_json"])
+        summary = payload.get("history_summary")
+        batches[row["operation_id"]] = dict(number=row["invoice_number"], date=row["invoice_date"],
+            summary=summary if isinstance(summary, dict) else {}, corrected=bool(row["corrected"]), rows=[])
+    for row in connection.execute("""
+        SELECT m.operation_id,m.snapshot_json,d.supplier_name,d.invoice_number,d.document_date
+        FROM customer_invoice_members m
+        LEFT JOIN expense_documents d ON d.id=json_extract(m.snapshot_json,'$.document_id')
+        WHERE m.object_id=? ORDER BY m.member_key
+    """, (object_id,)):
+        item = json.loads(row["snapshot_json"])
+        if item["kind"] == "expense":
+            item.update(supplier=row["supplier_name"], number=row["invoice_number"], date=row["document_date"])
+        batches[row["operation_id"]]["rows"].append(item)
+    return list(batches.values())
+
+
 def expense_member(document, index):
     allocation = document["allocations"][index]
     return {

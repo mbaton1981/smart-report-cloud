@@ -12557,7 +12557,12 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
         next_invoice_btn = QPushButton("Документы бухгалтеру · часы, OB, поездки и расходы")
         next_invoice_btn.setObjectName("prepareNextCustomerInvoice")
         next_invoice_btn.clicked.connect(self.open_next_customer_invoice)
-        card_layout.addRow(next_invoice_btn)
+        invoice_actions = QHBoxLayout()
+        invoice_actions.addWidget(next_invoice_btn)
+        history_button = QPushButton("История выставленных счетов")
+        history_button.clicked.connect(self.open_issued_invoice_history)
+        invoice_actions.addWidget(history_button)
+        card_layout.addRow(invoice_actions)
 
         confirm_hours_btn = QPushButton("Подтвердить часы")
         confirm_hours_btn.setObjectName("secondaryAction")
@@ -14004,6 +14009,10 @@ class SmartReportApp(CustomerIntervalsMixin, QMainWindow):
             open_next_invoice(self)
         except (ValueError, sqlite3.Error) as error:
             QMessageBox.warning(self, "Следующий счёт", str(error))
+
+    def open_issued_invoice_history(self):
+        from issued_invoice_history import open_history
+        open_history(self)
 
     def mark_period_as_invoiced(self):
         try:

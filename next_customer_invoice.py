@@ -585,6 +585,22 @@ def open_next_invoice(host):
         payload = {"operation_id": operation_id, "object_id": obj["server_id"], "purpose": "accountant",
                    "invoice_number": number.text().strip(), "invoice_date": invoice_date.date().toString("yyyy-MM-dd"),
                    "members": members}
+        selection = selected()
+        _, start, end = periods[period_buttons.checkedId()]
+        summary = summarize_accountant(report, selection, include_trips=include_trips.isChecked(),
+                                       rates=rates, use_saved_terms=use_saved_terms, material_percent=invoice_percent)
+        payload["history_summary"] = {
+            "start": start or min(entry["date"] for entry in selection), "end": end,
+            "total_sek": str(summary["total"]) if summary["total"] is not None else None,
+            "include_trips": include_trips.isChecked(),
+            "expense_details": {entry["member"]["key"]: {
+                "fingerprint": entry["member"]["fingerprint"], "date": entry["date"], "label": entry["label"],
+                "net": str(entry.get("display_allocation", entry["allocation"]).get("net_amount", "")),
+            } for entry in selection if entry["member"]["kind"] == "expense"},
+            "work_lines": [[label, str(quantity) if quantity is not None else None, unit,
+                            str(amount) if amount is not None else None]
+                           for label, quantity, unit, _rate, amount in summary["lines"]],
+        }
         if "material_terms" in state:
             payload["material_markup_percent"] = invoice_percent
         if state.get("custom_invoice_markup"):

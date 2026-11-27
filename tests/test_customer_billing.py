@@ -62,6 +62,49 @@ class CustomerBillingTests(unittest.TestCase):
         self.headers["X-SmartReport-Dataset"] = "isolated-billing-dataset"
         self.assertEqual(self.post().status_code, 200)
 
+    def test_history_of_existing_invoice_and_older_unnumbered_hours(self):
+        from types import SimpleNamespace
+        from issued_invoice_history import describe, open_history
+        from desktop_ui import ReportTable
+
+        self.assertEqual(self.post().status_code, 200)
+        with closing(self.desktop.get_db_connection()) as db:
+            obj = db.execute("SELECT * FROM objects WHERE is_active=1 LIMIT 1").fetchone()
+            db.execute("UPDATE objects SET server_id=? WHERE id=?", (self.object_id, obj["id"]))
+            for key, closed in (("billing-shift", 1), ("earlier", 1), ("pending", 0)):
+                db.execute("""INSERT INTO shifts(date,employee,company,object_name,hours,rate,invoiced,sync_id,entry_type)
+                              VALUES ('2026-10-16','Worker',?,?,3,0,?,?,'work')""", (obj["company"], obj["name"], closed, key))
+            db.commit()
+        def api(method, endpoint, params):
+            response = self.server_client.get(endpoint, headers=self.headers, query_string=params)
+            self.assertEqual(response.status_code, 200)
+            return response.get_json()
+        response = api("GET", "/api/customer-invoices", {"object_id": self.object_id, "view": "issued_history"})
+        batch, = response["history"]
+        self.assertEqual(batch["number"], "CUSTOMER-1")
+        _, amount, hours, rows = describe(batch)
+        self.assertEqual((amount, hours, len(rows)), ("Не сохранена", 8, 2))
+        self.assertEqual(api("GET", "/api/customer-invoices", {"object_id": self.object_id+1, "view":"issued_history"})["history"], [])
+        panel = self.desktop.QMainWindow()
+        self.addCleanup(panel.close)
+        panel.inv_obj_cb = SimpleNamespace(currentData=lambda: obj["id"])
+        seen = []
+        def inspect(dialog):
+            upper, lower = sorted(dialog.findChildren(ReportTable), key=lambda table: table.columnCount())
+            self.assertEqual(upper.rowCount(), 2)
+            self.assertEqual(upper.item(0, 0).text(), "№ CUSTOMER-1")
+            self.assertEqual(lower.rowCount(), 2)
+            upper.setCurrentCell(1, 0)
+            self.assertEqual(upper.item(1, 0).text(), "Выставлено без номера счёта")
+            self.assertEqual(lower.rowCount(), 1)
+            self.assertEqual(lower.item(0, 2).text(), "Worker")
+            seen.append(True)
+        with patch("issued_invoice_history._run_correction", side_effect=lambda _p, _m, fn: fn()), \
+                patch.object(self.desktop, "request_expense_api", side_effect=api), \
+                patch.object(self.desktop.QDialog, "exec", new=inspect):
+            open_history(panel)
+        self.assertEqual(seen, [True])
+
     def test_material_markup_uses_selected_net_and_freezes_on_invoice(self):
         from accountant_report import summarize_accountant
         from customer_billing import material_quote, priced_expense_member
@@ -256,6 +299,11 @@ class CustomerBillingTests(unittest.TestCase):
         self.assertEqual(correct({**correction, "correction_id": "stale"}).status_code, 409)
         refreshed = self.server_client.get(path, query_string=params, headers=auth).get_json()["correction"]
         self.assertEqual(refreshed["revision"], 1)
+        archived, = self.server_client.get("/api/customer-invoices", headers=self.headers,
+            query_string=dict(params, view="issued_history")).get_json()["history"]
+        self.assertTrue(archived["corrected"])
+        self.assertEqual({r["key"] for r in archived["rows"]},
+                         {self.payload["members"][0]["key"], available["snapshot"]["key"]})
         self.assertEqual([(item["snapshot"]["document_id"], item["included"]) for item in refreshed["expenses"]],
                          [(new_doc, True), (self.document["id"], False)])
         state = self.server_client.get("/api/customer-invoices", headers=self.headers, query_string=params).get_json()
@@ -507,3 +555,7 @@ class CustomerBillingTests(unittest.TestCase):
                              {incomplete_shift["sync_id"]: "Demontering av väggar och sortering av rivningsavfall"})
         state = api("GET", "/api/customer-invoices", params={"object_id": self.object_id})
         self.assertEqual(len(state["members"]), 2)
+        archived, = api("GET", "/api/customer-invoices", params=dict(object_id=self.object_id, view="issued_history"))["history"]
+        self.assertEqual(archived["summary"]["end"], "2026-11-24")
+        self.assertTrue(archived["summary"]["include_trips"])
+        self.assertIsNotNone(archived["summary"]["total_sek"])

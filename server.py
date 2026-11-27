@@ -5752,6 +5752,18 @@ def customer_invoices_api():
     try:
         if request.method == 'GET':
             object_id = int(request.args.get('object_id', ''))
+            if request.args.get("view") == "issued_history":
+                from customer_billing import issued_history
+                connection.execute("PRAGMA query_only=ON")
+                connection.execute("BEGIN")
+                legacy = connection.execute("""
+                    SELECT s.sync_id,s.date,s.employee,s.hours,s.transport,s.submission_type AS entry_type
+                    FROM incoming_submissions s JOIN meta_objects o ON o.company=s.company AND o.name=s.object_name
+                    WHERE o.id=? AND s.is_deleted=0 AND s.invoiced=1 AND s.submission_type IN ('work','ob')
+                    AND NOT EXISTS (SELECT 1 FROM customer_invoice_members m WHERE m.member_key='shift:' || s.sync_id)
+                """, (object_id,))
+                return jsonify({"ok": True, "history": issued_history(connection, object_id),
+                                "legacy": [dict(row) for row in legacy]})
             return jsonify({"ok": True, **invoice_state(connection, object_id)})
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
