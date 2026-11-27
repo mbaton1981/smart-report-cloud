@@ -64,7 +64,8 @@ class CustomerBillingTests(unittest.TestCase):
 
     def test_history_of_existing_invoice_and_older_unnumbered_hours(self):
         from types import SimpleNamespace
-        from issued_invoice_history import describe, open_history
+        from issued_invoice_history import invoice_amounts, open_history
+        from PyQt6.QtWidgets import QLabel
         from desktop_ui import ReportTable
 
         self.assertEqual(self.post().status_code, 200)
@@ -82,28 +83,50 @@ class CustomerBillingTests(unittest.TestCase):
         response = api("GET", "/api/customer-invoices", {"object_id": self.object_id, "view": "issued_history"})
         batch, = response["history"]
         self.assertEqual(batch["number"], "CUSTOMER-1")
-        _, amount, hours, rows = describe(batch)
-        self.assertEqual((amount, hours, len(rows)), ("Не сохранена", 8, 2))
+        _, amount, hours, parts = invoice_amounts(batch)
+        self.assertEqual((amount, hours), ("Сумма не сохранена", "8 ч"))
+        self.assertIn("Работы и поездки · сумма не сохранена", parts)
         self.assertEqual(api("GET", "/api/customer-invoices", {"object_id": self.object_id+1, "view":"issued_history"})["history"], [])
         panel = self.desktop.QMainWindow()
         self.addCleanup(panel.close)
         panel.inv_obj_cb = SimpleNamespace(currentData=lambda: obj["id"])
         seen = []
         def inspect(dialog):
-            upper, lower = sorted(dialog.findChildren(ReportTable), key=lambda table: table.columnCount())
+            upper, = dialog.findChildren(ReportTable)
             self.assertEqual(upper.rowCount(), 2)
             self.assertEqual(upper.item(0, 0).text(), "№ CUSTOMER-1")
-            self.assertEqual(lower.rowCount(), 2)
+            def labels():
+                return " ".join(w.text() for w in dialog.findChildren(QLabel))
+            self.assertIn("✓ Выставлено", labels())
+            self.assertIn("8 ч", labels())
+            self.assertIn("CUSTOMER-1 от 2026-11-18", labels())
             upper.setCurrentCell(1, 0)
             self.assertEqual(upper.item(1, 0).text(), "Выставлено без номера счёта")
-            self.assertEqual(lower.rowCount(), 1)
-            self.assertEqual(lower.item(0, 2).text(), "Worker")
+            self.assertIn("3 ч", labels())
+            self.assertNotIn("Worker", labels())
             seen.append(True)
-        with patch("issued_invoice_history._run_correction", side_effect=lambda _p, _m, fn: fn()), \
+        with tempfile.TemporaryDirectory() as folder, \
+                patch("accountant_mail.desktop_auth.app_data_dir", return_value=Path(folder)), \
+                patch("issued_invoice_history._run_correction", side_effect=lambda _p, _m, fn: fn()), \
                 patch.object(self.desktop, "request_expense_api", side_effect=api), \
                 patch.object(self.desktop.QDialog, "exec", new=inspect):
             open_history(panel)
         self.assertEqual(seen, [True])
+
+    def test_invoice_summary_keeps_materials_work_markup_and_currencies_distinct(self):
+        from issued_invoice_history import invoice_amounts
+        row = {"kind": "expense", "key": "e", "fingerprint": "a", "currency": "SEK",
+               "material_pricing": {"base": "100", "markup": "12"}}
+        batch = {"rows": [shift_member(self.shift), row], "summary": {
+            "work_lines": [["Arbete", "8", "h", "3600"], ["Resor", "1", "st", "450"]]}}
+        _, total, hours, parts = invoice_amounts(batch)
+        self.assertEqual((hours, total), ("8 ч", "4 162,00 SEK"))
+        self.assertIn("Материалы и закупки · 100,00 SEK", parts)
+        self.assertIn("Наценка · 12,00 SEK", parts)
+        batch["rows"].append({"kind": "expense", "key": "u", "currency": "USD", "net_amount": "10"})
+        self.assertEqual(invoice_amounts(batch)[1], "4 162,00 SEK + 10,00 USD")
+        batch["rows"][-1]["net_amount"] = None
+        self.assertEqual(invoice_amounts(batch)[1], "Сумма не сохранена")
 
     def test_material_markup_uses_selected_net_and_freezes_on_invoice(self):
         from accountant_report import summarize_accountant

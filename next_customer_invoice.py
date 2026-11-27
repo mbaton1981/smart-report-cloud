@@ -506,7 +506,16 @@ def open_next_invoice(host):
 
     markup_button.clicked.connect(change_markup)
 
+    sent_package = None
+
+    def package_choices():
+        return (period_buttons.checkedId(), tuple(
+            (entry["member"]["key"], table.item(entry_rows[entry["member"]["key"]], 6).checkState()
+             if entry["member"]["kind"] == "expense" else None) for entry in selected()),
+            include_trips.isChecked(), include_journal.isChecked(), dict(rates), use_saved_terms, invoice_percent)
+
     def export_pdf(*, email=False):
+        nonlocal sent_package
         selection = selected()
         _label, period_start, cutoff = periods[period_buttons.checkedId()]
         copies = {}
@@ -566,7 +575,9 @@ def open_next_invoice(host):
                 if email:
                     from accountant_mail_ui import compose
                     start = period_start or min(entry["date"] for entry in selection)
-                    compose(dialog, obj, f"{start} – {cutoff}", path, desktop)
+                    ref = compose(dialog, obj, f"{start} – {cutoff}", path, desktop)
+                    if ref:
+                        sent_package = (package_choices(), ref)
                 else:
                     open_preview(path, (Path(desktop.REPORTS_DIR) / filename).resolve(), dialog,
                                  title="Предпросмотр документа бухгалтеру")
@@ -595,12 +606,15 @@ def open_next_invoice(host):
             "include_trips": include_trips.isChecked(),
             "expense_details": {entry["member"]["key"]: {
                 "fingerprint": entry["member"]["fingerprint"], "date": entry["date"], "label": entry["label"],
+                "category": entry["category"],
                 "net": str(entry.get("display_allocation", entry["allocation"]).get("net_amount", "")),
             } for entry in selection if entry["member"]["kind"] == "expense"},
             "work_lines": [[label, str(quantity) if quantity is not None else None, unit,
                             str(amount) if amount is not None else None]
                            for label, quantity, unit, _rate, amount in summary["lines"]],
         }
+        if sent_package and sent_package[0] == package_choices():
+            payload["history_summary"]["sent_pdf_ref"] = sent_package[1]
         if "material_terms" in state:
             payload["material_markup_percent"] = invoice_percent
         if state.get("custom_invoice_markup"):

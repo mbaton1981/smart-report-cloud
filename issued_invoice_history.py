@@ -2,72 +2,101 @@
 from collections import defaultdict
 from contextlib import closing
 from decimal import Decimal
+from io import BytesIO
+from pathlib import Path
+import sqlite3
+import tempfile
+
+from pypdf import PdfReader
+import accountant_mail as mail
+from object_records import MAX_FILE_BYTES
+from payroll_preview import open_preview
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QDialog, QLabel, QMessageBox, QPushButton, QSplitter, QTableWidgetItem, QVBoxLayout,
+    QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMenu, QMessageBox, QPushButton, QTableWidgetItem, QVBoxLayout,
 )
 
 from analytics_ui import _run_correction
 from desktop_ui import ReportTable
 from expense_documents import parse_decimal
+from expense_categories import CATEGORY_MATERIALS, EXPENSE_CATEGORIES
 
 
 def money(value, currency):
-    return f"{value:,.2f} {currency}".replace(",", " ") if value is not None else "Не сохранена"
+    return f"{value:,.2f} {currency}".replace(",", " ").replace(".", ",")
 
 
-def describe(batch):
+def invoice_amounts(batch):
     summary = batch.get("summary") or {}
-    details, totals = [], defaultdict(Decimal)
+    days = []
+    groups = defaultdict(lambda: defaultdict(Decimal))
+    missing = set()
+    has_shifts = False
     hours = Decimal(0)
-    complete_expenses = True
-    has_work = False
     for row in batch["rows"]:
         if row["kind"] == "shift":
-            shift = row["signature"]
-            hours += Decimal(str(shift["hours"]))
-            kind = "Смена OB" if shift.get("entry_type") == "ob" else "Смена"
-            trips = shift.get("transport") or 0
-            detail = f"{shift['hours']:g} ч"
-            if trips:
-                detail += f" · поездок по смене: {trips:g}"
-            details.append((shift["date"], kind, shift["employee"], detail, "", ""))
-            has_work = True
+            has_shifts = True
+            days.append(row["signature"]["date"])
+            hours += Decimal(str(row["signature"]["hours"]))
+            continue
+        saved = summary.get("expense_details", {}).get(row["key"], {})
+        if saved.get("fingerprint") != row.get("fingerprint"):
+            saved = {}
+        days.append(saved.get("date") or row.get("date") or "")
+        quote = row.get("material_pricing") or {}
+        category = CATEGORY_MATERIALS if quote else saved.get("category")
+        if category not in EXPENSE_CATEGORIES:
+            category = "Расходы без сохранённой категории"
+        code = row.get("currency")
+        base = parse_decimal(quote.get("base", row.get("net_amount")))
+        if base is None:
+            base = parse_decimal(saved.get("net"))
+        if base is None or code in (None, "", "UNKNOWN"):
+            missing.add(category)
         else:
-            saved = summary.get("expense_details", {}).get(row["key"], {})
-            if saved.get("fingerprint") != row.get("fingerprint"):
-                saved = {}
-            quote = row.get("material_pricing") or {}
-            currency = row.get("currency") or ""
-            net = parse_decimal(quote.get("base", row.get("net_amount")))
-            if net is None:
-                net = parse_decimal(saved.get("net"))
-            customer = parse_decimal(quote.get("customer_net")) if quote else net
-            if customer is None or currency in ("", "UNKNOWN"):
-                complete_expenses = False
+            groups[category][code] += base
+        if quote:
+            extra = parse_decimal(quote.get("markup"))
+            if extra is None or code in (None, "", "UNKNOWN"):
+                missing.add("Наценка")
             else:
-                totals[currency] += customer
-            markup = f"{quote['percent']}% · {money(parse_decimal(quote['markup']), currency)}" if quote else ""
-            label = saved.get("label") or f"{row.get('supplier') or 'Документ'} · №{row.get('number') or row['document_id']}"
-            details.append((saved.get("date") or row.get("date") or "", f"Расход · доля {row['index'] + 1}",
-                            label, money(net, currency), markup, money(customer, currency)))
-    details.sort()
-    days = [item[0] for item in details if item[0]]
-    period = " — ".join(dict.fromkeys((days[0], days[-1]))) if days else "Не указан"
+                groups["Наценка"][code] += extra
+    work_lines = summary.get("work_lines", [])
+    if has_shifts and not work_lines:
+        missing.add("Работы и поездки")
+    for label, _, _, line_amount in work_lines:
+        amount = parse_decimal(line_amount)
+        group = "Поездки" if label.startswith(("Resor", "Resa")) else "Работы"
+        if amount is None:
+            missing.add(group)
+        else:
+            groups[group]["SEK"] += amount
+    days = sorted(day for day in days if day)
+    period = " — ".join(dict.fromkeys((days[0], days[-1]))) if days else "—"
     if summary.get("start") and summary.get("end"):
         period = f"{summary['start']} — {summary['end']}"
-    total = parse_decimal(summary.get("total_sek"))
+    totals = defaultdict(Decimal)
+    parts = []
+    for label in ("Работы", "Работы и поездки", "Поездки", *EXPENSE_CATEGORIES, "Расходы без сохранённой категории", "Наценка"):
+        amounts = groups.get(label)
+        if amounts:
+            values = " + ".join(money(value, code) for code, value in sorted(amounts.items()))
+            parts.append(f"{label} · {values}" + (" (известная часть)" if label in missing else ""))
+            for code, value in amounts.items():
+                totals[code] += value
+        elif label in missing:
+            parts.append(f"{label} · сумма не сохранена")
+    saved_total = parse_decimal(summary.get("total_sek"))
+    if saved_total is not None:
+        total = money(saved_total, "SEK")
+    elif not batch.get("corrected") and not missing and totals:
+        total = " + ".join(money(value, code) for code, value in sorted(totals.items()))
+    else:
+        total = "Сумма не сохранена"
     if batch.get("corrected"):
-        total = None
-    amount = money(total, "SEK")
-    if total is None and not has_work and complete_expenses and totals:
-        amount = " + ".join(money(value, code) for code, value in sorted(totals.items()))
-    for label, count, unit, line_amount in summary.get("work_lines", []):
-        details.append(("", "Расчёт счёта", label, f"{count} {unit}" if count is not None else "",
-                        "", money(parse_decimal(line_amount), "SEK")))
-    return period, amount, hours, details
-
+        parts.append("Состав расходов показан с учётом исправлений.")
+    return period, total, format(hours.normalize(), "f").replace(".", ",") + " ч", "   ·   ".join(parts)
 
 def load_history(desktop, local_id):
     with closing(desktop.get_db_connection()) as conn:
@@ -102,7 +131,7 @@ def load_history(desktop, local_id):
     for row in by_id.values():
         if row["sync_id"] not in linked:
             legacy[row["date"][:7]].append(dict(kind="shift", signature=row))
-    return obj["name"], batches + [
+    return obj["name"], obj["server_id"], batches + [
         dict(number="", date="", month=month, rows=legacy[month]) for month in sorted(legacy, reverse=True)]
 
 
@@ -113,64 +142,155 @@ def open_history(parent):
         QMessageBox.information(parent, "История выставленных счетов", "Выберите объект.")
         return
     try:
-        name, batches = _run_correction(parent, "Загружаем историю выставленных счетов…",
-                                        lambda: load_history(desktop, local_id))
+        name, project, batches = _run_correction(parent, "Загружаем историю выставленных счетов…",
+                                                lambda: load_history(desktop, local_id))
     except Exception as error:
         QMessageBox.warning(parent, "Не удалось открыть историю", str(error))
         return
     dialog = QDialog(parent)
     dialog.setWindowTitle(f"История выставленных счетов · {name}")
     dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
-    dialog.resize(1080, 680)
+    dialog.resize(900, min(620, 235 + 42 * len(batches)))
     layout = QVBoxLayout(dialog)
     if batches:
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        layout.addWidget(splitter)
-        def table(headers, widths, stretch):
-            widget = ReportTable(0, len(headers), dialog, column_widths=widths, stretch_columns=stretch)
-            widget.setHorizontalHeaderLabels(headers)
-            widget.setEditTriggers(ReportTable.EditTrigger.NoEditTriggers)
-            widget.setSelectionBehavior(ReportTable.SelectionBehavior.SelectRows)
-            widget.setSelectionMode(ReportTable.SelectionMode.SingleSelection)
-            splitter.addWidget(widget)
-            return widget
-        invoices = table(("Счёт", "Дата счёта", "Период позиций", "Часы", "Сумма без НДС"),
-                         {0: 280, 1: 125, 2: 238, 3: 95, 4: 190}, (0,))
-        lines = table(("Дата", "Позиция", "Сотрудник / документ", "Часы / закупка без НДС",
-                       "Наценка", "Клиенту без НДС"), {0: 110, 1: 135, 2: 250, 3: 190, 4: 160, 5: 145}, (2,))
-        note = QLabel()
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        def fill(widget, data):
-            widget.setRowCount(len(data))
-            for index, values in enumerate(data):
-                for col, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    item.setToolTip(value)
-                    widget.setItem(index, col, item)
-        descriptions = [describe(batch) for batch in batches]
-        fill(invoices, [(f"№ {batch['number']}" if batch["number"] else "Выставлено без номера счёта",
-                         batch["date"] or "—", period, f"{hours:g}", amount)
-                        for batch, (period, amount, hours, _) in zip(batches, descriptions)])
-        def choose(index, *_):
+        heading = QHBoxLayout()
+        status = QLabel("✓ Выставлено")
+        status.setStyleSheet("background:#176343;color:white;border-radius:5px;padding:4px 9px;")
+        heading.addWidget(status)
+        title = QLabel()
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setStyleSheet("font-size:16pt;font-weight:bold")
+        heading.addWidget(title)
+        heading.addStretch()
+        layout.addLayout(heading)
+        headline = QLabel()
+        headline.setStyleSheet("font-size:13pt;font-weight:bold")
+        headline.setWordWrap(True)
+        layout.addWidget(headline)
+        amounts = QLabel()
+        amounts.setWordWrap(True)
+        layout.addWidget(amounts)
+        period_label = QLabel()
+        layout.addWidget(period_label)
+        table = ReportTable(len(batches), 5, dialog, stretch_columns=(0,), column_widths={0: 150, 1: 115, 2: 215, 3: 85, 4: 170})
+        table.setHorizontalHeaderLabels(("Счёт", "Дата счёта", "Период позиций", "Часы", "Итого без НДС"))
+        table.setEditTriggers(ReportTable.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(ReportTable.SelectionBehavior.SelectRows)
+        table.setSelectionMode(ReportTable.SelectionMode.SingleSelection)
+        table.verticalHeader().hide()
+        layout.addWidget(table)
+        table.setVisible(len(batches) > 1)
+        summaries = []
+        for index, batch in enumerate(batches):
+            period, total, hours, parts = invoice_amounts(batch)
+            summaries.append((period, total, hours, parts))
+            for col, value in enumerate((f"№ {batch['number']}" if batch['number'] else "Выставлено без номера счёта",
+                                         batch['date'] or "—", period, hours, total)):
+                table.setItem(index, col, QTableWidgetItem(value))
+        source = QLabel()
+        source.setTextFormat(Qt.TextFormat.PlainText)
+        source.setWordWrap(True)
+        layout.addWidget(source)
+        bar = QHBoxLayout()
+        layout.addLayout(bar)
+        view = QPushButton("Открыть PDF")
+        attach = QPushButton("Прикрепить отчёт…")
+        menu = QMenu(attach)
+        from_mail = menu.addAction("Из отправленных бухгалтеру…")
+        from_file = menu.addAction("Выбрать PDF на компьютере…")
+        attach.setMenu(menu)
+        bar.addWidget(view)
+        bar.addWidget(attach)
+        bar.addStretch()
+
+        def refresh(*_):
+            index = table.currentRow()
             if index < 0:
                 return
             batch = batches[index]
-            fill(lines, descriptions[index][3])
-            if not batch["number"]:
-                note.setText("Прежние отметки по сменам сгруппированы по месяцу работы. Номер и дата счёта не сохранены.")
-            elif batch.get("corrected"):
-                note.setText("Показан состав после исправления расходов. Первоначальная сумма могла измениться.")
-            elif descriptions[index][1] == "Не сохранена":
-                note.setText("Для этого состава полная сумма не сохранена. Доступные суммы указаны в строках.")
+            period, total, hours, parts = summaries[index]
+            title.setText(f"Счёт № {batch['number']} от {batch['date']}" if batch['number'] else "Без номера счёта")
+            headline.setText(f"{hours}     ·     Итого без НДС — {total}")
+            amounts.setText(parts)
+            amounts.setVisible(bool(parts))
+            period_label.setText(f"Период позиций   {period}")
+            attach.setVisible(bool(batch['number']))
+            info = None
+            if batch['number']:
+                try:
+                    with mail.archive() as db:
+                        info = mail.invoice_attachment(db, project, batch['number'], batch['summary'].get("sent_pdf_ref"))
+                except OSError as error:
+                    source.setText(str(error))
+                    view.hide()
+                    return
+                except sqlite3.Error as error:
+                    source.setText(f"Архив PDF недоступен: {error}")
+                    view.hide()
+                    return
+            view.setVisible(info is not None)
+            attach.setText("Заменить отчёт…" if info else "Прикрепить отчёт…")
+            if info and info["created"]:
+                source.setText(f"Отправлено {info['created'][:16].replace('T', ' ')} · {info['recipient']}")
+            elif info:
+                source.setText(info["filename"])
             else:
-                note.clear()
-        invoices.currentCellChanged.connect(choose)
-        invoices.setCurrentCell(0, 0)
-        splitter.setSizes([220, 370])
+                source.setText("PDF не прикреплён." if batch['number'] else "Старые отметки сгруппированы по месяцу работы.")
+
+        def handle(action):
+            index = table.currentRow()
+            if index < 0 or not batches[index]["number"]:
+                return
+            batch = batches[index]
+            number = batch["number"]
+            try:
+                if action == "view":
+                    with mail.archive() as db:
+                        item = mail.invoice_attachment(db, project, number, batch["summary"].get("sent_pdf_ref"), content=True)
+                    if item:
+                        with tempfile.TemporaryDirectory(prefix="smartreport-invoice-pdf-") as folder:
+                            path = Path(folder) / Path(item["filename"]).name
+                            path.write_bytes(item["pdf"])
+                            open_preview(path, Path(desktop.REPORTS_DIR) / path.name, dialog, title=f"Отчёт к счёту № {number}")
+                elif action == "mail":
+                    with mail.archive() as db:
+                        sent = db.execute("SELECT id,created,recipient,period FROM mail WHERE project=? AND status='sent' ORDER BY id DESC", (project,)).fetchall()
+                    if not sent:
+                        QMessageBox.information(dialog, "Отправленные отчёты", "В этом профиле пока нет отправленных через SmartReport отчётов по объекту. Можно выбрать PDF на компьютере.")
+                        return
+                    choices = [f"{r['created'][:16].replace('T', ' ')} · {r['period']} · {r['recipient']} · #{r['id']}" for r in sent]
+                    choice, ok = QInputDialog.getItem(dialog, f"Отчёт к счёту № {number}", "Отправленный PDF", choices, 0, False)
+                    if ok:
+                        with mail.archive() as db:
+                            db.execute("INSERT OR REPLACE INTO invoice_pdf(project,number,mail_id) VALUES (?,?,?)",
+                                       (project, number, sent[choices.index(choice)]["id"]))
+                else:
+                    filename, _filter = QFileDialog.getOpenFileName(dialog, f"Отчёт к счёту № {number}", "", "PDF (*.pdf)")
+                    if filename:
+                        path = Path(filename)
+                        if path.stat().st_size > MAX_FILE_BYTES:
+                            raise ValueError("Размер PDF превышает 100 МБ.")
+                        data = path.read_bytes()
+                        if not PdfReader(BytesIO(data)).pages:
+                            raise ValueError("В PDF нет страниц.")
+                        with mail.archive() as db:
+                            db.execute("INSERT OR REPLACE INTO invoice_pdf(project,number,filename,pdf) VALUES (?,?,?,?)",
+                                       (project, number, path.name, data))
+            except Exception as error:
+                QMessageBox.warning(dialog, "Отчёт к счёту", str(error))
+            refresh()
+
+        table.currentCellChanged.connect(refresh)
+        view.clicked.connect(lambda: handle("view"))
+        from_mail.triggered.connect(lambda: handle("mail"))
+        from_file.triggered.connect(lambda: handle("file"))
+        table.setCurrentCell(0, 0)
     else:
-        layout.addWidget(QLabel("По этому объекту пока нет сохранённых счетов или смен с отметкой «выставлено»."))
+        layout.addWidget(QLabel("По этому объекту пока нет выставленных счетов."))
     close = QPushButton("Закрыть")
     close.clicked.connect(dialog.accept)
-    layout.addWidget(close)
+    if batches:
+        bar.addWidget(close)
+    else:
+        layout.addWidget(close)
     dialog.exec()

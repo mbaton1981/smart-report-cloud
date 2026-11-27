@@ -68,8 +68,8 @@ def compose(parent, obj, period, path, desktop):
                  path, obj["server_id"], period)
     loop = QEventLoop()
     outcome = []
-    def done(_, _result, error):
-        outcome.append(error)
+    def done(_, result, error):
+        outcome.append((result, error))
         loop.quit()
     task = desktop.ObjectPackageTask(0, lambda _update: mail.send_package(*arguments))
     task.signals.completed.connect(done)
@@ -80,11 +80,13 @@ def compose(parent, obj, period, path, desktop):
     QThreadPool.globalInstance().start(task)
     loop.exec()
     progress.close()
-    if outcome[0]:
-        QMessageBox.warning(parent, "Отправка бухгалтеру", outcome[0])
+    result, error = outcome[0]
+    if error:
+        QMessageBox.warning(parent, "Отправка бухгалтеру", error)
     else:
         QMessageBox.information(parent, "Письмо принято Loopia",
                                 f"Получатель: {arguments[2]}\nКопия PDF сохранена в истории отправок объекта.")
+        return result
 
 
 def show_history(parent, obj, reports_dir):

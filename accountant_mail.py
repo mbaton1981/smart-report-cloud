@@ -8,6 +8,7 @@ from email.utils import formatdate, make_msgid
 import smtplib
 import sqlite3
 import ssl
+import uuid
 
 import desktop_auth
 
@@ -36,6 +37,11 @@ def archive():
             id INTEGER PRIMARY KEY, project INTEGER NOT NULL, created TEXT NOT NULL,
             sender TEXT NOT NULL, recipient TEXT NOT NULL, subject TEXT NOT NULL,
             period TEXT NOT NULL, status TEXT NOT NULL, filename TEXT NOT NULL, pdf BLOB NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS mail_refs (
+            ref TEXT PRIMARY KEY, mail_id INTEGER NOT NULL UNIQUE REFERENCES mail(id))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS invoice_pdf (
+            project INTEGER NOT NULL, number TEXT NOT NULL, mail_id INTEGER REFERENCES mail(id),
+            filename TEXT, pdf BLOB, PRIMARY KEY(project,number))""")
         yield db
 
 
@@ -50,11 +56,13 @@ def send_package(settings, password, recipient, subject, body, path, project, pe
     msg.set_content(body)
     msg.add_attachment(pdf, maintype="application", subtype="pdf", filename=path.name)
     # If the process exits during SMTP, the retained attempt must not imply success.
+    ref = uuid.uuid4().hex
     with archive() as db:
         row_id = db.execute("""INSERT INTO mail
             (project,created,sender,recipient,subject,period,status,filename,pdf)
             VALUES (?,?,?,?,?,?,'unknown',?,?)""", (project, datetime.now().astimezone().isoformat(timespec="seconds"),
             sender, recipient, subject, period, path.name, pdf)).lastrowid
+        db.execute("INSERT INTO mail_refs VALUES (?,?)", (ref, row_id))
     submitting = False
     smtp = None
     try:
@@ -83,3 +91,20 @@ def send_package(settings, password, recipient, subject, body, path, project, pe
         raise
     if error:
         raise RuntimeError(error)
+    return ref
+
+
+def invoice_attachment(db, project, number, ref, *, content=False):
+    fields = "m.filename,m.created,m.recipient" + (",m.pdf" if content else "")
+    manual = db.execute("SELECT mail_id,filename FROM invoice_pdf WHERE project=? AND number=?",
+                        (project, number)).fetchone()
+    if manual and manual["mail_id"] is None:
+        return db.execute("SELECT filename,NULL AS created,NULL AS recipient" + (",pdf" if content else "") +
+                          " FROM invoice_pdf WHERE project=? AND number=?", (project, number)).fetchone()
+    if manual:
+        return db.execute(f"SELECT {fields} FROM mail m WHERE project=? AND id=? AND status='sent'",
+                          (project, manual["mail_id"])).fetchone()
+    if ref:
+        return db.execute(f"SELECT {fields} FROM mail m JOIN mail_refs r ON r.mail_id=m.id "
+                          "WHERE m.project=? AND r.ref=? AND m.status='sent'", (project, ref)).fetchone()
+    return None

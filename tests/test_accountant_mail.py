@@ -24,7 +24,7 @@ class AccountantMailTests(unittest.TestCase):
         self.settings = MailboxSettings("info@example.org", mail.MAIL_HOST, 993, "SSL/TLS", "INBOX", "Sent")
 
     def send(self, recipient="accounts@example.org"):
-        mail.send_package(self.settings, "test-password", recipient, "Faktureringsunderlag", "Hej!",
+        return mail.send_package(self.settings, "test-password", recipient, "Faktureringsunderlag", "Hej!",
                           self.path, 41, "2026-10-16 – 2026-11-14")
 
     def records(self):
@@ -32,7 +32,7 @@ class AccountantMailTests(unittest.TestCase):
             return db.execute("SELECT * FROM mail").fetchall()
 
     def test_attachment_matches_archive_and_envelope(self):
-        self.send()
+        ref = self.send()
         msg, = self.transport.return_value.send_message.call_args.args
         row, = self.records()
         self.assertEqual((row["project"], row["status"], row["recipient"]), (41, "sent", "accounts@example.org"))
@@ -42,6 +42,11 @@ class AccountantMailTests(unittest.TestCase):
         self.assertEqual(attachment.get_filename(), self.path.name)
         self.assertEqual(attachment.get_payload(decode=True), row["pdf"])
         self.assertEqual(row["pdf"], self.path.read_bytes())
+        with mail.archive() as db:
+            self.assertIsNone(mail.invoice_attachment(db, 42, "187", ref))
+            self.assertEqual(mail.invoice_attachment(db, 41, "187", ref, content=True)["pdf"], row["pdf"])
+            db.execute("UPDATE mail SET status='unknown'")
+            self.assertIsNone(mail.invoice_attachment(db, 41, "187", ref))
 
     def test_rejection_and_unknown_outcome_are_distinct_and_never_retried(self):
         smtp = self.transport.return_value
