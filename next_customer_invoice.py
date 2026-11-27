@@ -384,9 +384,11 @@ def open_next_invoice(host):
     layout.addWidget(reviewed)
     actions = QHBoxLayout()
     pdf_button = QPushButton("Предварительный PDF")
+    mail_button = QPushButton("Отправить бухгалтеру…")
+    history_button = QPushButton("История отправок…")
     save_button = QPushButton("Сохранить как выставленное")
     close = QPushButton("Закрыть")
-    for button in (pdf_button, save_button, close):
+    for button in (pdf_button, mail_button, history_button, save_button, close):
         actions.addWidget(button)
     layout.addLayout(actions)
     close.clicked.connect(dialog.reject)
@@ -439,6 +441,7 @@ def open_next_invoice(host):
                                and not any(item["missing"] for item in summary["markups"].values())
                                and bool(number.text().strip()) and not committed)
         pdf_button.setEnabled(valid)
+        mail_button.setEnabled(valid)
 
     table.itemChanged.connect(refresh)
     number.textChanged.connect(refresh)
@@ -503,7 +506,7 @@ def open_next_invoice(host):
 
     markup_button.clicked.connect(change_markup)
 
-    def export_pdf():
+    def export_pdf(*, email=False):
         selection = selected()
         _label, period_start, cutoff = periods[period_buttons.checkedId()]
         copies = {}
@@ -528,6 +531,8 @@ def open_next_invoice(host):
                         return
             pdf_report = {**report, "journal_translations": translations}
             filename = "Следующий-счёт.pdf"
+            if email:
+                filename = f"Faktureringsunderlag-{obj['server_id']}-{cutoff}.pdf"
             with tempfile.TemporaryDirectory(prefix="SmartReport-accountant-preview-") as folder:
                 path = Path(folder) / filename
                 def build(update):
@@ -558,10 +563,15 @@ def open_next_invoice(host):
                 progress.close()
                 if result[0]:
                     raise RuntimeError(result[0])
-                open_preview(path, (Path(desktop.REPORTS_DIR) / filename).resolve(), dialog,
-                             title="Предпросмотр документа бухгалтеру")
+                if email:
+                    from accountant_mail_ui import compose
+                    start = period_start or min(entry["date"] for entry in selection)
+                    compose(dialog, obj, f"{start} – {cutoff}", path, desktop)
+                else:
+                    open_preview(path, (Path(desktop.REPORTS_DIR) / filename).resolve(), dialog,
+                                 title="Предпросмотр документа бухгалтеру")
         except Exception as error:
-            QMessageBox.warning(dialog, "PDF не сформирован", str(error))
+            QMessageBox.warning(dialog, "Отправка бухгалтеру" if email else "PDF не сформирован", str(error))
 
     def commit():
         nonlocal committed, submitted_payload
@@ -603,6 +613,14 @@ def open_next_invoice(host):
             refresh()
 
     pdf_button.clicked.connect(export_pdf)
+    mail_button.clicked.connect(lambda: export_pdf(email=True))
+    def history_clicked():
+        from accountant_mail_ui import show_history
+        try:
+            show_history(dialog, obj, desktop.REPORTS_DIR)
+        except Exception as error:
+            QMessageBox.warning(dialog, "История отправок", str(error))
+    history_button.clicked.connect(history_clicked)
     save_button.clicked.connect(commit)
     apply_period(period_buttons.checkedId())
     dialog.exec()

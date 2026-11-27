@@ -164,7 +164,7 @@ class InfoMailConnectionDialog(QDialog):
         layout.addLayout(form)
         notice = QLabel(
             "Пароль хранится отдельно от фактур и защищается Windows DPAPI для этого пользователя. "
-            "Подключение только для чтения; отправки писем нет."
+            "Здесь проверяется чтение почты. В отчётах можно отдельно отправить выбранный PDF бухгалтеру через Loopia."
         )
         notice.setWordWrap(True)
         layout.addWidget(notice)

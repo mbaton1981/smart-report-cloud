@@ -340,6 +340,10 @@ class CustomerBillingTests(unittest.TestCase):
 
         def inspect(dialog):
             from PyQt6.QtWidgets import QAbstractItemView, QCheckBox, QLineEdit, QPushButton, QTableWidget, QTextEdit
+            if dialog.windowTitle() == "Отправить бухгалтеру":
+                dialog.findChildren(QLineEdit)[0].setText("accountant@example.org")
+                next(b for b in dialog.findChildren(QPushButton) if b.text() == "Отправить").click()
+                return dialog.result()
             if isinstance(dialog, self.desktop.JournalTranslationDialog):
                 self.assertEqual(dialog.table.rowCount(), 1)
                 self.assertIn("Документы бухгалтеру", dialog.parentWidget().windowTitle())
@@ -455,6 +459,19 @@ class CustomerBillingTests(unittest.TestCase):
             self.assertIn("600,00 SEK", without_attachments)
             self.assertIn("Materialpåslag 10 %", without_attachments)
             self.assertIn("110,00 SEK", without_attachments)
+            from info_mail import MailboxSettings
+            mailbox = MailboxSettings("info@example.org", "mailcluster.loopia.se", 993, "SSL/TLS", "INBOX", "Sent")
+            with patch("info_mail.load_settings", return_value=(mailbox, "test")), \
+                    patch("accountant_mail.desktop_auth.app_data_dir", return_value=output.parent), \
+                    patch("accountant_mail.smtplib.SMTP_SSL") as smtp, \
+                    patch.object(self.desktop.QMessageBox, "information"):
+                buttons["Отправить бухгалтеру…"].click()
+            message, = smtp.return_value.send_message.call_args.args
+            attachment, = message.iter_attachments()
+            output.write_bytes(attachment.get_payload(decode=True))
+            self.assertEqual(without_attachments, " ".join(page.extract_text() for page in PdfReader(output).pages))
+            self.assertEqual(str(message["To"]), "accountant@example.org")
+            self.assertFalse(buttons["Сохранить как выставленное"].isEnabled())
             with patch("next_customer_invoice.QInputDialog.getInt", return_value=(0, True)):
                 markup_button.click()
             buttons["Этот месяц"].click()
