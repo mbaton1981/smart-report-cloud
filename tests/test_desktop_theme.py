@@ -190,6 +190,42 @@ class DesktopThemeTests(unittest.TestCase):
         self.assertEqual(bar.styleSheet(), "")
         tabs.deleteLater()
 
+    def test_reopening_table_reuses_measurements_and_reflows_changed_cells(self):
+        from desktop_ui import ReportTable
+
+        table = ReportTable(1, 1, stretch_columns=(0,))
+        table.setHorizontalHeaderLabels(["Описание"])
+        item = QTableWidgetItem("Одна строка")
+        table.setItem(0, 0, item)
+        table.resize(600, 400)
+        table.show()
+        self.application.processEvents()
+        table.refresh_layout()
+        height = table.rowHeight(0)
+        cache = table.itemDelegate()._measure
+        initial = cache.cache_info()
+        table.hide()
+        table.show()
+        self.application.processEvents()
+        self.assertEqual(cache.cache_info().misses, initial.misses)
+        self.assertGreater(cache.cache_info().hits, initial.hits)
+        self.assertEqual(table.rowHeight(0), height)
+
+        item.setText("Длинное описание материала " * 10)
+        self.application.processEvents()
+        wide_height = table.rowHeight(0)
+        self.assertGreater(wide_height, height)
+        table.resize(260, 400)
+        self.application.processEvents()
+        narrow_height = table.rowHeight(0)
+        self.assertGreater(narrow_height, wide_height)
+        font = table.font()
+        font.setPointSize(22)
+        item.setFont(font)
+        self.application.processEvents()
+        self.assertGreater(table.rowHeight(0), narrow_height)
+        table.close()
+
     def test_switch_does_not_remeasure_content_sized_table_columns(self):
         import desktop_ui
 

@@ -1,7 +1,8 @@
 import re
+from functools import lru_cache
 
 from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QTimer
-from PyQt6.QtGui import QBrush, QFontMetrics, QTextDocument, QTextOption
+from PyQt6.QtGui import QBrush, QFont, QFontMetrics, QGuiApplication, QTextDocument, QTextOption
 from PyQt6.QtWidgets import QHeaderView, QStyle, QStyledItemDelegate, QTableWidget
 
 
@@ -19,6 +20,7 @@ def combo_items_need_refresh(combo, items):
     )
 
 
+@lru_cache(maxsize=256)
 def column_role(title):
     label = " ".join(title.casefold().split())
     if re.search(r"сотруд|фио|anställd|фирм|объект|поставщик|описан|коммент|помет|примеч|категор|специфик|specifikation|детализ|sammanfatt|назначение", label):
@@ -31,6 +33,17 @@ def column_role(title):
 
 
 class TableDelegate(QStyledItemDelegate):
+    def __init__(self, parent):
+        super().__init__(parent)
+        # Each table owns its cache, so closing a report also releases its texts.
+        self._measure = lru_cache(maxsize=2048)(self._text_size)
+        app = QGuiApplication.instance()
+        app.fontDatabaseChanged.connect(self.clear_measurements)
+        app.primaryScreenChanged.connect(self.clear_measurements)
+
+    def clear_measurements(self, *_):
+        self._measure.cache_clear()
+
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         role = self.parent().role_for_column(index.column())
@@ -39,26 +52,33 @@ class TableDelegate(QStyledItemDelegate):
         option.displayAlignment = horizontal | Qt.AlignmentFlag.AlignVCenter
         option.textElideMode = Qt.TextElideMode.ElideNone
 
+    @staticmethod
+    def _text_size(text, width, font, dpi):
+        document = QTextDocument()
+        document.setDocumentMargin(0)
+        document.setDefaultFont(font)
+        wrapping = QTextOption()
+        wrapping.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        document.setDefaultTextOption(wrapping)
+        document.setPlainText(text)
+        document.setTextWidth(width)
+        metrics = QFontMetrics(font)
+        preferred = metrics.horizontalAdvance(max(text.splitlines() or [""], key=len)) + 24
+        wrapped = metrics.boundingRect(QRect(0, 0, width, 100000), Qt.TextFlag.TextWordWrap, text)
+        return preferred, max(int(document.size().height()), wrapped.height()) + 16
+
     def sizeHint(self, option, index):
         self.initStyleOption(option, index)
         base = super().sizeHint(option, index)
         table = self.parent()
         text = str(index.data() or "")
         width = max(24, table.columnWidth(index.column()) - 32)
-        document = QTextDocument()
-        document.setDocumentMargin(0)
-        document.setDefaultFont(option.font)
-        wrapping = QTextOption()
-        wrapping.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-        document.setDefaultTextOption(wrapping)
-        document.setPlainText(text)
-        document.setTextWidth(width)
-        metrics = QFontMetrics(option.font)
-        preferred = metrics.horizontalAdvance(max(text.splitlines() or [""], key=len)) + 24
+        measure = self._measure if len(text) <= 2048 else self._text_size
+        # The style option is transient. Store an owned font value in the cache.
+        preferred, height = measure(text, width, QFont(option.font), table.logicalDpiY())
         if table.role_for_column(index.column()) != "number":
             preferred = min(preferred, 220)
-        wrapped = metrics.boundingRect(QRect(0, 0, width, 100000), Qt.TextFlag.TextWordWrap, text)
-        return QSize(max(48, preferred), max(32, base.height(), int(document.size().height()) + 16, wrapped.height() + 16))
+        return QSize(max(48, preferred), max(32, base.height(), height))
 
     def helpEvent(self, event, view, option, index):
         if event.type() == QEvent.Type.ToolTip and index.isValid():
